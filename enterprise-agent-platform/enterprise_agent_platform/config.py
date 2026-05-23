@@ -41,6 +41,10 @@ class PlatformConfig:
     container_image: str
     cognee_repo: Path
     hermes_repo: Path
+    manage_hermes: bool = True
+    manage_cognee: bool = True
+    hermes_home: Path | None = None
+    runtime_startup_wait_seconds: float = 8.0
 
     @property
     def db_path(self) -> Path:
@@ -49,6 +53,18 @@ class PlatformConfig:
     @property
     def workspace_dir(self) -> Path:
         return self.data_dir / "workspaces"
+
+    @property
+    def runtime_dir(self) -> Path:
+        return self.data_dir / "runtimes"
+
+    @property
+    def managed_hermes_home(self) -> Path:
+        return (self.hermes_home or self.runtime_dir / "hermes").expanduser()
+
+    @property
+    def cognee_runtime_dir(self) -> Path:
+        return self.runtime_dir / "cognee"
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
@@ -82,4 +98,12 @@ class PlatformConfig:
             container_image=os.getenv("ENTERPRISE_CONTAINER_IMAGE", "python:3.11-slim"),
             cognee_repo=Path(os.getenv("ENTERPRISE_COGNEE_REPO", base.parent / "cognee")).expanduser(),
             hermes_repo=Path(os.getenv("ENTERPRISE_HERMES_REPO", base.parent / "hermes-agent")).expanduser(),
+            manage_hermes=os.getenv("ENTERPRISE_MANAGE_HERMES", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            manage_cognee=os.getenv("ENTERPRISE_MANAGE_COGNEE", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            hermes_home=Path(
+                os.getenv("ENTERPRISE_HERMES_HOME", data_dir / "runtimes" / "hermes")
+            ).expanduser(),
+            runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
         )

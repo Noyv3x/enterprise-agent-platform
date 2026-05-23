@@ -8,6 +8,7 @@ const state = {
   documents: [],
   selectedDocument: null,
   secrets: [],
+  runtimes: null,
   busy: false,
   error: "",
 };
@@ -129,7 +130,7 @@ function navButton(view, label) {
       state.activeView = view;
       if (view === "private") await loadPrivateMessages();
       if (view === "knowledge") await loadDocuments();
-      if (view === "settings") await loadSecrets();
+      if (view === "settings") await loadSettings();
       render();
     },
   }, [label]);
@@ -263,7 +264,31 @@ function renderSettings() {
       }, [input, h("button", { text: "设置" })]),
     ]);
   });
+  const runtimeRows = state.runtimes ? Object.values(state.runtimes).map((runtime) =>
+    h("div", { class: "runtime-row" }, [
+      h("div", {}, [
+        h("strong", { text: runtime.name }),
+        h("span", { class: `status ${runtime.available ? "ok" : "warn"}`, text: runtime.state }),
+        h("div", { class: "muted", text: runtime.detail || runtime.error || runtime.path || "" }),
+      ]),
+      h("div", { class: "runtime-actions" }, [
+        h("button", {
+          onclick: async () => {
+            await withBusy(async () => {
+              await api(`/api/system/runtime/${runtime.name}/restart`, { method: "POST", body: "{}" });
+              await loadRuntime();
+            });
+          },
+          text: runtime.name === "hermes" ? "重启" : "刷新",
+        }),
+      ]),
+    ]),
+  ) : [];
   return h("div", { class: "panel" }, [
+    h("div", { class: "section" }, [
+      h("h2", { text: "底层基座" }),
+      h("div", { class: "list" }, runtimeRows),
+    ]),
     h("div", { class: "section" }, [
       h("h2", { text: "集中密钥配置" }),
       h("div", { class: "list" }, rows),
@@ -305,6 +330,14 @@ async function loadDocuments() {
 async function loadSecrets() {
   const result = await api("/api/settings/secrets");
   state.secrets = result.secrets;
+}
+
+async function loadRuntime() {
+  state.runtimes = await api("/api/system/runtime");
+}
+
+async function loadSettings() {
+  await Promise.all([loadSecrets(), loadRuntime()]);
 }
 
 async function logout() {

@@ -107,8 +107,9 @@ class HermesAgentClient:
 
 
 class AutoAgentClient:
-    def __init__(self, config: PlatformConfig, secret_provider):
+    def __init__(self, config: PlatformConfig, secret_provider, runtime_manager=None):
         self.config = config
+        self.runtime_manager = runtime_manager
         self.hermes = HermesAgentClient(config, secret_provider)
         self.local = LocalAgentClient()
 
@@ -116,6 +117,8 @@ class AutoAgentClient:
         if self.config.agent_mode == "local":
             return self.local.generate(**kwargs)
         try:
+            if self.runtime_manager is not None:
+                self.runtime_manager.ensure_hermes_ready(wait=True)
             return self.hermes.generate(**kwargs)
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             if self.config.agent_mode == "hermes":

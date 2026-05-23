@@ -45,7 +45,7 @@ def main() -> None:
         run_server(config)
         return
 
-    service = EnterpriseService(config)
+    service = EnterpriseService(config, autostart_runtime=False)
     try:
         if cmd == "init-admin":
             user = service.create_user(
@@ -68,7 +68,7 @@ def main() -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src, dest)
             print(f"installed Hermes plugin: {dest}")
-            print("Enable plugin key 'enterprise_kb' in Hermes config plugins.enabled.")
+            print("Enable plugin key 'enterprise-kb' in Hermes config plugins.enabled.")
     finally:
         service.close()
 

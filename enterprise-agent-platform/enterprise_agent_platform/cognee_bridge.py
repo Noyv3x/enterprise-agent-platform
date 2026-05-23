@@ -29,9 +29,10 @@ class CogneeBridge:
     Cognee ingestion/search using the repository path from configuration.
     """
 
-    def __init__(self, config: PlatformConfig, secret_provider):
+    def __init__(self, config: PlatformConfig, secret_provider, runtime_manager=None):
         self.config = config
         self.secret_provider = secret_provider
+        self.runtime_manager = runtime_manager
         self._module = None
         self._status: CogneeStatus | None = None
 
@@ -42,11 +43,20 @@ class CogneeBridge:
             self._status = CogneeStatus(False, "local", "")
             return self._status
         try:
+            if self.runtime_manager is not None:
+                runtime = self.runtime_manager.ensure_cognee_ready()
+                if not runtime.available:
+                    self._status = CogneeStatus(False, self.config.knowledge_backend, runtime.error)
+                    return self._status
             self._module = self._import_cognee()
             self._status = CogneeStatus(True, self.config.knowledge_backend)
         except Exception as exc:
             self._status = CogneeStatus(False, self.config.knowledge_backend, str(exc))
         return self._status
+
+    def refresh_status(self) -> CogneeStatus:
+        self._status = None
+        return self.status()
 
     def ingest_document(self, *, title: str, content: str, source: str = "") -> dict[str, Any]:
         if self.config.knowledge_backend not in {"hybrid", "cognee"}:
@@ -127,6 +137,8 @@ class CogneeBridge:
         return cognee
 
     def _seed_cognee_env(self) -> None:
+        if self.runtime_manager is not None:
+            self.runtime_manager.ensure_cognee_ready()
         # Cognee commonly reads LLM_API_KEY, while Hermes users usually store
         # provider-specific keys. Seed only missing vars and never expose values.
         if not os.getenv("LLM_API_KEY"):

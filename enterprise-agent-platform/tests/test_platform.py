@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from enterprise_agent_platform.config import PlatformConfig
@@ -23,6 +25,38 @@ class RecordingAgent:
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
+
+
+class FakeProcess:
+    pid = 43210
+
+    def __init__(self):
+        self.running = True
+
+    def poll(self):
+        return None if self.running else 0
+
+    def terminate(self):
+        self.running = False
+
+    def wait(self, timeout=None):
+        self.running = False
+        return 0
+
+    def kill(self):
+        self.running = False
+
+
+class RecordingLauncher:
+    def __init__(self):
+        self.calls = []
+        self.processes = []
+
+    def start(self, cmd, *, cwd, env, log_path):
+        process = FakeProcess()
+        self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path})
+        self.processes.append(process)
+        return process
 
 
 def make_config(tmp: Path) -> PlatformConfig:
@@ -46,6 +80,22 @@ def make_config(tmp: Path) -> PlatformConfig:
         container_image="python:3.11-slim",
         cognee_repo=tmp / "cognee",
         hermes_repo=tmp / "hermes-agent",
+        hermes_home=tmp / "runtimes" / "hermes",
+        runtime_startup_wait_seconds=0,
+    )
+
+
+def make_fake_hermes_repo(path: Path) -> None:
+    (path / "hermes_cli").mkdir(parents=True, exist_ok=True)
+    (path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (path / "hermes_cli" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+
+
+def make_fake_cognee_repo(path: Path) -> None:
+    (path / "cognee").mkdir(parents=True, exist_ok=True)
+    (path / "cognee" / "__init__.py").write_text(
+        "class SearchType:\n    CHUNKS = 'chunks'\n",
+        encoding="utf-8",
     )
 
 
@@ -124,6 +174,87 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(service.get_knowledge_document(doc["id"])["title"], "Runbook")
             service.close()
 
+    def test_platform_prepares_managed_hermes_and_cognee_without_manual_install(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            make_fake_cognee_repo(tmp / "cognee")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                hermes_home = service.config.managed_hermes_home
+                self.assertTrue((hermes_home / "plugins" / "enterprise_kb" / "plugin.yaml").exists())
+                config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+                env_text = (hermes_home / ".env").read_text(encoding="utf-8")
+
+                self.assertIn("enterprise-kb", config_text)
+                self.assertIn('API_SERVER_ENABLED="true"', env_text)
+                self.assertIn('ENTERPRISE_AGENT_TOOL_TOKEN="agent-token"', env_text)
+                self.assertIn("API_SERVER_KEY=", env_text)
+
+                _, admin = service.authenticate("admin", "admin")
+                status = service.runtime_status(admin)
+                self.assertEqual(status["hermes"]["managed"], True)
+                self.assertEqual(status["cognee"]["managed"], True)
+                self.assertEqual(status["cognee"]["state"], "prepared")
+            finally:
+                service.close()
+
+    def test_auto_agent_starts_managed_hermes_before_local_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            config = replace(
+                make_config(tmp),
+                agent_mode="auto",
+                hermes_timeout_seconds=0.2,
+                runtime_startup_wait_seconds=0,
+            )
+            launcher = RecordingLauncher()
+            service = EnterpriseService(config, runtime_process_launcher=launcher)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                result = service.send_channel_message(user, 1, "hello")
+
+                self.assertTrue(launcher.calls)
+                launch = launcher.calls[0]
+                self.assertEqual(launch["cwd"], tmp / "hermes-agent")
+                self.assertIn("gateway", launch["cmd"])
+                self.assertEqual(launch["env"]["HERMES_HOME"], str(config.managed_hermes_home))
+                self.assertEqual(launch["env"]["API_SERVER_ENABLED"], "true")
+                self.assertEqual(launch["env"]["ENTERPRISE_AGENT_TOOL_TOKEN"], "agent-token")
+                self.assertTrue(result["agent_message"]["metadata"]["degraded"])
+                self.assertIn("Hermes API is not reachable", result["agent_message"]["content"])
+            finally:
+                service.close()
+
+    def test_managed_cognee_environment_is_seeded_from_platform(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_cognee_repo(tmp / "cognee")
+            old_env = {key: os.environ.get(key) for key in ("DATA_ROOT_DIRECTORY", "SYSTEM_ROOT_DIRECTORY", "CACHE_ROOT_DIRECTORY", "COGNEE_LOGS_DIR", "LLM_API_KEY")}
+            for key in old_env:
+                os.environ.pop(key, None)
+            service = None
+            try:
+                service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
+                service.runtimes.ensure_cognee_ready()
+
+                self.assertEqual(os.environ["DATA_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "data"))
+                self.assertEqual(os.environ["SYSTEM_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "system"))
+                self.assertEqual(os.environ["CACHE_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "cache"))
+                self.assertEqual(os.environ["COGNEE_LOGS_DIR"], str(tmp / "runtimes" / "cognee" / "logs"))
+                self.assertEqual(os.environ["LLM_API_KEY"], "sk-test-value")
+            finally:
+                if service is not None:
+                    service.close()
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
 
 class PlatformHTTPTests(unittest.TestCase):
     def test_login_and_channel_message_over_http(self):
@@ -149,6 +280,13 @@ class PlatformHTTPTests(unittest.TestCase):
                 res = conn.getresponse()
                 channels = json.loads(res.read().decode("utf-8"))["channels"]
                 self.assertEqual(channels[0]["name"], "general")
+
+                conn.request("GET", "/api/system/runtime", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                runtime = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertIn("hermes", runtime)
+                self.assertIn("cognee", runtime)
 
                 conn.request(
                     "POST",

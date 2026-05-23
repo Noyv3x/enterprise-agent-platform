@@ -149,6 +149,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/settings/agent-token" and method == "GET":
             self._json(service.agent_tool_token(actor))
             return
+        if path == "/api/system/runtime" and method == "GET":
+            self._json(service.runtime_status(actor))
+            return
+        m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/restart", path)
+        if m and method == "POST":
+            self._json(service.restart_runtime(actor, m.group(1)))
+            return
 
         raise ServiceError(404, "endpoint not found")
 

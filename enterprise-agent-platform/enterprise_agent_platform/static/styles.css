@@ -290,7 +290,8 @@ textarea {
 }
 
 .doc-row,
-.secret-row {
+.secret-row,
+.runtime-row {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 10px;
@@ -306,6 +307,44 @@ textarea {
   grid-template-columns: 1fr 150px auto;
   gap: 8px;
   align-items: center;
+}
+
+.runtime-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.runtime-row strong {
+  margin-right: 8px;
+}
+
+.runtime-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.status.ok {
+  border-color: #b7dcd7;
+  color: #0b5f59;
+  background: #f3fbfa;
+}
+
+.status.warn {
+  border-color: #e8c48b;
+  color: #8a4b0a;
+  background: #fff8ec;
 }
 
 .error {
@@ -325,7 +364,8 @@ textarea {
 
   .grid,
   .composer,
-  .secret-row {
+  .secret-row,
+  .runtime-row {
     grid-template-columns: 1fr;
   }
 

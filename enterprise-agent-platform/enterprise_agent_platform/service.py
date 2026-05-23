@@ -13,6 +13,7 @@ from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient
 from .knowledge import KnowledgeBase, format_passive_suggestions
+from .runtimes import PlatformRuntimeManager
 
 
 class ServiceError(Exception):
@@ -23,18 +24,29 @@ class ServiceError(Exception):
 
 
 class EnterpriseService:
-    def __init__(self, config: PlatformConfig, agent_client: AgentClient | None = None):
+    def __init__(
+        self,
+        config: PlatformConfig,
+        agent_client: AgentClient | None = None,
+        runtime_process_launcher=None,
+        autostart_runtime: bool = True,
+    ):
         self.config = config
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(config.db_path)
         self.tokens = TokenSigner(config.token_secret, config.token_ttl_seconds)
         self.knowledge = KnowledgeBase(self.db)
-        self.cognee = CogneeBridge(config, self.get_secret)
+        self.runtimes = PlatformRuntimeManager(config, self.get_secret, process_launcher=runtime_process_launcher)
+        self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.containers = ContainerManager(config, self.db)
-        self.agent_client = agent_client or AutoAgentClient(config, self.get_secret)
+        self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
         self.ensure_bootstrap()
+        self.runtimes.prepare()
+        if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
+            self.runtimes.ensure_hermes_ready(wait=False)
 
     def close(self) -> None:
+        self.runtimes.close()
         self.db.close()
 
     def ensure_bootstrap(self) -> None:
@@ -56,6 +68,8 @@ class EnterpriseService:
         if not self.get_setting("agent_tool_token"):
             token = self.config.agent_tool_token or secrets.token_urlsafe(32)
             self.set_setting("agent_tool_token", token, secret=True)
+        if not self.config.hermes_api_key and not self.get_secret("ENTERPRISE_HERMES_API_KEY") and not self.get_secret("API_SERVER_KEY"):
+            self.set_setting("API_SERVER_KEY", secrets.token_urlsafe(32), secret=True)
 
     def create_user(
         self,
@@ -266,6 +280,20 @@ class EnterpriseService:
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         container = self.containers.get_private_container(actor["id"])
         return {"container": container.to_dict() if container else None, "session_id": f"enterprise-private-u{actor['id']}"}
+
+    def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        return self.runtimes.status(refresh=True)
+
+    def restart_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
+        require_admin(actor)
+        clean = name.strip().lower()
+        if clean == "hermes":
+            return {"runtime": self.runtimes.restart_hermes().to_dict()}
+        if clean == "cognee":
+            self.cognee.refresh_status()
+            return {"runtime": self.runtimes.ensure_cognee_ready().to_dict()}
+        raise ServiceError(404, "runtime not found")
 
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         doc = self.knowledge.add_document(
