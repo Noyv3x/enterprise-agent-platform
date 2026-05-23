@@ -1,0 +1,10 @@
+name: enterprise-kb
+version: 0.1.0
+description: Enterprise knowledge-base tools for the Enterprise Agent Platform.
+kind: standalone
+provides_tools:
+  - enterprise_kb_search
+  - enterprise_kb_read
+requires_env:
+  - ENTERPRISE_PLATFORM_URL
+  - ENTERPRISE_AGENT_TOOL_TOKEN

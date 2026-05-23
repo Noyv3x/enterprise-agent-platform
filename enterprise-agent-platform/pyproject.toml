@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enterprise-agent-platform"
+version = "0.1.0"
+description = "Enterprise web platform for shared and private Hermes agents with Cognee-backed knowledge tools."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Enterprise Agent Platform" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+enterprise-agent-platform = "enterprise_agent_platform.__main__:main"
+
+[tool.setuptools]
+packages = ["enterprise_agent_platform"]
+
+[tool.setuptools.package-data]
+enterprise_agent_platform = ["static/*"]

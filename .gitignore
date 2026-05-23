@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Enterprise platform runtime state
+enterprise-agent-platform/data/
+enterprise-agent-platform/.env
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+workspaces/
+logs/
+
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Frontend/editor noise
+node_modules/
+dist/
+build/
+.DS_Store
+.idea/
+.vscode/
+
+# Temporary outputs
+tmp/
+temp/
+*.log
