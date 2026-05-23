@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,15 @@ from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient
 from .knowledge import KnowledgeBase, format_passive_suggestions
-from .runtimes import PlatformRuntimeManager
+from .runtimes import (
+    HERMES_SETTING_API_URL,
+    HERMES_SETTING_INSTALL_EXTRAS,
+    HERMES_SETTING_MANAGED,
+    HERMES_SETTING_MODEL,
+    HERMES_SETTING_REPO,
+    HERMES_SETTING_STARTUP_WAIT,
+    PlatformRuntimeManager,
+)
 
 
 class ServiceError(Exception):
@@ -29,6 +38,7 @@ class EnterpriseService:
         config: PlatformConfig,
         agent_client: AgentClient | None = None,
         runtime_process_launcher=None,
+        runtime_command_runner=None,
         autostart_runtime: bool = True,
     ):
         self.config = config
@@ -36,7 +46,13 @@ class EnterpriseService:
         self.db = Database(config.db_path)
         self.tokens = TokenSigner(config.token_secret, config.token_ttl_seconds)
         self.knowledge = KnowledgeBase(self.db)
-        self.runtimes = PlatformRuntimeManager(config, self.get_secret, process_launcher=runtime_process_launcher)
+        self.runtimes = PlatformRuntimeManager(
+            config,
+            self.get_secret,
+            process_launcher=runtime_process_launcher,
+            command_runner=runtime_command_runner,
+            setting_provider=self.get_setting,
+        )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.containers = ContainerManager(config, self.db)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
@@ -285,6 +301,55 @@ class EnterpriseService:
         require_admin(actor)
         return self.runtimes.status(refresh=True)
 
+    def hermes_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        config = self.runtimes.hermes_runtime_config()
+        config["api_key_configured"] = bool(
+            self.config.hermes_api_key
+            or self.get_secret("ENTERPRISE_HERMES_API_KEY")
+            or self.get_secret("API_SERVER_KEY")
+        )
+        return {"config": config, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
+
+    def update_hermes_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        if "manage_hermes" in body:
+            self.set_setting(HERMES_SETTING_MANAGED, "1" if parse_bool(body.get("manage_hermes")) else "0")
+        if "repo_path" in body:
+            repo_path = str(body.get("repo_path", "")).strip()
+            if not repo_path:
+                raise ServiceError(400, "Hermes source path is required")
+            self.set_setting(HERMES_SETTING_REPO, str(Path(repo_path).expanduser()))
+        if "api_url" in body:
+            api_url = str(body.get("api_url", "")).strip()
+            parsed = urllib.parse.urlparse(api_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ServiceError(400, "Hermes API URL must be an http(s) URL")
+            self.set_setting(HERMES_SETTING_API_URL, api_url)
+        if "model" in body:
+            model = str(body.get("model", "")).strip()
+            if not model:
+                raise ServiceError(400, "Hermes model is required")
+            self.set_setting(HERMES_SETTING_MODEL, model)
+        if "install_extras" in body:
+            extras = str(body.get("install_extras", "")).strip()
+            if extras and not re.fullmatch(r"[A-Za-z0-9_,.-]{1,120}", extras):
+                raise ServiceError(400, "Hermes install extras contain unsupported characters")
+            self.set_setting(HERMES_SETTING_INSTALL_EXTRAS, extras)
+        if "startup_wait_seconds" in body:
+            try:
+                wait_seconds = float(body.get("startup_wait_seconds"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "startup wait seconds must be a number") from exc
+            if wait_seconds < 0 or wait_seconds > 120:
+                raise ServiceError(400, "startup wait seconds must be between 0 and 120")
+            self.set_setting(HERMES_SETTING_STARTUP_WAIT, str(wait_seconds))
+        api_key = str(body.get("api_key", "")).strip()
+        if api_key:
+            self.set_setting("API_SERVER_KEY", api_key, secret=True)
+        self.runtimes.prepare_hermes()
+        return self.hermes_config(actor)
+
     def restart_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
         require_admin(actor)
         clean = name.strip().lower()
@@ -293,6 +358,16 @@ class EnterpriseService:
         if clean == "cognee":
             self.cognee.refresh_status()
             return {"runtime": self.runtimes.ensure_cognee_ready().to_dict()}
+        raise ServiceError(404, "runtime not found")
+
+    def install_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
+        require_admin(actor)
+        clean = name.strip().lower()
+        if clean == "hermes":
+            install_status = self.runtimes.install_hermes(force=True)
+            if install_status.available:
+                self.runtimes.prepare_hermes()
+            return {"runtime": install_status.to_dict(), "config": self.runtimes.hermes_runtime_config()}
         raise ServiceError(404, "runtime not found")
 
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -481,6 +556,12 @@ def normalize_channel_name(value: str) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,48}", clean):
         raise ServiceError(400, "invalid channel name")
     return clean
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def mask_secret(value: str) -> str:

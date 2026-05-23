@@ -14,23 +14,36 @@ It provides:
 ## Run
 
 ```bash
-cd /home/dev/code/agent/enterprise-agent-platform
-ENTERPRISE_ADMIN_PASSWORD='change-me' python3 -m enterprise_agent_platform serve
+cd ..
+./deploy.sh
 ```
 
-Open `http://127.0.0.1:8765`.
+Open `http://127.0.0.1:8765`. The deploy script initializes submodules, creates the root `.venv`, installs this platform package, prepares runtime state, and starts the app. If user-level systemd is available it installs and starts `enterprise-agent-platform.service`; otherwise it runs in the foreground.
 
 If `ENTERPRISE_ADMIN_PASSWORD` is not set before first run, the bootstrap account is `admin` / `admin`.
 
+Useful deployment commands:
+
+```bash
+./deploy.sh service      # force user-level systemd install/start
+./deploy.sh foreground  # force foreground server
+./deploy.sh status
+./deploy.sh restart
+./deploy.sh logs
+```
+
 ## Managed Hermes
 
-No separate Hermes install/setup step is required when the adjacent `hermes-agent` repository is present. On platform startup it will:
+No separate Hermes install/setup step is required. The top-level deploy script initializes the adjacent `hermes-agent` repository, and on platform startup it will:
 
 - create a managed Hermes home under `data/runtimes/hermes`;
+- create `data/runtimes/hermes/venv` and install Hermes from the adjacent `../hermes-agent` source with `pip install -e`;
 - install and enable the `enterprise-kb` plugin;
 - generate an API server key if one is not already configured;
-- start `hermes gateway run --replace --quiet` with `API_SERVER_ENABLED=true`;
-- expose status and restart controls in Settings -> 底层基座.
+- start the Hermes gateway with `API_SERVER_ENABLED=true` from the managed venv;
+- expose install, configuration, status, and restart controls in Settings.
+
+The Settings screen can update the Hermes source path, API URL, model name, install extras, startup wait, and API server key. Changing install extras or source path causes the next managed prepare/install action to refresh the venv.
 
 The platform sends:
 
@@ -63,6 +76,6 @@ export ENTERPRISE_CONTAINER_IMAGE=python:3.11-slim
 ## Tests
 
 ```bash
-cd /home/dev/code/agent/enterprise-agent-platform
-python3 -m unittest discover -s tests
+cd ..
+./deploy.sh test
 ```

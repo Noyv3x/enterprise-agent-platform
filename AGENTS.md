@@ -11,11 +11,13 @@ This workspace ties together an enterprise platform and two upstream codebases.
 
 ## Build, Test, and Development Commands
 
-Initialize submodules before development:
+Use the top-level one-command deploy path for local bring-up:
 
 ```bash
-git submodule update --init --recursive
+./deploy.sh
 ```
+
+It initializes submodules, creates `.venv`, installs the platform package, prepares managed Hermes/Cognee state, and starts the app through user-level systemd when available. Keep `hermes-agent/` and `cognee/` next to `enterprise-agent-platform/`; managed Hermes is installed from adjacent `hermes-agent/` source into `data/runtimes/hermes/venv`.
 
 Run the platform locally:
 
@@ -30,6 +32,12 @@ Run focused verification for the platform:
 cd enterprise-agent-platform
 python3 -m unittest discover -s tests
 python3 -m compileall enterprise_agent_platform hermes_plugin tests
+```
+
+Or run both checks from the repository root:
+
+```bash
+./deploy.sh test
 ```
 
 Use submodule-specific commands only from the relevant submodule root.
@@ -50,4 +58,4 @@ PRs should include a summary, affected directories, commands run, linked issues 
 
 ## Security & Configuration Tips
 
-Never commit `.env`, runtime databases, generated workspaces, API keys, or logs. Configure model credentials through the platform settings UI or environment variables, and keep managed Hermes/Cognee state under the platform data directory.
+Never commit `.env`, runtime databases, generated workspaces, API keys, or logs. Configure model credentials and Hermes runtime settings through the platform settings UI or environment variables. Keep managed Hermes/Cognee state under the platform data directory.

@@ -152,6 +152,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/runtime" and method == "GET":
             self._json(service.runtime_status(actor))
             return
+        if path == "/api/system/hermes/config" and method == "GET":
+            self._json(service.hermes_config(actor))
+            return
+        if path == "/api/system/hermes/config" and method == "PUT":
+            self._json(service.update_hermes_config(actor, self._body_json()))
+            return
+        m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/install", path)
+        if m and method == "POST":
+            self._json(service.install_runtime(actor, m.group(1)))
+            return
         m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/restart", path)
         if m and method == "POST":
             self._json(service.restart_runtime(actor, m.group(1)))

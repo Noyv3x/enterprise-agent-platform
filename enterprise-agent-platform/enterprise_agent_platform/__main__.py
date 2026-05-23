@@ -30,9 +30,19 @@ def main() -> None:
     token.add_argument("--data", default=None)
     install_plugin = sub.add_parser("install-hermes-plugin", help="Install the enterprise_kb Hermes plugin into HERMES_HOME")
     install_plugin.add_argument("--hermes-home", default=None)
+    deploy = sub.add_parser("deploy", help="Bootstrap one-command deployment")
+    from .deployment import add_bootstrap_args
+
+    add_bootstrap_args(deploy)
 
     args = parser.parse_args()
     cmd = args.cmd or "serve"
+    if cmd == "deploy":
+        from .deployment import bootstrap_from_args
+
+        bootstrap_from_args(args)
+        return
+
     config = PlatformConfig.from_env(Path(__file__).resolve().parents[1])
     if getattr(args, "data", None):
         config = replace(config, data_dir=Path(args.data).expanduser().resolve())

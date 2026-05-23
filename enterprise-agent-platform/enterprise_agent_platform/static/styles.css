@@ -323,6 +323,39 @@ textarea {
 .runtime-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.config-form {
+  max-width: 760px;
+}
+
+.field,
+.check-row {
+  display: grid;
+  gap: 6px;
+}
+
+.field span,
+.check-row span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.check-row {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+.check-row input {
+  width: auto;
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .status {

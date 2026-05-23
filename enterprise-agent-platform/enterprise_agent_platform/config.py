@@ -44,6 +44,7 @@ class PlatformConfig:
     manage_hermes: bool = True
     manage_cognee: bool = True
     hermes_home: Path | None = None
+    hermes_install_extras: str = ""
     runtime_startup_wait_seconds: float = 8.0
 
     @property
@@ -96,8 +97,8 @@ class PlatformConfig:
             in {"1", "true", "yes", "on"},
             container_backend=os.getenv("ENTERPRISE_CONTAINER_BACKEND", "auto").strip().lower() or "auto",
             container_image=os.getenv("ENTERPRISE_CONTAINER_IMAGE", "python:3.11-slim"),
-            cognee_repo=Path(os.getenv("ENTERPRISE_COGNEE_REPO", base.parent / "cognee")).expanduser(),
-            hermes_repo=Path(os.getenv("ENTERPRISE_HERMES_REPO", base.parent / "hermes-agent")).expanduser(),
+            cognee_repo=Path(os.getenv("ENTERPRISE_COGNEE_REPO", _default_repo_path(base, "cognee"))).expanduser(),
+            hermes_repo=Path(os.getenv("ENTERPRISE_HERMES_REPO", _default_repo_path(base, "hermes-agent"))).expanduser(),
             manage_hermes=os.getenv("ENTERPRISE_MANAGE_HERMES", "1").strip().lower()
             in {"1", "true", "yes", "on"},
             manage_cognee=os.getenv("ENTERPRISE_MANAGE_COGNEE", "1").strip().lower()
@@ -105,5 +106,16 @@ class PlatformConfig:
             hermes_home=Path(
                 os.getenv("ENTERPRISE_HERMES_HOME", data_dir / "runtimes" / "hermes")
             ).expanduser(),
+            hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
             runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
         )
+
+
+def _default_repo_path(base: Path, name: str) -> Path:
+    in_base = base / name
+    if in_base.exists():
+        return in_base
+    in_parent = base.parent / name
+    if in_parent.exists():
+        return in_parent
+    return in_base

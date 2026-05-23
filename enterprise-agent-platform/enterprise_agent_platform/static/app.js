@@ -9,6 +9,7 @@ const state = {
   selectedDocument: null,
   secrets: [],
   runtimes: null,
+  hermesConfig: null,
   busy: false,
   error: "",
 };
@@ -247,6 +248,18 @@ function renderKnowledge() {
 }
 
 function renderSettings() {
+  const hermes = state.hermesConfig?.config || {};
+  const manageHermes = h("input", { type: "checkbox" });
+  manageHermes.checked = hermes.manage_hermes !== false;
+  const repoPath = h("input", { value: hermes.repo_path || "" });
+  const apiUrl = h("input", { value: hermes.api_url || "" });
+  const model = h("input", { value: hermes.model || "" });
+  const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
+  const startupWait = h("input", { type: "number", min: "0", max: "120", step: "0.5", value: hermes.startup_wait_seconds ?? 8 });
+  const apiKey = h("input", {
+    type: "password",
+    placeholder: hermes.api_key_configured ? "保持不变" : "API server key",
+  });
   const rows = state.secrets.map((secret) => {
     const input = h("input", { type: "password", placeholder: secret.configured ? secret.masked : "未配置" });
     return h("div", { class: "secret-row" }, [
@@ -272,11 +285,20 @@ function renderSettings() {
         h("div", { class: "muted", text: runtime.detail || runtime.error || runtime.path || "" }),
       ]),
       h("div", { class: "runtime-actions" }, [
+        runtime.name === "hermes" ? h("button", {
+          onclick: async () => {
+            await withBusy(async () => {
+              await api("/api/system/runtime/hermes/install", { method: "POST", body: "{}" });
+              await loadSettings();
+            });
+          },
+          text: "安装",
+        }) : null,
         h("button", {
           onclick: async () => {
             await withBusy(async () => {
               await api(`/api/system/runtime/${runtime.name}/restart`, { method: "POST", body: "{}" });
-              await loadRuntime();
+              await loadSettings();
             });
           },
           text: runtime.name === "hermes" ? "重启" : "刷新",
@@ -289,11 +311,60 @@ function renderSettings() {
       h("h2", { text: "底层基座" }),
       h("div", { class: "list" }, runtimeRows),
     ]),
+    h("form", {
+      class: "section config-form",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        await withBusy(async () => {
+          await api("/api/system/hermes/config", {
+            method: "PUT",
+            body: JSON.stringify({
+              manage_hermes: manageHermes.checked,
+              repo_path: repoPath.value,
+              api_url: apiUrl.value,
+              model: model.value,
+              install_extras: installExtras.value,
+              startup_wait_seconds: startupWait.value,
+              api_key: apiKey.value,
+            }),
+          });
+          apiKey.value = "";
+          await loadSettings();
+        });
+      },
+    }, [
+      h("h2", { text: "Hermes 配置" }),
+      h("label", { class: "check-row" }, [manageHermes, h("span", { text: "由平台托管 Hermes" })]),
+      field("源码路径", repoPath),
+      field("API URL", apiUrl),
+      field("模型", model),
+      field("安装 extras", installExtras),
+      field("启动等待秒数", startupWait),
+      field("API Server Key", apiKey),
+      h("div", { class: "form-actions" }, [
+        h("button", { class: "primary", type: "submit", disabled: state.busy, text: "保存配置" }),
+        h("button", {
+          type: "button",
+          disabled: state.busy,
+          onclick: async () => {
+            await withBusy(async () => {
+              await api("/api/system/runtime/hermes/install", { method: "POST", body: "{}" });
+              await loadSettings();
+            });
+          },
+          text: "从源码重装",
+        }),
+      ]),
+    ]),
     h("div", { class: "section" }, [
       h("h2", { text: "集中密钥配置" }),
       h("div", { class: "list" }, rows),
     ]),
   ]);
+}
+
+function field(label, control) {
+  return h("label", { class: "field" }, [h("span", { text: label }), control]);
 }
 
 function activeChannel() {
@@ -336,8 +407,12 @@ async function loadRuntime() {
   state.runtimes = await api("/api/system/runtime");
 }
 
+async function loadHermesConfig() {
+  state.hermesConfig = await api("/api/system/hermes/config");
+}
+
 async function loadSettings() {
-  await Promise.all([loadSecrets(), loadRuntime()]);
+  await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig()]);
 }
 
 async function logout() {

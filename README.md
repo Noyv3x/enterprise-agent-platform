@@ -11,39 +11,33 @@ This repository manages the enterprise agent platform built on top of the local 
 ## Quick Start
 
 ```bash
-git submodule update --init --recursive
-cd enterprise-agent-platform
-ENTERPRISE_ADMIN_PASSWORD='change-me' python3 -m enterprise_agent_platform serve
+./deploy.sh
 ```
 
-Then open `http://127.0.0.1:8765`.
+Then open `http://127.0.0.1:8765`. The deploy script initializes submodules, creates the platform `.venv`, installs the platform, prepares managed runtime state, and starts the platform. If user-level systemd is available it installs and starts `enterprise-agent-platform.service`; otherwise it runs the server in the foreground.
 
 If no admin password is configured before first boot, the bootstrap account is `admin` / `admin`.
+
+On first startup, the platform expects the adjacent `hermes-agent/` submodule to be present. `./deploy.sh` initializes that submodule automatically, and the platform creates `enterprise-agent-platform/data/runtimes/hermes/venv`, installs Hermes from local source with an editable install, writes managed Hermes config, and starts the Hermes API server when agent traffic needs it. Hermes source path, API URL, model name, install extras, startup wait, and API server key can be managed in the platform Settings screen.
+
+Service management:
+
+```bash
+./deploy.sh status
+./deploy.sh restart
+./deploy.sh logs
+./deploy.sh foreground
+```
 
 ## Verification
 
 ```bash
-cd enterprise-agent-platform
-python3 -m unittest discover -s tests
-python3 -m compileall enterprise_agent_platform tests
+./deploy.sh test
 ```
 
 ## Hermes Knowledge Tools
 
-```bash
-cd enterprise-agent-platform
-python3 -m enterprise_agent_platform install-hermes-plugin
-python3 -m enterprise_agent_platform print-agent-token
-```
-
-Set these for Hermes:
-
-```bash
-export ENTERPRISE_PLATFORM_URL='http://127.0.0.1:8765'
-export ENTERPRISE_AGENT_TOOL_TOKEN='<printed token>'
-```
-
-Enable plugin key `enterprise_kb` in Hermes config. The platform exposes:
+The managed startup installs and enables the `enterprise-kb` Hermes plugin automatically. The plugin exposes:
 
 - `enterprise_kb_search(query, limit)`
 - `enterprise_kb_read(document_id)`

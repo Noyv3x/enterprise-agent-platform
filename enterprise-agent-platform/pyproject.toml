@@ -20,4 +20,4 @@ packages = ["enterprise_agent_platform", "hermes_plugin", "hermes_plugin.enterpr
 
 [tool.setuptools.package-data]
 enterprise_agent_platform = ["static/*"]
-hermes_plugin.enterprise_kb = ["plugin.yaml"]
+"hermes_plugin.enterprise_kb" = ["plugin.yaml"]

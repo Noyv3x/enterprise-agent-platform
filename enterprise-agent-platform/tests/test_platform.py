@@ -3,6 +3,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -59,6 +61,20 @@ class RecordingLauncher:
         return process
 
 
+class RecordingCommandRunner:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, cmd, *, cwd, env, log_path, timeout):
+        self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path, "timeout": timeout})
+        if len(cmd) >= 4 and cmd[1:3] == ["-m", "venv"]:
+            venv_dir = Path(cmd[3])
+            python = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0)
+
+
 def make_config(tmp: Path) -> PlatformConfig:
     return PlatformConfig(
         data_dir=tmp,
@@ -89,6 +105,10 @@ def make_fake_hermes_repo(path: Path) -> None:
     (path / "hermes_cli").mkdir(parents=True, exist_ok=True)
     (path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (path / "hermes_cli" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+    (path / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent-test"\nversion = "0.0.0"\n',
+        encoding="utf-8",
+    )
 
 
 def make_fake_cognee_repo(path: Path) -> None:
@@ -99,7 +119,34 @@ def make_fake_cognee_repo(path: Path) -> None:
     )
 
 
+def managed_python(home: Path) -> Path:
+    return home / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+
+
 class PlatformServiceTests(unittest.TestCase):
+    def test_default_repo_paths_support_whole_checkout_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "hermes-agent").mkdir()
+            (root / "cognee").mkdir()
+            (root / "enterprise-agent-platform").mkdir()
+            old_env = {key: os.environ.get(key) for key in ("ENTERPRISE_HERMES_REPO", "ENTERPRISE_COGNEE_REPO")}
+            for key in old_env:
+                os.environ.pop(key, None)
+            try:
+                root_config = PlatformConfig.from_env(root)
+                platform_config = PlatformConfig.from_env(root / "enterprise-agent-platform")
+                self.assertEqual(root_config.hermes_repo, root / "hermes-agent")
+                self.assertEqual(root_config.cognee_repo, root / "cognee")
+                self.assertEqual(platform_config.hermes_repo, root / "hermes-agent")
+                self.assertEqual(platform_config.cognee_repo, root / "cognee")
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -179,7 +226,8 @@ class PlatformServiceTests(unittest.TestCase):
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
             make_fake_cognee_repo(tmp / "cognee")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
             try:
                 hermes_home = service.config.managed_hermes_home
                 self.assertTrue((hermes_home / "plugins" / "enterprise_kb" / "plugin.yaml").exists())
@@ -194,8 +242,11 @@ class PlatformServiceTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)
                 self.assertEqual(status["hermes"]["managed"], True)
+                self.assertEqual(status["hermes"]["install_state"], "installed")
                 self.assertEqual(status["cognee"]["managed"], True)
                 self.assertEqual(status["cognee"]["state"], "prepared")
+                install_commands = [call["cmd"] for call in runner.calls]
+                self.assertIn([str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")], install_commands)
             finally:
                 service.close()
 
@@ -210,7 +261,8 @@ class PlatformServiceTests(unittest.TestCase):
                 runtime_startup_wait_seconds=0,
             )
             launcher = RecordingLauncher()
-            service = EnterpriseService(config, runtime_process_launcher=launcher)
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
             try:
                 _, user = service.authenticate("admin", "admin")
                 result = service.send_channel_message(user, 1, "hello")
@@ -218,12 +270,77 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(launcher.calls)
                 launch = launcher.calls[0]
                 self.assertEqual(launch["cwd"], tmp / "hermes-agent")
+                self.assertEqual(launch["cmd"][0], str(managed_python(config.managed_hermes_home / "venv")))
                 self.assertIn("gateway", launch["cmd"])
                 self.assertEqual(launch["env"]["HERMES_HOME"], str(config.managed_hermes_home))
                 self.assertEqual(launch["env"]["API_SERVER_ENABLED"], "true")
                 self.assertEqual(launch["env"]["ENTERPRISE_AGENT_TOOL_TOKEN"], "agent-token")
                 self.assertTrue(result["agent_message"]["metadata"]["degraded"])
                 self.assertIn("Hermes API is not reachable", result["agent_message"]["content"])
+            finally:
+                service.close()
+
+    def test_first_run_installs_hermes_from_adjacent_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            try:
+                hermes_home = service.config.managed_hermes_home
+                self.assertTrue((hermes_home / "install.json").exists())
+                self.assertEqual(runner.calls[0]["cmd"][:3], [sys.executable, "-m", "venv"])
+                self.assertEqual(runner.calls[0]["cmd"][3], str(hermes_home / "venv"))
+                self.assertEqual(
+                    runner.calls[1]["cmd"],
+                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")],
+                )
+                _, admin = service.authenticate("admin", "admin")
+                status = service.runtime_status(admin)["hermes"]
+                self.assertEqual(status["install_state"], "installed")
+                self.assertEqual(status["source"], str(tmp / "hermes-agent"))
+            finally:
+                service.close()
+
+    def test_hermes_config_can_be_updated_from_platform(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                result = service.update_hermes_config(
+                    admin,
+                    {
+                        "manage_hermes": True,
+                        "repo_path": str(tmp / "hermes-agent"),
+                        "api_url": "http://127.0.0.1:8766/v1/chat/completions",
+                        "model": "enterprise-hermes",
+                        "install_extras": "dev",
+                        "startup_wait_seconds": 3.5,
+                        "api_key": "runtime-key",
+                    },
+                )
+
+                self.assertEqual(result["config"]["api_port"], 8766)
+                self.assertEqual(result["config"]["model"], "enterprise-hermes")
+                self.assertEqual(result["config"]["install_extras"], "dev")
+                env_text = (service.config.managed_hermes_home / ".env").read_text(encoding="utf-8")
+                self.assertIn('API_SERVER_PORT="8766"', env_text)
+                self.assertIn('API_SERVER_MODEL_NAME="enterprise-hermes"', env_text)
+                self.assertIn('API_SERVER_KEY="runtime-key"', env_text)
+                self.assertEqual(
+                    runner.calls[-1]["cmd"],
+                    [
+                        str(managed_python(service.config.managed_hermes_home / "venv")),
+                        "-m",
+                        "pip",
+                        "install",
+                        "-e",
+                        f"{tmp / 'hermes-agent'}[dev]",
+                    ],
+                )
             finally:
                 service.close()
 
@@ -287,6 +404,13 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(res.status, 200)
                 self.assertIn("hermes", runtime)
                 self.assertIn("cognee", runtime)
+
+                conn.request("GET", "/api/system/hermes/config", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                hermes_config = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertIn("config", hermes_config)
+                self.assertIn("repo_path", hermes_config["config"])
 
                 conn.request(
                     "POST",
