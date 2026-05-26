@@ -46,11 +46,21 @@ rm -rf .venv
 服务管理：
 
 ```bash
+./deploy.sh update
 ./deploy.sh status
 ./deploy.sh restart
 ./deploy.sh logs
 ./deploy.sh foreground
 ```
+
+以后更新到最新版并重新部署，只需要：
+
+```bash
+cd enterprise-agent-platform
+./deploy.sh update
+```
+
+`update` 会拉取当前分支的最新代码、同步 submodule，然后继续执行部署流程。
 
 ## 验证
 

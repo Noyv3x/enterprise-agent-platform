@@ -199,7 +199,10 @@ class DeploymentTests(unittest.TestCase):
         result = subprocess.run(["bash", str(script), "help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(result.returncode, 0)
         self.assertIn("./deploy.sh", result.stdout)
+        self.assertIn("update", result.stdout)
         self.assertIn("foreground", result.stdout)
+        syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_platform_pyproject_supports_editable_install(self):
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"

@@ -47,6 +47,7 @@ rm -rf .venv
 常用部署命令：
 
 ```bash
+./deploy.sh update     # 拉取最新代码、同步 submodule，然后重新部署
 ./deploy.sh service      # 强制使用 user-level systemd 安装/启动
 ./deploy.sh foreground  # 强制以前台模式运行
 ./deploy.sh status

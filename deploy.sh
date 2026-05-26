@@ -10,7 +10,7 @@ usage() {
   cat <<'EOF'
 Usage:
   ./deploy.sh [deploy|service|foreground|prepare] [options]
-  ./deploy.sh [start|stop|restart|status|logs|test]
+  ./deploy.sh [update|start|stop|restart|status|logs|test]
 
 Default:
   ./deploy.sh
@@ -19,6 +19,9 @@ Deploy options are passed to the Python bootstrapper, for example:
   ./deploy.sh --host 0.0.0.0 --port 8765
   ./deploy.sh service
   ./deploy.sh foreground
+
+Update and redeploy from the current branch:
+  ./deploy.sh update
 EOF
 }
 
@@ -37,10 +40,41 @@ systemctl_user() {
   systemctl --user "$@"
 }
 
+update_repo() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is required to update the repository." >&2
+    exit 1
+  fi
+  if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "$ROOT is not a git work tree." >&2
+    exit 1
+  fi
+
+  local branch upstream
+  branch="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD || true)"
+  upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+
+  git -C "$ROOT" fetch --recurse-submodules origin
+  if [[ -n "$upstream" ]]; then
+    git -C "$ROOT" pull --ff-only --recurse-submodules
+  elif [[ -n "$branch" ]]; then
+    git -C "$ROOT" pull --ff-only --recurse-submodules origin "$branch"
+  else
+    echo "Cannot update while the repository is in detached HEAD state." >&2
+    exit 1
+  fi
+  git -C "$ROOT" submodule update --init --recursive
+}
+
 cmd="${1:-deploy}"
 case "$cmd" in
   -h|--help|help)
     usage
+    ;;
+  update|upgrade)
+    shift || true
+    update_repo
+    python_bootstrap auto "$@"
     ;;
   deploy|up)
     shift || true
