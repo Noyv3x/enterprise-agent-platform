@@ -277,6 +277,7 @@ class DeploymentTests(unittest.TestCase):
 
             self.assertEqual(env["ENTERPRISE_HERMES_REPO"], str(root / "hermes-agent"))
             self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(root / "cognee"))
+            self.assertEqual(env["ENTERPRISE_FIRECRAWL_REPO"], str(root / "firecrawl"))
             self.assertEqual(env["ENTERPRISE_PLATFORM_PORT"], "9999")
 
     def test_deploy_script_exposes_one_command_entrypoint(self):

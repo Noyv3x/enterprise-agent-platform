@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+import signal
 import threading
 import urllib.parse
 from http import HTTPStatus
@@ -343,9 +344,27 @@ def run_server(config: PlatformConfig | None = None) -> None:
     host, port = server.server_address[:2]
     print(f"Enterprise Agent Platform running at http://{host}:{port}")
     print("Default bootstrap account is admin/admin unless ENTERPRISE_ADMIN_PASSWORD is set before first run.")
+    previous_handlers: dict[int, signal.Handlers] = {}
+
+    def request_shutdown(signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_shutdown)
+        except (ValueError, OSError):
+            pass
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
         server.service.close()
         server.server_close()
 

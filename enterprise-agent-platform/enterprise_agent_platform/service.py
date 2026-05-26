@@ -138,6 +138,7 @@ class EnterpriseService:
         self.ensure_bootstrap()
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
+            self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_hermes_ready(wait=False)
 
     def close(self) -> None:
@@ -731,6 +732,10 @@ class EnterpriseService:
         clean = name.strip().lower()
         if clean == "hermes":
             return {"runtime": self.runtimes.restart_hermes().to_dict()}
+        if clean == "camofox":
+            return {"runtime": self.runtimes.restart_camofox().to_dict()}
+        if clean == "firecrawl":
+            return {"runtime": self.runtimes.restart_firecrawl().to_dict()}
         if clean == "cognee":
             self.cognee.refresh_status()
             return {"runtime": self.runtimes.ensure_cognee_ready().to_dict()}
@@ -744,6 +749,10 @@ class EnterpriseService:
             if install_status.available:
                 self.runtimes.prepare_hermes()
             return {"runtime": install_status.to_dict(), "config": self.runtimes.hermes_runtime_config()}
+        if clean == "camofox":
+            return {"runtime": self.runtimes.ensure_camofox_ready(wait=True).to_dict()}
+        if clean == "firecrawl":
+            return {"runtime": self.runtimes.ensure_firecrawl_ready(wait=True).to_dict()}
         raise ServiceError(404, "runtime not found")
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:

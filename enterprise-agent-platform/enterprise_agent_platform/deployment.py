@@ -65,6 +65,7 @@ class DeploymentPaths:
     platform_dir: Path
     hermes_repo: Path
     cognee_repo: Path
+    firecrawl_repo: Path
     venv_dir: Path
     data_dir: Path
     service_dir: Path
@@ -78,6 +79,7 @@ class DeploymentPaths:
             platform_dir=clean_root / "enterprise-agent-platform",
             hermes_repo=clean_root / "hermes-agent",
             cognee_repo=clean_root / "cognee",
+            firecrawl_repo=clean_root / "firecrawl",
             venv_dir=clean_root / ".venv",
             data_dir=(data_dir or clean_root / "enterprise-agent-platform" / "data").expanduser().resolve(),
             service_dir=Path(os.getenv("XDG_CONFIG_HOME", "~/.config")).expanduser() / "systemd" / "user",
@@ -272,6 +274,8 @@ class DeploymentManager:
             public_base_url=public_base_url,
             hermes_repo=self.paths.hermes_repo,
             cognee_repo=self.paths.cognee_repo,
+            firecrawl_repo=self.paths.firecrawl_repo,
+            hermes_home=self.paths.data_dir / "runtimes" / "hermes",
         )
         service = EnterpriseService(config, autostart_runtime=False)
         try:
@@ -312,6 +316,7 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
         "ENTERPRISE_HERMES_REPO": str(paths.hermes_repo),
         "ENTERPRISE_COGNEE_REPO": str(paths.cognee_repo),
+        "ENTERPRISE_FIRECRAWL_REPO": str(paths.firecrawl_repo),
         "ENTERPRISE_PLATFORM_HOST": host,
         "ENTERPRISE_PLATFORM_PORT": str(port),
         "ENTERPRISE_PUBLIC_BASE_URL": DeploymentManager.public_url(host, port),

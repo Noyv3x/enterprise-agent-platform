@@ -42,6 +42,13 @@ class PlatformConfig:
     runtime_startup_wait_seconds: float = 8.0
     hermes_provider: str = "openai-codex"
     hermes_provider_base_url: str = ""
+    manage_camofox: bool = True
+    camofox_url: str = "http://127.0.0.1:9377"
+    camofox_command: str = ""
+    manage_firecrawl: bool = True
+    firecrawl_repo: Path | None = None
+    firecrawl_api_url: str = "http://127.0.0.1:3002"
+    firecrawl_command: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -62,6 +69,10 @@ class PlatformConfig:
     @property
     def cognee_runtime_dir(self) -> Path:
         return self.runtime_dir / "cognee"
+
+    @property
+    def firecrawl_runtime_dir(self) -> Path:
+        return self.runtime_dir / "firecrawl"
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
@@ -106,6 +117,15 @@ class PlatformConfig:
             runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
             hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "openai-codex").strip().lower() or "openai-codex",
             hermes_provider_base_url=os.getenv("ENTERPRISE_HERMES_PROVIDER_BASE_URL", "").strip().rstrip("/"),
+            manage_camofox=os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            camofox_url=os.getenv("ENTERPRISE_CAMOFOX_URL", "http://127.0.0.1:9377").strip().rstrip("/"),
+            camofox_command=os.getenv("ENTERPRISE_CAMOFOX_COMMAND", "").strip(),
+            manage_firecrawl=os.getenv("ENTERPRISE_MANAGE_FIRECRAWL", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            firecrawl_repo=Path(os.getenv("ENTERPRISE_FIRECRAWL_REPO", _default_repo_path(base, "firecrawl"))).expanduser(),
+            firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
+            firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
         )
 
 

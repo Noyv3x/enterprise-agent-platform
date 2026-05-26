@@ -117,6 +117,8 @@ HERMES_ENV_FIELDS = (
     ConfigField("GOOGLE_API_KEY", "Google API Key", "供应商密钥", secret=True),
     ConfigField("EXA_API_KEY", "Exa API Key", "工具密钥", secret=True),
     ConfigField("FIRECRAWL_API_KEY", "Firecrawl API Key", "工具密钥", secret=True),
+    ConfigField("FIRECRAWL_API_URL", "Firecrawl API URL", "工具"),
+    ConfigField("CAMOFOX_URL", "Camofox URL", "浏览器"),
     ConfigField("TERMINAL_ENV", "终端环境后端覆盖", "终端"),
     ConfigField("TERMINAL_TIMEOUT", "终端超时覆盖", "终端", "number"),
     ConfigField("TERMINAL_LIFETIME_SECONDS", "终端环境生命周期", "终端", "number"),

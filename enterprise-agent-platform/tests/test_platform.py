@@ -219,6 +219,9 @@ def make_config(tmp: Path) -> PlatformConfig:
         container_image="python:3.11-slim",
         cognee_repo=tmp / "cognee",
         hermes_repo=tmp / "hermes-agent",
+        firecrawl_repo=tmp / "firecrawl",
+        camofox_url="http://127.0.0.1:19377",
+        firecrawl_api_url="http://127.0.0.1:13002",
         hermes_home=tmp / "runtimes" / "hermes",
         runtime_startup_wait_seconds=0,
     )
@@ -240,6 +243,11 @@ def make_fake_cognee_repo(path: Path) -> None:
         "class SearchType:\n    CHUNKS = 'chunks'\n",
         encoding="utf-8",
     )
+
+
+def make_fake_firecrawl_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "docker-compose.yml").write_text("services:\n  api:\n    image: firecrawl\n", encoding="utf-8")
 
 
 def managed_python(home: Path) -> Path:
@@ -756,8 +764,10 @@ class PlatformServiceTests(unittest.TestCase):
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
             make_fake_cognee_repo(tmp / "cognee")
+            make_fake_firecrawl_repo(tmp / "firecrawl")
             runner = RecordingCommandRunner()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            config = make_config(tmp)
+            service = EnterpriseService(config, agent_client=RecordingAgent(), runtime_command_runner=runner)
             try:
                 hermes_home = service.config.managed_hermes_home
                 self.assertTrue((hermes_home / "plugins" / "enterprise_kb" / "plugin.yaml").exists())
@@ -765,9 +775,14 @@ class PlatformServiceTests(unittest.TestCase):
                 env_text = (hermes_home / ".env").read_text(encoding="utf-8")
 
                 self.assertIn("enterprise-kb", config_text)
+                self.assertIn("backend: firecrawl", config_text)
+                self.assertIn("cloud_provider: local", config_text)
+                self.assertIn("managed_persistence: true", config_text)
                 self.assertIn('API_SERVER_ENABLED="true"', env_text)
                 self.assertIn('ENTERPRISE_AGENT_TOOL_TOKEN="agent-token"', env_text)
                 self.assertIn("API_SERVER_KEY=", env_text)
+                self.assertIn(f'CAMOFOX_URL="{config.camofox_url}"', env_text)
+                self.assertIn(f'FIRECRAWL_API_URL="{config.firecrawl_api_url}"', env_text)
 
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)
@@ -775,6 +790,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["hermes"]["install_state"], "installed")
                 self.assertEqual(status["cognee"]["managed"], True)
                 self.assertEqual(status["cognee"]["state"], "prepared")
+                self.assertEqual(status["camofox"]["managed"], True)
+                self.assertEqual(status["camofox"]["url"], config.camofox_url)
+                self.assertEqual(status["firecrawl"]["managed"], True)
+                self.assertEqual(status["firecrawl"]["url"], config.firecrawl_api_url)
                 install_commands = [call["cmd"] for call in runner.calls]
                 self.assertIn([str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")], install_commands)
             finally:
@@ -802,17 +821,46 @@ class PlatformServiceTests(unittest.TestCase):
                 agent_message = service.list_messages(user, "channel", "1")[-1]
 
                 self.assertTrue(launcher.calls)
-                launch = launcher.calls[0]
+                launch = next(call for call in launcher.calls if "gateway" in call["cmd"])
                 self.assertEqual(launch["cwd"], tmp / "hermes-agent")
                 self.assertEqual(launch["cmd"][0], str(managed_python(config.managed_hermes_home / "venv")))
                 self.assertIn("gateway", launch["cmd"])
                 self.assertEqual(launch["env"]["HERMES_HOME"], str(config.managed_hermes_home))
                 self.assertEqual(launch["env"]["API_SERVER_ENABLED"], "true")
                 self.assertEqual(launch["env"]["ENTERPRISE_AGENT_TOOL_TOKEN"], "agent-token")
+                self.assertEqual(launch["env"]["CAMOFOX_URL"], config.camofox_url)
+                self.assertEqual(launch["env"]["FIRECRAWL_API_URL"], config.firecrawl_api_url)
                 self.assertTrue(agent_message["metadata"]["degraded"])
                 self.assertIn("Hermes API is not reachable", agent_message["content"])
             finally:
                 service.close()
+
+    def test_platform_manages_browser_and_firecrawl_process_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            make_fake_firecrawl_repo(tmp / "firecrawl")
+            config = replace(make_config(tmp), agent_mode="auto", runtime_startup_wait_seconds=0)
+            launcher = RecordingLauncher()
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                status = service.runtime_status(admin)
+                self.assertEqual(status["camofox"]["state"], "starting")
+                self.assertEqual(status["firecrawl"]["state"], "starting")
+                commands = [call["cmd"] for call in launcher.calls]
+                self.assertTrue(any("@askjo/camofox-browser@^1.5.2" in cmd for cmd in commands))
+                self.assertTrue(any(cmd[:3] == ["docker", "compose", "up"] for cmd in commands))
+
+                service.restart_runtime(admin, "camofox")
+                service.restart_runtime(admin, "firecrawl")
+                self.assertGreaterEqual(len([call for call in launcher.calls if "@askjo/camofox-browser@^1.5.2" in call["cmd"]]), 2)
+                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:3] == ["docker", "compose", "up"]]), 2)
+            finally:
+                service.close()
+
+            self.assertTrue(all(not process.running for process in launcher.processes))
 
     def test_first_run_installs_hermes_from_adjacent_source(self):
         with tempfile.TemporaryDirectory() as td:

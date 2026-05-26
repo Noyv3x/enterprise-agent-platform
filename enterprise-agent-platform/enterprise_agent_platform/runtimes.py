@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import re
+import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,13 @@ COGNEE_SETTING_SYSTEM_ROOT = "cognee_system_root_directory"
 COGNEE_SETTING_CACHE_ROOT = "cognee_cache_root_directory"
 COGNEE_SETTING_LOGS_DIR = "cognee_logs_dir"
 COGNEE_SETTING_SKIP_CONNECTION_TEST = "cognee_skip_connection_test"
+CAMOFOX_SETTING_MANAGED = "camofox_manage"
+CAMOFOX_SETTING_URL = "camofox_url"
+CAMOFOX_SETTING_COMMAND = "camofox_command"
+FIRECRAWL_SETTING_MANAGED = "firecrawl_manage"
+FIRECRAWL_SETTING_REPO = "firecrawl_repo"
+FIRECRAWL_SETTING_API_URL = "firecrawl_api_url"
+FIRECRAWL_SETTING_COMMAND = "firecrawl_command"
 
 DEFAULT_PROVIDER_MODELS = {
     "openai-codex": "gpt-5.3-codex",
@@ -157,21 +166,41 @@ class PlatformRuntimeManager:
         self.setting_provider = setting_provider
         self._lock = threading.RLock()
         self._hermes_process: ProcessLike | None = None
+        self._camofox_process: ProcessLike | None = None
+        self._firecrawl_process: ProcessLike | None = None
         self._hermes_last_started_at: int | None = None
+        self._camofox_last_started_at: int | None = None
+        self._firecrawl_last_started_at: int | None = None
         self._hermes_last_error = ""
         self._cognee_last_error = ""
+        self._camofox_last_error = ""
+        self._firecrawl_last_error = ""
 
     def prepare(self) -> dict[str, Any]:
         with self._lock:
             hermes = self.prepare_hermes()
             cognee = self.prepare_cognee()
-            return {"hermes": hermes.to_dict(), "cognee": cognee.to_dict()}
+            camofox = self.prepare_camofox()
+            firecrawl = self.prepare_firecrawl()
+            return {
+                "hermes": hermes.to_dict(),
+                "cognee": cognee.to_dict(),
+                "camofox": camofox.to_dict(),
+                "firecrawl": firecrawl.to_dict(),
+            }
 
     def status(self, *, refresh: bool = True) -> dict[str, Any]:
         with self._lock:
             hermes = self.hermes_status(refresh=refresh)
             cognee = self.cognee_status()
-            return {"hermes": hermes.to_dict(), "cognee": cognee.to_dict()}
+            camofox = self.camofox_status(refresh=refresh)
+            firecrawl = self.firecrawl_status(refresh=refresh)
+            return {
+                "hermes": hermes.to_dict(),
+                "cognee": cognee.to_dict(),
+                "camofox": camofox.to_dict(),
+                "firecrawl": firecrawl.to_dict(),
+            }
 
     def prepare_hermes(self) -> RuntimeStatus:
         if not self._managed_hermes_enabled():
@@ -211,6 +240,7 @@ class PlatformRuntimeManager:
         with self._lock:
             if not self._managed_hermes_enabled():
                 return self.hermes_status(refresh=False)
+            self.ensure_managed_tooling_ready(wait=False)
             prepared = self.prepare_hermes()
             if not prepared.available:
                 return prepared
@@ -231,15 +261,8 @@ class PlatformRuntimeManager:
     def stop_hermes(self) -> RuntimeStatus:
         with self._lock:
             proc = self._hermes_process
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=8)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            if proc is not None:
+                self._terminate_process(proc, timeout=8)
             self._hermes_process = None
             return self.hermes_status(refresh=False)
 
@@ -436,6 +459,16 @@ class PlatformRuntimeManager:
             "logs_dir": str(self.config.managed_hermes_home / "logs"),
             "installed": self._managed_venv_ready(),
             "oauth": self._oauth_status(),
+            "browser": {
+                "backend": "camofox",
+                "camofox_url": self._effective_camofox_url(),
+                "managed": self._managed_camofox_enabled(),
+            },
+            "web": {
+                "backend": "firecrawl",
+                "firecrawl_api_url": self._effective_firecrawl_api_url(),
+                "managed": self._managed_firecrawl_enabled(),
+            },
         }
 
     def cognee_runtime_config(self) -> dict[str, Any]:
@@ -496,8 +529,214 @@ class PlatformRuntimeManager:
     def cognee_status(self) -> RuntimeStatus:
         return self.prepare_cognee()
 
+    def prepare_camofox(self) -> RuntimeStatus:
+        if not self._managed_camofox_enabled():
+            return RuntimeStatus("camofox", False, False, "external", "managed Camofox disabled")
+        runtime_dir = self.config.runtime_dir / "camofox"
+        (runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
+        command, _cwd, detail = self._camofox_command()
+        available = bool(command)
+        self._camofox_last_error = "" if available else detail
+        return RuntimeStatus(
+            "camofox",
+            True,
+            available,
+            "prepared" if available else "missing",
+            detail=detail if available else "",
+            path=str(runtime_dir),
+            url=self._effective_camofox_url(),
+            error="" if available else detail,
+            last_started_at=self._camofox_last_started_at,
+            source=detail,
+        )
+
+    def ensure_camofox_ready(self, *, wait: bool = True) -> RuntimeStatus:
+        with self._lock:
+            if not self._managed_camofox_enabled():
+                return self.camofox_status(refresh=False)
+            prepared = self.prepare_camofox()
+            if not prepared.available:
+                return prepared
+            current = self.camofox_status(refresh=True)
+            if current.available:
+                return current
+            if self._camofox_process is None or self._camofox_process.poll() is not None:
+                self._start_camofox()
+            if wait:
+                return self._wait_for_runtime("camofox")
+            return self.camofox_status(refresh=True)
+
+    def restart_camofox(self) -> RuntimeStatus:
+        with self._lock:
+            self.stop_camofox()
+            return self.ensure_camofox_ready(wait=True)
+
+    def stop_camofox(self) -> RuntimeStatus:
+        with self._lock:
+            self._stop_process("_camofox_process")
+            return self.camofox_status(refresh=False)
+
+    def camofox_status(self, *, refresh: bool = True) -> RuntimeStatus:
+        if not self._managed_camofox_enabled():
+            return RuntimeStatus("camofox", False, False, "external", "managed Camofox disabled")
+        runtime_dir = self.config.runtime_dir / "camofox"
+        pid, process_running, returncode = self._process_state(self._camofox_process)
+        healthy = self._probe_camofox_health() if refresh else False
+        if healthy:
+            return RuntimeStatus(
+                "camofox",
+                True,
+                True,
+                "running",
+                "Camofox browser API is reachable",
+                pid=pid,
+                url=self._effective_camofox_url(),
+                path=str(runtime_dir),
+                last_started_at=self._camofox_last_started_at,
+                source=self._camofox_source_label(),
+            )
+        if process_running:
+            return RuntimeStatus(
+                "camofox",
+                True,
+                False,
+                "starting",
+                "Camofox process is running; health check is not ready yet",
+                pid=pid,
+                url=self._effective_camofox_url(),
+                path=str(runtime_dir),
+                error=self._camofox_last_error,
+                last_started_at=self._camofox_last_started_at,
+                source=self._camofox_source_label(),
+            )
+        command, _cwd, detail = self._camofox_command()
+        exited = self._process_exit_error("Camofox", returncode, runtime_dir / "logs" / "managed-camofox.log")
+        state = "error" if exited else ("prepared" if command else "missing")
+        runtime_detail = exited or ("Camofox is prepared but not running" if command else detail)
+        error = exited or (self._camofox_last_error if command else detail)
+        return RuntimeStatus(
+            "camofox",
+            True,
+            False,
+            state,
+            runtime_detail,
+            pid=pid,
+            url=self._effective_camofox_url(),
+            path=str(runtime_dir),
+            error=error,
+            last_started_at=self._camofox_last_started_at,
+            source=self._camofox_source_label(),
+        )
+
+    def prepare_firecrawl(self) -> RuntimeStatus:
+        if not self._managed_firecrawl_enabled():
+            return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
+        self.config.firecrawl_runtime_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.firecrawl_runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
+        command, cwd, detail = self._firecrawl_command()
+        available = bool(command)
+        self._firecrawl_last_error = "" if available else detail
+        return RuntimeStatus(
+            "firecrawl",
+            True,
+            available,
+            "prepared" if available else "missing",
+            detail=detail if available else "",
+            path=str(cwd or self.config.firecrawl_runtime_dir),
+            url=self._effective_firecrawl_api_url(),
+            error="" if available else detail,
+            last_started_at=self._firecrawl_last_started_at,
+            source=str(cwd or ""),
+        )
+
+    def ensure_firecrawl_ready(self, *, wait: bool = True) -> RuntimeStatus:
+        with self._lock:
+            if not self._managed_firecrawl_enabled():
+                return self.firecrawl_status(refresh=False)
+            prepared = self.prepare_firecrawl()
+            if not prepared.available:
+                return prepared
+            current = self.firecrawl_status(refresh=True)
+            if current.available:
+                return current
+            if self._firecrawl_process is None or self._firecrawl_process.poll() is not None:
+                self._start_firecrawl()
+            if wait:
+                return self._wait_for_runtime("firecrawl")
+            return self.firecrawl_status(refresh=True)
+
+    def restart_firecrawl(self) -> RuntimeStatus:
+        with self._lock:
+            self.stop_firecrawl()
+            return self.ensure_firecrawl_ready(wait=True)
+
+    def stop_firecrawl(self) -> RuntimeStatus:
+        with self._lock:
+            self._stop_process("_firecrawl_process")
+            return self.firecrawl_status(refresh=False)
+
+    def firecrawl_status(self, *, refresh: bool = True) -> RuntimeStatus:
+        if not self._managed_firecrawl_enabled():
+            return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
+        pid, process_running, returncode = self._process_state(self._firecrawl_process)
+        command, cwd, detail = self._firecrawl_command()
+        healthy = self._probe_firecrawl_health() if refresh else False
+        if healthy:
+            return RuntimeStatus(
+                "firecrawl",
+                True,
+                True,
+                "running",
+                "Self-hosted Firecrawl API is reachable",
+                pid=pid,
+                url=self._effective_firecrawl_api_url(),
+                path=str(cwd or self.config.firecrawl_runtime_dir),
+                last_started_at=self._firecrawl_last_started_at,
+                source=str(cwd or ""),
+            )
+        if process_running:
+            return RuntimeStatus(
+                "firecrawl",
+                True,
+                False,
+                "starting",
+                "Firecrawl process is running; API health check is not ready yet",
+                pid=pid,
+                url=self._effective_firecrawl_api_url(),
+                path=str(cwd or self.config.firecrawl_runtime_dir),
+                error=self._firecrawl_last_error,
+                last_started_at=self._firecrawl_last_started_at,
+                source=str(cwd or ""),
+            )
+        exited = self._process_exit_error("Firecrawl", returncode, self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log")
+        state = "error" if exited else ("prepared" if command else "missing")
+        runtime_detail = exited or ("Firecrawl is prepared but not running" if command else detail)
+        error = exited or (self._firecrawl_last_error if command else detail)
+        return RuntimeStatus(
+            "firecrawl",
+            True,
+            False,
+            state,
+            runtime_detail,
+            pid=pid,
+            url=self._effective_firecrawl_api_url(),
+            path=str(cwd or self.config.firecrawl_runtime_dir),
+            error=error,
+            last_started_at=self._firecrawl_last_started_at,
+            source=str(cwd or ""),
+        )
+
+    def ensure_managed_tooling_ready(self, *, wait: bool = False) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "camofox": self.ensure_camofox_ready(wait=wait).to_dict(),
+                "firecrawl": self.ensure_firecrawl_ready(wait=wait).to_dict(),
+            }
+
     def close(self) -> None:
         self.stop_hermes()
+        self.stop_camofox()
+        self.stop_firecrawl()
 
     def _start_hermes(self) -> None:
         command, cwd, detail = self._hermes_command()
@@ -514,6 +753,94 @@ class PlatformRuntimeManager:
             self._hermes_last_error = str(exc)
             self._hermes_process = None
 
+    def _start_camofox(self) -> None:
+        command, cwd, detail = self._camofox_command()
+        if not command:
+            self._camofox_last_error = detail
+            return
+        env = os.environ.copy()
+        env["CAMOFOX_PORT"] = str(urllib.parse.urlparse(self._effective_camofox_url()).port or 9377)
+        log_path = self.config.runtime_dir / "camofox" / "logs" / "managed-camofox.log"
+        try:
+            self._camofox_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
+            self._camofox_last_started_at = now_ts()
+            self._camofox_last_error = ""
+        except Exception as exc:
+            self._camofox_last_error = str(exc)
+            self._camofox_process = None
+
+    def _start_firecrawl(self) -> None:
+        command, cwd, detail = self._firecrawl_command()
+        if not command:
+            self._firecrawl_last_error = detail
+            return
+        env = os.environ.copy()
+        env.update({
+            "USE_DB_AUTHENTICATION": "false",
+            "HOST": "0.0.0.0",
+            "PORT": str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002),
+        })
+        log_path = self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log"
+        try:
+            self._firecrawl_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
+            self._firecrawl_last_started_at = now_ts()
+            self._firecrawl_last_error = ""
+        except Exception as exc:
+            self._firecrawl_last_error = str(exc)
+            self._firecrawl_process = None
+
+    def _stop_process(self, attr: str) -> None:
+        proc = getattr(self, attr)
+        if proc is not None:
+            self._terminate_process(proc, timeout=12)
+        setattr(self, attr, None)
+
+    @staticmethod
+    def _terminate_process(proc: ProcessLike, *, timeout: float) -> None:
+        if proc.poll() is not None:
+            return
+        signaled_group = False
+        if os.name != "nt" and isinstance(proc, subprocess.Popen):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                signaled_group = True
+            except Exception:
+                signaled_group = False
+        if not signaled_group:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except Exception:
+            pass
+        if os.name != "nt" and signaled_group:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=3)
+                return
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _process_state(proc: ProcessLike | None) -> tuple[int | None, bool, int | None]:
+        if proc is None:
+            return None, False, None
+        returncode = proc.poll()
+        return proc.pid, returncode is None, returncode
+
+    @staticmethod
+    def _process_exit_error(name: str, returncode: int | None, log_path: Path) -> str:
+        if returncode is None:
+            return ""
+        return f"{name} process exited with code {returncode}; see {log_path}"
+
     def _wait_for_hermes(self) -> RuntimeStatus:
         deadline = time.monotonic() + self._effective_startup_wait_seconds()
         while time.monotonic() < deadline:
@@ -524,6 +851,20 @@ class PlatformRuntimeManager:
                 return status
             time.sleep(0.25)
         return self.hermes_status(refresh=True)
+
+    def _wait_for_runtime(self, name: str) -> RuntimeStatus:
+        deadline = time.monotonic() + self._effective_startup_wait_seconds()
+        status_fn = self.camofox_status if name == "camofox" else self.firecrawl_status
+        process_attr = "_camofox_process" if name == "camofox" else "_firecrawl_process"
+        while time.monotonic() < deadline:
+            status = status_fn(refresh=True)
+            if status.available:
+                return status
+            proc = getattr(self, process_attr)
+            if proc is not None and proc.poll() is not None:
+                return status
+            time.sleep(0.25)
+        return status_fn(refresh=True)
 
     def _install_enterprise_plugin(self, home: Path) -> None:
         source = Path(__file__).resolve().parents[1] / "hermes_plugin" / HERMES_PLUGIN_DIR
@@ -553,6 +894,7 @@ class PlatformRuntimeManager:
         enabled_set.add(HERMES_PLUGIN_KEY)
         plugins["enabled"] = sorted(enabled_set)
         self._apply_managed_model_config(data)
+        self._apply_managed_tool_config(data)
         _write_yaml_mapping(path, data)
 
     def _apply_managed_model_config(self, data: dict[str, Any]) -> None:
@@ -588,6 +930,30 @@ class PlatformRuntimeManager:
                 model_config["base_url"] = base_url
             else:
                 model_config.pop("base_url", None)
+
+    @staticmethod
+    def _mapping_at(data: dict[str, Any], key: str) -> dict[str, Any]:
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+        value = {}
+        data[key] = value
+        return value
+
+    def _apply_managed_tool_config(self, data: dict[str, Any]) -> None:
+        web = self._mapping_at(data, "web")
+        web["backend"] = "firecrawl"
+        web["search_backend"] = "firecrawl"
+        web["extract_backend"] = "firecrawl"
+        web["crawl_backend"] = "firecrawl"
+
+        browser = self._mapping_at(data, "browser")
+        browser["cloud_provider"] = "local"
+        camofox = browser.get("camofox")
+        if not isinstance(camofox, dict):
+            camofox = {}
+            browser["camofox"] = camofox
+        camofox["managed_persistence"] = True
 
     def _write_hermes_env(self, home: Path) -> None:
         env_values = self._hermes_child_values()
@@ -706,6 +1072,8 @@ class PlatformRuntimeManager:
             "ENTERPRISE_AGENT_TOOL_TOKEN": self.secret_provider("agent_tool_token") or "",
             "HERMES_ACCEPT_HOOKS": "1",
             "COGNEE_SKIP_CONNECTION_TEST": "true",
+            "CAMOFOX_URL": self._effective_camofox_url(),
+            "FIRECRAWL_API_URL": self._effective_firecrawl_api_url(),
         }
         provider = self._effective_hermes_provider()
         provider_base_url = self._effective_hermes_provider_base_url(provider)
@@ -730,6 +1098,31 @@ class PlatformRuntimeManager:
             )
         return ([], None, f"Hermes is not installed from source: {repo}")
 
+    def _camofox_command(self) -> tuple[list[str], Path | None, str]:
+        configured = self._effective_camofox_command()
+        if configured:
+            return (shlex.split(configured), None, configured)
+        return (
+            [
+                "npx",
+                "-y",
+                "@askjo/camofox-browser@^1.5.2",
+            ],
+            None,
+            "npm package: @askjo/camofox-browser",
+        )
+
+    def _firecrawl_command(self) -> tuple[list[str], Path | None, str]:
+        configured = self._effective_firecrawl_command()
+        repo = self._effective_firecrawl_repo()
+        if configured:
+            return (shlex.split(configured), repo if repo.exists() else None, configured)
+        if not repo.exists():
+            return ([], repo, f"Firecrawl source not found: {repo}")
+        if not any((repo / name).exists() for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")):
+            return ([], repo, f"Firecrawl repository is missing a Docker Compose file: {repo}")
+        return (["docker", "compose", "up"], repo, f"self-hosted Firecrawl compose stack: {repo}")
+
     def _probe_hermes_health(self) -> bool:
         try:
             request = urllib.request.Request(self._hermes_health_url(), method="GET")
@@ -737,6 +1130,30 @@ class PlatformRuntimeManager:
                 return 200 <= response.status < 300
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return False
+
+    def _probe_camofox_health(self) -> bool:
+        return self._probe_http(self._effective_camofox_url(), ("/health",))
+
+    def _probe_firecrawl_health(self) -> bool:
+        return self._probe_http(self._effective_firecrawl_api_url(), ("/health", "/v1/health", "/"))
+
+    @staticmethod
+    def _probe_http(base_url: str, paths: tuple[str, ...]) -> bool:
+        base = base_url.rstrip("/")
+        if not base:
+            return False
+        for path in paths:
+            try:
+                request = urllib.request.Request(f"{base}{path}", method="GET")
+                with urllib.request.urlopen(request, timeout=0.8) as response:
+                    if 200 <= response.status < 500:
+                        return True
+            except urllib.error.HTTPError as exc:
+                if 400 <= exc.code < 500:
+                    return True
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                continue
+        return False
 
     def _hermes_health_url(self) -> str:
         parsed = urllib.parse.urlparse(self._effective_hermes_api_url())
@@ -764,6 +1181,18 @@ class PlatformRuntimeManager:
         value = self._runtime_setting(COGNEE_SETTING_MANAGED)
         if value is None:
             return self.config.manage_cognee
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _managed_camofox_enabled(self) -> bool:
+        value = self._runtime_setting(CAMOFOX_SETTING_MANAGED)
+        if value is None:
+            return self.config.manage_camofox
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _managed_firecrawl_enabled(self) -> bool:
+        value = self._runtime_setting(FIRECRAWL_SETTING_MANAGED)
+        if value is None:
+            return self.config.manage_firecrawl
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _effective_hermes_repo(self) -> Path:
@@ -808,6 +1237,26 @@ class PlatformRuntimeManager:
             return max(1.0, float(raw))
         except ValueError:
             return self.config.hermes_timeout_seconds
+
+    def _effective_camofox_url(self) -> str:
+        return (self._runtime_setting(CAMOFOX_SETTING_URL) or self.config.camofox_url or "http://127.0.0.1:9377").strip().rstrip("/")
+
+    def _effective_camofox_command(self) -> str:
+        return self._runtime_setting(CAMOFOX_SETTING_COMMAND) or self.config.camofox_command
+
+    def _effective_firecrawl_repo(self) -> Path:
+        value = self._runtime_setting(FIRECRAWL_SETTING_REPO)
+        if value:
+            return Path(value).expanduser()
+        if self.config.firecrawl_repo is not None:
+            return self.config.firecrawl_repo
+        return self.config.data_dir.parent / "firecrawl"
+
+    def _effective_firecrawl_api_url(self) -> str:
+        return (self._runtime_setting(FIRECRAWL_SETTING_API_URL) or self.config.firecrawl_api_url or "http://127.0.0.1:3002").strip().rstrip("/")
+
+    def _effective_firecrawl_command(self) -> str:
+        return self._runtime_setting(FIRECRAWL_SETTING_COMMAND) or self.config.firecrawl_command
 
     def _effective_cognee_repo(self) -> Path:
         value = self._runtime_setting(COGNEE_SETTING_REPO)
@@ -910,6 +1359,10 @@ class PlatformRuntimeManager:
 
     def _hermes_source_label(self) -> str:
         return str(self._effective_hermes_repo())
+
+    def _camofox_source_label(self) -> str:
+        command, _cwd, detail = self._camofox_command()
+        return detail if command else ""
 
     def _oauth_status(self) -> dict[str, dict[str, Any]]:
         path = self.config.managed_hermes_home / "auth.json"

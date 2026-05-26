@@ -1050,12 +1050,12 @@ function renderRuntimeSettings() {
                   await loadSettings();
                 });
               },
-            }, [icon("refresh", { size: 14 }), h("span", { text: runtime.name === "hermes" ? "重启" : "刷新" })]),
+            }, [icon("refresh", { size: 14 }), h("span", { text: runtime.managed && runtime.name !== "cognee" ? "重启" : "刷新" })]),
           ]),
         ]))
     : [h("div", { class: "muted", text: "正在读取运行时状态…" })];
   return h("section", { class: "card" }, [
-    cardHead("底层基座", "server", { desc: "平台托管的 Hermes / Cognee 运行时健康状态。" }),
+    cardHead("底层基座", "server", { desc: "平台托管的 Hermes / Cognee / Camofox / Firecrawl 运行时健康状态。" }),
     h("div", { class: "list" }, rows),
   ]);
 }
