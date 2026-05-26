@@ -10,6 +10,21 @@
 
 ## 快速开始
 
+先拉取仓库和 submodule：
+
+```bash
+git clone --recurse-submodules https://github.com/Noyv3x/enterprise-agent-platform.git
+cd enterprise-agent-platform
+```
+
+如果已经拉取过仓库但没有初始化 submodule，可以执行：
+
+```bash
+git submodule update --init --recursive
+```
+
+然后启动平台：
+
 ```bash
 ./deploy.sh
 ```

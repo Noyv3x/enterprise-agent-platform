@@ -13,8 +13,22 @@
 
 ## 运行
 
+从空目录开始时，先拉取顶层仓库和 submodule：
+
 ```bash
-cd ..
+git clone --recurse-submodules https://github.com/Noyv3x/enterprise-agent-platform.git
+cd enterprise-agent-platform
+```
+
+如果已经拉取过仓库但没有初始化 submodule，可以执行：
+
+```bash
+git submodule update --init --recursive
+```
+
+然后从顶层仓库启动平台：
+
+```bash
 ./deploy.sh
 ```
 
