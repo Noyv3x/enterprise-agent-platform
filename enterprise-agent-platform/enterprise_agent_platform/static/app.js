@@ -12,6 +12,10 @@ const state = {
   activeChannelId: null,
   messages: [],
   privateMessages: [],
+  pendingMessages: [],
+  drafts: {},
+  agentStatuses: { channels: {}, private: null },
+  typingUsers: [],
   documents: [],
   selectedDocument: null,
   users: [],
@@ -32,6 +36,10 @@ const state = {
 
 const app = document.getElementById("app");
 const toastStack = document.getElementById("toast-stack");
+let pollTimer = null;
+let pollInFlight = false;
+let localMessageSeq = 0;
+const typingState = { key: null, active: false, lastSent: 0, stopTimer: null };
 
 /* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
@@ -173,8 +181,9 @@ function render() {
 function afterRender() {
   const msgs = app.querySelector(".messages");
   if (msgs) msgs.scrollTop = msgs.scrollHeight;
+  const ta = app.querySelector(".composer textarea");
+  if (ta) autoGrow(ta, { animate: false });
   if (state._focusComposer) {
-    const ta = app.querySelector(".composer textarea");
     if (ta) { ta.focus(); autoGrow(ta); }
     state._focusComposer = false;
   }
@@ -236,6 +245,7 @@ function renderLogin() {
         });
         state.user = result.user;
         await loadInitial();
+        startPolling();
       });
     },
   }, [
@@ -369,11 +379,15 @@ function renderTopbar() {
 }
 
 function topbarInfo() {
-  if (state.activeView === "private") return { title: "私人 Agent", icon: "bot", sub: "仅你可见的私有助手会话" };
+  if (state.activeView === "private") {
+    const active = agentStatusText(agentStatusFor("private"));
+    return { title: "私人 Agent", icon: "bot", sub: active || "仅你可见的私有助手会话" };
+  }
   if (state.activeView === "knowledge") return { title: "企业知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
   if (state.activeView === "admin") return { title: "管理面板", icon: "shield", sub: "企业账户、权限组与模型策略" };
   const ch = activeChannel();
-  return { title: ch?.name || "频道", hash: true, sub: ch ? `${state.messages.length} 条消息` : "选择或创建一个频道" };
+  const active = agentStatusText(agentStatusFor("channel"));
+  return { title: ch?.name || "频道", hash: true, sub: ch ? (active || `${state.messages.length} 条消息`) : "选择或创建一个频道" };
 }
 
 function renderContent() {
@@ -392,15 +406,23 @@ function renderChat(mode) {
   const messages = mode === "private" ? state.privateMessages : state.messages;
   const noChannel = mode === "channel" && !state.activeChannelId;
   const canChat = hasPermission("chat") && (mode !== "private" || hasPermission("private_agent"));
+  const scopeId = scopeIdFor(mode);
+  const draftKey = composerDraftKey(mode, scopeId);
 
   const input = h("textarea", {
     rows: 1,
-    disabled: !canChat,
-    placeholder: canChat
+    disabled: noChannel || !canChat,
+    placeholder: noChannel
+      ? "选择频道后发送消息"
+      : canChat
       ? (mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息…`)
       : "当前权限组只能查看内容",
     "aria-label": "消息输入框",
-    oninput: (e) => autoGrow(e.target),
+    oninput: (e) => {
+      state.drafts[draftKey] = e.target.value;
+      autoGrow(e.target);
+      notifyTyping(mode, scopeId, e.target.value.trim().length > 0);
+    },
     onkeydown: (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
@@ -408,37 +430,31 @@ function renderChat(mode) {
       }
     },
   });
+  input.value = state.drafts[draftKey] || "";
 
   const submit = async () => {
-    const content = input.value.trim();
-    if (!content || state.busy || noChannel || !canChat) return;
+    const content = (state.drafts[draftKey] || input.value).trim();
+    if (!content || noChannel || !canChat) return;
     input.value = "";
+    state.drafts[draftKey] = "";
     autoGrow(input);
-    state.sending = true;
     state._focusComposer = true;
-    await withBusy(async () => {
-      if (mode === "private") {
-        await api("/api/private-agent/messages", { method: "POST", body: JSON.stringify({ content }) });
-        await loadPrivateMessages();
-      } else {
-        await api(`/api/channels/${state.activeChannelId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
-        await loadChannelMessages();
-      }
-    });
-    state.sending = false;
-    render();
+    notifyTyping(mode, scopeId, false);
+    await postChatMessage(mode, scopeId, content);
   };
 
   let body;
   if (noChannel) {
     body = emptyState("hash", "还没有频道", "在左侧创建一个频道，开始与团队和 Agent 协作。");
-  } else if (!messages.length && !state.sending) {
+  } else if (!messages.length && !isAgentActive(agentStatusFor(mode))) {
     body = mode === "private"
       ? emptyState("bot", "开启你的私人 Agent", "这是仅你可见的助手。发送第一条消息试试看。")
       : emptyState("message", "暂无消息", "成为第一个在该频道发言的人。Agent 会在此回应。");
   } else {
     const items = messages.map(renderMessage);
-    if (state.sending) items.push(renderTyping());
+    const status = agentStatusFor(mode);
+    if (isAgentActive(status)) items.push(renderAgentActivity(status));
+    if (mode === "channel" && state.typingUsers.length) items.push(renderTypingUsers(state.typingUsers));
     body = h("div", { class: "messages__inner" }, items);
   }
 
@@ -448,8 +464,8 @@ function renderChat(mode) {
       h("div", { class: "composer__wrap" }, [
         h("div", { class: "composer__field" }, [
           input,
-          h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: state.busy || noChannel || !canChat }, [
-            icon(state.busy ? "loader" : "send", { size: 18, cls: state.busy ? "spin" : "" }),
+          h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: noChannel || !canChat }, [
+            icon("send", { size: 18 }),
           ]),
         ]),
         h("div", { class: "composer__hint" }, [
@@ -467,11 +483,13 @@ function renderMessage(message) {
   const avatar = isUser
     ? h("div", { class: "msg__avatar", text: initials(message.username || "你") })
     : h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]);
-  return h("article", { class: `msg msg--${message.author_type}` }, [
+  const pending = message.metadata?.local_pending;
+  return h("article", { class: `msg msg--${message.author_type} ${pending ? "msg--pending" : ""}` }, [
     avatar,
     h("div", { class: "msg__bubble" }, [
       h("div", { class: "msg__meta" }, [
         h("span", { class: "msg__name", text: message.username || (isUser ? "你" : "Agent") }),
+        pending ? h("span", { class: "msg__pending", text: "发送中" }) : null,
         h("span", { class: "msg__time", text: formatTime(message.created_at) }),
       ]),
       h("div", { class: "msg__body", text: message.content }),
@@ -483,9 +501,23 @@ function renderMessage(message) {
   ]);
 }
 
-function renderTyping() {
-  return h("article", { class: "msg msg--agent" }, [
+function renderAgentActivity(status) {
+  const text = agentStatusText(status) || "Agent 正在回复";
+  const waiting = status?.state === "replying" ? status.queued_count : Math.max(0, (status?.queued_count || 0) - 1);
+  return h("article", { class: "msg msg--agent msg--activity" }, [
     h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
+    h("div", { class: "agent-status" }, [
+      h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
+      h("span", { text }),
+      waiting > 0 ? h("span", { class: "agent-status__queue", text: `另有 ${waiting} 条等待` }) : null,
+    ]),
+  ]);
+}
+
+function renderTypingUsers(users) {
+  const names = users.map((item) => item.username).filter(Boolean).slice(0, 3).join("、");
+  return h("div", { class: "typing-line" }, [
+    h("span", { text: `${names || "有人"} 正在输入` }),
     h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
   ]);
 }
@@ -974,6 +1006,116 @@ function formatTimestamp(value) {
   return date.toLocaleString();
 }
 function activeChannel() { return state.channels.find((c) => c.id === state.activeChannelId); }
+function scopeTypeFor(mode) { return mode === "private" ? "private" : "channel"; }
+function scopeIdFor(mode, channelId = state.activeChannelId) {
+  return mode === "private" ? String(state.user?.id || "") : String(channelId || "");
+}
+function composerDraftKey(mode, scopeId = scopeIdFor(mode)) {
+  return `${scopeTypeFor(mode)}:${scopeId}`;
+}
+function agentStatusFor(mode, channelId = state.activeChannelId) {
+  if (mode === "private") return state.agentStatuses.private;
+  return state.agentStatuses.channels[String(channelId || "")] || null;
+}
+function setAgentStatus(mode, scopeId, status) {
+  if (!status) return;
+  if (mode === "private") state.agentStatuses.private = status;
+  else state.agentStatuses.channels[String(scopeId)] = status;
+}
+function isAgentActive(status) {
+  return status && (status.state === "queued" || status.state === "replying");
+}
+function agentStatusText(status) {
+  if (!isAgentActive(status)) return "";
+  const target = status.replying_to?.username || "用户";
+  return status.state === "queued" ? `Agent 准备回复 ${target}` : `Agent 正在回复 ${target}`;
+}
+function mergePendingMessages(mode, scopeId, messages) {
+  const pending = state.pendingMessages.filter((message) => message.scope_type === scopeTypeFor(mode) && message.scope_id === String(scopeId));
+  return [...messages, ...pending];
+}
+function appendOptimisticMessage(mode, scopeId, content) {
+  const message = {
+    id: `tmp-${++localMessageSeq}`,
+    scope_type: scopeTypeFor(mode),
+    scope_id: String(scopeId),
+    author_type: "user",
+    user_id: state.user?.id || null,
+    username: state.user?.display_name || state.user?.username || "你",
+    content,
+    metadata: { local_pending: true },
+    created_at: Math.floor(Date.now() / 1000),
+  };
+  state.pendingMessages.push(message);
+  if (mode === "private") state.privateMessages = [...state.privateMessages, message];
+  else if (String(state.activeChannelId) === String(scopeId)) state.messages = [...state.messages, message];
+  return message;
+}
+function removeLocalMessage(list, id) {
+  return list.filter((message) => message.id !== id);
+}
+function replaceOptimisticMessage(mode, scopeId, tempId, savedMessage) {
+  state.pendingMessages = removeLocalMessage(state.pendingMessages, tempId);
+  const apply = (messages) => {
+    let next = removeLocalMessage(messages, tempId);
+    if (savedMessage && !next.some((message) => message.id === savedMessage.id)) next = [...next, savedMessage];
+    return next;
+  };
+  if (mode === "private") state.privateMessages = apply(state.privateMessages);
+  else if (String(state.activeChannelId) === String(scopeId)) state.messages = apply(state.messages);
+}
+function removeOptimisticMessage(mode, scopeId, tempId) {
+  state.pendingMessages = removeLocalMessage(state.pendingMessages, tempId);
+  if (mode === "private") state.privateMessages = removeLocalMessage(state.privateMessages, tempId);
+  else if (String(state.activeChannelId) === String(scopeId)) state.messages = removeLocalMessage(state.messages, tempId);
+}
+async function postChatMessage(mode, scopeId, content) {
+  const pending = appendOptimisticMessage(mode, scopeId, content);
+  render();
+  try {
+    const result = mode === "private"
+      ? await api("/api/private-agent/messages", { method: "POST", body: JSON.stringify({ content }) })
+      : await api(`/api/channels/${scopeId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
+    replaceOptimisticMessage(mode, scopeId, pending.id, result.user_message);
+    setAgentStatus(mode, scopeId, result.agent_status);
+    await refreshActiveChat({ renderAfter: false });
+  } catch (error) {
+    removeOptimisticMessage(mode, scopeId, pending.id);
+    const message = error.message || String(error);
+    state.error = message;
+    toast(message, { type: "error", title: "发送失败" });
+  } finally {
+    state._focusComposer = true;
+    render();
+  }
+}
+function notifyTyping(mode, scopeId, isTyping) {
+  if (mode !== "channel" || !scopeId) return;
+  const key = `channel:${scopeId}`;
+  if (typingState.stopTimer) {
+    clearTimeout(typingState.stopTimer);
+    typingState.stopTimer = null;
+  }
+  if (!isTyping) {
+    sendTypingState(key, false);
+    return;
+  }
+  const now = Date.now();
+  if (typingState.key !== key || !typingState.active || now - typingState.lastSent > 1800) {
+    sendTypingState(key, true);
+  }
+  typingState.stopTimer = setTimeout(() => sendTypingState(key, false), 3500);
+}
+function sendTypingState(key, isTyping) {
+  const channelId = key.replace(/^channel:/, "");
+  typingState.key = key;
+  typingState.active = isTyping;
+  typingState.lastSent = Date.now();
+  api(`/api/channels/${channelId}/typing`, {
+    method: "POST",
+    body: JSON.stringify({ typing: isTyping }),
+  }).catch(() => {});
+}
 
 /* ---------------------------------------------------------------- loads */
 async function loadInitial() {
@@ -987,12 +1129,18 @@ async function loadChannels() {
 }
 async function loadChannelMessages() {
   if (!state.activeChannelId) return;
-  const result = await api(`/api/channels/${state.activeChannelId}/messages`);
-  state.messages = result.messages;
+  const channelId = String(state.activeChannelId);
+  const result = await api(`/api/channels/${channelId}/messages`);
+  if (String(state.activeChannelId) !== channelId) return;
+  state.messages = mergePendingMessages("channel", channelId, result.messages || []);
+  setAgentStatus("channel", channelId, result.agent_status);
+  state.typingUsers = result.typing || [];
 }
 async function loadPrivateMessages() {
   const result = await api("/api/private-agent/messages");
-  state.privateMessages = result.messages;
+  const scopeId = scopeIdFor("private");
+  state.privateMessages = mergePendingMessages("private", scopeId, result.messages || []);
+  setAgentStatus("private", scopeId, result.agent_status);
 }
 async function loadDocuments() {
   const result = await api("/api/knowledge/documents");
@@ -1015,6 +1163,38 @@ async function loadRuntime() { state.runtimes = await api("/api/system/runtime")
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
 async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]); }
 async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings()]); }
+async function refreshActiveChat({ renderAfter = true } = {}) {
+  if (!state.user || pollInFlight) return;
+  const keepFocus = !!app.querySelector(".composer textarea:focus");
+  pollInFlight = true;
+  try {
+    if (state.activeView === "channel" && state.activeChannelId) await loadChannelMessages();
+    else if (state.activeView === "private") await loadPrivateMessages();
+    else return;
+    if (renderAfter) {
+      if (keepFocus) state._focusComposer = true;
+      render();
+    }
+  } catch (_) {
+    // Polling is best-effort; explicit user actions surface their own errors.
+  } finally {
+    pollInFlight = false;
+  }
+}
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => refreshActiveChat(), 1500);
+}
+function stopPolling() {
+  if (!pollTimer) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+  if (typingState.stopTimer) {
+    clearTimeout(typingState.stopTimer);
+    typingState.stopTimer = null;
+  }
+  typingState.active = false;
+}
 
 /* ----------------------------------------------------------------- oauth */
 async function startOAuthVerification(providerId) {
@@ -1050,8 +1230,11 @@ function updateOAuthState(providerId, result) {
 /* ---------------------------------------------------------------- session */
 async function logout() {
   await api("/api/auth/logout", { method: "POST" }).catch(() => {});
+  stopPolling();
   state.user = null;
   state.sidebarOpen = false;
+  state.pendingMessages = [];
+  state.typingUsers = [];
   render();
 }
 
@@ -1077,8 +1260,10 @@ async function boot() {
     state.user = result.user;
     state._focusComposer = true;
     await loadInitial();
+    startPolling();
   } catch (_) {
     state.user = null;
+    stopPolling();
   }
   render();
 }

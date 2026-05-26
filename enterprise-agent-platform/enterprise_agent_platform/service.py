@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import threading
+import time
 import urllib.parse
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Deque
 
 from .auth import TokenSigner, hash_password, verify_password
 from .cognee_bridge import CogneeBridge
@@ -117,12 +120,23 @@ class EnterpriseService:
         self.containers = ContainerManager(config, self.db)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
         self.oauth_flows = OAuthFlowManager(oauth_http_client)
+        self._conversation_lock = threading.RLock()
+        self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
+        self._agent_workers: dict[str, threading.Thread] = {}
+        self._agent_status: dict[str, dict[str, Any]] = {}
+        self._typing: dict[str, dict[int, dict[str, Any]]] = {}
+        self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
             self.runtimes.ensure_hermes_ready(wait=False)
 
     def close(self) -> None:
+        with self._conversation_lock:
+            self._closed = True
+            workers = list(self._agent_workers.values())
+        for worker in workers:
+            worker.join(timeout=2)
         self.runtimes.close()
         self.db.close()
 
@@ -374,21 +388,39 @@ class EnterpriseService:
             content=content,
             metadata={"generation": generation},
         )
-        context = self._recent_context("channel", scope_id, content)
-        suggestions = self.knowledge.suggest(context)
+        status = self._enqueue_agent_reply(
+            {
+                "scope_type": "channel",
+                "scope_id": scope_id,
+                "channel": channel,
+                "actor": dict(actor),
+                "content": content,
+                "generation": generation,
+                "user_message": user_msg,
+            }
+        )
+        return {"user_message": user_msg, "agent_message": None, "agent_status": status}
+
+    def _send_channel_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
+        scope_id = str(task["scope_id"])
+        channel = task["channel"]
+        content = str(task["content"])
+        generation = task["generation"]
+        user_msg = task["user_message"]
+        suggestions = self.knowledge.suggest(self._recent_context_before("channel", scope_id, content, int(user_msg["id"])))
         system_prompt = self._channel_system_prompt(channel, suggestions)
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=content,
-            history=self._agent_history("channel", scope_id),
-            session_id=f"enterprise-channel-{channel_id}-main-agent",
-            session_key=f"channel:{channel_id}:main-agent",
+            history=self._agent_history_before("channel", scope_id, int(user_msg["id"])),
+            session_id=f"enterprise-channel-{scope_id}-main-agent",
+            session_key=f"channel:{scope_id}:main-agent",
             metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions]},
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
-        agent_msg = self._append_message(
+        return self._append_message(
             scope_type="channel",
             scope_id=scope_id,
             author_type="agent",
@@ -400,9 +432,9 @@ class EnterpriseService:
                 "degraded": result.degraded,
                 "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "reply_to": self._reply_target(task),
             },
         )
-        return {"user_message": user_msg, "agent_message": agent_msg}
 
     def send_private_message(self, actor: dict[str, Any], content: str) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
@@ -410,11 +442,6 @@ class EnterpriseService:
         if not content:
             raise ServiceError(400, "message content is required")
         generation = self.account_generation_config(actor)
-        container = self.containers.ensure_private_container(
-            user_id=actor["id"],
-            username=actor["username"],
-            secrets_env=self.model_secret_env(),
-        )
         scope_id = str(actor["id"])
         user_msg = self._append_message(
             scope_type="private",
@@ -423,23 +450,52 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={"container": container.to_dict(), "generation": generation},
+            metadata={"generation": generation},
         )
-        context = self._recent_context("private", scope_id, content)
-        suggestions = self.knowledge.suggest(context)
-        system_prompt = self._private_system_prompt(actor, container.to_dict(), suggestions)
+        current_container = self.containers.get_private_container(actor["id"])
+        status = self._enqueue_agent_reply(
+            {
+                "scope_type": "private",
+                "scope_id": scope_id,
+                "actor": dict(actor),
+                "content": content,
+                "generation": generation,
+                "user_message": user_msg,
+            }
+        )
+        return {
+            "user_message": user_msg,
+            "agent_message": None,
+            "agent_status": status,
+            "container": current_container.to_dict() if current_container else None,
+        }
+
+    def _send_private_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
+        actor = task["actor"]
+        content = str(task["content"])
+        generation = task["generation"]
+        scope_id = str(task["scope_id"])
+        user_msg = task["user_message"]
+        container = self.containers.ensure_private_container(
+            user_id=actor["id"],
+            username=actor["username"],
+            secrets_env=self.model_secret_env(),
+        )
+        container_data = container.to_dict()
+        suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, content, int(user_msg["id"])))
+        system_prompt = self._private_system_prompt(actor, container_data, suggestions)
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=content,
-            history=self._agent_history("private", scope_id),
+            history=self._agent_history_before("private", scope_id, int(user_msg["id"])),
             session_id=container.session_id,
             session_key=f"private:{actor['id']}",
-            metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions], "container": container.to_dict()},
+            metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions], "container": container_data},
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
-        agent_msg = self._append_message(
+        return self._append_message(
             scope_type="private",
             scope_id=scope_id,
             author_type="agent",
@@ -449,17 +505,21 @@ class EnterpriseService:
             metadata={
                 "session_id": result.session_id,
                 "degraded": result.degraded,
-                "container": container.to_dict(),
+                "container": container_data,
                 "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "reply_to": self._reply_target(task),
             },
         )
-        return {"user_message": user_msg, "agent_message": agent_msg, "container": container.to_dict()}
 
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
         container = self.containers.get_private_container(actor["id"])
-        return {"container": container.to_dict() if container else None, "session_id": f"enterprise-private-u{actor['id']}"}
+        return {
+            "container": container.to_dict() if container else None,
+            "session_id": f"enterprise-private-u{actor['id']}",
+            "agent_status": self.agent_status(actor, "private", str(actor["id"])),
+        }
 
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -771,6 +831,201 @@ class EnterpriseService:
         expected = self.get_setting("agent_tool_token") or self.config.agent_tool_token
         return bool(token and expected and secrets.compare_digest(token, expected))
 
+    def agent_status(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+            return self._copy_status(status)
+
+    def update_typing(self, actor: dict[str, Any], scope_type: str, scope_id: str, typing: bool) -> dict[str, Any]:
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        if scope_type == "channel":
+            require_permission(actor, PERMISSION_CHAT)
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            users = self._typing.setdefault(key, {})
+            if typing:
+                users[int(actor["id"])] = {
+                    "user_id": int(actor["id"]),
+                    "username": actor.get("display_name") or actor.get("username") or "User",
+                    "updated_at": now_ts(),
+                    "expires_at": time.time() + 5,
+                }
+            else:
+                users.pop(int(actor["id"]), None)
+            return {"typing": self._typing_users_locked(key, exclude_user_id=int(actor["id"]))}
+
+    def typing_users(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> list[dict[str, Any]]:
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            return self._typing_users_locked(key, exclude_user_id=int(actor["id"]))
+
+    def wait_for_agent_idle(self, scope_type: str, scope_id: str, timeout: float = 5) -> dict[str, Any]:
+        key = self._conversation_key(scope_type, str(scope_id))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._conversation_lock:
+                worker = self._agent_workers.get(key)
+                status = self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            if status["state"] == "idle" and (worker is None or not worker.is_alive()):
+                return status
+            if worker is not None:
+                worker.join(timeout=0.05)
+            else:
+                time.sleep(0.05)
+        with self._conversation_lock:
+            return self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+
+    def _enqueue_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
+        scope_type = str(task["scope_type"])
+        scope_id = str(task["scope_id"])
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            if self._closed:
+                raise ServiceError(503, "service is shutting down")
+            queue = self._agent_queues.setdefault(key, deque())
+            queue.append(task)
+            status = self._agent_status.get(key)
+            if not status or status.get("state") == "idle":
+                status = self._status_for_task(task, "queued", queued_count=len(queue))
+            else:
+                status = dict(status)
+                status["queued_count"] = len(queue)
+                status["updated_at"] = now_ts()
+            self._agent_status[key] = status
+
+            worker = self._agent_workers.get(key)
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(target=self._agent_worker, args=(key,), name=f"agent-reply-{key}", daemon=True)
+                self._agent_workers[key] = worker
+                worker.start()
+            return self._copy_status(status)
+
+    def _agent_worker(self, key: str) -> None:
+        while True:
+            with self._conversation_lock:
+                queue = self._agent_queues.get(key)
+                if self._closed or not queue:
+                    scope_type, scope_id = self._split_conversation_key(key)
+                    self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
+                    self._agent_workers.pop(key, None)
+                    return
+                task = queue.popleft()
+                self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
+
+            error = ""
+            try:
+                if task["scope_type"] == "channel":
+                    self._send_channel_agent_reply(task)
+                else:
+                    self._send_private_agent_reply(task)
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    self._append_agent_error(task, error)
+                except Exception:
+                    pass
+
+            with self._conversation_lock:
+                queue = self._agent_queues.get(key)
+                if queue:
+                    self._agent_status[key] = self._status_for_task(queue[0], "queued", queued_count=len(queue))
+                    continue
+                scope_type, scope_id = self._split_conversation_key(key)
+                self._agent_status[key] = self._idle_agent_status(scope_type, scope_id, last_error=error)
+                self._agent_workers.pop(key, None)
+                return
+
+    def _append_agent_error(self, task: dict[str, Any], error: str) -> None:
+        username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
+        self._append_message(
+            scope_type=str(task["scope_type"]),
+            scope_id=str(task["scope_id"]),
+            author_type="agent",
+            user_id=None,
+            username=username,
+            content=f"Agent 回复失败: {error}",
+            metadata={"error": error, "reply_to": self._reply_target(task)},
+        )
+
+    def _normalize_conversation(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> tuple[str, str]:
+        scope_type = str(scope_type).strip().lower()
+        scope_id = str(scope_id)
+        if scope_type == "channel":
+            self.get_channel(actor, int(scope_id))
+            return "channel", scope_id
+        if scope_type == "private":
+            require_permission(actor, PERMISSION_PRIVATE_AGENT)
+            if scope_id != str(actor["id"]):
+                raise ServiceError(403, "private agent conversation is user scoped")
+            return "private", scope_id
+        raise ServiceError(400, "unsupported message scope")
+
+    @staticmethod
+    def _conversation_key(scope_type: str, scope_id: str) -> str:
+        return f"{scope_type}:{scope_id}"
+
+    @staticmethod
+    def _split_conversation_key(key: str) -> tuple[str, str]:
+        scope_type, _, scope_id = key.partition(":")
+        return scope_type, scope_id
+
+    def _status_for_task(self, task: dict[str, Any], state: str, queued_count: int) -> dict[str, Any]:
+        return {
+            "scope_type": str(task["scope_type"]),
+            "scope_id": str(task["scope_id"]),
+            "state": state,
+            "replying_to": self._reply_target(task),
+            "queued_count": queued_count,
+            "updated_at": now_ts(),
+            "last_error": "",
+        }
+
+    @staticmethod
+    def _idle_agent_status(scope_type: str, scope_id: str, last_error: str = "") -> dict[str, Any]:
+        return {
+            "scope_type": scope_type,
+            "scope_id": str(scope_id),
+            "state": "idle",
+            "replying_to": None,
+            "queued_count": 0,
+            "updated_at": now_ts(),
+            "last_error": last_error,
+        }
+
+    @staticmethod
+    def _copy_status(status: dict[str, Any]) -> dict[str, Any]:
+        copied = dict(status)
+        if copied.get("replying_to"):
+            copied["replying_to"] = dict(copied["replying_to"])
+        return copied
+
+    @staticmethod
+    def _reply_target(task: dict[str, Any]) -> dict[str, Any]:
+        actor = task["actor"]
+        message = task["user_message"]
+        content = str(task.get("content") or "")
+        return {
+            "message_id": int(message["id"]),
+            "user_id": int(actor["id"]),
+            "username": actor.get("display_name") or actor.get("username") or "User",
+            "content_preview": content[:120],
+        }
+
+    def _typing_users_locked(self, key: str, exclude_user_id: int | None = None) -> list[dict[str, Any]]:
+        users = self._typing.get(key, {})
+        now = time.time()
+        expired = [user_id for user_id, item in users.items() if float(item.get("expires_at", 0)) <= now]
+        for user_id in expired:
+            users.pop(user_id, None)
+        return [
+            {"user_id": item["user_id"], "username": item["username"], "updated_at": item["updated_at"]}
+            for user_id, item in users.items()
+            if exclude_user_id is None or user_id != exclude_user_id
+        ]
+
     def _append_message(
         self,
         *,
@@ -816,8 +1071,40 @@ class EnterpriseService:
                 history.append({"role": "assistant", "content": msg["content"]})
         return history
 
+    def _agent_history_before(self, scope_type: str, scope_id: str, before_message_id: int) -> list[dict[str, str]]:
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = ? AND scope_id = ? AND id < ?
+            ORDER BY id DESC
+            LIMIT 30
+            """,
+            (scope_type, str(scope_id), int(before_message_id)),
+        )
+        history: list[dict[str, str]] = []
+        for row in reversed(rows):
+            msg = self._message_from_row(row)
+            if msg["author_type"] == "user":
+                history.append({"role": "user", "content": msg["content"]})
+            elif msg["author_type"] == "agent":
+                history.append({"role": "assistant", "content": msg["content"]})
+        return history
+
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self.list_messages({"id": 0}, scope_type, scope_id, limit=12)
+        return "\n".join([m["content"] for m in messages] + [content])
+
+    def _recent_context_before(self, scope_type: str, scope_id: str, content: str, before_message_id: int) -> str:
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = ? AND scope_id = ? AND id < ?
+            ORDER BY id DESC
+            LIMIT 12
+            """,
+            (scope_type, str(scope_id), int(before_message_id)),
+        )
+        messages = [self._message_from_row(row) for row in reversed(rows)]
         return "\n".join([m["content"] for m in messages] + [content])
 
     def _channel_system_prompt(self, channel: dict[str, Any], suggestions) -> str:

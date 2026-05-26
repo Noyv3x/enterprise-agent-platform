@@ -115,20 +115,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
         if m and method == "GET":
             limit = int(first(query, "limit", "100"))
-            self._json({"messages": service.list_messages(actor, "channel", m.group(1), limit=limit)})
+            self._json({
+                "messages": service.list_messages(actor, "channel", m.group(1), limit=limit),
+                "agent_status": service.agent_status(actor, "channel", m.group(1)),
+                "typing": service.typing_users(actor, "channel", m.group(1)),
+            })
             return
         if m and method == "POST":
             body = self._body_json()
             self._json(service.send_channel_message(actor, int(m.group(1)), str(body.get("content", ""))), status=201)
             return
+        m = re.fullmatch(r"/api/channels/(\d+)/typing", path)
+        if m and method == "POST":
+            body = self._body_json()
+            self._json(service.update_typing(actor, "channel", m.group(1), bool(body.get("typing"))))
+            return
+        m = re.fullmatch(r"/api/channels/(\d+)/agent-status", path)
+        if m and method == "GET":
+            self._json({"agent_status": service.agent_status(actor, "channel", m.group(1))})
+            return
 
         if path == "/api/private-agent/messages" and method == "GET":
             limit = int(first(query, "limit", "100"))
-            self._json({"messages": service.list_messages(actor, "private", str(actor["id"]), limit=limit)})
+            self._json({
+                "messages": service.list_messages(actor, "private", str(actor["id"]), limit=limit),
+                "agent_status": service.agent_status(actor, "private", str(actor["id"])),
+                "typing": [],
+            })
             return
         if path == "/api/private-agent/messages" and method == "POST":
             body = self._body_json()
             self._json(service.send_private_message(actor, str(body.get("content", ""))), status=201)
+            return
+        if path == "/api/private-agent/agent-status" and method == "GET":
+            self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
             return
         if path == "/api/private-agent/status" and method == "GET":
             self._json(service.private_status(actor))

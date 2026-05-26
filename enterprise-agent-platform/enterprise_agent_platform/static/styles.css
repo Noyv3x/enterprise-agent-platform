@@ -506,6 +506,8 @@ select {
 .msg__meta { display: flex; align-items: baseline; gap: 9px; margin-bottom: 5px; }
 .msg__name { font-weight: 650; font-size: 12.5px; }
 .msg__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--faint); }
+.msg__pending { font-size: 11px; color: var(--muted); }
+.msg--pending { opacity: 0.72; }
 .msg__body { white-space: pre-wrap; word-break: break-word; line-height: 1.66; font-size: 14.5px; }
 
 .msg__suggest { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--line); }
@@ -528,6 +530,25 @@ select {
 .typing__dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite both; }
 .typing__dots i:nth-child(2) { animation-delay: 0.2s; }
 .typing__dots i:nth-child(3) { animation-delay: 0.4s; }
+.msg--activity { max-width: 100%; }
+.agent-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 13px;
+  min-height: 32px;
+}
+.agent-status__queue { color: var(--faint); font-size: 12px; }
+.typing-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  padding-left: 44px;
+}
+.typing-line .typing__dots { padding: 0; }
 @keyframes blink { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
 
 /* Composer */
