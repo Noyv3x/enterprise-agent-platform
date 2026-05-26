@@ -1,26 +1,26 @@
-# Enterprise Agent Platform Workspace
+# 企业 Agent 平台工作区
 
-This repository manages the enterprise agent platform built on top of the local Hermes Agent and Cognee codebases.
+本仓库用于管理基于本地 Hermes Agent 和 Cognee 代码库构建的企业 Agent 平台。
 
-## Layout
+## 目录结构
 
-- `enterprise-agent-platform/` - the web platform layer: account login, channel chat, private agents, managed workspaces/containers, central model key configuration, enterprise knowledge base, tests, and Hermes knowledge-tool plugin.
-- `hermes-agent/` - Git submodule pinned to `NousResearch/hermes-agent`, used as the agent runtime and OpenAI-compatible agent API backend.
-- `cognee/` - Git submodule pinned to `topoteretes/cognee`, used as the optional enterprise knowledge graph backend.
+- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、托管工作区/容器、集中模型密钥配置、企业知识库、测试，以及 Hermes 知识工具插件。
+- `hermes-agent/`：指向 `NousResearch/hermes-agent` 的 Git submodule，用作 Agent 运行时和 OpenAI 兼容 API 后端。
+- `cognee/`：指向 `topoteretes/cognee` 的 Git submodule，用作可选的企业知识图谱后端。
 
-## Quick Start
+## 快速开始
 
 ```bash
 ./deploy.sh
 ```
 
-Then open `http://127.0.0.1:8765`. The deploy script initializes submodules, creates the platform `.venv`, installs the platform, prepares managed runtime state, and starts the platform. If user-level systemd is available it installs and starts `enterprise-agent-platform.service`; otherwise it runs the server in the foreground.
+然后打开 `http://127.0.0.1:8765`。部署脚本会初始化 submodule、创建平台 `.venv`、安装平台包、准备托管运行时状态，并启动平台。如果当前环境支持 user-level systemd，它会安装并启动 `enterprise-agent-platform.service`；否则会以前台模式运行服务。
 
-If no admin password is configured before first boot, the bootstrap account is `admin` / `admin`.
+如果首次启动前没有配置管理员密码，默认引导账号为 `admin` / `admin`。
 
-On first startup, the platform expects the adjacent `hermes-agent/` submodule to be present. `./deploy.sh` initializes that submodule automatically, and the platform creates `enterprise-agent-platform/data/runtimes/hermes/venv`, installs Hermes from local source with an editable install, writes managed Hermes config, and starts the Hermes API server when agent traffic needs it. Hermes source path, API URL, model name, install extras, startup wait, and API server key can be managed in the platform Settings screen.
+首次启动时，平台需要相邻的 `hermes-agent/` submodule 存在。`./deploy.sh` 会自动初始化该 submodule；平台随后会创建 `enterprise-agent-platform/data/runtimes/hermes/venv`，从本地源码以 editable install 方式安装 Hermes，写入托管 Hermes 配置，并在 Agent 流量需要时启动 Hermes API server。Hermes 源码路径、API URL、模型名、安装 extras、启动等待时间和 API server key 都可以在平台设置页管理。
 
-Service management:
+服务管理：
 
 ```bash
 ./deploy.sh status
@@ -29,19 +29,19 @@ Service management:
 ./deploy.sh foreground
 ```
 
-## Verification
+## 验证
 
 ```bash
 ./deploy.sh test
 ```
 
-## Hermes Knowledge Tools
+## Hermes 知识工具
 
-The managed startup installs and enables the `enterprise-kb` Hermes plugin automatically. The plugin exposes:
+托管启动流程会自动安装并启用 `enterprise-kb` Hermes 插件。该插件暴露以下工具：
 
 - `enterprise_kb_search(query, limit)`
 - `enterprise_kb_read(document_id)`
 
-## Runtime Data
+## 运行时数据
 
-Runtime databases, workspaces, local containers, logs, and secrets are intentionally excluded from Git. Use `ENTERPRISE_PLATFORM_DATA` to choose the platform data directory.
+运行时数据库、工作区、本地容器、日志和密钥都不会提交到 Git。可以通过 `ENTERPRISE_PLATFORM_DATA` 指定平台数据目录。
