@@ -19,6 +19,16 @@ class AgentResult:
 
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
+AgentContentCallback = Callable[[str], None]
+
+
+def emit_content(content_callback: AgentContentCallback | None, content: str) -> None:
+    if content_callback is None or not content:
+        return
+    try:
+        content_callback(content)
+    except Exception:
+        return
 
 
 class AgentClient(Protocol):
@@ -35,6 +45,7 @@ class AgentClient(Protocol):
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
         progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
     ) -> AgentResult:
         ...
 
@@ -55,6 +66,7 @@ class LocalAgentClient:
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
         progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
     ) -> AgentResult:
         prefix = "Main agent" if session_key.startswith("channel:") else "Private agent"
         hints = metadata.get("knowledge_suggestions", []) if metadata else []
@@ -63,6 +75,7 @@ class LocalAgentClient:
             titles = ", ".join(str(item.get("title", "")) for item in hints[:3])
             hint_text = f"\n\n知识库提示: {titles}"
         content = f"{prefix} received: {user_message}{hint_text}"
+        emit_content(content_callback, content)
         return AgentResult(content=content, session_id=session_id, raw={"mode": "local"}, degraded=True)
 
 
@@ -85,6 +98,7 @@ class HermesAgentClient:
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
         progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
     ) -> AgentResult:
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-30:])
@@ -93,7 +107,7 @@ class HermesAgentClient:
         body = {
             "model": effective_model,
             "messages": messages,
-            "stream": progress_callback is not None,
+            "stream": progress_callback is not None or content_callback is not None,
         }
         self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
         headers = {
@@ -115,9 +129,11 @@ class HermesAgentClient:
             response_session = response.headers.get("X-Hermes-Session-Id") or session_id
             content_type = str(response.headers.get("Content-Type") or "")
             if body["stream"] and "text/event-stream" in content_type:
-                return self._read_streaming_response(response, response_session, progress_callback)
+                return self._read_streaming_response(response, response_session, progress_callback, content_callback)
             raw = json.loads(response.read().decode("utf-8"))
-        return self._result_from_completion(raw, response_session)
+        result = self._result_from_completion(raw, response_session)
+        emit_content(content_callback, result.content)
+        return result
 
     @staticmethod
     def _result_from_completion(raw: dict[str, Any], response_session: str) -> AgentResult:
@@ -144,6 +160,7 @@ class HermesAgentClient:
         response,
         response_session: str,
         progress_callback: AgentProgressCallback | None,
+        content_callback: AgentContentCallback | None,
     ) -> AgentResult:
         content_parts: list[str] = []
         raw_events: list[dict[str, Any]] = []
@@ -184,13 +201,19 @@ class HermesAgentClient:
                     delta = choice.get("delta") or {}
                     chunk = delta.get("content")
                     if chunk is not None:
-                        content_parts.append(str(chunk))
+                        text = str(chunk)
+                        content_parts.append(text)
+                        emit_content(content_callback, text)
                     message = choice.get("message") or {}
                     message_content = message.get("content")
                     if message_content is not None:
-                        content_parts.append(str(message_content))
+                        text = str(message_content)
+                        content_parts.append(text)
+                        emit_content(content_callback, text)
                 elif payload.get("final_response"):
-                    content_parts.append(str(payload.get("final_response") or ""))
+                    text = str(payload.get("final_response") or "")
+                    content_parts.append(text)
+                    emit_content(content_callback, text)
             return False
 
         for raw_line in response:
@@ -284,12 +307,16 @@ class AutoAgentClient:
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             if self.config.agent_mode == "hermes":
                 raise
-            fallback = self.local.generate(**kwargs)
+            fallback_kwargs = dict(kwargs)
+            content_callback = fallback_kwargs.pop("content_callback", None)
+            fallback = self.local.generate(**fallback_kwargs)
+            content = (
+                "Hermes API is not reachable, so this response was produced by the local "
+                f"platform fallback. Original error: {exc}\n\n{fallback.content}"
+            )
+            emit_content(content_callback, content)
             return AgentResult(
-                content=(
-                    "Hermes API is not reachable, so this response was produced by the local "
-                    f"platform fallback. Original error: {exc}\n\n{fallback.content}"
-                ),
+                content=content,
                 session_id=fallback.session_id,
                 raw={"mode": "auto-fallback", "error": str(exc)},
                 degraded=True,

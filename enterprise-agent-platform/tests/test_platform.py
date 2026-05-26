@@ -83,6 +83,27 @@ class ProgressAgent:
         )
 
 
+class StreamingAgent:
+    def __init__(self):
+        self.calls = []
+        self.first_delta = threading.Event()
+        self.release = threading.Event()
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        content_callback = kwargs.get("content_callback")
+        if content_callback:
+            content_callback("Hello ")
+            self.first_delta.set()
+            self.release.wait(timeout=5)
+            content_callback("world")
+        return AgentResult(
+            content="Hello world",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
 class FakeProcess:
     pid = 43210
 
@@ -271,6 +292,7 @@ class PlatformServiceTests(unittest.TestCase):
                     hermes_api_key="test-key",
                 )
                 events = []
+                content_chunks = []
                 client = HermesAgentClient(config, lambda name: "")
                 result = client.generate(
                     system_prompt="system",
@@ -279,9 +301,11 @@ class PlatformServiceTests(unittest.TestCase):
                     session_id="session-1",
                     session_key="channel:1:main-agent",
                     progress_callback=events.append,
+                    content_callback=content_chunks.append,
                 )
 
                 self.assertEqual(result.content, "Found policy.")
+                self.assertEqual(content_chunks, ["Found ", "policy."])
                 self.assertEqual(result.session_id, "stream-session")
                 self.assertEqual([event["status"] for event in events], ["running", "completed"])
                 self.assertEqual(events[0]["tool"], "enterprise_kb_search")
@@ -400,6 +424,30 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(hermes_activity[0]["line"], '🔍 enterprise_kb_search: "VPN access policy"')
             self.assertEqual(hermes_activity[0]["tool_status"], "completed")
             service.close()
+
+    def test_channel_agent_reply_exposes_streaming_content_while_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = StreamingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                result = service.send_channel_message(user, 1, "@agent stream a reply")
+                self.assertIsNone(result["agent_message"])
+                self.assertTrue(agent.first_delta.wait(timeout=1))
+
+                status = service.agent_status(user, "channel", "1")
+                self.assertEqual(status["state"], "replying")
+                self.assertEqual(status["stream_message"]["content"], "Hello ")
+                self.assertEqual(status["stream_message"]["username"], "Main Agent")
+
+                agent.release.set()
+                service.wait_for_agent_idle("channel", "1")
+                messages = service.list_messages(user, "channel", "1")
+                self.assertEqual(messages[-1]["content"], "Hello world")
+                self.assertIsNone(service.agent_status(user, "channel", "1").get("stream_message"))
+            finally:
+                agent.release.set()
+                service.close()
 
     def test_channel_message_without_agent_mention_does_not_trigger_agent(self):
         with tempfile.TemporaryDirectory() as td:

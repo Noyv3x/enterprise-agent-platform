@@ -471,6 +471,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: self._record_hermes_progress("channel", scope_id, event),
+            content_callback=lambda delta: self._record_agent_content_delta("channel", scope_id, delta),
         )
         self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
         metadata = {
@@ -553,6 +554,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
+            content_callback=lambda delta: self._record_agent_content_delta("private", scope_id, delta),
         )
         self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
         metadata = {
@@ -1127,6 +1129,7 @@ class EnterpriseService:
             "started_at": started_at,
             "updated_at": started_at,
             "last_error": "",
+            "stream_message": None,
         }
 
     @staticmethod
@@ -1143,6 +1146,7 @@ class EnterpriseService:
             "started_at": None,
             "updated_at": now_ts(),
             "last_error": last_error,
+            "stream_message": None,
         }
 
     @staticmethod
@@ -1151,6 +1155,8 @@ class EnterpriseService:
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
+        if copied.get("stream_message"):
+            copied["stream_message"] = dict(copied["stream_message"])
         return copied
 
     def _record_agent_activity(
@@ -1181,6 +1187,26 @@ class EnterpriseService:
             )
             status["activity"] = activity[-30:]
             status["current_step"] = label
+            status["updated_at"] = timestamp
+            self._agent_status[key] = status
+
+    def _record_agent_content_delta(self, scope_type: str, scope_id: str, delta: str) -> None:
+        delta = str(delta or "")
+        if not delta:
+            return
+        key = self._conversation_key(scope_type, str(scope_id))
+        timestamp = now_ts()
+        with self._conversation_lock:
+            status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            stream = dict(status.get("stream_message") or {})
+            stream.setdefault("id", f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}")
+            stream.setdefault("author_type", "agent")
+            stream.setdefault("username", "Main Agent" if scope_type == "channel" else "Private Agent")
+            stream.setdefault("created_at", status.get("started_at") or timestamp)
+            stream["content"] = str(stream.get("content") or "") + delta
+            stream["updated_at"] = timestamp
+            stream["active"] = True
+            status["stream_message"] = stream
             status["updated_at"] = timestamp
             self._agent_status[key] = status
 

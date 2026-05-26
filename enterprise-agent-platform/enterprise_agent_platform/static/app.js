@@ -494,7 +494,11 @@ function renderChat(mode) {
   } else {
     const items = messages.map(renderMessage);
     const status = agentStatusFor(mode);
-    if (isAgentActive(status)) items.push(renderAgentActivity(status));
+    if (isAgentActive(status)) {
+      items.push(renderAgentActivity(status));
+      const streamingMessage = agentStreamingMessage(status, mode);
+      if (streamingMessage) items.push(renderMessage(streamingMessage));
+    }
     if (mode === "channel" && state.typingUsers.length) items.push(renderTypingUsers(state.typingUsers));
     body = h("div", { class: "messages__inner" }, items);
   }
@@ -523,16 +527,18 @@ function renderMessage(message) {
   const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
   const agentWork = message.metadata?.agent_work || null;
+  const streaming = !!message.metadata?.streaming;
   const avatar = isUser
     ? h("div", { class: "msg__avatar", text: initials(message.username || "你") })
     : h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]);
   const pending = message.metadata?.local_pending;
-  return h("article", { class: `msg msg--${message.author_type} ${pending ? "msg--pending" : ""}` }, [
+  return h("article", { class: `msg msg--${message.author_type} ${pending ? "msg--pending" : ""} ${streaming ? "msg--streaming" : ""}` }, [
     avatar,
     h("div", { class: "msg__bubble" }, [
       h("div", { class: "msg__meta" }, [
         h("span", { class: "msg__name", text: message.username || (isUser ? "你" : "Agent") }),
         pending ? h("span", { class: "msg__pending", text: "发送中" }) : null,
+        streaming ? h("span", { class: "msg__pending", text: "生成中" }) : null,
         h("span", { class: "msg__time", text: formatTime(message.created_at) }),
       ]),
       h("div", { class: "msg__body", text: message.content }),
@@ -550,6 +556,23 @@ function renderAgentActivity(status) {
     h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
     renderAgentWorkCard(status, { active: true }),
   ]);
+}
+
+function agentStreamingMessage(status, mode) {
+  const stream = status?.stream_message || null;
+  const content = stream?.content || "";
+  if (!content) return null;
+  return {
+    id: stream.id || `stream-${status.run_id || status.started_at || "agent"}`,
+    scope_type: scopeTypeFor(mode),
+    scope_id: scopeIdFor(mode),
+    author_type: "agent",
+    user_id: null,
+    username: stream.username || (mode === "private" ? "Private Agent" : "Main Agent"),
+    content,
+    metadata: { streaming: true },
+    created_at: stream.created_at || status.started_at || Math.floor(Date.now() / 1000),
+  };
 }
 
 function renderAgentWorkCard(work, { active = false } = {}) {
@@ -1471,6 +1494,13 @@ function agentStatusFingerprint(status) {
     queued_count: status.queued_count || 0,
     current_step: status.current_step || "",
     activity: (status.activity || []).map((item) => `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool_status || ""}:${item.at}`),
+    stream_message: status.stream_message
+      ? {
+          id: status.stream_message.id,
+          content: status.stream_message.content || "",
+          updated_at: status.stream_message.updated_at || 0,
+        }
+      : null,
     replying_to: status.replying_to
       ? {
           id: status.replying_to.id,
@@ -1657,7 +1687,7 @@ async function refreshActiveChat({ renderAfter = true } = {}) {
 }
 function startPolling() {
   if (pollTimer) return;
-  pollTimer = setInterval(() => refreshActiveChat(), 1500);
+  pollTimer = setInterval(() => refreshActiveChat(), 600);
 }
 function stopPolling() {
   if (!pollTimer) return;
