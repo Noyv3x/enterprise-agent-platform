@@ -553,13 +553,15 @@ function renderAgentActivity(status) {
 }
 
 function renderAgentWorkCard(work, { active = false } = {}) {
-  const text = active ? (agentStatusText(work) || "Agent 正在回复") : agentWorkTitle(work);
+  const text = active ? (agentStatusText(work) || "Agent 正在处理") : agentWorkTitle(work);
   const queuedCount = Number(work?.queued_count || 0);
   const waiting = active ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1)) : 0;
-  const steps = work?.activity || [];
   const current = work?.current_step || (active ? text : "已完成");
   const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
-  const expanded = !!state.expandedAgentRuns[runId];
+  const hasStoredExpansion = Object.prototype.hasOwnProperty.call(state.expandedAgentRuns, runId);
+  const expanded = hasStoredExpansion ? !!state.expandedAgentRuns[runId] : active;
+  const processLines = agentProcessLines(work);
+  const lines = processLines.length ? processLines : [active ? "等待 Hermes Agent 运行过程" : "本次没有工具调用记录"];
   return h("details", { class: `agent-work ${active ? "agent-work--active" : "agent-work--complete"}`, open: expanded }, [
       h("summary", {
         class: "agent-work__summary",
@@ -574,29 +576,39 @@ function renderAgentWorkCard(work, { active = false } = {}) {
           : h("div", { class: "agent-work__done" }, [icon(work?.state === "error" ? "alert" : "checkCircle", { size: 15 })]),
         h("div", { class: "agent-work__main" }, [
           h("span", { class: "agent-work__title", text }),
-          h("span", { class: "agent-work__step", text: current }),
+          h("span", { class: "agent-work__step", text: active ? current : `${processLines.length} 条工作记录` }),
         ]),
         waiting > 0 ? h("span", { class: "agent-status__queue", text: `另有 ${waiting} 条等待` }) : null,
       ]),
-      h("div", { class: "agent-work__timeline" }, (steps.length ? steps : [{ stage: "active", label: current, detail: "", at: work?.updated_at }]).map(renderAgentStep)),
+      h("div", { class: "agent-work__log" }, lines.map((line) => h("div", { class: "agent-work__line", text: line }))),
   ]);
 }
 
 function agentWorkTitle(work) {
-  const target = work?.replying_to?.username || "用户";
-  if (work?.state === "error") return `Agent 回复 ${target} 失败`;
-  return `Agent 已回复 ${target}`;
+  if (work?.state === "error") return "Agent 工作过程失败";
+  return `查看 Agent 工作过程`;
 }
 
-function renderAgentStep(step) {
-  return h("div", { class: "agent-step" }, [
-    h("span", { class: "agent-step__dot" }),
-    h("div", { class: "agent-step__body" }, [
-      h("span", { class: "agent-step__label", text: step.label || step.stage || "处理中" }),
-      step.detail ? h("span", { class: "agent-step__detail", text: step.detail }) : null,
-    ]),
-    step.at ? h("span", { class: "agent-step__time", text: formatTime(step.at) }) : null,
-  ]);
+function agentProcessLines(work) {
+  const steps = work?.activity || [];
+  return steps.filter(isAgentProcessStep).map((step) => step.line || agentStepLine(step)).filter(Boolean);
+}
+
+function isAgentProcessStep(step) {
+  const stage = String(step?.stage || "").toLowerCase();
+  return step?.source === "hermes" || stage === "tool" || stage.startsWith("tool.") || !!step?.tool;
+}
+
+function agentStepLine(step) {
+  const stage = String(step?.stage || "").toLowerCase();
+  const label = step?.label || step?.stage || "处理中";
+  const detail = step?.detail || "";
+  if (stage === "tool") return `${step?.emoji || "⚙️"} ${step?.tool || label}${detail ? `: "${detail}"` : "..."}`;
+  if (stage === "complete") return `✅ ${label}`;
+  if (stage === "error") return `⚠️ ${label}${detail ? `: ${detail}` : ""}`;
+  if (stage === "queued") return `⏳ ${label}`;
+  if (stage === "replying") return `💬 ${label}`;
+  return `• ${label}${detail ? `: ${detail}` : ""}`;
 }
 
 function currentMentionRange(input) {
@@ -1446,7 +1458,7 @@ function messageFingerprint(message) {
           run_id: work.run_id,
           state: work.state,
           current_step: work.current_step || "",
-          activity: (work.activity || []).map((item) => `${item.stage}:${item.label}:${item.detail}:${item.at}`),
+          activity: (work.activity || []).map((item) => `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool_status || ""}:${item.at}`),
         }
       : null,
   };
@@ -1458,7 +1470,7 @@ function agentStatusFingerprint(status) {
     state: status.state,
     queued_count: status.queued_count || 0,
     current_step: status.current_step || "",
-    activity: (status.activity || []).map((item) => `${item.stage}:${item.label}:${item.detail}:${item.at}`),
+    activity: (status.activity || []).map((item) => `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool_status || ""}:${item.at}`),
     replying_to: status.replying_to
       ? {
           id: status.replying_to.id,

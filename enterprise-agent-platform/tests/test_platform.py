@@ -12,10 +12,11 @@ import time
 import unittest
 import urllib.parse
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from enterprise_agent_platform.config import PlatformConfig
-from enterprise_agent_platform.hermes import AgentResult
+from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
@@ -44,6 +45,37 @@ class BlockingAgent:
         self.calls.append(kwargs)
         self.started.set()
         self.release.wait(timeout=5)
+        return AgentResult(
+            content=f"agent response to {kwargs['user_message']}",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
+class ProgressAgent:
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback(
+                {
+                    "tool": "enterprise_kb_search",
+                    "emoji": "🔍",
+                    "label": "VPN access policy",
+                    "toolCallId": "call-1",
+                    "status": "running",
+                }
+            )
+            progress_callback(
+                {
+                    "tool": "enterprise_kb_search",
+                    "toolCallId": "call-1",
+                    "status": "completed",
+                }
+            )
         return AgentResult(
             content=f"agent response to {kwargs['user_message']}",
             session_id=kwargs["session_id"],
@@ -194,6 +226,72 @@ def managed_python(home: Path) -> Path:
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_hermes_client_streams_tool_progress_events(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                requests.append({"headers": dict(self.headers), "body": body})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("X-Hermes-Session-Id", "stream-session")
+                self.end_headers()
+                events = [
+                    (
+                        "event: hermes.tool.progress\n"
+                        f"data: {json.dumps({'tool': 'enterprise_kb_search', 'emoji': '🔍', 'label': 'VPN policy', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
+                    ),
+                    f"data: {json.dumps({'choices': [{'delta': {'role': 'assistant'}}]})}\n\n",
+                    f"data: {json.dumps({'choices': [{'delta': {'content': 'Found '}}]})}\n\n",
+                    (
+                        "event: hermes.tool.progress\n"
+                        f"data: {json.dumps({'tool': 'enterprise_kb_search', 'toolCallId': 'call-1', 'status': 'completed'})}\n\n"
+                    ),
+                    f"data: {json.dumps({'choices': [{'delta': {'content': 'policy.'}}]})}\n\n",
+                    "data: [DONE]\n\n",
+                ]
+                for event in events:
+                    self.wfile.write(event.encode("utf-8"))
+                    self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    hermes_api_key="test-key",
+                )
+                events = []
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="question",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                    progress_callback=events.append,
+                )
+
+                self.assertEqual(result.content, "Found policy.")
+                self.assertEqual(result.session_id, "stream-session")
+                self.assertEqual([event["status"] for event in events], ["running", "completed"])
+                self.assertEqual(events[0]["tool"], "enterprise_kb_search")
+                self.assertTrue(requests[-1]["body"]["stream"])
+                self.assertEqual(requests[-1]["headers"]["Authorization"], "Bearer test-key")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_default_repo_paths_support_whole_checkout_startup(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -257,7 +355,7 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
-            agent = RecordingAgent()
+            agent = ProgressAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             _, user = service.authenticate("admin", "admin")
             service.add_knowledge_document(
@@ -297,8 +395,10 @@ class PlatformServiceTests(unittest.TestCase):
             work = agent_message["metadata"]["agent_work"]
             self.assertEqual(work["state"], "complete")
             self.assertEqual(work["run_id"], f"channel:1:{result['user_message']['id']}")
-            self.assertIn("model", [item["stage"] for item in work["activity"]])
-            self.assertIn("complete", [item["stage"] for item in work["activity"]])
+            hermes_activity = [item for item in work["activity"] if item.get("source") == "hermes"]
+            self.assertEqual(len(hermes_activity), 1)
+            self.assertEqual(hermes_activity[0]["line"], '🔍 enterprise_kb_search: "VPN access policy"')
+            self.assertEqual(hermes_activity[0]["tool_status"], "completed")
             service.close()
 
     def test_channel_message_without_agent_mention_does_not_trigger_agent(self):
@@ -345,8 +445,8 @@ class PlatformServiceTests(unittest.TestCase):
                 status = service.agent_status(user, "channel", "1")
                 self.assertEqual(status["state"], "replying")
                 self.assertEqual(status["replying_to"]["username"], "Administrator")
-                self.assertEqual(status["current_step"], "调用 Hermes Agent")
-                self.assertIn("model", [item["stage"] for item in status["activity"]])
+                self.assertEqual(status["current_step"], "等待 Hermes Agent 运行过程")
+                self.assertIn("replying", [item["stage"] for item in status["activity"]])
                 self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "@agent slow question")
 
                 second_started_at = time.monotonic()
@@ -372,6 +472,7 @@ class PlatformServiceTests(unittest.TestCase):
                 final_message = service.list_messages(user, "channel", "1")[-1]
                 self.assertEqual(final_message["content"], "agent response to Alice: second question")
                 self.assertEqual(final_message["metadata"]["agent_work"]["state"], "complete")
+                self.assertTrue(final_message["metadata"]["agent_work"]["activity"][-1]["line"].startswith("✅"))
             finally:
                 agent.release.set()
                 service.close()

@@ -448,7 +448,7 @@ class EnterpriseService:
         content = str(task["content"])
         generation = task["generation"]
         user_msg = task["user_message"]
-        self._record_agent_activity("channel", scope_id, "knowledge", "检索企业知识", "enterprise_kb_search")
+        self._record_agent_activity("channel", scope_id, "preparing", "准备 Agent 请求", "整理频道上下文")
         suggestions = self.knowledge.suggest(
             self._recent_context_before(
                 "channel",
@@ -458,9 +458,8 @@ class EnterpriseService:
                 current_speaker=self._actor_display_name(task["actor"]),
             )
         )
-        self._record_agent_activity("channel", scope_id, "context", "整理频道上下文", f"{len(suggestions)} 条知识建议")
         system_prompt = self._channel_system_prompt(channel, suggestions)
-        self._record_agent_activity("channel", scope_id, "model", "调用 Hermes Agent", generation["model"])
+        self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], content),
@@ -471,8 +470,9 @@ class EnterpriseService:
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
+            progress_callback=lambda event: self._record_hermes_progress("channel", scope_id, event),
         )
-        self._record_agent_activity("channel", scope_id, "complete", "写回频道回复", "保存到频道消息")
+        self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
         metadata = {
             "session_id": result.session_id,
             "degraded": result.degraded,
@@ -532,18 +532,16 @@ class EnterpriseService:
         generation = task["generation"]
         scope_id = str(task["scope_id"])
         user_msg = task["user_message"]
-        self._record_agent_activity("private", scope_id, "workspace", "准备私人工作区", f"u{actor['id']}")
+        self._record_agent_activity("private", scope_id, "preparing", "准备私人工作区", f"u{actor['id']}")
         container = self.containers.ensure_private_container(
             user_id=actor["id"],
             username=actor["username"],
             secrets_env=self.model_secret_env(),
         )
         container_data = container.to_dict()
-        self._record_agent_activity("private", scope_id, "knowledge", "检索企业知识", "enterprise_kb_search")
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, content, int(user_msg["id"])))
-        self._record_agent_activity("private", scope_id, "context", "整理私人会话上下文", f"{len(suggestions)} 条知识建议")
         system_prompt = self._private_system_prompt(actor, container_data, suggestions)
-        self._record_agent_activity("private", scope_id, "model", "调用私人 Agent", generation["model"])
+        self._record_agent_activity("private", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=content,
@@ -554,8 +552,9 @@ class EnterpriseService:
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
+            progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
         )
-        self._record_agent_activity("private", scope_id, "complete", "写回私人回复", "保存到私人会话")
+        self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
         metadata = {
             "session_id": result.session_id,
             "degraded": result.degraded,
@@ -1105,6 +1104,8 @@ class EnterpriseService:
         return scope_type, scope_id
 
     def _status_for_task(self, task: dict[str, Any], state: str, queued_count: int) -> dict[str, Any]:
+        label = "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求"
+        started_at = now_ts()
         return {
             "scope_type": str(task["scope_type"]),
             "scope_id": str(task["scope_id"]),
@@ -1115,14 +1116,16 @@ class EnterpriseService:
             "activity": [
                 {
                     "stage": state,
-                    "label": "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求",
+                    "source": "platform",
+                    "label": label,
                     "detail": "",
-                    "at": now_ts(),
+                    "line": agent_work_line(state, label, ""),
+                    "at": started_at,
                 }
             ],
-            "current_step": "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求",
-            "started_at": now_ts(),
-            "updated_at": now_ts(),
+            "current_step": label,
+            "started_at": started_at,
+            "updated_at": started_at,
             "last_error": "",
         }
 
@@ -1150,15 +1153,90 @@ class EnterpriseService:
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
         return copied
 
-    def _record_agent_activity(self, scope_type: str, scope_id: str, stage: str, label: str, detail: str = "") -> None:
+    def _record_agent_activity(
+        self,
+        scope_type: str,
+        scope_id: str,
+        stage: str,
+        label: str,
+        detail: str = "",
+        *,
+        source: str = "platform",
+        line: str | None = None,
+    ) -> None:
+        key = self._conversation_key(scope_type, str(scope_id))
+        timestamp = now_ts()
+        with self._conversation_lock:
+            status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            activity = [dict(item) for item in status.get("activity") or []]
+            activity.append(
+                {
+                    "stage": stage,
+                    "source": source,
+                    "label": label,
+                    "detail": detail,
+                    "line": line if line is not None else agent_work_line(stage, label, detail),
+                    "at": timestamp,
+                }
+            )
+            status["activity"] = activity[-30:]
+            status["current_step"] = label
+            status["updated_at"] = timestamp
+            self._agent_status[key] = status
+
+    def _record_hermes_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
+        label = str(event.get("label") or event.get("preview") or tool).strip() or tool
+        tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or event.get("id") or "").strip()
+        tool_status = str(event.get("status") or event.get("event_type") or "running").strip().lower()
+        timestamp = now_ts()
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             activity = [dict(item) for item in status.get("activity") or []]
-            activity.append({"stage": stage, "label": label, "detail": detail, "at": now_ts()})
+            if tool_status in {"completed", "complete", "done", "tool.completed"}:
+                updated = False
+                if tool_call_id:
+                    for item in reversed(activity):
+                        if item.get("source") == "hermes" and item.get("tool_call_id") == tool_call_id:
+                            item["tool_status"] = "completed"
+                            item["completed_at"] = timestamp
+                            updated = True
+                            break
+                if updated:
+                    status["activity"] = activity[-30:]
+                    status["current_step"] = f"完成 {tool}"
+                    status["updated_at"] = timestamp
+                    self._agent_status[key] = status
+                return
+
+            line = hermes_progress_line(event)
+            existing = None
+            if tool_call_id:
+                for item in reversed(activity):
+                    if item.get("source") == "hermes" and item.get("tool_call_id") == tool_call_id:
+                        existing = item
+                        break
+            item_data = {
+                "stage": "tool",
+                "source": "hermes",
+                "label": tool,
+                "detail": label,
+                "line": line,
+                "tool": tool,
+                "tool_call_id": tool_call_id,
+                "tool_status": "running",
+                "at": timestamp,
+            }
+            if existing is not None:
+                existing.update(item_data)
+            else:
+                activity.append(item_data)
             status["activity"] = activity[-30:]
-            status["current_step"] = label
-            status["updated_at"] = now_ts()
+            status["current_step"] = line
+            status["updated_at"] = timestamp
             self._agent_status[key] = status
 
     def _agent_work_snapshot(self, task: dict[str, Any], state: str) -> dict[str, Any]:
@@ -1416,6 +1494,32 @@ def channel_agent_request(content: str) -> str | None:
     cleaned = AGENT_MENTION_RE.sub("", content).strip()
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned or content.strip()
+
+
+def agent_work_line(stage: str, label: str, detail: str = "") -> str:
+    stage = str(stage or "").strip().lower()
+    label = str(label or "").strip()
+    detail = str(detail or "").strip()
+    if stage == "preparing":
+        return f"📁 {label}{(': ' + detail) if detail else ''}"
+    if stage == "complete":
+        return f"✅ {label}"
+    if stage == "error":
+        return f"⚠️ {label}{(': ' + detail) if detail else ''}"
+    if stage == "queued":
+        return f"⏳ {label or '等待 Agent 处理'}"
+    if stage == "replying":
+        return f"💬 {label or '开始处理 Agent 请求'}"
+    return f"• {label}{(': ' + detail) if detail else ''}"
+
+
+def hermes_progress_line(event: dict[str, Any]) -> str:
+    tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
+    label = str(event.get("label") or event.get("preview") or "").strip()
+    emoji = str(event.get("emoji") or "⚙️").strip() or "⚙️"
+    if label and label != tool:
+        return f"{emoji} {tool}: \"{label}\""
+    return f"{emoji} {tool}..."
 
 
 def parse_bool(value: Any) -> bool:

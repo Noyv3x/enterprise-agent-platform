@@ -5,7 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import PlatformConfig
 
@@ -16,6 +16,9 @@ class AgentResult:
     session_id: str
     raw: dict[str, Any]
     degraded: bool = False
+
+
+AgentProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class AgentClient(Protocol):
@@ -31,6 +34,7 @@ class AgentClient(Protocol):
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
     ) -> AgentResult:
         ...
 
@@ -50,6 +54,7 @@ class LocalAgentClient:
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
     ) -> AgentResult:
         prefix = "Main agent" if session_key.startswith("channel:") else "Private agent"
         hints = metadata.get("knowledge_suggestions", []) if metadata else []
@@ -79,6 +84,7 @@ class HermesAgentClient:
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
     ) -> AgentResult:
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-30:])
@@ -87,7 +93,7 @@ class HermesAgentClient:
         body = {
             "model": effective_model,
             "messages": messages,
-            "stream": False,
+            "stream": progress_callback is not None,
         }
         self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
         headers = {
@@ -106,8 +112,15 @@ class HermesAgentClient:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self._effective_timeout_seconds()) as response:
-            raw = json.loads(response.read().decode("utf-8"))
             response_session = response.headers.get("X-Hermes-Session-Id") or session_id
+            content_type = str(response.headers.get("Content-Type") or "")
+            if body["stream"] and "text/event-stream" in content_type:
+                return self._read_streaming_response(response, response_session, progress_callback)
+            raw = json.loads(response.read().decode("utf-8"))
+        return self._result_from_completion(raw, response_session)
+
+    @staticmethod
+    def _result_from_completion(raw: dict[str, Any], response_session: str) -> AgentResult:
         choices = raw.get("choices") or []
         content = ""
         if choices:
@@ -115,6 +128,97 @@ class HermesAgentClient:
             content = str(message.get("content") or "")
         if not content:
             content = str(raw.get("final_response") or "")
+        return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
+
+    @staticmethod
+    def _emit_progress(progress_callback: AgentProgressCallback | None, payload: dict[str, Any]) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(payload)
+        except Exception:
+            return
+
+    def _read_streaming_response(
+        self,
+        response,
+        response_session: str,
+        progress_callback: AgentProgressCallback | None,
+    ) -> AgentResult:
+        content_parts: list[str] = []
+        raw_events: list[dict[str, Any]] = []
+        event_count = 0
+        event_name = "message"
+        data_lines: list[str] = []
+
+        def remember(event: str, payload: Any) -> None:
+            nonlocal event_count
+            event_count += 1
+            raw_events.append({"event": event, "data": payload})
+            del raw_events[:-50]
+
+        def dispatch_event() -> bool:
+            nonlocal event_name, data_lines
+            if not data_lines:
+                event_name = "message"
+                return False
+            event = event_name or "message"
+            data = "\n".join(data_lines)
+            event_name = "message"
+            data_lines = []
+            if data == "[DONE]":
+                remember(event, data)
+                return True
+            if event == "hermes.tool.progress":
+                payload = json.loads(data)
+                if isinstance(payload, dict):
+                    remember(event, payload)
+                    self._emit_progress(progress_callback, payload)
+                return False
+            payload = json.loads(data)
+            remember(event, payload)
+            if isinstance(payload, dict):
+                choices = payload.get("choices") or []
+                if choices:
+                    choice = choices[0] or {}
+                    delta = choice.get("delta") or {}
+                    chunk = delta.get("content")
+                    if chunk is not None:
+                        content_parts.append(str(chunk))
+                    message = choice.get("message") or {}
+                    message_content = message.get("content")
+                    if message_content is not None:
+                        content_parts.append(str(message_content))
+                elif payload.get("final_response"):
+                    content_parts.append(str(payload.get("final_response") or ""))
+            return False
+
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if dispatch_event():
+                    break
+                continue
+            if line.startswith(":"):
+                continue
+            field, sep, value = line.partition(":")
+            if not sep:
+                continue
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                event_name = value or "message"
+            elif field == "data":
+                data_lines.append(value)
+        if data_lines:
+            dispatch_event()
+
+        raw = {
+            "mode": "stream",
+            "event_count": event_count,
+            "events": raw_events,
+        }
+        content = "".join(content_parts)
         return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
 
     def _runtime_config(self) -> dict[str, Any]:
