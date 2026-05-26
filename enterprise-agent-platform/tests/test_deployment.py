@@ -71,6 +71,19 @@ class BrokenExistingVenvRunner(RecordingDeployRunner):
         return super().run(cmd, cwd=cwd, env=env, timeout=timeout, check=check)
 
 
+class TransientPipFailureRunner(RecordingDeployRunner):
+    def __init__(self):
+        super().__init__()
+        self.platform_install_attempts = 0
+
+    def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
+        if "-e" in cmd:
+            self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
+            self.platform_install_attempts += 1
+            return subprocess.CompletedProcess(cmd, 1 if self.platform_install_attempts == 1 else 0)
+        return super().run(cmd, cwd=cwd, env=env, timeout=timeout, check=check)
+
+
 def make_deploy_root(root: Path) -> None:
     (root / ".git").mkdir()
     (root / "enterprise-agent-platform" / "enterprise_agent_platform").mkdir(parents=True)
@@ -100,8 +113,44 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn([sys.executable, "-c", "import ensurepip"], commands)
             self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
             self.assertIn([str(paths.venv_python), "-m", "pip", "--version"], commands)
-            self.assertIn([str(paths.venv_python), "-m", "pip", "install", "--upgrade", "pip"], commands)
-            self.assertIn([str(paths.venv_python), "-m", "pip", "install", "-e", str(root / "enterprise-agent-platform")], commands)
+            self.assertIn(
+                [str(paths.venv_python), "-m", "pip", "install", "--retries", "8", "--timeout", "120", "--upgrade", "pip"],
+                commands,
+            )
+            self.assertIn(
+                [
+                    str(paths.venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--retries",
+                    "8",
+                    "--timeout",
+                    "120",
+                    "--no-build-isolation",
+                    "-e",
+                    str(root / "enterprise-agent-platform"),
+                ],
+                commands,
+            )
+
+    def test_platform_pip_install_retries_transient_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            runner = TransientPipFailureRunner()
+            paths = DeploymentPaths.from_root(root)
+            manager = DeploymentManager(paths, runner=runner)
+
+            with mock.patch.dict(os.environ, {"ENTERPRISE_PIP_INSTALL_ATTEMPTS": "2"}):
+                result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
+
+            install_calls = [call for call in runner.calls if "-e" in call["cmd"]]
+            self.assertEqual(result.mode, "prepare")
+            self.assertEqual(runner.platform_install_attempts, 2)
+            self.assertEqual(len(install_calls), 2)
+            self.assertEqual(install_calls[0]["check"], False)
+            self.assertEqual(install_calls[0]["env"]["PIP_DISABLE_PIP_VERSION_CHECK"], "1")
 
     def test_missing_ensurepip_auto_installs_debian_venv_package(self):
         with tempfile.TemporaryDirectory() as td:

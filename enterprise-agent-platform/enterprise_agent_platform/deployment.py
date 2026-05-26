@@ -14,6 +14,9 @@ from .service import EnterpriseService
 
 
 DEFAULT_SERVICE_NAME = "enterprise-agent-platform.service"
+DEFAULT_PIP_INSTALL_ATTEMPTS = 3
+DEFAULT_PIP_NETWORK_RETRIES = 8
+DEFAULT_PIP_TIMEOUT_SECONDS = 120
 
 
 class DeploymentError(RuntimeError):
@@ -175,8 +178,31 @@ class DeploymentManager:
             self.recreate_platform_venv()
             if not self.venv_pip_available():
                 raise DeploymentError(venv_package_hint(sys.executable, self.paths.venv_dir, existing_broken=True))
-        self.runner.run([str(self.paths.venv_python), "-m", "pip", "install", "--upgrade", "pip"], cwd=self.paths.root, timeout=900)
-        self.runner.run([str(self.paths.venv_python), "-m", "pip", "install", "-e", str(self.paths.platform_dir)], cwd=self.paths.root, timeout=900)
+        self.run_pip_install(["--upgrade", "pip"], timeout=900)
+        self.run_pip_install(["--no-build-isolation", "-e", str(self.paths.platform_dir)], timeout=900)
+
+    def run_pip_install(self, args: list[str], *, timeout: float) -> None:
+        attempts = positive_int_env("ENTERPRISE_PIP_INSTALL_ATTEMPTS", DEFAULT_PIP_INSTALL_ATTEMPTS)
+        cmd = [
+            str(self.paths.venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--retries",
+            str(positive_int_env("ENTERPRISE_PIP_RETRIES", DEFAULT_PIP_NETWORK_RETRIES)),
+            "--timeout",
+            str(positive_int_env("ENTERPRISE_PIP_TIMEOUT", DEFAULT_PIP_TIMEOUT_SECONDS)),
+            *args,
+        ]
+        env = os.environ.copy()
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        for attempt in range(1, attempts + 1):
+            result = self.runner.run(cmd, cwd=self.paths.root, env=env, timeout=timeout, check=False)
+            if result.returncode == 0:
+                return
+            if attempt < attempts:
+                print(f"pip install failed with exit code {result.returncode}; retrying ({attempt + 1}/{attempts}).", flush=True)
+        raise DeploymentError(f"command failed after {attempts} attempts with exit code {result.returncode}: {' '.join(cmd)}")
 
     def recreate_platform_venv(self) -> None:
         self.ensure_venv_module_available()
@@ -368,6 +394,17 @@ def apt_get_command_base() -> list[str] | None:
     if sudo:
         return [sudo, apt_get]
     return None
+
+
+def positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def build_parser() -> argparse.ArgumentParser:
