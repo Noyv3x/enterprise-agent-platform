@@ -114,7 +114,20 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
             self.assertIn([str(paths.venv_python), "-m", "pip", "--version"], commands)
             self.assertIn(
-                [str(paths.venv_python), "-m", "pip", "install", "--retries", "8", "--timeout", "120", "--upgrade", "pip"],
+                [
+                    str(paths.venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--retries",
+                    "8",
+                    "--timeout",
+                    "120",
+                    "--upgrade",
+                    "pip",
+                    "setuptools",
+                    "wheel",
+                ],
                 commands,
             )
             self.assertIn(

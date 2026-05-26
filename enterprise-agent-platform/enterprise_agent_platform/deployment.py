@@ -178,7 +178,7 @@ class DeploymentManager:
             self.recreate_platform_venv()
             if not self.venv_pip_available():
                 raise DeploymentError(venv_package_hint(sys.executable, self.paths.venv_dir, existing_broken=True))
-        self.run_pip_install(["--upgrade", "pip"], timeout=900)
+        self.run_pip_install(["--upgrade", "pip", "setuptools", "wheel"], timeout=900)
         self.run_pip_install(["--no-build-isolation", "-e", str(self.paths.platform_dir)], timeout=900)
 
     def run_pip_install(self, args: list[str], *, timeout: float) -> None:
