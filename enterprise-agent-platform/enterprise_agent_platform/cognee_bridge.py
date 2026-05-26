@@ -38,19 +38,20 @@ class CogneeBridge:
     def status(self) -> CogneeStatus:
         if self._status is not None:
             return self._status
-        if self.config.knowledge_backend == "local":
+        backend = self._backend()
+        if backend == "local":
             self._status = CogneeStatus(False, "local", "")
             return self._status
         try:
             if self.runtime_manager is not None:
                 runtime = self.runtime_manager.ensure_cognee_ready()
                 if not runtime.available:
-                    self._status = CogneeStatus(False, self.config.knowledge_backend, runtime.error)
+                    self._status = CogneeStatus(False, backend, runtime.error)
                     return self._status
             self._module = self._import_cognee()
-            self._status = CogneeStatus(True, self.config.knowledge_backend)
+            self._status = CogneeStatus(True, backend)
         except Exception as exc:
-            self._status = CogneeStatus(False, self.config.knowledge_backend, str(exc))
+            self._status = CogneeStatus(False, backend, str(exc))
         return self._status
 
     def refresh_status(self) -> CogneeStatus:
@@ -58,13 +59,14 @@ class CogneeBridge:
         return self.status()
 
     def ingest_document(self, *, title: str, content: str, source: str = "") -> dict[str, Any]:
-        if self.config.knowledge_backend not in {"hybrid", "cognee"}:
+        backend = self._backend()
+        if backend not in {"hybrid", "cognee"}:
             return {"attempted": False, "available": False}
         status = self.status()
         if not status.available:
             return {"attempted": True, "available": False, "error": status.error}
         self._seed_cognee_env()
-        dataset = self.config.cognee_dataset
+        dataset = self._dataset()
         payload = f"# {title}\n\nSource: {source}\n\n{content}"
         try:
             cognee = self._module
@@ -78,7 +80,7 @@ class CogneeBridge:
             cognify_result = asyncio.run(
                 cognee.cognify(
                     datasets=[dataset],
-                    run_in_background=self.config.cognee_ingest_background,
+                    run_in_background=self._ingest_background(),
                 )
             )
             return {
@@ -92,7 +94,7 @@ class CogneeBridge:
             return {"attempted": True, "available": True, "dataset": dataset, "error": str(exc)}
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        if self.config.knowledge_backend not in {"hybrid", "cognee"}:
+        if self._backend() not in {"hybrid", "cognee"}:
             return []
         status = self.status()
         if not status.available:
@@ -105,7 +107,7 @@ class CogneeBridge:
                 cognee.search(
                     query_text=query,
                     query_type=search_type,
-                    datasets=[self.config.cognee_dataset],
+                    datasets=[self._dataset()],
                     top_k=max(1, min(int(limit), 20)),
                 )
             )
@@ -128,7 +130,7 @@ class CogneeBridge:
         return normalized
 
     def _import_cognee(self):
-        repo = self.config.cognee_repo
+        repo = self._repo()
         if repo.exists() and str(repo) not in sys.path:
             sys.path.insert(0, str(repo))
         import cognee  # type: ignore
@@ -138,6 +140,34 @@ class CogneeBridge:
     def _seed_cognee_env(self) -> None:
         if self.runtime_manager is not None:
             self.runtime_manager.ensure_cognee_ready()
+
+    def _runtime_config(self) -> dict[str, Any]:
+        if self.runtime_manager is None:
+            return {}
+        try:
+            data = self.runtime_manager.cognee_runtime_config()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _backend(self) -> str:
+        value = str(self._runtime_config().get("backend") or self.config.knowledge_backend).strip().lower()
+        return value if value in {"local", "hybrid", "cognee"} else "hybrid"
+
+    def _dataset(self) -> str:
+        return str(self._runtime_config().get("dataset") or self.config.cognee_dataset)
+
+    def _repo(self):
+        from pathlib import Path
+
+        value = self._runtime_config().get("repo_path")
+        return Path(str(value)).expanduser() if value else self.config.cognee_repo
+
+    def _ingest_background(self) -> bool:
+        value = self._runtime_config().get("ingest_background")
+        if value is None:
+            return self.config.cognee_ingest_background
+        return bool(value)
 
 
 def stringify_cognee_result(item: Any) -> str:

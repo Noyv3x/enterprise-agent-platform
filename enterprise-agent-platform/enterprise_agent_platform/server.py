@@ -192,6 +192,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/hermes/config" and method == "PUT":
             self._json(service.update_hermes_config(actor, self._body_json()))
             return
+        if path == "/api/system/hermes/internal-config" and method == "GET":
+            self._json(service.hermes_internal_config(actor))
+            return
+        if path == "/api/system/hermes/internal-config" and method == "PUT":
+            self._json(service.update_hermes_internal_config(actor, self._body_json()))
+            return
+        if path == "/api/system/cognee/config" and method == "GET":
+            self._json(service.cognee_config(actor))
+            return
+        if path == "/api/system/cognee/config" and method == "PUT":
+            self._json(service.update_cognee_config(actor, self._body_json()))
+            return
         if path == "/api/system/oauth/providers" and method == "GET":
             self._json(service.oauth_provider_status(actor))
             return

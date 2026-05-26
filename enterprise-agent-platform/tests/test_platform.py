@@ -270,9 +270,9 @@ class PlatformServiceTests(unittest.TestCase):
                 },
             )
 
-            result = service.send_channel_message(user, 1, "What is the VPN access policy?")
+            result = service.send_channel_message(user, 1, "@agent What is the VPN access policy?")
             self.assertIsNone(result["agent_message"])
-            self.assertEqual(result["user_message"]["content"], "What is the VPN access policy?")
+            self.assertEqual(result["user_message"]["content"], "@agent What is the VPN access policy?")
             service.wait_for_agent_idle("channel", "1")
             messages = service.list_messages(user, "channel", "1")
             agent_message = messages[-1]
@@ -280,9 +280,29 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent_message["username"], "Main Agent")
             self.assertEqual(agent.calls[-1]["session_id"], "enterprise-channel-1-main-agent")
             self.assertEqual(agent.calls[-1]["session_key"], "channel:1:main-agent")
+            self.assertEqual(agent.calls[-1]["user_message"], "What is the VPN access policy?")
             self.assertIn("enterprise_kb_search", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
             service.close()
+
+    def test_channel_message_without_agent_mention_does_not_trigger_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+
+                result = service.send_channel_message(user, 1, "normal channel message")
+                status = service.wait_for_agent_idle("channel", "1")
+                messages = service.list_messages(user, "channel", "1")
+
+                self.assertEqual(result["user_message"]["content"], "normal channel message")
+                self.assertIsNone(result["agent_message"])
+                self.assertEqual(status["state"], "idle")
+                self.assertEqual(messages[-1]["content"], "normal channel message")
+                self.assertEqual(agent.calls, [])
+            finally:
+                service.close()
 
     def test_channel_message_returns_before_agent_finishes_and_reports_reply_target(self):
         with tempfile.TemporaryDirectory() as td:
@@ -299,27 +319,35 @@ class PlatformServiceTests(unittest.TestCase):
                 )
 
                 started_at = time.monotonic()
-                result = service.send_channel_message(user, 1, "slow question")
+                result = service.send_channel_message(user, 1, "@agent slow question")
                 elapsed = time.monotonic() - started_at
 
                 self.assertLess(elapsed, 0.5)
-                self.assertEqual(result["user_message"]["content"], "slow question")
+                self.assertEqual(result["user_message"]["content"], "@agent slow question")
                 self.assertIsNone(result["agent_message"])
                 self.assertTrue(agent.started.wait(timeout=1))
                 status = service.agent_status(user, "channel", "1")
                 self.assertEqual(status["state"], "replying")
                 self.assertEqual(status["replying_to"]["username"], "Administrator")
-                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "slow question")
+                self.assertEqual(status["current_step"], "调用 Hermes Agent")
+                self.assertIn("model", [item["stage"] for item in status["activity"]])
+                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "@agent slow question")
 
                 second_started_at = time.monotonic()
-                second = service.send_channel_message(member, 1, "second question")
+                second = service.send_channel_message(member, 1, "second normal message")
                 self.assertLess(time.monotonic() - second_started_at, 0.5)
-                self.assertEqual(second["user_message"]["content"], "second question")
+                self.assertEqual(second["user_message"]["content"], "second normal message")
                 status = service.agent_status(user, "channel", "1")
                 self.assertEqual(status["state"], "replying")
                 self.assertEqual(status["replying_to"]["username"], "Administrator")
+                self.assertEqual(status["queued_count"], 0)
+                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "second normal message")
+
+                third = service.send_channel_message(member, 1, "@agent second question")
+                self.assertEqual(third["user_message"]["content"], "@agent second question")
+                status = service.agent_status(user, "channel", "1")
                 self.assertEqual(status["queued_count"], 1)
-                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "second question")
+                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "@agent second question")
 
                 agent.release.set()
                 status = service.wait_for_agent_idle("channel", "1")
@@ -381,8 +409,8 @@ class PlatformServiceTests(unittest.TestCase):
                 actor=admin,
             )
 
-            service.send_channel_message(admin, 1, "admin asks")
-            service.send_channel_message(member, 1, "member asks")
+            service.send_channel_message(admin, 1, "@agent admin asks")
+            service.send_channel_message(member, 1, "@agent member asks")
             service.wait_for_agent_idle("channel", "1")
             channel_sessions = [call["session_id"] for call in agent.calls[-2:]]
             self.assertEqual(channel_sessions, ["enterprise-channel-1-main-agent", "enterprise-channel-1-main-agent"])
@@ -577,7 +605,7 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
             try:
                 _, user = service.authenticate("admin", "admin")
-                result = service.send_channel_message(user, 1, "hello")
+                result = service.send_channel_message(user, 1, "@agent hello")
                 self.assertIsNone(result["agent_message"])
                 service.wait_for_agent_idle("channel", "1", timeout=10)
                 agent_message = service.list_messages(user, "channel", "1")[-1]
@@ -656,6 +684,88 @@ class PlatformServiceTests(unittest.TestCase):
                         f"{tmp / 'hermes-agent'}[dev]",
                     ],
                 )
+            finally:
+                service.close()
+
+    def test_hermes_internal_config_exposes_yaml_and_env_without_leaking_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+
+                current = service.hermes_internal_config(admin)
+                yaml_keys = {item["key"] for item in current["internal"]["fields"]}
+                env_by_key = {item["key"]: item for item in current["internal"]["env"]}
+
+                self.assertIn("agent.max_turns", yaml_keys)
+                self.assertIn("display.show_reasoning", yaml_keys)
+                self.assertIn("API_SERVER_KEY", env_by_key)
+                self.assertTrue(env_by_key["API_SERVER_KEY"]["secret"])
+                self.assertEqual(env_by_key["API_SERVER_KEY"]["value"], "")
+
+                updated = service.update_hermes_internal_config(
+                    admin,
+                    {
+                        "yaml_updates": {
+                            "agent.max_turns": "12",
+                            "display.show_reasoning": "true",
+                        },
+                        "env": {
+                            "HERMES_MAX_ITERATIONS": "12",
+                            "OPENROUTER_API_KEY": "openrouter-secret",
+                        },
+                    },
+                )
+                fields = {item["key"]: item for item in updated["internal"]["fields"]}
+                env = {item["key"]: item for item in updated["internal"]["env"]}
+
+                self.assertEqual(fields["agent.max_turns"]["value"], 12)
+                self.assertEqual(fields["display.show_reasoning"]["value"], True)
+                self.assertEqual(env["HERMES_MAX_ITERATIONS"]["value"], "12")
+                self.assertEqual(env["OPENROUTER_API_KEY"]["value"], "")
+                self.assertTrue(env["OPENROUTER_API_KEY"]["masked"])
+
+                with self.assertRaises(ServiceError) as bad_yaml:
+                    service.update_hermes_internal_config(admin, {"yaml_text": "not: [valid"})
+                self.assertEqual(bad_yaml.exception.status, 400)
+            finally:
+                service.close()
+
+    def test_cognee_internal_config_exposes_and_updates_managed_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_cognee_repo(tmp / "cognee")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+
+                current = service.cognee_config(admin)
+                env_keys = {item["key"] for item in current["internal"]["env"]}
+                self.assertIn("LLM_MODEL", env_keys)
+                self.assertIn("VECTOR_DB_PROVIDER", env_keys)
+                self.assertIn("DATA_ROOT_DIRECTORY", env_keys)
+
+                updated = service.update_cognee_config(
+                    admin,
+                    {
+                        "env": {
+                            "LLM_MODEL": "openai/gpt-5-mini",
+                            "VECTOR_DB_PROVIDER": "lancedb",
+                            "LLM_API_KEY": "llm-secret",
+                        }
+                    },
+                )
+                env = {item["key"]: item for item in updated["internal"]["env"]}
+                env_text = (tmp / "runtimes" / "cognee" / ".env").read_text(encoding="utf-8")
+
+                self.assertEqual(env["LLM_MODEL"]["value"], "openai/gpt-5-mini")
+                self.assertEqual(env["VECTOR_DB_PROVIDER"]["value"], "lancedb")
+                self.assertEqual(env["LLM_API_KEY"]["value"], "")
+                self.assertTrue(env["LLM_API_KEY"]["masked"])
+                self.assertIn('LLM_MODEL="openai/gpt-5-mini"', env_text)
             finally:
                 service.close()
 
@@ -914,6 +1024,19 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(res.status, 201)
                 self.assertEqual(payload["user_message"]["content"], "hello")
                 self.assertIsNone(payload["agent_message"])
+                self.assertEqual(payload["agent_status"]["state"], "idle")
+                service.wait_for_agent_idle("channel", str(channels[0]["id"]))
+
+                conn.request(
+                    "POST",
+                    f"/api/channels/{channels[0]['id']}/messages",
+                    body=json.dumps({"content": "@agent hello"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 201)
+                self.assertEqual(payload["user_message"]["content"], "@agent hello")
                 self.assertIn(payload["agent_status"]["state"], {"queued", "replying", "idle"})
                 service.wait_for_agent_idle("channel", str(channels[0]["id"]))
 

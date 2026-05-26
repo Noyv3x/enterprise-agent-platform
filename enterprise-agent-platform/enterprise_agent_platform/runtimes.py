@@ -32,6 +32,17 @@ HERMES_SETTING_INSTALL_EXTRAS = "hermes_install_extras"
 HERMES_SETTING_STARTUP_WAIT = "hermes_startup_wait_seconds"
 HERMES_SETTING_PROVIDER = "hermes_provider"
 HERMES_SETTING_PROVIDER_BASE_URL = "hermes_provider_base_url"
+HERMES_SETTING_TIMEOUT = "hermes_timeout_seconds"
+COGNEE_SETTING_MANAGED = "cognee_manage"
+COGNEE_SETTING_REPO = "cognee_repo"
+COGNEE_SETTING_BACKEND = "cognee_backend"
+COGNEE_SETTING_DATASET = "cognee_dataset"
+COGNEE_SETTING_INGEST_BACKGROUND = "cognee_ingest_background"
+COGNEE_SETTING_DATA_ROOT = "cognee_data_root_directory"
+COGNEE_SETTING_SYSTEM_ROOT = "cognee_system_root_directory"
+COGNEE_SETTING_CACHE_ROOT = "cognee_cache_root_directory"
+COGNEE_SETTING_LOGS_DIR = "cognee_logs_dir"
+COGNEE_SETTING_SKIP_CONNECTION_TEST = "cognee_skip_connection_test"
 
 DEFAULT_PROVIDER_MODELS = {
     "openai-codex": "gpt-5.3-codex",
@@ -416,18 +427,40 @@ class PlatformRuntimeManager:
             "provider_base_url": self._effective_hermes_provider_base_url(provider),
             "install_extras": self._effective_install_extras(),
             "startup_wait_seconds": self._effective_startup_wait_seconds(),
+            "timeout_seconds": self._effective_hermes_timeout_seconds(),
             "source_install": True,
             "venv_path": str(self._hermes_venv_dir()),
+            "config_path": str(self.config.managed_hermes_home / "config.yaml"),
+            "env_path": str(self.config.managed_hermes_home / ".env"),
+            "auth_store": str(self.config.managed_hermes_home / "auth.json"),
+            "logs_dir": str(self.config.managed_hermes_home / "logs"),
             "installed": self._managed_venv_ready(),
             "oauth": self._oauth_status(),
         }
 
+    def cognee_runtime_config(self) -> dict[str, Any]:
+        env_values = self._cognee_env_values()
+        return {
+            "manage_cognee": self._managed_cognee_enabled(),
+            "repo_path": str(self._effective_cognee_repo()),
+            "runtime_dir": str(self.config.cognee_runtime_dir),
+            "backend": self._effective_cognee_backend(),
+            "dataset": self._effective_cognee_dataset(),
+            "ingest_background": self._effective_cognee_ingest_background(),
+            "data_root_directory": env_values["DATA_ROOT_DIRECTORY"],
+            "system_root_directory": env_values["SYSTEM_ROOT_DIRECTORY"],
+            "cache_root_directory": env_values["CACHE_ROOT_DIRECTORY"],
+            "logs_dir": env_values["COGNEE_LOGS_DIR"],
+            "skip_connection_test": env_values["COGNEE_SKIP_CONNECTION_TEST"].lower() in {"1", "true", "yes", "on"},
+            "env_path": str(self._cognee_env_path()),
+        }
+
     def prepare_cognee(self) -> RuntimeStatus:
-        if not self.config.manage_cognee:
+        if not self._managed_cognee_enabled():
             return RuntimeStatus("cognee", False, False, "external", "managed Cognee disabled")
         try:
             self._seed_cognee_env()
-            repo = self.config.cognee_repo
+            repo = self._effective_cognee_repo()
             if repo.exists() and str(repo) not in sys.path:
                 sys.path.insert(0, str(repo))
             available = repo.exists() or _module_importable("cognee")
@@ -440,6 +473,7 @@ class PlatformRuntimeManager:
                     "missing",
                     path=str(self.config.cognee_runtime_dir),
                     error=self._cognee_last_error,
+                    source=str(repo),
                 )
             self._cognee_last_error = ""
             return RuntimeStatus(
@@ -449,6 +483,7 @@ class PlatformRuntimeManager:
                 "prepared",
                 "Cognee local storage and import path are managed by the platform",
                 path=str(self.config.cognee_runtime_dir),
+                source=str(repo),
             )
         except Exception as exc:
             self._cognee_last_error = str(exc)
@@ -712,24 +747,23 @@ class PlatformRuntimeManager:
         return urllib.parse.urlunparse((scheme, netloc, "/health", "", "", ""))
 
     def _seed_cognee_env(self) -> None:
-        root = self.config.cognee_runtime_dir
-        values = {
-            "DATA_ROOT_DIRECTORY": str(root / "data"),
-            "SYSTEM_ROOT_DIRECTORY": str(root / "system"),
-            "CACHE_ROOT_DIRECTORY": str(root / "cache"),
-            "COGNEE_LOGS_DIR": str(root / "logs"),
-            "COGNEE_SKIP_CONNECTION_TEST": "true",
-        }
+        values = self._cognee_env_values()
         for path in values.values():
             if path.startswith("/") or path.startswith("~"):
                 Path(path).expanduser().mkdir(parents=True, exist_ok=True)
         for key, value in values.items():
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
 
     def _managed_hermes_enabled(self) -> bool:
         value = self._runtime_setting(HERMES_SETTING_MANAGED)
         if value is None:
             return self.config.manage_hermes
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _managed_cognee_enabled(self) -> bool:
+        value = self._runtime_setting(COGNEE_SETTING_MANAGED)
+        if value is None:
+            return self.config.manage_cognee
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _effective_hermes_repo(self) -> Path:
@@ -765,6 +799,47 @@ class PlatformRuntimeManager:
             return max(0.0, float(raw))
         except ValueError:
             return self.config.runtime_startup_wait_seconds
+
+    def _effective_hermes_timeout_seconds(self) -> float:
+        raw = self._runtime_setting(HERMES_SETTING_TIMEOUT)
+        if not raw:
+            return self.config.hermes_timeout_seconds
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            return self.config.hermes_timeout_seconds
+
+    def _effective_cognee_repo(self) -> Path:
+        value = self._runtime_setting(COGNEE_SETTING_REPO)
+        return Path(value).expanduser() if value else self.config.cognee_repo
+
+    def _effective_cognee_backend(self) -> str:
+        value = (self._runtime_setting(COGNEE_SETTING_BACKEND) or self.config.knowledge_backend).strip().lower()
+        return value if value in {"local", "hybrid", "cognee"} else "hybrid"
+
+    def _effective_cognee_dataset(self) -> str:
+        return self._runtime_setting(COGNEE_SETTING_DATASET) or self.config.cognee_dataset
+
+    def _effective_cognee_ingest_background(self) -> bool:
+        value = self._runtime_setting(COGNEE_SETTING_INGEST_BACKGROUND)
+        if value is None:
+            return self.config.cognee_ingest_background
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _cognee_env_values(self) -> dict[str, str]:
+        root = self.config.cognee_runtime_dir
+        values = {
+            "DATA_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_DATA_ROOT) or str(root / "data"),
+            "SYSTEM_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_SYSTEM_ROOT) or str(root / "system"),
+            "CACHE_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_CACHE_ROOT) or str(root / "cache"),
+            "COGNEE_LOGS_DIR": self._runtime_setting(COGNEE_SETTING_LOGS_DIR) or str(root / "logs"),
+            "COGNEE_SKIP_CONNECTION_TEST": self._runtime_setting(COGNEE_SETTING_SKIP_CONNECTION_TEST) or "true",
+        }
+        values.update(_read_env_file(self._cognee_env_path()))
+        return values
+
+    def _cognee_env_path(self) -> Path:
+        return self.config.cognee_runtime_dir / ".env"
 
     def _runtime_setting(self, key: str) -> str | None:
         if self.setting_provider is None:

@@ -16,6 +16,13 @@ from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient
+from .internal_config import (
+    read_cognee_internal_config,
+    read_hermes_internal_config,
+    update_env_file,
+    update_yaml_text,
+    update_yaml_values,
+)
 from .knowledge import KnowledgeBase, format_passive_suggestions
 from .oauth_flows import OAuthFlowError, OAuthFlowManager, SUPPORTED_OAUTH_PROVIDERS, oauth_provider_info
 from .runtimes import (
@@ -27,6 +34,7 @@ from .runtimes import (
     HERMES_SETTING_PROVIDER_BASE_URL,
     HERMES_SETTING_REPO,
     HERMES_SETTING_STARTUP_WAIT,
+    HERMES_SETTING_TIMEOUT,
     PlatformRuntimeManager,
     default_base_url_for_provider,
     default_model_for_provider,
@@ -43,6 +51,7 @@ class ServiceError(Exception):
 
 THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING_DEPTH = "medium"
+AGENT_MENTION_RE = re.compile(r"(?<![\w@])@(agent|main-agent|main_agent|main\s+agent)(?![A-Za-z0-9_-])", re.IGNORECASE)
 
 PERMISSION_READ_WORKSPACE = "read_workspace"
 PERMISSION_CHAT = "chat"
@@ -386,15 +395,22 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={"generation": generation},
+            metadata={"generation": generation, "agent_mention": bool(channel_agent_request(content))},
         )
+        agent_content = channel_agent_request(content)
+        if agent_content is None:
+            return {
+                "user_message": user_msg,
+                "agent_message": None,
+                "agent_status": self.agent_status(actor, "channel", scope_id),
+            }
         status = self._enqueue_agent_reply(
             {
                 "scope_type": "channel",
                 "scope_id": scope_id,
                 "channel": channel,
                 "actor": dict(actor),
-                "content": content,
+                "content": agent_content,
                 "generation": generation,
                 "user_message": user_msg,
             }
@@ -407,8 +423,11 @@ class EnterpriseService:
         content = str(task["content"])
         generation = task["generation"]
         user_msg = task["user_message"]
+        self._record_agent_activity("channel", scope_id, "knowledge", "检索企业知识", "enterprise_kb_search")
         suggestions = self.knowledge.suggest(self._recent_context_before("channel", scope_id, content, int(user_msg["id"])))
+        self._record_agent_activity("channel", scope_id, "context", "整理频道上下文", f"{len(suggestions)} 条知识建议")
         system_prompt = self._channel_system_prompt(channel, suggestions)
+        self._record_agent_activity("channel", scope_id, "model", "调用 Hermes Agent", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=content,
@@ -420,7 +439,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
-        return self._append_message(
+        message = self._append_message(
             scope_type="channel",
             scope_id=scope_id,
             author_type="agent",
@@ -435,6 +454,8 @@ class EnterpriseService:
                 "reply_to": self._reply_target(task),
             },
         )
+        self._record_agent_activity("channel", scope_id, "complete", "写回频道回复", f"message #{message['id']}")
+        return message
 
     def send_private_message(self, actor: dict[str, Any], content: str) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
@@ -476,14 +497,18 @@ class EnterpriseService:
         generation = task["generation"]
         scope_id = str(task["scope_id"])
         user_msg = task["user_message"]
+        self._record_agent_activity("private", scope_id, "workspace", "准备私人工作区", f"u{actor['id']}")
         container = self.containers.ensure_private_container(
             user_id=actor["id"],
             username=actor["username"],
             secrets_env=self.model_secret_env(),
         )
         container_data = container.to_dict()
+        self._record_agent_activity("private", scope_id, "knowledge", "检索企业知识", "enterprise_kb_search")
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, content, int(user_msg["id"])))
+        self._record_agent_activity("private", scope_id, "context", "整理私人会话上下文", f"{len(suggestions)} 条知识建议")
         system_prompt = self._private_system_prompt(actor, container_data, suggestions)
+        self._record_agent_activity("private", scope_id, "model", "调用私人 Agent", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=content,
@@ -495,7 +520,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
-        return self._append_message(
+        message = self._append_message(
             scope_type="private",
             scope_id=scope_id,
             author_type="agent",
@@ -511,6 +536,8 @@ class EnterpriseService:
                 "reply_to": self._reply_target(task),
             },
         )
+        self._record_agent_activity("private", scope_id, "complete", "写回私人回复", f"message #{message['id']}")
+        return message
 
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
@@ -534,6 +561,63 @@ class EnterpriseService:
             or self.get_secret("API_SERVER_KEY")
         )
         return {"config": config, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
+
+    def hermes_internal_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        self.runtimes.prepare_hermes()
+        config = self.runtimes.hermes_runtime_config()
+        internal = read_hermes_internal_config(Path(config["config_path"]), Path(config["env_path"]))
+        return {"config": config, "internal": internal, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
+
+    def update_hermes_internal_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        config = self.runtimes.hermes_runtime_config()
+        try:
+            if "yaml_text" in body:
+                update_yaml_text(Path(config["config_path"]), str(body.get("yaml_text") or ""))
+            yaml_updates = body.get("yaml_updates")
+            if isinstance(yaml_updates, dict):
+                update_yaml_values(Path(config["config_path"]), yaml_updates)
+            env_updates = body.get("env")
+            if isinstance(env_updates, dict):
+                update_env_file(Path(config["env_path"]), env_updates)
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        self.runtimes.prepare_hermes()
+        return self.hermes_internal_config(actor)
+
+    def cognee_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        runtime_config = self.runtimes.cognee_runtime_config()
+        internal = read_cognee_internal_config(
+            Path(runtime_config["env_path"]),
+            {
+                "DATA_ROOT_DIRECTORY": str(runtime_config.get("data_root_directory", "")),
+                "SYSTEM_ROOT_DIRECTORY": str(runtime_config.get("system_root_directory", "")),
+                "CACHE_ROOT_DIRECTORY": str(runtime_config.get("cache_root_directory", "")),
+                "COGNEE_LOGS_DIR": str(runtime_config.get("logs_dir", "")),
+                "COGNEE_SKIP_CONNECTION_TEST": "true" if runtime_config.get("skip_connection_test") else "false",
+            },
+        )
+        return {
+            "config": runtime_config,
+            "internal": internal,
+            "runtime": self.runtimes.cognee_status().to_dict(),
+            "knowledge": self.knowledge_status(),
+        }
+
+    def update_cognee_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        runtime_config = self.runtimes.cognee_runtime_config()
+        env_updates = body.get("env")
+        if isinstance(env_updates, dict):
+            try:
+                update_env_file(Path(runtime_config["env_path"]), env_updates)
+            except ValueError as exc:
+                raise ServiceError(400, str(exc)) from exc
+        self.cognee.refresh_status()
+        self.runtimes.ensure_cognee_ready()
+        return self.cognee_config(actor)
 
     def update_hermes_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -590,6 +674,14 @@ class EnterpriseService:
             if wait_seconds < 0 or wait_seconds > 120:
                 raise ServiceError(400, "startup wait seconds must be between 0 and 120")
             self.set_setting(HERMES_SETTING_STARTUP_WAIT, str(wait_seconds))
+        if "timeout_seconds" in body:
+            try:
+                timeout_seconds = float(body.get("timeout_seconds"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "timeout seconds must be a number") from exc
+            if timeout_seconds < 1 or timeout_seconds > 3600:
+                raise ServiceError(400, "timeout seconds must be between 1 and 3600")
+            self.set_setting(HERMES_SETTING_TIMEOUT, str(timeout_seconds))
         api_key = str(body.get("api_key", "")).strip()
         if api_key:
             self.set_setting("API_SERVER_KEY", api_key, secret=True)
@@ -940,6 +1032,7 @@ class EnterpriseService:
 
     def _append_agent_error(self, task: dict[str, Any], error: str) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
+        self._record_agent_activity(str(task["scope_type"]), str(task["scope_id"]), "error", "Agent 回复失败", error[:180])
         self._append_message(
             scope_type=str(task["scope_type"]),
             scope_id=str(task["scope_id"]),
@@ -976,9 +1069,20 @@ class EnterpriseService:
         return {
             "scope_type": str(task["scope_type"]),
             "scope_id": str(task["scope_id"]),
+            "run_id": self._run_id_for_task(task),
             "state": state,
             "replying_to": self._reply_target(task),
             "queued_count": queued_count,
+            "activity": [
+                {
+                    "stage": state,
+                    "label": "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求",
+                    "detail": "",
+                    "at": now_ts(),
+                }
+            ],
+            "current_step": "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求",
+            "started_at": now_ts(),
             "updated_at": now_ts(),
             "last_error": "",
         }
@@ -988,9 +1092,13 @@ class EnterpriseService:
         return {
             "scope_type": scope_type,
             "scope_id": str(scope_id),
+            "run_id": "",
             "state": "idle",
             "replying_to": None,
             "queued_count": 0,
+            "activity": [],
+            "current_step": "",
+            "started_at": None,
             "updated_at": now_ts(),
             "last_error": last_error,
         }
@@ -1000,7 +1108,24 @@ class EnterpriseService:
         copied = dict(status)
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
+        copied["activity"] = [dict(item) for item in copied.get("activity") or []]
         return copied
+
+    def _record_agent_activity(self, scope_type: str, scope_id: str, stage: str, label: str, detail: str = "") -> None:
+        key = self._conversation_key(scope_type, str(scope_id))
+        with self._conversation_lock:
+            status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            activity = [dict(item) for item in status.get("activity") or []]
+            activity.append({"stage": stage, "label": label, "detail": detail, "at": now_ts()})
+            status["activity"] = activity[-30:]
+            status["current_step"] = label
+            status["updated_at"] = now_ts()
+            self._agent_status[key] = status
+
+    @staticmethod
+    def _run_id_for_task(task: dict[str, Any]) -> str:
+        message = task["user_message"]
+        return f"{task['scope_type']}:{task['scope_id']}:{message['id']}"
 
     @staticmethod
     def _reply_target(task: dict[str, Any]) -> dict[str, Any]:
@@ -1208,6 +1333,14 @@ def normalize_channel_name(value: str) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,48}", clean):
         raise ServiceError(400, "invalid channel name")
     return clean
+
+
+def channel_agent_request(content: str) -> str | None:
+    if not AGENT_MENTION_RE.search(content):
+        return None
+    cleaned = AGENT_MENTION_RE.sub("", content).strip()
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned or content.strip()
 
 
 def parse_bool(value: Any) -> bool:

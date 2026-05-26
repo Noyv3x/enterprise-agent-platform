@@ -15,6 +15,7 @@ const state = {
   pendingMessages: [],
   drafts: {},
   agentStatuses: { channels: {}, private: null },
+  expandedAgentRuns: {},
   typingUsers: [],
   documents: [],
   selectedDocument: null,
@@ -23,6 +24,8 @@ const state = {
   secrets: [],
   runtimes: null,
   hermesConfig: null,
+  hermesInternalConfig: null,
+  cogneeConfig: null,
   oauthProviders: null,
   oauthFlows: {},
   oauthCallbackUrls: {},
@@ -429,7 +432,7 @@ function renderChat(mode) {
     placeholder: noChannel
       ? "选择频道后发送消息"
       : canChat
-      ? (mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息…`)
+      ? (mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息，@agent 呼叫 Agent…`)
       : "当前权限组只能查看内容",
     "aria-label": "消息输入框",
     oninput: (e) => {
@@ -474,7 +477,7 @@ function renderChat(mode) {
   } else if (!messages.length && !isAgentActive(agentStatusFor(mode))) {
     body = mode === "private"
       ? emptyState("bot", "开启你的私人 Agent", "这是仅你可见的助手。发送第一条消息试试看。")
-      : emptyState("message", "暂无消息", "成为第一个在该频道发言的人。Agent 会在此回应。");
+      : emptyState("message", "暂无消息", "成为第一个在该频道发言的人。需要时 @agent。");
   } else {
     const items = messages.map(renderMessage);
     const status = agentStatusFor(mode);
@@ -529,13 +532,41 @@ function renderMessage(message) {
 function renderAgentActivity(status) {
   const text = agentStatusText(status) || "Agent 正在回复";
   const waiting = status?.state === "replying" ? status.queued_count : Math.max(0, (status?.queued_count || 0) - 1);
+  const steps = status?.activity || [];
+  const current = status?.current_step || text;
+  const runId = status?.run_id || `${status?.scope_type || "agent"}:${status?.scope_id || ""}`;
+  const expanded = !!state.expandedAgentRuns[runId];
   return h("article", { class: "msg msg--agent msg--activity" }, [
     h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
-    h("div", { class: "agent-status" }, [
-      h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
-      h("span", { text }),
-      waiting > 0 ? h("span", { class: "agent-status__queue", text: `另有 ${waiting} 条等待` }) : null,
+    h("details", { class: "agent-work", open: expanded }, [
+      h("summary", {
+        class: "agent-work__summary",
+        onclick: (event) => {
+          event.preventDefault();
+          state.expandedAgentRuns[runId] = !expanded;
+          render();
+        },
+      }, [
+        h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
+        h("div", { class: "agent-work__main" }, [
+          h("span", { class: "agent-work__title", text }),
+          h("span", { class: "agent-work__step", text: current }),
+        ]),
+        waiting > 0 ? h("span", { class: "agent-status__queue", text: `另有 ${waiting} 条等待` }) : null,
+      ]),
+      h("div", { class: "agent-work__timeline" }, (steps.length ? steps : [{ stage: "active", label: current, detail: "", at: status?.updated_at }]).map(renderAgentStep)),
     ]),
+  ]);
+}
+
+function renderAgentStep(step) {
+  return h("div", { class: "agent-step" }, [
+    h("span", { class: "agent-step__dot" }),
+    h("div", { class: "agent-step__body" }, [
+      h("span", { class: "agent-step__label", text: step.label || step.stage || "处理中" }),
+      step.detail ? h("span", { class: "agent-step__detail", text: step.detail }) : null,
+    ]),
+    step.at ? h("span", { class: "agent-step__time", text: formatTime(step.at) }) : null,
   ]);
 }
 
@@ -660,6 +691,8 @@ function renderAdminPanel() {
       renderOAuthSettings(),
       renderRuntimeSettings(),
       renderHermesConfig(),
+      renderHermesInternalConfig(),
+      renderCogneeInternalConfig(),
       renderSecretsSettings(),
     ]),
   ]);
@@ -855,6 +888,7 @@ function renderHermesConfig() {
   const model = h("input", { value: hermes.model || "" });
   const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
   const startupWait = h("input", { type: "number", min: "0", max: "120", step: "0.5", value: hermes.startup_wait_seconds ?? 8 });
+  const timeoutSeconds = h("input", { type: "number", min: "1", max: "3600", step: "1", value: hermes.timeout_seconds ?? 240 });
   const apiKey = h("input", { type: "password", autocomplete: "off", placeholder: hermes.api_key_configured ? "保持不变" : "API server key" });
 
   return h("section", { class: "card config-form" }, [
@@ -874,6 +908,7 @@ function renderHermesConfig() {
               model: model.value,
               install_extras: installExtras.value,
               startup_wait_seconds: startupWait.value,
+              timeout_seconds: timeoutSeconds.value,
               api_key: apiKey.value,
             }),
           });
@@ -895,6 +930,7 @@ function renderHermesConfig() {
         field("模型", model),
         field("安装 extras", installExtras),
         field("启动等待秒数", startupWait),
+        field("请求超时秒数", timeoutSeconds),
         field("API Server Key", apiKey),
       ]),
       h("div", { class: "form-actions" }, [
@@ -903,6 +939,186 @@ function renderHermesConfig() {
       ]),
     ]),
   ]);
+}
+
+function renderHermesInternalConfig() {
+  const payload = state.hermesInternalConfig || {};
+  const internal = payload.internal || {};
+  const fields = internal.fields || [];
+  const envFields = internal.env || [];
+  const yaml = h("textarea", { class: "raw-config", spellcheck: "false", "aria-label": "Hermes config.yaml" });
+  yaml.value = internal.yaml_text || "";
+  return h("section", { class: "card config-software" }, [
+    cardHead("Hermes 内部配置", "settings", { desc: internal.config_path || "config.yaml" }),
+    internal.yaml_error ? h("div", { class: "config-warning", text: internal.yaml_error }) : null,
+    renderConfigSections(internal.sections || []),
+    renderConfigFieldsForm({
+      fields,
+      attr: "yamlKey",
+      buttonText: "保存 Hermes 字段",
+      onsubmit: async (updates) => {
+        await withBusy(async () => {
+          await api("/api/system/hermes/internal-config", { method: "PUT", body: JSON.stringify({ yaml_updates: updates }) });
+          await loadHermesInternalConfig();
+          toast("Hermes 内部配置已保存", { type: "ok", title: "完成" });
+        });
+      },
+    }),
+    h("form", {
+      class: "raw-config-form",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        await withBusy(async () => {
+          await api("/api/system/hermes/internal-config", { method: "PUT", body: JSON.stringify({ yaml_text: yaml.value }) });
+          await loadHermesInternalConfig();
+          toast("Hermes config.yaml 已保存", { type: "ok", title: "完成" });
+        });
+      },
+    }, [
+      h("div", { class: "section-label", text: "config.yaml" }),
+      yaml,
+      h("div", { class: "form-actions" }, [
+        h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [h("span", { text: "保存 YAML" })]),
+      ]),
+    ]),
+    renderConfigFieldsForm({
+      fields: envFields,
+      attr: "envKey",
+      buttonText: "保存 Hermes 环境变量",
+      onsubmit: async (updates) => {
+        await withBusy(async () => {
+          await api("/api/system/hermes/internal-config", { method: "PUT", body: JSON.stringify({ env: updates }) });
+          await loadHermesInternalConfig();
+          toast("Hermes .env 已保存", { type: "ok", title: "完成" });
+        });
+      },
+    }),
+  ]);
+}
+
+function renderCogneeInternalConfig() {
+  const payload = state.cogneeConfig || {};
+  const internal = payload.internal || {};
+  return h("section", { class: "card config-software" }, [
+    cardHead("Cognee 内部配置", "settings", { desc: internal.env_path || "Cognee .env" }),
+    renderConfigFieldsForm({
+      fields: internal.env || [],
+      attr: "envKey",
+      buttonText: "保存 Cognee 环境变量",
+      onsubmit: async (updates) => {
+        await withBusy(async () => {
+          await api("/api/system/cognee/config", { method: "PUT", body: JSON.stringify({ env: updates }) });
+          await loadCogneeConfig();
+          await loadRuntime();
+          toast("Cognee 内部配置已保存", { type: "ok", title: "完成" });
+        });
+      },
+    }),
+  ]);
+}
+
+function renderConfigSections(sections) {
+  if (!sections.length) return null;
+  return h("div", { class: "config-sections" }, sections.slice(0, 18).map((section) =>
+    h("span", { class: "chip" }, [h("span", { class: "chip__id", text: section.key }), h("span", { text: section.detail })])));
+}
+
+function renderConfigFieldsForm({ fields, attr, buttonText, onsubmit }) {
+  if (!fields.length) return h("div", { class: "muted", text: "正在读取配置…" });
+  return h("form", {
+    class: "config-fields-form",
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const updates = collectConfigUpdates(event.currentTarget, attr);
+      if (!Object.keys(updates).length) return;
+      await onsubmit(updates);
+    },
+  }, [
+    h("div", { class: "config-groups" }, groupedConfigFields(fields, attr)),
+    h("div", { class: "form-actions" }, [
+      h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [h("span", { text: buttonText })]),
+    ]),
+  ]);
+}
+
+function groupedConfigFields(fields, attr) {
+  const groups = {};
+  for (const item of fields) {
+    const group = item.group || "配置";
+    groups[group] = groups[group] || [];
+    groups[group].push(item);
+  }
+  return Object.entries(groups).map(([group, items], index) =>
+    h("details", { class: "config-group", open: index < 2 }, [
+      h("summary", {}, [h("span", { text: group }), h("span", { class: "nav__badge", text: String(items.length) })]),
+      h("div", { class: "config-group__body" }, items.map((item) => renderConfigField(item, attr))),
+    ]));
+}
+
+function renderConfigField(item, attr) {
+  return h("label", { class: "config-field" }, [
+    h("span", { class: "config-field__label" }, [
+      h("strong", { text: item.label || item.key }),
+      h("code", { text: item.key }),
+    ]),
+    configFieldControl(item, attr),
+  ]);
+}
+
+function configFieldControl(item, attr) {
+  const dataAttr = attr === "yamlKey" ? "data-yaml-key" : "data-env-key";
+  const common = { [dataAttr]: item.key };
+  if (item.kind === "boolean") {
+    const select = h("select", common, [
+      h("option", { value: "", text: "未设置" }),
+      h("option", { value: "true", text: "true" }),
+      h("option", { value: "false", text: "false" }),
+    ]);
+    if (item.configured) select.value = String(item.value === true || String(item.value).toLowerCase() === "true");
+    select.dataset.initial = select.value;
+    return select;
+  }
+  if (item.options?.length) {
+    const select = h("select", common, [
+      h("option", { value: "", text: "未设置" }),
+      ...item.options.map((option) => h("option", { value: option, text: option })),
+    ]);
+    select.value = item.configured ? String(item.value ?? "") : "";
+    select.dataset.initial = select.value;
+    return select;
+  }
+  if (item.kind === "json") {
+    const textarea = h("textarea", { ...common, spellcheck: "false" });
+    textarea.value = item.configured ? String(item.value ?? "") : "";
+    textarea.dataset.initial = textarea.value;
+    return textarea;
+  }
+  const attrs = {
+    ...common,
+    type: item.secret ? "password" : item.kind === "number" ? "number" : "text",
+    autocomplete: "off",
+    placeholder: item.secret && item.configured ? item.masked : "",
+  };
+  const input = h("input", attrs);
+  if (!item.secret && item.configured) input.value = String(item.value ?? "");
+  input.dataset.initial = input.value;
+  return input;
+}
+
+function collectConfigUpdates(form, attr) {
+  const selector = attr === "yamlKey" ? "[data-yaml-key]" : "[data-env-key]";
+  const keyAttr = attr === "yamlKey" ? "yamlKey" : "envKey";
+  const updates = {};
+  form.querySelectorAll(selector).forEach((control) => {
+    const key = control.dataset[keyAttr];
+    if (!key) return;
+    const value = control.value;
+    if (value === control.dataset.initial) return;
+    if (control.type === "password" && !value) return;
+    if (attr === "envKey" && value === "") return;
+    updates[key] = value;
+  });
+  return updates;
 }
 
 function renderSecretsSettings() {
@@ -1071,6 +1287,8 @@ function agentStatusFingerprint(status) {
   return {
     state: status.state,
     queued_count: status.queued_count || 0,
+    current_step: status.current_step || "",
+    activity: (status.activity || []).map((item) => `${item.stage}:${item.label}:${item.detail}:${item.at}`),
     replying_to: status.replying_to
       ? {
           id: status.replying_to.id,
@@ -1221,7 +1439,9 @@ async function loadSecrets() {
 async function loadOAuthProviders() { state.oauthProviders = await api("/api/system/oauth/providers"); }
 async function loadRuntime() { state.runtimes = await api("/api/system/runtime"); }
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
-async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]); }
+async function loadHermesInternalConfig() { state.hermesInternalConfig = await api("/api/system/hermes/internal-config"); }
+async function loadCogneeConfig() { state.cogneeConfig = await api("/api/system/cognee/config"); }
+async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
 async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings()]); }
 async function refreshActiveChat({ renderAfter = true } = {}) {
   if (!state.user || pollInFlight) return;

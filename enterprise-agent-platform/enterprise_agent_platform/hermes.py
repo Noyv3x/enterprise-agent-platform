@@ -105,7 +105,7 @@ class HermesAgentClient:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.config.hermes_timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=self._effective_timeout_seconds()) as response:
             raw = json.loads(response.read().decode("utf-8"))
             response_session = response.headers.get("X-Hermes-Session-Id") or session_id
         choices = raw.get("choices") or []
@@ -131,6 +131,13 @@ class HermesAgentClient:
 
     def _effective_model(self) -> str:
         return str(self._runtime_config().get("model") or self.config.hermes_model)
+
+    def _effective_timeout_seconds(self) -> float:
+        raw = self._runtime_config().get("timeout_seconds")
+        try:
+            return max(1.0, float(raw)) if raw is not None else self.config.hermes_timeout_seconds
+        except (TypeError, ValueError):
+            return self.config.hermes_timeout_seconds
 
     @staticmethod
     def _apply_reasoning_config(
