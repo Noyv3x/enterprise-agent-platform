@@ -9,7 +9,7 @@ from typing import Any
 
 from .auth import TokenSigner, hash_password, verify_password
 from .cognee_bridge import CogneeBridge
-from .config import MODEL_SECRET_KEYS, PlatformConfig
+from .config import MODEL_SECRET_KEYS, OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient
@@ -19,9 +19,14 @@ from .runtimes import (
     HERMES_SETTING_INSTALL_EXTRAS,
     HERMES_SETTING_MANAGED,
     HERMES_SETTING_MODEL,
+    HERMES_SETTING_PROVIDER,
+    HERMES_SETTING_PROVIDER_BASE_URL,
     HERMES_SETTING_REPO,
     HERMES_SETTING_STARTUP_WAIT,
     PlatformRuntimeManager,
+    default_base_url_for_provider,
+    default_model_for_provider,
+    normalize_hermes_provider,
 )
 
 
@@ -326,11 +331,33 @@ class EnterpriseService:
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ServiceError(400, "Hermes API URL must be an http(s) URL")
             self.set_setting(HERMES_SETTING_API_URL, api_url)
+        provider = None
+        if "provider" in body:
+            provider = normalize_hermes_provider(str(body.get("provider", "") or "auto"))
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", provider):
+                raise ServiceError(400, "invalid Hermes provider")
+            self.set_setting(HERMES_SETTING_PROVIDER, provider)
+        if "provider_base_url" in body or "base_url" in body:
+            raw_base_url = body.get("provider_base_url", body.get("base_url", ""))
+            base_url = str(raw_base_url or "").strip().rstrip("/")
+            if base_url:
+                parsed = urllib.parse.urlparse(base_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ServiceError(400, "Hermes provider base URL must be an http(s) URL")
+            self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, base_url)
         if "model" in body:
             model = str(body.get("model", "")).strip()
+            if provider and model in {"", "hermes-agent"}:
+                model = default_model_for_provider(provider) or model
             if not model:
                 raise ServiceError(400, "Hermes model is required")
             self.set_setting(HERMES_SETTING_MODEL, model)
+        elif provider:
+            default_model = default_model_for_provider(provider)
+            if default_model:
+                self.set_setting(HERMES_SETTING_MODEL, default_model)
+            if not self.get_setting(HERMES_SETTING_PROVIDER_BASE_URL):
+                self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
         if "install_extras" in body:
             extras = str(body.get("install_extras", "")).strip()
             if extras and not re.fullmatch(r"[A-Za-z0-9_,.-]{1,120}", extras):
@@ -441,7 +468,8 @@ class EnterpriseService:
         rows = self.db.query("SELECT key, value, updated_at FROM settings WHERE secret = 1 ORDER BY key")
         found = {row["key"]: row for row in rows}
         items = []
-        for key in sorted(set(MODEL_SECRET_KEYS) | set(found) | {"ENTERPRISE_HERMES_API_KEY", "API_SERVER_KEY"}):
+        known_keys = set(MODEL_SECRET_KEYS) | set(OAUTH_SECRET_KEYS) | {"ENTERPRISE_HERMES_API_KEY", "API_SERVER_KEY"}
+        for key in sorted(known_keys | set(found)):
             value = found.get(key, {}).get("value") or os.getenv(key, "")
             items.append({
                 "key": key,

@@ -19,6 +19,19 @@ MODEL_SECRET_KEYS = (
     "NVIDIA_API_KEY",
 )
 
+OAUTH_SECRET_KEYS = (
+    "CODEX_OAUTH_ACCESS_TOKEN",
+    "CODEX_OAUTH_REFRESH_TOKEN",
+    "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
+    "OPENAI_CODEX_OAUTH_REFRESH_TOKEN",
+    "XAI_OAUTH_ACCESS_TOKEN",
+    "XAI_OAUTH_REFRESH_TOKEN",
+    "XAI_OAUTH_ID_TOKEN",
+    "GROK_OAUTH_ACCESS_TOKEN",
+    "GROK_OAUTH_REFRESH_TOKEN",
+    "GROK_OAUTH_ID_TOKEN",
+)
+
 
 @dataclass(frozen=True)
 class PlatformConfig:
@@ -46,6 +59,8 @@ class PlatformConfig:
     hermes_home: Path | None = None
     hermes_install_extras: str = ""
     runtime_startup_wait_seconds: float = 8.0
+    hermes_provider: str = "auto"
+    hermes_provider_base_url: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -108,6 +123,8 @@ class PlatformConfig:
             ).expanduser(),
             hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
             runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
+            hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "auto").strip().lower() or "auto",
+            hermes_provider_base_url=os.getenv("ENTERPRISE_HERMES_PROVIDER_BASE_URL", "").strip().rstrip("/"),
         )
 
 

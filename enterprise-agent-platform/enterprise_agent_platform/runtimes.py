@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -27,6 +29,15 @@ HERMES_SETTING_API_URL = "hermes_api_url"
 HERMES_SETTING_MODEL = "hermes_model"
 HERMES_SETTING_INSTALL_EXTRAS = "hermes_install_extras"
 HERMES_SETTING_STARTUP_WAIT = "hermes_startup_wait_seconds"
+HERMES_SETTING_PROVIDER = "hermes_provider"
+HERMES_SETTING_PROVIDER_BASE_URL = "hermes_provider_base_url"
+
+DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_PROVIDER_MODELS = {
+    "openai-codex": "gpt-5.3-codex",
+    "xai-oauth": "grok-4.3",
+}
 
 
 class ProcessLike(Protocol):
@@ -162,6 +173,7 @@ class PlatformRuntimeManager:
         (home / "logs").mkdir(parents=True, exist_ok=True)
         self._install_enterprise_plugin(home)
         self._ensure_hermes_config(home)
+        self._write_hermes_auth(home)
         self._write_hermes_env(home)
         install_status = self.ensure_hermes_installed(force=False)
         if not install_status.available:
@@ -393,6 +405,7 @@ class PlatformRuntimeManager:
     def hermes_runtime_config(self) -> dict[str, Any]:
         api_url = self._effective_hermes_api_url()
         parsed = urllib.parse.urlparse(api_url)
+        provider = self._effective_hermes_provider()
         return {
             "manage_hermes": self._managed_hermes_enabled(),
             "repo_path": str(self._effective_hermes_repo()),
@@ -401,11 +414,14 @@ class PlatformRuntimeManager:
             "api_host": parsed.hostname or "127.0.0.1",
             "api_port": parsed.port or 8642,
             "model": self._effective_hermes_model(),
+            "provider": provider,
+            "provider_base_url": self._effective_hermes_provider_base_url(provider),
             "install_extras": self._effective_install_extras(),
             "startup_wait_seconds": self._effective_startup_wait_seconds(),
             "source_install": True,
             "venv_path": str(self._hermes_venv_dir()),
             "installed": self._managed_venv_ready(),
+            "oauth": self._oauth_status(),
         }
 
     def prepare_cognee(self) -> RuntimeStatus:
@@ -503,7 +519,46 @@ class PlatformRuntimeManager:
         enabled_set = {str(item) for item in enabled}
         enabled_set.add(HERMES_PLUGIN_KEY)
         plugins["enabled"] = sorted(enabled_set)
+        self._apply_managed_model_config(data)
         _write_yaml_mapping(path, data)
+
+    def _apply_managed_model_config(self, data: dict[str, Any]) -> None:
+        model_setting = self._runtime_setting(HERMES_SETTING_MODEL)
+        provider_setting = self._runtime_setting(HERMES_SETTING_PROVIDER)
+        base_url_setting = self._runtime_setting(HERMES_SETTING_PROVIDER_BASE_URL)
+        if model_setting is None and provider_setting is None and base_url_setting is None:
+            return
+
+        existing = data.get("model")
+        if isinstance(existing, dict):
+            model_config = existing
+        elif isinstance(existing, str) and existing.strip():
+            model_config = {"default": existing.strip()}
+        else:
+            model_config = {}
+        data["model"] = model_config
+
+        if model_setting is not None:
+            model_config["default"] = self._effective_hermes_model()
+
+        if provider_setting is not None:
+            provider = self._effective_hermes_provider()
+            if provider == "auto":
+                model_config.pop("provider", None)
+                model_config.pop("base_url", None)
+            else:
+                model_config["provider"] = provider
+                base_url = self._effective_hermes_provider_base_url(provider)
+                if base_url:
+                    model_config["base_url"] = base_url
+                else:
+                    model_config.pop("base_url", None)
+        elif base_url_setting is not None:
+            base_url = self._effective_hermes_provider_base_url(self._effective_hermes_provider())
+            if base_url:
+                model_config["base_url"] = base_url
+            else:
+                model_config.pop("base_url", None)
 
     def _write_hermes_env(self, home: Path) -> None:
         env_values = self._hermes_child_values()
@@ -511,6 +566,84 @@ class PlatformRuntimeManager:
         existing = _read_env_file(path)
         existing.update(env_values)
         _write_env_file(path, existing)
+
+    def _write_hermes_auth(self, home: Path) -> None:
+        auth_path = home / "auth.json"
+        auth_store = _read_json_mapping(auth_path)
+        providers = auth_store.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            auth_store["providers"] = providers
+
+        changed = False
+        changed |= self._upsert_codex_oauth(providers)
+        changed |= self._upsert_xai_oauth(providers)
+
+        provider = self._effective_hermes_provider()
+        if provider in {"openai-codex", "xai-oauth"} and isinstance(providers.get(provider), dict):
+            if auth_store.get("active_provider") != provider:
+                auth_store["active_provider"] = provider
+                changed = True
+
+        if changed:
+            auth_store["version"] = auth_store.get("version") or 2
+            auth_store["updated_at"] = _iso_now()
+            _write_json_secure(auth_path, auth_store)
+
+    def _upsert_codex_oauth(self, providers: dict[str, Any]) -> bool:
+        access_token = self._first_secret(
+            "CODEX_OAUTH_ACCESS_TOKEN",
+            "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
+        )
+        refresh_token = self._first_secret(
+            "CODEX_OAUTH_REFRESH_TOKEN",
+            "OPENAI_CODEX_OAUTH_REFRESH_TOKEN",
+        )
+        if not access_token or not refresh_token:
+            return False
+        state = providers.get("openai-codex")
+        if not isinstance(state, dict):
+            state = {}
+        original = json.dumps(state, sort_keys=True)
+        tokens = dict(state.get("tokens") or {})
+        tokens["access_token"] = access_token
+        tokens["refresh_token"] = refresh_token
+        state["tokens"] = tokens
+        state["auth_mode"] = "chatgpt"
+        state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        changed = original != json.dumps(state, sort_keys=True)
+        providers["openai-codex"] = state
+        return changed
+
+    def _upsert_xai_oauth(self, providers: dict[str, Any]) -> bool:
+        access_token = self._first_secret("XAI_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_ACCESS_TOKEN")
+        refresh_token = self._first_secret("XAI_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_REFRESH_TOKEN")
+        if not access_token or not refresh_token:
+            return False
+        state = providers.get("xai-oauth")
+        if not isinstance(state, dict):
+            state = {}
+        original = json.dumps(state, sort_keys=True)
+        tokens = dict(state.get("tokens") or {})
+        tokens["access_token"] = access_token
+        tokens["refresh_token"] = refresh_token
+        id_token = self._first_secret("XAI_OAUTH_ID_TOKEN", "GROK_OAUTH_ID_TOKEN")
+        if id_token:
+            tokens["id_token"] = id_token
+        tokens.setdefault("token_type", "Bearer")
+        state["tokens"] = tokens
+        state["auth_mode"] = "oauth_pkce"
+        state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        changed = original != json.dumps(state, sort_keys=True)
+        providers["xai-oauth"] = state
+        return changed
+
+    def _first_secret(self, *keys: str) -> str:
+        for key in keys:
+            value = self.secret_provider(key)
+            if value:
+                return str(value).strip()
+        return ""
 
     def _hermes_process_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -521,6 +654,15 @@ class PlatformRuntimeManager:
             current = env.get("PYTHONPATH", "")
             parts = [str(repo)] + ([current] if current else [])
             env["PYTHONPATH"] = os.pathsep.join(parts)
+        provider = self._effective_hermes_provider()
+        provider_base_url = self._effective_hermes_provider_base_url(provider)
+        if provider != "auto":
+            env["HERMES_INFERENCE_PROVIDER"] = provider
+        if provider == "openai-codex" and provider_base_url:
+            env["HERMES_CODEX_BASE_URL"] = provider_base_url
+        if provider in {"xai", "xai-oauth"} and provider_base_url:
+            env["HERMES_XAI_BASE_URL"] = provider_base_url
+            env["XAI_BASE_URL"] = provider_base_url
         for key in MODEL_SECRET_KEYS:
             value = self.secret_provider(key)
             if value:
@@ -543,6 +685,15 @@ class PlatformRuntimeManager:
             "HERMES_ACCEPT_HOOKS": "1",
             "COGNEE_SKIP_CONNECTION_TEST": "true",
         }
+        provider = self._effective_hermes_provider()
+        provider_base_url = self._effective_hermes_provider_base_url(provider)
+        if provider != "auto":
+            values["HERMES_INFERENCE_PROVIDER"] = provider
+        if provider == "openai-codex" and provider_base_url:
+            values["HERMES_CODEX_BASE_URL"] = provider_base_url
+        if provider in {"xai", "xai-oauth"} and provider_base_url:
+            values["HERMES_XAI_BASE_URL"] = provider_base_url
+            values["XAI_BASE_URL"] = provider_base_url
         if api_key:
             values["API_SERVER_KEY"] = api_key
         return values
@@ -614,6 +765,17 @@ class PlatformRuntimeManager:
 
     def _effective_hermes_model(self) -> str:
         return self._runtime_setting(HERMES_SETTING_MODEL) or self.config.hermes_model
+
+    def _effective_hermes_provider(self) -> str:
+        value = self._runtime_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider
+        return normalize_hermes_provider(value)
+
+    def _effective_hermes_provider_base_url(self, provider: str | None = None) -> str:
+        provider = normalize_hermes_provider(provider or self._effective_hermes_provider())
+        value = self._runtime_setting(HERMES_SETTING_PROVIDER_BASE_URL) or self.config.hermes_provider_base_url
+        if value:
+            return str(value).strip().rstrip("/")
+        return default_base_url_for_provider(provider)
 
     def _effective_install_extras(self) -> str:
         return self._runtime_setting(HERMES_SETTING_INSTALL_EXTRAS) or self.config.hermes_install_extras
@@ -697,6 +859,22 @@ class PlatformRuntimeManager:
     def _hermes_source_label(self) -> str:
         return str(self._effective_hermes_repo())
 
+    def _oauth_status(self) -> dict[str, dict[str, Any]]:
+        path = self.config.managed_hermes_home / "auth.json"
+        store = _read_json_mapping(path)
+        providers = store.get("providers") if isinstance(store, dict) else {}
+        result: dict[str, dict[str, Any]] = {}
+        for provider in ("openai-codex", "xai-oauth"):
+            state = providers.get(provider) if isinstance(providers, dict) else None
+            tokens = state.get("tokens") if isinstance(state, dict) else None
+            result[provider] = {
+                "configured": bool(isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token")),
+                "auth_store": str(path),
+                "last_refresh": state.get("last_refresh") if isinstance(state, dict) else None,
+                "active": store.get("active_provider") == provider,
+            }
+        return result
+
 
 def _module_importable(name: str) -> bool:
     try:
@@ -704,6 +882,64 @@ def _module_importable(name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def normalize_hermes_provider(value: str | None) -> str:
+    clean = (value or "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "": "auto",
+        "default": "auto",
+        "codex": "openai-codex",
+        "openai-codex-oauth": "openai-codex",
+        "grok": "xai",
+        "grok-api": "xai",
+        "grok-oauth": "xai-oauth",
+        "x-ai-oauth": "xai-oauth",
+        "xai-grok-oauth": "xai-oauth",
+    }
+    return aliases.get(clean, clean)
+
+
+def default_base_url_for_provider(provider: str) -> str:
+    provider = normalize_hermes_provider(provider)
+    if provider == "openai-codex":
+        return DEFAULT_CODEX_BASE_URL
+    if provider in {"xai", "xai-oauth"}:
+        return DEFAULT_XAI_BASE_URL
+    return ""
+
+
+def default_model_for_provider(provider: str) -> str:
+    return DEFAULT_PROVIDER_MODELS.get(normalize_hermes_provider(provider), "")
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _read_json_mapping(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 2, "providers": {}}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 2, "providers": {}}
+    return loaded if isinstance(loaded, dict) else {"version": 2, "providers": {}}
+
+
+def _write_json_secure(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _read_yaml_mapping(path: Path) -> dict[str, Any] | None:
@@ -728,7 +964,20 @@ def _write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
         enabled = data.get("plugins", {}).get("enabled", [HERMES_PLUGIN_KEY])
         lines = ["plugins:", "  enabled:"]
         lines.extend(f"    - {item}" for item in enabled)
+        model = data.get("model")
+        if isinstance(model, dict) and model:
+            lines.extend(["model:"])
+            for key in ("default", "provider", "base_url"):
+                value = model.get(key)
+                if value is not None and str(value) != "":
+                    lines.append(f"  {key}: {_quote_yaml_scalar(str(value))}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _quote_yaml_scalar(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_.:/-]+", value):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

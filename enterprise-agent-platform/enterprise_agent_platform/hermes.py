@@ -56,9 +56,10 @@ class LocalAgentClient:
 
 
 class HermesAgentClient:
-    def __init__(self, config: PlatformConfig, secret_provider):
+    def __init__(self, config: PlatformConfig, secret_provider, runtime_config_provider=None):
         self.config = config
         self.secret_provider = secret_provider
+        self.runtime_config_provider = runtime_config_provider
 
     def generate(
         self,
@@ -74,7 +75,7 @@ class HermesAgentClient:
         messages.extend(history[-30:])
         messages.append({"role": "user", "content": user_message})
         body = {
-            "model": self.config.hermes_model,
+            "model": self._effective_model(),
             "messages": messages,
             "stream": False,
         }
@@ -88,7 +89,7 @@ class HermesAgentClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(
-            self.config.hermes_api_url,
+            self._effective_api_url(),
             data=json.dumps(body).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -105,12 +106,28 @@ class HermesAgentClient:
             content = str(raw.get("final_response") or "")
         return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
 
+    def _runtime_config(self) -> dict[str, Any]:
+        if self.runtime_config_provider is None:
+            return {}
+        try:
+            data = self.runtime_config_provider()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _effective_api_url(self) -> str:
+        return str(self._runtime_config().get("api_url") or self.config.hermes_api_url)
+
+    def _effective_model(self) -> str:
+        return str(self._runtime_config().get("model") or self.config.hermes_model)
+
 
 class AutoAgentClient:
     def __init__(self, config: PlatformConfig, secret_provider, runtime_manager=None):
         self.config = config
         self.runtime_manager = runtime_manager
-        self.hermes = HermesAgentClient(config, secret_provider)
+        runtime_config_provider = runtime_manager.hermes_runtime_config if runtime_manager is not None else None
+        self.hermes = HermesAgentClient(config, secret_provider, runtime_config_provider=runtime_config_provider)
         self.local = LocalAgentClient()
 
     def generate(self, **kwargs: Any) -> AgentResult:

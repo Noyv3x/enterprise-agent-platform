@@ -210,6 +210,23 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(service.model_secret_env()["OPENAI_API_KEY"], "sk-test-value")
             service.close()
 
+    def test_oauth_secret_keys_are_admin_configurable_but_not_model_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                keys = {item["key"] for item in service.list_secrets(admin)}
+
+                self.assertIn("CODEX_OAUTH_ACCESS_TOKEN", keys)
+                self.assertIn("CODEX_OAUTH_REFRESH_TOKEN", keys)
+                self.assertIn("GROK_OAUTH_ACCESS_TOKEN", keys)
+                self.assertIn("XAI_OAUTH_REFRESH_TOKEN", keys)
+
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                self.assertNotIn("CODEX_OAUTH_ACCESS_TOKEN", service.model_secret_env())
+            finally:
+                service.close()
+
     def test_agent_tool_token_protects_knowledge_endpoints(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -341,6 +358,61 @@ class PlatformServiceTests(unittest.TestCase):
                         f"{tmp / 'hermes-agent'}[dev]",
                     ],
                 )
+            finally:
+                service.close()
+
+    def test_platform_writes_managed_codex_and_grok_oauth_state_for_hermes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            runner = RecordingCommandRunner()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+                service.set_secret(admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
+                service.set_secret(admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
+
+                codex_config = service.update_hermes_config(
+                    admin,
+                    {
+                        "provider": "codex",
+                        "model": "hermes-agent",
+                    },
+                )["config"]
+                auth_path = service.config.managed_hermes_home / "auth.json"
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+
+                self.assertEqual(codex_config["provider"], "openai-codex")
+                self.assertEqual(codex_config["model"], "gpt-5.3-codex")
+                self.assertEqual(auth_store["active_provider"], "openai-codex")
+                self.assertEqual(auth_store["providers"]["openai-codex"]["auth_mode"], "chatgpt")
+                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
+                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["refresh_token"], "codex-refresh")
+
+                grok_config = service.update_hermes_config(
+                    admin,
+                    {
+                        "provider": "grok-oauth",
+                        "model": "hermes-agent",
+                    },
+                )["config"]
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+                config_text = (service.config.managed_hermes_home / "config.yaml").read_text(encoding="utf-8")
+                env_text = (service.config.managed_hermes_home / ".env").read_text(encoding="utf-8")
+
+                self.assertEqual(grok_config["provider"], "xai-oauth")
+                self.assertEqual(grok_config["model"], "grok-4.3")
+                self.assertEqual(grok_config["provider_base_url"], "https://api.x.ai/v1")
+                self.assertEqual(auth_store["active_provider"], "xai-oauth")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["auth_mode"], "oauth_pkce")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["refresh_token"], "grok-refresh")
+                self.assertIn("provider: xai-oauth", config_text)
+                self.assertIn("default: grok-4.3", config_text)
+                self.assertIn('HERMES_INFERENCE_PROVIDER="xai-oauth"', env_text)
+                self.assertIn('HERMES_XAI_BASE_URL="https://api.x.ai/v1"', env_text)
             finally:
                 service.close()
 

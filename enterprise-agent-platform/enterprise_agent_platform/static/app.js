@@ -253,6 +253,18 @@ function renderSettings() {
   manageHermes.checked = hermes.manage_hermes !== false;
   const repoPath = h("input", { value: hermes.repo_path || "" });
   const apiUrl = h("input", { value: hermes.api_url || "" });
+  const provider = h("select", {}, [
+    h("option", { value: "auto", text: "auto" }),
+    h("option", { value: "openrouter", text: "OpenRouter / API key" }),
+    h("option", { value: "openai-codex", text: "Codex OAuth" }),
+    h("option", { value: "xai", text: "Grok / xAI API key" }),
+    h("option", { value: "xai-oauth", text: "Grok OAuth" }),
+  ]);
+  provider.value = hermes.provider || "auto";
+  const providerBaseUrl = h("input", {
+    value: hermes.provider_base_url || "",
+    placeholder: "可选；OAuth 会自动使用默认 endpoint",
+  });
   const model = h("input", { value: hermes.model || "" });
   const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
   const startupWait = h("input", { type: "number", min: "0", max: "120", step: "0.5", value: hermes.startup_wait_seconds ?? 8 });
@@ -322,6 +334,8 @@ function renderSettings() {
               manage_hermes: manageHermes.checked,
               repo_path: repoPath.value,
               api_url: apiUrl.value,
+              provider: provider.value,
+              provider_base_url: providerBaseUrl.value,
               model: model.value,
               install_extras: installExtras.value,
               startup_wait_seconds: startupWait.value,
@@ -337,6 +351,8 @@ function renderSettings() {
       h("label", { class: "check-row" }, [manageHermes, h("span", { text: "由平台托管 Hermes" })]),
       field("源码路径", repoPath),
       field("API URL", apiUrl),
+      field("Provider", provider),
+      field("Provider Base URL", providerBaseUrl),
       field("模型", model),
       field("安装 extras", installExtras),
       field("启动等待秒数", startupWait),
