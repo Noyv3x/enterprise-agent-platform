@@ -340,7 +340,7 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         "",
         "[Service]",
         "Type=simple",
-        f"WorkingDirectory={_systemd_quote(str(paths.platform_dir))}",
+        f"WorkingDirectory={_systemd_path_value(paths.platform_dir)}",
         "Environment=PYTHONUNBUFFERED=1",
         *env_lines,
         f"ExecStart={exec_start}",
@@ -477,6 +477,10 @@ def _quote_arg(value: str) -> str:
 
 def _systemd_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _systemd_path_value(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
 
 
 if __name__ == "__main__":

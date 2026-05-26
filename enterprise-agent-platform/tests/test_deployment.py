@@ -241,7 +241,32 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(f"ENTERPRISE_HERMES_REPO={root / 'hermes-agent'}", unit)
             self.assertIn(f"ENTERPRISE_COGNEE_REPO={root / 'cognee'}", unit)
             self.assertIn(str(paths.platform_cli), unit)
+            self.assertIn(f"WorkingDirectory={root / 'enterprise-agent-platform'}", unit)
+            self.assertNotIn(f"WorkingDirectory=\"{root / 'enterprise-agent-platform'}\"", unit)
             self.assertIn("--host \"0.0.0.0\" --port 8765", unit)
+
+    def test_user_service_unit_passes_systemd_verify_when_available(self):
+        if not shutil.which("systemd-analyze"):
+            self.skipTest("systemd-analyze is not available")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root)
+            paths.platform_dir.mkdir(parents=True)
+            paths.platform_cli.parent.mkdir(parents=True)
+            paths.platform_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            paths.platform_cli.chmod(0o755)
+            unit_path = root / "enterprise-agent-platform.service"
+            unit_path.write_text(user_service_unit(paths, host="127.0.0.1", port=8765), encoding="utf-8")
+
+            result = subprocess.run(
+                ["systemd-analyze", "verify", "--user", str(unit_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_runtime_env_exposes_adjacent_sources(self):
         with tempfile.TemporaryDirectory() as td:
