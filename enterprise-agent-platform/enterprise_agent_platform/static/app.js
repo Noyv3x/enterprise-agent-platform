@@ -1,3 +1,10 @@
+/* =====================================================================
+   Enterprise Agent Platform — application shell
+   Framework-free, dependency-free. Full re-render on state change with
+   targeted post-render hooks (scroll, focus). All API calls and payload
+   shapes are preserved from the original implementation.
+   ===================================================================== */
+
 const state = {
   user: null,
   channels: [],
@@ -14,11 +21,17 @@ const state = {
   oauthFlows: {},
   oauthCallbackUrls: {},
   busy: false,
+  sending: false,
+  sidebarOpen: false,
   error: "",
+  _lastView: null,
+  _focusComposer: false,
 };
 
 const app = document.getElementById("app");
+const toastStack = document.getElementById("toast-stack");
 
+/* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
   const res = await fetch(path, {
     credentials: "include",
@@ -33,6 +46,7 @@ async function api(path, options = {}) {
   return data;
 }
 
+/* ------------------------------------------------------ DOM builders */
 function h(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
@@ -42,16 +56,146 @@ function h(tag, attrs = {}, children = []) {
     else if (value !== false && value != null) node.setAttribute(key, value === true ? "" : String(value));
   }
   for (const child of Array.isArray(children) ? children : [children]) {
-    if (child == null) continue;
+    if (child == null || child === false) continue;
     node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
   return node;
 }
 
-function render() {
-  app.replaceChildren(state.user ? renderShell() : renderLogin());
+const SVGNS = "http://www.w3.org/2000/svg";
+const ICONS = {
+  hash: [["line", { x1: 4, y1: 9, x2: 20, y2: 9 }], ["line", { x1: 4, y1: 15, x2: 20, y2: 15 }], ["line", { x1: 10, y1: 3, x2: 8, y2: 21 }], ["line", { x1: 16, y1: 3, x2: 14, y2: 21 }]],
+  bot: [["rect", { x: 4, y: 9, width: 16, height: 11, rx: 2.5 }], ["path", { d: "M12 9V5" }], ["circle", { cx: 12, cy: 3.6, r: 1.3 }], ["path", { d: "M9.4 14h.01" }], ["path", { d: "M14.6 14h.01" }], ["path", { d: "M4 13.5H2.5" }], ["path", { d: "M21.5 13.5H20" }]],
+  library: [["path", { d: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20" }], ["path", { d: "M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" }]],
+  settings: [["line", { x1: 3, y1: 8, x2: 21, y2: 8 }], ["circle", { cx: 9, cy: 8, r: 2.3 }], ["line", { x1: 3, y1: 16, x2: 21, y2: 16 }], ["circle", { cx: 15, cy: 16, r: 2.3 }]],
+  send: [["path", { d: "M12 19V5" }], ["path", { d: "M6 11l6-6 6 6" }]],
+  search: [["circle", { cx: 11, cy: 11, r: 7 }], ["line", { x1: 21, y1: 21, x2: 16.65, y2: 16.65 }]],
+  sun: [["circle", { cx: 12, cy: 12, r: 4 }], ["path", { d: "M12 2v2" }], ["path", { d: "M12 20v2" }], ["path", { d: "M2 12h2" }], ["path", { d: "M20 12h2" }], ["path", { d: "M4.9 4.9l1.4 1.4" }], ["path", { d: "M17.7 17.7l1.4 1.4" }], ["path", { d: "M19.1 4.9l-1.4 1.4" }], ["path", { d: "M6.3 17.7l-1.4 1.4" }]],
+  moon: [["path", { d: "M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" }]],
+  logout: [["path", { d: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" }], ["path", { d: "M16 17l5-5-5-5" }], ["line", { x1: 21, y1: 12, x2: 9, y2: 12 }]],
+  plus: [["line", { x1: 12, y1: 5, x2: 12, y2: 19 }], ["line", { x1: 5, y1: 12, x2: 19, y2: 12 }]],
+  checkCircle: [["path", { d: "M22 11.08V12a10 10 0 1 1-5.93-9.14" }], ["path", { d: "M22 4L12 14.01l-3-3" }]],
+  alert: [["path", { d: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" }], ["line", { x1: 12, y1: 9, x2: 12, y2: 13 }], ["line", { x1: 12, y1: 17, x2: 12.01, y2: 17 }]],
+  refresh: [["path", { d: "M21 2v6h-6" }], ["path", { d: "M3 12a9 9 0 0 1 15-6.7L21 8" }], ["path", { d: "M3 22v-6h6" }], ["path", { d: "M21 12a9 9 0 0 1-15 6.7L3 16" }]],
+  download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "M7 10l5 5 5-5" }], ["line", { x1: 12, y1: 15, x2: 12, y2: 3 }]],
+  close: [["line", { x1: 18, y1: 6, x2: 6, y2: 18 }], ["line", { x1: 6, y1: 6, x2: 18, y2: 18 }]],
+  menu: [["line", { x1: 3, y1: 6, x2: 21, y2: 6 }], ["line", { x1: 3, y1: 12, x2: 21, y2: 12 }], ["line", { x1: 3, y1: 18, x2: 21, y2: 18 }]],
+  external: [["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }], ["path", { d: "M15 3h6v6" }], ["line", { x1: 10, y1: 14, x2: 21, y2: 3 }]],
+  loader: [["line", { x1: 12, y1: 2, x2: 12, y2: 6 }], ["line", { x1: 12, y1: 18, x2: 12, y2: 22 }], ["line", { x1: 4.9, y1: 4.9, x2: 7.8, y2: 7.8 }], ["line", { x1: 16.2, y1: 16.2, x2: 19.1, y2: 19.1 }], ["line", { x1: 2, y1: 12, x2: 6, y2: 12 }], ["line", { x1: 18, y1: 12, x2: 22, y2: 12 }], ["line", { x1: 4.9, y1: 19.1, x2: 7.8, y2: 16.2 }], ["line", { x1: 16.2, y1: 7.8, x2: 19.1, y2: 4.9 }]],
+  key: [["circle", { cx: 7.5, cy: 15.5, r: 3.5 }], ["path", { d: "M10 13l9-9" }], ["path", { d: "M18 5l2 2" }], ["path", { d: "M15 8l2 2" }]],
+  server: [["rect", { x: 3, y: 4, width: 18, height: 7, rx: 1.6 }], ["rect", { x: 3, y: 13, width: 18, height: 7, rx: 1.6 }], ["line", { x1: 7, y1: 7.5, x2: 7.01, y2: 7.5 }], ["line", { x1: 7, y1: 16.5, x2: 7.01, y2: 16.5 }]],
+  shield: [["path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" }], ["path", { d: "M9 12l2 2 4-4" }]],
+  doc: [["path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }], ["path", { d: "M14 2v6h6" }], ["line", { x1: 8, y1: 13, x2: 16, y2: 13 }], ["line", { x1: 8, y1: 17, x2: 13, y2: 17 }]],
+  message: [["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }]],
+  link: [["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }], ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }]],
+};
+
+function icon(name, { size, cls, strokeWidth } = {}) {
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", String(strokeWidth || 1.7));
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  if (size) { svg.setAttribute("width", size); svg.setAttribute("height", size); }
+  if (cls) svg.setAttribute("class", cls);
+  for (const [tag, attrs] of ICONS[name] || []) {
+    const el = document.createElementNS(SVGNS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+    svg.appendChild(el);
+  }
+  return svg;
 }
 
+/* --------------------------------------------------------------- theme */
+function currentTheme() {
+  const attr = document.documentElement.dataset.theme;
+  if (attr === "light" || attr === "dark") return attr;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function toggleTheme() {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("eap-theme", next); } catch (_) {}
+  render();
+}
+function themeToggle() {
+  const dark = currentTheme() === "dark";
+  return h("button", { class: "icon-btn", title: dark ? "切换到浅色主题" : "切换到深色主题", "aria-label": "切换主题", onclick: toggleTheme }, [icon(dark ? "sun" : "moon")]);
+}
+
+/* -------------------------------------------------------------- toasts */
+function toast(message, { type = "error", title } = {}) {
+  if (!toastStack) return;
+  let timer;
+  const dismiss = () => {
+    clearTimeout(timer);
+    node.classList.add("is-leaving");
+    node.addEventListener("animationend", () => node.remove(), { once: true });
+  };
+  const node = h("div", { class: `toast toast--${type}`, role: "status" }, [
+    h("div", { class: "toast__icon" }, [icon(type === "ok" ? "checkCircle" : "alert", { size: 18 })]),
+    h("div", { class: "toast__body" }, [
+      title ? h("div", { class: "toast__title", text: title }) : null,
+      h("div", { class: "toast__msg", text: message }),
+    ]),
+    h("button", { class: "icon-btn toast__close", title: "关闭", onclick: dismiss }, [icon("close", { size: 16 })]),
+  ]);
+  toastStack.appendChild(node);
+  timer = setTimeout(dismiss, type === "ok" ? 3200 : 6500);
+}
+
+/* ----------------------------------------------------- render plumbing */
+function render() {
+  app.replaceChildren(state.user ? renderShell() : renderLogin());
+  requestAnimationFrame(afterRender);
+}
+function afterRender() {
+  const msgs = app.querySelector(".messages");
+  if (msgs) msgs.scrollTop = msgs.scrollHeight;
+  if (state._focusComposer) {
+    const ta = app.querySelector(".composer textarea");
+    if (ta) { ta.focus(); autoGrow(ta); }
+    state._focusComposer = false;
+  }
+}
+
+/* ----------------------------------------------------------- shared UI */
+function brand() {
+  return h("div", { class: "brand" }, [
+    h("img", { class: "brand__logo", src: "/ubitech-logo.png", alt: "ubitech" }),
+    h("span", { class: "brand__eyebrow", text: "Agent Platform" }),
+  ]);
+}
+function field(label, control) {
+  return h("label", { class: "field" }, [h("span", { text: label }), control]);
+}
+function cardHead(title, iconName, { desc, extra } = {}) {
+  return h("div", { class: "card__head" }, [
+    h("div", {}, [
+      h("div", { class: "card__title" }, [iconName ? icon(iconName) : null, h("span", { text: title })]),
+      desc ? h("div", { class: "card__desc", text: desc }) : null,
+    ]),
+    extra || null,
+  ]);
+}
+function statusBadge(ok, label) {
+  return h("span", { class: `status status--${ok ? "ok" : "warn"}` }, [
+    h("span", { class: `dot ${ok ? "" : "dot--warn"}` }),
+    document.createTextNode(label),
+  ]);
+}
+function emptyState(iconName, title, text) {
+  return h("div", { class: "empty" }, [
+    h("div", { class: "empty__icon" }, [icon(iconName, { size: 26 })]),
+    h("h3", { text: title }),
+    h("p", { text: text }),
+  ]);
+}
+
+/* ---------------------------------------------------------------- login */
 function renderLogin() {
   const username = h("input", { name: "username", autocomplete: "username", placeholder: "用户名", value: "admin" });
   const password = h("input", { name: "password", type: "password", autocomplete: "current-password", placeholder: "密码" });
@@ -68,189 +212,394 @@ function renderLogin() {
       });
     },
   }, [
-    h("h1", { text: "Enterprise Agent" }),
-    h("p", { text: "账号密码登录" }),
-    username,
-    password,
-    h("button", { class: "primary", type: "submit", disabled: state.busy, text: state.busy ? "登录中" : "登录" }),
+    field("用户名", username),
+    field("密码", password),
+    h("button", { class: "btn btn--primary btn--lg btn--block", type: "submit", disabled: state.busy }, [
+      state.busy ? icon("loader", { size: 18, cls: "spin" }) : null,
+      h("span", { text: state.busy ? "正在登录…" : "登录" }),
+    ]),
     h("div", { class: "error", text: state.error }),
   ]);
-  return h("main", { class: "login" }, [form]);
-}
-
-function renderShell() {
-  return h("div", { class: "shell" }, [
-    renderSidebar(),
-    h("main", { class: "main" }, [
-      renderTopbar(),
-      h("section", { class: "content" }, [renderContent()]),
+  return h("main", { class: "auth" }, [
+    h("aside", { class: "auth__aside" }, [
+      h("img", { class: "auth__logo", src: "/ubitech-logo.png", alt: "ubitech" }),
+    ]),
+    h("div", { class: "auth__main" }, [
+      h("div", { class: "auth__card" }, [
+        brand(),
+        h("h1", { text: "登录" }),
+        form,
+      ]),
     ]),
   ]);
 }
+
+/* ---------------------------------------------------------------- shell */
+function renderShell() {
+  return h("div", { class: `shell ${state.sidebarOpen ? "is-open" : ""}` }, [
+    renderSidebar(),
+    h("div", { class: "scrim", onclick: closeSidebar }),
+    h("main", { class: "main" }, [renderTopbar(), renderContent()]),
+  ]);
+}
+
+function closeSidebar() { state.sidebarOpen = false; render(); }
 
 function renderSidebar() {
-  const channelButtons = state.channels.map((channel) =>
-    h("button", {
-      class: `channel-button ${state.activeView === "channel" && state.activeChannelId === channel.id ? "active" : ""}`,
-      onclick: async () => {
-        state.activeView = "channel";
-        state.activeChannelId = channel.id;
-        await loadChannelMessages();
-        render();
-      },
-    }, [`# ${channel.name}`]),
-  );
-  const channelName = h("input", { placeholder: "新频道" });
+  const navItems = [
+    ["channel", "频道", "hash"],
+    ["private", "私人 Agent", "bot"],
+    ["knowledge", "知识库", "library"],
+    ["settings", "设置", "settings"],
+  ].map(([view, label, ic]) => navItem(view, label, ic));
+
+  const channelName = h("input", { placeholder: "新频道名称", "aria-label": "新频道名称" });
+  const channelButtons = state.channels.length
+    ? state.channels.map((channel) =>
+        h("button", {
+          class: `channel ${state.activeView === "channel" && state.activeChannelId === channel.id ? "is-active" : ""}`,
+          onclick: async () => {
+            state.activeView = "channel";
+            state.activeChannelId = channel.id;
+            state._focusComposer = true;
+            state.sidebarOpen = false;
+            await withBusy(loadChannelMessages);
+          },
+        }, [h("span", { class: "channel__hash", text: "#" }), h("span", { class: "channel__name", text: channel.name })]))
+    : [h("div", { class: "muted", style: "padding:4px 10px;font-size:12.5px", text: "暂无频道，创建一个开始协作。" })];
+
   return h("aside", { class: "sidebar" }, [
-    h("div", { class: "brand" }, [
-      h("strong", { text: "Agent Platform" }),
-      h("button", { class: "icon", title: "退出", onclick: logout, text: "↗" }),
+    h("div", { class: "sidebar__head" }, [brand()]),
+    h("div", { class: "sidebar__scroll" }, [
+      h("div", {}, [h("div", { class: "section-label", text: "工作区" }), h("nav", { class: "nav" }, navItems)]),
+      h("div", {}, [
+        h("div", { class: "section-label" }, [h("span", { text: "频道" }), h("span", { class: "nav__badge", text: String(state.channels.length) })]),
+        h("div", { class: "channels" }, channelButtons),
+        h("form", {
+          class: "channel-create",
+          onsubmit: async (event) => {
+            event.preventDefault();
+            if (!channelName.value.trim()) return;
+            await withBusy(async () => {
+              await api("/api/channels", { method: "POST", body: JSON.stringify({ name: channelName.value }) });
+              channelName.value = "";
+              await loadChannels();
+            });
+          },
+        }, [channelName, h("button", { class: "icon-btn", type: "submit", title: "创建频道", "aria-label": "创建频道", style: "border:1px solid var(--line-strong)" }, [icon("plus", { size: 16 })])]),
+      ]),
     ]),
-    h("div", { class: "nav" }, [
-      navButton("channel", "频道"),
-      navButton("private", "私人 Agent"),
-      navButton("knowledge", "知识库"),
-      navButton("settings", "设置"),
-    ]),
-    h("div", { class: "channels" }, channelButtons),
-    h("form", {
-      class: "channel-create",
-      onsubmit: async (event) => {
-        event.preventDefault();
-        await withBusy(async () => {
-          await api("/api/channels", { method: "POST", body: JSON.stringify({ name: channelName.value }) });
-          channelName.value = "";
-          await loadChannels();
-        });
-      },
-    }, [channelName, h("button", { text: "创建频道" })]),
+    renderSidebarFoot(),
   ]);
 }
 
-function navButton(view, label) {
+function navItem(view, label, iconName) {
   return h("button", {
-    class: state.activeView === view ? "active" : "",
+    class: `nav__item ${state.activeView === view ? "is-active" : ""}`,
     onclick: async () => {
       state.activeView = view;
-      if (view === "private") await loadPrivateMessages();
-      if (view === "knowledge") await loadDocuments();
-      if (view === "settings") await loadSettings();
-      render();
+      state.sidebarOpen = false;
+      if (view === "channel" || view === "private") state._focusComposer = true;
+      if (view === "private") await withBusy(loadPrivateMessages);
+      else if (view === "knowledge") await withBusy(loadDocuments);
+      else if (view === "settings") await withBusy(loadSettings);
+      else render();
     },
-  }, [label]);
+  }, [icon(iconName), h("span", { class: "nav__label", text: label })]);
+}
+
+function renderSidebarFoot() {
+  const name = state.user.display_name || state.user.username || "用户";
+  const role = (state.user.role || "member").toUpperCase();
+  return h("div", { class: "sidebar__foot" }, [
+    h("div", { class: "user" }, [
+      h("div", { class: "avatar", text: initials(name) }),
+      h("div", { class: "user__meta" }, [
+        h("span", { class: "user__name", text: name }),
+        h("span", { class: "user__role", text: role }),
+      ]),
+    ]),
+    h("button", { class: "icon-btn", title: "退出登录", "aria-label": "退出登录", onclick: logout }, [icon("logout")]),
+  ]);
 }
 
 function renderTopbar() {
-  const title = state.activeView === "channel"
-    ? `# ${activeChannel()?.name || "频道"}`
-    : state.activeView === "private"
-      ? "私人 Agent"
-      : state.activeView === "knowledge"
-        ? "企业知识库"
-        : "系统设置";
+  const info = topbarInfo();
   return h("header", { class: "topbar" }, [
-    h("div", {}, [h("h1", { text: title }), h("div", { class: "muted", text: state.user.display_name })]),
-    h("div", { class: "error", text: state.error }),
+    h("button", { class: "icon-btn menu-btn", title: "打开菜单", "aria-label": "打开菜单", onclick: () => { state.sidebarOpen = true; render(); } }, [icon("menu")]),
+    h("div", { class: "topbar__title-wrap" }, [
+      h("div", { class: "topbar__title" }, [
+        info.hash ? h("span", { class: "hash", text: "#" }) : icon(info.icon, { size: 18, cls: "muted" }),
+        h("span", { text: info.title }),
+      ]),
+      info.sub ? h("div", { class: "topbar__sub", text: info.sub }) : null,
+    ]),
+    h("div", { class: "topbar__actions" }, [themeToggle()]),
   ]);
 }
 
-function renderContent() {
-  if (state.activeView === "private") return renderChat("private");
-  if (state.activeView === "knowledge") return renderKnowledge();
-  if (state.activeView === "settings") return renderSettings();
-  return renderChat("channel");
+function topbarInfo() {
+  if (state.activeView === "private") return { title: "私人 Agent", icon: "bot", sub: "仅你可见的私有助手会话" };
+  if (state.activeView === "knowledge") return { title: "企业知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
+  if (state.activeView === "settings") return { title: "系统设置", icon: "settings", sub: "运行时、API 供应商与平台密钥" };
+  const ch = activeChannel();
+  return { title: ch?.name || "频道", hash: true, sub: ch ? `${state.messages.length} 条消息` : "选择或创建一个频道" };
 }
 
+function renderContent() {
+  const animate = state._lastView !== state.activeView;
+  state._lastView = state.activeView;
+  let view;
+  if (state.activeView === "private") view = renderChat("private");
+  else if (state.activeView === "knowledge") view = renderKnowledge();
+  else if (state.activeView === "settings") view = renderSettings();
+  else view = renderChat("channel");
+  return h("section", { class: `content ${animate ? "view-enter" : ""}` }, [view]);
+}
+
+/* ----------------------------------------------------------------- chat */
 function renderChat(mode) {
   const messages = mode === "private" ? state.privateMessages : state.messages;
-  const input = h("textarea", { placeholder: mode === "private" ? "发送给你的私人 Agent" : "发送到频道主线程" });
+  const noChannel = mode === "channel" && !state.activeChannelId;
+
+  const input = h("textarea", {
+    rows: 1,
+    placeholder: mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息…`,
+    "aria-label": "消息输入框",
+    oninput: (e) => autoGrow(e.target),
+    onkeydown: (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        submit();
+      }
+    },
+  });
+
+  const submit = async () => {
+    const content = input.value.trim();
+    if (!content || state.busy || noChannel) return;
+    input.value = "";
+    autoGrow(input);
+    state.sending = true;
+    state._focusComposer = true;
+    await withBusy(async () => {
+      if (mode === "private") {
+        await api("/api/private-agent/messages", { method: "POST", body: JSON.stringify({ content }) });
+        await loadPrivateMessages();
+      } else {
+        await api(`/api/channels/${state.activeChannelId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
+        await loadChannelMessages();
+      }
+    });
+    state.sending = false;
+    render();
+  };
+
+  let body;
+  if (noChannel) {
+    body = emptyState("hash", "还没有频道", "在左侧创建一个频道，开始与团队和 Agent 协作。");
+  } else if (!messages.length && !state.sending) {
+    body = mode === "private"
+      ? emptyState("bot", "开启你的私人 Agent", "这是仅你可见的助手。发送第一条消息试试看。")
+      : emptyState("message", "暂无消息", "成为第一个在该频道发言的人。Agent 会在此回应。");
+  } else {
+    const items = messages.map(renderMessage);
+    if (state.sending) items.push(renderTyping());
+    body = h("div", { class: "messages__inner" }, items);
+  }
+
   return h("div", { class: "chat" }, [
-    h("div", { class: "messages" }, messages.map(renderMessage)),
-    h("form", {
-      class: "composer",
-      onsubmit: async (event) => {
-        event.preventDefault();
-        const content = input.value.trim();
-        if (!content) return;
-        input.value = "";
-        await withBusy(async () => {
-          if (mode === "private") {
-            await api("/api/private-agent/messages", { method: "POST", body: JSON.stringify({ content }) });
-            await loadPrivateMessages();
-          } else {
-            await api(`/api/channels/${state.activeChannelId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
-            await loadChannelMessages();
-          }
-        });
-      },
-    }, [input, h("button", { class: "primary", disabled: state.busy, text: state.busy ? "处理中" : "发送" })]),
+    h("div", { class: "messages" }, [body]),
+    h("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); submit(); } }, [
+      h("div", { class: "composer__wrap" }, [
+        h("div", { class: "composer__field" }, [
+          input,
+          h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: state.busy || noChannel }, [
+            icon(state.busy ? "loader" : "send", { size: 18, cls: state.busy ? "spin" : "" }),
+          ]),
+        ]),
+        h("div", { class: "composer__hint" }, [
+          h("span", { class: "kbd", text: "Enter" }), h("span", { text: "发送" }),
+          h("span", { class: "kbd", text: "Shift+Enter" }), h("span", { text: "换行" }),
+        ]),
+      ]),
+    ]),
   ]);
 }
 
 function renderMessage(message) {
+  const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
-  return h("article", { class: `message ${message.author_type}` }, [
-    h("div", { class: "message-head" }, [
-      h("strong", { text: message.username || message.author_type }),
-      h("span", { text: new Date(message.created_at * 1000).toLocaleString() }),
+  const avatar = isUser
+    ? h("div", { class: "msg__avatar", text: initials(message.username || "你") })
+    : h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]);
+  return h("article", { class: `msg msg--${message.author_type}` }, [
+    avatar,
+    h("div", { class: "msg__bubble" }, [
+      h("div", { class: "msg__meta" }, [
+        h("span", { class: "msg__name", text: message.username || (isUser ? "你" : "Agent") }),
+        h("span", { class: "msg__time", text: formatTime(message.created_at) }),
+      ]),
+      h("div", { class: "msg__body", text: message.content }),
+      suggestions.length
+        ? h("div", { class: "msg__suggest" }, suggestions.map((s) =>
+            h("span", { class: "chip" }, [h("span", { class: "chip__id", text: `kb:${s.id}` }), h("span", { text: s.title })])))
+        : null,
     ]),
-    h("div", { class: "message-body", text: message.content }),
-    suggestions.length ? h("div", { class: "suggestions" }, suggestions.map((s) => h("span", { class: "pill", text: `kb:${s.id} ${s.title}` }))) : null,
   ]);
 }
 
+function renderTyping() {
+  return h("article", { class: "msg msg--agent" }, [
+    h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
+    h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
+  ]);
+}
+
+function autoGrow(el) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 200) + "px";
+}
+
+/* ------------------------------------------------------------ knowledge */
 function renderKnowledge() {
   const title = h("input", { placeholder: "标题" });
-  const source = h("input", { placeholder: "来源" });
+  const source = h("input", { placeholder: "来源（URL、系统名等）" });
   const summary = h("input", { placeholder: "摘要（可留空）" });
-  const content = h("textarea", { placeholder: "正文" });
-  const search = h("input", { placeholder: "搜索知识库" });
-  const docs = state.documents.map((doc) =>
-    h("div", { class: "doc-row" }, [
-      h("strong", { text: doc.title }),
-      h("div", { class: "muted", text: doc.summary }),
-      h("button", {
-        onclick: async () => {
-          const result = await api(`/api/knowledge/documents/${doc.id}`);
-          state.selectedDocument = result.document;
-          render();
-        },
-        text: "读取",
-      }),
-    ]),
-  );
-  return h("div", { class: "panel grid" }, [
-    h("form", {
-      class: "section",
-      onsubmit: async (event) => {
-        event.preventDefault();
-        await withBusy(async () => {
-          await api("/api/knowledge/documents", {
-            method: "POST",
-            body: JSON.stringify({ title: title.value, source: source.value, summary: summary.value, content: content.value }),
-          });
-          title.value = source.value = summary.value = content.value = "";
-          await loadDocuments();
-        });
-      },
-    }, [h("h2", { text: "新增条目" }), title, source, summary, content, h("button", { class: "primary", text: "保存" })]),
-    h("div", { class: "section" }, [
-      h("h2", { text: "条目" }),
-      h("form", {
-        onsubmit: async (event) => {
-          event.preventDefault();
-          const result = await api(`/api/knowledge/search?q=${encodeURIComponent(search.value)}`);
-          state.documents = result.results;
-          render();
-        },
-      }, [search]),
-      h("div", { class: "list" }, docs),
-      state.selectedDocument ? h("pre", { class: "doc-row", text: state.selectedDocument.content }) : null,
+  const content = h("textarea", { placeholder: "正文内容…" });
+  const search = h("input", { placeholder: "搜索标题或正文…", "aria-label": "搜索知识库" });
+
+  const docCards = state.documents.length
+    ? state.documents.map((doc) =>
+        h("div", { class: "doc-card" }, [
+          h("div", { class: "doc-card__title" }, [icon("doc"), h("span", { text: doc.title })]),
+          doc.summary ? h("div", { class: "doc-card__summary", text: doc.summary }) : null,
+          h("div", { class: "doc-card__actions" }, [
+            h("button", {
+              class: "btn btn--sm",
+              onclick: async () => {
+                await withBusy(async () => {
+                  const result = await api(`/api/knowledge/documents/${doc.id}`);
+                  state.selectedDocument = result.document;
+                });
+              },
+            }, [icon("doc", { size: 14 }), h("span", { text: "查看正文" })]),
+          ]),
+        ]))
+    : [emptyState("doc", "知识库为空", "在左侧表单中录入第一条企业知识。")];
+
+  return h("div", { class: "panel" }, [
+    h("div", { class: "panel__inner" }, [
+      h("div", { class: "kb-grid" }, [
+        h("section", { class: "card" }, [
+          cardHead("新增条目", "plus", { desc: "结构化录入企业知识，供 Agent 检索引用。" }),
+          h("form", {
+            onsubmit: async (event) => {
+              event.preventDefault();
+              await withBusy(async () => {
+                await api("/api/knowledge/documents", {
+                  method: "POST",
+                  body: JSON.stringify({ title: title.value, source: source.value, summary: summary.value, content: content.value }),
+                });
+                title.value = source.value = summary.value = content.value = "";
+                await loadDocuments();
+                toast("已保存知识条目", { type: "ok", title: "完成" });
+              });
+            },
+          }, [
+            field("标题", title),
+            field("来源", source),
+            field("摘要", summary),
+            field("正文", content),
+            h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [icon("plus", { size: 16 }), h("span", { text: "保存条目" })]),
+          ]),
+        ]),
+        h("section", { class: "card" }, [
+          cardHead("条目库", "library", { extra: h("span", { class: "status", text: `${state.documents.length} docs` }) }),
+          h("form", {
+            onsubmit: async (event) => {
+              event.preventDefault();
+              await withBusy(async () => {
+                const result = await api(`/api/knowledge/search?q=${encodeURIComponent(search.value)}`);
+                state.documents = result.results;
+              });
+            },
+          }, [h("div", { class: "search-field" }, [icon("search"), search])]),
+          h("div", { class: "list" }, docCards),
+          state.selectedDocument ? renderDocViewer() : null,
+        ]),
+      ]),
     ]),
   ]);
 }
 
+function renderDocViewer() {
+  return h("div", { class: "doc-viewer" }, [
+    h("div", { class: "doc-viewer__bar" }, [
+      h("span", { class: "eyebrow", text: state.selectedDocument.title || "DOCUMENT" }),
+      h("button", { class: "icon-btn", title: "关闭", "aria-label": "关闭文档", onclick: () => { state.selectedDocument = null; render(); } }, [icon("close", { size: 16 })]),
+    ]),
+    h("pre", { text: state.selectedDocument.content }),
+  ]);
+}
+
+/* ------------------------------------------------------------- settings */
 function renderSettings() {
+  return h("div", { class: "panel" }, [
+    h("div", { class: "panel__inner" }, [
+      renderOAuthSettings(),
+      renderRuntimeSettings(),
+      renderHermesConfig(),
+      renderSecretsSettings(),
+    ]),
+  ]);
+}
+
+function renderRuntimeSettings() {
+  const rows = state.runtimes
+    ? Object.values(state.runtimes).map((runtime) =>
+        h("div", { class: "runtime-row" }, [
+          h("div", { class: "runtime-row__main" }, [
+            h("div", { class: "runtime-row__title" }, [
+              h("span", { class: `dot ${runtime.available ? "dot--pulse" : "dot--off"}` }),
+              h("span", { class: "runtime-row__name", text: runtime.name }),
+              statusBadge(runtime.available, runtime.state || (runtime.available ? "ready" : "down")),
+            ]),
+            h("div", { class: "runtime-row__detail", text: runtime.detail || runtime.error || runtime.path || "" }),
+          ]),
+          h("div", { class: "runtime-row__actions" }, [
+            runtime.name === "hermes"
+              ? h("button", { class: "btn btn--sm", disabled: state.busy, onclick: () => runHermesInstall() }, [icon("download", { size: 14 }), h("span", { text: "安装" })])
+              : null,
+            h("button", {
+              class: "btn btn--sm",
+              disabled: state.busy,
+              onclick: async () => {
+                await withBusy(async () => {
+                  await api(`/api/system/runtime/${runtime.name}/restart`, { method: "POST", body: "{}" });
+                  await loadSettings();
+                });
+              },
+            }, [icon("refresh", { size: 14 }), h("span", { text: runtime.name === "hermes" ? "重启" : "刷新" })]),
+          ]),
+        ]))
+    : [h("div", { class: "muted", text: "正在读取运行时状态…" })];
+  return h("section", { class: "card" }, [
+    cardHead("底层基座", "server", { desc: "平台托管的 Hermes / Cognee 运行时健康状态。" }),
+    h("div", { class: "list" }, rows),
+  ]);
+}
+
+async function runHermesInstall() {
+  await withBusy(async () => {
+    await api("/api/system/runtime/hermes/install", { method: "POST", body: "{}" });
+    await loadSettings();
+    toast("已触发 Hermes 安装", { type: "ok", title: "完成" });
+  });
+}
+
+function renderHermesConfig() {
   const hermes = state.hermesConfig?.config || {};
   const manageHermes = h("input", { type: "checkbox" });
   manageHermes.checked = hermes.manage_hermes !== false;
@@ -261,71 +610,15 @@ function renderSettings() {
     h("option", { value: "xai-oauth", text: "Grok OAuth" }),
   ]);
   provider.value = ["openai-codex", "xai-oauth"].includes(hermes.provider) ? hermes.provider : "openai-codex";
-  const providerBaseUrl = h("input", {
-    value: hermes.provider_base_url || "",
-    placeholder: "默认使用所选 OAuth 供应商 endpoint",
-  });
+  const providerBaseUrl = h("input", { value: hermes.provider_base_url || "", placeholder: "默认使用所选 OAuth 供应商 endpoint" });
   const model = h("input", { value: hermes.model || "" });
   const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
   const startupWait = h("input", { type: "number", min: "0", max: "120", step: "0.5", value: hermes.startup_wait_seconds ?? 8 });
-  const apiKey = h("input", {
-    type: "password",
-    placeholder: hermes.api_key_configured ? "保持不变" : "API server key",
-  });
-  const rows = state.secrets.filter((secret) => !isOAuthSecret(secret.key)).map((secret) => {
-    const input = h("input", { type: "password", placeholder: secret.configured ? secret.masked : "未配置" });
-    return h("div", { class: "secret-row" }, [
-      h("strong", { text: secret.key }),
-      h("span", { class: "muted", text: secret.configured ? secret.masked : "empty" }),
-      h("form", {
-        onsubmit: async (event) => {
-          event.preventDefault();
-          await withBusy(async () => {
-            await api(`/api/settings/secrets/${secret.key}`, { method: "PUT", body: JSON.stringify({ value: input.value }) });
-            input.value = "";
-            await loadSecrets();
-          });
-        },
-      }, [input, h("button", { text: "设置" })]),
-    ]);
-  });
-  const runtimeRows = state.runtimes ? Object.values(state.runtimes).map((runtime) =>
-    h("div", { class: "runtime-row" }, [
-      h("div", {}, [
-        h("strong", { text: runtime.name }),
-        h("span", { class: `status ${runtime.available ? "ok" : "warn"}`, text: runtime.state }),
-        h("div", { class: "muted", text: runtime.detail || runtime.error || runtime.path || "" }),
-      ]),
-      h("div", { class: "runtime-actions" }, [
-        runtime.name === "hermes" ? h("button", {
-          onclick: async () => {
-            await withBusy(async () => {
-              await api("/api/system/runtime/hermes/install", { method: "POST", body: "{}" });
-              await loadSettings();
-            });
-          },
-          text: "安装",
-        }) : null,
-        h("button", {
-          onclick: async () => {
-            await withBusy(async () => {
-              await api(`/api/system/runtime/${runtime.name}/restart`, { method: "POST", body: "{}" });
-              await loadSettings();
-            });
-          },
-          text: runtime.name === "hermes" ? "重启" : "刷新",
-        }),
-      ]),
-    ]),
-  ) : [];
-  return h("div", { class: "panel" }, [
-    renderOAuthSettings(),
-    h("div", { class: "section" }, [
-      h("h2", { text: "底层基座" }),
-      h("div", { class: "list" }, runtimeRows),
-    ]),
+  const apiKey = h("input", { type: "password", autocomplete: "off", placeholder: hermes.api_key_configured ? "保持不变" : "API server key" });
+
+  return h("section", { class: "card config-form" }, [
+    cardHead("Hermes 配置", "settings", { desc: "运行时来源、API 供应商与模型参数。" }),
     h("form", {
-      class: "section config-form",
       onsubmit: async (event) => {
         event.preventDefault();
         await withBusy(async () => {
@@ -345,96 +638,108 @@ function renderSettings() {
           });
           apiKey.value = "";
           await loadSettings();
+          toast("Hermes 配置已保存", { type: "ok", title: "完成" });
         });
       },
     }, [
-      h("h2", { text: "Hermes 配置" }),
-      h("label", { class: "check-row" }, [manageHermes, h("span", { text: "由平台托管 Hermes" })]),
-      field("源码路径", repoPath),
-      field("API URL", apiUrl),
-      field("API 供应商", provider),
-      field("供应商 Base URL", providerBaseUrl),
-      field("模型", model),
-      field("安装 extras", installExtras),
-      field("启动等待秒数", startupWait),
-      field("API Server Key", apiKey),
-      h("div", { class: "form-actions" }, [
-        h("button", { class: "primary", type: "submit", disabled: state.busy, text: "保存配置" }),
-        h("button", {
-          type: "button",
-          disabled: state.busy,
-          onclick: async () => {
-            await withBusy(async () => {
-              await api("/api/system/runtime/hermes/install", { method: "POST", body: "{}" });
-              await loadSettings();
-            });
-          },
-          text: "从源码重装",
-        }),
+      h("label", { class: "check-row" }, [
+        manageHermes,
+        h("div", { class: "check-row__text" }, [h("strong", { text: "由平台托管 Hermes" }), h("span", { text: "自动安装与管理运行时生命周期" })]),
       ]),
-    ]),
-    h("div", { class: "section" }, [
-      h("h2", { text: "平台内部密钥" }),
-      rows.length ? h("div", { class: "list" }, rows) : h("div", { class: "muted", text: "暂无可手动配置的内部密钥" }),
+      h("div", { class: "config-grid" }, [
+        h("div", { class: "field--full" }, [field("源码路径", repoPath)]),
+        h("div", { class: "field--full" }, [field("API URL", apiUrl)]),
+        field("API 供应商", provider),
+        field("供应商 Base URL", providerBaseUrl),
+        field("模型", model),
+        field("安装 extras", installExtras),
+        field("启动等待秒数", startupWait),
+        field("API Server Key", apiKey),
+      ]),
+      h("div", { class: "form-actions" }, [
+        h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [h("span", { text: "保存配置" })]),
+        h("button", { class: "btn", type: "button", disabled: state.busy, onclick: () => runHermesInstall() }, [icon("download", { size: 15 }), h("span", { text: "从源码重装" })]),
+      ]),
     ]),
   ]);
 }
 
+function renderSecretsSettings() {
+  const rows = state.secrets.filter((secret) => !isOAuthSecret(secret.key)).map((secret) => {
+    const input = h("input", { type: "password", autocomplete: "off", placeholder: secret.configured ? secret.masked : "未配置" });
+    return h("div", { class: "secret-row" }, [
+      h("div", { class: "secret-row__key" }, [icon("key"), h("span", { class: "secret-row__name", text: secret.key })]),
+      h("span", { class: "secret-row__val", text: secret.configured ? secret.masked : "empty" }),
+      h("form", {
+        onsubmit: async (event) => {
+          event.preventDefault();
+          await withBusy(async () => {
+            await api(`/api/settings/secrets/${secret.key}`, { method: "PUT", body: JSON.stringify({ value: input.value }) });
+            input.value = "";
+            await loadSecrets();
+            toast(`已更新 ${secret.key}`, { type: "ok", title: "完成" });
+          });
+        },
+      }, [input, h("button", { class: "btn btn--sm", type: "submit", text: "设置" })]),
+    ]);
+  });
+  return h("section", { class: "card" }, [
+    cardHead("平台内部密钥", "key", { desc: "手动配置的平台级密钥，OAuth 凭据在上方管理。" }),
+    rows.length ? h("div", { class: "list" }, rows) : h("div", { class: "muted", text: "暂无可手动配置的内部密钥。" }),
+  ]);
+}
+
+/* ---------------------------------------------------------------- oauth */
 function renderOAuthSettings() {
   const providers = state.oauthProviders?.providers || [];
-  return h("div", { class: "section" }, [
-    h("h2", { text: "API 供应商验证" }),
-    h("div", { class: "oauth-grid" }, providers.map(renderOAuthProviderCard)),
+  return h("section", { class: "card" }, [
+    cardHead("API 供应商验证", "shield", { desc: "通过 OAuth 授权模型供应商，验证后 Hermes 自动切换。" }),
+    providers.length
+      ? h("div", { class: "oauth-grid" }, providers.map(renderOAuthProviderCard))
+      : h("div", { class: "muted", text: "未发现可验证的供应商。" }),
   ]);
 }
 
 function renderOAuthProviderCard(provider) {
   const flow = state.oauthFlows[provider.id];
   const callbackValue = state.oauthCallbackUrls[provider.id] || "";
-  const statusClass = provider.configured ? "ok" : "warn";
-  const header = h("div", { class: "oauth-card-head" }, [
-    h("div", {}, [
-      h("strong", { text: provider.label }),
-      h("div", { class: "muted", text: provider.model }),
+  const header = h("div", { class: "oauth-card__head" }, [
+    h("div", { class: "oauth-card__id" }, [
+      h("div", { class: "oauth-card__logo" }, [h("strong", { class: "mono", text: (provider.label || "?").trim().charAt(0) })]),
+      h("div", {}, [
+        h("div", { class: "oauth-card__label", text: provider.label }),
+        provider.model ? h("div", { class: "oauth-card__model", text: provider.model }) : null,
+      ]),
     ]),
-    h("span", { class: `status ${statusClass}`, text: provider.configured ? "已验证" : "未验证" }),
+    statusBadge(!!provider.configured, provider.configured ? "已验证" : "未验证"),
   ]);
   const meta = h("div", { class: "oauth-meta" }, [
-    provider.active ? h("span", { class: "pill", text: "当前使用" }) : null,
-    provider.last_refresh ? h("span", { class: "muted", text: `更新：${formatTimestamp(provider.last_refresh)}` }) : null,
+    provider.active ? h("span", { class: "chip" }, [h("span", { class: "dot" }), document.createTextNode("使用中")]) : null,
+    provider.last_refresh ? h("span", { class: "muted", style: "font-size:12px", text: `更新于 ${formatTimestamp(provider.last_refresh)}` }) : null,
   ]);
   const startButton = h("button", {
-    class: provider.configured ? "" : "primary",
+    class: provider.configured ? "btn btn--sm" : "btn btn--primary btn--sm",
     disabled: state.busy,
     onclick: async () => startOAuthVerification(provider.id),
-    text: provider.configured ? "重新验证" : "开始验证",
-  });
+  }, [icon("shield", { size: 14 }), h("span", { text: provider.configured ? "重新验证" : "开始验证" })]);
+
   const children = [header, meta, h("div", { class: "oauth-actions" }, [startButton])];
-  if (flow?.kind === "device_code") {
-    children.push(renderCodexOAuthFlow(provider.id, flow));
-  } else if (flow?.kind === "manual_callback") {
-    children.push(renderGrokOAuthFlow(provider.id, flow, callbackValue));
-  }
-  if (flow?.complete) {
-    children.push(h("div", { class: "oauth-guide complete", text: "验证完成，Hermes 已切换到该供应商。" }));
-  }
-  return h("div", { class: "oauth-card" }, children);
+  if (flow?.kind === "device_code") children.push(renderCodexOAuthFlow(provider.id, flow));
+  else if (flow?.kind === "manual_callback") children.push(renderGrokOAuthFlow(provider.id, flow, callbackValue));
+  if (flow?.complete) children.push(h("div", { class: "oauth-guide complete" }, [icon("checkCircle", { size: 16 }), h("span", { text: "验证完成，Hermes 已切换到该供应商。" })]));
+  return h("div", { class: `oauth-card ${provider.active ? "is-active" : ""}` }, children);
 }
 
 function renderCodexOAuthFlow(providerId, flow) {
   return h("div", { class: "oauth-guide" }, [
     h("div", { class: "oauth-line" }, [
       h("span", { text: "验证页" }),
-      h("a", { href: flow.verification_url, target: "_blank", rel: "noreferrer", text: flow.verification_url }),
+      h("a", { href: flow.verification_url, target: "_blank", rel: "noreferrer" }, [h("span", { text: flow.verification_url }), icon("external", { size: 13 })]),
     ]),
     h("div", { class: "oauth-code", text: flow.user_code }),
     h("div", { class: "oauth-actions" }, [
-      h("button", {
-        disabled: state.busy,
-        onclick: async () => pollOAuthVerification(providerId, flow.flow_id),
-        text: "检查状态",
-      }),
-      h("span", { class: "muted", text: `状态：${oauthStatusLabel(flow.status)}` }),
+      h("button", { class: "btn btn--sm", disabled: state.busy, onclick: async () => pollOAuthVerification(providerId, flow.flow_id) }, [icon("refresh", { size: 14 }), h("span", { text: "检查状态" })]),
+      h("span", { class: "muted", style: "font-size:12px", text: `状态：${oauthStatusLabel(flow.status)}` }),
     ]),
   ]);
 }
@@ -442,108 +747,83 @@ function renderCodexOAuthFlow(providerId, flow) {
 function renderGrokOAuthFlow(providerId, flow, callbackValue) {
   const callbackInput = h("textarea", {
     placeholder: "粘贴浏览器跳转后的完整 callback URL",
-    oninput: (event) => {
-      state.oauthCallbackUrls[providerId] = event.target.value;
-    },
+    oninput: (event) => { state.oauthCallbackUrls[providerId] = event.target.value; },
   });
   callbackInput.value = callbackValue;
   return h("div", { class: "oauth-guide" }, [
     h("div", { class: "oauth-line" }, [
       h("span", { text: "授权页" }),
-      h("a", { href: flow.authorize_url, target: "_blank", rel: "noreferrer", text: "打开 Grok OAuth" }),
+      h("a", { href: flow.authorize_url, target: "_blank", rel: "noreferrer" }, [h("span", { text: "打开 Grok OAuth" }), icon("external", { size: 13 })]),
     ]),
-    h("div", { class: "oauth-line" }, [
-      h("span", { text: "回调地址" }),
-      h("code", { text: flow.redirect_uri }),
-    ]),
+    h("div", { class: "oauth-line" }, [h("span", { text: "回调地址" }), h("code", { text: flow.redirect_uri })]),
     callbackInput,
     h("div", { class: "oauth-actions" }, [
-      h("button", {
-        disabled: state.busy,
-        onclick: async () => completeOAuthVerification(providerId, flow.flow_id),
-        text: "完成验证",
-      }),
-      h("span", { class: "muted", text: `状态：${oauthStatusLabel(flow.status)}` }),
+      h("button", { class: "btn btn--primary btn--sm", disabled: state.busy, onclick: async () => completeOAuthVerification(providerId, flow.flow_id) }, [icon("checkCircle", { size: 14 }), h("span", { text: "完成验证" })]),
+      h("span", { class: "muted", style: "font-size:12px", text: `状态：${oauthStatusLabel(flow.status)}` }),
     ]),
   ]);
 }
 
-function field(label, control) {
-  return h("label", { class: "field" }, [h("span", { text: label }), control]);
-}
-
-function isOAuthSecret(key) {
-  return key.includes("_OAUTH_");
-}
-
+/* --------------------------------------------------------------- helpers */
+function isOAuthSecret(key) { return key.includes("_OAUTH_"); }
 function oauthStatusLabel(status) {
-  const labels = {
-    waiting_for_user: "等待网页登录",
-    waiting_for_callback: "等待回调 URL",
-    complete: "已完成",
-  };
-  return labels[status] || status || "等待中";
+  return ({ waiting_for_user: "等待网页登录", waiting_for_callback: "等待回调 URL", complete: "已完成" })[status] || status || "等待中";
 }
-
+function initials(name) {
+  const s = String(name || "?").trim();
+  if (!s) return "?";
+  const parts = s.split(/\s+/);
+  if (parts.length >= 2 && /[a-zA-Z]/.test(s)) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return s.slice(0, 2).toUpperCase();
+}
+function formatTime(value) {
+  if (!value) return "";
+  const d = new Date(value * 1000);
+  if (Number.isNaN(d.getTime())) return "";
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
 function formatTimestamp(value) {
   if (!value) return "";
   const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
 }
+function activeChannel() { return state.channels.find((c) => c.id === state.activeChannelId); }
 
-function activeChannel() {
-  return state.channels.find((c) => c.id === state.activeChannelId);
-}
-
+/* ---------------------------------------------------------------- loads */
 async function loadInitial() {
   await loadChannels();
   await loadChannelMessages();
 }
-
 async function loadChannels() {
   const result = await api("/api/channels");
   state.channels = result.channels;
   if (!state.activeChannelId && state.channels.length) state.activeChannelId = state.channels[0].id;
 }
-
 async function loadChannelMessages() {
   if (!state.activeChannelId) return;
   const result = await api(`/api/channels/${state.activeChannelId}/messages`);
   state.messages = result.messages;
 }
-
 async function loadPrivateMessages() {
   const result = await api("/api/private-agent/messages");
   state.privateMessages = result.messages;
 }
-
 async function loadDocuments() {
   const result = await api("/api/knowledge/documents");
   state.documents = result.documents;
 }
-
 async function loadSecrets() {
   const result = await api("/api/settings/secrets");
   state.secrets = result.secrets;
 }
+async function loadOAuthProviders() { state.oauthProviders = await api("/api/system/oauth/providers"); }
+async function loadRuntime() { state.runtimes = await api("/api/system/runtime"); }
+async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
+async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]); }
 
-async function loadOAuthProviders() {
-  state.oauthProviders = await api("/api/system/oauth/providers");
-}
-
-async function loadRuntime() {
-  state.runtimes = await api("/api/system/runtime");
-}
-
-async function loadHermesConfig() {
-  state.hermesConfig = await api("/api/system/hermes/config");
-}
-
-async function loadSettings() {
-  await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]);
-}
-
+/* ----------------------------------------------------------------- oauth */
 async function startOAuthVerification(providerId) {
   await withBusy(async () => {
     const result = await api(`/api/system/oauth/${providerId}/start`, { method: "POST", body: "{}" });
@@ -551,18 +831,13 @@ async function startOAuthVerification(providerId) {
     await loadHermesConfig();
   });
 }
-
 async function pollOAuthVerification(providerId, flowId) {
   await withBusy(async () => {
-    const result = await api(`/api/system/oauth/${providerId}/poll`, {
-      method: "POST",
-      body: JSON.stringify({ flow_id: flowId }),
-    });
+    const result = await api(`/api/system/oauth/${providerId}/poll`, { method: "POST", body: JSON.stringify({ flow_id: flowId }) });
     updateOAuthState(providerId, result);
     await loadHermesConfig();
   });
 }
-
 async function completeOAuthVerification(providerId, flowId) {
   await withBusy(async () => {
     const result = await api(`/api/system/oauth/${providerId}/complete`, {
@@ -574,18 +849,16 @@ async function completeOAuthVerification(providerId, flowId) {
     await loadHermesConfig();
   });
 }
-
 function updateOAuthState(providerId, result) {
-  state.oauthProviders = {
-    providers: result.providers || [],
-    active_provider: result.active_provider || providerId,
-  };
+  state.oauthProviders = { providers: result.providers || [], active_provider: result.active_provider || providerId };
   if (result.flow) state.oauthFlows[providerId] = result.flow;
 }
 
+/* ---------------------------------------------------------------- session */
 async function logout() {
   await api("/api/auth/logout", { method: "POST" }).catch(() => {});
   state.user = null;
+  state.sidebarOpen = false;
   render();
 }
 
@@ -596,7 +869,9 @@ async function withBusy(fn) {
   try {
     await fn();
   } catch (error) {
-    state.error = error.message || String(error);
+    const message = error.message || String(error);
+    state.error = message;
+    if (state.user) toast(message, { type: "error", title: "操作失败" });
   } finally {
     state.busy = false;
     render();
@@ -607,6 +882,7 @@ async function boot() {
   try {
     const result = await api("/api/auth/me");
     state.user = result.user;
+    state._focusComposer = true;
     await loadInitial();
   } catch (_) {
     state.user = null;
