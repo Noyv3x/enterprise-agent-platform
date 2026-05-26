@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -139,14 +138,6 @@ class CogneeBridge:
     def _seed_cognee_env(self) -> None:
         if self.runtime_manager is not None:
             self.runtime_manager.ensure_cognee_ready()
-        # Cognee commonly reads LLM_API_KEY, while Hermes users usually store
-        # provider-specific keys. Seed only missing vars and never expose values.
-        if not os.getenv("LLM_API_KEY"):
-            for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY", "OPENROUTER_API_KEY"):
-                value = self.secret_provider(key)
-                if value:
-                    os.environ["LLM_API_KEY"] = value
-                    break
 
 
 def stringify_cognee_result(item: Any) -> str:

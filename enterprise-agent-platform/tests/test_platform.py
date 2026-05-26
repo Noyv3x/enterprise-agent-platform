@@ -7,13 +7,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from dataclasses import replace
 from pathlib import Path
 
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult
+from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
-from enterprise_agent_platform.service import EnterpriseService
+from enterprise_agent_platform.service import EnterpriseService, ServiceError
 
 
 class RecordingAgent:
@@ -73,6 +75,54 @@ class RecordingCommandRunner:
             python.parent.mkdir(parents=True, exist_ok=True)
             python.write_text("", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0)
+
+
+class FakeOAuthHTTPClient:
+    def __init__(self):
+        self.calls = []
+
+    def get_json(self, url, *, timeout=20.0):
+        self.calls.append(("get_json", url, {}))
+        return OAuthHTTPResponse(
+            200,
+            {
+                "authorization_endpoint": "https://xai.example/authorize",
+                "token_endpoint": "https://xai.example/token",
+            },
+        )
+
+    def post_json(self, url, body, *, timeout=20.0):
+        self.calls.append(("post_json", url, dict(body)))
+        if url.endswith("/usercode"):
+            return OAuthHTTPResponse(
+                200,
+                {
+                    "user_code": "CODE-1234",
+                    "device_auth_id": "device-1",
+                    "interval": 1,
+                    "expires_in": 900,
+                },
+            )
+        if url.endswith("/token"):
+            return OAuthHTTPResponse(200, {"authorization_code": "codex-code", "code_verifier": "codex-verifier"})
+        return OAuthHTTPResponse(404, {}, "not found")
+
+    def post_form(self, url, body, *, timeout=20.0):
+        self.calls.append(("post_form", url, dict(body)))
+        if url == "https://auth.openai.com/oauth/token":
+            return OAuthHTTPResponse(200, {"access_token": "codex-access", "refresh_token": "codex-refresh"})
+        if url == "https://xai.example/token":
+            return OAuthHTTPResponse(
+                200,
+                {
+                    "access_token": "grok-access",
+                    "refresh_token": "grok-refresh",
+                    "id_token": "grok-id",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                },
+            )
+        return OAuthHTTPResponse(404, {}, "not found")
 
 
 def make_config(tmp: Path) -> PlatformConfig:
@@ -186,7 +236,7 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
             service.close()
 
-    def test_multiple_users_share_channel_main_agent_but_keep_private_key_injection(self):
+    def test_multiple_users_share_channel_main_agent_without_model_key_injection(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
@@ -198,7 +248,6 @@ class PlatformServiceTests(unittest.TestCase):
                 role="member",
                 actor=admin,
             )
-            service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
 
             service.send_channel_message(admin, 1, "admin asks")
             service.send_channel_message(member, 1, "member asks")
@@ -207,7 +256,7 @@ class PlatformServiceTests(unittest.TestCase):
 
             private = service.send_private_message(member, "private task")
             self.assertEqual(private["container"]["session_id"], "enterprise-private-u2")
-            self.assertEqual(service.model_secret_env()["OPENAI_API_KEY"], "sk-test-value")
+            self.assertEqual(service.model_secret_env(), {})
             service.close()
 
     def test_oauth_secret_keys_are_admin_configurable_but_not_model_env(self):
@@ -220,10 +269,16 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn("CODEX_OAUTH_ACCESS_TOKEN", keys)
                 self.assertIn("CODEX_OAUTH_REFRESH_TOKEN", keys)
                 self.assertIn("GROK_OAUTH_ACCESS_TOKEN", keys)
-                self.assertIn("XAI_OAUTH_REFRESH_TOKEN", keys)
+                self.assertIn("GROK_OAUTH_REFRESH_TOKEN", keys)
+                self.assertIn("GROK_OAUTH_ID_TOKEN", keys)
+                self.assertNotIn("OPENAI_API_KEY", keys)
+                self.assertNotIn("XAI_API_KEY", keys)
+                self.assertNotIn("XAI_OAUTH_REFRESH_TOKEN", keys)
 
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
                 self.assertNotIn("CODEX_OAUTH_ACCESS_TOKEN", service.model_secret_env())
+                with self.assertRaises(ServiceError):
+                    service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
             finally:
                 service.close()
 
@@ -416,6 +471,91 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_api_providers_are_limited_to_codex_and_grok_oauth(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                status = service.oauth_provider_status(admin)
+                self.assertEqual([item["id"] for item in status["providers"]], ["openai-codex", "xai-oauth"])
+                self.assertEqual(status["active_provider"], "openai-codex")
+
+                with self.assertRaises(ServiceError) as update_error:
+                    service.update_hermes_config(admin, {"provider": "openrouter"})
+                self.assertEqual(update_error.exception.status, 400)
+
+                with self.assertRaises(ServiceError) as key_error:
+                    service.set_secret(admin, "XAI_API_KEY", "xai-key")
+                self.assertEqual(key_error.exception.status, 400)
+            finally:
+                service.close()
+
+    def test_codex_guided_oauth_flow_stores_tokens_for_hermes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(
+                make_config(tmp),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+
+                started = service.start_oauth_verification(admin, "openai-codex")
+                flow = started["flow"]
+                self.assertEqual(flow["kind"], "device_code")
+                self.assertEqual(flow["user_code"], "CODE-1234")
+                self.assertEqual(started["active_provider"], "openai-codex")
+
+                completed = service.poll_oauth_verification(admin, "openai-codex", {"flow_id": flow["flow_id"]})
+                self.assertTrue(completed["flow"]["complete"])
+                self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
+                self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
+
+                auth_store = json.loads((service.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
+                self.assertEqual(auth_store["active_provider"], "openai-codex")
+                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
+                self.assertTrue(next(item for item in completed["providers"] if item["id"] == "openai-codex")["configured"])
+            finally:
+                service.close()
+
+    def test_grok_guided_oauth_flow_accepts_pasted_callback_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(
+                make_config(tmp),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+
+                started = service.start_oauth_verification(admin, "grok-oauth")
+                flow = started["flow"]
+                self.assertEqual(flow["kind"], "manual_callback")
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(flow["authorize_url"]).query)
+                self.assertEqual(query["referrer"], ["hermes-agent"])
+                callback_url = f"{flow['redirect_uri']}?code=grok-code&state={query['state'][0]}"
+
+                completed = service.complete_oauth_verification(
+                    admin,
+                    "xai-oauth",
+                    {"flow_id": flow["flow_id"], "callback_url": callback_url},
+                )
+                self.assertTrue(completed["flow"]["complete"])
+                self.assertEqual(service.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "grok-access")
+                self.assertEqual(service.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
+                self.assertEqual(service.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
+
+                auth_store = json.loads((service.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
+                self.assertEqual(auth_store["active_provider"], "xai-oauth")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
+                self.assertTrue(next(item for item in completed["providers"] if item["id"] == "xai-oauth")["configured"])
+            finally:
+                service.close()
+
     def test_managed_cognee_environment_is_seeded_from_platform(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -426,15 +566,13 @@ class PlatformServiceTests(unittest.TestCase):
             service = None
             try:
                 service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-                _, admin = service.authenticate("admin", "admin")
-                service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
                 service.runtimes.ensure_cognee_ready()
 
                 self.assertEqual(os.environ["DATA_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "data"))
                 self.assertEqual(os.environ["SYSTEM_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "system"))
                 self.assertEqual(os.environ["CACHE_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "cache"))
                 self.assertEqual(os.environ["COGNEE_LOGS_DIR"], str(tmp / "runtimes" / "cognee" / "logs"))
-                self.assertEqual(os.environ["LLM_API_KEY"], "sk-test-value")
+                self.assertNotIn("LLM_API_KEY", os.environ)
             finally:
                 if service is not None:
                     service.close()

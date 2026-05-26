@@ -9,11 +9,12 @@ from typing import Any
 
 from .auth import TokenSigner, hash_password, verify_password
 from .cognee_bridge import CogneeBridge
-from .config import MODEL_SECRET_KEYS, OAUTH_SECRET_KEYS, PlatformConfig
+from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient
 from .knowledge import KnowledgeBase, format_passive_suggestions
+from .oauth_flows import OAuthFlowError, OAuthFlowManager, SUPPORTED_OAUTH_PROVIDERS, oauth_provider_info
 from .runtimes import (
     HERMES_SETTING_API_URL,
     HERMES_SETTING_INSTALL_EXTRAS,
@@ -44,6 +45,7 @@ class EnterpriseService:
         agent_client: AgentClient | None = None,
         runtime_process_launcher=None,
         runtime_command_runner=None,
+        oauth_http_client=None,
         autostart_runtime: bool = True,
     ):
         self.config = config
@@ -61,6 +63,7 @@ class EnterpriseService:
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.containers = ContainerManager(config, self.db)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
+        self.oauth_flows = OAuthFlowManager(oauth_http_client)
         self.ensure_bootstrap()
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
@@ -334,8 +337,8 @@ class EnterpriseService:
         provider = None
         if "provider" in body:
             provider = normalize_hermes_provider(str(body.get("provider", "") or "auto"))
-            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", provider):
-                raise ServiceError(400, "invalid Hermes provider")
+            if provider not in SUPPORTED_OAUTH_PROVIDERS:
+                raise ServiceError(400, "Hermes provider must be Codex OAuth or Grok OAuth")
             self.set_setting(HERMES_SETTING_PROVIDER, provider)
         if "provider_base_url" in body or "base_url" in body:
             raw_base_url = body.get("provider_base_url", body.get("base_url", ""))
@@ -397,6 +400,66 @@ class EnterpriseService:
             return {"runtime": install_status.to_dict(), "config": self.runtimes.hermes_runtime_config()}
         raise ServiceError(404, "runtime not found")
 
+    def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        active_provider = normalize_hermes_provider(self.get_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider)
+        if active_provider not in SUPPORTED_OAUTH_PROVIDERS:
+            active_provider = "openai-codex"
+        runtime_oauth = self.runtimes.hermes_runtime_config().get("oauth", {})
+        providers = []
+        for provider in SUPPORTED_OAUTH_PROVIDERS:
+            info = oauth_provider_info(provider)
+            configured = self._oauth_tokens_configured(provider)
+            runtime_status = runtime_oauth.get(provider, {}) if isinstance(runtime_oauth, dict) else {}
+            providers.append(
+                {
+                    **info,
+                    "configured": configured or bool(runtime_status.get("configured")),
+                    "active": active_provider == provider,
+                    "last_refresh": self._oauth_last_refresh(provider) or runtime_status.get("last_refresh"),
+                }
+            )
+        return {"providers": providers, "active_provider": active_provider}
+
+    def start_oauth_verification(self, actor: dict[str, Any], provider: str) -> dict[str, Any]:
+        require_admin(actor)
+        provider = normalize_hermes_provider(provider)
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+        self._select_oauth_provider(provider)
+        try:
+            flow = self.oauth_flows.start(provider)
+        except OAuthFlowError as exc:
+            raise ServiceError(exc.status, exc.message) from exc
+        return {"flow": flow, **self.oauth_provider_status(actor)}
+
+    def poll_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        provider = normalize_hermes_provider(provider)
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+        flow_id = str(body.get("flow_id", "")).strip()
+        try:
+            flow = self.oauth_flows.poll(provider, flow_id)
+        except OAuthFlowError as exc:
+            raise ServiceError(exc.status, exc.message) from exc
+        self._store_oauth_flow_result(provider, flow)
+        return {"flow": flow, **self.oauth_provider_status(actor)}
+
+    def complete_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        provider = normalize_hermes_provider(provider)
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+        flow_id = str(body.get("flow_id", "")).strip()
+        callback_url = str(body.get("callback_url", "")).strip()
+        try:
+            flow = self.oauth_flows.complete(provider, flow_id, callback_url)
+        except OAuthFlowError as exc:
+            raise ServiceError(exc.status, exc.message) from exc
+        self._store_oauth_flow_result(provider, flow)
+        return {"flow": flow, **self.oauth_provider_status(actor)}
+
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         doc = self.knowledge.add_document(
             title=str(body.get("title", "")),
@@ -456,20 +519,15 @@ class EnterpriseService:
         return os.getenv(key, "")
 
     def model_secret_env(self) -> dict[str, str]:
-        values: dict[str, str] = {}
-        for key in MODEL_SECRET_KEYS:
-            value = self.get_secret(key)
-            if value:
-                values[key] = value
-        return values
+        return {}
 
     def list_secrets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
         rows = self.db.query("SELECT key, value, updated_at FROM settings WHERE secret = 1 ORDER BY key")
         found = {row["key"]: row for row in rows}
         items = []
-        known_keys = set(MODEL_SECRET_KEYS) | set(OAUTH_SECRET_KEYS) | {"ENTERPRISE_HERMES_API_KEY", "API_SERVER_KEY"}
-        for key in sorted(known_keys | set(found)):
+        known_keys = set(OAUTH_SECRET_KEYS) | {"API_SERVER_KEY", "agent_tool_token"}
+        for key in sorted(known_keys):
             value = found.get(key, {}).get("value") or os.getenv(key, "")
             items.append({
                 "key": key,
@@ -481,12 +539,61 @@ class EnterpriseService:
 
     def set_secret(self, actor: dict[str, Any], key: str, value: str) -> None:
         require_admin(actor)
-        clean = key.strip().upper()
+        raw_key = key.strip()
+        if raw_key == "agent_tool_token":
+            if not value:
+                raise ServiceError(400, "secret value is required")
+            self.set_setting(raw_key, value, secret=True)
+            return
+        clean = raw_key.upper()
         if not re.fullmatch(r"[A-Z0-9_]{2,80}", clean):
             raise ServiceError(400, "invalid secret key")
+        allowed_keys = set(OAUTH_SECRET_KEYS) | {"API_SERVER_KEY"}
+        if clean not in allowed_keys:
+            raise ServiceError(400, "unsupported secret key")
         if not value:
             raise ServiceError(400, "secret value is required")
         self.set_setting(clean, value, secret=True)
+
+    def _select_oauth_provider(self, provider: str) -> None:
+        self.set_setting(HERMES_SETTING_PROVIDER, provider)
+        self.set_setting(HERMES_SETTING_MODEL, default_model_for_provider(provider))
+        self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
+        self.runtimes.prepare_hermes()
+
+    def _store_oauth_flow_result(self, provider: str, flow: dict[str, Any]) -> None:
+        tokens = flow.pop("tokens", None)
+        if not tokens:
+            return
+        self._select_oauth_provider(provider)
+        if provider == "openai-codex":
+            self.set_setting("CODEX_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
+            self.set_setting("CODEX_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+        elif provider == "xai-oauth":
+            self.set_setting("GROK_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
+            self.set_setting("GROK_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+            id_token = str(tokens.get("id_token", "") or "").strip()
+            if id_token:
+                self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
+        self.runtimes.prepare_hermes()
+
+    def _oauth_tokens_configured(self, provider: str) -> bool:
+        if provider == "openai-codex":
+            return bool(self.get_secret("CODEX_OAUTH_ACCESS_TOKEN") and self.get_secret("CODEX_OAUTH_REFRESH_TOKEN"))
+        if provider == "xai-oauth":
+            return bool(self.get_secret("GROK_OAUTH_ACCESS_TOKEN") and self.get_secret("GROK_OAUTH_REFRESH_TOKEN"))
+        return False
+
+    def _oauth_last_refresh(self, provider: str) -> int | None:
+        keys = {
+            "openai-codex": "CODEX_OAUTH_ACCESS_TOKEN",
+            "xai-oauth": "GROK_OAUTH_ACCESS_TOKEN",
+        }
+        key = keys.get(provider)
+        if not key:
+            return None
+        row = self.db.query_one("SELECT updated_at FROM settings WHERE key = ? AND secret = 1", (key,))
+        return int(row["updated_at"]) if row and row.get("updated_at") else None
 
     def agent_tool_token(self, actor: dict[str, Any]) -> dict[str, str]:
         require_admin(actor)

@@ -158,6 +158,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/hermes/config" and method == "PUT":
             self._json(service.update_hermes_config(actor, self._body_json()))
             return
+        if path == "/api/system/oauth/providers" and method == "GET":
+            self._json(service.oauth_provider_status(actor))
+            return
+        m = re.fullmatch(r"/api/system/oauth/([A-Za-z0-9_-]+)/start", path)
+        if m and method == "POST":
+            self._json(service.start_oauth_verification(actor, m.group(1)), status=201)
+            return
+        m = re.fullmatch(r"/api/system/oauth/([A-Za-z0-9_-]+)/poll", path)
+        if m and method == "POST":
+            self._json(service.poll_oauth_verification(actor, m.group(1), self._body_json()))
+            return
+        m = re.fullmatch(r"/api/system/oauth/([A-Za-z0-9_-]+)/complete", path)
+        if m and method == "POST":
+            self._json(service.complete_oauth_verification(actor, m.group(1), self._body_json()))
+            return
         m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/install", path)
         if m and method == "POST":
             self._json(service.install_runtime(actor, m.group(1)))

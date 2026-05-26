@@ -5,28 +5,9 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
-
-MODEL_SECRET_KEYS = (
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENROUTER_API_KEY",
-    "NOUS_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "XAI_API_KEY",
-    "MOONSHOT_API_KEY",
-    "ZAI_API_KEY",
-    "NVIDIA_API_KEY",
-)
-
 OAUTH_SECRET_KEYS = (
     "CODEX_OAUTH_ACCESS_TOKEN",
     "CODEX_OAUTH_REFRESH_TOKEN",
-    "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
-    "OPENAI_CODEX_OAUTH_REFRESH_TOKEN",
-    "XAI_OAUTH_ACCESS_TOKEN",
-    "XAI_OAUTH_REFRESH_TOKEN",
-    "XAI_OAUTH_ID_TOKEN",
     "GROK_OAUTH_ACCESS_TOKEN",
     "GROK_OAUTH_REFRESH_TOKEN",
     "GROK_OAUTH_ID_TOKEN",
@@ -59,7 +40,7 @@ class PlatformConfig:
     hermes_home: Path | None = None
     hermes_install_extras: str = ""
     runtime_startup_wait_seconds: float = 8.0
-    hermes_provider: str = "auto"
+    hermes_provider: str = "openai-codex"
     hermes_provider_base_url: str = ""
 
     @property
@@ -123,7 +104,7 @@ class PlatformConfig:
             ).expanduser(),
             hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
             runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
-            hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "auto").strip().lower() or "auto",
+            hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "openai-codex").strip().lower() or "openai-codex",
             hermes_provider_base_url=os.getenv("ENTERPRISE_HERMES_PROVIDER_BASE_URL", "").strip().rstrip("/"),
         )
 

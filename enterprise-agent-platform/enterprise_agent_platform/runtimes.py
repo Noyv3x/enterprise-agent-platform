@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from .config import MODEL_SECRET_KEYS, PlatformConfig
+from .config import PlatformConfig
+from .oauth_flows import OAUTH_PROVIDER_INFO, SUPPORTED_OAUTH_PROVIDERS, normalize_oauth_provider
 from .db import now_ts
 
 
@@ -32,8 +33,6 @@ HERMES_SETTING_STARTUP_WAIT = "hermes_startup_wait_seconds"
 HERMES_SETTING_PROVIDER = "hermes_provider"
 HERMES_SETTING_PROVIDER_BASE_URL = "hermes_provider_base_url"
 
-DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_PROVIDER_MODELS = {
     "openai-codex": "gpt-5.3-codex",
     "xai-oauth": "grok-4.3",
@@ -150,7 +149,6 @@ class PlatformRuntimeManager:
         self._hermes_last_started_at: int | None = None
         self._hermes_last_error = ""
         self._cognee_last_error = ""
-        self._managed_llm_api_key: str | None = None
 
     def prepare(self) -> dict[str, Any]:
         with self._lock:
@@ -543,16 +541,12 @@ class PlatformRuntimeManager:
 
         if provider_setting is not None:
             provider = self._effective_hermes_provider()
-            if provider == "auto":
-                model_config.pop("provider", None)
-                model_config.pop("base_url", None)
+            model_config["provider"] = provider
+            base_url = self._effective_hermes_provider_base_url(provider)
+            if base_url:
+                model_config["base_url"] = base_url
             else:
-                model_config["provider"] = provider
-                base_url = self._effective_hermes_provider_base_url(provider)
-                if base_url:
-                    model_config["base_url"] = base_url
-                else:
-                    model_config.pop("base_url", None)
+                model_config.pop("base_url", None)
         elif base_url_setting is not None:
             base_url = self._effective_hermes_provider_base_url(self._effective_hermes_provider())
             if base_url:
@@ -580,7 +574,7 @@ class PlatformRuntimeManager:
         changed |= self._upsert_xai_oauth(providers)
 
         provider = self._effective_hermes_provider()
-        if provider in {"openai-codex", "xai-oauth"} and isinstance(providers.get(provider), dict):
+        if provider in SUPPORTED_OAUTH_PROVIDERS and isinstance(providers.get(provider), dict):
             if auth_store.get("active_provider") != provider:
                 auth_store["active_provider"] = provider
                 changed = True
@@ -593,11 +587,9 @@ class PlatformRuntimeManager:
     def _upsert_codex_oauth(self, providers: dict[str, Any]) -> bool:
         access_token = self._first_secret(
             "CODEX_OAUTH_ACCESS_TOKEN",
-            "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
         )
         refresh_token = self._first_secret(
             "CODEX_OAUTH_REFRESH_TOKEN",
-            "OPENAI_CODEX_OAUTH_REFRESH_TOKEN",
         )
         if not access_token or not refresh_token:
             return False
@@ -616,8 +608,8 @@ class PlatformRuntimeManager:
         return changed
 
     def _upsert_xai_oauth(self, providers: dict[str, Any]) -> bool:
-        access_token = self._first_secret("XAI_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_ACCESS_TOKEN")
-        refresh_token = self._first_secret("XAI_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_REFRESH_TOKEN")
+        access_token = self._first_secret("GROK_OAUTH_ACCESS_TOKEN")
+        refresh_token = self._first_secret("GROK_OAUTH_REFRESH_TOKEN")
         if not access_token or not refresh_token:
             return False
         state = providers.get("xai-oauth")
@@ -627,7 +619,7 @@ class PlatformRuntimeManager:
         tokens = dict(state.get("tokens") or {})
         tokens["access_token"] = access_token
         tokens["refresh_token"] = refresh_token
-        id_token = self._first_secret("XAI_OAUTH_ID_TOKEN", "GROK_OAUTH_ID_TOKEN")
+        id_token = self._first_secret("GROK_OAUTH_ID_TOKEN")
         if id_token:
             tokens["id_token"] = id_token
         tokens.setdefault("token_type", "Bearer")
@@ -656,17 +648,12 @@ class PlatformRuntimeManager:
             env["PYTHONPATH"] = os.pathsep.join(parts)
         provider = self._effective_hermes_provider()
         provider_base_url = self._effective_hermes_provider_base_url(provider)
-        if provider != "auto":
-            env["HERMES_INFERENCE_PROVIDER"] = provider
+        env["HERMES_INFERENCE_PROVIDER"] = provider
         if provider == "openai-codex" and provider_base_url:
             env["HERMES_CODEX_BASE_URL"] = provider_base_url
-        if provider in {"xai", "xai-oauth"} and provider_base_url:
+        if provider == "xai-oauth" and provider_base_url:
             env["HERMES_XAI_BASE_URL"] = provider_base_url
             env["XAI_BASE_URL"] = provider_base_url
-        for key in MODEL_SECRET_KEYS:
-            value = self.secret_provider(key)
-            if value:
-                env[key] = value
         return env
 
     def _hermes_child_values(self) -> dict[str, str]:
@@ -687,11 +674,10 @@ class PlatformRuntimeManager:
         }
         provider = self._effective_hermes_provider()
         provider_base_url = self._effective_hermes_provider_base_url(provider)
-        if provider != "auto":
-            values["HERMES_INFERENCE_PROVIDER"] = provider
+        values["HERMES_INFERENCE_PROVIDER"] = provider
         if provider == "openai-codex" and provider_base_url:
             values["HERMES_CODEX_BASE_URL"] = provider_base_url
-        if provider in {"xai", "xai-oauth"} and provider_base_url:
+        if provider == "xai-oauth" and provider_base_url:
             values["HERMES_XAI_BASE_URL"] = provider_base_url
             values["XAI_BASE_URL"] = provider_base_url
         if api_key:
@@ -739,16 +725,6 @@ class PlatformRuntimeManager:
                 Path(path).expanduser().mkdir(parents=True, exist_ok=True)
         for key, value in values.items():
             os.environ.setdefault(key, value)
-        selected_key = ""
-        for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY", "OPENROUTER_API_KEY"):
-            value = self.secret_provider(key)
-            if value:
-                selected_key = value
-                break
-        current_key = os.getenv("LLM_API_KEY")
-        if selected_key and (not current_key or current_key == self._managed_llm_api_key):
-            os.environ["LLM_API_KEY"] = selected_key
-            self._managed_llm_api_key = selected_key
 
     def _managed_hermes_enabled(self) -> bool:
         value = self._runtime_setting(HERMES_SETTING_MANAGED)
@@ -768,7 +744,8 @@ class PlatformRuntimeManager:
 
     def _effective_hermes_provider(self) -> str:
         value = self._runtime_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider
-        return normalize_hermes_provider(value)
+        provider = normalize_hermes_provider(value)
+        return provider if provider in SUPPORTED_OAUTH_PROVIDERS else "openai-codex"
 
     def _effective_hermes_provider_base_url(self, provider: str | None = None) -> str:
         provider = normalize_hermes_provider(provider or self._effective_hermes_provider())
@@ -885,14 +862,14 @@ def _module_importable(name: str) -> bool:
 
 
 def normalize_hermes_provider(value: str | None) -> str:
-    clean = (value or "auto").strip().lower().replace("_", "-")
+    clean = (value or "openai-codex").strip().lower().replace("_", "-")
     aliases = {
-        "": "auto",
-        "default": "auto",
+        "": "openai-codex",
+        "auto": "openai-codex",
+        "default": "openai-codex",
         "codex": "openai-codex",
         "openai-codex-oauth": "openai-codex",
-        "grok": "xai",
-        "grok-api": "xai",
+        "grok": "xai-oauth",
         "grok-oauth": "xai-oauth",
         "x-ai-oauth": "xai-oauth",
         "xai-grok-oauth": "xai-oauth",
@@ -902,11 +879,8 @@ def normalize_hermes_provider(value: str | None) -> str:
 
 def default_base_url_for_provider(provider: str) -> str:
     provider = normalize_hermes_provider(provider)
-    if provider == "openai-codex":
-        return DEFAULT_CODEX_BASE_URL
-    if provider in {"xai", "xai-oauth"}:
-        return DEFAULT_XAI_BASE_URL
-    return ""
+    info = OAUTH_PROVIDER_INFO.get(provider)
+    return str(info.get("base_url", "")) if info else ""
 
 
 def default_model_for_provider(provider: str) -> str:

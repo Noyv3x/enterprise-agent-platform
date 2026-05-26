@@ -10,6 +10,9 @@ const state = {
   secrets: [],
   runtimes: null,
   hermesConfig: null,
+  oauthProviders: null,
+  oauthFlows: {},
+  oauthCallbackUrls: {},
   busy: false,
   error: "",
 };
@@ -254,16 +257,13 @@ function renderSettings() {
   const repoPath = h("input", { value: hermes.repo_path || "" });
   const apiUrl = h("input", { value: hermes.api_url || "" });
   const provider = h("select", {}, [
-    h("option", { value: "auto", text: "auto" }),
-    h("option", { value: "openrouter", text: "OpenRouter / API key" }),
     h("option", { value: "openai-codex", text: "Codex OAuth" }),
-    h("option", { value: "xai", text: "Grok / xAI API key" }),
     h("option", { value: "xai-oauth", text: "Grok OAuth" }),
   ]);
-  provider.value = hermes.provider || "auto";
+  provider.value = ["openai-codex", "xai-oauth"].includes(hermes.provider) ? hermes.provider : "openai-codex";
   const providerBaseUrl = h("input", {
     value: hermes.provider_base_url || "",
-    placeholder: "可选；OAuth 会自动使用默认 endpoint",
+    placeholder: "默认使用所选 OAuth 供应商 endpoint",
   });
   const model = h("input", { value: hermes.model || "" });
   const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
@@ -272,7 +272,7 @@ function renderSettings() {
     type: "password",
     placeholder: hermes.api_key_configured ? "保持不变" : "API server key",
   });
-  const rows = state.secrets.map((secret) => {
+  const rows = state.secrets.filter((secret) => !isOAuthSecret(secret.key)).map((secret) => {
     const input = h("input", { type: "password", placeholder: secret.configured ? secret.masked : "未配置" });
     return h("div", { class: "secret-row" }, [
       h("strong", { text: secret.key }),
@@ -319,6 +319,7 @@ function renderSettings() {
     ]),
   ) : [];
   return h("div", { class: "panel" }, [
+    renderOAuthSettings(),
     h("div", { class: "section" }, [
       h("h2", { text: "底层基座" }),
       h("div", { class: "list" }, runtimeRows),
@@ -351,8 +352,8 @@ function renderSettings() {
       h("label", { class: "check-row" }, [manageHermes, h("span", { text: "由平台托管 Hermes" })]),
       field("源码路径", repoPath),
       field("API URL", apiUrl),
-      field("Provider", provider),
-      field("Provider Base URL", providerBaseUrl),
+      field("API 供应商", provider),
+      field("供应商 Base URL", providerBaseUrl),
       field("模型", model),
       field("安装 extras", installExtras),
       field("启动等待秒数", startupWait),
@@ -373,14 +374,122 @@ function renderSettings() {
       ]),
     ]),
     h("div", { class: "section" }, [
-      h("h2", { text: "集中密钥配置" }),
-      h("div", { class: "list" }, rows),
+      h("h2", { text: "平台内部密钥" }),
+      rows.length ? h("div", { class: "list" }, rows) : h("div", { class: "muted", text: "暂无可手动配置的内部密钥" }),
+    ]),
+  ]);
+}
+
+function renderOAuthSettings() {
+  const providers = state.oauthProviders?.providers || [];
+  return h("div", { class: "section" }, [
+    h("h2", { text: "API 供应商验证" }),
+    h("div", { class: "oauth-grid" }, providers.map(renderOAuthProviderCard)),
+  ]);
+}
+
+function renderOAuthProviderCard(provider) {
+  const flow = state.oauthFlows[provider.id];
+  const callbackValue = state.oauthCallbackUrls[provider.id] || "";
+  const statusClass = provider.configured ? "ok" : "warn";
+  const header = h("div", { class: "oauth-card-head" }, [
+    h("div", {}, [
+      h("strong", { text: provider.label }),
+      h("div", { class: "muted", text: provider.model }),
+    ]),
+    h("span", { class: `status ${statusClass}`, text: provider.configured ? "已验证" : "未验证" }),
+  ]);
+  const meta = h("div", { class: "oauth-meta" }, [
+    provider.active ? h("span", { class: "pill", text: "当前使用" }) : null,
+    provider.last_refresh ? h("span", { class: "muted", text: `更新：${formatTimestamp(provider.last_refresh)}` }) : null,
+  ]);
+  const startButton = h("button", {
+    class: provider.configured ? "" : "primary",
+    disabled: state.busy,
+    onclick: async () => startOAuthVerification(provider.id),
+    text: provider.configured ? "重新验证" : "开始验证",
+  });
+  const children = [header, meta, h("div", { class: "oauth-actions" }, [startButton])];
+  if (flow?.kind === "device_code") {
+    children.push(renderCodexOAuthFlow(provider.id, flow));
+  } else if (flow?.kind === "manual_callback") {
+    children.push(renderGrokOAuthFlow(provider.id, flow, callbackValue));
+  }
+  if (flow?.complete) {
+    children.push(h("div", { class: "oauth-guide complete", text: "验证完成，Hermes 已切换到该供应商。" }));
+  }
+  return h("div", { class: "oauth-card" }, children);
+}
+
+function renderCodexOAuthFlow(providerId, flow) {
+  return h("div", { class: "oauth-guide" }, [
+    h("div", { class: "oauth-line" }, [
+      h("span", { text: "验证页" }),
+      h("a", { href: flow.verification_url, target: "_blank", rel: "noreferrer", text: flow.verification_url }),
+    ]),
+    h("div", { class: "oauth-code", text: flow.user_code }),
+    h("div", { class: "oauth-actions" }, [
+      h("button", {
+        disabled: state.busy,
+        onclick: async () => pollOAuthVerification(providerId, flow.flow_id),
+        text: "检查状态",
+      }),
+      h("span", { class: "muted", text: `状态：${oauthStatusLabel(flow.status)}` }),
+    ]),
+  ]);
+}
+
+function renderGrokOAuthFlow(providerId, flow, callbackValue) {
+  const callbackInput = h("textarea", {
+    placeholder: "粘贴浏览器跳转后的完整 callback URL",
+    oninput: (event) => {
+      state.oauthCallbackUrls[providerId] = event.target.value;
+    },
+  });
+  callbackInput.value = callbackValue;
+  return h("div", { class: "oauth-guide" }, [
+    h("div", { class: "oauth-line" }, [
+      h("span", { text: "授权页" }),
+      h("a", { href: flow.authorize_url, target: "_blank", rel: "noreferrer", text: "打开 Grok OAuth" }),
+    ]),
+    h("div", { class: "oauth-line" }, [
+      h("span", { text: "回调地址" }),
+      h("code", { text: flow.redirect_uri }),
+    ]),
+    callbackInput,
+    h("div", { class: "oauth-actions" }, [
+      h("button", {
+        disabled: state.busy,
+        onclick: async () => completeOAuthVerification(providerId, flow.flow_id),
+        text: "完成验证",
+      }),
+      h("span", { class: "muted", text: `状态：${oauthStatusLabel(flow.status)}` }),
     ]),
   ]);
 }
 
 function field(label, control) {
   return h("label", { class: "field" }, [h("span", { text: label }), control]);
+}
+
+function isOAuthSecret(key) {
+  return key.includes("_OAUTH_");
+}
+
+function oauthStatusLabel(status) {
+  const labels = {
+    waiting_for_user: "等待网页登录",
+    waiting_for_callback: "等待回调 URL",
+    complete: "已完成",
+  };
+  return labels[status] || status || "等待中";
+}
+
+function formatTimestamp(value) {
+  if (!value) return "";
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
 }
 
 function activeChannel() {
@@ -419,6 +528,10 @@ async function loadSecrets() {
   state.secrets = result.secrets;
 }
 
+async function loadOAuthProviders() {
+  state.oauthProviders = await api("/api/system/oauth/providers");
+}
+
 async function loadRuntime() {
   state.runtimes = await api("/api/system/runtime");
 }
@@ -428,7 +541,46 @@ async function loadHermesConfig() {
 }
 
 async function loadSettings() {
-  await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig()]);
+  await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]);
+}
+
+async function startOAuthVerification(providerId) {
+  await withBusy(async () => {
+    const result = await api(`/api/system/oauth/${providerId}/start`, { method: "POST", body: "{}" });
+    updateOAuthState(providerId, result);
+    await loadHermesConfig();
+  });
+}
+
+async function pollOAuthVerification(providerId, flowId) {
+  await withBusy(async () => {
+    const result = await api(`/api/system/oauth/${providerId}/poll`, {
+      method: "POST",
+      body: JSON.stringify({ flow_id: flowId }),
+    });
+    updateOAuthState(providerId, result);
+    await loadHermesConfig();
+  });
+}
+
+async function completeOAuthVerification(providerId, flowId) {
+  await withBusy(async () => {
+    const result = await api(`/api/system/oauth/${providerId}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ flow_id: flowId, callback_url: state.oauthCallbackUrls[providerId] || "" }),
+    });
+    updateOAuthState(providerId, result);
+    if (result.flow?.complete) state.oauthCallbackUrls[providerId] = "";
+    await loadHermesConfig();
+  });
+}
+
+function updateOAuthState(providerId, result) {
+  state.oauthProviders = {
+    providers: result.providers || [],
+    active_provider: result.active_provider || providerId,
+  };
+  if (result.flow) state.oauthFlows[providerId] = result.flow;
 }
 
 async function logout() {

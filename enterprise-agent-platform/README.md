@@ -7,7 +7,7 @@
 - 基于账号和密码的登录，并使用签名的 HttpOnly session。
 - 基于频道的 Web 聊天。每个频道会路由到一个共享的 Hermes 主 Agent 线程。
 - 按用户隔离的私人 Agent。平台会为用户创建独立工作区，并在 Docker 可用时启动托管容器。
-- 集中的模型/API key 配置。用户无需在私人 Agent 会话中输入模型密钥。
+- Codex OAuth 和 Grok OAuth 两种模型供应商验证。用户无需在私人 Agent 会话中输入模型密钥。
 - 企业知识库，支持文档写入、搜索、每轮被动建议、可选 Cognee 混合索引，以及 Hermes 工具调用。
 - 可在 Web 设置页管理 Hermes 和 Cognee 运行时。
 
@@ -43,6 +43,13 @@ rm -rf .venv
 ```
 
 如果首次运行前未设置 `ENTERPRISE_ADMIN_PASSWORD`，默认引导账号为 `admin` / `admin`。
+
+登录后进入“设置”页面，在“API 供应商验证”中完成二选一的供应商授权：
+
+- `Codex OAuth`：点击开始验证，打开页面并输入设备码，再回到平台点击检查状态。
+- `Grok OAuth`：点击开始验证，打开授权页，浏览器跳转到本机回调地址后复制完整 URL 并粘贴回平台完成验证。
+
+平台只保留这两个 Hermes 模型供应商；OpenAI、OpenRouter 或 xAI API key 不再作为模型供应商配置入口。
 
 常用部署命令：
 

@@ -328,6 +328,78 @@ textarea {
   flex-wrap: wrap;
 }
 
+.oauth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.oauth-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.oauth-card-head,
+.oauth-meta,
+.oauth-actions,
+.oauth-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.oauth-card-head {
+  justify-content: space-between;
+}
+
+.oauth-actions {
+  align-items: center;
+}
+
+.oauth-guide {
+  border: 1px solid #c9d8ef;
+  border-radius: 6px;
+  background: #f7fbff;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.oauth-guide.complete {
+  border-color: #b7dcd7;
+  background: #f3fbfa;
+  color: #0b5f59;
+}
+
+.oauth-line span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.oauth-line a,
+.oauth-line code {
+  overflow-wrap: anywhere;
+}
+
+.oauth-code {
+  border: 1px solid #b7dcd7;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #0b5f59;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0;
+  padding: 10px;
+  text-align: center;
+}
+
 .config-form {
   max-width: 760px;
 }
@@ -397,6 +469,7 @@ textarea {
   }
 
   .grid,
+  .oauth-grid,
   .composer,
   .secret-row,
   .runtime-row {

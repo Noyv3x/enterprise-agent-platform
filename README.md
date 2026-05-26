@@ -4,7 +4,7 @@
 
 ## 目录结构
 
-- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、托管工作区/容器、集中模型密钥配置、企业知识库、测试，以及 Hermes 知识工具插件。
+- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、托管工作区/容器、Codex OAuth/Grok OAuth 供应商验证、企业知识库、测试，以及 Hermes 知识工具插件。
 - `hermes-agent/`：指向 `NousResearch/hermes-agent` 的 Git submodule，用作 Agent 运行时和 OpenAI 兼容 API 后端。
 - `cognee/`：指向 `topoteretes/cognee` 的 Git submodule，用作可选的企业知识图谱后端。
 
@@ -40,6 +40,8 @@ rm -rf .venv
 ```
 
 如果首次启动前没有配置管理员密码，默认引导账号为 `admin` / `admin`。
+
+登录后进入“设置”，在“API 供应商验证”中选择并完成 `Codex OAuth` 或 `Grok OAuth`。平台只保留这两个 Hermes 模型供应商；不再通过 OpenAI、OpenRouter 或 xAI API key 配置模型供应商。
 
 首次启动时，平台需要相邻的 `hermes-agent/` submodule 存在。`./deploy.sh` 会自动初始化该 submodule；平台随后会创建 `enterprise-agent-platform/data/runtimes/hermes/venv`，从本地源码以 editable install 方式安装 Hermes，写入托管 Hermes 配置，并在 Agent 流量需要时启动 Hermes API server。Hermes 源码路径、API URL、模型名、安装 extras、启动等待时间和 API server key 都可以在平台设置页管理。
 
