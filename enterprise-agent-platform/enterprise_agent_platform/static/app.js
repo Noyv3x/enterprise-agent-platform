@@ -490,10 +490,22 @@ function renderTyping() {
   ]);
 }
 
-function autoGrow(el) {
+function autoGrow(el, { animate = true } = {}) {
   if (!el) return;
+  const previousHeight = el.getBoundingClientRect().height;
   el.style.height = "auto";
-  el.style.height = Math.min(el.scrollHeight, 200) + "px";
+  const fullHeight = el.scrollHeight;
+  const nextHeight = Math.min(fullHeight, 200);
+  el.classList.toggle("is-scrollable", fullHeight > nextHeight + 1);
+
+  if (!animate || !previousHeight || Math.abs(previousHeight - nextHeight) < 1) {
+    el.style.height = nextHeight + "px";
+    return;
+  }
+
+  el.style.height = previousHeight + "px";
+  void el.offsetHeight;
+  el.style.height = nextHeight + "px";
 }
 
 /* ------------------------------------------------------------ knowledge */
