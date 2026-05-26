@@ -40,6 +40,7 @@ let pollTimer = null;
 let pollInFlight = false;
 let localMessageSeq = 0;
 const typingState = { key: null, active: false, lastSent: 0, stopTimer: null };
+const composerState = { composing: false, renderDeferred: false };
 
 /* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
@@ -175,8 +176,21 @@ function toast(message, { type = "error", title } = {}) {
 
 /* ----------------------------------------------------- render plumbing */
 function render() {
+  if (shouldDeferComposerRender()) {
+    composerState.renderDeferred = true;
+    return;
+  }
   app.replaceChildren(state.user ? renderShell() : renderLogin());
   requestAnimationFrame(afterRender);
+}
+function shouldDeferComposerRender() {
+  return composerState.composing && document.activeElement?.matches?.(".composer textarea");
+}
+function flushDeferredRender() {
+  if (!composerState.renderDeferred) return;
+  composerState.renderDeferred = false;
+  state._focusComposer = true;
+  render();
 }
 function afterRender() {
   const msgs = app.querySelector(".messages");
@@ -421,7 +435,17 @@ function renderChat(mode) {
     oninput: (e) => {
       state.drafts[draftKey] = e.target.value;
       autoGrow(e.target);
+      if (!e.isComposing && !composerState.composing) notifyTyping(mode, scopeId, e.target.value.trim().length > 0);
+    },
+    oncompositionstart: () => {
+      composerState.composing = true;
+    },
+    oncompositionend: (e) => {
+      composerState.composing = false;
+      state.drafts[draftKey] = e.target.value;
+      autoGrow(e.target);
       notifyTyping(mode, scopeId, e.target.value.trim().length > 0);
+      flushDeferredRender();
     },
     onkeydown: (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -433,6 +457,7 @@ function renderChat(mode) {
   input.value = state.drafts[draftKey] || "";
 
   const submit = async () => {
+    if (composerState.composing) return;
     const content = (state.drafts[draftKey] || input.value).trim();
     if (!content || noChannel || !canChat) return;
     input.value = "";
@@ -1030,6 +1055,41 @@ function agentStatusText(status) {
   const target = status.replying_to?.username || "用户";
   return status.state === "queued" ? `Agent 准备回复 ${target}` : `Agent 正在回复 ${target}`;
 }
+function messageFingerprint(message) {
+  return {
+    id: message.id,
+    author_type: message.author_type,
+    user_id: message.user_id,
+    username: message.username,
+    content: message.content,
+    created_at: message.created_at,
+    pending: !!message.metadata?.local_pending,
+  };
+}
+function agentStatusFingerprint(status) {
+  if (!status) return null;
+  return {
+    state: status.state,
+    queued_count: status.queued_count || 0,
+    replying_to: status.replying_to
+      ? {
+          id: status.replying_to.id,
+          username: status.replying_to.username,
+          content: status.replying_to.content,
+          created_at: status.replying_to.created_at,
+        }
+      : null,
+  };
+}
+function chatSnapshot(mode, scopeId = scopeIdFor(mode)) {
+  const messages = mode === "private" ? state.privateMessages : state.messages;
+  return JSON.stringify({
+    scope: `${scopeTypeFor(mode)}:${scopeId || ""}`,
+    messages: messages.map(messageFingerprint),
+    agent: agentStatusFingerprint(agentStatusFor(mode, scopeId)),
+    typing: mode === "channel" ? state.typingUsers.map((item) => ({ user_id: item.user_id, username: item.username })) : [],
+  });
+}
 function mergePendingMessages(mode, scopeId, messages) {
   const pending = state.pendingMessages.filter((message) => message.scope_type === scopeTypeFor(mode) && message.scope_id === String(scopeId));
   return [...messages, ...pending];
@@ -1166,12 +1226,16 @@ async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermission
 async function refreshActiveChat({ renderAfter = true } = {}) {
   if (!state.user || pollInFlight) return;
   const keepFocus = !!app.querySelector(".composer textarea:focus");
+  const mode = state.activeView === "private" ? "private" : state.activeView === "channel" ? "channel" : "";
+  const scopeId = mode ? scopeIdFor(mode) : "";
+  const before = mode ? chatSnapshot(mode, scopeId) : "";
   pollInFlight = true;
   try {
     if (state.activeView === "channel" && state.activeChannelId) await loadChannelMessages();
     else if (state.activeView === "private") await loadPrivateMessages();
     else return;
-    if (renderAfter) {
+    const changed = mode ? before !== chatSnapshot(mode, scopeId) : true;
+    if (renderAfter && changed) {
       if (keepFocus) state._focusComposer = true;
       render();
     }
