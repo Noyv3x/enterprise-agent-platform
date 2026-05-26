@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -197,6 +198,44 @@ class PlatformServiceTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
+    def test_existing_admin_rows_migrate_to_admin_permission_group(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            conn = sqlite3.connect(tmp / "platform.db")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL UNIQUE,
+                        display_name TEXT NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        role TEXT NOT NULL DEFAULT 'member',
+                        active INTEGER NOT NULL DEFAULT 1,
+                        created_at INTEGER NOT NULL,
+                        last_login_at INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO users(username, display_name, password_hash, role, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("admin", "Administrator", "legacy", "admin", 1),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                user = service.get_user(1)
+                self.assertEqual(user["role"], "admin")
+                self.assertEqual(user["permission_group"], "admin")
+                self.assertIn("system_settings", user["permissions"])
+            finally:
+                service.close()
+
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -258,6 +297,108 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(private["container"]["session_id"], "enterprise-private-u2")
             self.assertEqual(service.model_secret_env(), {})
             service.close()
+
+    def test_admin_can_manage_account_permissions_and_model_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                user = service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    position="Analyst",
+                    permission_group="viewer",
+                    model_name="gpt-5.3-codex",
+                    thinking_depth="low",
+                    actor=admin,
+                )
+
+                self.assertEqual(user["position"], "Analyst")
+                self.assertEqual(user["permission_group"], "viewer")
+                self.assertEqual(user["role"], "member")
+                self.assertEqual(user["model_name"], "gpt-5.3-codex")
+                self.assertEqual(user["thinking_depth"], "low")
+                self.assertNotIn("chat", user["permissions"])
+                groups = {item["id"] for item in service.list_permission_groups(admin)}
+                self.assertIn("admin", groups)
+                self.assertIn("manager", groups)
+
+                updated = service.update_user(
+                    admin,
+                    user["id"],
+                    {
+                        "position": "Engineering Manager",
+                        "permission_group": "manager",
+                        "model_name": "grok-4.3",
+                        "thinking_depth": "high",
+                    },
+                )
+                self.assertEqual(updated["position"], "Engineering Manager")
+                self.assertEqual(updated["permission_group"], "manager")
+                self.assertIn("manage_knowledge", updated["permissions"])
+                self.assertEqual(updated["model_name"], "grok-4.3")
+                self.assertEqual(updated["thinking_depth"], "high")
+
+                _, member_actor = service.authenticate("alice", "alice-pass")
+                with self.assertRaises(ServiceError) as list_error:
+                    service.list_users(member_actor)
+                self.assertEqual(list_error.exception.status, 403)
+                with self.assertRaises(ServiceError) as update_error:
+                    service.update_user(member_actor, admin["id"], {"position": "Owner"})
+                self.assertEqual(update_error.exception.status, 403)
+            finally:
+                service.close()
+
+    def test_account_model_and_thinking_depth_are_used_for_agent_calls(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="bob",
+                    password="bob-pass",
+                    display_name="Bob",
+                    permission_group="member",
+                    model_name="grok-4.3",
+                    thinking_depth="xhigh",
+                    actor=admin,
+                )
+                _, bob = service.authenticate("bob", "bob-pass")
+
+                result = service.send_private_message(bob, "draft a plan")
+
+                self.assertEqual(agent.calls[-1]["model"], "grok-4.3")
+                self.assertEqual(agent.calls[-1]["thinking_depth"], "xhigh")
+                self.assertEqual(agent.calls[-1]["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+                self.assertEqual(result["agent_message"]["metadata"]["generation"]["model"], "grok-4.3")
+                self.assertEqual(result["agent_message"]["metadata"]["generation"]["thinking_depth"], "xhigh")
+            finally:
+                service.close()
+
+    def test_viewer_permission_group_cannot_send_messages(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="viewer",
+                    password="viewer-pass",
+                    display_name="Viewer",
+                    permission_group="viewer",
+                    actor=admin,
+                )
+                _, viewer = service.authenticate("viewer", "viewer-pass")
+
+                with self.assertRaises(ServiceError) as send_error:
+                    service.send_channel_message(viewer, 1, "hello")
+                self.assertEqual(send_error.exception.status, 403)
+                with self.assertRaises(ServiceError) as private_error:
+                    service.send_private_message(viewer, "hello")
+                self.assertEqual(private_error.exception.status, 403)
+            finally:
+                service.close()
 
     def test_oauth_secret_keys_are_admin_configurable_but_not_model_env(self):
         with tempfile.TemporaryDirectory() as td:
@@ -621,6 +762,44 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(res.status, 200)
                 self.assertIn("config", hermes_config)
                 self.assertIn("repo_path", hermes_config["config"])
+
+                conn.request("GET", "/api/permission-groups", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                groups = json.loads(res.read().decode("utf-8"))["permission_groups"]
+                self.assertEqual(res.status, 200)
+                self.assertIn("admin", {group["id"] for group in groups})
+
+                conn.request(
+                    "POST",
+                    "/api/users",
+                    body=json.dumps({
+                        "username": "http-user",
+                        "password": "http-pass",
+                        "display_name": "HTTP User",
+                        "position": "Designer",
+                        "permission_group": "member",
+                        "model_name": "gpt-5.3-codex",
+                        "thinking_depth": "minimal",
+                    }),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                created_user = json.loads(res.read().decode("utf-8"))["user"]
+                self.assertEqual(res.status, 201)
+                self.assertEqual(created_user["position"], "Designer")
+                self.assertEqual(created_user["model_name"], "gpt-5.3-codex")
+
+                conn.request(
+                    "PUT",
+                    f"/api/users/{created_user['id']}",
+                    body=json.dumps({"permission_group": "manager", "thinking_depth": "high"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                updated_user = json.loads(res.read().decode("utf-8"))["user"]
+                self.assertEqual(res.status, 200)
+                self.assertEqual(updated_user["permission_group"], "manager")
+                self.assertEqual(updated_user["thinking_depth"], "high")
 
                 conn.request(
                     "POST",

@@ -14,6 +14,8 @@ const state = {
   privateMessages: [],
   documents: [],
   selectedDocument: null,
+  users: [],
+  permissionGroups: [],
   secrets: [],
   runtimes: null,
   hermesConfig: null,
@@ -88,7 +90,23 @@ const ICONS = {
   doc: [["path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }], ["path", { d: "M14 2v6h6" }], ["line", { x1: 8, y1: 13, x2: 16, y2: 13 }], ["line", { x1: 8, y1: 17, x2: 13, y2: 17 }]],
   message: [["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }]],
   link: [["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }], ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }]],
+  users: [["path", { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }], ["circle", { cx: 9, cy: 7, r: 4 }], ["path", { d: "M22 21v-2a4 4 0 0 0-3-3.9" }], ["path", { d: "M16 3.1a4 4 0 0 1 0 7.8" }]],
 };
+
+const FALLBACK_PERMISSION_GROUPS = [
+  { id: "admin", label: "管理员", description: "管理企业账户、模型配置和平台运行时。", permissions: ["read_workspace", "chat", "private_agent", "manage_channels", "manage_knowledge", "manage_users", "system_settings"] },
+  { id: "manager", label: "经理", description: "管理频道和知识库，并使用企业 Agent。", permissions: ["read_workspace", "chat", "private_agent", "manage_channels", "manage_knowledge"] },
+  { id: "member", label: "成员", description: "使用频道、知识库和私人 Agent。", permissions: ["read_workspace", "chat", "private_agent"] },
+  { id: "viewer", label: "只读", description: "只能查看频道消息和企业知识。", permissions: ["read_workspace"] },
+];
+const THINKING_DEPTH_OPTIONS = [
+  ["none", "关闭"],
+  ["minimal", "极低"],
+  ["low", "低"],
+  ["medium", "中"],
+  ["high", "高"],
+  ["xhigh", "超高"],
+];
 
 function icon(name, { size, cls, strokeWidth } = {}) {
   const svg = document.createElementNS(SVGNS, "svg");
@@ -187,6 +205,15 @@ function statusBadge(ok, label) {
     document.createTextNode(label),
   ]);
 }
+function userPermissions() {
+  return new Set(state.user?.permissions || []);
+}
+function isAdmin() {
+  return state.user?.role === "admin" || state.user?.permission_group === "admin" || userPermissions().has("system_settings");
+}
+function hasPermission(permission) {
+  return isAdmin() || userPermissions().has(permission);
+}
 function emptyState(iconName, title, text) {
   return h("div", { class: "empty" }, [
     h("div", { class: "empty__icon" }, [icon(iconName, { size: 26 })]),
@@ -236,6 +263,8 @@ function renderLogin() {
 
 /* ---------------------------------------------------------------- shell */
 function renderShell() {
+  if (!isAdmin() && state.activeView === "admin") state.activeView = "channel";
+  if (!hasPermission("private_agent") && state.activeView === "private") state.activeView = "channel";
   return h("div", { class: `shell ${state.sidebarOpen ? "is-open" : ""}` }, [
     renderSidebar(),
     h("div", { class: "scrim", onclick: closeSidebar }),
@@ -246,12 +275,13 @@ function renderShell() {
 function closeSidebar() { state.sidebarOpen = false; render(); }
 
 function renderSidebar() {
-  const navItems = [
+  const navSpecs = [
     ["channel", "频道", "hash"],
-    ["private", "私人 Agent", "bot"],
+    hasPermission("private_agent") ? ["private", "私人 Agent", "bot"] : null,
     ["knowledge", "知识库", "library"],
-    ["settings", "设置", "settings"],
-  ].map(([view, label, ic]) => navItem(view, label, ic));
+    isAdmin() ? ["admin", "管理面板", "shield"] : null,
+  ].filter(Boolean);
+  const navItems = navSpecs.map(([view, label, ic]) => navItem(view, label, ic));
 
   const channelName = h("input", { placeholder: "新频道名称", "aria-label": "新频道名称" });
   const channelButtons = state.channels.length
@@ -275,7 +305,7 @@ function renderSidebar() {
       h("div", {}, [
         h("div", { class: "section-label" }, [h("span", { text: "频道" }), h("span", { class: "nav__badge", text: String(state.channels.length) })]),
         h("div", { class: "channels" }, channelButtons),
-        h("form", {
+        hasPermission("manage_channels") ? h("form", {
           class: "channel-create",
           onsubmit: async (event) => {
             event.preventDefault();
@@ -286,7 +316,7 @@ function renderSidebar() {
               await loadChannels();
             });
           },
-        }, [channelName, h("button", { class: "icon-btn", type: "submit", title: "创建频道", "aria-label": "创建频道", style: "border:1px solid var(--line-strong)" }, [icon("plus", { size: 16 })])]),
+        }, [channelName, h("button", { class: "icon-btn", type: "submit", title: "创建频道", "aria-label": "创建频道", style: "border:1px solid var(--line-strong)" }, [icon("plus", { size: 16 })])]) : null,
       ]),
     ]),
     renderSidebarFoot(),
@@ -302,7 +332,7 @@ function navItem(view, label, iconName) {
       if (view === "channel" || view === "private") state._focusComposer = true;
       if (view === "private") await withBusy(loadPrivateMessages);
       else if (view === "knowledge") await withBusy(loadDocuments);
-      else if (view === "settings") await withBusy(loadSettings);
+      else if (view === "admin") await withBusy(loadAdminPanel);
       else render();
     },
   }, [icon(iconName), h("span", { class: "nav__label", text: label })]);
@@ -310,7 +340,7 @@ function navItem(view, label, iconName) {
 
 function renderSidebarFoot() {
   const name = state.user.display_name || state.user.username || "用户";
-  const role = (state.user.role || "member").toUpperCase();
+  const role = state.user.position || state.user.permission_group_label || (state.user.role || "member").toUpperCase();
   return h("div", { class: "sidebar__foot" }, [
     h("div", { class: "user" }, [
       h("div", { class: "avatar", text: initials(name) }),
@@ -341,7 +371,7 @@ function renderTopbar() {
 function topbarInfo() {
   if (state.activeView === "private") return { title: "私人 Agent", icon: "bot", sub: "仅你可见的私有助手会话" };
   if (state.activeView === "knowledge") return { title: "企业知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
-  if (state.activeView === "settings") return { title: "系统设置", icon: "settings", sub: "运行时、API 供应商与平台密钥" };
+  if (state.activeView === "admin") return { title: "管理面板", icon: "shield", sub: "企业账户、权限组与模型策略" };
   const ch = activeChannel();
   return { title: ch?.name || "频道", hash: true, sub: ch ? `${state.messages.length} 条消息` : "选择或创建一个频道" };
 }
@@ -352,7 +382,7 @@ function renderContent() {
   let view;
   if (state.activeView === "private") view = renderChat("private");
   else if (state.activeView === "knowledge") view = renderKnowledge();
-  else if (state.activeView === "settings") view = renderSettings();
+  else if (state.activeView === "admin") view = renderAdminPanel();
   else view = renderChat("channel");
   return h("section", { class: `content ${animate ? "view-enter" : ""}` }, [view]);
 }
@@ -361,10 +391,14 @@ function renderContent() {
 function renderChat(mode) {
   const messages = mode === "private" ? state.privateMessages : state.messages;
   const noChannel = mode === "channel" && !state.activeChannelId;
+  const canChat = hasPermission("chat") && (mode !== "private" || hasPermission("private_agent"));
 
   const input = h("textarea", {
     rows: 1,
-    placeholder: mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息…`,
+    disabled: !canChat,
+    placeholder: canChat
+      ? (mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息…`)
+      : "当前权限组只能查看内容",
     "aria-label": "消息输入框",
     oninput: (e) => autoGrow(e.target),
     onkeydown: (e) => {
@@ -377,7 +411,7 @@ function renderChat(mode) {
 
   const submit = async () => {
     const content = input.value.trim();
-    if (!content || state.busy || noChannel) return;
+    if (!content || state.busy || noChannel || !canChat) return;
     input.value = "";
     autoGrow(input);
     state.sending = true;
@@ -414,7 +448,7 @@ function renderChat(mode) {
       h("div", { class: "composer__wrap" }, [
         h("div", { class: "composer__field" }, [
           input,
-          h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: state.busy || noChannel }, [
+          h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: state.busy || noChannel || !canChat }, [
             icon(state.busy ? "loader" : "send", { size: 18, cls: state.busy ? "spin" : "" }),
           ]),
         ]),
@@ -464,6 +498,7 @@ function autoGrow(el) {
 
 /* ------------------------------------------------------------ knowledge */
 function renderKnowledge() {
+  const canManage = hasPermission("manage_knowledge");
   const title = h("input", { placeholder: "标题" });
   const source = h("input", { placeholder: "来源（URL、系统名等）" });
   const summary = h("input", { placeholder: "摘要（可留空）" });
@@ -489,47 +524,50 @@ function renderKnowledge() {
         ]))
     : [emptyState("doc", "知识库为空", "在左侧表单中录入第一条企业知识。")];
 
+  const sections = [];
+  if (canManage) {
+    sections.push(h("section", { class: "card" }, [
+      cardHead("新增条目", "plus", { desc: "结构化录入企业知识，供 Agent 检索引用。" }),
+      h("form", {
+        onsubmit: async (event) => {
+          event.preventDefault();
+          await withBusy(async () => {
+            await api("/api/knowledge/documents", {
+              method: "POST",
+              body: JSON.stringify({ title: title.value, source: source.value, summary: summary.value, content: content.value }),
+            });
+            title.value = source.value = summary.value = content.value = "";
+            await loadDocuments();
+            toast("已保存知识条目", { type: "ok", title: "完成" });
+          });
+        },
+      }, [
+        field("标题", title),
+        field("来源", source),
+        field("摘要", summary),
+        field("正文", content),
+        h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [icon("plus", { size: 16 }), h("span", { text: "保存条目" })]),
+      ]),
+    ]));
+  }
+  sections.push(h("section", { class: "card" }, [
+    cardHead("条目库", "library", { extra: h("span", { class: "status", text: `${state.documents.length} docs` }) }),
+    h("form", {
+      onsubmit: async (event) => {
+        event.preventDefault();
+        await withBusy(async () => {
+          const result = await api(`/api/knowledge/search?q=${encodeURIComponent(search.value)}`);
+          state.documents = result.results;
+        });
+      },
+    }, [h("div", { class: "search-field" }, [icon("search"), search])]),
+    h("div", { class: "list" }, docCards),
+    state.selectedDocument ? renderDocViewer() : null,
+  ]));
+
   return h("div", { class: "panel" }, [
     h("div", { class: "panel__inner" }, [
-      h("div", { class: "kb-grid" }, [
-        h("section", { class: "card" }, [
-          cardHead("新增条目", "plus", { desc: "结构化录入企业知识，供 Agent 检索引用。" }),
-          h("form", {
-            onsubmit: async (event) => {
-              event.preventDefault();
-              await withBusy(async () => {
-                await api("/api/knowledge/documents", {
-                  method: "POST",
-                  body: JSON.stringify({ title: title.value, source: source.value, summary: summary.value, content: content.value }),
-                });
-                title.value = source.value = summary.value = content.value = "";
-                await loadDocuments();
-                toast("已保存知识条目", { type: "ok", title: "完成" });
-              });
-            },
-          }, [
-            field("标题", title),
-            field("来源", source),
-            field("摘要", summary),
-            field("正文", content),
-            h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [icon("plus", { size: 16 }), h("span", { text: "保存条目" })]),
-          ]),
-        ]),
-        h("section", { class: "card" }, [
-          cardHead("条目库", "library", { extra: h("span", { class: "status", text: `${state.documents.length} docs` }) }),
-          h("form", {
-            onsubmit: async (event) => {
-              event.preventDefault();
-              await withBusy(async () => {
-                const result = await api(`/api/knowledge/search?q=${encodeURIComponent(search.value)}`);
-                state.documents = result.results;
-              });
-            },
-          }, [h("div", { class: "search-field" }, [icon("search"), search])]),
-          h("div", { class: "list" }, docCards),
-          state.selectedDocument ? renderDocViewer() : null,
-        ]),
-      ]),
+      h("div", { class: `kb-grid ${canManage ? "" : "kb-grid--single"}` }, sections),
     ]),
   ]);
 }
@@ -544,16 +582,150 @@ function renderDocViewer() {
   ]);
 }
 
-/* ------------------------------------------------------------- settings */
-function renderSettings() {
+/* --------------------------------------------------------- admin panel */
+function renderAdminPanel() {
+  if (!isAdmin()) return emptyState("shield", "需要管理员权限", "请使用管理员账户登录后访问管理面板。");
   return h("div", { class: "panel" }, [
     h("div", { class: "panel__inner" }, [
+      renderAccountManagement(),
       renderOAuthSettings(),
       renderRuntimeSettings(),
       renderHermesConfig(),
       renderSecretsSettings(),
     ]),
   ]);
+}
+
+function renderAccountManagement() {
+  const groups = state.permissionGroups.length ? state.permissionGroups : FALLBACK_PERMISSION_GROUPS;
+  const username = h("input", { placeholder: "username", autocomplete: "off" });
+  const displayName = h("input", { placeholder: "显示名称" });
+  const password = h("input", { type: "password", autocomplete: "new-password", placeholder: "初始密码" });
+  const position = h("input", { placeholder: "职位，例如 项目经理" });
+  const permissionGroup = permissionGroupSelect(groups, "member");
+  const modelName = h("input", { placeholder: state.hermesConfig?.config?.model || "默认模型" });
+  const thinkingDepth = thinkingDepthSelect("medium");
+
+  const createForm = h("form", {
+    class: "account-create",
+    onsubmit: async (event) => {
+      event.preventDefault();
+      await withBusy(async () => {
+        await api("/api/users", {
+          method: "POST",
+          body: JSON.stringify({
+            username: username.value,
+            display_name: displayName.value,
+            password: password.value,
+            position: position.value,
+            permission_group: permissionGroup.value,
+            model_name: modelName.value,
+            thinking_depth: thinkingDepth.value,
+          }),
+        });
+        username.value = displayName.value = password.value = position.value = modelName.value = "";
+        permissionGroup.value = "member";
+        thinkingDepth.value = "medium";
+        await loadUsers();
+        toast("企业账户已创建", { type: "ok", title: "完成" });
+      });
+    },
+  }, [
+    h("div", { class: "account-create__grid" }, [
+      field("用户名", username),
+      field("显示名称", displayName),
+      field("初始密码", password),
+      field("职位", position),
+      field("权限组", permissionGroup),
+      field("模型型号", modelName),
+      field("思考深度", thinkingDepth),
+    ]),
+    h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [icon("plus", { size: 16 }), h("span", { text: "创建账户" })]),
+  ]);
+
+  const rows = state.users.length
+    ? state.users.map((user) => renderAccountRow(user, groups))
+    : [h("div", { class: "muted", text: "暂无企业账户。" })];
+  return h("section", { class: "card account-admin" }, [
+    cardHead("企业账户", "users"),
+    createForm,
+    h("div", { class: "account-list" }, rows),
+  ]);
+}
+
+function renderAccountRow(user, groups) {
+  const displayName = h("input", { value: user.display_name || "" });
+  const position = h("input", { value: user.position || "", placeholder: "职位" });
+  const permissionGroup = permissionGroupSelect(groups, user.permission_group || "member");
+  const modelName = h("input", { value: user.model_name || "", placeholder: state.hermesConfig?.config?.model || "默认模型" });
+  const thinkingDepth = thinkingDepthSelect(user.thinking_depth || "medium");
+  const active = h("input", { type: "checkbox" });
+  active.checked = !!user.active;
+  if (user.id === state.user.id) active.disabled = true;
+  const password = h("input", { type: "password", autocomplete: "new-password", placeholder: "留空不修改" });
+  return h("form", {
+    class: "account-row",
+    onsubmit: async (event) => {
+      event.preventDefault();
+      await withBusy(async () => {
+        await api(`/api/users/${user.id}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            display_name: displayName.value,
+            position: position.value,
+            permission_group: permissionGroup.value,
+            model_name: modelName.value,
+            thinking_depth: thinkingDepth.value,
+            active: active.checked,
+            password: password.value,
+          }),
+        });
+        password.value = "";
+        await loadUsers();
+        toast(`已更新 ${user.username}`, { type: "ok", title: "完成" });
+      });
+    },
+  }, [
+    h("div", { class: "account-row__head" }, [
+      h("div", { class: "account-row__identity" }, [
+        h("div", { class: "avatar", text: initials(user.display_name || user.username) }),
+        h("div", {}, [
+          h("strong", { text: user.username }),
+          h("span", { text: user.permission_group_label || user.permission_group || "member" }),
+        ]),
+      ]),
+      statusBadge(user.active, user.active ? "active" : "disabled"),
+    ]),
+    h("div", { class: "account-row__grid" }, [
+      field("显示名称", displayName),
+      field("职位", position),
+      field("权限组", permissionGroup),
+      field("模型型号", modelName),
+      field("思考深度", thinkingDepth),
+      field("重置密码", password),
+      h("label", { class: "check-row account-row__active" }, [
+        active,
+        h("div", { class: "check-row__text" }, [h("strong", { text: "账户启用" }), h("span", { text: "停用后无法登录" })]),
+      ]),
+    ]),
+    h("div", { class: "form-actions" }, [
+      h("button", { class: "btn btn--primary btn--sm", type: "submit", disabled: state.busy }, [h("span", { text: "保存账户" })]),
+    ]),
+  ]);
+}
+
+function permissionGroupSelect(groups, selected) {
+  const select = h("select", {}, groups.map((group) =>
+    h("option", { value: group.id, text: group.label || group.id })));
+  select.value = selected;
+  return select;
+}
+
+function thinkingDepthSelect(selected) {
+  const select = h("select", {}, THINKING_DEPTH_OPTIONS.map(([value, label]) =>
+    h("option", { value, text: label })));
+  select.value = selected;
+  return select;
 }
 
 function renderRuntimeSettings() {
@@ -814,6 +986,14 @@ async function loadDocuments() {
   const result = await api("/api/knowledge/documents");
   state.documents = result.documents;
 }
+async function loadUsers() {
+  const result = await api("/api/users");
+  state.users = result.users;
+}
+async function loadPermissionGroups() {
+  const result = await api("/api/permission-groups");
+  state.permissionGroups = result.permission_groups;
+}
 async function loadSecrets() {
   const result = await api("/api/settings/secrets");
   state.secrets = result.secrets;
@@ -822,6 +1002,7 @@ async function loadOAuthProviders() { state.oauthProviders = await api("/api/sys
 async function loadRuntime() { state.runtimes = await api("/api/system/runtime"); }
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
 async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadOAuthProviders()]); }
+async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings()]); }
 
 /* ----------------------------------------------------------------- oauth */
 async function startOAuthVerification(providerId) {

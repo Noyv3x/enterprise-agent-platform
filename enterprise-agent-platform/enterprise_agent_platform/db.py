@@ -38,6 +38,10 @@ class Database:
                     display_name TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'member',
+                    position TEXT NOT NULL DEFAULT '',
+                    permission_group TEXT NOT NULL DEFAULT 'member',
+                    model_name TEXT NOT NULL DEFAULT '',
+                    thinking_depth TEXT NOT NULL DEFAULT 'medium',
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
                     last_login_at INTEGER
@@ -95,8 +99,34 @@ class Database:
                 );
                 """
             )
+            self._ensure_user_columns()
             self._ensure_fts()
             self._conn.commit()
+
+    def _ensure_user_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        additions = {
+            "position": "ALTER TABLE users ADD COLUMN position TEXT NOT NULL DEFAULT ''",
+            "permission_group": "ALTER TABLE users ADD COLUMN permission_group TEXT NOT NULL DEFAULT 'member'",
+            "model_name": "ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
+            "thinking_depth": "ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'",
+        }
+        for name, sql in additions.items():
+            if name not in columns:
+                self._conn.execute(sql)
+        self._conn.execute(
+            """
+            UPDATE users
+            SET permission_group = CASE WHEN role = 'admin' THEN 'admin' ELSE 'member' END
+            WHERE permission_group IS NULL OR permission_group = ''
+            """
+        )
+        self._conn.execute(
+            "UPDATE users SET permission_group = 'admin' WHERE role = 'admin' AND permission_group != 'admin'"
+        )
+        self._conn.execute(
+            "UPDATE users SET thinking_depth = 'medium' WHERE thinking_depth IS NULL OR thinking_depth = ''"
+        )
 
     def _ensure_fts(self) -> None:
         try:

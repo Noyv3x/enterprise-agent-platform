@@ -585,6 +585,7 @@ select {
 
 /* Knowledge */
 .kb-grid { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
+.kb-grid--single { grid-template-columns: 1fr; }
 .search-field { position: relative; display: flex; align-items: center; }
 .search-field svg { position: absolute; left: 11px; width: 16px; height: 16px; color: var(--faint); pointer-events: none; }
 .search-field input { padding-left: 34px; }
@@ -613,6 +614,59 @@ select {
 .doc-viewer pre { margin: 0; padding: 14px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; color: var(--ink); }
 
 /* Settings rows */
+.account-admin { gap: 16px; }
+.account-create {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 14px;
+  background: var(--surface-2);
+}
+.account-create__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.account-list { display: grid; gap: 10px; }
+.account-row {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 14px;
+  background: var(--surface-2);
+}
+.account-row__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.account-row__identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.account-row__identity > div:last-child {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+.account-row__identity strong {
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.account-row__identity span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.account-row__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.account-row__active { min-height: 100%; margin: 0; }
 .secret-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -809,7 +863,7 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid { grid-template-columns: 1fr; }
+  .kb-grid, .config-grid, .account-create__grid, .account-row__grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 800px) {

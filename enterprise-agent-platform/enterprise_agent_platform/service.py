@@ -38,6 +38,59 @@ class ServiceError(Exception):
         self.message = message
 
 
+THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
+DEFAULT_THINKING_DEPTH = "medium"
+
+PERMISSION_READ_WORKSPACE = "read_workspace"
+PERMISSION_CHAT = "chat"
+PERMISSION_PRIVATE_AGENT = "private_agent"
+PERMISSION_MANAGE_CHANNELS = "manage_channels"
+PERMISSION_MANAGE_KNOWLEDGE = "manage_knowledge"
+PERMISSION_MANAGE_USERS = "manage_users"
+PERMISSION_SYSTEM_SETTINGS = "system_settings"
+
+PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
+    "admin": {
+        "label": "管理员",
+        "description": "管理企业账户、模型配置和平台运行时。",
+        "permissions": [
+            PERMISSION_READ_WORKSPACE,
+            PERMISSION_CHAT,
+            PERMISSION_PRIVATE_AGENT,
+            PERMISSION_MANAGE_CHANNELS,
+            PERMISSION_MANAGE_KNOWLEDGE,
+            PERMISSION_MANAGE_USERS,
+            PERMISSION_SYSTEM_SETTINGS,
+        ],
+    },
+    "manager": {
+        "label": "经理",
+        "description": "管理频道和知识库，并使用企业 Agent。",
+        "permissions": [
+            PERMISSION_READ_WORKSPACE,
+            PERMISSION_CHAT,
+            PERMISSION_PRIVATE_AGENT,
+            PERMISSION_MANAGE_CHANNELS,
+            PERMISSION_MANAGE_KNOWLEDGE,
+        ],
+    },
+    "member": {
+        "label": "成员",
+        "description": "使用频道、知识库和私人 Agent。",
+        "permissions": [
+            PERMISSION_READ_WORKSPACE,
+            PERMISSION_CHAT,
+            PERMISSION_PRIVATE_AGENT,
+        ],
+    },
+    "viewer": {
+        "label": "只读",
+        "description": "只能查看频道消息和企业知识。",
+        "permissions": [PERMISSION_READ_WORKSPACE],
+    },
+}
+
+
 class EnterpriseService:
     def __init__(
         self,
@@ -102,24 +155,35 @@ class EnterpriseService:
         password: str,
         display_name: str = "",
         role: str = "member",
+        position: str = "",
+        permission_group: str | None = None,
+        model_name: str = "",
+        thinking_depth: str = DEFAULT_THINKING_DEPTH,
         actor: dict[str, Any] | None,
     ) -> dict[str, Any]:
         if actor is not None and actor.get("role") != "admin":
             raise ServiceError(403, "admin role required")
         username = normalize_name(username)
-        if role not in {"admin", "member"}:
-            raise ServiceError(400, "invalid role")
+        requested_role = normalize_role(role)
+        group = normalize_permission_group(permission_group or ("admin" if requested_role == "admin" else "member"))
+        role = role_for_permission_group(group)
         if not password or len(password) < 4:
             raise ServiceError(400, "password must be at least 4 characters")
         display = display_name.strip() or username
+        position = normalize_position(position)
+        model_name = normalize_model_name(model_name)
+        thinking_depth = normalize_thinking_depth(thinking_depth)
         ts = now_ts()
         try:
             user_id = self.db.insert(
                 """
-                INSERT INTO users(username, display_name, password_hash, role, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users(
+                    username, display_name, password_hash, role, position,
+                    permission_group, model_name, thinking_depth, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (username, display, hash_password(password), role, ts),
+                (username, display, hash_password(password), role, position, group, model_name, thinking_depth, ts),
             )
         except Exception as exc:
             raise ServiceError(409, f"user already exists: {username}") from exc
@@ -156,17 +220,95 @@ class EnterpriseService:
         rows = self.db.query("SELECT * FROM users ORDER BY id")
         return [self.public_user(row) for row in rows]
 
+    def list_permission_groups(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        require_admin(actor)
+        return [
+            {"id": key, **value}
+            for key, value in PERMISSION_GROUPS.items()
+        ]
+
+    def update_user(self, actor: dict[str, Any], user_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        current = self.db.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if not current:
+            raise ServiceError(404, "user not found")
+
+        updates: dict[str, Any] = {}
+        if "display_name" in body:
+            display_name = str(body.get("display_name", "")).strip()
+            updates["display_name"] = display_name or current["username"]
+        if "position" in body:
+            updates["position"] = normalize_position(str(body.get("position", "")))
+        if "permission_group" in body or "role" in body:
+            if "permission_group" in body:
+                group = normalize_permission_group(str(body.get("permission_group", "")))
+            else:
+                group = "admin" if normalize_role(str(body.get("role", ""))) == "admin" else "member"
+            updates["permission_group"] = group
+            updates["role"] = role_for_permission_group(group)
+        if "model_name" in body or "model" in body:
+            updates["model_name"] = normalize_model_name(str(body.get("model_name", body.get("model", ""))))
+        if "thinking_depth" in body:
+            updates["thinking_depth"] = normalize_thinking_depth(str(body.get("thinking_depth", "")))
+        if "active" in body:
+            updates["active"] = 1 if parse_bool(body.get("active")) else 0
+        password = str(body.get("password", "") or "")
+        if password:
+            if len(password) < 4:
+                raise ServiceError(400, "password must be at least 4 characters")
+            updates["password_hash"] = hash_password(password)
+
+        if not updates:
+            return self.get_user(user_id) or {}
+        self._guard_admin_update(actor, current, updates)
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        self.db.execute(
+            f"UPDATE users SET {assignments} WHERE id = ?",
+            [*updates.values(), user_id],
+        )
+        return self.get_user(user_id) or {}
+
+    def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
+        return self.update_user(actor, user_id, {"active": False})
+
     @staticmethod
     def public_user(row: dict[str, Any]) -> dict[str, Any]:
+        group = public_permission_group(row)
+        thinking_depth = str(row.get("thinking_depth") or DEFAULT_THINKING_DEPTH).strip().lower()
+        if thinking_depth not in THINKING_DEPTHS:
+            thinking_depth = DEFAULT_THINKING_DEPTH
         return {
             "id": int(row["id"]),
             "username": row["username"],
             "display_name": row["display_name"],
             "role": row["role"],
+            "position": row.get("position", "") or "",
+            "permission_group": group,
+            "permission_group_label": PERMISSION_GROUPS[group]["label"],
+            "permissions": list(PERMISSION_GROUPS[group]["permissions"]),
+            "model_name": row.get("model_name", "") or "",
+            "thinking_depth": thinking_depth,
             "active": bool(row["active"]),
             "created_at": row["created_at"],
             "last_login_at": row.get("last_login_at"),
         }
+
+    def _guard_admin_update(self, actor: dict[str, Any], current: dict[str, Any], updates: dict[str, Any]) -> None:
+        target_id = int(current["id"])
+        next_role = str(updates.get("role", current["role"]))
+        next_active = bool(updates.get("active", current["active"]))
+        if target_id == int(actor["id"]):
+            if not next_active:
+                raise ServiceError(400, "cannot deactivate your own account")
+            if next_role != "admin":
+                raise ServiceError(400, "cannot remove your own admin permission")
+        if current["role"] == "admin" and (next_role != "admin" or not next_active):
+            remaining = self.db.scalar(
+                "SELECT COUNT(*) FROM users WHERE id != ? AND role = 'admin' AND active = 1",
+                (target_id,),
+            )
+            if not remaining:
+                raise ServiceError(400, "at least one active admin account is required")
 
     def list_channels(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         rows = self.db.query(
@@ -183,6 +325,7 @@ class EnterpriseService:
         return [dict(row) for row in rows]
 
     def create_channel(self, actor: dict[str, Any], name: str, description: str = "") -> dict[str, Any]:
+        require_permission(actor, PERMISSION_MANAGE_CHANNELS)
         clean = normalize_channel_name(name)
         ts = now_ts()
         try:
@@ -215,10 +358,12 @@ class EnterpriseService:
         return messages
 
     def send_channel_message(self, actor: dict[str, Any], channel_id: int, content: str) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_CHAT)
         channel = self.get_channel(actor, channel_id)
         content = content.strip()
         if not content:
             raise ServiceError(400, "message content is required")
+        generation = self.account_generation_config(actor)
         scope_id = str(channel_id)
         user_msg = self._append_message(
             scope_type="channel",
@@ -227,7 +372,7 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={},
+            metadata={"generation": generation},
         )
         context = self._recent_context("channel", scope_id, content)
         suggestions = self.knowledge.suggest(context)
@@ -239,6 +384,9 @@ class EnterpriseService:
             session_id=f"enterprise-channel-{channel_id}-main-agent",
             session_key=f"channel:{channel_id}:main-agent",
             metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions]},
+            model=generation["model"],
+            thinking_depth=generation["thinking_depth"],
+            reasoning_config=generation["reasoning_config"],
         )
         agent_msg = self._append_message(
             scope_type="channel",
@@ -250,15 +398,18 @@ class EnterpriseService:
             metadata={
                 "session_id": result.session_id,
                 "degraded": result.degraded,
+                "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
             },
         )
         return {"user_message": user_msg, "agent_message": agent_msg}
 
     def send_private_message(self, actor: dict[str, Any], content: str) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
         content = content.strip()
         if not content:
             raise ServiceError(400, "message content is required")
+        generation = self.account_generation_config(actor)
         container = self.containers.ensure_private_container(
             user_id=actor["id"],
             username=actor["username"],
@@ -272,7 +423,7 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={"container": container.to_dict()},
+            metadata={"container": container.to_dict(), "generation": generation},
         )
         context = self._recent_context("private", scope_id, content)
         suggestions = self.knowledge.suggest(context)
@@ -284,6 +435,9 @@ class EnterpriseService:
             session_id=container.session_id,
             session_key=f"private:{actor['id']}",
             metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions], "container": container.to_dict()},
+            model=generation["model"],
+            thinking_depth=generation["thinking_depth"],
+            reasoning_config=generation["reasoning_config"],
         )
         agent_msg = self._append_message(
             scope_type="private",
@@ -296,12 +450,14 @@ class EnterpriseService:
                 "session_id": result.session_id,
                 "degraded": result.degraded,
                 "container": container.to_dict(),
+                "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
             },
         )
         return {"user_message": user_msg, "agent_message": agent_msg, "container": container.to_dict()}
 
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
         container = self.containers.get_private_container(actor["id"])
         return {"container": container.to_dict() if container else None, "session_id": f"enterprise-private-u{actor['id']}"}
 
@@ -461,6 +617,7 @@ class EnterpriseService:
         return {"flow": flow, **self.oauth_provider_status(actor)}
 
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_MANAGE_KNOWLEDGE)
         doc = self.knowledge.add_document(
             title=str(body.get("title", "")),
             summary=str(body.get("summary", "")),
@@ -520,6 +677,17 @@ class EnterpriseService:
 
     def model_secret_env(self) -> dict[str, str]:
         return {}
+
+    def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        model = normalize_model_name(str(actor.get("model_name") or ""))
+        if not model:
+            model = str(self.runtimes.hermes_runtime_config().get("model") or self.config.hermes_model)
+        thinking_depth = normalize_thinking_depth(str(actor.get("thinking_depth") or DEFAULT_THINKING_DEPTH))
+        return {
+            "model": model,
+            "thinking_depth": thinking_depth,
+            "reasoning_config": reasoning_config_for_depth(thinking_depth),
+        }
 
     def list_secrets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
@@ -677,6 +845,68 @@ class EnterpriseService:
 def require_admin(actor: dict[str, Any]) -> None:
     if actor.get("role") != "admin":
         raise ServiceError(403, "admin role required")
+
+
+def require_permission(actor: dict[str, Any], permission: str) -> None:
+    if actor.get("role") == "admin":
+        return
+    if permission not in set(actor.get("permissions") or []):
+        raise ServiceError(403, "permission required")
+
+
+def role_for_permission_group(group: str) -> str:
+    return "admin" if group == "admin" else "member"
+
+
+def public_permission_group(row: dict[str, Any]) -> str:
+    group = str(row.get("permission_group") or "").strip().lower()
+    if group in PERMISSION_GROUPS:
+        return group
+    return "admin" if row.get("role") == "admin" else "member"
+
+
+def normalize_role(value: str) -> str:
+    role = str(value or "member").strip().lower()
+    if role not in {"admin", "member"}:
+        raise ServiceError(400, "invalid role")
+    return role
+
+
+def normalize_permission_group(value: str) -> str:
+    group = str(value or "member").strip().lower()
+    if group not in PERMISSION_GROUPS:
+        raise ServiceError(400, "invalid permission group")
+    return group
+
+
+def normalize_position(value: str) -> str:
+    clean = str(value or "").strip()
+    if len(clean) > 80 or re.search(r"[\r\n\x00]", clean):
+        raise ServiceError(400, "invalid position")
+    return clean
+
+
+def normalize_model_name(value: str) -> str:
+    clean = str(value or "").strip()
+    if len(clean) > 120 or re.search(r"[\r\n\x00]", clean):
+        raise ServiceError(400, "invalid model name")
+    return clean
+
+
+def normalize_thinking_depth(value: str) -> str:
+    clean = str(value or DEFAULT_THINKING_DEPTH).strip().lower()
+    if not clean:
+        clean = DEFAULT_THINKING_DEPTH
+    if clean not in THINKING_DEPTHS:
+        raise ServiceError(400, "invalid thinking depth")
+    return clean
+
+
+def reasoning_config_for_depth(thinking_depth: str) -> dict[str, Any] | None:
+    depth = normalize_thinking_depth(thinking_depth)
+    if depth == "none":
+        return {"enabled": False}
+    return {"enabled": True, "effort": depth}
 
 
 def normalize_name(value: str) -> str:

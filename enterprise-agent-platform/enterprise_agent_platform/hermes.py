@@ -28,6 +28,9 @@ class AgentClient(Protocol):
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         ...
 
@@ -44,6 +47,9 @@ class LocalAgentClient:
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         prefix = "Main agent" if session_key.startswith("channel:") else "Private agent"
         hints = metadata.get("knowledge_suggestions", []) if metadata else []
@@ -70,15 +76,20 @@ class HermesAgentClient:
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> AgentResult:
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-30:])
         messages.append({"role": "user", "content": user_message})
+        effective_model = str(model or self._effective_model())
         body = {
-            "model": self._effective_model(),
+            "model": effective_model,
             "messages": messages,
             "stream": False,
         }
+        self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
         headers = {
             "Content-Type": "application/json",
             "X-Hermes-Session-Id": session_id,
@@ -120,6 +131,28 @@ class HermesAgentClient:
 
     def _effective_model(self) -> str:
         return str(self._runtime_config().get("model") or self.config.hermes_model)
+
+    @staticmethod
+    def _apply_reasoning_config(
+        body: dict[str, Any],
+        *,
+        thinking_depth: str | None,
+        reasoning_config: dict[str, Any] | None,
+    ) -> None:
+        config = dict(reasoning_config or {})
+        depth = str(thinking_depth or "").strip().lower()
+        if not config and depth:
+            config = {"enabled": False} if depth == "none" else {"enabled": True, "effort": depth}
+        if not config:
+            return
+        body["reasoning_config"] = config
+        body["reasoning"] = config
+        if config.get("enabled") is False:
+            body["reasoning_effort"] = "none"
+            return
+        effort = str(config.get("effort") or "").strip().lower()
+        if effort:
+            body["reasoning_effort"] = effort
 
 
 class AutoAgentClient:

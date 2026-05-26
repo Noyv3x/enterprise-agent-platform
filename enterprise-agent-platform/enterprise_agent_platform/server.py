@@ -78,6 +78,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/users" and method == "GET":
             self._json({"users": service.list_users(actor)})
             return
+        if path == "/api/permission-groups" and method == "GET":
+            self._json({"permission_groups": service.list_permission_groups(actor)})
+            return
         if path == "/api/users" and method == "POST":
             body = self._body_json()
             user = service.create_user(
@@ -85,9 +88,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                 password=str(body.get("password", "")),
                 display_name=str(body.get("display_name", "")),
                 role=str(body.get("role", "member")),
+                position=str(body.get("position", "")),
+                permission_group=str(body.get("permission_group", "")) or None,
+                model_name=str(body.get("model_name", body.get("model", ""))),
+                thinking_depth=str(body.get("thinking_depth", "medium")),
                 actor=actor,
             )
             self._json({"user": user}, status=201)
+            return
+        m = re.fullmatch(r"/api/users/(\d+)", path)
+        if m and method == "PUT":
+            self._json({"user": service.update_user(actor, int(m.group(1)), self._body_json())})
+            return
+        if m and method == "DELETE":
+            self._json({"user": service.deactivate_user(actor, int(m.group(1)))})
             return
         if path == "/api/channels" and method == "GET":
             self._json({"channels": service.list_channels(actor)})
