@@ -75,6 +75,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/me" and method == "GET":
             self._json({"user": actor})
             return
+        if path == "/api/mention-targets" and method == "GET":
+            self._json({"targets": service.mention_targets(actor)})
+            return
         if path == "/api/users" and method == "GET":
             self._json({"users": service.list_users(actor)})
             return

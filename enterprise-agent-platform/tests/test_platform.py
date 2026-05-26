@@ -269,6 +269,15 @@ class PlatformServiceTests(unittest.TestCase):
                     "source": "policy",
                 },
             )
+            alice = service.create_user(
+                username="alice",
+                password="alice-pass",
+                display_name="Alice",
+                permission_group="member",
+                actor=user,
+            )
+            service.send_channel_message(user, 1, "VPN onboarding starts in the general channel.")
+            service.send_channel_message(alice, 1, "I need device posture details before Friday.")
 
             result = service.send_channel_message(user, 1, "@agent What is the VPN access policy?")
             self.assertIsNone(result["agent_message"])
@@ -280,9 +289,16 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent_message["username"], "Main Agent")
             self.assertEqual(agent.calls[-1]["session_id"], "enterprise-channel-1-main-agent")
             self.assertEqual(agent.calls[-1]["session_key"], "channel:1:main-agent")
-            self.assertEqual(agent.calls[-1]["user_message"], "What is the VPN access policy?")
+            self.assertEqual(agent.calls[-1]["user_message"], "Administrator: What is the VPN access policy?")
+            self.assertIn({"role": "user", "content": "Administrator: VPN onboarding starts in the general channel."}, agent.calls[-1]["history"])
+            self.assertIn({"role": "user", "content": "Alice: I need device posture details before Friday."}, agent.calls[-1]["history"])
             self.assertIn("enterprise_kb_search", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
+            work = agent_message["metadata"]["agent_work"]
+            self.assertEqual(work["state"], "complete")
+            self.assertEqual(work["run_id"], f"channel:1:{result['user_message']['id']}")
+            self.assertIn("model", [item["stage"] for item in work["activity"]])
+            self.assertIn("complete", [item["stage"] for item in work["activity"]])
             service.close()
 
     def test_channel_message_without_agent_mention_does_not_trigger_agent(self):
@@ -352,10 +368,36 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 status = service.wait_for_agent_idle("channel", "1")
                 self.assertEqual(status["state"], "idle")
-                self.assertEqual([call["user_message"] for call in agent.calls], ["slow question", "second question"])
-                self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "agent response to second question")
+                self.assertEqual([call["user_message"] for call in agent.calls], ["Administrator: slow question", "Alice: second question"])
+                final_message = service.list_messages(user, "channel", "1")[-1]
+                self.assertEqual(final_message["content"], "agent response to Alice: second question")
+                self.assertEqual(final_message["metadata"]["agent_work"]["state"], "complete")
             finally:
                 agent.release.set()
+                service.close()
+
+    def test_channel_mention_targets_include_agent_and_active_users(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    position="Designer",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, alice = service.authenticate("alice", "alice-pass")
+
+                targets = service.mention_targets(alice)
+                self.assertEqual(targets[0]["handle"], "agent")
+                self.assertIn(
+                    {"kind": "user", "id": alice["id"], "handle": "alice", "label": "Alice", "description": "Designer"},
+                    targets,
+                )
+            finally:
                 service.close()
 
     def test_channel_typing_presence_excludes_current_user(self):
@@ -1027,6 +1069,12 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["agent_status"]["state"], "idle")
                 service.wait_for_agent_idle("channel", str(channels[0]["id"]))
 
+                conn.request("GET", "/api/mention-targets", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertEqual(payload["targets"][0]["handle"], "agent")
+
                 conn.request(
                     "POST",
                     f"/api/channels/{channels[0]['id']}/messages",
@@ -1044,7 +1092,8 @@ class PlatformHTTPTests(unittest.TestCase):
                 res = conn.getresponse()
                 payload = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
-                self.assertEqual(payload["messages"][-1]["content"], "agent response to hello")
+                self.assertEqual(payload["messages"][-1]["content"], "agent response to Administrator: hello")
+                self.assertEqual(payload["messages"][-1]["metadata"]["agent_work"]["state"], "complete")
                 self.assertEqual(payload["agent_status"]["state"], "idle")
             finally:
                 server.shutdown()

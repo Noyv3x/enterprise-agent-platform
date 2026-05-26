@@ -16,6 +16,7 @@ const state = {
   drafts: {},
   agentStatuses: { channels: {}, private: null },
   expandedAgentRuns: {},
+  mentionTargets: [],
   typingUsers: [],
   documents: [],
   selectedDocument: null,
@@ -44,6 +45,7 @@ let pollInFlight = false;
 let localMessageSeq = 0;
 const typingState = { key: null, active: false, lastSent: 0, stopTimer: null };
 const composerState = { composing: false, renderDeferred: false };
+const mentionState = { active: false, selected: 0, options: [], range: null, menu: null };
 
 /* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
@@ -425,6 +427,7 @@ function renderChat(mode) {
   const canChat = hasPermission("chat") && (mode !== "private" || hasPermission("private_agent"));
   const scopeId = scopeIdFor(mode);
   const draftKey = composerDraftKey(mode, scopeId);
+  const mentionMenu = h("div", { class: "mention-menu", role: "listbox", hidden: true });
 
   const input = h("textarea", {
     rows: 1,
@@ -438,19 +441,29 @@ function renderChat(mode) {
     oninput: (e) => {
       state.drafts[draftKey] = e.target.value;
       autoGrow(e.target);
+      updateMentionMenu(input, mentionMenu, mode);
       if (!e.isComposing && !composerState.composing) notifyTyping(mode, scopeId, e.target.value.trim().length > 0);
     },
+    onfocus: () => updateMentionMenu(input, mentionMenu, mode),
+    onclick: () => updateMentionMenu(input, mentionMenu, mode),
+    onkeyup: (e) => {
+      if (!["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(e.key)) updateMentionMenu(input, mentionMenu, mode);
+    },
+    onblur: () => setTimeout(() => hideMentionMenu(mentionMenu), 120),
     oncompositionstart: () => {
       composerState.composing = true;
+      hideMentionMenu(mentionMenu);
     },
     oncompositionend: (e) => {
       composerState.composing = false;
       state.drafts[draftKey] = e.target.value;
       autoGrow(e.target);
       notifyTyping(mode, scopeId, e.target.value.trim().length > 0);
+      updateMentionMenu(input, mentionMenu, mode);
       flushDeferredRender();
     },
     onkeydown: (e) => {
+      if (!e.isComposing && handleMentionKey(e, input, mentionMenu, mode, scopeId, draftKey)) return;
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         submit();
@@ -492,6 +505,7 @@ function renderChat(mode) {
       h("div", { class: "composer__wrap" }, [
         h("div", { class: "composer__field" }, [
           input,
+          mentionMenu,
           h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: noChannel || !canChat }, [
             icon("send", { size: 18 }),
           ]),
@@ -508,6 +522,7 @@ function renderChat(mode) {
 function renderMessage(message) {
   const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
+  const agentWork = message.metadata?.agent_work || null;
   const avatar = isUser
     ? h("div", { class: "msg__avatar", text: initials(message.username || "你") })
     : h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]);
@@ -525,20 +540,27 @@ function renderMessage(message) {
         ? h("div", { class: "msg__suggest" }, suggestions.map((s) =>
             h("span", { class: "chip" }, [h("span", { class: "chip__id", text: `kb:${s.id}` }), h("span", { text: s.title })])))
         : null,
+      agentWork ? renderAgentWorkCard(agentWork, { active: false }) : null,
     ]),
   ]);
 }
 
 function renderAgentActivity(status) {
-  const text = agentStatusText(status) || "Agent 正在回复";
-  const waiting = status?.state === "replying" ? status.queued_count : Math.max(0, (status?.queued_count || 0) - 1);
-  const steps = status?.activity || [];
-  const current = status?.current_step || text;
-  const runId = status?.run_id || `${status?.scope_type || "agent"}:${status?.scope_id || ""}`;
-  const expanded = !!state.expandedAgentRuns[runId];
   return h("article", { class: "msg msg--agent msg--activity" }, [
     h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
-    h("details", { class: "agent-work", open: expanded }, [
+    renderAgentWorkCard(status, { active: true }),
+  ]);
+}
+
+function renderAgentWorkCard(work, { active = false } = {}) {
+  const text = active ? (agentStatusText(work) || "Agent 正在回复") : agentWorkTitle(work);
+  const queuedCount = Number(work?.queued_count || 0);
+  const waiting = active ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1)) : 0;
+  const steps = work?.activity || [];
+  const current = work?.current_step || (active ? text : "已完成");
+  const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
+  const expanded = !!state.expandedAgentRuns[runId];
+  return h("details", { class: `agent-work ${active ? "agent-work--active" : "agent-work--complete"}`, open: expanded }, [
       h("summary", {
         class: "agent-work__summary",
         onclick: (event) => {
@@ -547,16 +569,23 @@ function renderAgentActivity(status) {
           render();
         },
       }, [
-        h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
+        active
+          ? h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")])
+          : h("div", { class: "agent-work__done" }, [icon(work?.state === "error" ? "alert" : "checkCircle", { size: 15 })]),
         h("div", { class: "agent-work__main" }, [
           h("span", { class: "agent-work__title", text }),
           h("span", { class: "agent-work__step", text: current }),
         ]),
         waiting > 0 ? h("span", { class: "agent-status__queue", text: `另有 ${waiting} 条等待` }) : null,
       ]),
-      h("div", { class: "agent-work__timeline" }, (steps.length ? steps : [{ stage: "active", label: current, detail: "", at: status?.updated_at }]).map(renderAgentStep)),
-    ]),
+      h("div", { class: "agent-work__timeline" }, (steps.length ? steps : [{ stage: "active", label: current, detail: "", at: work?.updated_at }]).map(renderAgentStep)),
   ]);
+}
+
+function agentWorkTitle(work) {
+  const target = work?.replying_to?.username || "用户";
+  if (work?.state === "error") return `Agent 回复 ${target} 失败`;
+  return `Agent 已回复 ${target}`;
 }
 
 function renderAgentStep(step) {
@@ -568,6 +597,137 @@ function renderAgentStep(step) {
     ]),
     step.at ? h("span", { class: "agent-step__time", text: formatTime(step.at) }) : null,
   ]);
+}
+
+function currentMentionRange(input) {
+  const cursor = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0, cursor);
+  const match = before.match(/(^|[\s([{])@([A-Za-z0-9_.-]*)$/);
+  if (!match) return null;
+  const query = match[2] || "";
+  return { start: before.length - query.length - 1, end: cursor, query: query.toLowerCase() };
+}
+
+function mentionOptions(query) {
+  const targets = state.mentionTargets.length
+    ? state.mentionTargets
+    : [{ kind: "agent", handle: "agent", label: "Agent", description: "呼叫频道 Agent" }];
+  return targets.filter((target) => {
+    const haystack = `${target.handle || ""} ${target.label || ""} ${target.description || ""}`.toLowerCase();
+    return !query || haystack.includes(query);
+  }).slice(0, 8);
+}
+
+function updateMentionMenu(input, menu, mode) {
+  if (mode !== "channel" || input.disabled || composerState.composing) {
+    hideMentionMenu(menu);
+    return;
+  }
+  const range = currentMentionRange(input);
+  if (!range) {
+    hideMentionMenu(menu);
+    return;
+  }
+  const options = mentionOptions(range.query);
+  if (!options.length) {
+    hideMentionMenu(menu);
+    return;
+  }
+  const previousQuery = mentionState.range?.query;
+  mentionState.active = true;
+  mentionState.selected = previousQuery === range.query ? Math.min(mentionState.selected, options.length - 1) : 0;
+  mentionState.options = options;
+  mentionState.range = range;
+  mentionState.menu = menu;
+  renderMentionMenu(input, menu);
+}
+
+function renderMentionMenu(input, menu) {
+  const options = mentionState.options || [];
+  menu.replaceChildren(...options.map((option, index) =>
+    h("button", {
+      class: `mention-option ${index === mentionState.selected ? "is-active" : ""}`,
+      type: "button",
+      role: "option",
+      "aria-selected": index === mentionState.selected,
+      onmousedown: (event) => {
+        event.preventDefault();
+        mentionState.selected = index;
+        applyMention(input, menu);
+      },
+      onmouseenter: () => {
+        mentionState.selected = index;
+        renderMentionMenu(input, menu);
+      },
+    }, [
+      h("span", { class: `mention-option__avatar mention-option__avatar--${option.kind || "user"}`, text: option.kind === "agent" ? "A" : initials(option.label || option.handle) }),
+      h("span", { class: "mention-option__main" }, [
+        h("span", { class: "mention-option__label", text: option.label || option.handle }),
+        h("span", { class: "mention-option__meta", text: `@${option.handle}` }),
+      ]),
+      option.description ? h("span", { class: "mention-option__desc", text: option.description }) : null,
+    ])
+  ));
+  menu.hidden = false;
+}
+
+function handleMentionKey(event, input, menu, mode, scopeId, draftKey) {
+  if (mode !== "channel") return false;
+  if (!mentionState.active || mentionState.menu !== menu) updateMentionMenu(input, menu, mode);
+  if (!mentionState.active || mentionState.menu !== menu) return false;
+  const options = mentionState.options || [];
+  if (!options.length) return false;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    mentionState.selected = (mentionState.selected + 1) % options.length;
+    renderMentionMenu(input, menu);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    mentionState.selected = (mentionState.selected - 1 + options.length) % options.length;
+    renderMentionMenu(input, menu);
+    return true;
+  }
+  if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    applyMention(input, menu, scopeId, draftKey);
+    return true;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    hideMentionMenu(menu);
+    return true;
+  }
+  return false;
+}
+
+function applyMention(input, menu, scopeId = scopeIdFor("channel"), draftKey = composerDraftKey("channel", scopeId)) {
+  const option = mentionState.options[mentionState.selected];
+  const range = mentionState.range || currentMentionRange(input);
+  if (!option || !range) return;
+  const insert = `@${option.handle} `;
+  const next = `${input.value.slice(0, range.start)}${insert}${input.value.slice(range.end)}`;
+  const cursor = range.start + insert.length;
+  input.value = next;
+  state.drafts[draftKey] = next;
+  autoGrow(input);
+  notifyTyping("channel", scopeId, next.trim().length > 0);
+  hideMentionMenu(menu);
+  input.focus();
+  input.setSelectionRange(cursor, cursor);
+}
+
+function hideMentionMenu(menu) {
+  if (menu) {
+    menu.hidden = true;
+    menu.replaceChildren();
+  }
+  mentionState.active = false;
+  mentionState.selected = 0;
+  mentionState.options = [];
+  mentionState.range = null;
+  if (!menu || mentionState.menu === menu) mentionState.menu = null;
 }
 
 function renderTypingUsers(users) {
@@ -1272,6 +1432,7 @@ function agentStatusText(status) {
   return status.state === "queued" ? `Agent 准备回复 ${target}` : `Agent 正在回复 ${target}`;
 }
 function messageFingerprint(message) {
+  const work = message.metadata?.agent_work || null;
   return {
     id: message.id,
     author_type: message.author_type,
@@ -1280,11 +1441,20 @@ function messageFingerprint(message) {
     content: message.content,
     created_at: message.created_at,
     pending: !!message.metadata?.local_pending,
+    agent_work: work
+      ? {
+          run_id: work.run_id,
+          state: work.state,
+          current_step: work.current_step || "",
+          activity: (work.activity || []).map((item) => `${item.stage}:${item.label}:${item.detail}:${item.at}`),
+        }
+      : null,
   };
 }
 function agentStatusFingerprint(status) {
   if (!status) return null;
   return {
+    run_id: status.run_id || "",
     state: status.state,
     queued_count: status.queued_count || 0,
     current_step: status.current_step || "",
@@ -1397,13 +1567,21 @@ function sendTypingState(key, isTyping) {
 
 /* ---------------------------------------------------------------- loads */
 async function loadInitial() {
-  await loadChannels();
+  await Promise.all([loadChannels(), loadMentionTargets()]);
   await loadChannelMessages();
 }
 async function loadChannels() {
   const result = await api("/api/channels");
   state.channels = result.channels;
   if (!state.activeChannelId && state.channels.length) state.activeChannelId = state.channels[0].id;
+}
+async function loadMentionTargets() {
+  try {
+    const result = await api("/api/mention-targets");
+    state.mentionTargets = result.targets || [];
+  } catch (_) {
+    state.mentionTargets = [];
+  }
 }
 async function loadChannelMessages() {
   if (!state.activeChannelId) return;
@@ -1518,7 +1696,9 @@ async function logout() {
   state.user = null;
   state.sidebarOpen = false;
   state.pendingMessages = [];
+  state.mentionTargets = [];
   state.typingUsers = [];
+  hideMentionMenu();
   render();
 }
 

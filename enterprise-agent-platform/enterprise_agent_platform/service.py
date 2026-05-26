@@ -243,6 +243,31 @@ class EnterpriseService:
         rows = self.db.query("SELECT * FROM users ORDER BY id")
         return [self.public_user(row) for row in rows]
 
+    def mention_targets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        require_permission(actor, PERMISSION_CHAT)
+        rows = self.db.query("SELECT id, username, display_name, position FROM users WHERE active = 1 ORDER BY display_name, username")
+        targets = [
+            {
+                "kind": "agent",
+                "handle": "agent",
+                "label": "Agent",
+                "description": "呼叫频道 Agent",
+            }
+        ]
+        for row in rows:
+            username = str(row["username"])
+            display = str(row["display_name"] or username)
+            targets.append(
+                {
+                    "kind": "user",
+                    "id": int(row["id"]),
+                    "handle": username,
+                    "label": display,
+                    "description": str(row["position"] or username),
+                }
+            )
+        return targets
+
     def list_permission_groups(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
         return [
@@ -424,13 +449,21 @@ class EnterpriseService:
         generation = task["generation"]
         user_msg = task["user_message"]
         self._record_agent_activity("channel", scope_id, "knowledge", "检索企业知识", "enterprise_kb_search")
-        suggestions = self.knowledge.suggest(self._recent_context_before("channel", scope_id, content, int(user_msg["id"])))
+        suggestions = self.knowledge.suggest(
+            self._recent_context_before(
+                "channel",
+                scope_id,
+                content,
+                int(user_msg["id"]),
+                current_speaker=self._actor_display_name(task["actor"]),
+            )
+        )
         self._record_agent_activity("channel", scope_id, "context", "整理频道上下文", f"{len(suggestions)} 条知识建议")
         system_prompt = self._channel_system_prompt(channel, suggestions)
         self._record_agent_activity("channel", scope_id, "model", "调用 Hermes Agent", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
-            user_message=content,
+            user_message=self._channel_speaker_line(task["actor"], content),
             history=self._agent_history_before("channel", scope_id, int(user_msg["id"])),
             session_id=f"enterprise-channel-{scope_id}-main-agent",
             session_key=f"channel:{scope_id}:main-agent",
@@ -439,6 +472,15 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
+        self._record_agent_activity("channel", scope_id, "complete", "写回频道回复", "保存到频道消息")
+        metadata = {
+            "session_id": result.session_id,
+            "degraded": result.degraded,
+            "generation": generation,
+            "knowledge_suggestions": [h.to_dict() for h in suggestions],
+            "reply_to": self._reply_target(task),
+        }
+        metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
         message = self._append_message(
             scope_type="channel",
             scope_id=scope_id,
@@ -446,15 +488,8 @@ class EnterpriseService:
             user_id=None,
             username="Main Agent",
             content=result.content,
-            metadata={
-                "session_id": result.session_id,
-                "degraded": result.degraded,
-                "generation": generation,
-                "knowledge_suggestions": [h.to_dict() for h in suggestions],
-                "reply_to": self._reply_target(task),
-            },
+            metadata=metadata,
         )
-        self._record_agent_activity("channel", scope_id, "complete", "写回频道回复", f"message #{message['id']}")
         return message
 
     def send_private_message(self, actor: dict[str, Any], content: str) -> dict[str, Any]:
@@ -520,6 +555,16 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
         )
+        self._record_agent_activity("private", scope_id, "complete", "写回私人回复", "保存到私人会话")
+        metadata = {
+            "session_id": result.session_id,
+            "degraded": result.degraded,
+            "container": container_data,
+            "generation": generation,
+            "knowledge_suggestions": [h.to_dict() for h in suggestions],
+            "reply_to": self._reply_target(task),
+        }
+        metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
         message = self._append_message(
             scope_type="private",
             scope_id=scope_id,
@@ -527,16 +572,8 @@ class EnterpriseService:
             user_id=None,
             username="Private Agent",
             content=result.content,
-            metadata={
-                "session_id": result.session_id,
-                "degraded": result.degraded,
-                "container": container_data,
-                "generation": generation,
-                "knowledge_suggestions": [h.to_dict() for h in suggestions],
-                "reply_to": self._reply_target(task),
-            },
+            metadata=metadata,
         )
-        self._record_agent_activity("private", scope_id, "complete", "写回私人回复", f"message #{message['id']}")
         return message
 
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -1033,6 +1070,8 @@ class EnterpriseService:
     def _append_agent_error(self, task: dict[str, Any], error: str) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
         self._record_agent_activity(str(task["scope_type"]), str(task["scope_id"]), "error", "Agent 回复失败", error[:180])
+        metadata = {"error": error, "reply_to": self._reply_target(task)}
+        metadata["agent_work"] = self._agent_work_snapshot(task, state="error")
         self._append_message(
             scope_type=str(task["scope_type"]),
             scope_id=str(task["scope_id"]),
@@ -1040,7 +1079,7 @@ class EnterpriseService:
             user_id=None,
             username=username,
             content=f"Agent 回复失败: {error}",
-            metadata={"error": error, "reply_to": self._reply_target(task)},
+            metadata=metadata,
         )
 
     def _normalize_conversation(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> tuple[str, str]:
@@ -1122,6 +1161,20 @@ class EnterpriseService:
             status["updated_at"] = now_ts()
             self._agent_status[key] = status
 
+    def _agent_work_snapshot(self, task: dict[str, Any], state: str) -> dict[str, Any]:
+        key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
+        with self._conversation_lock:
+            status = self._copy_status(self._agent_status.get(key) or self._idle_agent_status(str(task["scope_type"]), str(task["scope_id"])))
+        return {
+            "run_id": self._run_id_for_task(task),
+            "state": state,
+            "replying_to": self._reply_target(task),
+            "activity": status.get("activity") or [],
+            "current_step": status.get("current_step") or "",
+            "started_at": status.get("started_at"),
+            "updated_at": status.get("updated_at"),
+        }
+
     @staticmethod
     def _run_id_for_task(task: dict[str, Any]) -> str:
         message = task["user_message"]
@@ -1191,9 +1244,9 @@ class EnterpriseService:
         history: list[dict[str, str]] = []
         for msg in messages[:-1]:
             if msg["author_type"] == "user":
-                history.append({"role": "user", "content": msg["content"]})
+                history.append({"role": "user", "content": self._history_message_content(msg)})
             elif msg["author_type"] == "agent":
-                history.append({"role": "assistant", "content": msg["content"]})
+                history.append({"role": "assistant", "content": self._history_message_content(msg)})
         return history
 
     def _agent_history_before(self, scope_type: str, scope_id: str, before_message_id: int) -> list[dict[str, str]]:
@@ -1210,16 +1263,23 @@ class EnterpriseService:
         for row in reversed(rows):
             msg = self._message_from_row(row)
             if msg["author_type"] == "user":
-                history.append({"role": "user", "content": msg["content"]})
+                history.append({"role": "user", "content": self._history_message_content(msg)})
             elif msg["author_type"] == "agent":
-                history.append({"role": "assistant", "content": msg["content"]})
+                history.append({"role": "assistant", "content": self._history_message_content(msg)})
         return history
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self.list_messages({"id": 0}, scope_type, scope_id, limit=12)
         return "\n".join([m["content"] for m in messages] + [content])
 
-    def _recent_context_before(self, scope_type: str, scope_id: str, content: str, before_message_id: int) -> str:
+    def _recent_context_before(
+        self,
+        scope_type: str,
+        scope_id: str,
+        content: str,
+        before_message_id: int,
+        current_speaker: str = "",
+    ) -> str:
         rows = self.db.query(
             """
             SELECT * FROM messages
@@ -1230,7 +1290,22 @@ class EnterpriseService:
             (scope_type, str(scope_id), int(before_message_id)),
         )
         messages = [self._message_from_row(row) for row in reversed(rows)]
-        return "\n".join([m["content"] for m in messages] + [content])
+        current = f"{current_speaker}: {content}" if current_speaker else content
+        return "\n".join([self._history_message_content(m) for m in messages] + [current])
+
+    @staticmethod
+    def _actor_display_name(actor: dict[str, Any]) -> str:
+        return str(actor.get("display_name") or actor.get("username") or "User")
+
+    def _channel_speaker_line(self, actor: dict[str, Any], content: str) -> str:
+        return f"{self._actor_display_name(actor)}: {content}"
+
+    @staticmethod
+    def _history_message_content(message: dict[str, Any]) -> str:
+        if message.get("scope_type") != "channel":
+            return str(message.get("content") or "")
+        speaker = str(message.get("username") or ("Agent" if message.get("author_type") == "agent" else "User"))
+        return f"{speaker}: {message.get('content') or ''}"
 
     def _channel_system_prompt(self, channel: dict[str, Any], suggestions) -> str:
         passive = format_passive_suggestions(suggestions)
