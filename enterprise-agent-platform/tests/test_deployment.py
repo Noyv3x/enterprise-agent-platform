@@ -8,8 +8,16 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from enterprise_agent_platform.deployment import DeploymentManager, DeploymentPaths, runtime_env, user_service_unit
+from enterprise_agent_platform.deployment import (
+    DeploymentError,
+    DeploymentManager,
+    DeploymentPaths,
+    python_venv_package_names,
+    runtime_env,
+    user_service_unit,
+)
 
 
 class RecordingDeployRunner:
@@ -21,7 +29,46 @@ class RecordingDeployRunner:
         self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
         if cmd[:3] == ["systemctl", "--user", "show-environment"]:
             return subprocess.CompletedProcess(cmd, 0 if self.systemd_available else 1)
+        if cmd[:3] == [sys.executable, "-m", "venv"]:
+            bin_dir = Path(cmd[3]) / ("Scripts" if os.name == "nt" else "bin")
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            (bin_dir / "python").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0)
+
+
+class MissingEnsurepipRunner(RecordingDeployRunner):
+    def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
+        if cmd == [sys.executable, "-c", "import ensurepip"]:
+            self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
+            return subprocess.CompletedProcess(cmd, 1)
+        return super().run(cmd, cwd=cwd, env=env, timeout=timeout, check=check)
+
+
+class AutoInstallEnsurepipRunner(RecordingDeployRunner):
+    def __init__(self):
+        super().__init__()
+        self.ensurepip_available = False
+
+    def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
+        if cmd == [sys.executable, "-c", "import ensurepip"]:
+            self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
+            return subprocess.CompletedProcess(cmd, 0 if self.ensurepip_available else 1)
+        if len(cmd) >= 4 and Path(cmd[-4]).name == "apt-get" and cmd[-3:-1] == ["install", "-y"]:
+            self.ensurepip_available = True
+        return super().run(cmd, cwd=cwd, env=env, timeout=timeout, check=check)
+
+
+class BrokenExistingVenvRunner(RecordingDeployRunner):
+    def __init__(self):
+        super().__init__()
+        self.pip_checks = 0
+
+    def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
+        if len(cmd) >= 4 and cmd[-3:] == ["-m", "pip", "--version"]:
+            self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
+            self.pip_checks += 1
+            return subprocess.CompletedProcess(cmd, 1 if self.pip_checks == 1 else 0)
+        return super().run(cmd, cwd=cwd, env=env, timeout=timeout, check=check)
 
 
 def make_deploy_root(root: Path) -> None:
@@ -50,9 +97,75 @@ class DeploymentTests(unittest.TestCase):
             commands = [call["cmd"] for call in runner.calls]
             self.assertEqual(result.mode, "prepare")
             self.assertEqual(commands[0], ["git", "submodule", "update", "--init", "--recursive"])
+            self.assertIn([sys.executable, "-c", "import ensurepip"], commands)
             self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
+            self.assertIn([str(paths.venv_python), "-m", "pip", "--version"], commands)
             self.assertIn([str(paths.venv_python), "-m", "pip", "install", "--upgrade", "pip"], commands)
             self.assertIn([str(paths.venv_python), "-m", "pip", "install", "-e", str(root / "enterprise-agent-platform")], commands)
+
+    def test_missing_ensurepip_auto_installs_debian_venv_package(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            runner = AutoInstallEnsurepipRunner()
+            paths = DeploymentPaths.from_root(root)
+            manager = DeploymentManager(paths, runner=runner)
+
+            def fake_which(name):
+                if name in {"apt-get", "git", "sudo"}:
+                    return f"/usr/bin/{name}"
+                return None
+
+            with mock.patch("enterprise_agent_platform.deployment.shutil.which", side_effect=fake_which):
+                with mock.patch("enterprise_agent_platform.deployment.os.geteuid", return_value=1000):
+                    result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(result.mode, "prepare")
+            self.assertIn(["/usr/bin/sudo", "/usr/bin/apt-get", "update"], commands)
+            self.assertIn(
+                ["/usr/bin/sudo", "/usr/bin/apt-get", "install", "-y", python_venv_package_names()[0]],
+                commands,
+            )
+            self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
+
+    def test_incomplete_platform_venv_is_recreated(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = DeploymentPaths.from_root(root)
+            paths.venv_python.parent.mkdir(parents=True)
+            paths.venv_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            marker = paths.venv_dir / "partial-marker"
+            marker.write_text("old", encoding="utf-8")
+            runner = BrokenExistingVenvRunner()
+            manager = DeploymentManager(paths, runner=runner)
+
+            result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(result.mode, "prepare")
+            self.assertEqual(runner.pip_checks, 2)
+            self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
+            self.assertFalse(marker.exists())
+
+    def test_missing_ensurepip_reports_debian_venv_package_hint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            runner = MissingEnsurepipRunner()
+            paths = DeploymentPaths.from_root(root)
+            manager = DeploymentManager(paths, runner=runner)
+
+            with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_APT": "0"}):
+                with self.assertRaises(DeploymentError) as ctx:
+                    manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
+
+            message = str(ctx.exception)
+            self.assertIn("Python venv support is not available", message)
+            self.assertIn("sudo apt update && sudo apt install -y", message)
+            self.assertIn("python3-venv", message)
+            self.assertIn(f"rm -rf {paths.venv_dir}", message)
 
     def test_user_service_unit_pins_managed_paths_and_restart_policy(self):
         with tempfile.TemporaryDirectory() as td:

@@ -169,9 +169,71 @@ class DeploymentManager:
 
     def ensure_platform_venv(self) -> None:
         if not self.paths.venv_python.exists():
-            self.runner.run([sys.executable, "-m", "venv", str(self.paths.venv_dir)], cwd=self.paths.root, timeout=180)
+            self.recreate_platform_venv()
+        if not self.venv_pip_available():
+            print(f"Existing platform virtual environment is incomplete; recreating {self.paths.venv_dir}", flush=True)
+            self.recreate_platform_venv()
+            if not self.venv_pip_available():
+                raise DeploymentError(venv_package_hint(sys.executable, self.paths.venv_dir, existing_broken=True))
         self.runner.run([str(self.paths.venv_python), "-m", "pip", "install", "--upgrade", "pip"], cwd=self.paths.root, timeout=900)
         self.runner.run([str(self.paths.venv_python), "-m", "pip", "install", "-e", str(self.paths.platform_dir)], cwd=self.paths.root, timeout=900)
+
+    def recreate_platform_venv(self) -> None:
+        self.ensure_venv_module_available()
+        if self.paths.venv_dir.exists():
+            shutil.rmtree(self.paths.venv_dir)
+        self.runner.run([sys.executable, "-m", "venv", str(self.paths.venv_dir)], cwd=self.paths.root, timeout=180)
+
+    def ensure_venv_module_available(self) -> None:
+        result = self.runner.run(
+            [sys.executable, "-c", "import ensurepip"],
+            cwd=self.paths.root,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        if self.install_venv_system_package():
+            retry = self.runner.run(
+                [sys.executable, "-c", "import ensurepip"],
+                cwd=self.paths.root,
+                timeout=30,
+                check=False,
+            )
+            if retry.returncode == 0:
+                return
+        raise DeploymentError(venv_package_hint(sys.executable, self.paths.venv_dir))
+
+    def install_venv_system_package(self) -> bool:
+        command_base = apt_get_command_base()
+        if command_base is None:
+            return False
+        package_names = python_venv_package_names()
+        print(
+            "Python venv support is missing; attempting to install "
+            + " or ".join(package_names)
+            + ".",
+            flush=True,
+        )
+        update = self.runner.run([*command_base, "update"], cwd=self.paths.root, timeout=1800, check=False)
+        if update.returncode != 0:
+            return False
+        for package_name in package_names:
+            result = self.runner.run([*command_base, "install", "-y", package_name], cwd=self.paths.root, timeout=1800, check=False)
+            if result.returncode == 0:
+                return True
+        return False
+
+    def venv_pip_available(self) -> bool:
+        if not self.paths.venv_python.exists():
+            return False
+        result = self.runner.run(
+            [str(self.paths.venv_python), "-m", "pip", "--version"],
+            cwd=self.paths.root,
+            timeout=30,
+            check=False,
+        )
+        return result.returncode == 0
 
     def prepare_platform_runtime(self, *, host: str, port: int) -> dict[str, object]:
         public_base_url = os.getenv("ENTERPRISE_PUBLIC_BASE_URL", self.public_url(host, port)).rstrip("/")
@@ -264,6 +326,48 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def venv_package_hint(python_executable: str, venv_dir: Path, *, existing_broken: bool = False) -> str:
+    package = python_venv_package_names()[0]
+    prefix = (
+        f"Existing virtual environment appears incomplete: {venv_dir}"
+        if existing_broken
+        else "Python venv support is not available for this interpreter, and automatic installation did not complete."
+    )
+    return "\n".join(
+        [
+            prefix,
+            "",
+            "On Debian/Ubuntu install the venv package, remove any partial venv, then rerun deploy:",
+            f"  sudo apt update && sudo apt install -y {package}",
+            f"  rm -rf {venv_dir}",
+            "  ./deploy.sh",
+            "",
+            f"Python executable: {python_executable}",
+            f"Fallback package name if needed: python3-venv",
+        ]
+    )
+
+
+def python_venv_package_names() -> list[str]:
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    names = [f"python{version}-venv", "python3-venv"]
+    return list(dict.fromkeys(names))
+
+
+def apt_get_command_base() -> list[str] | None:
+    if os.getenv("ENTERPRISE_DEPLOY_AUTO_APT", "1").lower() in {"0", "false", "no"}:
+        return None
+    apt_get = shutil.which("apt-get")
+    if not apt_get:
+        return None
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        return [apt_get]
+    sudo = shutil.which("sudo")
+    if sudo:
+        return [sudo, apt_get]
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
