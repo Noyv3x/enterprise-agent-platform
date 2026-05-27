@@ -105,6 +105,7 @@ const ICONS = {
   alert: [["path", { d: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" }], ["line", { x1: 12, y1: 9, x2: 12, y2: 13 }], ["line", { x1: 12, y1: 17, x2: 12.01, y2: 17 }]],
   refresh: [["path", { d: "M21 2v6h-6" }], ["path", { d: "M3 12a9 9 0 0 1 15-6.7L21 8" }], ["path", { d: "M3 22v-6h6" }], ["path", { d: "M21 12a9 9 0 0 1-15 6.7L3 16" }]],
   download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "M7 10l5 5 5-5" }], ["line", { x1: 12, y1: 15, x2: 12, y2: 3 }]],
+  upload: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "M17 8l-5-5-5 5" }], ["line", { x1: 12, y1: 3, x2: 12, y2: 15 }]],
   close: [["line", { x1: 18, y1: 6, x2: 6, y2: 18 }], ["line", { x1: 6, y1: 6, x2: 18, y2: 18 }]],
   menu: [["line", { x1: 3, y1: 6, x2: 21, y2: 6 }], ["line", { x1: 3, y1: 12, x2: 21, y2: 12 }], ["line", { x1: 3, y1: 18, x2: 21, y2: 18 }]],
   external: [["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }], ["path", { d: "M15 3h6v6" }], ["line", { x1: 10, y1: 14, x2: 21, y2: 3 }]],
@@ -1591,8 +1592,33 @@ function renderSecretsSettings() {
 /* ---------------------------------------------------------------- oauth */
 function renderOAuthSettings() {
   const providers = state.oauthProviders?.providers || [];
+  const importInput = h("input", {
+    type: "file",
+    accept: "application/json,.json",
+    style: "display:none",
+    onchange: async (event) => {
+      const file = event.target.files?.[0];
+      event.target.value = "";
+      if (file) await importOAuthCredentials(file);
+    },
+  });
+  const transferActions = h("div", { class: "oauth-transfer" }, [
+    h("button", {
+      class: "btn btn--sm",
+      type: "button",
+      disabled: state.busy,
+      onclick: () => exportOAuthCredentials(),
+    }, [icon("download", { size: 14 }), h("span", { text: "导出凭据" })]),
+    h("button", {
+      class: "btn btn--sm",
+      type: "button",
+      disabled: state.busy,
+      onclick: () => importInput.click(),
+    }, [icon("upload", { size: 14 }), h("span", { text: "导入凭据" })]),
+    importInput,
+  ]);
   return h("section", { class: "card" }, [
-    cardHead("API 供应商验证", "shield", { desc: "通过 OAuth 授权模型供应商，验证后 Hermes 自动切换。" }),
+    cardHead("API 供应商验证", "shield", { desc: "通过 OAuth 授权模型供应商，验证后 Hermes 自动切换。", extra: transferActions }),
     providers.length
       ? h("div", { class: "oauth-grid" }, providers.map(renderOAuthProviderCard))
       : h("div", { class: "muted", text: "未发现可验证的供应商。" }),
@@ -2077,6 +2103,40 @@ async function completeOAuthVerification(providerId, flowId) {
     updateOAuthState(providerId, result);
     if (result.flow?.complete) state.oauthCallbackUrls[providerId] = "";
     await loadHermesConfig();
+  });
+}
+async function exportOAuthCredentials() {
+  await withBusy(async () => {
+    const payload = await api("/api/system/oauth/credentials/export");
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = h("a", {
+      href: url,
+      download: `enterprise-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`,
+    });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toast("OAuth 凭据文件已生成", { type: "ok", title: "完成" });
+  });
+}
+async function importOAuthCredentials(file) {
+  await withBusy(async () => {
+    let credentials;
+    try {
+      credentials = JSON.parse(await file.text());
+    } catch (error) {
+      throw new Error("OAuth 凭据文件不是有效 JSON");
+    }
+    const result = await api("/api/system/oauth/credentials/import", {
+      method: "POST",
+      body: JSON.stringify({ credentials }),
+    });
+    updateOAuthState(result.active_provider, result);
+    await Promise.all([loadSecrets(), loadHermesConfig()]);
+    const count = result.imported?.keys?.length || 0;
+    toast(`已导入 ${count} 个 OAuth 凭据`, { type: "ok", title: "完成" });
   });
 }
 function updateOAuthState(providerId, result) {

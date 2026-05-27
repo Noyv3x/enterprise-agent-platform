@@ -1255,6 +1255,88 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_oauth_credentials_export_import_roundtrip_restores_managed_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_dir = root / "source"
+            target_dir = root / "target"
+            make_fake_hermes_repo(source_dir / "hermes-agent")
+            make_fake_hermes_repo(target_dir / "hermes-agent")
+            source = EnterpriseService(
+                make_config(source_dir),
+                agent_client=RecordingAgent(),
+                runtime_command_runner=RecordingCommandRunner(),
+            )
+            target = EnterpriseService(
+                make_config(target_dir),
+                agent_client=RecordingAgent(),
+                runtime_command_runner=RecordingCommandRunner(),
+            )
+            try:
+                _, source_admin = source.authenticate("admin", "admin")
+                source.set_secret(source_admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                source.set_secret(source_admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+                source.set_secret(source_admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
+                source.set_secret(source_admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
+                source.set_secret(source_admin, "GROK_OAUTH_ID_TOKEN", "grok-id")
+                source.update_hermes_config(source_admin, {"provider": "grok-oauth"})
+
+                exported = source.export_oauth_credentials(source_admin)
+                self.assertEqual(exported["kind"], "enterprise-agent-platform.oauth-credentials")
+                self.assertEqual(exported["version"], 1)
+                self.assertEqual(exported["active_provider"], "xai-oauth")
+                self.assertEqual(
+                    exported["providers"]["openai-codex"]["credentials"]["CODEX_OAUTH_ACCESS_TOKEN"],
+                    "codex-access",
+                )
+                self.assertEqual(
+                    exported["providers"]["xai-oauth"]["credentials"]["GROK_OAUTH_ID_TOKEN"],
+                    "grok-id",
+                )
+                self.assertNotIn("API_SERVER_KEY", json.dumps(exported))
+
+                _, target_admin = target.authenticate("admin", "admin")
+                imported = target.import_oauth_credentials(target_admin, {"credentials": exported})
+
+                self.assertCountEqual(imported["imported"]["providers"], ["openai-codex", "xai-oauth"])
+                self.assertEqual(imported["active_provider"], "xai-oauth")
+                self.assertEqual(target.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
+                self.assertEqual(target.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
+                self.assertEqual(target.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "grok-access")
+                self.assertEqual(target.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
+                self.assertEqual(target.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
+
+                auth_store = json.loads((target.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
+                self.assertEqual(auth_store["active_provider"], "xai-oauth")
+                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
+                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["id_token"], "grok-id")
+            finally:
+                source.close()
+                target.close()
+
+    def test_oauth_credentials_import_rejects_incomplete_token_pairs(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                with self.assertRaises(ServiceError) as import_error:
+                    service.import_oauth_credentials(
+                        admin,
+                        {
+                            "credentials": {
+                                "providers": {
+                                    "openai-codex": {
+                                        "credentials": {"CODEX_OAUTH_ACCESS_TOKEN": "codex-access"}
+                                    }
+                                }
+                            }
+                        },
+                    )
+                self.assertEqual(import_error.exception.status, 400)
+            finally:
+                service.close()
+
     def test_managed_cognee_environment_is_seeded_from_platform(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

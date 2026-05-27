@@ -237,6 +237,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/oauth/providers" and method == "GET":
             self._json(service.oauth_provider_status(actor))
             return
+        if path == "/api/system/oauth/credentials/export" and method == "GET":
+            self._json(service.export_oauth_credentials(actor))
+            return
+        if path == "/api/system/oauth/credentials/import" and method == "POST":
+            self._json(service.import_oauth_credentials(actor, self._body_json()))
+            return
         m = re.fullmatch(r"/api/system/oauth/([A-Za-z0-9_-]+)/start", path)
         if m and method == "POST":
             self._json(service.start_oauth_verification(actor, m.group(1)), status=201)

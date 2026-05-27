@@ -49,6 +49,8 @@ rm -rf .venv
 - `Codex OAuth`：点击开始验证，打开页面并输入设备码，再回到平台点击检查状态。
 - `Grok OAuth`：点击开始验证，打开授权页，浏览器跳转到本机回调地址后复制完整 URL 并粘贴回平台完成验证。
 
+同一区域提供 OAuth 凭据导入/导出：管理员可以一键导出 Codex 与 Grok 的 OAuth token JSON 文件，并在新部署或重建环境后重新导入。
+
 平台只保留这两个 Hermes 模型供应商；OpenAI、OpenRouter 或 xAI API key 不再作为模型供应商配置入口。
 
 常用部署命令：

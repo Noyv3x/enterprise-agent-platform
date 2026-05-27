@@ -61,6 +61,13 @@ PERMISSION_MANAGE_KNOWLEDGE = "manage_knowledge"
 PERMISSION_MANAGE_USERS = "manage_users"
 PERMISSION_SYSTEM_SETTINGS = "system_settings"
 
+OAUTH_CREDENTIAL_EXPORT_KIND = "enterprise-agent-platform.oauth-credentials"
+OAUTH_CREDENTIAL_EXPORT_VERSION = 1
+OAUTH_PROVIDER_SECRET_KEYS = {
+    "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
+    "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
+}
+
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     "admin": {
         "label": "管理员",
@@ -912,9 +919,7 @@ class EnterpriseService:
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        active_provider = normalize_hermes_provider(self.get_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider)
-        if active_provider not in SUPPORTED_OAUTH_PROVIDERS:
-            active_provider = "openai-codex"
+        active_provider = self._active_oauth_provider()
         runtime_oauth = self.runtimes.hermes_runtime_config().get("oauth", {})
         providers = []
         for provider in SUPPORTED_OAUTH_PROVIDERS:
@@ -930,6 +935,68 @@ class EnterpriseService:
                 }
             )
         return {"providers": providers, "active_provider": active_provider}
+
+    def export_oauth_credentials(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        providers: dict[str, dict[str, Any]] = {}
+        for provider in SUPPORTED_OAUTH_PROVIDERS:
+            info = oauth_provider_info(provider)
+            credentials = {
+                key: value
+                for key in OAUTH_PROVIDER_SECRET_KEYS[provider]
+                if (value := self.get_secret(key))
+            }
+            providers[provider] = {
+                "id": provider,
+                "label": info["label"],
+                "model": info["model"],
+                "configured": self._oauth_tokens_configured(provider),
+                "credentials": credentials,
+            }
+        return {
+            "kind": OAUTH_CREDENTIAL_EXPORT_KIND,
+            "version": OAUTH_CREDENTIAL_EXPORT_VERSION,
+            "exported_at": now_ts(),
+            "active_provider": self._active_oauth_provider(),
+            "providers": providers,
+        }
+
+    def import_oauth_credentials(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        payload = body.get("credentials", body)
+        if not isinstance(payload, dict):
+            raise ServiceError(400, "OAuth credential import must be a JSON object")
+        by_provider = self._extract_oauth_credentials(payload)
+        imported_keys = []
+        imported_providers = []
+        for provider, secrets_by_key in by_provider.items():
+            if not secrets_by_key:
+                continue
+            required = OAUTH_PROVIDER_SECRET_KEYS[provider][:2]
+            if any(key in secrets_by_key for key in required) and not all(key in secrets_by_key for key in required):
+                label = oauth_provider_info(provider)["label"]
+                raise ServiceError(400, f"{label} import requires both access and refresh tokens")
+            imported_providers.append(provider)
+            for key, value in secrets_by_key.items():
+                self.set_setting(key, value, secret=True)
+                imported_keys.append(key)
+        if not imported_keys:
+            raise ServiceError(400, "no supported OAuth credentials found in import file")
+
+        active_raw = payload.get("active_provider")
+        active_provider = normalize_hermes_provider(str(active_raw)) if active_raw else ""
+        if active_provider in SUPPORTED_OAUTH_PROVIDERS and self._oauth_tokens_configured(active_provider):
+            self._select_oauth_provider(active_provider)
+        else:
+            self.runtimes.prepare_hermes()
+
+        return {
+            "imported": {
+                "providers": imported_providers,
+                "keys": imported_keys,
+            },
+            **self.oauth_provider_status(actor),
+        }
 
     def start_oauth_verification(self, actor: dict[str, Any], provider: str) -> dict[str, Any]:
         require_admin(actor)
@@ -1076,6 +1143,55 @@ class EnterpriseService:
         if not value:
             raise ServiceError(400, "secret value is required")
         self.set_setting(clean, value, secret=True)
+
+    def _active_oauth_provider(self) -> str:
+        active_provider = normalize_hermes_provider(self.get_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider)
+        return active_provider if active_provider in SUPPORTED_OAUTH_PROVIDERS else "openai-codex"
+
+    def _extract_oauth_credentials(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
+        by_provider: dict[str, dict[str, str]] = {provider: {} for provider in SUPPORTED_OAUTH_PROVIDERS}
+        self._collect_flat_oauth_credentials(by_provider, payload)
+        top_level_credentials = payload.get("credentials")
+        if isinstance(top_level_credentials, dict):
+            self._collect_flat_oauth_credentials(by_provider, top_level_credentials)
+        providers = payload.get("providers")
+        if providers is None:
+            return by_provider
+        if not isinstance(providers, dict):
+            raise ServiceError(400, "OAuth credential providers must be a JSON object")
+        for raw_provider, entry in providers.items():
+            provider = normalize_hermes_provider(str(raw_provider))
+            if provider not in SUPPORTED_OAUTH_PROVIDERS:
+                continue
+            if not isinstance(entry, dict):
+                raise ServiceError(400, f"OAuth credential provider {raw_provider} must be a JSON object")
+            source = entry.get("credentials")
+            if not isinstance(source, dict):
+                source = entry.get("secrets")
+            if source is None:
+                source = entry
+            if not isinstance(source, dict):
+                raise ServiceError(400, f"OAuth credential provider {raw_provider} credentials must be a JSON object")
+            self._collect_provider_oauth_credentials(by_provider, provider, source)
+        return by_provider
+
+    def _collect_flat_oauth_credentials(self, by_provider: dict[str, dict[str, str]], source: dict[str, Any]) -> None:
+        for provider in SUPPORTED_OAUTH_PROVIDERS:
+            self._collect_provider_oauth_credentials(by_provider, provider, source)
+
+    def _collect_provider_oauth_credentials(
+        self,
+        by_provider: dict[str, dict[str, str]],
+        provider: str,
+        source: dict[str, Any],
+    ) -> None:
+        for key in OAUTH_PROVIDER_SECRET_KEYS[provider]:
+            value = source.get(key)
+            if value is None:
+                continue
+            clean = str(value).strip()
+            if clean:
+                by_provider[provider][key] = clean
 
     def _select_oauth_provider(self, provider: str) -> None:
         self.set_setting(HERMES_SETTING_PROVIDER, provider)
