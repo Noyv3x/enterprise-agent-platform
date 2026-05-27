@@ -19,7 +19,13 @@ from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
-from enterprise_agent_platform.service import EnterpriseService, ServiceError, UploadedFile
+from enterprise_agent_platform.service import (
+    BOOTSTRAP_ADMIN_PASSWORD_FILE,
+    MAX_LOGIN_FAILURES,
+    EnterpriseService,
+    ServiceError,
+    UploadedFile,
+)
 
 
 class RecordingAgent:
@@ -238,6 +244,7 @@ def make_config(tmp: Path) -> PlatformConfig:
         firecrawl_api_url="http://127.0.0.1:13002",
         hermes_home=tmp / "runtimes" / "hermes",
         runtime_startup_wait_seconds=0,
+        allow_insecure_bootstrap_password=True,
     )
 
 
@@ -1483,6 +1490,43 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_bootstrap_admin_password_is_generated_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config = replace(make_config(tmp), allow_insecure_bootstrap_password=False)
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                password_path = tmp / BOOTSTRAP_ADMIN_PASSWORD_FILE
+                self.assertTrue(password_path.exists())
+                password = password_path.read_text(encoding="utf-8").strip()
+                self.assertGreaterEqual(len(password), 24)
+                with self.assertRaises(ServiceError) as login_error:
+                    service.authenticate("admin", "admin")
+                self.assertEqual(login_error.exception.status, 401)
+                _, admin = service.authenticate("admin", password)
+                self.assertEqual(admin["username"], "admin")
+                if os.name != "nt":
+                    self.assertEqual(password_path.stat().st_mode & 0o777, 0o600)
+            finally:
+                service.close()
+
+    def test_login_failures_are_rate_limited_per_client(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                for _ in range(MAX_LOGIN_FAILURES):
+                    with self.assertRaises(ServiceError) as login_error:
+                        service.authenticate("admin", "wrong-password", client_id="198.51.100.10")
+                    self.assertEqual(login_error.exception.status, 401)
+                with self.assertRaises(ServiceError) as limited:
+                    service.authenticate("admin", "admin", client_id="198.51.100.10")
+                self.assertEqual(limited.exception.status, 429)
+
+                _, admin = service.authenticate("admin", "admin", client_id="198.51.100.11")
+                self.assertEqual(admin["username"], "admin")
+            finally:
+                service.close()
+
     def test_managed_cognee_environment_is_seeded_from_platform(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1511,6 +1555,114 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_http_security_headers_secure_cookie_and_csrf_origin_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), public_base_url="https://agents.example")
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/")
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 200)
+                self.assertEqual(res.getheader("X-Frame-Options"), "DENY")
+                self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
+                self.assertIn("frame-ancestors 'none'", res.getheader("Content-Security-Policy"))
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(denied["error"], "cross-origin request denied")
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": "https://agents.example"},
+                )
+                res = conn.getresponse()
+                res.read()
+                cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertIn("HttpOnly", cookie)
+                self.assertIn("SameSite=Lax", cookie)
+                self.assertIn("Secure", cookie)
+
+                conn.request(
+                    "POST",
+                    "/api/channels",
+                    body=json.dumps({"name": "blocked"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": "https://evil.example"},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(denied["error"], "cross-origin request denied")
+
+                conn.request(
+                    "POST",
+                    "/api/channels",
+                    body=json.dumps({"name": "allowed"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": "https://agents.example"},
+                )
+                res = conn.getresponse()
+                created = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 201)
+                self.assertEqual(created["channel"]["name"], "allowed")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_attachment_inline_is_limited_to_safe_image_mime_types(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            server, thread = serve_in_thread(make_config(Path(td)), service)
+            host, port = server.server_address
+            try:
+                token, admin = service.authenticate("admin", "admin")
+                svg_message = service.send_channel_message(
+                    admin,
+                    1,
+                    "svg",
+                    [UploadedFile("diagram.svg", "image/svg+xml", b"<svg><script>alert(1)</script></svg>")],
+                )["user_message"]
+                png_message = service.send_channel_message(
+                    admin,
+                    1,
+                    "png",
+                    [UploadedFile("pixel.png", "image/png", b"\x89PNG\r\n\x1a\n")],
+                )["user_message"]
+                self.assertFalse(svg_message["attachments"][0]["is_image"])
+                self.assertTrue(png_message["attachments"][0]["is_image"])
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", svg_message["attachments"][0]["url"], headers={"Authorization": f"Bearer {token}"})
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 200)
+                self.assertTrue(res.getheader("Content-Disposition").startswith("attachment;"))
+
+                conn.request("GET", png_message["attachments"][0]["url"], headers={"Authorization": f"Bearer {token}"})
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 200)
+                self.assertTrue(res.getheader("Content-Disposition").startswith("inline;"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_login_and_channel_message_over_http(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -1625,6 +1777,7 @@ class PlatformHTTPTests(unittest.TestCase):
 
                 conn.request("GET", payload["user_message"]["attachments"][0]["url"], headers={"Cookie": cookie})
                 res = conn.getresponse()
+                self.assertTrue(res.getheader("Content-Disposition").startswith("attachment;"))
                 attachment_body = res.read()
                 self.assertEqual(res.status, 200)
                 self.assertEqual(attachment_body, b"hello file")

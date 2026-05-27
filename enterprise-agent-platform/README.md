@@ -42,7 +42,9 @@ rm -rf .venv
 ./deploy.sh
 ```
 
-如果首次运行前未设置 `ENTERPRISE_ADMIN_PASSWORD`，默认引导账号为 `admin` / `admin`。
+首次运行前建议设置 `ENTERPRISE_ADMIN_PASSWORD`。如果未设置，平台会为引导账号 `admin` 生成随机初始密码，并写入数据目录下的 `bootstrap-admin-password.txt`（文件权限会尽量限制为 `0600`）。首次登录并修改密码后可以删除该文件；仅本地开发测试时可以显式设置 `ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD=1` 恢复 `admin` / `admin`。
+
+通过 HTTPS 反向代理开放到公网时，把 `ENTERPRISE_PUBLIC_BASE_URL` 设置为公网地址，例如 `https://agent.example.com`。平台会据此为会话 Cookie 增加 `Secure` 属性，并校验浏览器写请求的 `Origin` / `Referer`。
 
 登录后进入“设置”页面，在“API 供应商验证”中完成二选一的供应商授权：
 

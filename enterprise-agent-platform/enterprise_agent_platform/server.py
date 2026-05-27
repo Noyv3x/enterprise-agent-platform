@@ -4,7 +4,9 @@ import json
 import mimetypes
 import re
 import signal
+import sys
 import threading
+import traceback
 import urllib.parse
 from email import policy
 from email.parser import BytesParser
@@ -15,12 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import PlatformConfig
-from .service import EnterpriseService, ServiceError, UploadedFile
+from .service import BOOTSTRAP_ADMIN_PASSWORD_FILE, EnterpriseService, ServiceError, UploadedFile, is_safe_inline_attachment_mime
 
 
 COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
@@ -52,23 +55,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            if path.startswith("/api/") and method in UNSAFE_METHODS:
+                self._require_same_origin()
             if path.startswith("/api/agent/tools/"):
                 self._handle_agent_tool(method, path, query)
                 return
             if path.startswith("/api/"):
                 self._handle_api(method, path, query)
                 return
+            if method != "GET":
+                self._json({"error": "method not allowed"}, status=405)
+                return
             self._serve_static(path)
         except ServiceError as exc:
             self._json({"error": exc.message}, status=exc.status)
         except Exception as exc:
-            self._json({"error": f"internal server error: {exc}"}, status=500)
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+            self._json({"error": "internal server error"}, status=500)
 
     def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
         if path == "/api/auth/login" and method == "POST":
             body = self._body_json()
-            token, user = service.authenticate(str(body.get("username", "")), str(body.get("password", "")))
+            token, user = service.authenticate(
+                str(body.get("username", "")),
+                str(body.get("password", "")),
+                client_id=self._client_identity(),
+            )
             self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
             return
         if path == "/api/auth/logout" and method == "POST":
@@ -307,7 +320,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def _body_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        length = self._content_length()
         if length > MAX_BODY_BYTES:
             raise ServiceError(413, "request body too large")
         raw = self.rfile.read(length) if length else b"{}"
@@ -327,7 +340,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return str(body.get("content", "")), []
 
     def _body_multipart_message(self, content_type: str) -> tuple[str, list[UploadedFile]]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        length = self._content_length()
         if length > MAX_UPLOAD_BODY_BYTES:
             raise ServiceError(413, "upload body too large")
         raw = self.rfile.read(length) if length else b""
@@ -363,6 +376,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -373,13 +387,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = path.read_bytes()
         filename = str(attachment.get("filename") or "attachment")
         ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "attachment"
-        disposition = "attachment" if download else "inline"
+        mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+        disposition = "inline" if not download and is_safe_inline_attachment_mime(mime_type) else "attachment"
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", str(attachment.get("mime_type") or "application/octet-stream"))
+        self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Disposition", f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}")
-        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "private, max-age=3600")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -398,20 +413,96 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def _not_found(self) -> None:
         self.send_response(HTTPStatus.NOT_FOUND)
+        self._send_security_headers()
         self.end_headers()
 
-    @staticmethod
-    def _session_cookie(token: str) -> str:
-        return f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax"
+    def _content_length(self) -> int:
+        raw = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw)
+        except ValueError as exc:
+            raise ServiceError(400, "invalid Content-Length") from exc
+        if length < 0:
+            raise ServiceError(400, "invalid Content-Length")
+        return length
 
-    @staticmethod
-    def _clear_cookie() -> str:
-        return f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'",
+        )
+
+    def _session_cookie(self, token: str) -> str:
+        attrs = [f"{COOKIE_NAME}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
+        if self._secure_cookie_enabled():
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+    def _clear_cookie(self) -> str:
+        attrs = [f"{COOKIE_NAME}=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"]
+        if self._secure_cookie_enabled():
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+    def _secure_cookie_enabled(self) -> bool:
+        return urllib.parse.urlparse(self.server.service.config.public_base_url).scheme == "https"
+
+    def _require_same_origin(self) -> None:
+        origin = self.headers.get("Origin", "").strip()
+        if origin:
+            if not self._origin_allowed(origin):
+                raise ServiceError(403, "cross-origin request denied")
+            return
+        referer = self.headers.get("Referer", "").strip()
+        if referer and not self._origin_allowed(referer):
+            raise ServiceError(403, "cross-origin request denied")
+
+    def _origin_allowed(self, value: str) -> bool:
+        origin = normalized_origin(value)
+        return bool(origin and origin in self._allowed_origins())
+
+    def _allowed_origins(self) -> set[str]:
+        origins = set()
+        public_origin = normalized_origin(self.server.service.config.public_base_url)
+        if public_origin:
+            origins.add(public_origin)
+        request_origin = normalized_origin(self._request_base_url())
+        if request_origin:
+            origins.add(request_origin)
+        return origins
+
+    def _request_base_url(self) -> str:
+        proto = first_forwarded(self.headers.get("X-Forwarded-Proto", "")) or "http"
+        if proto not in {"http", "https"}:
+            proto = "http"
+        host = first_forwarded(self.headers.get("X-Forwarded-Host", "")) or self.headers.get("Host", "")
+        return f"{proto}://{host}" if host else ""
+
+    def _client_identity(self) -> str:
+        forwarded = first_forwarded(self.headers.get("X-Forwarded-For", ""))
+        if forwarded:
+            return forwarded
+        try:
+            return str(self.client_address[0])
+        except Exception:
+            return "unknown"
 
 
 def first(query: dict[str, list[str]], key: str, default: str) -> str:
@@ -425,6 +516,24 @@ def bearer_token(value: str) -> str | None:
     return None
 
 
+def first_forwarded(value: str) -> str:
+    return str(value or "").split(",", 1)[0].strip()
+
+
+def normalized_origin(value: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlparse(str(value or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        hostname = parsed.hostname.lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    netloc = hostname if port in {None, default_port} else f"{hostname}:{port}"
+    return f"{parsed.scheme}://{netloc}"
+
+
 def make_server(config: PlatformConfig | None = None, service: EnterpriseService | None = None) -> EnterpriseHTTPServer:
     config = config or PlatformConfig.from_env(Path(__file__).resolve().parents[1])
     service = service or EnterpriseService(config)
@@ -435,7 +544,11 @@ def run_server(config: PlatformConfig | None = None) -> None:
     server = make_server(config)
     host, port = server.server_address[:2]
     print(f"Enterprise Agent Platform running at http://{host}:{port}")
-    print("Default bootstrap account is admin/admin unless ENTERPRISE_ADMIN_PASSWORD is set before first run.")
+    bootstrap_password_path = server.service.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE
+    if bootstrap_password_path.exists():
+        print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")
+    else:
+        print("Bootstrap admin account is admin; password came from ENTERPRISE_ADMIN_PASSWORD or existing database state.")
     previous_handlers: dict[int, signal.Handlers] = {}
 
     def request_shutdown(signum, _frame) -> None:

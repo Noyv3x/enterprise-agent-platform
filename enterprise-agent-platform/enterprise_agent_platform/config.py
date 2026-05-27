@@ -49,6 +49,7 @@ class PlatformConfig:
     firecrawl_repo: Path | None = None
     firecrawl_api_url: str = "http://127.0.0.1:3002"
     firecrawl_command: str = ""
+    allow_insecure_bootstrap_password: bool = False
 
     @property
     def db_path(self) -> Path:
@@ -126,6 +127,7 @@ class PlatformConfig:
             firecrawl_repo=Path(os.getenv("ENTERPRISE_FIRECRAWL_REPO", _default_repo_path(base, "firecrawl"))).expanduser(),
             firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
+            allow_insecure_bootstrap_password=_env_bool("ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD", False),
         )
 
 
@@ -137,3 +139,10 @@ def _default_repo_path(base: Path, name: str) -> Path:
     if in_parent.exists():
         return in_parent
     return in_base
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}

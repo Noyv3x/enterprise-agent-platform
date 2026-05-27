@@ -61,6 +61,17 @@ class UploadedFile:
 
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+MIN_PASSWORD_LENGTH = 8
+BOOTSTRAP_ADMIN_PASSWORD_FILE = "bootstrap-admin-password.txt"
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+MAX_LOGIN_FAILURES = 8
+SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+}
 MEDIA_TAG_RE = re.compile(
     r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
     re.IGNORECASE,
@@ -157,6 +168,8 @@ class EnterpriseService:
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
+        self._auth_lock = threading.RLock()
+        self._login_failures: dict[tuple[str, str], Deque[float]] = {}
         self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
@@ -181,19 +194,42 @@ class EnterpriseService:
                 ("general", "Company-wide agent channel", ts),
             )
         if not self.db.scalar("SELECT COUNT(*) FROM users"):
-            password = os.getenv("ENTERPRISE_ADMIN_PASSWORD", "admin")
+            password, allow_weak = self._bootstrap_admin_password()
             self.create_user(
                 username="admin",
                 password=password,
                 display_name="Administrator",
                 role="admin",
                 actor=None,
+                _allow_weak_password=allow_weak,
             )
         if not self.get_setting("agent_tool_token"):
             token = self.config.agent_tool_token or secrets.token_urlsafe(32)
             self.set_setting("agent_tool_token", token, secret=True)
         if not self.config.hermes_api_key and not self.get_secret("ENTERPRISE_HERMES_API_KEY") and not self.get_secret("API_SERVER_KEY"):
             self.set_setting("API_SERVER_KEY", secrets.token_urlsafe(32), secret=True)
+
+    def _bootstrap_admin_password(self) -> tuple[str, bool]:
+        configured = os.getenv("ENTERPRISE_ADMIN_PASSWORD")
+        if configured:
+            return configured, False
+        if self.config.allow_insecure_bootstrap_password:
+            return "admin", True
+
+        password_path = self.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE
+        if password_path.exists():
+            existing = password_path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing, False
+
+        password = secrets.token_urlsafe(24)
+        password_path.parent.mkdir(parents=True, exist_ok=True)
+        password_path.write_text(password + "\n", encoding="utf-8")
+        try:
+            password_path.chmod(0o600)
+        except OSError:
+            pass
+        return password, False
 
     def create_user(
         self,
@@ -207,6 +243,7 @@ class EnterpriseService:
         model_name: str = "",
         thinking_depth: str = DEFAULT_THINKING_DEPTH,
         actor: dict[str, Any] | None,
+        _allow_weak_password: bool = False,
     ) -> dict[str, Any]:
         if actor is not None and actor.get("role") != "admin":
             raise ServiceError(403, "admin role required")
@@ -214,8 +251,8 @@ class EnterpriseService:
         requested_role = normalize_role(role)
         group = normalize_permission_group(permission_group or ("admin" if requested_role == "admin" else "member"))
         role = role_for_permission_group(group)
-        if not password or len(password) < 4:
-            raise ServiceError(400, "password must be at least 4 characters")
+        if not password or (len(password) < MIN_PASSWORD_LENGTH and not _allow_weak_password):
+            raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
         display = display_name.strip() or username
         position = normalize_position(position)
         model_name = normalize_model_name(model_name)
@@ -236,16 +273,60 @@ class EnterpriseService:
             raise ServiceError(409, f"user already exists: {username}") from exc
         return self.get_user(user_id) or {}
 
-    def authenticate(self, username: str, password: str) -> tuple[str, dict[str, Any]]:
+    def authenticate(self, username: str, password: str, *, client_id: str = "") -> tuple[str, dict[str, Any]]:
+        try:
+            clean_username = normalize_name(username)
+        except ServiceError as exc:
+            self._record_login_failure(str(username).strip().lower()[:80] or "invalid", client_id)
+            raise ServiceError(401, "invalid username or password") from exc
+        self._check_login_rate_limit(clean_username, client_id)
         user = self.db.query_one(
             "SELECT * FROM users WHERE username = ? AND active = 1",
-            (normalize_name(username),),
+            (clean_username,),
         )
         if not user or not verify_password(password, user["password_hash"]):
+            self._record_login_failure(clean_username, client_id)
             raise ServiceError(401, "invalid username or password")
+        self._clear_login_failures(clean_username, client_id)
         self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), user["id"]))
         public = self.public_user(user)
         return self.tokens.issue(int(user["id"])), public
+
+    def _check_login_rate_limit(self, username: str, client_id: str) -> None:
+        key = self._login_failure_key(username, client_id)
+        now = time.time()
+        with self._auth_lock:
+            failures = self._login_failures.get(key)
+            if not failures:
+                return
+            self._trim_login_failures(failures, now)
+            if len(failures) >= MAX_LOGIN_FAILURES:
+                raise ServiceError(429, "too many failed login attempts; try again later")
+
+    def _record_login_failure(self, username: str, client_id: str) -> None:
+        key = self._login_failure_key(username, client_id)
+        now = time.time()
+        with self._auth_lock:
+            failures = self._login_failures.setdefault(key, deque())
+            self._trim_login_failures(failures, now)
+            failures.append(now)
+
+    def _clear_login_failures(self, username: str, client_id: str) -> None:
+        key = self._login_failure_key(username, client_id)
+        with self._auth_lock:
+            self._login_failures.pop(key, None)
+
+    @staticmethod
+    def _trim_login_failures(failures: Deque[float], now: float) -> None:
+        cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+        while failures and failures[0] < cutoff:
+            failures.popleft()
+
+    @staticmethod
+    def _login_failure_key(username: str, client_id: str) -> tuple[str, str]:
+        clean_user = str(username or "unknown").strip().lower()[:80] or "unknown"
+        clean_client = str(client_id or "local").strip()[:120] or "local"
+        return clean_user, clean_client
 
     def user_from_token(self, token: str | None) -> dict[str, Any] | None:
         if not token:
@@ -326,8 +407,8 @@ class EnterpriseService:
             updates["active"] = 1 if parse_bool(body.get("active")) else 0
         password = str(body.get("password", "") or "")
         if password:
-            if len(password) < 4:
-                raise ServiceError(400, "password must be at least 4 characters")
+            if len(password) < MIN_PASSWORD_LENGTH:
+                raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
             updates["password_hash"] = hash_password(password)
 
         if not updates:
@@ -1837,7 +1918,7 @@ class EnterpriseService:
             "size_bytes": int(row["size_bytes"] or 0),
             "sha256": row["sha256"],
             "created_at": row["created_at"],
-            "is_image": mime_type.startswith("image/"),
+            "is_image": is_safe_inline_attachment_mime(mime_type),
             "url": f"/api/attachments/{int(row['id'])}",
             "download_url": f"/api/attachments/{int(row['id'])}?download=1",
         }
@@ -2135,6 +2216,10 @@ def normalize_attachment_mime(filename: str, value: str) -> str:
     if not clean or "/" not in clean or re.search(r"[\r\n\x00]", clean):
         clean = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return clean[:120]
+
+
+def is_safe_inline_attachment_mime(mime_type: str) -> bool:
+    return str(mime_type or "").split(";", 1)[0].strip().lower() in SAFE_INLINE_ATTACHMENT_MIME_TYPES
 
 
 def safe_attachment_suffix(filename: str) -> str:
