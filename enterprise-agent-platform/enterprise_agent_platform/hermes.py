@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import base64
+import mimetypes
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .config import PlatformConfig
@@ -37,10 +40,11 @@ class AgentClient(Protocol):
         *,
         system_prompt: str,
         user_message: str,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
@@ -58,10 +62,11 @@ class LocalAgentClient:
         *,
         system_prompt: str,
         user_message: str,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
@@ -74,7 +79,9 @@ class LocalAgentClient:
         if hints:
             titles = ", ".join(str(item.get("title", "")) for item in hints[:3])
             hint_text = f"\n\n知识库提示: {titles}"
-        content = f"{prefix} received: {user_message}{hint_text}"
+        attachment_count = len(attachments or [])
+        attachment_text = f"\n\n附件: {attachment_count} 个" if attachment_count else ""
+        content = f"{prefix} received: {user_message}{attachment_text}{hint_text}"
         emit_content(content_callback, content)
         return AgentResult(content=content, session_id=session_id, raw={"mode": "local"}, degraded=True)
 
@@ -90,10 +97,11 @@ class HermesAgentClient:
         *,
         system_prompt: str,
         user_message: str,
-        history: list[dict[str, str]],
+        history: list[dict[str, Any]],
         session_id: str,
         session_key: str,
         metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         model: str | None = None,
         thinking_depth: str | None = None,
         reasoning_config: dict[str, Any] | None = None,
@@ -102,13 +110,15 @@ class HermesAgentClient:
     ) -> AgentResult:
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-30:])
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": self._content_with_images(user_message, attachments or [])})
         effective_model = str(model or self._effective_model())
         body = {
             "model": effective_model,
             "messages": messages,
             "stream": progress_callback is not None or content_callback is not None,
         }
+        if metadata:
+            body["metadata"] = metadata
         self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
         headers = {
             "Content-Type": "application/json",
@@ -145,6 +155,39 @@ class HermesAgentClient:
         if not content:
             content = str(raw.get("final_response") or "")
         return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
+
+    @staticmethod
+    def _content_with_images(user_message: str, attachments: list[dict[str, Any]]) -> Any:
+        image_parts = []
+        skipped = []
+        total_inline_bytes = 0
+        for attachment in attachments:
+            if not attachment.get("is_image"):
+                continue
+            local_path = str(attachment.get("local_path") or "").strip()
+            if not local_path:
+                continue
+            path = Path(local_path)
+            try:
+                size = path.stat().st_size
+                if size <= 0 or total_inline_bytes + size > 5 * 1024 * 1024:
+                    skipped.append(str(attachment.get("filename") or path.name))
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                skipped.append(str(attachment.get("filename") or local_path))
+                continue
+            mime_type = str(attachment.get("mime_type") or mimetypes.guess_type(path.name)[0] or "image/png")
+            encoded = base64.b64encode(data).decode("ascii")
+            image_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}})
+            total_inline_bytes += size
+
+        if not image_parts:
+            return user_message
+        text = user_message
+        if skipped:
+            text = f"{text}\n\n[Some image attachments were too large or unreadable for inline vision: {', '.join(skipped[:5])}]"
+        return [{"type": "text", "text": text}, *image_parts]
 
     @staticmethod
     def _emit_progress(progress_callback: AgentProgressCallback | None, payload: dict[str, Any]) -> None:

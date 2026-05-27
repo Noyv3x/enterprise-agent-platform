@@ -19,7 +19,7 @@ from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
-from enterprise_agent_platform.service import EnterpriseService, ServiceError
+from enterprise_agent_platform.service import EnterpriseService, ServiceError, UploadedFile
 
 
 class RecordingAgent:
@@ -30,6 +30,20 @@ class RecordingAgent:
         self.calls.append(kwargs)
         return AgentResult(
             content=f"agent response to {kwargs['user_message']}",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
+class MediaReturningAgent:
+    def __init__(self, media_path: Path):
+        self.media_path = media_path
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return AgentResult(
+            content=f"created file\nMEDIA:{self.media_path}",
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
@@ -324,6 +338,67 @@ class PlatformServiceTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=1)
 
+    def test_hermes_client_sends_image_attachments_as_multimodal_content(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                requests.append(body)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({"choices": [{"message": {"content": "saw image"}}]}).encode("utf-8")
+                )
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                image_path = tmp / "image.png"
+                image_path.write_bytes(b"\x89PNG\r\n\x1a\nimage-bytes")
+                config = replace(
+                    make_config(tmp),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    hermes_api_key="test-key",
+                )
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="look at this\n\n[User attached image: image.png (image/png, 19 B); local path: /tmp/image.png]",
+                    history=[],
+                    session_id="session-1",
+                    session_key="private:1",
+                    attachments=[
+                        {
+                            "filename": "image.png",
+                            "mime_type": "image/png",
+                            "is_image": True,
+                            "local_path": str(image_path),
+                            "size_bytes": image_path.stat().st_size,
+                        }
+                    ],
+                )
+
+                self.assertEqual(result.content, "saw image")
+                content = requests[-1]["messages"][-1]["content"]
+                self.assertIsInstance(content, list)
+                self.assertEqual(content[0]["type"], "text")
+                self.assertEqual(content[1]["type"], "image_url")
+                self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_default_repo_paths_support_whole_checkout_startup(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -476,6 +551,32 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_channel_image_attachment_is_stored_and_passed_to_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+
+                result = service.send_channel_message(
+                    user,
+                    1,
+                    "@agent inspect this",
+                    [UploadedFile("diagram.png", "image/png", b"\x89PNG\r\n\x1a\nimage")],
+                )
+                self.assertEqual(result["user_message"]["attachments"][0]["filename"], "diagram.png")
+                self.assertTrue(result["user_message"]["attachments"][0]["is_image"])
+                service.wait_for_agent_idle("channel", "1")
+
+                call = agent.calls[-1]
+                self.assertEqual(len(call["attachments"]), 1)
+                self.assertTrue(Path(call["attachments"][0]["local_path"]).exists())
+                self.assertIn("[User attached image: diagram.png", call["user_message"])
+                messages = service.list_messages(user, "channel", "1")
+                self.assertEqual(messages[0]["attachments"][0]["download_url"], f"/api/attachments/{messages[0]['attachments'][0]['id']}?download=1")
+            finally:
+                service.close()
+
     def test_channel_message_returns_before_agent_finishes_and_reports_reply_target(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()
@@ -594,6 +695,51 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent.calls[-1]["session_id"], "enterprise-private-u1")
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
             service.close()
+
+    def test_private_agent_accepts_file_only_message_and_passes_file_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+
+                result = service.send_private_message(
+                    user,
+                    "",
+                    [UploadedFile("brief.txt", "text/plain", b"project brief")],
+                )
+                self.assertEqual(result["user_message"]["content"], "")
+                self.assertEqual(result["user_message"]["attachments"][0]["filename"], "brief.txt")
+                service.wait_for_agent_idle("private", str(user["id"]))
+
+                call = agent.calls[-1]
+                self.assertIn("brief.txt", call["user_message"])
+                self.assertIn("local path:", call["user_message"])
+                self.assertTrue(Path(call["attachments"][0]["local_path"]).exists())
+            finally:
+                service.close()
+
+    def test_agent_media_tags_are_saved_as_returned_attachments(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            media_path = tmp / "result.csv"
+            media_path.write_text("a,b\n1,2\n", encoding="utf-8")
+            agent = MediaReturningAgent(media_path)
+            service = EnterpriseService(make_config(tmp), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+
+                service.send_private_message(user, "make a csv")
+                service.wait_for_agent_idle("private", str(user["id"]))
+                agent_message = service.list_messages(user, "private", str(user["id"]))[-1]
+
+                self.assertEqual(agent_message["content"], "created file")
+                self.assertEqual(agent_message["attachments"][0]["filename"], "result.csv")
+                attachment, stored_path = service.get_attachment_file(user, agent_message["attachments"][0]["id"])
+                self.assertEqual(attachment["mime_type"], "text/csv")
+                self.assertEqual(stored_path.read_text(encoding="utf-8"), "a,b\n1,2\n")
+            finally:
+                service.close()
 
     def test_multiple_users_share_channel_main_agent_without_model_key_injection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1454,6 +1600,34 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIsNone(payload["agent_message"])
                 self.assertEqual(payload["agent_status"]["state"], "idle")
                 service.wait_for_agent_idle("channel", str(channels[0]["id"]))
+
+                boundary = "----enterprise-platform-test"
+                multipart = (
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="content"\r\n\r\n'
+                    "file upload\r\n"
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="files"; filename="note.txt"\r\n'
+                    "Content-Type: text/plain\r\n\r\n"
+                    "hello file\r\n"
+                    f"--{boundary}--\r\n"
+                ).encode("utf-8")
+                conn.request(
+                    "POST",
+                    f"/api/channels/{channels[0]['id']}/messages",
+                    body=multipart,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 201)
+                self.assertEqual(payload["user_message"]["attachments"][0]["filename"], "note.txt")
+
+                conn.request("GET", payload["user_message"]["attachments"][0]["url"], headers={"Cookie": cookie})
+                res = conn.getresponse()
+                attachment_body = res.read()
+                self.assertEqual(res.status, 200)
+                self.assertEqual(attachment_body, b"hello file")
 
                 conn.request("GET", "/api/mention-targets", headers={"Cookie": cookie})
                 res = conn.getresponse()

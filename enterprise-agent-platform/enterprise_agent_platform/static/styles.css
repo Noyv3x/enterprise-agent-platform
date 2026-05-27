@@ -524,6 +524,63 @@ select {
   animation: blink 1s infinite both;
 }
 
+.msg-attachments {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+}
+.msg-attachment {
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.msg-attachment--image {
+  width: min(360px, 100%);
+  display: grid;
+  gap: 5px;
+}
+.msg-attachment--image img {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.msg-attachment__caption,
+.msg-attachment__meta span {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.msg-attachment--file {
+  width: min(420px, 100%);
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.msg-attachment__fileicon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.msg-attachment__meta { min-width: 0; display: grid; gap: 1px; }
+.msg-attachment__meta strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+
 .msg__suggest { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--line); }
 .chip {
   display: inline-flex;
@@ -656,8 +713,44 @@ select {
 }
 .composer__field textarea.is-scrollable { overflow-y: auto; }
 .composer__field textarea:focus-visible { box-shadow: none; }
+.composer__file-input { display: none; }
+.composer__attach {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
 .composer__send { width: 36px; height: 36px; border-radius: var(--r-pill); padding: 0; }
 .composer__hint { display: flex; gap: 8px; align-items: center; margin-top: 9px; font-size: 11.5px; color: var(--faint); padding-left: 2px; }
+.composer-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 9px;
+}
+.composer-file {
+  max-width: 260px;
+  min-height: 32px;
+  display: inline-grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 5px 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.composer-file__icon { color: var(--accent); }
+.composer-file__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+.composer-file__size { color: var(--faint); font-size: 11px; }
+.composer-file__remove { width: 24px; height: 24px; }
 .mention-menu {
   position: absolute;
   left: 12px;

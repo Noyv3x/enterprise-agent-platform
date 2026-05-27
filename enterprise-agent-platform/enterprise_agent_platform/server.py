@@ -6,6 +6,8 @@ import re
 import signal
 import threading
 import urllib.parse
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,11 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import PlatformConfig
-from .service import EnterpriseService, ServiceError
+from .service import EnterpriseService, ServiceError, UploadedFile
 
 
 COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
+MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
@@ -76,6 +79,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/me" and method == "GET":
             self._json({"user": actor})
             return
+        m = re.fullmatch(r"/api/attachments/(\d+)", path)
+        if m and method == "GET":
+            self._serve_attachment(actor, int(m.group(1)), download=first(query, "download", "") in {"1", "true", "yes"})
+            return
         if path == "/api/mention-targets" and method == "GET":
             self._json({"targets": service.mention_targets(actor)})
             return
@@ -126,8 +133,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             })
             return
         if m and method == "POST":
-            body = self._body_json()
-            self._json(service.send_channel_message(actor, int(m.group(1)), str(body.get("content", ""))), status=201)
+            content, attachments = self._body_message()
+            self._json(service.send_channel_message(actor, int(m.group(1)), content, attachments), status=201)
             return
         m = re.fullmatch(r"/api/channels/(\d+)/typing", path)
         if m and method == "POST":
@@ -148,8 +155,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/api/private-agent/messages" and method == "POST":
-            body = self._body_json()
-            self._json(service.send_private_message(actor, str(body.get("content", ""))), status=201)
+            content, attachments = self._body_message()
+            self._json(service.send_private_message(actor, content, attachments), status=201)
             return
         if path == "/api/private-agent/agent-status" and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
@@ -312,6 +319,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(400, "JSON body must be an object")
         return data
 
+    def _body_message(self) -> tuple[str, list[UploadedFile]]:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().startswith("multipart/form-data"):
+            return self._body_multipart_message(content_type)
+        body = self._body_json()
+        return str(body.get("content", "")), []
+
+    def _body_multipart_message(self, content_type: str) -> tuple[str, list[UploadedFile]]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > MAX_UPLOAD_BODY_BYTES:
+            raise ServiceError(413, "upload body too large")
+        raw = self.rfile.read(length) if length else b""
+        parser_body = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(parser_body)
+        except Exception as exc:
+            raise ServiceError(400, "invalid multipart body") from exc
+        if not message.is_multipart():
+            raise ServiceError(400, "invalid multipart body")
+
+        content = ""
+        attachments: list[UploadedFile] = []
+        for part in message.iter_parts():
+            disposition = part.get_content_disposition()
+            if disposition not in {"form-data", "attachment", "inline"}:
+                continue
+            name = part.get_param("name", header="content-disposition")
+            filename = part.get_filename()
+            data = part.get_payload(decode=True) or b""
+            if filename is not None:
+                if filename == "" and not data:
+                    continue
+                attachments.append(UploadedFile(filename=filename or "attachment", content_type=part.get_content_type(), data=data))
+            elif name == "content":
+                charset = part.get_content_charset() or "utf-8"
+                content = data.decode(charset, errors="replace")
+        return content, attachments
+
     def _json(self, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -320,6 +365,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_attachment(self, actor: dict[str, Any], attachment_id: int, *, download: bool) -> None:
+        attachment, path = self.server.service.get_attachment_file(actor, attachment_id)
+        body = path.read_bytes()
+        filename = str(attachment.get("filename") or "attachment")
+        ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "attachment"
+        disposition = "attachment" if download else "inline"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", str(attachment.get("mime_type") or "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
         self.wfile.write(body)
 

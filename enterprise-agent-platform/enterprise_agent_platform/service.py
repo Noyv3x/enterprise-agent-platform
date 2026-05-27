@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import hashlib
+import mimetypes
 import threading
 import time
 import urllib.parse
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque
 
@@ -49,6 +52,19 @@ class ServiceError(Exception):
         self.message = message
 
 
+@dataclass(frozen=True)
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: bytes
+
+
+MAX_ATTACHMENTS_PER_MESSAGE = 10
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+MEDIA_TAG_RE = re.compile(
+    r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
+    re.IGNORECASE,
+)
 THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING_DEPTH = "medium"
 AGENT_MENTION_RE = re.compile(r"(?<![\w@])@(agent|main-agent|main_agent|main\s+agent)(?![A-Za-z0-9_-])", re.IGNORECASE)
@@ -450,6 +466,7 @@ class EnterpriseService:
         if not row:
             raise ServiceError(404, "channel message not found")
         message = self._message_from_row(row)
+        self._delete_attachment_files_for_messages([int(message_id)])
         self.db.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
         return {"deleted": 1, "message": message}
 
@@ -470,6 +487,14 @@ class EnterpriseService:
             """,
             (scope_id, before_ts),
         )
+        rows = self.db.query(
+            """
+            SELECT id FROM messages
+            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
         self.db.execute(
             """
             DELETE FROM messages
@@ -487,6 +512,11 @@ class EnterpriseService:
             "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
             (scope_id,),
         )
+        rows = self.db.query(
+            "SELECT id FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
+            (scope_id,),
+        )
+        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
         self.db.execute(
             "DELETE FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
             (scope_id,),
@@ -568,14 +598,26 @@ class EnterpriseService:
             "total": int(total or 0),
         }
 
-    def send_channel_message(self, actor: dict[str, Any], channel_id: int, content: str) -> dict[str, Any]:
+    def send_channel_message(
+        self,
+        actor: dict[str, Any],
+        channel_id: int,
+        content: str,
+        attachments: list[UploadedFile] | None = None,
+    ) -> dict[str, Any]:
         require_permission(actor, PERMISSION_CHAT)
         channel = self.get_channel(actor, channel_id)
         content = content.strip()
-        if not content:
+        uploads = self._normalize_uploaded_files(attachments)
+        if not content and not uploads:
             raise ServiceError(400, "message content is required")
         generation = self.account_generation_config(actor)
         scope_id = str(channel_id)
+        agent_content = channel_agent_request(content)
+        if agent_content is not None and uploads:
+            cleaned = AGENT_MENTION_RE.sub("", content).strip()
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            agent_content = cleaned
         user_msg = self._append_message(
             scope_type="channel",
             scope_id=scope_id,
@@ -583,15 +625,20 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={"generation": generation, "agent_mention": bool(channel_agent_request(content))},
+            metadata={
+                "generation": generation,
+                "agent_mention": agent_content is not None,
+                "attachment_count": len(uploads),
+            },
+            attachments=uploads,
         )
-        agent_content = channel_agent_request(content)
         if agent_content is None:
             return {
                 "user_message": user_msg,
                 "agent_message": None,
                 "agent_status": self.agent_status(actor, "channel", scope_id),
             }
+        agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
         status = self._enqueue_agent_reply(
             {
                 "scope_type": "channel",
@@ -599,6 +646,7 @@ class EnterpriseService:
                 "channel": channel,
                 "actor": dict(actor),
                 "content": agent_content,
+                "attachments": agent_attachments,
                 "generation": generation,
                 "user_message": user_msg,
             }
@@ -609,6 +657,8 @@ class EnterpriseService:
         scope_id = str(task["scope_id"])
         channel = task["channel"]
         content = str(task["content"])
+        attachments = list(task.get("attachments") or [])
+        prompt_content = self._agent_prompt_content(content, attachments, default="请处理这些附件。")
         generation = task["generation"]
         user_msg = task["user_message"]
         self._record_agent_activity("channel", scope_id, "preparing", "准备 Agent 请求", "整理频道上下文")
@@ -616,7 +666,7 @@ class EnterpriseService:
             self._recent_context_before(
                 "channel",
                 scope_id,
-                content,
+                prompt_content,
                 int(user_msg["id"]),
                 current_speaker=self._actor_display_name(task["actor"]),
             )
@@ -625,17 +675,22 @@ class EnterpriseService:
         self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
-            user_message=self._channel_speaker_line(task["actor"], content),
+            user_message=self._channel_speaker_line(task["actor"], prompt_content),
             history=self._agent_history_before("channel", scope_id, int(user_msg["id"])),
             session_id=f"enterprise-channel-{scope_id}-main-agent",
             session_key=f"channel:{scope_id}:main-agent",
-            metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions]},
+            metadata={
+                "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "attachments": self._attachment_metadata_for_agent(attachments),
+            },
+            attachments=attachments,
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: self._record_hermes_progress("channel", scope_id, event),
             content_callback=lambda delta: self._record_agent_content_delta("channel", scope_id, delta),
         )
+        clean_content, generated_attachments = self._extract_generated_attachments(result.content)
         self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
         metadata = {
             "session_id": result.session_id,
@@ -651,15 +706,23 @@ class EnterpriseService:
             author_type="agent",
             user_id=None,
             username="Main Agent",
-            content=result.content,
+            content=clean_content,
             metadata=metadata,
+            attachments=generated_attachments,
+            attachment_source="hermes",
         )
         return message
 
-    def send_private_message(self, actor: dict[str, Any], content: str) -> dict[str, Any]:
+    def send_private_message(
+        self,
+        actor: dict[str, Any],
+        content: str,
+        attachments: list[UploadedFile] | None = None,
+    ) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
         content = content.strip()
-        if not content:
+        uploads = self._normalize_uploaded_files(attachments)
+        if not content and not uploads:
             raise ServiceError(400, "message content is required")
         generation = self.account_generation_config(actor)
         scope_id = str(actor["id"])
@@ -670,8 +733,10 @@ class EnterpriseService:
             user_id=actor["id"],
             username=actor["display_name"],
             content=content,
-            metadata={"generation": generation},
+            metadata={"generation": generation, "attachment_count": len(uploads)},
+            attachments=uploads,
         )
+        agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
         current_container = self.containers.get_private_container(actor["id"])
         status = self._enqueue_agent_reply(
             {
@@ -679,6 +744,7 @@ class EnterpriseService:
                 "scope_id": scope_id,
                 "actor": dict(actor),
                 "content": content,
+                "attachments": agent_attachments,
                 "generation": generation,
                 "user_message": user_msg,
             }
@@ -693,6 +759,8 @@ class EnterpriseService:
     def _send_private_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         actor = task["actor"]
         content = str(task["content"])
+        attachments = list(task.get("attachments") or [])
+        prompt_content = self._agent_prompt_content(content, attachments, default="请处理这些附件。")
         generation = task["generation"]
         scope_id = str(task["scope_id"])
         user_msg = task["user_message"]
@@ -703,22 +771,28 @@ class EnterpriseService:
             secrets_env=self.model_secret_env(),
         )
         container_data = container.to_dict()
-        suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, content, int(user_msg["id"])))
+        suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
         system_prompt = self._private_system_prompt(actor, container_data, suggestions)
         self._record_agent_activity("private", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
-            user_message=content,
+            user_message=prompt_content,
             history=self._agent_history_before("private", scope_id, int(user_msg["id"])),
             session_id=container.session_id,
             session_key=f"private:{actor['id']}",
-            metadata={"knowledge_suggestions": [h.to_dict() for h in suggestions], "container": container_data},
+            metadata={
+                "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "container": container_data,
+                "attachments": self._attachment_metadata_for_agent(attachments),
+            },
+            attachments=attachments,
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
             content_callback=lambda delta: self._record_agent_content_delta("private", scope_id, delta),
         )
+        clean_content, generated_attachments = self._extract_generated_attachments(result.content)
         self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
         metadata = {
             "session_id": result.session_id,
@@ -735,8 +809,10 @@ class EnterpriseService:
             author_type="agent",
             user_id=None,
             username="Private Agent",
-            content=result.content,
+            content=clean_content,
             metadata=metadata,
+            attachments=generated_attachments,
+            attachment_source="hermes",
         )
         return message
 
@@ -1569,6 +1645,9 @@ class EnterpriseService:
         actor = task["actor"]
         message = task["user_message"]
         content = str(task.get("content") or "")
+        if not content and task.get("attachments"):
+            names = ", ".join(str(item.get("filename") or "attachment") for item in list(task.get("attachments") or [])[:3])
+            content = f"attachments: {names}" if names else "attachments"
         return {
             "message_id": int(message["id"]),
             "user_id": int(actor["id"]),
@@ -1598,7 +1677,13 @@ class EnterpriseService:
         username: str,
         content: str,
         metadata: dict[str, Any],
+        attachments: list[UploadedFile] | None = None,
+        attachment_source: str = "upload",
     ) -> dict[str, Any]:
+        attachments = list(attachments or [])
+        metadata = dict(metadata)
+        if attachments:
+            metadata["attachment_count"] = len(attachments)
         msg_id = self.db.insert(
             """
             INSERT INTO messages(scope_type, scope_id, author_type, user_id, username, content, metadata_json, created_at)
@@ -1606,11 +1691,237 @@ class EnterpriseService:
             """,
             (scope_type, str(scope_id), author_type, user_id, username, content, encode_json(metadata), now_ts()),
         )
+        if attachments:
+            self._store_attachments(
+                message_id=msg_id,
+                scope_type=scope_type,
+                scope_id=str(scope_id),
+                uploader_user_id=user_id,
+                source=attachment_source,
+                attachments=attachments,
+            )
         row = self.db.query_one("SELECT * FROM messages WHERE id = ?", (msg_id,))
         return self._message_from_row(row)
 
+    def _normalize_uploaded_files(self, attachments: list[UploadedFile] | None) -> list[UploadedFile]:
+        if not attachments:
+            return []
+        if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ServiceError(400, f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed")
+        normalized = []
+        for item in attachments:
+            data = bytes(item.data or b"")
+            if not data:
+                raise ServiceError(400, "attachment is empty")
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                raise ServiceError(413, f"attachment exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB")
+            filename = sanitize_attachment_filename(item.filename)
+            content_type = normalize_attachment_mime(filename, item.content_type)
+            normalized.append(UploadedFile(filename=filename, content_type=content_type, data=data))
+        return normalized
+
+    def _store_attachments(
+        self,
+        *,
+        message_id: int,
+        scope_type: str,
+        scope_id: str,
+        uploader_user_id: int | None,
+        source: str,
+        attachments: list[UploadedFile],
+    ) -> None:
+        root = self._attachment_root()
+        target_dir = root / scope_type / str(scope_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = now_ts()
+        for attachment in attachments:
+            digest = hashlib.sha256(attachment.data).hexdigest()
+            ext = safe_attachment_suffix(attachment.filename)
+            storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
+            target = root / storage_path
+            target.write_bytes(attachment.data)
+            try:
+                self.db.insert(
+                    """
+                    INSERT INTO attachments(
+                        message_id, scope_type, scope_id, uploader_user_id, source,
+                        filename, storage_path, mime_type, size_bytes, sha256, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        scope_type,
+                        str(scope_id),
+                        uploader_user_id,
+                        source,
+                        attachment.filename,
+                        storage_path,
+                        attachment.content_type,
+                        len(attachment.data),
+                        digest,
+                        timestamp,
+                    ),
+                )
+            except Exception:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                raise
+
+    def _attachments_for_message(self, message_id: int, *, include_local_path: bool = False) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM attachments WHERE message_id = ? ORDER BY id",
+            (int(message_id),),
+        )
+        return [self._attachment_from_row(row, include_local_path=include_local_path) for row in rows]
+
+    def _delete_attachment_files_for_messages(self, message_ids: list[int]) -> None:
+        ids = [int(message_id) for message_id in message_ids if int(message_id) > 0]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.db.query(
+            f"SELECT storage_path FROM attachments WHERE message_id IN ({placeholders})",
+            ids,
+        )
+        root = self._attachment_root().resolve()
+        for row in rows:
+            path = (root / str(row["storage_path"])).resolve()
+            if root != path and root not in path.parents:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def get_attachment_file(self, actor: dict[str, Any], attachment_id: int) -> tuple[dict[str, Any], Path]:
+        row = self.db.query_one("SELECT * FROM attachments WHERE id = ?", (int(attachment_id),))
+        if not row:
+            raise ServiceError(404, "attachment not found")
+        self._authorize_attachment(actor, row)
+        root = self._attachment_root().resolve()
+        path = (root / str(row["storage_path"])).resolve()
+        if root != path and root not in path.parents:
+            raise ServiceError(404, "attachment not found")
+        if not path.exists() or not path.is_file():
+            raise ServiceError(404, "attachment file is missing")
+        return self._attachment_from_row(row), path
+
+    def _authorize_attachment(self, actor: dict[str, Any], row: dict[str, Any]) -> None:
+        scope_type = str(row["scope_type"])
+        scope_id = str(row["scope_id"])
+        if scope_type == "channel":
+            require_permission(actor, PERMISSION_READ_WORKSPACE)
+            self.get_channel(actor, int(scope_id))
+            return
+        if scope_type == "private":
+            if scope_id == str(actor["id"]):
+                require_permission(actor, PERMISSION_PRIVATE_AGENT)
+                return
+            require_admin(actor)
+            return
+        raise ServiceError(400, "unsupported attachment scope")
+
+    def _attachment_from_row(self, row: dict[str, Any], *, include_local_path: bool = False) -> dict[str, Any]:
+        mime_type = str(row.get("mime_type") or "application/octet-stream")
+        item = {
+            "id": int(row["id"]),
+            "message_id": int(row["message_id"]),
+            "scope_type": row["scope_type"],
+            "scope_id": row["scope_id"],
+            "source": row["source"],
+            "filename": row["filename"],
+            "mime_type": mime_type,
+            "size_bytes": int(row["size_bytes"] or 0),
+            "sha256": row["sha256"],
+            "created_at": row["created_at"],
+            "is_image": mime_type.startswith("image/"),
+            "url": f"/api/attachments/{int(row['id'])}",
+            "download_url": f"/api/attachments/{int(row['id'])}?download=1",
+        }
+        if include_local_path:
+            item["local_path"] = str(self._attachment_root() / str(row["storage_path"]))
+        return item
+
+    def _attachment_root(self) -> Path:
+        root = self.config.data_dir / "attachments"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _agent_prompt_content(
+        self,
+        content: str,
+        attachments: list[dict[str, Any]],
+        *,
+        default: str,
+    ) -> str:
+        text = str(content or "").strip() or default
+        lines = self._attachment_context_lines(attachments, include_local_paths=True)
+        if lines:
+            return f"{text}\n\n" + "\n".join(lines)
+        return text
+
+    def _attachment_context_lines(
+        self,
+        attachments: list[dict[str, Any]],
+        *,
+        include_local_paths: bool = False,
+    ) -> list[str]:
+        lines = []
+        for attachment in attachments:
+            kind = "image" if attachment.get("is_image") else "file"
+            filename = str(attachment.get("filename") or "attachment")
+            mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+            size = format_bytes(int(attachment.get("size_bytes") or 0))
+            line = f"[User attached {kind}: {filename} ({mime_type}, {size})"
+            local_path = str(attachment.get("local_path") or "").strip()
+            if include_local_paths and local_path:
+                line += f"; local path: {local_path}"
+            line += "]"
+            lines.append(line)
+        return lines
+
     @staticmethod
-    def _message_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    def _attachment_metadata_for_agent(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        keys = ("id", "filename", "mime_type", "size_bytes", "sha256", "is_image", "local_path")
+        return [{key: item[key] for key in keys if key in item} for item in attachments]
+
+    def _extract_generated_attachments(self, content: str) -> tuple[str, list[UploadedFile]]:
+        content = str(content or "")
+        attachments: list[UploadedFile] = []
+        missing: list[str] = []
+        for match in MEDIA_TAG_RE.finditer(content):
+            raw_path = clean_media_path(match.group("path"))
+            if not raw_path:
+                continue
+            path = Path(os.path.expanduser(raw_path))
+            if not path.exists() or not path.is_file():
+                missing.append(raw_path)
+                continue
+            try:
+                data = path.read_bytes()
+                attachments.extend(
+                    self._normalize_uploaded_files(
+                        [UploadedFile(path.name, normalize_attachment_mime(path.name, ""), data)]
+                    )
+                )
+            except Exception:
+                missing.append(raw_path)
+
+        if not attachments and not missing:
+            return content, []
+
+        cleaned = MEDIA_TAG_RE.sub("", content)
+        cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        if missing:
+            note = "Hermes returned file path(s) that the platform could not read: " + ", ".join(missing[:5])
+            cleaned = f"{cleaned}\n\n{note}".strip()
+        return cleaned, attachments
+
+    def _message_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": int(row["id"]),
             "scope_type": row["scope_type"],
@@ -1620,6 +1931,7 @@ class EnterpriseService:
             "username": row["username"],
             "content": row["content"],
             "metadata": decode_json(row["metadata_json"]),
+            "attachments": self._attachments_for_message(int(row["id"])),
             "created_at": row["created_at"],
         }
 
@@ -1686,10 +1998,21 @@ class EnterpriseService:
 
     @staticmethod
     def _history_message_content(message: dict[str, Any]) -> str:
+        content = str(message.get("content") or "")
+        attachments = message.get("attachments") or []
+        if attachments:
+            lines = []
+            for attachment in attachments:
+                kind = "image" if attachment.get("is_image") else "file"
+                lines.append(
+                    f"[Attached {kind}: {attachment.get('filename')} "
+                    f"({attachment.get('mime_type')}, {format_bytes(int(attachment.get('size_bytes') or 0))})]"
+                )
+            content = f"{content}\n" + "\n".join(lines) if content else "\n".join(lines)
         if message.get("scope_type") != "channel":
-            return str(message.get("content") or "")
+            return content
         speaker = str(message.get("username") or ("Agent" if message.get("author_type") == "agent" else "User"))
-        return f"{speaker}: {message.get('content') or ''}"
+        return f"{speaker}: {content}"
 
     def _channel_system_prompt(self, channel: dict[str, Any], suggestions) -> str:
         passive = format_passive_suggestions(suggestions)
@@ -1792,6 +2115,52 @@ def normalize_channel_name(value: str) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,48}", clean):
         raise ServiceError(400, "invalid channel name")
     return clean
+
+
+def sanitize_attachment_filename(value: str) -> str:
+    clean = Path(str(value or "attachment")).name.strip()
+    clean = re.sub(r"[\r\n\x00/\\]+", "_", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" .")
+    if not clean:
+        clean = "attachment"
+    if len(clean) > 180:
+        suffix = Path(clean).suffix[:32]
+        stem = clean[: max(1, 180 - len(suffix))]
+        clean = f"{stem}{suffix}"
+    return clean
+
+
+def normalize_attachment_mime(filename: str, value: str) -> str:
+    clean = str(value or "").split(";", 1)[0].strip().lower()
+    if not clean or "/" not in clean or re.search(r"[\r\n\x00]", clean):
+        clean = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return clean[:120]
+
+
+def safe_attachment_suffix(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if not suffix or len(suffix) > 24 or not re.fullmatch(r"\.[a-z0-9][a-z0-9._-]{0,22}", suffix):
+        return ""
+    return suffix
+
+
+def clean_media_path(value: str) -> str:
+    path = str(value or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+        path = path[1:-1].strip()
+    return path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+
+
+def format_bytes(value: int) -> str:
+    size = max(0, int(value or 0))
+    units = ("B", "KB", "MB", "GB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
 
 
 def channel_agent_request(content: str) -> str | None:

@@ -14,6 +14,7 @@ const state = {
   privateMessages: [],
   pendingMessages: [],
   drafts: {},
+  draftFiles: {},
   agentStatuses: { channels: {}, private: null },
   expandedAgentRuns: {},
   mentionTargets: [],
@@ -54,15 +55,18 @@ const toastStack = document.getElementById("toast-stack");
 let pollTimer = null;
 let pollInFlight = false;
 let localMessageSeq = 0;
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const typingState = { key: null, active: false, lastSent: 0, stopTimer: null };
 const composerState = { composing: false, renderDeferred: false };
 const mentionState = { active: false, selected: 0, options: [], range: null, menu: null };
 
 /* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
+  const isForm = options.body instanceof FormData;
   const res = await fetch(path, {
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: isForm ? (options.headers || {}) : { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
   const text = await res.text();
@@ -106,6 +110,7 @@ const ICONS = {
   refresh: [["path", { d: "M21 2v6h-6" }], ["path", { d: "M3 12a9 9 0 0 1 15-6.7L21 8" }], ["path", { d: "M3 22v-6h6" }], ["path", { d: "M21 12a9 9 0 0 1-15 6.7L3 16" }]],
   download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "M7 10l5 5 5-5" }], ["line", { x1: 12, y1: 15, x2: 12, y2: 3 }]],
   upload: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "M17 8l-5-5-5 5" }], ["line", { x1: 12, y1: 3, x2: 12, y2: 15 }]],
+  paperclip: [["path", { d: "M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7L9.2 18.2a2 2 0 0 1-2.8-2.8l9.2-9.2" }]],
   close: [["line", { x1: 18, y1: 6, x2: 6, y2: 18 }], ["line", { x1: 6, y1: 6, x2: 18, y2: 18 }]],
   menu: [["line", { x1: 3, y1: 6, x2: 21, y2: 6 }], ["line", { x1: 3, y1: 12, x2: 21, y2: 12 }], ["line", { x1: 3, y1: 18, x2: 21, y2: 18 }]],
   external: [["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }], ["path", { d: "M15 3h6v6" }], ["line", { x1: 10, y1: 14, x2: 21, y2: 3 }]],
@@ -114,6 +119,7 @@ const ICONS = {
   server: [["rect", { x: 3, y: 4, width: 18, height: 7, rx: 1.6 }], ["rect", { x: 3, y: 13, width: 18, height: 7, rx: 1.6 }], ["line", { x1: 7, y1: 7.5, x2: 7.01, y2: 7.5 }], ["line", { x1: 7, y1: 16.5, x2: 7.01, y2: 16.5 }]],
   shield: [["path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" }], ["path", { d: "M9 12l2 2 4-4" }]],
   doc: [["path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }], ["path", { d: "M14 2v6h6" }], ["line", { x1: 8, y1: 13, x2: 16, y2: 13 }], ["line", { x1: 8, y1: 17, x2: 13, y2: 17 }]],
+  image: [["rect", { x: 3, y: 5, width: 18, height: 14, rx: 2 }], ["circle", { cx: 8.5, cy: 10, r: 1.5 }], ["path", { d: "M21 15l-4.5-4.5L7 19" }]],
   message: [["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }]],
   trash: [["path", { d: "M3 6h18" }], ["path", { d: "M8 6V4h8v2" }], ["path", { d: "M19 6l-1 15H6L5 6" }], ["path", { d: "M10 11v6" }], ["path", { d: "M14 11v6" }]],
   link: [["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }], ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }]],
@@ -469,7 +475,35 @@ function renderChat(mode) {
   const canChat = hasPermission("chat") && (mode !== "private" || hasPermission("private_agent"));
   const scopeId = scopeIdFor(mode);
   const draftKey = composerDraftKey(mode, scopeId);
+  const selectedFiles = state.draftFiles[draftKey] || [];
   const mentionMenu = h("div", { class: "mention-menu", role: "listbox", hidden: true });
+  const fileInput = h("input", {
+    class: "composer__file-input",
+    type: "file",
+    multiple: true,
+    tabindex: "-1",
+    onchange: (event) => {
+      const incoming = Array.from(event.target.files || []);
+      event.target.value = "";
+      if (!incoming.length) return;
+      const current = state.draftFiles[draftKey] || [];
+      const accepted = [];
+      for (const file of incoming) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          toast(`${file.name} 超过 50 MB`, { title: "文件过大" });
+          continue;
+        }
+        accepted.push(file);
+      }
+      const next = [...current, ...accepted].slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+      if (current.length + accepted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        toast(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`, { title: "附件过多" });
+      }
+      state.draftFiles[draftKey] = next;
+      state._focusComposer = true;
+      render();
+    },
+  });
 
   const input = h("textarea", {
     rows: 1,
@@ -517,14 +551,17 @@ function renderChat(mode) {
   const submit = async () => {
     if (composerState.composing) return;
     const content = (state.drafts[draftKey] || input.value).trim();
-    if (!content || noChannel || !canChat) return;
+    const files = state.draftFiles[draftKey] || [];
+    if ((!content && !files.length) || noChannel || !canChat) return;
     input.value = "";
     state.drafts[draftKey] = "";
+    delete state.draftFiles[draftKey];
     autoGrow(input);
     state._focusComposer = true;
     state._scrollChatToBottom = true;
     notifyTyping(mode, scopeId, false);
-    await postChatMessage(mode, scopeId, content);
+    const sent = await postChatMessage(mode, scopeId, content, files);
+    if (!sent) state.draftFiles[draftKey] = files;
   };
 
   let body;
@@ -551,12 +588,22 @@ function renderChat(mode) {
     h("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); submit(); } }, [
       h("div", { class: "composer__wrap" }, [
         h("div", { class: "composer__field" }, [
+          fileInput,
+          h("button", {
+            class: "icon-btn composer__attach",
+            type: "button",
+            title: "添加文件",
+            "aria-label": "添加文件",
+            disabled: noChannel || !canChat,
+            onclick: () => fileInput.click(),
+          }, [icon("paperclip", { size: 18 })]),
           input,
           mentionMenu,
           h("button", { class: "btn btn--primary composer__send", type: "submit", title: "发送 (Enter)", "aria-label": "发送", disabled: noChannel || !canChat }, [
             icon("send", { size: 18 }),
           ]),
         ]),
+        selectedFiles.length ? renderComposerFiles(draftKey, selectedFiles) : null,
         h("div", { class: "composer__hint" }, [
           h("span", { class: "kbd", text: "Enter" }), h("span", { text: "发送" }),
           h("span", { class: "kbd", text: "Shift+Enter" }), h("span", { text: "换行" }),
@@ -571,6 +618,7 @@ function renderMessage(message) {
   const suggestions = message.metadata?.knowledge_suggestions || [];
   const agentWork = message.metadata?.agent_work || null;
   const streaming = !!message.metadata?.streaming;
+  const attachments = message.attachments || [];
   const avatar = isUser
     ? h("div", { class: "msg__avatar", text: initials(message.username || "你") })
     : h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]);
@@ -584,7 +632,8 @@ function renderMessage(message) {
         streaming ? h("span", { class: "msg__pending", text: "生成中" }) : null,
         h("span", { class: "msg__time", text: formatTime(message.created_at) }),
       ]),
-      h("div", { class: "msg__body", text: message.content }),
+      message.content ? h("div", { class: "msg__body", text: message.content }) : null,
+      attachments.length ? renderMessageAttachments(attachments) : null,
       suggestions.length
         ? h("div", { class: "msg__suggest" }, suggestions.map((s) =>
             h("span", { class: "chip" }, [h("span", { class: "chip__id", text: `kb:${s.id}` }), h("span", { text: s.title })])))
@@ -592,6 +641,39 @@ function renderMessage(message) {
       agentWork ? renderAgentWorkCard(agentWork, { active: false }) : null,
     ]),
   ]);
+}
+
+function renderMessageAttachments(attachments) {
+  return h("div", { class: "msg-attachments" }, attachments.map((attachment) => {
+    const name = attachment.filename || "attachment";
+    const size = formatFileSize(attachment.size_bytes || 0);
+    if (attachment.is_image) {
+      return h("a", {
+        class: "msg-attachment msg-attachment--image",
+        href: attachment.download_url || attachment.url,
+        target: "_blank",
+        rel: "noreferrer",
+        title: name,
+      }, [
+        h("img", { src: attachment.url, alt: name, loading: "lazy" }),
+        h("span", { class: "msg-attachment__caption", text: `${name} · ${size}` }),
+      ]);
+    }
+    return h("a", {
+      class: "msg-attachment msg-attachment--file",
+      href: attachment.download_url || attachment.url,
+      target: "_blank",
+      rel: "noreferrer",
+      title: name,
+    }, [
+      h("span", { class: "msg-attachment__fileicon" }, [icon("doc", { size: 18 })]),
+      h("span", { class: "msg-attachment__meta" }, [
+        h("strong", { text: name }),
+        h("span", { text: `${attachment.mime_type || "file"} · ${size}` }),
+      ]),
+      icon("download", { size: 16 }),
+    ]);
+  }));
 }
 
 function renderAgentActivity(status) {
@@ -832,6 +914,30 @@ function autoGrow(el, { animate = true } = {}) {
   el.style.height = previousHeight + "px";
   void el.offsetHeight;
   el.style.height = nextHeight + "px";
+}
+
+function renderComposerFiles(draftKey, files) {
+  return h("div", { class: "composer-files" }, files.map((file, index) =>
+    h("div", { class: "composer-file" }, [
+      h("span", { class: "composer-file__icon" }, [icon(file.type?.startsWith("image/") ? "image" : "doc", { size: 15 })]),
+      h("span", { class: "composer-file__name", text: file.name || "attachment" }),
+      h("span", { class: "composer-file__size", text: formatFileSize(file.size || 0) }),
+      h("button", {
+        class: "icon-btn composer-file__remove",
+        type: "button",
+        title: "移除",
+        "aria-label": "移除附件",
+        onclick: () => {
+          const next = [...(state.draftFiles[draftKey] || [])];
+          next.splice(index, 1);
+          if (next.length) state.draftFiles[draftKey] = next;
+          else delete state.draftFiles[draftKey];
+          state._focusComposer = true;
+          render();
+        },
+      }, [icon("close", { size: 14 })]),
+    ])
+  ));
 }
 
 /* ------------------------------------------------------------ knowledge */
@@ -1262,6 +1368,7 @@ function renderAuditMessageRow(message, { deletable = false, onDelete = null } =
       h("span", { text: formatTimestamp(message.created_at) }),
     ]),
     h("div", { class: "audit-message__body", text: message.content }),
+    message.attachments?.length ? renderMessageAttachments(message.attachments) : null,
     deletable ? h("div", { class: "audit-message__actions" }, [
       h("button", {
         class: "icon-btn",
@@ -1734,6 +1841,17 @@ function formatTimestamp(value) {
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
 }
+function formatFileSize(value) {
+  let size = Math.max(0, Number(value) || 0);
+  const units = ["B", "KB", "MB", "GB"];
+  for (const unit of units) {
+    if (size < 1024 || unit === units[units.length - 1]) {
+      return unit === "B" ? `${Math.round(size)} ${unit}` : `${size.toFixed(1)} ${unit}`;
+    }
+    size /= 1024;
+  }
+  return "0 B";
+}
 function activeChannel() { return state.channels.find((c) => c.id === state.activeChannelId); }
 function scopeTypeFor(mode) { return mode === "private" ? "private" : "channel"; }
 function scopeIdFor(mode, channelId = state.activeChannelId) {
@@ -1767,6 +1885,13 @@ function messageFingerprint(message) {
     user_id: message.user_id,
     username: message.username,
     content: message.content,
+    attachments: (message.attachments || []).map((item) => ({
+      id: item.id,
+      filename: item.filename,
+      mime_type: item.mime_type,
+      size_bytes: item.size_bytes,
+      url: item.url,
+    })),
     created_at: message.created_at,
     pending: !!message.metadata?.local_pending,
     agent_work: work
@@ -1817,15 +1942,39 @@ function mergePendingMessages(mode, scopeId, messages) {
   const pending = state.pendingMessages.filter((message) => message.scope_type === scopeTypeFor(mode) && message.scope_id === String(scopeId));
   return [...messages, ...pending];
 }
-function appendOptimisticMessage(mode, scopeId, content) {
+function optimisticAttachments(files) {
+  return (files || []).map((file, index) => {
+    const url = URL.createObjectURL(file);
+    return {
+      id: `tmp-att-${localMessageSeq}-${index}`,
+      filename: file.name || "attachment",
+      mime_type: file.type || "application/octet-stream",
+      size_bytes: file.size || 0,
+      is_image: (file.type || "").startsWith("image/"),
+      url,
+      download_url: url,
+      local_preview: true,
+    };
+  });
+}
+function revokeAttachmentUrls(message) {
+  for (const attachment of message?.attachments || []) {
+    if (attachment.local_preview && attachment.url) {
+      try { URL.revokeObjectURL(attachment.url); } catch (_) {}
+    }
+  }
+}
+function appendOptimisticMessage(mode, scopeId, content, files = []) {
+  localMessageSeq += 1;
   const message = {
-    id: `tmp-${++localMessageSeq}`,
+    id: `tmp-${localMessageSeq}`,
     scope_type: scopeTypeFor(mode),
     scope_id: String(scopeId),
     author_type: "user",
     user_id: state.user?.id || null,
     username: state.user?.display_name || state.user?.username || "你",
     content,
+    attachments: optimisticAttachments(files),
     metadata: { local_pending: true },
     created_at: Math.floor(Date.now() / 1000),
   };
@@ -1838,8 +1987,12 @@ function removeLocalMessage(list, id) {
   return list.filter((message) => message.id !== id);
 }
 function replaceOptimisticMessage(mode, scopeId, tempId, savedMessage) {
+  const pending = state.pendingMessages.find((message) => message.id === tempId);
+  revokeAttachmentUrls(pending);
   state.pendingMessages = removeLocalMessage(state.pendingMessages, tempId);
   const apply = (messages) => {
+    const old = messages.find((message) => message.id === tempId);
+    revokeAttachmentUrls(old);
     let next = removeLocalMessage(messages, tempId);
     if (savedMessage && !next.some((message) => message.id === savedMessage.id)) next = [...next, savedMessage];
     return next;
@@ -1848,25 +2001,38 @@ function replaceOptimisticMessage(mode, scopeId, tempId, savedMessage) {
   else if (String(state.activeChannelId) === String(scopeId)) state.messages = apply(state.messages);
 }
 function removeOptimisticMessage(mode, scopeId, tempId) {
+  const pending = state.pendingMessages.find((message) => message.id === tempId);
+  revokeAttachmentUrls(pending);
   state.pendingMessages = removeLocalMessage(state.pendingMessages, tempId);
   if (mode === "private") state.privateMessages = removeLocalMessage(state.privateMessages, tempId);
   else if (String(state.activeChannelId) === String(scopeId)) state.messages = removeLocalMessage(state.messages, tempId);
 }
-async function postChatMessage(mode, scopeId, content) {
-  const pending = appendOptimisticMessage(mode, scopeId, content);
+async function postChatMessage(mode, scopeId, content, files = []) {
+  const pending = appendOptimisticMessage(mode, scopeId, content, files);
   render();
   try {
+    let request;
+    if (files.length) {
+      const form = new FormData();
+      form.append("content", content);
+      for (const file of files) form.append("files", file, file.name);
+      request = { method: "POST", body: form };
+    } else {
+      request = { method: "POST", body: JSON.stringify({ content }) };
+    }
     const result = mode === "private"
-      ? await api("/api/private-agent/messages", { method: "POST", body: JSON.stringify({ content }) })
-      : await api(`/api/channels/${scopeId}/messages`, { method: "POST", body: JSON.stringify({ content }) });
+      ? await api("/api/private-agent/messages", request)
+      : await api(`/api/channels/${scopeId}/messages`, request);
     replaceOptimisticMessage(mode, scopeId, pending.id, result.user_message);
     setAgentStatus(mode, scopeId, result.agent_status);
     await refreshActiveChat({ renderAfter: false });
+    return true;
   } catch (error) {
     removeOptimisticMessage(mode, scopeId, pending.id);
     const message = error.message || String(error);
     state.error = message;
     toast(message, { type: "error", title: "发送失败" });
+    return false;
   } finally {
     state._focusComposer = true;
     render();
@@ -2148,9 +2314,11 @@ function updateOAuthState(providerId, result) {
 async function logout() {
   await api("/api/auth/logout", { method: "POST" }).catch(() => {});
   stopPolling();
+  for (const message of state.pendingMessages) revokeAttachmentUrls(message);
   state.user = null;
   state.sidebarOpen = false;
   state.pendingMessages = [];
+  state.draftFiles = {};
   state.mentionTargets = [];
   state.typingUsers = [];
   state.messageAudit = {

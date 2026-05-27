@@ -69,6 +69,23 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope_type, scope_id, id);
 
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    uploader_user_id INTEGER REFERENCES users(id),
+                    source TEXT NOT NULL DEFAULT 'upload' CHECK(source IN ('upload', 'hermes')),
+                    filename TEXT NOT NULL,
+                    storage_path TEXT NOT NULL UNIQUE,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id, id);
+                CREATE INDEX IF NOT EXISTS idx_attachments_scope ON attachments(scope_type, scope_id, id);
+
                 CREATE TABLE IF NOT EXISTS private_agents (
                     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     session_id TEXT NOT NULL,
