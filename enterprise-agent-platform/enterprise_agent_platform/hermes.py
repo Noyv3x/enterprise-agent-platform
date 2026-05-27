@@ -147,14 +147,10 @@ class HermesAgentClient:
 
     @staticmethod
     def _result_from_completion(raw: dict[str, Any], response_session: str) -> AgentResult:
-        choices = raw.get("choices") or []
-        content = ""
-        if choices:
-            message = choices[0].get("message") or {}
-            content = str(message.get("content") or "")
+        content = text_from_response_payload(raw)
         if not content:
-            content = str(raw.get("final_response") or "")
-        return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
+            raise ValueError("Hermes returned an empty response")
+        return AgentResult(content=content, session_id=response_session, raw=raw)
 
     @staticmethod
     def _content_with_images(user_message: str, attachments: list[dict[str, Any]]) -> Any:
@@ -238,23 +234,8 @@ class HermesAgentClient:
             payload = json.loads(data)
             remember(event, payload)
             if isinstance(payload, dict):
-                choices = payload.get("choices") or []
-                if choices:
-                    choice = choices[0] or {}
-                    delta = choice.get("delta") or {}
-                    chunk = delta.get("content")
-                    if chunk is not None:
-                        text = str(chunk)
-                        content_parts.append(text)
-                        emit_content(content_callback, text)
-                    message = choice.get("message") or {}
-                    message_content = message.get("content")
-                    if message_content is not None:
-                        text = str(message_content)
-                        content_parts.append(text)
-                        emit_content(content_callback, text)
-                elif payload.get("final_response"):
-                    text = str(payload.get("final_response") or "")
+                text = text_from_stream_payload(payload, already_streaming=bool(content_parts))
+                if text:
                     content_parts.append(text)
                     emit_content(content_callback, text)
             return False
@@ -285,7 +266,9 @@ class HermesAgentClient:
             "events": raw_events,
         }
         content = "".join(content_parts)
-        return AgentResult(content=content or "(agent returned an empty response)", session_id=response_session, raw=raw)
+        if not content:
+            raise ValueError(f"Hermes returned an empty streaming response after {event_count} events")
+        return AgentResult(content=content, session_id=response_session, raw=raw)
 
     def _runtime_config(self) -> dict[str, Any]:
         if self.runtime_config_provider is None:
@@ -364,3 +347,75 @@ class AutoAgentClient:
                 raw={"mode": "auto-fallback", "error": str(exc)},
                 degraded=True,
             )
+
+
+def text_from_response_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices") or []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        text = text_from_content(message.get("content"))
+        if text:
+            return text
+        text = text_from_content(choice.get("text"))
+        if text:
+            return text
+    for key in ("final_response", "output_text", "text", "content"):
+        text = text_from_content(payload.get(key))
+        if text:
+            return text
+    output = payload.get("output")
+    if isinstance(output, list):
+        text = "".join(text_from_content(item) for item in output).strip()
+        if text:
+            return text
+    response = payload.get("response")
+    if isinstance(response, dict):
+        return text_from_response_payload(response)
+    return ""
+
+
+def text_from_stream_payload(payload: dict[str, Any], *, already_streaming: bool) -> str:
+    event_type = str(payload.get("type") or "")
+    if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+        return text_from_content(payload.get("delta"))
+    if event_type in {"response.content_part.done", "response.output_item.done"}:
+        return "" if already_streaming else text_from_content(payload.get("part") or payload.get("item"))
+    if event_type in {"response.completed", "response.done"}:
+        return "" if already_streaming else text_from_response_payload(payload.get("response"))
+
+    choices = payload.get("choices") or []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        text = text_from_content(delta.get("content"))
+        if text:
+            return text
+        message = choice.get("message") or {}
+        text = text_from_content(message.get("content"))
+        if text:
+            return text
+    if already_streaming:
+        return ""
+    return text_from_response_payload(payload)
+
+
+def text_from_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(text_from_content(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("text", "output_text", "content", "final_response"):
+            text = text_from_content(value.get(key))
+            if text:
+                return text
+        if value.get("type") in {"output_text", "text"}:
+            return text_from_content(value.get("value"))
+    return ""

@@ -345,6 +345,94 @@ class PlatformServiceTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=1)
 
+    def test_hermes_client_streams_responses_api_output_text_events(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                events = [
+                    f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': '看到了'})}\n\n",
+                    f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': '图片。'})}\n\n",
+                    "data: [DONE]\n\n",
+                ]
+                for event in events:
+                    self.wfile.write(event.encode("utf-8"))
+                    self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                )
+                chunks = []
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="question",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                    content_callback=chunks.append,
+                )
+
+                self.assertEqual(result.content, "看到了图片。")
+                self.assertEqual(chunks, ["看到了", "图片。"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_auto_agent_falls_back_instead_of_saving_empty_hermes_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                service = EnterpriseService(
+                    replace(
+                        make_config(Path(td)),
+                        agent_mode="auto",
+                        hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    )
+                )
+                try:
+                    _, user = service.authenticate("admin", "admin")
+                    service.send_channel_message(user, 1, "@agent hello")
+                    service.wait_for_agent_idle("channel", "1")
+                    messages = service.list_messages(user, "channel", "1")
+
+                    self.assertNotIn("(agent returned an empty response)", messages[-1]["content"])
+                    self.assertIn("Hermes API is not reachable", messages[-1]["content"])
+                    self.assertTrue(messages[-1]["metadata"]["degraded"])
+                finally:
+                    service.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_hermes_client_sends_image_attachments_as_multimodal_content(self):
         requests = []
 
