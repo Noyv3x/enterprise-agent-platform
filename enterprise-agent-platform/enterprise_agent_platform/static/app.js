@@ -37,6 +37,7 @@ const state = {
   error: "",
   _lastView: null,
   _focusComposer: false,
+  _scrollChatToBottom: false,
 };
 
 const app = document.getElementById("app");
@@ -194,8 +195,9 @@ function render() {
     composerState.renderDeferred = true;
     return;
   }
+  const messageScroll = captureMessageScroll();
   app.replaceChildren(state.user ? renderShell() : renderLogin());
-  requestAnimationFrame(afterRender);
+  requestAnimationFrame(() => afterRender(messageScroll));
 }
 function shouldDeferComposerRender() {
   return composerState.composing && document.activeElement?.matches?.(".composer textarea");
@@ -206,15 +208,34 @@ function flushDeferredRender() {
   state._focusComposer = true;
   render();
 }
-function afterRender() {
+function afterRender(messageScroll) {
   const msgs = app.querySelector(".messages");
-  if (msgs) msgs.scrollTop = msgs.scrollHeight;
+  if (msgs) restoreMessageScroll(msgs, messageScroll);
+  state._scrollChatToBottom = false;
   const ta = app.querySelector(".composer textarea");
   if (ta) autoGrow(ta, { animate: false });
   if (state._focusComposer) {
     if (ta) { ta.focus(); autoGrow(ta); }
     state._focusComposer = false;
   }
+}
+function captureMessageScroll() {
+  const msgs = app.querySelector(".messages");
+  if (!msgs) return null;
+  return {
+    key: msgs.dataset.chatKey || "",
+    top: msgs.scrollTop,
+    bottom: Math.max(0, msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight),
+  };
+}
+function restoreMessageScroll(msgs, previous) {
+  const sameChat = previous && previous.key === (msgs.dataset.chatKey || "");
+  if (state._scrollChatToBottom || !sameChat || previous.bottom < 32) {
+    msgs.scrollTop = msgs.scrollHeight;
+    return;
+  }
+  const maxTop = Math.max(0, msgs.scrollHeight - msgs.clientHeight);
+  msgs.scrollTop = Math.min(previous.top, maxTop);
 }
 
 /* ----------------------------------------------------------- shared UI */
@@ -489,6 +510,7 @@ function renderChat(mode) {
     state.drafts[draftKey] = "";
     autoGrow(input);
     state._focusComposer = true;
+    state._scrollChatToBottom = true;
     notifyTyping(mode, scopeId, false);
     await postChatMessage(mode, scopeId, content);
   };
@@ -513,7 +535,7 @@ function renderChat(mode) {
   }
 
   return h("div", { class: "chat" }, [
-    h("div", { class: "messages" }, [body]),
+    h("div", { class: "messages", "data-chat-key": `${scopeTypeFor(mode)}:${scopeId}` }, [body]),
     h("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); submit(); } }, [
       h("div", { class: "composer__wrap" }, [
         h("div", { class: "composer__field" }, [
