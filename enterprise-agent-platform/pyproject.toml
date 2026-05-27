@@ -19,5 +19,5 @@ enterprise-agent-platform = "enterprise_agent_platform.__main__:main"
 packages = ["enterprise_agent_platform", "hermes_plugin", "hermes_plugin.enterprise_kb"]
 
 [tool.setuptools.package-data]
-enterprise_agent_platform = ["static/*"]
+enterprise_agent_platform = ["static/*", "hermes_runtime_patch/*.py"]
 "hermes_plugin.enterprise_kb" = ["plugin.yaml"]

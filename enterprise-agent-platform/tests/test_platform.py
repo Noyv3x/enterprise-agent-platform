@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import importlib.util
 import json
 import os
 import sqlite3
@@ -14,7 +15,9 @@ import urllib.parse
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
+from enterprise_agent_platform import runtimes as runtime_module
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
@@ -170,6 +173,49 @@ class RecordingCommandRunner:
         return subprocess.CompletedProcess(cmd, 0)
 
 
+class FakeResponsesStream:
+    def __init__(self, events):
+        self.events = events
+        self.kwargs = None
+        self.closed = False
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return self
+
+    def __iter__(self):
+        return iter(self.events)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeCodexClient:
+    def __init__(self, events):
+        self.responses = FakeResponsesStream(events)
+
+
+class FakeCodexAgent:
+    _interrupt_requested = False
+
+    def __init__(self):
+        self.activity = []
+        self.deltas = []
+        self.reasoning = []
+
+    def _get_transport(self):
+        return SimpleNamespace(preflight_kwargs=lambda kwargs, allow_stream=False: kwargs)
+
+    def _touch_activity(self, message):
+        self.activity.append(message)
+
+    def _fire_stream_delta(self, delta):
+        self.deltas.append(delta)
+
+    def _fire_reasoning_delta(self, delta):
+        self.reasoning.append(delta)
+
+
 class FakeOAuthHTTPClient:
     def __init__(self):
         self.calls = []
@@ -276,6 +322,38 @@ def managed_python(home: Path) -> Path:
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_hermes_runtime_patch_backfills_codex_stream_output_null(self):
+        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
+        spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_test", patch_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        terminal = SimpleNamespace(status="completed", output=None)
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="O"),
+            SimpleNamespace(type="response.output_text.delta", delta="K"),
+            SimpleNamespace(type="response.completed", response=terminal),
+        ]
+        client = FakeCodexClient(events)
+        agent = FakeCodexAgent()
+        first_delta = []
+
+        result = module._run_raw_responses_stream(
+            agent,
+            {"model": "gpt-5.3-codex", "input": []},
+            client=client,
+            on_first_delta=lambda: first_delta.append(True),
+        )
+
+        self.assertEqual(agent.deltas, ["O", "K"])
+        self.assertEqual(first_delta, [True])
+        self.assertTrue(client.responses.closed)
+        self.assertEqual(client.responses.kwargs["stream"], True)
+        self.assertEqual(len(result.output), 1)
+        self.assertEqual(result.output[0].content[0].text, "OK")
+
     def test_hermes_client_streams_tool_progress_events(self):
         requests = []
 
@@ -1164,6 +1242,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(launch["env"]["ENTERPRISE_AGENT_TOOL_TOKEN"], "agent-token")
                 self.assertEqual(launch["env"]["CAMOFOX_URL"], config.camofox_url)
                 self.assertEqual(launch["env"]["FIRECRAWL_API_URL"], config.firecrawl_api_url)
+                python_path = launch["env"]["PYTHONPATH"].split(os.pathsep)
+                patch_path = str(Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch")
+                self.assertEqual(python_path[0], patch_path)
+                self.assertEqual(python_path[1], str(tmp / "hermes-agent"))
                 self.assertTrue(agent_message["metadata"]["degraded"])
                 self.assertIn("Hermes API is not reachable", agent_message["content"])
             finally:

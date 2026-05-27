@@ -1049,10 +1049,16 @@ class PlatformRuntimeManager:
         env.update(self._hermes_child_values())
         env["HERMES_HOME"] = str(self.config.managed_hermes_home)
         repo = self._effective_hermes_repo()
+        patch_path = Path(__file__).resolve().parent / "hermes_runtime_patch"
+        python_path_parts = [str(patch_path)]
         if repo.exists():
             current = env.get("PYTHONPATH", "")
-            parts = [str(repo)] + ([current] if current else [])
-            env["PYTHONPATH"] = os.pathsep.join(parts)
+            python_path_parts.append(str(repo))
+            if current:
+                python_path_parts.append(current)
+        elif env.get("PYTHONPATH"):
+            python_path_parts.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
         provider = self._effective_hermes_provider()
         provider_base_url = self._effective_hermes_provider_base_url(provider)
         env["HERMES_INFERENCE_PROVIDER"] = provider
