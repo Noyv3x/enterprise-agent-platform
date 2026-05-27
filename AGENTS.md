@@ -9,6 +9,7 @@ This workspace ties together an enterprise platform and three upstream codebases
 - `cognee/`: Git submodule for the optional knowledge graph backend. Follow `cognee/AGENTS.md` when editing this submodule.
 - `firecrawl/`: Git submodule for the managed self-hosted Firecrawl web runtime. Treat it as upstream code unless intentionally updating the pinned submodule revision.
 - Runtime data, databases, logs, workspaces, and secrets are intentionally ignored. Use `ENTERPRISE_PLATFORM_DATA` to relocate platform state.
+- This project depends on the underlying Hermes Agent and Cognee codebases. For platform adapter or integration changes involving either system, inspect the corresponding upstream submodule first so the change matches its runtime behavior and extension points.
 
 ## Build, Test, and Development Commands
 
