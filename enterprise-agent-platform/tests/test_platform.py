@@ -794,6 +794,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["camofox"]["url"], config.camofox_url)
                 self.assertEqual(status["firecrawl"]["managed"], True)
                 self.assertEqual(status["firecrawl"]["url"], config.firecrawl_api_url)
+                firecrawl_env_text = (tmp / "firecrawl" / ".env").read_text(encoding="utf-8")
+                self.assertIn('PORT="13002"', firecrawl_env_text)
+                self.assertIn('HOST="0.0.0.0"', firecrawl_env_text)
+                self.assertIn('USE_DB_AUTHENTICATION="false"', firecrawl_env_text)
+                self.assertIn('BULL_AUTH_KEY=', firecrawl_env_text)
                 install_commands = [call["cmd"] for call in runner.calls]
                 self.assertIn([str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")], install_commands)
             finally:
@@ -851,12 +856,25 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["firecrawl"]["state"], "starting")
                 commands = [call["cmd"] for call in launcher.calls]
                 self.assertTrue(any("@askjo/camofox-browser@^1.5.2" in cmd for cmd in commands))
-                self.assertTrue(any(cmd[:3] == ["docker", "compose", "up"] for cmd in commands))
+                self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
+                firecrawl_launch = next(call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"])
+                self.assertIn("docker-compose.yml", firecrawl_launch["cmd"])
+                self.assertIn("docker-compose.enterprise.yaml", firecrawl_launch["cmd"])
+                self.assertIn("--no-build", firecrawl_launch["cmd"])
+                self.assertIn("--pull", firecrawl_launch["cmd"])
+                self.assertIn("missing", firecrawl_launch["cmd"])
+                self.assertEqual(firecrawl_launch["env"]["DOCKER_BUILDKIT"], "1")
+                self.assertEqual(firecrawl_launch["env"]["COMPOSE_DOCKER_CLI_BUILD"], "1")
+                self.assertEqual(firecrawl_launch["env"]["PORT"], "13002")
+                override_text = (tmp / "firecrawl" / "docker-compose.enterprise.yaml").read_text(encoding="utf-8")
+                self.assertIn("ghcr.io/firecrawl/firecrawl:latest", override_text)
+                self.assertIn("ghcr.io/firecrawl/playwright-service:latest", override_text)
+                self.assertIn("ghcr.io/firecrawl/nuq-postgres:latest", override_text)
 
                 service.restart_runtime(admin, "camofox")
                 service.restart_runtime(admin, "firecrawl")
                 self.assertGreaterEqual(len([call for call in launcher.calls if "@askjo/camofox-browser@^1.5.2" in call["cmd"]]), 2)
-                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:3] == ["docker", "compose", "up"]]), 2)
+                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"]]), 2)
             finally:
                 service.close()
 
