@@ -298,7 +298,8 @@ class DeploymentManager:
         self.paths.service_dir.mkdir(parents=True, exist_ok=True)
         self.paths.service_path.write_text(user_service_unit(self.paths, host=host, port=port), encoding="utf-8")
         self.runner.run(["systemctl", "--user", "daemon-reload"], timeout=30)
-        self.runner.run(["systemctl", "--user", "enable", "--now", self.paths.service_name], timeout=60)
+        self.runner.run(["systemctl", "--user", "enable", self.paths.service_name], timeout=60)
+        self.runner.run(["systemctl", "--user", "restart", self.paths.service_name], timeout=60)
         return self.paths.service_path
 
     def run_foreground(self, *, host: str, port: int) -> None:

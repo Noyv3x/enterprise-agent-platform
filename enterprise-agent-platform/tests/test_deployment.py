@@ -247,6 +247,23 @@ class DeploymentTests(unittest.TestCase):
             self.assertNotIn(f"WorkingDirectory=\"{root / 'enterprise-agent-platform'}\"", unit)
             self.assertIn("--host \"0.0.0.0\" --port 8765", unit)
 
+    def test_service_bootstrap_restarts_existing_user_service(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = DeploymentPaths.from_root(root)
+            manager = DeploymentManager(paths, runner=runner)
+
+            result = manager.bootstrap(host="127.0.0.1", port=8765, mode="service", prepare_runtime=False)
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(result.mode, "service")
+            self.assertIn(["systemctl", "--user", "daemon-reload"], commands)
+            self.assertIn(["systemctl", "--user", "enable", paths.service_name], commands)
+            self.assertIn(["systemctl", "--user", "restart", paths.service_name], commands)
+            self.assertNotIn(["systemctl", "--user", "enable", "--now", paths.service_name], commands)
+
     def test_user_service_unit_passes_systemd_verify_when_available(self):
         if not shutil.which("systemd-analyze"):
             self.skipTest("systemd-analyze is not available")
