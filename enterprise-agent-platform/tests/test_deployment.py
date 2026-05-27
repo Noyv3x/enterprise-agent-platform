@@ -7,6 +7,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -252,7 +253,7 @@ class DeploymentTests(unittest.TestCase):
             root = Path(td)
             make_deploy_root(root)
             runner = RecordingDeployRunner(systemd_available=True)
-            paths = DeploymentPaths.from_root(root)
+            paths = replace(DeploymentPaths.from_root(root), service_dir=root / "systemd-user")
             manager = DeploymentManager(paths, runner=runner)
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="service", prepare_runtime=False)
