@@ -406,6 +406,161 @@ class EnterpriseService:
         messages = [self._message_from_row(row) for row in reversed(rows)]
         return messages
 
+    def audit_channel_messages(self, actor: dict[str, Any], channel_id: int, limit: int = 200) -> dict[str, Any]:
+        require_admin(actor)
+        channel = self.get_channel(actor, channel_id)
+        limit = max(1, min(int(limit), 500))
+        scope_id = str(channel_id)
+        total = self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
+            (scope_id,),
+        )
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = 'channel' AND scope_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (scope_id, limit),
+        )
+        return {
+            "channel": channel,
+            "messages": [self._message_from_row(row) for row in reversed(rows)],
+            "total": int(total or 0),
+        }
+
+    def delete_channel_message(self, actor: dict[str, Any], channel_id: int, message_id: int) -> dict[str, Any]:
+        require_admin(actor)
+        self.get_channel(actor, channel_id)
+        row = self.db.query_one(
+            """
+            SELECT * FROM messages
+            WHERE id = ? AND scope_type = 'channel' AND scope_id = ?
+            """,
+            (int(message_id), str(channel_id)),
+        )
+        if not row:
+            raise ServiceError(404, "channel message not found")
+        message = self._message_from_row(row)
+        self.db.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
+        return {"deleted": 1, "message": message}
+
+    def delete_channel_messages_before(self, actor: dict[str, Any], channel_id: int, before_created_at: int) -> dict[str, Any]:
+        require_admin(actor)
+        self.get_channel(actor, channel_id)
+        try:
+            before_ts = int(before_created_at)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "before_created_at must be a unix timestamp") from exc
+        if before_ts <= 0:
+            raise ServiceError(400, "before_created_at must be a unix timestamp")
+        scope_id = str(channel_id)
+        deleted = self.db.scalar(
+            """
+            SELECT COUNT(*) FROM messages
+            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        self.db.execute(
+            """
+            DELETE FROM messages
+            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        return {"deleted": int(deleted or 0), "before_created_at": before_ts}
+
+    def clear_channel_messages(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
+        require_admin(actor)
+        self.get_channel(actor, channel_id)
+        scope_id = str(channel_id)
+        deleted = self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
+            (scope_id,),
+        )
+        self.db.execute(
+            "DELETE FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
+            (scope_id,),
+        )
+        return {"deleted": int(deleted or 0)}
+
+    def list_private_conversation_audits(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        require_admin(actor)
+        rows = self.db.query(
+            """
+            SELECT
+                u.*,
+                COALESCE(stats.message_count, 0) AS message_count,
+                COALESCE(stats.user_message_count, 0) AS user_message_count,
+                COALESCE(stats.agent_message_count, 0) AS agent_message_count,
+                stats.first_message_at AS first_message_at,
+                stats.last_message_at AS last_message_at
+            FROM users u
+            LEFT JOIN (
+                SELECT
+                    scope_id,
+                    COUNT(*) AS message_count,
+                    SUM(CASE WHEN author_type = 'user' THEN 1 ELSE 0 END) AS user_message_count,
+                    SUM(CASE WHEN author_type = 'agent' THEN 1 ELSE 0 END) AS agent_message_count,
+                    MIN(created_at) AS first_message_at,
+                    MAX(created_at) AS last_message_at
+                FROM messages
+                WHERE scope_type = 'private'
+                GROUP BY scope_id
+            ) stats ON stats.scope_id = CAST(u.id AS TEXT)
+            ORDER BY
+                CASE WHEN stats.last_message_at IS NULL THEN 1 ELSE 0 END,
+                stats.last_message_at DESC,
+                u.id
+            """
+        )
+        conversations = []
+        for row in rows:
+            user = self.public_user(row)
+            conversations.append(
+                {
+                    "user": user,
+                    "user_id": user["id"],
+                    "username": user["username"],
+                    "display_name": user["display_name"],
+                    "active": user["active"],
+                    "message_count": int(row.get("message_count") or 0),
+                    "user_message_count": int(row.get("user_message_count") or 0),
+                    "agent_message_count": int(row.get("agent_message_count") or 0),
+                    "first_message_at": row.get("first_message_at"),
+                    "last_message_at": row.get("last_message_at"),
+                }
+            )
+        return conversations
+
+    def audit_private_messages(self, actor: dict[str, Any], user_id: int, limit: int = 200) -> dict[str, Any]:
+        require_admin(actor)
+        subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
+        if not subject:
+            raise ServiceError(404, "user not found")
+        limit = max(1, min(int(limit), 500))
+        scope_id = str(user_id)
+        total = self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+            (scope_id,),
+        )
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = 'private' AND scope_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (scope_id, limit),
+        )
+        return {
+            "subject": self.public_user(subject),
+            "messages": [self._message_from_row(row) for row in reversed(rows)],
+            "total": int(total or 0),
+        }
+
     def send_channel_message(self, actor: dict[str, Any], channel_id: int, content: str) -> dict[str, Any]:
         require_permission(actor, PERMISSION_CHAT)
         channel = self.get_channel(actor, channel_id)

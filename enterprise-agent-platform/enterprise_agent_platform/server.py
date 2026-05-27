@@ -158,6 +158,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(service.private_status(actor))
             return
 
+        m = re.fullmatch(r"/api/admin/channels/(\d+)/messages/(\d+)", path)
+        if m and method == "DELETE":
+            self._json(service.delete_channel_message(actor, int(m.group(1)), int(m.group(2))))
+            return
+        m = re.fullmatch(r"/api/admin/channels/(\d+)/messages", path)
+        if m and method == "GET":
+            limit = int(first(query, "limit", "200"))
+            self._json(service.audit_channel_messages(actor, int(m.group(1)), limit=limit))
+            return
+        if m and method == "DELETE":
+            body = self._body_json()
+            if body.get("clear_all"):
+                self._json(service.clear_channel_messages(actor, int(m.group(1))))
+                return
+            before = body.get("before_created_at", first(query, "before_created_at", ""))
+            self._json(service.delete_channel_messages_before(actor, int(m.group(1)), before))
+            return
+        if path == "/api/admin/private-agent/conversations" and method == "GET":
+            self._json({"conversations": service.list_private_conversation_audits(actor)})
+            return
+        m = re.fullmatch(r"/api/admin/private-agent/conversations/(\d+)/messages", path)
+        if m and method == "GET":
+            limit = int(first(query, "limit", "200"))
+            self._json(service.audit_private_messages(actor, int(m.group(1)), limit=limit))
+            return
+
         if path == "/api/knowledge/documents" and method == "GET":
             self._json({"documents": service.knowledge.list_documents()})
             return

@@ -920,6 +920,137 @@ select {
   gap: 12px;
 }
 .account-row__active { min-height: 100%; margin: 0; }
+
+/* Message audit */
+.audit-grid { display: grid; gap: 16px; }
+.audit-card { min-width: 0; }
+.audit-tools {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.audit-tool {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  align-content: end;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 12px;
+  background: var(--surface-2);
+}
+.audit-tool--compact .field { margin: 0; }
+.audit-list {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 520px;
+  overflow: auto;
+  padding-right: 2px;
+}
+.audit-message {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 11px 12px;
+  background: var(--surface-2);
+}
+.audit-message__meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+.audit-message__meta strong { color: var(--ink); font-size: 12.5px; }
+.audit-message__body {
+  grid-column: 1 / 2;
+  min-width: 0;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.58;
+}
+.audit-message__actions {
+  grid-column: 2 / 3;
+  grid-row: 1 / span 2;
+  display: flex;
+  align-items: center;
+}
+.audit-message__actions .icon-btn { color: var(--danger); }
+.audit-private {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  gap: 14px;
+  min-width: 0;
+}
+.audit-conversations {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  max-height: 560px;
+  overflow: auto;
+}
+.audit-conversation {
+  min-width: 0;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  padding: 9px;
+  text-align: left;
+  cursor: pointer;
+}
+.audit-conversation:hover { border-color: var(--accent-line); background: var(--surface-3); }
+.audit-conversation.is-active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-soft-ink);
+}
+.audit-conversation .avatar { width: 30px; height: 30px; border-radius: 8px; }
+.audit-conversation__main {
+  min-width: 0;
+  display: grid;
+  line-height: 1.25;
+}
+.audit-conversation__main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.audit-conversation__main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.audit-private__messages { min-width: 0; display: grid; gap: 10px; align-content: start; }
+.audit-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.audit-subhead > div { min-width: 0; display: grid; line-height: 1.25; }
+.audit-subhead strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-subhead span:not(.status) { color: var(--muted); font-size: 12px; }
+
 .secret-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1180,7 +1311,7 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid, .account-create__grid, .account-row__grid { grid-template-columns: 1fr; }
+  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .audit-tools, .audit-private { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 800px) {

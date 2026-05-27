@@ -23,6 +23,15 @@ const state = {
   users: [],
   permissionGroups: [],
   activeAdminPage: "accounts",
+  messageAudit: {
+    auditChannelId: null,
+    channelMessages: [],
+    channelTotal: 0,
+    privateConversations: [],
+    auditPrivateUserId: null,
+    privateMessages: [],
+    privateTotal: 0,
+  },
   secrets: [],
   runtimes: null,
   hermesConfig: null,
@@ -105,6 +114,7 @@ const ICONS = {
   shield: [["path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" }], ["path", { d: "M9 12l2 2 4-4" }]],
   doc: [["path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }], ["path", { d: "M14 2v6h6" }], ["line", { x1: 8, y1: 13, x2: 16, y2: 13 }], ["line", { x1: 8, y1: 17, x2: 13, y2: 17 }]],
   message: [["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }]],
+  trash: [["path", { d: "M3 6h18" }], ["path", { d: "M8 6V4h8v2" }], ["path", { d: "M19 6l-1 15H6L5 6" }], ["path", { d: "M10 11v6" }], ["path", { d: "M14 11v6" }]],
   link: [["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }], ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }]],
   users: [["path", { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }], ["circle", { cx: 9, cy: 7, r: 4 }], ["path", { d: "M22 21v-2a4 4 0 0 0-3-3.9" }], ["path", { d: "M16 3.1a4 4 0 0 1 0 7.8" }]],
 };
@@ -125,6 +135,7 @@ const THINKING_DEPTH_OPTIONS = [
 ];
 const ADMIN_PAGES = [
   { id: "accounts", label: "账户权限", icon: "users", description: "企业账户、权限组与个人模型策略。" },
+  { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
   { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
   { id: "runtime", label: "运行时", icon: "server", description: "底层基座服务健康状态。" },
   { id: "hermes", label: "Hermes", icon: "settings", description: "Hermes config.yaml 与环境变量。" },
@@ -941,9 +952,10 @@ function renderAdminPager(activeId) {
       class: `admin-pager__item ${active ? "is-active" : ""}`,
       type: "button",
       "aria-current": active ? "page" : null,
-      onclick: () => {
+      onclick: async () => {
         state.activeAdminPage = page.id;
-        render();
+        if (page.id === "messages") await withBusy(loadMessageAudit);
+        else render();
       },
     }, [
       icon(page.icon, { size: 16 }),
@@ -956,6 +968,7 @@ function renderAdminPager(activeId) {
 function adminPageBadge(pageId) {
   const value = {
     accounts: state.users.length,
+    messages: (state.messageAudit?.privateConversations || []).filter((item) => item.message_count > 0).length,
     model: state.oauthProviders?.providers?.length || 0,
     runtime: state.runtimes ? Object.keys(state.runtimes).length : 0,
     secrets: state.secrets.filter((secret) => !isOAuthSecret(secret.key)).length,
@@ -965,6 +978,7 @@ function adminPageBadge(pageId) {
 
 function renderAdminPageSections(pageId) {
   if (pageId === "accounts") return [renderAccountManagement()];
+  if (pageId === "messages") return [renderMessageAuditManagement()];
   if (pageId === "model") return [renderOAuthSettings(), renderHermesConfig()];
   if (pageId === "runtime") return [renderRuntimeSettings()];
   if (pageId === "hermes") return [renderHermesInternalConfig()];
@@ -1103,6 +1117,159 @@ function thinkingDepthSelect(selected) {
     h("option", { value, text: label })));
   select.value = selected;
   return select;
+}
+
+function renderMessageAuditManagement() {
+  const audit = messageAuditState();
+  const channelId = String(audit.auditChannelId || state.activeChannelId || state.channels[0]?.id || "");
+  if (!audit.auditChannelId && channelId) audit.auditChannelId = channelId;
+  const channel = state.channels.find((item) => String(item.id) === channelId);
+  const channelSelect = h("select", {
+    onchange: async (event) => {
+      const nextId = String(event.target.value || "");
+      audit.auditChannelId = nextId;
+      await withBusy(async () => loadAuditChannelMessages(nextId));
+    },
+  }, state.channels.map((item) => h("option", { value: item.id, text: `#${item.name}` })));
+  channelSelect.value = channelId;
+
+  const messageId = h("input", { type: "number", min: "1", step: "1", placeholder: "消息 ID" });
+  const beforeTime = h("input", { type: "datetime-local" });
+  const channelMessages = audit.channelMessages || [];
+
+  const channelRows = channelMessages.length
+    ? channelMessages.map((message) => renderAuditMessageRow(message, {
+        deletable: true,
+        onDelete: () => deleteChannelMessage(channelId, message.id),
+      }))
+    : [h("div", { class: "muted", text: channel ? "当前频道暂无消息。" : "暂无频道。" })];
+
+  const conversations = audit.privateConversations || [];
+  const selectedPrivateUserId = String(audit.auditPrivateUserId || "");
+  const selectedConversation = conversations.find((item) => String(item.user_id) === selectedPrivateUserId);
+  const privateRows = (audit.privateMessages || []).length
+    ? audit.privateMessages.map((message) => renderAuditMessageRow(message))
+    : [h("div", { class: "muted", text: selectedConversation ? "该用户暂无私人 Agent 消息。" : "选择一个用户查看私人 Agent 会话。" })];
+
+  return h("div", { class: "audit-grid" }, [
+    h("section", { class: "card audit-card" }, [
+      cardHead("频道消息管理", "message", {
+        desc: channel ? `#${channel.name}：${audit.channelTotal || 0} 条消息` : "选择频道后查看和删除消息",
+        extra: h("button", {
+          class: "btn btn--sm",
+          type: "button",
+          disabled: state.busy || !channelId,
+          onclick: async () => withBusy(async () => loadAuditChannelMessages(channelId)),
+        }, [icon("refresh", { size: 14 }), h("span", { text: "刷新" })]),
+      }),
+      state.channels.length ? field("频道", channelSelect) : null,
+      h("div", { class: "audit-tools" }, [
+        h("form", {
+          class: "audit-tool",
+          onsubmit: async (event) => {
+            event.preventDefault();
+            const id = Number(messageId.value);
+            if (!id) return toast("请输入要删除的消息 ID", { title: "缺少消息 ID" });
+            await deleteChannelMessage(channelId, id);
+            messageId.value = "";
+          },
+        }, [
+          field("精确删除", messageId),
+          h("button", { class: "btn btn--danger", type: "submit", disabled: state.busy || !channelId }, [icon("trash", { size: 15 }), h("span", { text: "删除 ID" })]),
+        ]),
+        h("form", {
+          class: "audit-tool",
+          onsubmit: async (event) => {
+            event.preventDefault();
+            const ts = unixFromDatetimeLocal(beforeTime.value);
+            if (!ts) return toast("请选择删除截止时间", { title: "缺少时间" });
+            await deleteChannelMessagesBefore(channelId, ts);
+            beforeTime.value = "";
+          },
+        }, [
+          field("删除时间点前", beforeTime),
+          h("button", { class: "btn btn--danger", type: "submit", disabled: state.busy || !channelId }, [icon("trash", { size: 15 }), h("span", { text: "删除之前" })]),
+        ]),
+        h("div", { class: "audit-tool audit-tool--compact" }, [
+          h("span", { class: "field" }, [h("span", { text: "全部清空" }), h("span", { class: "muted", text: "清空当前频道消息" })]),
+          h("button", {
+            class: "btn btn--danger",
+            type: "button",
+            disabled: state.busy || !channelId,
+            onclick: async () => clearChannelMessages(channelId),
+          }, [icon("trash", { size: 15 }), h("span", { text: "清空频道" })]),
+        ]),
+      ]),
+      h("div", { class: "audit-list" }, channelRows),
+    ]),
+    h("section", { class: "card audit-card" }, [
+      cardHead("私人 Agent 审计", "bot", {
+        desc: `${conversations.filter((item) => item.message_count > 0).length} 个用户有私人会话记录`,
+        extra: h("button", {
+          class: "btn btn--sm",
+          type: "button",
+          disabled: state.busy,
+          onclick: async () => withBusy(loadMessageAudit),
+        }, [icon("refresh", { size: 14 }), h("span", { text: "刷新" })]),
+      }),
+      h("div", { class: "audit-private" }, [
+        h("div", { class: "audit-conversations" }, conversations.length
+          ? conversations.map(renderPrivateConversationItem)
+          : [h("div", { class: "muted", text: "暂无用户可审计。" })]),
+        h("div", { class: "audit-private__messages" }, [
+          selectedConversation ? h("div", { class: "audit-subhead" }, [
+            h("div", {}, [
+              h("strong", { text: selectedConversation.display_name || selectedConversation.username }),
+              h("span", { text: `@${selectedConversation.username}` }),
+            ]),
+            h("span", { class: "status", text: `${audit.privateTotal || 0} messages` }),
+          ]) : null,
+          h("div", { class: "audit-list" }, privateRows),
+        ]),
+      ]),
+    ]),
+  ]);
+}
+
+function renderPrivateConversationItem(item) {
+  const audit = messageAuditState();
+  const active = String(audit.auditPrivateUserId || "") === String(item.user_id);
+  return h("button", {
+    class: `audit-conversation ${active ? "is-active" : ""}`,
+    type: "button",
+    onclick: async () => {
+      audit.auditPrivateUserId = String(item.user_id);
+      await withBusy(async () => loadAuditPrivateMessages(item.user_id));
+    },
+  }, [
+    h("div", { class: "avatar", text: initials(item.display_name || item.username) }),
+    h("div", { class: "audit-conversation__main" }, [
+      h("strong", { text: item.display_name || item.username }),
+      h("span", { text: item.last_message_at ? formatTimestamp(item.last_message_at) : "暂无记录" }),
+    ]),
+    h("span", { class: "nav__badge", text: String(item.message_count || 0) }),
+  ]);
+}
+
+function renderAuditMessageRow(message, { deletable = false, onDelete = null } = {}) {
+  const author = message.username || (message.author_type === "agent" ? "Agent" : "User");
+  return h("article", { class: `audit-message audit-message--${message.author_type}` }, [
+    h("div", { class: "audit-message__meta" }, [
+      h("span", { class: "mono", text: `#${message.id}` }),
+      h("strong", { text: author }),
+      h("span", { text: message.author_type }),
+      h("span", { text: formatTimestamp(message.created_at) }),
+    ]),
+    h("div", { class: "audit-message__body", text: message.content }),
+    deletable ? h("div", { class: "audit-message__actions" }, [
+      h("button", {
+        class: "icon-btn",
+        title: "删除消息",
+        "aria-label": "删除消息",
+        onclick: async () => onDelete && onDelete(),
+      }, [icon("trash", { size: 16 })]),
+    ]) : null,
+  ]);
 }
 
 function renderRuntimeSettings() {
@@ -1497,6 +1664,26 @@ function renderGrokOAuthFlow(providerId, flow, callbackValue) {
 }
 
 /* --------------------------------------------------------------- helpers */
+function messageAuditState() {
+  if (!state.messageAudit) {
+    state.messageAudit = {
+      auditChannelId: null,
+      channelMessages: [],
+      channelTotal: 0,
+      privateConversations: [],
+      auditPrivateUserId: null,
+      privateMessages: [],
+      privateTotal: 0,
+    };
+  }
+  return state.messageAudit;
+}
+function unixFromDatetimeLocal(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return Math.floor(date.getTime() / 1000);
+}
 function isOAuthSecret(key) { return key.includes("_OAUTH_"); }
 function oauthStatusLabel(status) {
   return ({ waiting_for_user: "等待网页登录", waiting_for_callback: "等待回调 URL", complete: "已完成" })[status] || status || "等待中";
@@ -1687,6 +1874,47 @@ function sendTypingState(key, isTyping) {
   }).catch(() => {});
 }
 
+async function deleteChannelMessage(channelId, messageId) {
+  if (!channelId || !messageId) return;
+  if (!window.confirm(`删除频道消息 #${messageId}？`)) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/channels/${channelId}/messages/${messageId}`, { method: "DELETE", body: "{}" });
+    await reloadAfterChannelAuditChange(channelId);
+    toast(`已删除 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+  });
+}
+
+async function deleteChannelMessagesBefore(channelId, beforeCreatedAt) {
+  if (!channelId || !beforeCreatedAt) return;
+  if (!window.confirm("删除该时间点之前的频道消息？")) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/channels/${channelId}/messages`, {
+      method: "DELETE",
+      body: JSON.stringify({ before_created_at: beforeCreatedAt }),
+    });
+    await reloadAfterChannelAuditChange(channelId);
+    toast(`已删除 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+  });
+}
+
+async function clearChannelMessages(channelId) {
+  if (!channelId) return;
+  if (!window.confirm("清空当前频道的全部消息？")) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/channels/${channelId}/messages`, {
+      method: "DELETE",
+      body: JSON.stringify({ clear_all: true }),
+    });
+    await reloadAfterChannelAuditChange(channelId);
+    toast(`已清空 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+  });
+}
+
+async function reloadAfterChannelAuditChange(channelId) {
+  await Promise.all([loadChannels(), loadAuditChannelMessages(channelId)]);
+  if (String(state.activeChannelId || "") === String(channelId)) await loadChannelMessages();
+}
+
 /* ---------------------------------------------------------------- loads */
 async function loadInitial() {
   await Promise.all([loadChannels(), loadMentionTargets()]);
@@ -1732,6 +1960,42 @@ async function loadPermissionGroups() {
   const result = await api("/api/permission-groups");
   state.permissionGroups = result.permission_groups;
 }
+async function loadAuditChannelMessages(channelId = messageAuditState().auditChannelId) {
+  const audit = messageAuditState();
+  if (!channelId) {
+    audit.channelMessages = [];
+    audit.channelTotal = 0;
+    return;
+  }
+  audit.auditChannelId = String(channelId);
+  const result = await api(`/api/admin/channels/${channelId}/messages?limit=200`);
+  audit.channelMessages = result.messages || [];
+  audit.channelTotal = result.total || 0;
+}
+async function loadPrivateConversations() {
+  const audit = messageAuditState();
+  const result = await api("/api/admin/private-agent/conversations");
+  audit.privateConversations = result.conversations || [];
+  const selected = String(audit.auditPrivateUserId || "");
+  if (!audit.privateConversations.some((item) => String(item.user_id) === selected)) {
+    const firstWithMessages = audit.privateConversations.find((item) => item.message_count > 0);
+    audit.auditPrivateUserId = firstWithMessages
+      ? String(firstWithMessages.user_id)
+      : String(audit.privateConversations[0]?.user_id || "");
+  }
+}
+async function loadAuditPrivateMessages(userId = messageAuditState().auditPrivateUserId) {
+  const audit = messageAuditState();
+  if (!userId) {
+    audit.privateMessages = [];
+    audit.privateTotal = 0;
+    return;
+  }
+  audit.auditPrivateUserId = String(userId);
+  const result = await api(`/api/admin/private-agent/conversations/${userId}/messages?limit=200`);
+  audit.privateMessages = result.messages || [];
+  audit.privateTotal = result.total || 0;
+}
 async function loadSecrets() {
   const result = await api("/api/settings/secrets");
   state.secrets = result.secrets;
@@ -1742,7 +2006,16 @@ async function loadHermesConfig() { state.hermesConfig = await api("/api/system/
 async function loadHermesInternalConfig() { state.hermesInternalConfig = await api("/api/system/hermes/internal-config"); }
 async function loadCogneeConfig() { state.cogneeConfig = await api("/api/system/cognee/config"); }
 async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
-async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings()]); }
+async function loadMessageAudit() {
+  const audit = messageAuditState();
+  if (!state.channels.length) await loadChannels();
+  if (!audit.auditChannelId && (state.activeChannelId || state.channels[0]?.id)) {
+    audit.auditChannelId = String(state.activeChannelId || state.channels[0].id);
+  }
+  await Promise.all([loadAuditChannelMessages(audit.auditChannelId), loadPrivateConversations()]);
+  await loadAuditPrivateMessages(audit.auditPrivateUserId);
+}
+async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings(), loadMessageAudit()]); }
 async function refreshActiveChat({ renderAfter = true } = {}) {
   if (!state.user || pollInFlight) return;
   const keepFocus = !!app.querySelector(".composer textarea:focus");
@@ -1820,6 +2093,15 @@ async function logout() {
   state.pendingMessages = [];
   state.mentionTargets = [];
   state.typingUsers = [];
+  state.messageAudit = {
+    auditChannelId: null,
+    channelMessages: [],
+    channelTotal: 0,
+    privateConversations: [],
+    auditPrivateUserId: null,
+    privateMessages: [],
+    privateTotal: 0,
+  };
   hideMentionMenu();
   render();
 }

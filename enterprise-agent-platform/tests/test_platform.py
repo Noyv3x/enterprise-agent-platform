@@ -620,6 +620,94 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(service.model_secret_env(), {})
             service.close()
 
+    def test_admin_can_delete_channel_messages_by_id_before_time_and_clear(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    permission_group="member",
+                    actor=admin,
+                )
+
+                first = service.send_channel_message(admin, 1, "first")["user_message"]
+                second = service.send_channel_message(member, 1, "second")["user_message"]
+                third = service.send_channel_message(admin, 1, "third")["user_message"]
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (1000, first["id"]))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (2000, second["id"]))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (3000, third["id"]))
+
+                audit = service.audit_channel_messages(admin, 1)
+                self.assertEqual(audit["total"], 3)
+                self.assertEqual([message["content"] for message in audit["messages"]], ["first", "second", "third"])
+
+                with self.assertRaises(ServiceError) as member_error:
+                    service.delete_channel_message(member, 1, first["id"])
+                self.assertEqual(member_error.exception.status, 403)
+
+                deleted = service.delete_channel_message(admin, 1, second["id"])
+                self.assertEqual(deleted["deleted"], 1)
+                self.assertEqual(deleted["message"]["content"], "second")
+                self.assertEqual([message["content"] for message in service.audit_channel_messages(admin, 1)["messages"]], ["first", "third"])
+
+                before = service.delete_channel_messages_before(admin, 1, 2500)
+                self.assertEqual(before["deleted"], 1)
+                self.assertEqual([message["content"] for message in service.audit_channel_messages(admin, 1)["messages"]], ["third"])
+
+                cleared = service.clear_channel_messages(admin, 1)
+                self.assertEqual(cleared["deleted"], 1)
+                self.assertEqual(service.audit_channel_messages(admin, 1)["total"], 0)
+            finally:
+                service.close()
+
+    def test_admin_can_audit_all_private_agent_conversations(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, alice = service.authenticate("alice", "alice-pass")
+
+                service.send_private_message(alice, "alice private task")
+                service.wait_for_agent_idle("private", str(alice["id"]))
+                service.send_private_message(admin, "admin private task")
+                service.wait_for_agent_idle("private", str(admin["id"]))
+
+                conversations = service.list_private_conversation_audits(admin)
+                by_user = {item["username"]: item for item in conversations}
+                self.assertEqual(by_user["alice"]["message_count"], 2)
+                self.assertEqual(by_user["alice"]["user_message_count"], 1)
+                self.assertEqual(by_user["alice"]["agent_message_count"], 1)
+                self.assertEqual(by_user["admin"]["message_count"], 2)
+
+                audit = service.audit_private_messages(admin, alice["id"])
+                self.assertEqual(audit["subject"]["username"], "alice")
+                self.assertEqual(audit["total"], 2)
+                self.assertEqual(audit["messages"][0]["content"], "alice private task")
+                self.assertEqual(audit["messages"][1]["content"], "agent response to alice private task")
+
+                with self.assertRaises(ServiceError) as member_error:
+                    service.audit_private_messages(alice, admin["id"])
+                self.assertEqual(member_error.exception.status, 403)
+
+                service.deactivate_user(admin, alice["id"])
+                retained = {item["username"]: item for item in service.list_private_conversation_audits(admin)}
+                self.assertFalse(retained["alice"]["active"])
+                self.assertEqual(retained["alice"]["message_count"], 2)
+                self.assertEqual(service.audit_private_messages(admin, alice["id"])["total"], 2)
+            finally:
+                service.close()
+
     def test_admin_can_manage_account_permissions_and_model_policy(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -1311,6 +1399,30 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["messages"][-1]["content"], "agent response to Administrator: hello")
                 self.assertEqual(payload["messages"][-1]["metadata"]["agent_work"]["state"], "complete")
                 self.assertEqual(payload["agent_status"]["state"], "idle")
+
+                conn.request("GET", f"/api/admin/channels/{channels[0]['id']}/messages?limit=10", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                audit_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertGreaterEqual(audit_payload["total"], 3)
+                hello_message = next(message for message in audit_payload["messages"] if message["content"] == "hello")
+
+                conn.request(
+                    "DELETE",
+                    f"/api/admin/channels/{channels[0]['id']}/messages/{hello_message['id']}",
+                    body="{}",
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                delete_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertEqual(delete_payload["deleted"], 1)
+
+                conn.request("GET", "/api/admin/private-agent/conversations", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                private_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertIn("admin", {item["username"] for item in private_payload["conversations"]})
             finally:
                 server.shutdown()
                 server.server_close()
