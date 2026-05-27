@@ -92,6 +92,8 @@ def make_deploy_root(root: Path) -> None:
     (root / "hermes-agent" / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
     (root / "cognee").mkdir()
     (root / "cognee" / "pyproject.toml").write_text("[project]\nname='cognee'\n", encoding="utf-8")
+    (root / "firecrawl").mkdir()
+    (root / "firecrawl" / "docker-compose.yaml").write_text("services:\n  api:\n    image: firecrawl\n", encoding="utf-8")
 
 
 class DeploymentTests(unittest.TestCase):

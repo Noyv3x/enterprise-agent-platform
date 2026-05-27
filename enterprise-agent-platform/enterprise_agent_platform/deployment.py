@@ -169,6 +169,11 @@ class DeploymentManager:
             missing.append(str(self.paths.hermes_repo))
         if not (self.paths.cognee_repo / "pyproject.toml").exists():
             missing.append(str(self.paths.cognee_repo))
+        if not any(
+            (self.paths.firecrawl_repo / name).exists()
+            for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+        ):
+            missing.append(str(self.paths.firecrawl_repo))
         if missing:
             raise DeploymentError("required adjacent source repositories are missing: " + ", ".join(missing))
 

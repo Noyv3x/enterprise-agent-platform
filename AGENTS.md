@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-This workspace ties together an enterprise platform and two upstream codebases.
+This workspace ties together an enterprise platform and three upstream codebases.
 
 - `enterprise-agent-platform/`: primary platform code. Python package lives in `enterprise_agent_platform/`, browser assets in `enterprise_agent_platform/static/`, tests in `tests/`, and the managed Hermes knowledge plugin in `hermes_plugin/`.
 - `hermes-agent/`: Git submodule for the Hermes runtime and OpenAI-compatible API server. Follow `hermes-agent/AGENTS.md` when editing this submodule.
 - `cognee/`: Git submodule for the optional knowledge graph backend. Follow `cognee/AGENTS.md` when editing this submodule.
+- `firecrawl/`: Git submodule for the managed self-hosted Firecrawl web runtime. Treat it as upstream code unless intentionally updating the pinned submodule revision.
 - Runtime data, databases, logs, workspaces, and secrets are intentionally ignored. Use `ENTERPRISE_PLATFORM_DATA` to relocate platform state.
 
 ## Build, Test, and Development Commands
@@ -17,7 +18,7 @@ Use the top-level one-command deploy path for local bring-up:
 ./deploy.sh
 ```
 
-It initializes submodules, creates `.venv`, installs the platform package, prepares managed Hermes/Cognee state, and starts the app through user-level systemd when available. Keep `hermes-agent/` and `cognee/` next to `enterprise-agent-platform/`; managed Hermes is installed from adjacent `hermes-agent/` source into `data/runtimes/hermes/venv`.
+It initializes submodules, creates `.venv`, installs the platform package, prepares managed Hermes/Cognee/Firecrawl state, and starts the app through user-level systemd when available. Keep `hermes-agent/`, `cognee/`, and `firecrawl/` next to `enterprise-agent-platform/`; managed Hermes is installed from adjacent `hermes-agent/` source into `data/runtimes/hermes/venv`.
 
 Run the platform locally:
 
@@ -58,4 +59,4 @@ PRs should include a summary, affected directories, commands run, linked issues 
 
 ## Security & Configuration Tips
 
-Never commit `.env`, runtime databases, generated workspaces, API keys, or logs. Configure model credentials and Hermes runtime settings through the platform settings UI or environment variables. Keep managed Hermes/Cognee state under the platform data directory.
+Never commit `.env`, runtime databases, generated workspaces, API keys, or logs. Configure model credentials and Hermes runtime settings through the platform settings UI or environment variables. Keep managed Hermes/Cognee/Firecrawl state under the platform data directory.
