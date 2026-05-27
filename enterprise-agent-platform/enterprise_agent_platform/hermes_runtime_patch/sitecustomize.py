@@ -9,6 +9,7 @@ Hermes installs untouched.
 from __future__ import annotations
 
 import logging
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -47,7 +48,13 @@ def _synthesized_message(text: str) -> Any:
     )
 
 
-def _backfill_response_output(response: Any, output_items: list[Any], text_deltas: list[str]) -> Any:
+def _backfill_response_output(
+    response: Any,
+    output_items: list[Any],
+    text_deltas: list[str],
+    *,
+    synthesize_text: bool = True,
+) -> Any:
     if response is None:
         return SimpleNamespace(
             status="completed",
@@ -60,7 +67,7 @@ def _backfill_response_output(response: Any, output_items: list[Any], text_delta
 
     items = list(output_items)
     text = "".join(text_deltas)
-    if text and not any(_message_text(item) for item in items):
+    if synthesize_text and text and not any(_message_text(item) for item in items):
         items.append(_synthesized_message(text))
 
     try:
@@ -73,6 +80,94 @@ def _backfill_response_output(response: Any, output_items: list[Any], text_delta
             incomplete_details=_event_value(response, "incomplete_details"),
         )
     return response
+
+
+class _RawResponsesStreamContext:
+    """Small Responses.stream() substitute backed by responses.create(stream=True)."""
+
+    def __init__(self, responses_resource: Any, stream_kwargs: dict[str, Any]):
+        self._responses_resource = responses_resource
+        self._stream_kwargs = dict(stream_kwargs)
+        self._stream_kwargs["stream"] = True
+        self._stream_or_response = None
+        self._iterator = None
+        self._output_items: list[Any] = []
+        self._text_deltas: list[str] = []
+        self._terminal_response = None
+        self._has_function_calls = False
+
+    def __enter__(self) -> "_RawResponsesStreamContext":
+        self._stream_or_response = self._responses_resource.create(**self._stream_kwargs)
+        if hasattr(self._stream_or_response, "output") or not hasattr(self._stream_or_response, "__iter__"):
+            self._terminal_response = self._stream_or_response
+            self._iterator = iter(())
+        else:
+            self._iterator = iter(self._stream_or_response)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __iter__(self) -> "_RawResponsesStreamContext":
+        return self
+
+    def __next__(self) -> Any:
+        if self._iterator is None:
+            raise StopIteration
+
+        event = next(self._iterator)
+        event_type = str(_event_value(event, "type", "") or "")
+
+        if event_type == "error":
+            message = str(_event_value(event, "message", "") or "stream emitted error event").strip()
+            raise _stream_error_event(
+                message,
+                code=_event_value(event, "code"),
+                param=_event_value(event, "param"),
+            )
+
+        if "function_call" in event_type:
+            self._has_function_calls = True
+
+        if event_type == "response.output_item.done":
+            item = _event_value(event, "item")
+            if item is not None:
+                self._output_items.append(item)
+        elif event_type == "response.content_part.done":
+            part = _event_value(event, "part")
+            if part is not None and _event_value(part, "type") in {"output_text", "text"}:
+                text = _event_value(part, "text")
+                if isinstance(text, str) and text and not self._text_deltas:
+                    self._text_deltas.append(text)
+        elif "output_text.delta" in event_type:
+            delta = _event_value(event, "delta", "")
+            if isinstance(delta, str) and delta:
+                self._text_deltas.append(delta)
+
+        if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            self._terminal_response = _event_value(event, "response")
+
+        return event
+
+    def get_final_response(self) -> Any:
+        if self._terminal_response is None:
+            get_final_response = getattr(self._stream_or_response, "get_final_response", None)
+            if callable(get_final_response):
+                self._terminal_response = get_final_response()
+        return _backfill_response_output(
+            self._terminal_response,
+            self._output_items,
+            self._text_deltas,
+            synthesize_text=not self._has_function_calls,
+        )
+
+    def close(self) -> None:
+        close_fn = getattr(self._stream_or_response, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
 
 
 def _stream_error_event(message: str, *, code: Any = None, param: Any = None) -> Exception:
@@ -187,7 +282,54 @@ def _install_codex_response_stream_patch() -> None:
     codex_runtime._enterprise_response_stream_patch = True
 
 
+def _install_auxiliary_response_stream_patch() -> None:
+    try:
+        from agent import auxiliary_client
+    except Exception:
+        return
+
+    adapter_cls = getattr(auxiliary_client, "_CodexCompletionsAdapter", None)
+    if adapter_cls is None or getattr(adapter_cls, "_enterprise_response_stream_patch", False):
+        return
+
+    original_create = adapter_cls.create
+
+    def create(self: Any, **kwargs: Any) -> Any:
+        responses_resource = getattr(getattr(self, "_client", None), "responses", None)
+        if responses_resource is None or not callable(getattr(responses_resource, "create", None)):
+            return original_create(self, **kwargs)
+
+        lock = getattr(self, "_enterprise_response_stream_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            try:
+                self._enterprise_response_stream_lock = lock
+            except Exception:
+                pass
+
+        def raw_stream(**stream_kwargs: Any) -> _RawResponsesStreamContext:
+            return _RawResponsesStreamContext(responses_resource, stream_kwargs)
+
+        with lock:
+            original_stream = getattr(responses_resource, "stream", None)
+            try:
+                responses_resource.stream = raw_stream
+            except Exception:
+                return original_create(self, **kwargs)
+            try:
+                return original_create(self, **kwargs)
+            finally:
+                try:
+                    responses_resource.stream = original_stream
+                except Exception:
+                    pass
+
+    adapter_cls.create = create
+    adapter_cls._enterprise_response_stream_patch = True
+
+
 try:
     _install_codex_response_stream_patch()
+    _install_auxiliary_response_stream_patch()
 except Exception as exc:
     logger.debug("Enterprise Hermes runtime patch did not install: %s", exc)

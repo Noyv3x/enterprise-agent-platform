@@ -567,8 +567,9 @@ function renderChat(mode) {
     const status = agentStatusFor(mode);
     if (isAgentActive(status)) {
       items.push(renderAgentActivity(status));
-      const streamingMessage = agentStreamingMessage(status, mode);
-      if (streamingMessage) items.push(renderMessage(streamingMessage));
+      for (const streamingMessage of agentStreamingMessages(status, mode)) {
+        items.push(renderMessage(streamingMessage));
+      }
     }
     if (mode === "channel" && state.typingUsers.length) items.push(renderTypingUsers(state.typingUsers));
     body = h("div", { class: "messages__inner" }, items);
@@ -727,21 +728,24 @@ function renderAgentActivity(status) {
   ]);
 }
 
-function agentStreamingMessage(status, mode) {
-  const stream = status?.stream_message || null;
-  const content = stream?.content || "";
-  if (!content) return null;
-  return {
-    id: stream.id || `stream-${status.run_id || status.started_at || "agent"}`,
+function agentStreamingMessages(status, mode) {
+  const segments = [];
+  for (const stream of status?.stream_messages || []) {
+    if (stream?.content) segments.push(stream);
+  }
+  const active = status?.stream_message || null;
+  if (active?.content) segments.push(active);
+  return segments.map((stream, index) => ({
+    id: stream.id || `stream-${status.run_id || status.started_at || "agent"}-${index}`,
     scope_type: scopeTypeFor(mode),
     scope_id: scopeIdFor(mode),
     author_type: "agent",
     user_id: null,
     username: stream.username || (mode === "private" ? "Private Agent" : "Main Agent"),
-    content,
-    metadata: { streaming: true },
+    content: stream.content || "",
+    metadata: { streaming: stream.active !== false, stream_segment: stream.active === false },
     created_at: stream.created_at || status.started_at || Math.floor(Date.now() / 1000),
-  };
+  }));
 }
 
 function renderAgentWorkCard(work, { active = false } = {}) {
@@ -1963,6 +1967,7 @@ function agentStatusFingerprint(status) {
           updated_at: status.stream_message.updated_at || 0,
         }
       : null,
+    stream_messages: (status.stream_messages || []).map((item) => `${item.id}:${item.content || ""}:${item.updated_at || 0}`),
     replying_to: status.replying_to
       ? {
           id: status.replying_to.id,

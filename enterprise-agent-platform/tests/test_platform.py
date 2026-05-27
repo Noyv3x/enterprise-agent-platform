@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.parse
 from dataclasses import replace
@@ -122,6 +123,41 @@ class StreamingAgent:
             content_callback("world")
         return AgentResult(
             content="Hello world",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
+class ToolBoundaryStreamingAgent:
+    def __init__(self):
+        self.calls = []
+        self.first_delta = threading.Event()
+        self.release_tool = threading.Event()
+        self.tool_started = threading.Event()
+        self.release_final = threading.Event()
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        content_callback = kwargs.get("content_callback")
+        progress_callback = kwargs.get("progress_callback")
+        if content_callback:
+            content_callback("Now browser_vision call.\n\n")
+            self.first_delta.set()
+        self.release_tool.wait(timeout=5)
+        if progress_callback:
+            progress_callback(
+                {
+                    "tool": "browser_vision",
+                    "toolCallId": "call-1",
+                    "status": "running",
+                }
+            )
+            self.tool_started.set()
+        self.release_final.wait(timeout=5)
+        if content_callback:
+            content_callback("好了，这次成功了。")
+        return AgentResult(
+            content="好了，这次成功了。",
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
@@ -322,6 +358,66 @@ def managed_python(home: Path) -> Path:
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_hermes_client_uses_post_tool_stream_as_final_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                events = [
+                    "data: "
+                    + json.dumps({"choices": [{"delta": {"content": "Now browser_vision call.\n\n"}}]})
+                    + "\n\n",
+                    (
+                        "event: hermes.tool.progress\n"
+                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
+                    ),
+                    (
+                        "event: hermes.tool.progress\n"
+                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'completed'})}\n\n"
+                    ),
+                    "data: " + json.dumps({"choices": [{"delta": {"content": "好了，这次成功了。"}}]}) + "\n\n",
+                    "data: [DONE]\n\n",
+                ]
+                for event in events:
+                    self.wfile.write(event.encode("utf-8"))
+                    self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                )
+                chunks = []
+                progress = []
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="question",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                    progress_callback=progress.append,
+                    content_callback=chunks.append,
+                )
+
+                self.assertEqual(result.content, "好了，这次成功了。")
+                self.assertEqual(chunks, ["Now browser_vision call.\n\n", None, "好了，这次成功了。"])
+                self.assertEqual([event["status"] for event in progress], ["running", "completed"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_hermes_runtime_patch_backfills_codex_stream_output_null(self):
         patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
         spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_test", patch_path)
@@ -353,6 +449,67 @@ class PlatformServiceTests(unittest.TestCase):
         self.assertEqual(client.responses.kwargs["stream"], True)
         self.assertEqual(len(result.output), 1)
         self.assertEqual(result.output[0].content[0].text, "OK")
+
+    def test_hermes_runtime_patch_backfills_auxiliary_codex_stream_output_null(self):
+        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
+        spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_aux_test", patch_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class FakeAuxiliaryResponses(FakeResponsesStream):
+            def stream(self, **kwargs):
+                raise TypeError("'NoneType' object is not iterable")
+
+        class FakeAuxiliaryClient:
+            def __init__(self, events):
+                self.responses = FakeAuxiliaryResponses(events)
+
+        class FakeAuxiliaryAdapter:
+            def __init__(self, client):
+                self._client = client
+
+            def create(self, **kwargs):
+                with self._client.responses.stream(**kwargs) as stream:
+                    for _event in stream:
+                        pass
+                    return stream.get_final_response()
+
+        fake_auxiliary = types.ModuleType("agent.auxiliary_client")
+        fake_auxiliary._CodexCompletionsAdapter = FakeAuxiliaryAdapter
+        fake_agent = types.ModuleType("agent")
+        fake_agent.auxiliary_client = fake_auxiliary
+        old_agent = sys.modules.get("agent")
+        old_auxiliary = sys.modules.get("agent.auxiliary_client")
+        sys.modules["agent"] = fake_agent
+        sys.modules["agent.auxiliary_client"] = fake_auxiliary
+        try:
+            module._install_auxiliary_response_stream_patch()
+
+            terminal = SimpleNamespace(status="completed", output=None)
+            client = FakeAuxiliaryClient([
+                SimpleNamespace(type="response.output_text.delta", delta="O"),
+                SimpleNamespace(type="response.output_text.delta", delta="K"),
+                SimpleNamespace(type="response.completed", response=terminal),
+            ])
+            result = FakeAuxiliaryAdapter(client).create(model="gpt-5.3-codex", input=[])
+        finally:
+            if old_agent is None:
+                sys.modules.pop("agent", None)
+            else:
+                sys.modules["agent"] = old_agent
+            if old_auxiliary is None:
+                sys.modules.pop("agent.auxiliary_client", None)
+            else:
+                sys.modules["agent.auxiliary_client"] = old_auxiliary
+
+        self.assertTrue(client.responses.closed)
+        self.assertEqual(client.responses.kwargs["stream"], True)
+        self.assertEqual(len(result.output), 1)
+        self.assertEqual(result.output[0].content[0].text, "OK")
+        with self.assertRaises(TypeError):
+            client.responses.stream()
 
     def test_hermes_client_streams_tool_progress_events(self):
         requests = []
@@ -703,6 +860,34 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIsNone(service.agent_status(user, "channel", "1").get("stream_message"))
             finally:
                 agent.release.set()
+                service.close()
+
+    def test_channel_agent_reply_clears_pre_tool_stream_on_substantive_tool(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = ToolBoundaryStreamingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_channel_message(user, 1, "@agent screenshot the browser")
+                self.assertTrue(agent.first_delta.wait(timeout=1))
+                status = service.agent_status(user, "channel", "1")
+                self.assertEqual(status["stream_message"]["content"], "Now browser_vision call.\n\n")
+
+                agent.release_tool.set()
+                self.assertTrue(agent.tool_started.wait(timeout=1))
+                status = service.agent_status(user, "channel", "1")
+                self.assertIsNone(status.get("stream_message"))
+                self.assertEqual(status["stream_messages"][-1]["content"], "Now browser_vision call.\n\n")
+                self.assertFalse(status["stream_messages"][-1]["active"])
+                self.assertEqual(status["activity"][-1]["tool"], "browser_vision")
+
+                agent.release_final.set()
+                service.wait_for_agent_idle("channel", "1")
+                messages = service.list_messages(user, "channel", "1")
+                self.assertEqual(messages[-1]["content"], "好了，这次成功了。")
+            finally:
+                agent.release_tool.set()
+                agent.release_final.set()
                 service.close()
 
     def test_channel_message_without_agent_mention_does_not_trigger_agent(self):

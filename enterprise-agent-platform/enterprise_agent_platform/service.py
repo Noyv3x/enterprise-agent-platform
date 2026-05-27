@@ -18,7 +18,7 @@ from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
-from .hermes import AgentClient, AutoAgentClient
+from .hermes import AgentClient, AutoAgentClient, is_substantive_tool_start
 from .internal_config import (
     read_cognee_internal_config,
     read_hermes_internal_config,
@@ -1566,6 +1566,7 @@ class EnterpriseService:
             "started_at": started_at,
             "updated_at": started_at,
             "last_error": "",
+            "stream_messages": [],
             "stream_message": None,
         }
 
@@ -1583,6 +1584,7 @@ class EnterpriseService:
             "started_at": None,
             "updated_at": now_ts(),
             "last_error": last_error,
+            "stream_messages": [],
             "stream_message": None,
         }
 
@@ -1592,6 +1594,7 @@ class EnterpriseService:
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
+        copied["stream_messages"] = [dict(item) for item in copied.get("stream_messages") or []]
         if copied.get("stream_message"):
             copied["stream_message"] = dict(copied["stream_message"])
         return copied
@@ -1627,16 +1630,43 @@ class EnterpriseService:
             status["updated_at"] = timestamp
             self._agent_status[key] = status
 
-    def _record_agent_content_delta(self, scope_type: str, scope_id: str, delta: str) -> None:
-        delta = str(delta or "")
-        if not delta:
-            return
+    @staticmethod
+    def _finalize_stream_message(status: dict[str, Any], timestamp: int) -> dict[str, Any]:
+        stream = dict(status.get("stream_message") or {})
+        content = str(stream.get("content") or "")
+        if not content:
+            status["stream_message"] = None
+            return status
+        stream["active"] = False
+        stream["updated_at"] = timestamp
+        segments = [dict(item) for item in status.get("stream_messages") or []]
+        if not segments or segments[-1].get("id") != stream.get("id"):
+            segments.append(stream)
+        else:
+            segments[-1] = stream
+        status["stream_messages"] = segments[-8:]
+        status["stream_message"] = None
+        return status
+
+    def _record_agent_content_delta(self, scope_type: str, scope_id: str, delta: str | None) -> None:
         key = self._conversation_key(scope_type, str(scope_id))
         timestamp = now_ts()
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            if delta is None:
+                status = self._finalize_stream_message(status, timestamp)
+                status["updated_at"] = timestamp
+                self._agent_status[key] = status
+                return
+            delta = str(delta or "")
+            if not delta:
+                return
             stream = dict(status.get("stream_message") or {})
-            stream.setdefault("id", f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}")
+            stream.setdefault(
+                "id",
+                f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}:"
+                f"{len(status.get('stream_messages') or [])}",
+            )
             stream.setdefault("author_type", "agent")
             stream.setdefault("username", "Main Agent" if scope_type == "channel" else "Private Agent")
             stream.setdefault("created_at", status.get("started_at") or timestamp)
@@ -1697,6 +1727,8 @@ class EnterpriseService:
                 existing.update(item_data)
             else:
                 activity.append(item_data)
+            if is_substantive_tool_start(event):
+                status = self._finalize_stream_message(status, timestamp)
             status["activity"] = activity[-30:]
             status["current_step"] = line
             status["updated_at"] = timestamp

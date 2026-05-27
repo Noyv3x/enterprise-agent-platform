@@ -13,6 +13,9 @@ from typing import Any, Callable, Protocol
 from .config import PlatformConfig
 
 
+HOUSEKEEPING_TOOLS = frozenset({"memory", "todo", "skill_manage", "session_search"})
+
+
 @dataclass(frozen=True)
 class AgentResult:
     content: str
@@ -22,7 +25,7 @@ class AgentResult:
 
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
-AgentContentCallback = Callable[[str], None]
+AgentContentCallback = Callable[[str | None], None]
 
 
 def emit_content(content_callback: AgentContentCallback | None, content: str) -> None:
@@ -30,6 +33,15 @@ def emit_content(content_callback: AgentContentCallback | None, content: str) ->
         return
     try:
         content_callback(content)
+    except Exception:
+        return
+
+
+def emit_content_segment_break(content_callback: AgentContentCallback | None) -> None:
+    if content_callback is None:
+        return
+    try:
+        content_callback(None)
     except Exception:
         return
 
@@ -202,6 +214,7 @@ class HermesAgentClient:
         content_callback: AgentContentCallback | None,
     ) -> AgentResult:
         content_parts: list[str] = []
+        prior_content_before_substantive_tool = False
         raw_events: list[dict[str, Any]] = []
         event_count = 0
         event_name = "message"
@@ -229,6 +242,10 @@ class HermesAgentClient:
                 payload = json.loads(data)
                 if isinstance(payload, dict):
                     remember(event, payload)
+                    if is_substantive_tool_start(payload) and content_parts:
+                        content_parts.clear()
+                        prior_content_before_substantive_tool = True
+                        emit_content_segment_break(content_callback)
                     self._emit_progress(progress_callback, payload)
                 return False
             payload = json.loads(data)
@@ -267,6 +284,11 @@ class HermesAgentClient:
         }
         content = "".join(content_parts)
         if not content:
+            if prior_content_before_substantive_tool:
+                raise ValueError(
+                    "Hermes returned no final streaming response after substantive tool calls "
+                    f"({event_count} events)"
+                )
             raise ValueError(f"Hermes returned an empty streaming response after {event_count} events")
         return AgentResult(content=content, session_id=response_session, raw=raw)
 
@@ -376,6 +398,16 @@ def text_from_response_payload(payload: Any) -> str:
     if isinstance(response, dict):
         return text_from_response_payload(response)
     return ""
+
+
+def is_substantive_tool_start(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or payload.get("event_type") or "running").strip().lower()
+    if status not in {"running", "started", "start", "tool.started"}:
+        return False
+    tool = str(payload.get("tool") or payload.get("tool_name") or "").strip()
+    return bool(tool) and not tool.startswith("_") and tool not in HOUSEKEEPING_TOOLS
 
 
 def text_from_stream_payload(payload: dict[str, Any], *, already_streaming: bool) -> str:
