@@ -486,22 +486,7 @@ function renderChat(mode) {
       const incoming = Array.from(event.target.files || []);
       event.target.value = "";
       if (!incoming.length) return;
-      const current = state.draftFiles[draftKey] || [];
-      const accepted = [];
-      for (const file of incoming) {
-        if (file.size > MAX_ATTACHMENT_BYTES) {
-          toast(`${file.name} 超过 50 MB`, { title: "文件过大" });
-          continue;
-        }
-        accepted.push(file);
-      }
-      const next = [...current, ...accepted].slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
-      if (current.length + accepted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-        toast(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`, { title: "附件过多" });
-      }
-      state.draftFiles[draftKey] = next;
-      state._focusComposer = true;
-      render();
+      addDraftFiles(draftKey, incoming);
     },
   });
 
@@ -522,6 +507,12 @@ function renderChat(mode) {
     },
     onfocus: () => updateMentionMenu(input, mentionMenu, mode),
     onclick: () => updateMentionMenu(input, mentionMenu, mode),
+    onpaste: (e) => {
+      const images = clipboardImageFiles(e.clipboardData);
+      if (!images.length) return;
+      e.preventDefault();
+      addDraftFiles(draftKey, images);
+    },
     onkeyup: (e) => {
       if (!["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(e.key)) updateMentionMenu(input, mentionMenu, mode);
     },
@@ -611,6 +602,59 @@ function renderChat(mode) {
       ]),
     ]),
   ]);
+}
+
+function addDraftFiles(draftKey, incoming) {
+  const current = state.draftFiles[draftKey] || [];
+  const accepted = [];
+  for (const file of incoming || []) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      toast(`${file.name || "附件"} 超过 50 MB`, { title: "文件过大" });
+      continue;
+    }
+    accepted.push(file);
+  }
+  if (!accepted.length) return false;
+  const next = [...current, ...accepted].slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+  if (current.length + accepted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    toast(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`, { title: "附件过多" });
+  }
+  state.draftFiles[draftKey] = next;
+  state._focusComposer = true;
+  render();
+  return true;
+}
+
+function clipboardImageFiles(clipboardData) {
+  if (!clipboardData) return [];
+  const files = [];
+  for (const item of Array.from(clipboardData.items || [])) {
+    if (item.kind !== "file" || !item.type?.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) files.push(namedClipboardImage(file, files.length));
+  }
+  if (!files.length) {
+    for (const file of Array.from(clipboardData.files || [])) {
+      if (file.type?.startsWith("image/")) files.push(namedClipboardImage(file, files.length));
+    }
+  }
+  return files;
+}
+
+function namedClipboardImage(file, index) {
+  if (file.name) return file;
+  const extension = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+  }[file.type] || "png";
+  try {
+    return new File([file], `pasted-image-${index + 1}.${extension}`, { type: file.type || "image/png", lastModified: file.lastModified || Date.now() });
+  } catch (_) {
+    return file;
+  }
 }
 
 function renderMessage(message) {
