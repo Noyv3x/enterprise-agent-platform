@@ -22,6 +22,7 @@ const state = {
   selectedDocument: null,
   users: [],
   permissionGroups: [],
+  activeAdminPage: "accounts",
   secrets: [],
   runtimes: null,
   hermesConfig: null,
@@ -120,6 +121,14 @@ const THINKING_DEPTH_OPTIONS = [
   ["medium", "中"],
   ["high", "高"],
   ["xhigh", "超高"],
+];
+const ADMIN_PAGES = [
+  { id: "accounts", label: "账户权限", icon: "users", description: "企业账户、权限组与个人模型策略。" },
+  { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
+  { id: "runtime", label: "运行时", icon: "server", description: "底层基座服务健康状态。" },
+  { id: "hermes", label: "Hermes", icon: "settings", description: "Hermes config.yaml 与环境变量。" },
+  { id: "cognee", label: "Cognee", icon: "library", description: "Cognee 环境变量配置。" },
+  { id: "secrets", label: "密钥", icon: "key", description: "平台内部密钥。" },
 ];
 
 function icon(name, { size, cls, strokeWidth } = {}) {
@@ -403,7 +412,7 @@ function topbarInfo() {
     return { title: "私人 Agent", icon: "bot", sub: active || "仅你可见的私有助手会话" };
   }
   if (state.activeView === "knowledge") return { title: "企业知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
-  if (state.activeView === "admin") return { title: "管理面板", icon: "shield", sub: "企业账户、权限组与模型策略" };
+  if (state.activeView === "admin") return { title: "管理面板", icon: "shield", sub: activeAdminPage().description };
   const ch = activeChannel();
   const active = agentStatusText(agentStatusFor("channel"));
   return { title: ch?.name || "频道", hash: true, sub: ch ? (active || `${state.messages.length} 条消息`) : "选择或创建一个频道" };
@@ -880,17 +889,66 @@ function renderDocViewer() {
 /* --------------------------------------------------------- admin panel */
 function renderAdminPanel() {
   if (!isAdmin()) return emptyState("shield", "需要管理员权限", "请使用管理员账户登录后访问管理面板。");
+  const page = activeAdminPage();
   return h("div", { class: "panel" }, [
-    h("div", { class: "panel__inner" }, [
-      renderAccountManagement(),
-      renderOAuthSettings(),
-      renderRuntimeSettings(),
-      renderHermesConfig(),
-      renderHermesInternalConfig(),
-      renderCogneeInternalConfig(),
-      renderSecretsSettings(),
+    h("div", { class: "panel__inner admin-panel" }, [
+      renderAdminPager(page.id),
+      h("div", { class: `admin-page admin-page--${page.id}` }, [
+        h("div", { class: "admin-page__head" }, [
+          h("div", {}, [
+            h("div", { class: "eyebrow", text: "管理分页" }),
+            h("h2", { text: page.label }),
+            h("p", { text: page.description }),
+          ]),
+          h("span", { class: "status", text: `${ADMIN_PAGES.findIndex((item) => item.id === page.id) + 1}/${ADMIN_PAGES.length}` }),
+        ]),
+        h("div", { class: "admin-page__content" }, renderAdminPageSections(page.id)),
+      ]),
     ]),
   ]);
+}
+
+function activeAdminPage() {
+  return ADMIN_PAGES.find((page) => page.id === state.activeAdminPage) || ADMIN_PAGES[0];
+}
+
+function renderAdminPager(activeId) {
+  return h("nav", { class: "admin-pager", "aria-label": "管理面板分页" }, ADMIN_PAGES.map((page) => {
+    const active = page.id === activeId;
+    return h("button", {
+      class: `admin-pager__item ${active ? "is-active" : ""}`,
+      type: "button",
+      "aria-current": active ? "page" : null,
+      onclick: () => {
+        state.activeAdminPage = page.id;
+        render();
+      },
+    }, [
+      icon(page.icon, { size: 16 }),
+      h("span", { text: page.label }),
+      adminPageBadge(page.id),
+    ]);
+  }));
+}
+
+function adminPageBadge(pageId) {
+  const value = {
+    accounts: state.users.length,
+    model: state.oauthProviders?.providers?.length || 0,
+    runtime: state.runtimes ? Object.keys(state.runtimes).length : 0,
+    secrets: state.secrets.filter((secret) => !isOAuthSecret(secret.key)).length,
+  }[pageId];
+  return value ? h("span", { class: "admin-pager__badge", text: String(value) }) : null;
+}
+
+function renderAdminPageSections(pageId) {
+  if (pageId === "accounts") return [renderAccountManagement()];
+  if (pageId === "model") return [renderOAuthSettings(), renderHermesConfig()];
+  if (pageId === "runtime") return [renderRuntimeSettings()];
+  if (pageId === "hermes") return [renderHermesInternalConfig()];
+  if (pageId === "cognee") return [renderCogneeInternalConfig()];
+  if (pageId === "secrets") return [renderSecretsSettings()];
+  return [renderAccountManagement()];
 }
 
 function renderAccountManagement() {

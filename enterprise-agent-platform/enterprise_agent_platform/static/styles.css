@@ -737,6 +737,87 @@ select {
 .panel__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 2px; }
 .panel__header h2 { font-family: var(--font-display); font-size: 18px; font-weight: 500; }
 
+/* Admin paging */
+.admin-panel { gap: 14px; }
+.admin-pager {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: saturate(140%) blur(8px);
+  box-shadow: var(--shadow-1);
+}
+.admin-pager__item {
+  min-width: 0;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.admin-pager__item:hover { background: var(--surface-2); color: var(--ink); }
+.admin-pager__item.is-active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-soft-ink);
+}
+.admin-pager__item svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.admin-pager__item > span:not(.admin-pager__badge) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-pager__badge {
+  margin-left: auto;
+  min-width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.admin-page { display: grid; gap: 14px; min-width: 0; }
+.admin-page__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 2px 2px 0;
+}
+.admin-page__head h2 {
+  margin-top: 2px;
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 500;
+}
+.admin-page__head p {
+  max-width: 660px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.admin-page__content { display: grid; gap: 16px; min-width: 0; }
+
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
