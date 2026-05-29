@@ -93,13 +93,31 @@ class OAuthHTTPClient:
             raise OAuthFlowError(502, f"OAuth network request failed: {exc}") from exc
 
 
+MAX_OAUTH_SESSIONS = 100
+
+
 class OAuthFlowManager:
     def __init__(self, http_client: OAuthHTTPClient | None = None):
         self.http = http_client or OAuthHTTPClient()
         self._sessions: dict[str, dict[str, Any]] = {}
 
+    def _prune_sessions(self) -> None:
+        """Evict timed-out flow sessions (and the oldest if still over cap).
+
+        Without this, abandoned verification flows accumulate forever because a
+        session is otherwise only removed when it is explicitly polled/completed.
+        """
+        now = time.time()
+        for flow_id in [fid for fid, s in self._sessions.items() if now > float(s.get("expires_at", 0))]:
+            self._sessions.pop(flow_id, None)
+        if len(self._sessions) > MAX_OAUTH_SESSIONS:
+            ordered = sorted(self._sessions.items(), key=lambda kv: float(kv[1].get("expires_at", 0)))
+            for flow_id, _ in ordered[: len(self._sessions) - MAX_OAUTH_SESSIONS]:
+                self._sessions.pop(flow_id, None)
+
     def start(self, provider: str) -> dict[str, Any]:
         provider = normalize_oauth_provider(provider)
+        self._prune_sessions()
         if provider == "openai-codex":
             return self._start_codex()
         if provider == "xai-oauth":

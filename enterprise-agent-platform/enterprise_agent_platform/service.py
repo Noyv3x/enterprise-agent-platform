@@ -5,6 +5,8 @@ import re
 import secrets
 import hashlib
 import mimetypes
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -65,6 +67,18 @@ MIN_PASSWORD_LENGTH = 8
 BOOTSTRAP_ADMIN_PASSWORD_FILE = "bootstrap-admin-password.txt"
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 8
+# A per-account ceiling across all client identities, so a distributed brute
+# force (rotating source IPs / X-Forwarded-For) against one username is still
+# bounded even though the per-(user, client) limit alone could be evaded.
+MAX_LOGIN_FAILURES_PER_USER = 50
+# Bound in-memory agent state so a flood of @agent messages or many idle
+# conversations cannot grow memory without limit.
+MAX_AGENT_QUEUE_DEPTH = 64
+MAX_TRACKED_CONVERSATIONS = 1000
+# Cognee ingestion is heavy; it runs on a background worker so document creation
+# never blocks the request thread (and, via the DB, every other request).
+MAX_INGEST_QUEUE_DEPTH = 256
+MAX_TRACKED_INGEST_RESULTS = 1000
 SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
     "image/png",
     "image/jpeg",
@@ -145,12 +159,13 @@ class EnterpriseService:
         runtime_process_launcher=None,
         runtime_command_runner=None,
         oauth_http_client=None,
+        container_command_runner=None,
         autostart_runtime: bool = True,
     ):
         self.config = config
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(config.db_path)
-        self.tokens = TokenSigner(config.token_secret, config.token_ttl_seconds)
+        self.tokens = TokenSigner(self._resolve_session_secret(), config.token_ttl_seconds)
         self.knowledge = KnowledgeBase(self.db)
         self.runtimes = PlatformRuntimeManager(
             config,
@@ -160,7 +175,7 @@ class EnterpriseService:
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
-        self.containers = ContainerManager(config, self.db)
+        self.containers = ContainerManager(config, self.db, runner=container_command_runner)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
         self.oauth_flows = OAuthFlowManager(oauth_http_client)
         self._conversation_lock = threading.RLock()
@@ -170,6 +185,11 @@ class EnterpriseService:
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
         self._auth_lock = threading.RLock()
         self._login_failures: dict[tuple[str, str], Deque[float]] = {}
+        self._login_failures_by_user: dict[str, Deque[float]] = {}
+        self._ingest_lock = threading.Lock()
+        self._ingest_queue: Deque[dict[str, Any]] = deque()
+        self._ingest_thread: threading.Thread | None = None
+        self._ingest_results: dict[int, dict[str, Any]] = {}
         self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
@@ -183,6 +203,10 @@ class EnterpriseService:
             workers = list(self._agent_workers.values())
         for worker in workers:
             worker.join(timeout=2)
+        with self._ingest_lock:
+            ingest = self._ingest_thread
+        if ingest is not None:
+            ingest.join(timeout=2)
         self.runtimes.close()
         self.db.close()
 
@@ -230,6 +254,30 @@ class EnterpriseService:
         except OSError:
             pass
         return password, False
+
+    def _resolve_session_secret(self) -> str:
+        """Resolve a stable HMAC signing secret for session tokens.
+
+        Precedence: an explicit ``ENTERPRISE_SESSION_SECRET`` env var wins so
+        operators can rotate it; otherwise reuse a value previously persisted in
+        the settings table; otherwise persist this process's secret so it stays
+        stable across restarts. Without persistence, ``config.token_secret``
+        falls back to a fresh random value on every boot, which would silently
+        invalidate every outstanding session/token each time the service
+        restarts (including systemd auto-restarts).
+        """
+        env_secret = os.getenv("ENTERPRISE_SESSION_SECRET")
+        if env_secret:
+            return env_secret
+        row = self.db.query_one(
+            "SELECT value FROM settings WHERE key = ? AND secret = 1",
+            ("ENTERPRISE_SESSION_SECRET",),
+        )
+        if row and row["value"]:
+            return str(row["value"])
+        secret = self.config.token_secret or secrets.token_urlsafe(32)
+        self.set_setting("ENTERPRISE_SESSION_SECRET", secret, secret=True)
+        return secret
 
     def create_user(
         self,
@@ -290,31 +338,39 @@ class EnterpriseService:
         self._clear_login_failures(clean_username, client_id)
         self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), user["id"]))
         public = self.public_user(user)
-        return self.tokens.issue(int(user["id"])), public
+        return self.tokens.issue(int(user["id"]), int(user.get("token_version") or 1)), public
 
     def _check_login_rate_limit(self, username: str, client_id: str) -> None:
         key = self._login_failure_key(username, client_id)
         now = time.time()
         with self._auth_lock:
-            failures = self._login_failures.get(key)
-            if not failures:
-                return
-            self._trim_login_failures(failures, now)
-            if len(failures) >= MAX_LOGIN_FAILURES:
-                raise ServiceError(429, "too many failed login attempts; try again later")
+            per_client = self._login_failures.get(key)
+            if per_client:
+                self._trim_login_failures(per_client, now)
+                if len(per_client) >= MAX_LOGIN_FAILURES:
+                    raise ServiceError(429, "too many failed login attempts; try again later")
+            per_user = self._login_failures_by_user.get(key[0])
+            if per_user:
+                self._trim_login_failures(per_user, now)
+                if len(per_user) >= MAX_LOGIN_FAILURES_PER_USER:
+                    raise ServiceError(429, "too many failed login attempts; try again later")
 
     def _record_login_failure(self, username: str, client_id: str) -> None:
         key = self._login_failure_key(username, client_id)
         now = time.time()
         with self._auth_lock:
-            failures = self._login_failures.setdefault(key, deque())
-            self._trim_login_failures(failures, now)
-            failures.append(now)
+            for failures in (
+                self._login_failures.setdefault(key, deque()),
+                self._login_failures_by_user.setdefault(key[0], deque()),
+            ):
+                self._trim_login_failures(failures, now)
+                failures.append(now)
 
     def _clear_login_failures(self, username: str, client_id: str) -> None:
         key = self._login_failure_key(username, client_id)
         with self._auth_lock:
             self._login_failures.pop(key, None)
+            self._login_failures_by_user.pop(key[0], None)
 
     @staticmethod
     def _trim_login_failures(failures: Deque[float], now: float) -> None:
@@ -334,10 +390,24 @@ class EnterpriseService:
         payload = self.tokens.verify(token)
         if not payload:
             return None
-        user = self.get_user(payload.user_id)
-        if not user or not user.get("active"):
+        row = self.db.query_one(
+            "SELECT active, token_version FROM users WHERE id = ?",
+            (payload.user_id,),
+        )
+        if not row or not row.get("active"):
             return None
-        return user
+        # Reject tokens minted before a session-invalidating change (password
+        # reset, role/permission change, deactivation, explicit revoke).
+        if int(row.get("token_version") or 1) != int(payload.version):
+            return None
+        return self.get_user(payload.user_id)
+
+    def revoke_user_sessions(self, user_id: int) -> None:
+        """Invalidate all outstanding session tokens for a user."""
+        self.db.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+            (int(user_id),),
+        )
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
         row = self.db.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
@@ -414,7 +484,18 @@ class EnterpriseService:
         if not updates:
             return self.get_user(user_id) or {}
         self._guard_admin_update(actor, current, updates)
+        # Invalidate existing sessions when credentials or privileges change, or
+        # when the account is deactivated, so a captured token cannot outlive a
+        # password reset or a permission downgrade.
+        bump_sessions = (
+            "password_hash" in updates
+            or "permission_group" in updates
+            or "role" in updates
+            or updates.get("active") == 0
+        )
         assignments = ", ".join(f"{key} = ?" for key in updates)
+        if bump_sessions:
+            assignments += ", token_version = token_version + 1"
         self.db.execute(
             f"UPDATE users SET {assignments} WHERE id = ?",
             [*updates.values(), user_id],
@@ -464,6 +545,7 @@ class EnterpriseService:
                 raise ServiceError(400, "at least one active admin account is required")
 
     def list_channels(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        require_permission(actor, PERMISSION_READ_WORKSPACE)
         rows = self.db.query(
             """
             SELECT c.*, (
@@ -497,6 +579,13 @@ class EnterpriseService:
         return dict(row)
 
     def list_messages(self, actor: dict[str, Any], scope_type: str, scope_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        # Reads are authorized like any other scope access: channels require
+        # read_workspace, private conversations require private_agent and must
+        # belong to the actor. (Internal callers use _messages_for_scope.)
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        return self._messages_for_scope(scope_type, scope_id, limit)
+
+    def _messages_for_scope(self, scope_type: str, scope_id: str, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 300))
         rows = self.db.query(
             """
@@ -507,8 +596,14 @@ class EnterpriseService:
             """,
             (scope_type, str(scope_id), limit),
         )
-        messages = [self._message_from_row(row) for row in reversed(rows)]
-        return messages
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def latest_message_id(self, scope_type: str, scope_id: str) -> int:
+        row = self.db.query_one(
+            "SELECT MAX(id) AS mid FROM messages WHERE scope_type = ? AND scope_id = ?",
+            (scope_type, str(scope_id)),
+        )
+        return int(row["mid"]) if row and row["mid"] is not None else 0
 
     def audit_channel_messages(self, actor: dict[str, Any], channel_id: int, limit: int = 200) -> dict[str, Any]:
         require_admin(actor)
@@ -873,7 +968,9 @@ class EnterpriseService:
             progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
             content_callback=lambda delta: self._record_agent_content_delta("private", scope_id, delta),
         )
-        clean_content, generated_attachments = self._extract_generated_attachments(result.content)
+        clean_content, generated_attachments = self._extract_generated_attachments(
+            result.content, owner_id=int(scope_id)
+        )
         self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
         metadata = {
             "session_id": result.session_id,
@@ -977,6 +1074,58 @@ class EnterpriseService:
         self.runtimes.ensure_cognee_ready()
         return self.cognee_config(actor)
 
+    def _hermes_repo_allowed_roots(self) -> list[Path]:
+        """Trusted base directories a managed Hermes source path may live under.
+
+        Defaults to ONLY the bundled submodule directory (the parent tree is not
+        trusted, because it contains agent/user-writable storage such as the
+        workspaces). Operators can widen this via
+        ``ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS`` (os.pathsep separated). This is
+        the trust boundary that prevents a (possibly compromised) web admin from
+        pointing the source path at an attacker-influenced directory, which
+        would otherwise run code via ``pip install -e <dir>`` and the gateway.
+        """
+        roots: list[Path] = []
+        for base in (self.config.hermes_repo,):
+            try:
+                roots.append(base.resolve())
+            except OSError:
+                continue
+        for raw in os.getenv("ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS", "").split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                try:
+                    roots.append(Path(raw).expanduser().resolve())
+                except OSError:
+                    continue
+        return roots
+
+    def _validate_hermes_repo_path(self, repo_path: str) -> str:
+        try:
+            candidate = Path(repo_path).expanduser().resolve()
+        except OSError as exc:
+            raise ServiceError(400, "Hermes source path is invalid") from exc
+        if not candidate.is_dir():
+            raise ServiceError(400, "Hermes source path does not exist")
+        if not (candidate / "pyproject.toml").exists():
+            raise ServiceError(400, "Hermes source path must contain pyproject.toml")
+        # Never install from agent/user-writable storage (the workspace tree)
+        # even if an override root were to cover it.
+        try:
+            workspace_root = self.config.workspace_dir.resolve()
+        except OSError:
+            workspace_root = None
+        if workspace_root is not None and (candidate == workspace_root or candidate.is_relative_to(workspace_root)):
+            raise ServiceError(403, "Hermes source path must not be inside the agent workspace")
+        roots = self._hermes_repo_allowed_roots()
+        if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
+            raise ServiceError(
+                403,
+                "Hermes source path must be located under a trusted directory; set "
+                "ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS to permit additional locations",
+            )
+        return str(candidate)
+
     def update_hermes_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         if "manage_hermes" in body:
@@ -985,7 +1134,7 @@ class EnterpriseService:
             repo_path = str(body.get("repo_path", "")).strip()
             if not repo_path:
                 raise ServiceError(400, "Hermes source path is required")
-            self.set_setting(HERMES_SETTING_REPO, str(Path(repo_path).expanduser()))
+            self.set_setting(HERMES_SETTING_REPO, self._validate_hermes_repo_path(repo_path))
         if "api_url" in body:
             api_url = str(body.get("api_url", "")).strip()
             parsed = urllib.parse.urlparse(api_url)
@@ -1203,12 +1352,67 @@ class EnterpriseService:
             source=str(body.get("source", "")),
             created_by=actor["id"],
         )
-        doc["cognee"] = self.cognee.ingest_document(
-            title=doc["title"],
-            content=doc["content"],
-            source=doc.get("source", ""),
-        )
+        doc["cognee"] = self._queue_cognee_ingest(doc)
         return doc
+
+    def _queue_cognee_ingest(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Schedule Cognee ingestion off the request thread.
+
+        Cognee's add+cognify can take many seconds; running it inline would hold
+        the request thread (and contend on the database) for the whole graph
+        build. For the local backend ingestion is a no-op, so we return the
+        immediate (synchronous) result and skip the worker entirely.
+        """
+        if self.config.knowledge_backend not in {"hybrid", "cognee"}:
+            return self.cognee.ingest_document(
+                title=doc["title"], content=doc["content"], source=doc.get("source", "")
+            )
+        with self._ingest_lock:
+            if self._closed:
+                return {"attempted": False, "available": False, "error": "service shutting down"}
+            self._ingest_queue.append(
+                {
+                    "document_id": doc.get("id"),
+                    "title": doc["title"],
+                    "content": doc["content"],
+                    "source": doc.get("source", ""),
+                }
+            )
+            while len(self._ingest_queue) > MAX_INGEST_QUEUE_DEPTH:
+                self._ingest_queue.popleft()
+            if self._ingest_thread is None or not self._ingest_thread.is_alive():
+                self._ingest_thread = threading.Thread(
+                    target=self._ingest_worker, name="cognee-ingest", daemon=True
+                )
+                self._ingest_thread.start()
+        return {"attempted": True, "available": True, "queued": True, "document_id": doc.get("id")}
+
+    def _ingest_worker(self) -> None:
+        while True:
+            with self._ingest_lock:
+                if self._closed or not self._ingest_queue:
+                    self._ingest_thread = None
+                    return
+                job = self._ingest_queue.popleft()
+            try:
+                result = self.cognee.ingest_document(
+                    title=job["title"], content=job["content"], source=job["source"]
+                )
+            except Exception as exc:  # never let a bad ingest kill the worker
+                result = {"attempted": True, "available": True, "error": str(exc)}
+            if result.get("error"):
+                print(f"Cognee ingest failed for document {job.get('document_id')}: {result['error']}", file=sys.stderr)
+            doc_id = job.get("document_id")
+            if doc_id is not None:
+                with self._ingest_lock:
+                    self._ingest_results[int(doc_id)] = result
+                    while len(self._ingest_results) > MAX_TRACKED_INGEST_RESULTS:
+                        self._ingest_results.pop(next(iter(self._ingest_results)), None)
+
+    def cognee_ingest_result(self, document_id: int) -> dict[str, Any] | None:
+        with self._ingest_lock:
+            result = self._ingest_results.get(int(document_id))
+            return dict(result) if result else None
 
     def search_knowledge(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         local = [hit.to_dict() for hit in self.knowledge.search(query, limit)]
@@ -1216,8 +1420,10 @@ class EnterpriseService:
             return local[:limit]
         cognee_hits = self.cognee.search(query, limit=max(0, limit - len(local)))
         if self.config.knowledge_backend == "cognee":
-            return cognee_hits or local[:limit]
-        return (local + cognee_hits)[:limit]
+            return _dedupe_knowledge_hits(cognee_hits or local)[:limit]
+        # Local (bm25-ranked) results lead; cognee graph results follow. Dedupe
+        # so the same document is not surfaced twice across backends.
+        return _dedupe_knowledge_hits(local + cognee_hits)[:limit]
 
     def get_knowledge_document(self, document_id: int) -> dict[str, Any]:
         doc = self.knowledge.get_document(document_id)
@@ -1225,12 +1431,35 @@ class EnterpriseService:
             raise ServiceError(404, "knowledge document not found")
         return doc
 
+    # User-facing knowledge reads require read_workspace. The bare
+    # search_knowledge/get_knowledge_document methods stay unauthenticated for
+    # the agent-tool boundary, which is gated separately by the agent token.
+    def list_knowledge_documents(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        require_permission(actor, PERMISSION_READ_WORKSPACE)
+        return self.knowledge.list_documents()
+
+    def user_search_knowledge(self, actor: dict[str, Any], query: str, limit: int = 5) -> list[dict[str, Any]]:
+        require_permission(actor, PERMISSION_READ_WORKSPACE)
+        return self.search_knowledge(query, limit)
+
+    def user_knowledge_document(self, actor: dict[str, Any], document_id: int) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_READ_WORKSPACE)
+        return self.get_knowledge_document(document_id)
+
     def knowledge_status(self) -> dict[str, Any]:
+        with self._ingest_lock:
+            ingest_pending = len(self._ingest_queue)
+        fts = bool(getattr(self.db, "fts_available", False))
         return {
-            "local": {"available": True, "backend": "sqlite-fts"},
+            "local": {
+                "available": True,
+                "backend": "sqlite-fts" if fts else "sqlite-like",
+                "fts5": fts,
+            },
             "cognee": self.cognee.status().to_dict(),
             "mode": self.config.knowledge_backend,
             "dataset": self.config.cognee_dataset,
+            "ingest_pending": ingest_pending,
         }
 
     def get_setting(self, key: str) -> str | None:
@@ -1445,6 +1674,27 @@ class EnterpriseService:
         with self._conversation_lock:
             return self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
 
+    def _prune_agent_status_locked(self) -> None:
+        """Drop the oldest idle conversation statuses once the cap is exceeded.
+
+        Must be called while holding ``_conversation_lock``. Only conversations
+        that are idle with no queued work and no live worker are eligible, so an
+        active or queued conversation is never evicted.
+        """
+        if len(self._agent_status) <= MAX_TRACKED_CONVERSATIONS:
+            return
+        prunable = [
+            (status.get("updated_at") or 0, key)
+            for key, status in self._agent_status.items()
+            if status.get("state") == "idle"
+            and not self._agent_queues.get(key)
+            and not (self._agent_workers.get(key) and self._agent_workers[key].is_alive())
+        ]
+        prunable.sort()
+        excess = len(self._agent_status) - MAX_TRACKED_CONVERSATIONS
+        for _, key in prunable[:excess]:
+            self._agent_status.pop(key, None)
+
     def _enqueue_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         scope_type = str(task["scope_type"])
         scope_id = str(task["scope_id"])
@@ -1453,6 +1703,8 @@ class EnterpriseService:
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
             queue = self._agent_queues.setdefault(key, deque())
+            if len(queue) >= MAX_AGENT_QUEUE_DEPTH:
+                raise ServiceError(429, "agent is busy; too many queued messages for this conversation")
             queue.append(task)
             status = self._agent_status.get(key)
             if not status or status.get("state") == "idle":
@@ -1462,6 +1714,7 @@ class EnterpriseService:
                 status["queued_count"] = len(queue)
                 status["updated_at"] = now_ts()
             self._agent_status[key] = status
+            self._prune_agent_status_locked()
 
             worker = self._agent_workers.get(key)
             if worker is None or not worker.is_alive():
@@ -1524,6 +1777,7 @@ class EnterpriseService:
         scope_type = str(scope_type).strip().lower()
         scope_id = str(scope_id)
         if scope_type == "channel":
+            require_permission(actor, PERMISSION_READ_WORKSPACE)
             self.get_channel(actor, int(scope_id))
             return "channel", scope_id
         if scope_type == "private":
@@ -2001,19 +2255,103 @@ class EnterpriseService:
         keys = ("id", "filename", "mime_type", "size_bytes", "sha256", "is_image", "local_path")
         return [{key: item[key] for key in keys if key in item} for item in attachments]
 
-    def _extract_generated_attachments(self, content: str) -> tuple[str, list[UploadedFile]]:
+    def _media_safe_data_subtrees(self, owner_id: int | None) -> list[Path]:
+        """Subtrees under the platform data dir that ARE safe to read media from
+        (the agent's own workspace and the managed Hermes generated-media cache),
+        used to keep platform secrets unreadable even when the data dir overlaps
+        another allowed root such as the temp dir."""
+        if owner_id is not None:
+            workspace = self.config.workspace_dir / f"user-{int(owner_id)}"
+        else:
+            workspace = self.config.workspace_dir
+        subtrees: list[Path] = []
+        for path in (workspace, self.config.managed_hermes_home / "cache"):
+            try:
+                subtrees.append(path.resolve())
+            except OSError:
+                continue
+        return subtrees
+
+    def _media_allowed_roots(self, owner_id: int | None) -> list[Path]:
+        """Directories the platform will read agent-generated media from.
+
+        For a private conversation only the owning user's workspace is allowed;
+        a shared channel allows the whole workspace tree. Managed Hermes writes
+        generated documents/images/audio under its cache, so that subtree is
+        allowed too, plus the system temp dir and operator-configured
+        ``ENTERPRISE_MEDIA_ROOTS``. Platform secrets elsewhere under the data
+        directory (``platform.db``, the managed Hermes ``.env``, the bootstrap
+        admin password) are never readable — see ``_resolve_media_path``.
+        """
+        candidates = list(self._media_safe_data_subtrees(owner_id))
+        candidates.append(Path(tempfile.gettempdir()))
+        for raw in os.getenv("ENTERPRISE_MEDIA_ROOTS", "").split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                candidates.append(Path(raw).expanduser())
+        roots: list[Path] = []
+        for candidate in candidates:
+            try:
+                roots.append(candidate.resolve())
+            except OSError:
+                continue
+        return roots
+
+    def _resolve_media_path(self, raw_path: str, owner_id: int | None) -> Path | None:
+        """Resolve a model-supplied MEDIA: path, confining it to allowed roots.
+
+        Symlinks are resolved before the containment check so a symlink inside
+        an allowed root cannot point at a sensitive file outside it. Returns the
+        resolved path only when it is a regular file under an allowed media root
+        AND not a platform secret under the data dir; otherwise returns None.
+        """
+        try:
+            candidate = Path(os.path.expanduser(raw_path)).resolve()
+        except OSError:
+            return None
+        if not candidate.is_file():
+            return None
+        roots = self._media_allowed_roots(owner_id)
+        if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
+            return None
+        # Even within an allowed root (e.g. the temp dir overlapping a data dir
+        # that an operator relocated under /tmp), never serve platform secrets:
+        # reject anything under the data dir except the explicitly safe subtrees.
+        try:
+            data_root = self.config.data_dir.resolve()
+        except OSError:
+            return candidate
+        if candidate == data_root or candidate.is_relative_to(data_root):
+            safe = self._media_safe_data_subtrees(owner_id)
+            if not any(candidate == s or candidate.is_relative_to(s) for s in safe):
+                return None
+        return candidate
+
+    def _extract_generated_attachments(
+        self, content: str, owner_id: int | None = None
+    ) -> tuple[str, list[UploadedFile]]:
         content = str(content or "")
         attachments: list[UploadedFile] = []
         missing: list[str] = []
+        refused: list[str] = []
         for match in MEDIA_TAG_RE.finditer(content):
             raw_path = clean_media_path(match.group("path"))
             if not raw_path:
                 continue
-            path = Path(os.path.expanduser(raw_path))
-            if not path.exists() or not path.is_file():
-                missing.append(raw_path)
+            path = self._resolve_media_path(raw_path, owner_id)
+            if path is None:
+                # Distinguish "file is gone" from "file is outside the sandbox"
+                # for diagnostics, without reading anything out of scope.
+                try:
+                    exists = Path(os.path.expanduser(raw_path)).exists()
+                except OSError:
+                    exists = False
+                (refused if exists else missing).append(raw_path)
                 continue
             try:
+                if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+                    refused.append(raw_path)
+                    continue
                 data = path.read_bytes()
                 attachments.extend(
                     self._normalize_uploaded_files(
@@ -2023,15 +2361,22 @@ class EnterpriseService:
             except Exception:
                 missing.append(raw_path)
 
-        if not attachments and not missing:
+        if not attachments and not missing and not refused:
             return content, []
 
         cleaned = MEDIA_TAG_RE.sub("", content)
         cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        notes: list[str] = []
         if missing:
-            note = "Hermes returned file path(s) that the platform could not read: " + ", ".join(missing[:5])
-            cleaned = f"{cleaned}\n\n{note}".strip()
+            notes.append("Hermes returned file path(s) that the platform could not read: " + ", ".join(missing[:5]))
+        if refused:
+            notes.append(
+                "Hermes returned file path(s) outside the allowed media directories; they were not shared: "
+                + ", ".join(refused[:5])
+            )
+        if notes:
+            cleaned = (cleaned + "\n\n" + "\n".join(notes)).strip()
         return cleaned, attachments
 
     def _message_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -2049,7 +2394,7 @@ class EnterpriseService:
         }
 
     def _agent_history(self, scope_type: str, scope_id: str) -> list[dict[str, str]]:
-        messages = self.list_messages({"id": 0}, scope_type, scope_id, limit=30)
+        messages = self._messages_for_scope(scope_type, scope_id, limit=30)
         history: list[dict[str, str]] = []
         for msg in messages[:-1]:
             if msg["author_type"] == "user":
@@ -2078,7 +2423,7 @@ class EnterpriseService:
         return history
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
-        messages = self.list_messages({"id": 0}, scope_type, scope_id, limit=12)
+        messages = self._messages_for_scope(scope_type, scope_id, limit=12)
         return "\n".join([m["content"] for m in messages] + [content])
 
     def _recent_context_before(
@@ -2147,6 +2492,21 @@ class EnterpriseService:
             "企业知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
             f"{passive}"
         )
+
+
+def _dedupe_knowledge_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop hits sharing an id (e.g. a document returned by two backends),
+    preserving order. Cognee results carry distinct ids so they are not
+    collapsed together."""
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for hit in hits:
+        key = str(hit.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(hit)
+    return result
 
 
 def require_admin(actor: dict[str, Any]) -> None:

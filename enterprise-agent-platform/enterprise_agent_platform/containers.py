@@ -33,9 +33,11 @@ class PrivateContainer:
 
 
 class ContainerManager:
-    def __init__(self, config: PlatformConfig, db: Database):
+    def __init__(self, config: PlatformConfig, db: Database, *, runner=None):
         self.config = config
         self.db = db
+        # Injectable for tests; defaults to the real subprocess.run.
+        self._run = runner or subprocess.run
         self.config.workspace_dir.mkdir(parents=True, exist_ok=True)
 
     def ensure_private_container(
@@ -112,7 +114,7 @@ class ContainerManager:
         if self.config.container_backend == "docker":
             return "docker"
         try:
-            subprocess.run(
+            self._run(
                 ["docker", "info"],
                 check=True,
                 stdout=subprocess.DEVNULL,
@@ -122,6 +124,23 @@ class ContainerManager:
             return "docker"
         except Exception:
             return "local"
+
+    def _hardening_flags(self) -> list[str]:
+        """Restrict the per-user agent sandbox so a compromised agent has a
+        narrow host foothold: drop all capabilities, forbid privilege
+        escalation, and cap pids/memory/cpu/network."""
+        flags: list[str] = []
+        if self.config.container_harden:
+            flags += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
+            if self.config.container_pids_limit and self.config.container_pids_limit > 0:
+                flags += ["--pids-limit", str(int(self.config.container_pids_limit))]
+            if self.config.container_memory:
+                flags += ["--memory", self.config.container_memory]
+            if self.config.container_cpus:
+                flags += ["--cpus", self.config.container_cpus]
+        if self.config.container_network:
+            flags += ["--network", self.config.container_network]
+        return flags
 
     def _ensure_docker(
         self,
@@ -137,7 +156,7 @@ class ContainerManager:
             suffix = hashlib.sha256(f"{user_id}:{username}".encode("utf-8")).hexdigest()[:10]
             name = f"enterprise-agent-u{user_id}-{suffix}"
 
-        inspect = subprocess.run(
+        inspect = self._run(
             ["docker", "inspect", "-f", "{{.Id}} {{.State.Status}}", name],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -149,7 +168,7 @@ class ContainerManager:
             container_id = parts[0] if parts else ""
             status = parts[1] if len(parts) > 1 else "unknown"
             if status != "running":
-                subprocess.run(["docker", "start", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                self._run(["docker", "start", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
                 status = "running"
             return PrivateContainer(user_id, session_id, name, container_id, status, str(workspace), "docker")
 
@@ -163,12 +182,13 @@ class ContainerManager:
             f"{workspace.resolve()}:/workspace",
             "-w",
             "/workspace",
+            *self._hardening_flags(),
         ]
         for key, value in sorted(secrets_env.items()):
             if value:
                 cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([self.config.container_image, "tail", "-f", "/dev/null"])
         env = os.environ.copy()
-        created = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
+        created = self._run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
         container_id = created.stdout.strip()
         return PrivateContainer(user_id, session_id, name, container_id, "running", str(workspace), "docker")

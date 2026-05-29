@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from .config import PlatformConfig
 from .knowledge import summarize_content
+
+# How long a resolved Cognee availability status is trusted before being
+# re-evaluated, so availability changes after startup are eventually noticed.
+COGNEE_STATUS_TTL_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -34,28 +39,34 @@ class CogneeBridge:
         self.runtime_manager = runtime_manager
         self._module = None
         self._status: CogneeStatus | None = None
+        self._status_checked_at = 0.0
 
     def status(self) -> CogneeStatus:
-        if self._status is not None:
+        now = time.time()
+        if self._status is not None and (now - self._status_checked_at) < COGNEE_STATUS_TTL_SECONDS:
             return self._status
         backend = self._backend()
         if backend == "local":
             self._status = CogneeStatus(False, "local", "")
+            self._status_checked_at = now
             return self._status
         try:
             if self.runtime_manager is not None:
                 runtime = self.runtime_manager.ensure_cognee_ready()
                 if not runtime.available:
                     self._status = CogneeStatus(False, backend, runtime.error)
+                    self._status_checked_at = now
                     return self._status
             self._module = self._import_cognee()
             self._status = CogneeStatus(True, backend)
         except Exception as exc:
             self._status = CogneeStatus(False, backend, str(exc))
+        self._status_checked_at = now
         return self._status
 
     def refresh_status(self) -> CogneeStatus:
         self._status = None
+        self._status_checked_at = 0.0
         return self.status()
 
     def ingest_document(self, *, title: str, content: str, source: str = "") -> dict[str, Any]:

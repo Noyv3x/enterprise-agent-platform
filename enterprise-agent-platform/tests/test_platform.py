@@ -4,6 +4,7 @@ import http.client
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -413,6 +414,58 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(result.content, "好了，这次成功了。")
                 self.assertEqual(chunks, ["Now browser_vision call.\n\n", None, "好了，这次成功了。"])
                 self.assertEqual([event["status"] for event in progress], ["running", "completed"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_hermes_client_keeps_pre_tool_text_when_no_post_tool_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                events = [
+                    "data: "
+                    + json.dumps({"choices": [{"delta": {"content": "Here is the summary you asked for."}}]})
+                    + "\n\n",
+                    (
+                        "event: hermes.tool.progress\n"
+                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
+                    ),
+                    "data: [DONE]\n\n",
+                ]
+                for event in events:
+                    self.wfile.write(event.encode("utf-8"))
+                    self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                )
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="question",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                    progress_callback=lambda event: None,
+                    content_callback=lambda chunk: None,
+                )
+                # Pre-tool prose is preserved instead of being lost (which used
+                # to raise "no final streaming response").
+                self.assertEqual(result.content, "Here is the summary you asked for.")
         finally:
             server.shutdown()
             server.server_close()
@@ -1078,9 +1131,11 @@ class PlatformServiceTests(unittest.TestCase):
                 service.close()
 
     def test_agent_media_tags_are_saved_as_returned_attachments(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as media_td:
             tmp = Path(td)
-            media_path = tmp / "result.csv"
+            # Generated media lives outside the data dir (here a sibling temp
+            # dir, which is an allowed root) so it is not a platform secret.
+            media_path = Path(media_td) / "result.csv"
             media_path.write_text("a,b\n1,2\n", encoding="utf-8")
             agent = MediaReturningAgent(media_path)
             service = EnterpriseService(make_config(tmp), agent_client=agent)
@@ -1096,6 +1151,51 @@ class PlatformServiceTests(unittest.TestCase):
                 attachment, stored_path = service.get_attachment_file(user, agent_message["attachments"][0]["id"])
                 self.assertEqual(attachment["mime_type"], "text/csv")
                 self.assertEqual(stored_path.read_text(encoding="utf-8"), "a,b\n1,2\n")
+            finally:
+                service.close()
+
+    def test_agent_media_tags_outside_allowed_roots_are_refused(self):
+        # A path that exists but lives outside the temp dir and the workspace
+        # tree (here: next to the test file in the repo) must never be read and
+        # surfaced as an attachment, even though the file is present.
+        probe = Path(__file__).resolve().parent / "_media_denied_probe.csv"
+        if str(probe).startswith(tempfile.gettempdir()):
+            self.skipTest("repository tree is under the temp dir; cannot test refusal deterministically")
+        probe.write_text("secret,value\n1,2\n", encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                agent = MediaReturningAgent(probe)
+                service = EnterpriseService(make_config(tmp), agent_client=agent)
+                try:
+                    _, user = service.authenticate("admin", "admin")
+                    service.send_private_message(user, "exfiltrate please")
+                    service.wait_for_agent_idle("private", str(user["id"]))
+                    agent_message = service.list_messages(user, "private", str(user["id"]))[-1]
+                    self.assertEqual(agent_message["attachments"], [])
+                    self.assertIn("outside the allowed media directories", agent_message["content"])
+                finally:
+                    service.close()
+        finally:
+            probe.unlink(missing_ok=True)
+
+    def test_agent_media_cannot_exfiltrate_data_dir_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            # A secret-like file under the data dir (which the test harness puts
+            # under the temp dir) must be refused even though the temp dir is an
+            # allowed media root, because it is not in a safe data subtree.
+            secret = tmp / "secret-export.txt"
+            secret.write_text("session_secret=topsecret\n", encoding="utf-8")
+            agent = MediaReturningAgent(secret)
+            service = EnterpriseService(make_config(tmp), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "exfiltrate secrets")
+                service.wait_for_agent_idle("private", str(user["id"]))
+                msg = service.list_messages(user, "private", str(user["id"]))[-1]
+                self.assertEqual(msg["attachments"], [])
+                self.assertIn("outside the allowed media directories", msg["content"])
             finally:
                 service.close()
 
@@ -1541,6 +1641,52 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_update_hermes_config_rejects_untrusted_repo_path(self):
+        # A directory containing a pyproject.toml but located outside the
+        # trusted submodule tree must be rejected, so a web admin cannot drive
+        # `pip install -e <attacker dir>` (arbitrary code execution).
+        evil = Path(__file__).resolve().parent / "_evil_hermes_repo"
+        evil.mkdir(exist_ok=True)
+        (evil / "pyproject.toml").write_text("[project]\nname = 'evil'\nversion = '0'\n", encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                if str(evil).startswith(str(tmp)):
+                    self.skipTest("repository tree is under the temp dir; cannot test refusal deterministically")
+                make_fake_hermes_repo(tmp / "hermes-agent")
+                service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+                try:
+                    _, admin = service.authenticate("admin", "admin")
+                    with self.assertRaises(ServiceError) as ctx:
+                        service.update_hermes_config(admin, {"repo_path": str(evil)})
+                    self.assertEqual(ctx.exception.status, 403)
+                    # The trusted bundled path is still accepted.
+                    ok = service.update_hermes_config(admin, {"repo_path": str(tmp / "hermes-agent")})
+                    self.assertIn("repo_path", ok["config"])
+                finally:
+                    service.close()
+        finally:
+            shutil.rmtree(evil, ignore_errors=True)
+
+    def test_update_hermes_config_rejects_workspace_repo_path(self):
+        # An agent-writable workspace directory containing a pyproject.toml must
+        # be rejected so an agent cannot plant a build backend for an admin to
+        # install.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            planted = tmp / "workspaces" / "user-1"
+            planted.mkdir(parents=True, exist_ok=True)
+            (planted / "pyproject.toml").write_text("[project]\nname = 'x'\nversion = '0'\n", encoding="utf-8")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                with self.assertRaises(ServiceError) as ctx:
+                    service.update_hermes_config(admin, {"repo_path": str(planted)})
+                self.assertEqual(ctx.exception.status, 403)
+            finally:
+                service.close()
+
     def test_hermes_internal_config_exposes_yaml_and_env_without_leaking_secrets(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1882,6 +2028,243 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_password_change_revokes_existing_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                token, admin = service.authenticate("admin", "admin")
+                self.assertIsNotNone(service.user_from_token(token))
+                service.update_user(admin, admin["id"], {"password": "new-strong-password"})
+                # The previously issued token must no longer authenticate.
+                self.assertIsNone(service.user_from_token(token))
+                fresh_token, _ = service.authenticate("admin", "new-strong-password")
+                self.assertIsNotNone(service.user_from_token(fresh_token))
+            finally:
+                service.close()
+
+    def test_permission_change_and_explicit_revoke_invalidate_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="member1", password="member-password", actor=admin, permission_group="member"
+                )
+                token, _ = service.authenticate("member1", "member-password")
+                self.assertIsNotNone(service.user_from_token(token))
+                # Downgrading the permission group invalidates the live token.
+                service.update_user(admin, member["id"], {"permission_group": "viewer"})
+                self.assertIsNone(service.user_from_token(token))
+                # Explicit revoke also invalidates a fresh token.
+                token2, _ = service.authenticate("member1", "member-password")
+                self.assertIsNotNone(service.user_from_token(token2))
+                service.revoke_user_sessions(member["id"])
+                self.assertIsNone(service.user_from_token(token2))
+            finally:
+                service.close()
+
+    def test_tampered_and_expired_tokens_are_rejected(self):
+        from enterprise_agent_platform.auth import TokenSigner
+
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                token, _ = service.authenticate("admin", "admin")
+                self.assertIsNone(service.user_from_token(token + "tamper"))
+                self.assertIsNone(service.user_from_token("not.a.valid.token"))
+                self.assertIsNone(service.user_from_token(""))
+                secret = service.get_secret("ENTERPRISE_SESSION_SECRET")
+                self.assertTrue(secret)
+                expired = TokenSigner(secret, ttl_seconds=-10).issue(1, 1)
+                self.assertIsNone(service.user_from_token(expired))
+            finally:
+                service.close()
+
+    def test_database_handles_concurrent_threads(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                errors: list[Exception] = []
+
+                def worker(n: int) -> None:
+                    try:
+                        for i in range(20):
+                            service.db.execute(
+                                "INSERT INTO messages(scope_type, scope_id, author_type, user_id, "
+                                "username, content, created_at) VALUES ('channel', ?, 'system', NULL, '', ?, ?)",
+                                (f"t{n}", f"msg-{n}-{i}", 0),
+                            )
+                            service.db.query("SELECT COUNT(*) FROM messages")
+                    except Exception as exc:  # noqa: BLE001 - recorded for assertion
+                        errors.append(exc)
+
+                workers = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+                for t in workers:
+                    t.start()
+                for t in workers:
+                    t.join(timeout=30)
+                self.assertEqual(errors, [])
+                total = service.db.scalar("SELECT COUNT(*) FROM messages WHERE author_type = 'system'")
+                self.assertEqual(total, 8 * 20)
+            finally:
+                service.close()
+
+    def test_database_rejects_use_after_close(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            db = service.db
+            service.close()
+            # After close, a lingering caller gets a clean error, not an
+            # AttributeError from a None connection.
+            with self.assertRaises(sqlite3.ProgrammingError):
+                db.query("SELECT 1")
+
+    def test_agent_queue_depth_is_capped(self):
+        from enterprise_agent_platform.service import MAX_AGENT_QUEUE_DEPTH
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                self.assertTrue(agent.started.wait(timeout=5))
+                # The first task is now held in the worker; fill the queue to the
+                # cap, then the next enqueue must be rejected rather than growing
+                # memory without bound.
+                for i in range(MAX_AGENT_QUEUE_DEPTH):
+                    service.send_private_message(user, f"queued-{i}")
+                with self.assertRaises(ServiceError) as ctx:
+                    service.send_private_message(user, "overflow")
+                self.assertEqual(ctx.exception.status, 429)
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_cognee_ingest_runs_in_background(self):
+        from enterprise_agent_platform.cognee_bridge import CogneeStatus
+
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), knowledge_backend="hybrid")
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                done = threading.Event()
+                calls: list[str] = []
+
+                class FakeCognee:
+                    def ingest_document(self, *, title, content, source=""):
+                        calls.append(title)
+                        done.set()
+                        return {"attempted": True, "available": True, "dataset": "x"}
+
+                    def search(self, query, limit=5):
+                        return []
+
+                    def status(self):
+                        return CogneeStatus(True, "hybrid")
+
+                service.cognee = FakeCognee()
+                _, user = service.authenticate("admin", "admin")
+                doc = service.add_knowledge_document(user, {"title": "Async Doc", "content": "body"})
+                # The request returns immediately with a "queued" marker.
+                self.assertTrue(doc["cognee"].get("queued"))
+                # The heavy ingest happens on the background worker.
+                self.assertTrue(done.wait(timeout=5))
+                self.assertEqual(calls, ["Async Doc"])
+                result = service.cognee_ingest_result(doc["id"])
+                self.assertTrue(result and result.get("available"))
+            finally:
+                service.close()
+
+    def test_channel_and_private_reads_enforce_authorization(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                alice = service.create_user(
+                    username="alice", password="alice-password", actor=admin, permission_group="member"
+                )
+                bob = service.create_user(
+                    username="bob", password="bob-password", actor=admin, permission_group="member"
+                )
+                service.send_private_message(alice, "alice secret")
+                # Bob must not be able to read Alice's private conversation.
+                with self.assertRaises(ServiceError) as ctx:
+                    service.list_messages(bob, "private", str(alice["id"]))
+                self.assertEqual(ctx.exception.status, 403)
+                # Alice can read her own private conversation.
+                own = service.list_messages(alice, "private", str(alice["id"]))
+                self.assertTrue(any(m["content"] == "alice secret" for m in own))
+                # A permissionless actor cannot read channel history.
+                with self.assertRaises(ServiceError) as ctx2:
+                    service.list_messages({"id": 0}, "channel", "1")
+                self.assertEqual(ctx2.exception.status, 403)
+                # A member with read_workspace can read the channel.
+                self.assertIsInstance(service.list_messages(alice, "channel", "1"), list)
+            finally:
+                service.close()
+
+    def test_knowledge_reads_require_read_permission(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                doc = service.add_knowledge_document(admin, {"title": "Policy", "content": "secret policy"})
+                for call in (
+                    lambda: service.list_knowledge_documents({"id": 0}),
+                    lambda: service.user_search_knowledge({"id": 0}, "policy"),
+                    lambda: service.user_knowledge_document({"id": 0}, doc["id"]),
+                ):
+                    with self.assertRaises(ServiceError) as ctx:
+                        call()
+                    self.assertEqual(ctx.exception.status, 403)
+                # The token-gated agent-tool path still resolves documents.
+                self.assertEqual(service.get_knowledge_document(doc["id"])["title"], "Policy")
+            finally:
+                service.close()
+
+    def test_knowledge_status_reports_fts_and_ingest_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                status = service.knowledge_status()
+                self.assertTrue(status["local"]["available"])
+                self.assertEqual(status["local"]["fts5"], service.db.fts_available)
+                self.assertEqual(status["local"]["backend"], "sqlite-fts" if service.db.fts_available else "sqlite-like")
+                self.assertIn("ingest_pending", status)
+                self.assertEqual(status["mode"], "local")
+            finally:
+                service.close()
+
+    def test_docker_backend_applies_isolation_hardening(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), container_backend="docker")
+            runner_calls: list[list[str]] = []
+
+            def fake_run(cmd, **kwargs):
+                runner_calls.append(cmd)
+                if cmd[:2] == ["docker", "inspect"]:
+                    return SimpleNamespace(returncode=1, stdout="")
+                if cmd[:2] == ["docker", "run"]:
+                    return SimpleNamespace(returncode=0, stdout="cid123\n")
+                return SimpleNamespace(returncode=0, stdout="")
+
+            service = EnterpriseService(config, agent_client=RecordingAgent(), container_command_runner=fake_run)
+            try:
+                container = service.containers.ensure_private_container(user_id=1, username="admin", secrets_env={})
+                self.assertEqual(container.backend, "docker")
+                run_cmd = next(c for c in runner_calls if c[:2] == ["docker", "run"])
+                self.assertIn("--cap-drop", run_cmd)
+                self.assertIn("ALL", run_cmd)
+                self.assertIn("--security-opt", run_cmd)
+                self.assertIn("no-new-privileges", run_cmd)
+                self.assertIn("--pids-limit", run_cmd)
+                self.assertIn("--memory", run_cmd)
+                # No secrets are forwarded into the container with an empty env.
+                self.assertNotIn("-e", run_cmd)
+            finally:
+                service.close()
+
     def test_managed_cognee_environment_is_seeded_from_platform(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1978,6 +2361,95 @@ class PlatformHTTPTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
+    def test_csrf_requires_origin_for_cookie_requests_but_exempts_bearer(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                token, _ = service.authenticate("admin", "admin")
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                res.read()
+                cookie = res.getheader("Set-Cookie")
+
+                # A cookie-authenticated state-changing request with no Origin
+                # or Referer must be refused (closes the no-header CSRF bypass).
+                conn.request(
+                    "POST",
+                    "/api/channels",
+                    body=json.dumps({"name": "no-origin"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertIn("Origin", denied["error"])
+
+                # A bearer-token request is exempt (not forgeable cross-origin).
+                conn.request(
+                    "POST",
+                    "/api/channels",
+                    body=json.dumps({"name": "bearer-ok"}),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                )
+                res = conn.getresponse()
+                created = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 201)
+                self.assertEqual(created["channel"]["name"], "bearer-ok")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_scope_events_stream_emits_update(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                token, _ = service.authenticate("admin", "admin")
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/channels/1/events", headers={"Authorization": f"Bearer {token}"})
+                res = conn.getresponse()
+                self.assertEqual(res.status, 200)
+                self.assertIn("text/event-stream", res.getheader("Content-Type"))
+                buf = b""
+                event_block = None
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    chunk = res.read(1)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n\n" in buf:
+                        block, buf = buf.split(b"\n\n", 1)
+                        text = block.decode("utf-8")
+                        if text.startswith("event: update"):
+                            event_block = text
+                            break
+                    if event_block:
+                        break
+                self.assertIsNotNone(event_block)
+                self.assertIn('"agent_status"', event_block)
+                self.assertIn('"latest_message_id"', event_block)
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_attachment_inline_is_limited_to_safe_image_mime_types(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -2025,11 +2497,12 @@ class PlatformHTTPTests(unittest.TestCase):
             host, port = server.server_address
             try:
                 conn = http.client.HTTPConnection(host, port, timeout=5)
+                origin = f"http://{host}:{port}"
                 conn.request(
                     "POST",
                     "/api/auth/login",
                     body=json.dumps({"username": "admin", "password": "admin"}),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "Origin": origin},
                 )
                 res = conn.getresponse()
                 body = json.loads(res.read().decode("utf-8"))
@@ -2074,7 +2547,7 @@ class PlatformHTTPTests(unittest.TestCase):
                         "model_name": "gpt-5.3-codex",
                         "thinking_depth": "minimal",
                     }),
-                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 created_user = json.loads(res.read().decode("utf-8"))["user"]
@@ -2086,7 +2559,7 @@ class PlatformHTTPTests(unittest.TestCase):
                     "PUT",
                     f"/api/users/{created_user['id']}",
                     body=json.dumps({"permission_group": "manager", "thinking_depth": "high"}),
-                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 updated_user = json.loads(res.read().decode("utf-8"))["user"]
@@ -2098,7 +2571,7 @@ class PlatformHTTPTests(unittest.TestCase):
                     "POST",
                     f"/api/channels/{channels[0]['id']}/messages",
                     body=json.dumps({"content": "hello"}),
-                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 payload = json.loads(res.read().decode("utf-8"))
@@ -2123,7 +2596,7 @@ class PlatformHTTPTests(unittest.TestCase):
                     "POST",
                     f"/api/channels/{channels[0]['id']}/messages",
                     body=multipart,
-                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Cookie": cookie},
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 payload = json.loads(res.read().decode("utf-8"))
@@ -2147,7 +2620,7 @@ class PlatformHTTPTests(unittest.TestCase):
                     "POST",
                     f"/api/channels/{channels[0]['id']}/messages",
                     body=json.dumps({"content": "@agent hello"}),
-                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 payload = json.loads(res.read().decode("utf-8"))
@@ -2175,7 +2648,7 @@ class PlatformHTTPTests(unittest.TestCase):
                     "DELETE",
                     f"/api/admin/channels/{channels[0]['id']}/messages/{hello_message['id']}",
                     body="{}",
-                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
                 )
                 res = conn.getresponse()
                 delete_payload = json.loads(res.read().decode("utf-8"))

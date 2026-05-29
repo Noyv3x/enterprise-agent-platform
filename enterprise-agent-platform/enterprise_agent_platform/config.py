@@ -50,6 +50,12 @@ class PlatformConfig:
     firecrawl_api_url: str = "http://127.0.0.1:3002"
     firecrawl_command: str = ""
     allow_insecure_bootstrap_password: bool = False
+    trust_forwarded_headers: bool = False
+    container_harden: bool = True
+    container_memory: str = "512m"
+    container_cpus: str = ""
+    container_network: str = ""
+    container_pids_limit: int = 512
 
     @property
     def db_path(self) -> Path:
@@ -128,6 +134,12 @@ class PlatformConfig:
             firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
             allow_insecure_bootstrap_password=_env_bool("ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD", False),
+            trust_forwarded_headers=_env_bool("ENTERPRISE_TRUSTED_PROXY", False),
+            container_harden=_env_bool("ENTERPRISE_CONTAINER_HARDEN", True),
+            container_memory=os.getenv("ENTERPRISE_CONTAINER_MEMORY", "512m").strip(),
+            container_cpus=os.getenv("ENTERPRISE_CONTAINER_CPUS", "").strip(),
+            container_network=os.getenv("ENTERPRISE_CONTAINER_NETWORK", "").strip(),
+            container_pids_limit=int(os.getenv("ENTERPRISE_CONTAINER_PIDS_LIMIT", "512") or "512"),
         )
 
 

@@ -60,9 +60,10 @@ class TokenPayload:
     user_id: int
     expires_at: int
     nonce: str
+    version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
-        return {"uid": self.user_id, "exp": self.expires_at, "nonce": self.nonce}
+        return {"uid": self.user_id, "exp": self.expires_at, "nonce": self.nonce, "ver": self.version}
 
 
 class TokenSigner:
@@ -72,11 +73,12 @@ class TokenSigner:
         self._secret = secret.encode("utf-8")
         self._ttl_seconds = ttl_seconds
 
-    def issue(self, user_id: int) -> str:
+    def issue(self, user_id: int, version: int = 1) -> str:
         payload = TokenPayload(
             user_id=user_id,
             expires_at=int(time.time()) + self._ttl_seconds,
             nonce=secrets.token_urlsafe(12),
+            version=int(version),
         )
         body = _b64url(json.dumps(payload.to_dict(), separators=(",", ":")).encode("utf-8"))
         sig = _b64url(hmac.new(self._secret, body.encode("ascii"), hashlib.sha256).digest())
@@ -96,6 +98,7 @@ class TokenSigner:
                 user_id=int(data["uid"]),
                 expires_at=int(data["exp"]),
                 nonce=str(data["nonce"]),
+                version=int(data.get("ver", 1)),
             )
         except Exception:
             return None

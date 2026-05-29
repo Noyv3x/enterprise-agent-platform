@@ -214,7 +214,7 @@ class HermesAgentClient:
         content_callback: AgentContentCallback | None,
     ) -> AgentResult:
         content_parts: list[str] = []
-        prior_content_before_substantive_tool = False
+        last_cleared = ""
         raw_events: list[dict[str, Any]] = []
         event_count = 0
         event_name = "message"
@@ -227,7 +227,7 @@ class HermesAgentClient:
             del raw_events[:-50]
 
         def dispatch_event() -> bool:
-            nonlocal event_name, data_lines
+            nonlocal event_name, data_lines, last_cleared
             if not data_lines:
                 event_name = "message"
                 return False
@@ -243,8 +243,13 @@ class HermesAgentClient:
                 if isinstance(payload, dict):
                     remember(event, payload)
                     if is_substantive_tool_start(payload) and content_parts:
+                        # Break the live stream into a new segment, but keep the
+                        # pre-tool prose as a fallback so it is never lost from
+                        # the final result (the previous code cleared it, which
+                        # discarded legitimate text and could spuriously raise
+                        # "no final streaming response").
+                        last_cleared = "".join(content_parts)
                         content_parts.clear()
-                        prior_content_before_substantive_tool = True
                         emit_content_segment_break(content_callback)
                     self._emit_progress(progress_callback, payload)
                 return False
@@ -282,13 +287,10 @@ class HermesAgentClient:
             "event_count": event_count,
             "events": raw_events,
         }
-        content = "".join(content_parts)
+        # Prefer post-tool text; fall back to the last pre-tool prose so a
+        # tool-only tail does not lose the model's earlier answer.
+        content = "".join(content_parts) or last_cleared
         if not content:
-            if prior_content_before_substantive_tool:
-                raise ValueError(
-                    "Hermes returned no final streaming response after substantive tool calls "
-                    f"({event_count} events)"
-                )
             raise ValueError(f"Hermes returned an empty streaming response after {event_count} events")
         return AgentResult(content=content, session_id=response_session, raw=raw)
 

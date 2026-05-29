@@ -70,11 +70,39 @@ async function api(path, options = {}) {
     ...options,
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  let data = {};
+  if (text) {
+    // The server always returns JSON, but a fronting proxy can emit an HTML
+    // 502/504 page (or an HTML login redirect); don't blow up on those.
+    try { data = JSON.parse(text); } catch (_) { data = {}; }
+  }
+  if (res.status === 401 && !options.skipAuthHandling) {
+    handleSessionExpired();
+  }
   if (!res.ok) {
-    throw new Error(data.error || data.detail || `${res.status} ${res.statusText}`);
+    throw new Error(data.error || data.detail || `请求失败（${res.status}）`);
   }
   return data;
+}
+
+// Only http(s)/relative URLs (plus mailto/tel) are allowed as link targets so a
+// compromised or unexpected backend value such as "javascript:..." cannot run
+// when an anchor is clicked. src attributes additionally allow data:/blob: for
+// inline image previews.
+function safeUrl(value, { allowData = false } = {}) {
+  // Strip control chars (incl. tab/newline/CR) first, so something like
+  // "java\tscript:alert(1)" cannot smuggle a blocked scheme past the allow-list.
+  const raw = String(value == null ? "" : value).replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (!raw) return "";
+  if (/^(\/|\.|#|\?)/.test(raw)) return raw;
+  const match = /^([a-z][a-z0-9+.-]*):/i.exec(raw);
+  if (!match) return raw;
+  const scheme = match[1].toLowerCase();
+  // blob: is safe for links: such URLs are minted in-page by the app (OAuth
+  // credential export, optimistic attachment previews), never backend-supplied.
+  // data: is permitted only for src (images), never for href (data:text/html).
+  const allowed = allowData ? ["http", "https", "blob", "data"] : ["http", "https", "mailto", "tel", "blob"];
+  return allowed.includes(scheme) ? raw : "";
 }
 
 /* ------------------------------------------------------ DOM builders */
@@ -84,6 +112,8 @@ function h(tag, attrs = {}, children = []) {
     if (key === "class") node.className = value;
     else if (key === "text") node.textContent = value;
     else if (key.startsWith("on") && typeof value === "function") node.addEventListener(key.slice(2).toLowerCase(), value);
+    else if (key === "href") { const safe = safeUrl(value); if (safe) node.setAttribute("href", safe); }
+    else if (key === "src" || key === "xlink:href") { const safe = safeUrl(value, { allowData: true }); if (safe) node.setAttribute(key, safe); }
     else if (value !== false && value != null) node.setAttribute(key, value === true ? "" : String(value));
   }
   for (const child of Array.isArray(children) ? children : [children]) {
@@ -236,6 +266,7 @@ function afterRender(messageScroll) {
     if (ta) { ta.focus(); autoGrow(ta); }
     state._focusComposer = false;
   }
+  syncScopeStream();
 }
 function captureMessageScroll() {
   const msgs = app.querySelector(".messages");
@@ -300,7 +331,7 @@ function emptyState(iconName, title, text) {
 
 /* ---------------------------------------------------------------- login */
 function renderLogin() {
-  const username = h("input", { name: "username", autocomplete: "username", placeholder: "用户名", value: "admin" });
+  const username = h("input", { name: "username", autocomplete: "username", placeholder: "用户名" });
   const password = h("input", { name: "password", type: "password", autocomplete: "current-password", placeholder: "密码" });
   const form = h("form", {
     onsubmit: async (event) => {
@@ -2281,17 +2312,65 @@ async function refreshActiveChat({ renderAfter = true } = {}) {
 }
 function startPolling() {
   if (pollTimer) return;
-  pollTimer = setInterval(() => refreshActiveChat(), 600);
+  // Real-time updates arrive via the SSE stream (syncScopeStream); this poll is
+  // only a low-frequency safety net for when the stream is unavailable.
+  pollTimer = setInterval(() => refreshActiveChat(), 4000);
 }
 function stopPolling() {
-  if (!pollTimer) return;
-  clearInterval(pollTimer);
-  pollTimer = null;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  closeScopeStream();
   if (typingState.stopTimer) {
     clearTimeout(typingState.stopTimer);
     typingState.stopTimer = null;
   }
   typingState.active = false;
+}
+
+let scopeStream = null;
+let scopeStreamKey = null;
+
+function currentScopeStreamUrl() {
+  if (state.activeView === "channel" && state.activeChannelId) return `/api/channels/${state.activeChannelId}/events`;
+  if (state.activeView === "private") return "/api/private-agent/events";
+  return null;
+}
+
+function closeScopeStream() {
+  if (scopeStream) {
+    try { scopeStream.close(); } catch (_) {}
+  }
+  scopeStream = null;
+  scopeStreamKey = null;
+}
+
+// Keep a single Server-Sent Events stream open for the active conversation so
+// agent activity and new messages surface immediately instead of waiting for
+// the poll. The browser auto-reconnects on error; the fallback poll covers gaps.
+function syncScopeStream() {
+  if (!state.user || typeof EventSource === "undefined") return;
+  const url = currentScopeStreamUrl();
+  if (!url) { closeScopeStream(); return; }
+  if (scopeStreamKey === url && scopeStream && scopeStream.readyState !== 2) return;
+  closeScopeStream();
+  scopeStreamKey = url;
+  const es = new EventSource(url, { withCredentials: true });
+  scopeStream = es;
+  es.addEventListener("update", () => {
+    if (scopeStream === es) refreshActiveChat();
+  });
+  es.addEventListener("error", () => {
+    if (scopeStream !== es) return;
+    // readyState 2 (CLOSED) means the browser gave up (e.g. the session
+    // expired and the request 401'd). Clean up and probe auth so an expired
+    // session drops to login promptly instead of waiting for the poll.
+    if (es.readyState === 2) {
+      closeScopeStream();
+      api("/api/auth/me").catch(() => {});
+    }
+  });
 }
 
 /* ----------------------------------------------------------------- oauth */
@@ -2360,6 +2439,18 @@ function updateOAuthState(providerId, result) {
 }
 
 /* ---------------------------------------------------------------- session */
+function handleSessionExpired() {
+  // Triggered when any API call returns 401 while we believed we were logged
+  // in: drop to the login screen instead of silently polling forever.
+  if (!state.user) return;
+  stopPolling();
+  state.user = null;
+  state.sidebarOpen = false;
+  hideMentionMenu();
+  toast("会话已过期，请重新登录", { type: "error", title: "需要登录" });
+  render();
+}
+
 async function logout() {
   await api("/api/auth/logout", { method: "POST" }).catch(() => {});
   stopPolling();

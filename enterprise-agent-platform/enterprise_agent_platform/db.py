@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -12,21 +13,86 @@ def now_ts() -> int:
     return int(time.time())
 
 
+class _ConnectionHolder:
+    """Owns one sqlite3 connection and closes it when garbage collected.
+
+    Stored in thread-local storage so a connection is closed automatically when
+    its owning thread dies (sqlite3.Connection is not weakref-able, but a plain
+    holder object is, which lets the Database track live connections in a
+    WeakSet without preventing that cleanup).
+    """
+
+    __slots__ = ("conn", "__weakref__")
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def close(self) -> None:
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class Database:
+    """SQLite access with one connection per thread.
+
+    WAL mode plus a per-connection busy timeout lets reads run concurrently and
+    serializes writes at the SQLite level, so no global Python lock is needed on
+    the hot path (the previous single-connection + RLock design serialized every
+    request and agent-worker thread platform-wide).
+    """
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._init_lock = threading.RLock()
+        self._holders: "weakref.WeakSet[_ConnectionHolder]" = weakref.WeakSet()
+        self._holders_lock = threading.Lock()
+        self.fts_available = False
+        self._closed = False
         self.init_schema()
 
+    def _new_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        holder = getattr(self._local, "holder", None)
+        # holder.conn can be None if another thread's close() ran; recreate it.
+        if holder is None or holder.conn is None:
+            holder = _ConnectionHolder(self._new_connection())
+            self._local.holder = holder
+            with self._holders_lock:
+                self._holders.add(holder)
+        return holder.conn
+
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self._closed = True
+        with self._holders_lock:
+            holders = list(self._holders)
+        for holder in holders:
+            holder.close()
+        try:
+            self._local.holder = None
+        except Exception:
+            pass
 
     def init_schema(self) -> None:
-        with self._lock:
+        with self._init_lock:
             self._conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -43,6 +109,7 @@ class Database:
                     model_name TEXT NOT NULL DEFAULT '',
                     thinking_depth TEXT NOT NULL DEFAULT 'medium',
                     active INTEGER NOT NULL DEFAULT 1,
+                    token_version INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
                     last_login_at INTEGER
                 );
@@ -127,6 +194,7 @@ class Database:
             "permission_group": "ALTER TABLE users ADD COLUMN permission_group TEXT NOT NULL DEFAULT 'member'",
             "model_name": "ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
             "thinking_depth": "ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'",
+            "token_version": "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1",
         }
         for name, sql in additions.items():
             if name not in columns:
@@ -169,40 +237,39 @@ class Database:
                 END;
                 """
             )
+            self.fts_available = True
         except sqlite3.OperationalError:
-            pass
+            # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
+            self.fts_available = False
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
-        with self._lock:
-            cur = self._conn.execute(sql, tuple(params))
-            self._conn.commit()
-            return cur
+        conn = self._conn
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        return cur
 
     def executemany(self, sql: str, seq: Iterable[Iterable[Any]]) -> None:
-        with self._lock:
-            self._conn.executemany(sql, seq)
-            self._conn.commit()
+        conn = self._conn
+        conn.executemany(sql, seq)
+        conn.commit()
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-            return [dict(row) for row in rows]
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def query_one(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(sql, tuple(params)).fetchone()
-            return dict(row) if row else None
+        row = self._conn.execute(sql, tuple(params)).fetchone()
+        return dict(row) if row else None
 
     def scalar(self, sql: str, params: Iterable[Any] = ()) -> Any:
-        with self._lock:
-            row = self._conn.execute(sql, tuple(params)).fetchone()
-            return row[0] if row else None
+        row = self._conn.execute(sql, tuple(params)).fetchone()
+        return row[0] if row else None
 
     def insert(self, sql: str, params: Iterable[Any] = ()) -> int:
-        with self._lock:
-            cur = self._conn.execute(sql, tuple(params))
-            self._conn.commit()
-            return int(cur.lastrowid)
+        conn = self._conn
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        return int(cur.lastrowid)
 
 
 def encode_json(value: dict[str, Any] | list[Any] | None) -> str:

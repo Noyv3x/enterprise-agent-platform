@@ -1514,19 +1514,33 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {"version": 2, "providers": {}}
 
 
-def _write_json_secure(path: Path, data: dict[str, Any]) -> None:
+def _write_text_secure(path: Path, text: str) -> None:
+    """Atomically write text to ``path`` with owner-only (0600) permissions.
+
+    The temp file is created with 0600 from the start (via os.open) so secrets
+    are never briefly world/group readable, then atomically renamed into place.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        tmp.chmod(0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    os.replace(str(tmp), str(path))
     try:
         path.chmod(0o600)
     except OSError:
         pass
+
+
+def _write_json_secure(path: Path, data: dict[str, Any]) -> None:
+    _write_text_secure(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def _read_yaml_mapping(path: Path) -> dict[str, Any] | None:
@@ -1581,9 +1595,11 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Managed runtime .env files hold API_SERVER_KEY, the agent tool token and
+    # provider URLs, so they are written 0600 like auth.json rather than with
+    # the default umask.
     lines = [f"{key}={_quote_env(value)}" for key, value in sorted(values.items())]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_secure(path, "\n".join(lines) + "\n")
 
 
 def _quote_env(value: str) -> str:

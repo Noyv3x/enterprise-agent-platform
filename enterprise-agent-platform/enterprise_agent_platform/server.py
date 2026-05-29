@@ -6,6 +6,7 @@ import re
 import signal
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 from email import policy
@@ -24,6 +25,10 @@ COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Server-sent events: how often the stream checks for scope changes, and the
+# max lifetime of one connection before the browser's EventSource reconnects.
+SSE_POLL_INTERVAL = 0.4
+SSE_MAX_SECONDS = 120
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
@@ -34,6 +39,9 @@ class EnterpriseHTTPServer(ThreadingHTTPServer):
 
 class RequestHandler(BaseHTTPRequestHandler):
     server: EnterpriseHTTPServer
+    # Bound how long a single connection may stall mid-request so a slow or
+    # stuck client cannot hold a worker thread (and its DB connection) forever.
+    timeout = 60
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -158,6 +166,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "channel", m.group(1))})
             return
+        m = re.fullmatch(r"/api/channels/(\d+)/events", path)
+        if m and method == "GET":
+            self._stream_scope_events(actor, "channel", m.group(1))
+            return
 
         if path == "/api/private-agent/messages" and method == "GET":
             limit = int(first(query, "limit", "100"))
@@ -173,6 +185,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/private-agent/agent-status" and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
+            return
+        if path == "/api/private-agent/events" and method == "GET":
+            self._stream_scope_events(actor, "private", str(actor["id"]))
             return
         if path == "/api/private-agent/status" and method == "GET":
             self._json(service.private_status(actor))
@@ -205,7 +220,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/knowledge/documents" and method == "GET":
-            self._json({"documents": service.knowledge.list_documents()})
+            self._json({"documents": service.list_knowledge_documents(actor)})
             return
         if path == "/api/knowledge/status" and method == "GET":
             self._json(service.knowledge_status())
@@ -214,11 +229,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"document": service.add_knowledge_document(actor, self._body_json())}, status=201)
             return
         if path == "/api/knowledge/search" and method == "GET":
-            self._json({"results": service.search_knowledge(first(query, "q", ""), int(first(query, "limit", "5")))})
+            self._json({"results": service.user_search_knowledge(actor, first(query, "q", ""), int(first(query, "limit", "5")))})
             return
         m = re.fullmatch(r"/api/knowledge/documents/(\d+)", path)
         if m and method == "GET":
-            self._json({"document": service.get_knowledge_document(int(m.group(1)))})
+            self._json({"document": service.user_knowledge_document(actor, int(m.group(1)))})
             return
 
         if path == "/api/settings/secrets" and method == "GET":
@@ -398,6 +413,47 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream_scope_events(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> None:
+        service = self.server.service
+        # Authorize before emitting any response so a denial becomes a normal
+        # JSON error (no headers are sent yet).
+        service.agent_status(actor, scope_type, scope_id)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self._send_security_headers()
+        self.end_headers()
+        deadline = time.time() + SSE_MAX_SECONDS
+        last_token = None
+        try:
+            while time.time() < deadline:
+                status = service.agent_status(actor, scope_type, scope_id)
+                latest = service.latest_message_id(scope_type, scope_id)
+                stream = status.get("stream_message") or {}
+                token = (
+                    latest,
+                    status.get("state"),
+                    status.get("updated_at"),
+                    stream.get("content"),
+                    len(status.get("stream_messages") or []),
+                )
+                if token != last_token:
+                    payload = json.dumps(
+                        {"agent_status": status, "latest_message_id": latest}, ensure_ascii=False
+                    )
+                    self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
+                    last_token = token
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(SSE_POLL_INTERVAL)
+        except Exception:
+            # Client disconnected or the scope became unavailable; just end the
+            # stream (the browser's EventSource will reconnect if appropriate).
+            return
+
     def _serve_static(self, path: str) -> None:
         static_dir = Path(__file__).resolve().parent / "static"
         if path in {"", "/"}:
@@ -465,13 +521,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         return urllib.parse.urlparse(self.server.service.config.public_base_url).scheme == "https"
 
     def _require_same_origin(self) -> None:
-        origin = self.headers.get("Origin", "").strip()
-        if origin:
-            if not self._origin_allowed(origin):
-                raise ServiceError(403, "cross-origin request denied")
+        # CSRF defenses only apply to ambient cookie auth. A request that carries
+        # its own Authorization: Bearer token is not forgeable cross-origin (an
+        # attacker cannot make a victim's browser attach a custom header), so it
+        # is exempt — this keeps programmatic/bearer API clients working.
+        if bearer_token(self.headers.get("Authorization", "")):
             return
-        referer = self.headers.get("Referer", "").strip()
-        if referer and not self._origin_allowed(referer):
+        candidate = self.headers.get("Origin", "").strip() or self.headers.get("Referer", "").strip()
+        if not candidate:
+            # Reject state-changing cookie requests that omit BOTH headers,
+            # rather than silently allowing them.
+            raise ServiceError(403, "missing Origin/Referer on state-changing request")
+        if not self._origin_allowed(candidate):
             raise ServiceError(403, "cross-origin request denied")
 
     def _origin_allowed(self, value: str) -> bool:
@@ -488,17 +549,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             origins.add(request_origin)
         return origins
 
+    def _trusts_forwarded_headers(self) -> bool:
+        return bool(self.server.service.config.trust_forwarded_headers)
+
     def _request_base_url(self) -> str:
-        proto = first_forwarded(self.headers.get("X-Forwarded-Proto", "")) or "http"
+        # Only honour X-Forwarded-* when an operator has declared a trusted
+        # reverse proxy; otherwise a client could forge X-Forwarded-Host to
+        # spoof an allowed origin.
+        if self._trusts_forwarded_headers():
+            proto = first_forwarded(self.headers.get("X-Forwarded-Proto", "")) or "http"
+            host = first_forwarded(self.headers.get("X-Forwarded-Host", "")) or self.headers.get("Host", "")
+        else:
+            proto = "https" if self._secure_cookie_enabled() else "http"
+            host = self.headers.get("Host", "")
         if proto not in {"http", "https"}:
             proto = "http"
-        host = first_forwarded(self.headers.get("X-Forwarded-Host", "")) or self.headers.get("Host", "")
         return f"{proto}://{host}" if host else ""
 
     def _client_identity(self) -> str:
-        forwarded = first_forwarded(self.headers.get("X-Forwarded-For", ""))
-        if forwarded:
-            return forwarded
+        # Trust X-Forwarded-For only behind a declared proxy; otherwise an
+        # attacker could rotate it to evade the login rate limiter.
+        if self._trusts_forwarded_headers():
+            forwarded = first_forwarded(self.headers.get("X-Forwarded-For", ""))
+            if forwarded:
+                return forwarded
         try:
             return str(self.client_address[0])
         except Exception:
@@ -549,6 +623,11 @@ def run_server(config: PlatformConfig | None = None) -> None:
         print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")
     else:
         print("Bootstrap admin account is admin; password came from ENTERPRISE_ADMIN_PASSWORD or existing database state.")
+    if not getattr(server.service.db, "fts_available", True):
+        print(
+            "Warning: SQLite was built without FTS5; knowledge search falls back to a slower LIKE scan.",
+            file=sys.stderr,
+        )
     previous_handlers: dict[int, signal.Handlers] = {}
 
     def request_shutdown(signum, _frame) -> None:
