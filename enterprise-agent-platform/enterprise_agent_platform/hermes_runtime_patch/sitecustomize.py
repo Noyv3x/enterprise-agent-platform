@@ -9,11 +9,31 @@ Hermes installs untouched.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Aggregated, process-visible status string the platform can surface after the
+# managed Hermes gateway starts. ``sitecustomize`` runs at interpreter startup
+# before logging is configured, so a log record may never reach a handler; an
+# environment marker survives so operators can detect a silent no-op patch.
+_PATCH_STATUS_ENV = "ENTERPRISE_HERMES_PATCH_STATUS"
+_patch_status: dict[str, str] = {}
+
+
+def _record_patch_status(component: str, state: str) -> None:
+    """Record per-component patch status and publish it to the environment."""
+
+    _patch_status[component] = state
+    try:
+        os.environ[_PATCH_STATUS_ENV] = ";".join(
+            f"{name}={value}" for name, value in sorted(_patch_status.items())
+        )
+    except Exception:
+        pass
 
 
 def _event_value(event: Any, name: str, default: Any = None) -> Any:
@@ -267,8 +287,11 @@ def _install_codex_response_stream_patch() -> None:
     try:
         from agent import codex_runtime
     except Exception:
+        # Standalone Hermes installs lack this module; expected, not an error.
+        _record_patch_status("codex", "no_module")
         return
     if getattr(codex_runtime, "_enterprise_response_stream_patch", False):
+        _record_patch_status("codex", "ok")
         return
 
     def run_codex_stream(agent: Any, api_kwargs: dict[str, Any], client: Any = None, on_first_delta: Any = None) -> Any:
@@ -280,16 +303,42 @@ def _install_codex_response_stream_patch() -> None:
     codex_runtime.run_codex_stream = run_codex_stream
     codex_runtime.run_codex_create_stream_fallback = run_codex_create_stream_fallback
     codex_runtime._enterprise_response_stream_patch = True
+    _record_patch_status("codex", "ok")
+
+
+# Thread-local stash of the per-call raw-stream factory. The auxiliary patch
+# installs a single permanent ``stream`` shim on each Responses resource (the
+# OpenAI client exposes ``responses`` as a cached_property, so it is a shared
+# singleton). Each ``create()`` call publishes its own factory here, so
+# concurrent worker threads (async aux calls dispatched via asyncio.to_thread
+# onto a shared sync adapter) each resolve their own substitute with no shared
+# mutation, no restore window, and no global lock serializing parallel streams.
+_aux_stream_state = threading.local()
 
 
 def _install_auxiliary_response_stream_patch() -> None:
     try:
         from agent import auxiliary_client
     except Exception:
+        # Standalone Hermes installs lack this module; expected, not an error.
+        _record_patch_status("aux", "no_module")
         return
 
     adapter_cls = getattr(auxiliary_client, "_CodexCompletionsAdapter", None)
-    if adapter_cls is None or getattr(adapter_cls, "_enterprise_response_stream_patch", False):
+    if adapter_cls is None:
+        # The module is present but the private symbol this monkeypatch depends
+        # on is gone — almost certainly upstream drift at the next submodule
+        # bump. This silently disables the auxiliary Codex raw-stream/backfill
+        # behavior, so make it operator-visible rather than a quiet no-op.
+        logger.warning(
+            "Enterprise Hermes patch: auxiliary_client present but "
+            "_CodexCompletionsAdapter missing; auxiliary Codex stream patch "
+            "not applied (upstream drift?)"
+        )
+        _record_patch_status("aux", "missing_adapter")
+        return
+    if getattr(adapter_cls, "_enterprise_response_stream_patch", False):
+        _record_patch_status("aux", "ok")
         return
 
     original_create = adapter_cls.create
@@ -299,37 +348,55 @@ def _install_auxiliary_response_stream_patch() -> None:
         if responses_resource is None or not callable(getattr(responses_resource, "create", None)):
             return original_create(self, **kwargs)
 
-        lock = getattr(self, "_enterprise_response_stream_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            try:
-                self._enterprise_response_stream_lock = lock
-            except Exception:
-                pass
-
         def raw_stream(**stream_kwargs: Any) -> _RawResponsesStreamContext:
             return _RawResponsesStreamContext(responses_resource, stream_kwargs)
 
-        with lock:
-            original_stream = getattr(responses_resource, "stream", None)
+        # Install a permanent, thread-aware ``stream`` shim on the shared
+        # Responses singleton exactly once. The shim consults a thread-local
+        # for the active raw-stream factory, so it never mutates shared state
+        # per call and there is no restore window to clobber.
+        stash = getattr(responses_resource, "_enterprise_stream_stash", None)
+        if stash is None:
+            class_stream = type(responses_resource).__dict__.get("stream")
+
+            def stream_shim(*args: Any, **stream_kwargs: Any) -> Any:
+                factory = getattr(_aux_stream_state, "factory", None)
+                if factory is not None:
+                    return factory(**stream_kwargs)
+                # No active substitute on this thread: fall back to the real
+                # SDK ``stream`` (a bound method when ``stream`` was an own
+                # instance attribute, else the class descriptor).
+                if class_stream is not None:
+                    return class_stream(responses_resource, *args, **stream_kwargs)
+                return _RawResponsesStreamContext(responses_resource, stream_kwargs)
+
             try:
-                responses_resource.stream = raw_stream
+                responses_resource.stream = stream_shim
+                responses_resource._enterprise_stream_stash = stream_shim
             except Exception:
+                # Read-only resource: fall back to the unpatched upstream path
+                # rather than failing the auxiliary call.
                 return original_create(self, **kwargs)
-            try:
-                return original_create(self, **kwargs)
-            finally:
-                try:
-                    responses_resource.stream = original_stream
-                except Exception:
-                    pass
+
+        previous = getattr(_aux_stream_state, "factory", None)
+        _aux_stream_state.factory = raw_stream
+        try:
+            return original_create(self, **kwargs)
+        finally:
+            _aux_stream_state.factory = previous
 
     adapter_cls.create = create
     adapter_cls._enterprise_response_stream_patch = True
+    _record_patch_status("aux", "ok")
 
 
 try:
     _install_codex_response_stream_patch()
     _install_auxiliary_response_stream_patch()
 except Exception as exc:
-    logger.debug("Enterprise Hermes runtime patch did not install: %s", exc)
+    # A genuine failure while installing (as opposed to the expected
+    # "standalone Hermes, module absent" path, which is handled quietly inside
+    # each installer) silently disables Codex streaming/backfill. Surface it at
+    # WARNING and record a process-visible marker the platform can read.
+    logger.warning("Enterprise Hermes runtime patch did not install: %s", exc)
+    _record_patch_status("install_error", repr(exc))

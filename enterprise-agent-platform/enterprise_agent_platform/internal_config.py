@@ -7,8 +7,26 @@ from pathlib import Path
 from typing import Any
 
 
-SENSITIVE_RE = re.compile(r"(API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|JWT)", re.IGNORECASE)
+# Match secret-bearing key names. TOKEN carries a trailing word boundary so it
+# matches real credential keys (auth_token, agent_token, "token") but NOT
+# non-secret keys that merely start with the substring (max_tokens, tokenizer,
+# token_count would otherwise be wrongly redacted/corrupted on a config round-trip).
+SENSITIVE_RE = re.compile(
+    r"(API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|TOKEN\b|SECRET|PASSWORD|CREDENTIAL|JWT)",
+    re.IGNORECASE,
+)
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,100}$")
+
+# Placeholder written in place of inline secrets when redacting the raw
+# config.yaml dump. On save, any value still equal to this placeholder is
+# re-injected from the on-disk config so a redacted round-trip never clobbers
+# the real credential.
+REDACTED_PLACEHOLDER = "__REDACTED__"
+
+# Top-level YAML keys whose nested values legitimately carry inline secrets
+# (e.g. providers/auxiliary/delegation blocks define `api_key`). Their JSON
+# field renders and the raw yaml_text dump must be deep-redacted.
+SECRET_BEARING_KEYS = ("providers", "fallback_providers", "auxiliary", "delegation")
 
 
 @dataclass(frozen=True)
@@ -23,6 +41,12 @@ class ConfigField:
 
     def to_dict(self, value: Any, *, configured: bool) -> dict[str, Any]:
         secret = self.secret or is_sensitive_key(self.key)
+        # Structured (e.g. JSON) values such as `providers`/`fallback_providers`
+        # legitimately embed inline `api_key` secrets that the key-level
+        # `secret` flag does not catch. Replace any nested sensitive subkey with
+        # the redaction placeholder before serializing so plaintext keys never
+        # reach the client; the placeholder is restored from disk on save.
+        rendered = value if secret and configured else redact_sensitive(value, REDACTED_PLACEHOLDER)
         return {
             "key": self.key,
             "label": self.label,
@@ -32,7 +56,7 @@ class ConfigField:
             "options": list(self.options),
             "secret": secret,
             "configured": configured,
-            "value": "" if secret and configured else value_for_json(value),
+            "value": "" if secret and configured else value_for_json(rendered),
             "masked": mask_value(str(value)) if secret and configured else "",
         }
 
@@ -207,12 +231,33 @@ def read_hermes_internal_config(config_path: Path, env_path: Path) -> dict[str, 
     return {
         "config_path": str(config_path),
         "env_path": str(env_path),
-        "yaml_text": yaml_text,
+        "yaml_text": redact_yaml_text(mapping, yaml_text) if not error else yaml_text,
         "yaml_error": error,
         "sections": summarize_mapping(mapping),
         "fields": fields_from_mapping(HERMES_YAML_FIELDS, mapping),
         "env": fields_from_env(HERMES_ENV_FIELDS, env_values),
     }
+
+
+def redact_yaml_text(mapping: dict[str, Any], yaml_text: str) -> str:
+    """Return the raw config dump with inline secrets replaced by a recognizable
+    placeholder. The mapping is re-serialized only when it actually contains a
+    sensitive nested value, so secret-free configs keep their original
+    formatting/comments untouched.
+    """
+
+    if not yaml_text.strip() or not mapping:
+        return yaml_text
+    redacted = redact_sensitive(mapping, REDACTED_PLACEHOLDER)
+    if redacted == mapping:
+        return yaml_text
+    try:
+        import yaml
+    except Exception:
+        # Without PyYAML we cannot safely re-serialize; fail closed by not
+        # shipping the raw text rather than leaking unredacted secrets.
+        return ""
+    return yaml.safe_dump(redacted, sort_keys=False, allow_unicode=True)
 
 
 def read_cognee_internal_config(env_path: Path, effective_env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -225,7 +270,24 @@ def read_cognee_internal_config(env_path: Path, effective_env: dict[str, str] | 
 
 
 def update_yaml_text(config_path: Path, yaml_text: str) -> None:
-    validate_yaml_mapping(yaml_text)
+    incoming = validate_yaml_mapping(yaml_text)
+    # If the submitted text still carries the redaction placeholder (the raw
+    # dump is masked on read), re-inject the real on-disk secrets so a redacted
+    # round-trip never overwrites credentials with the placeholder.
+    if REDACTED_PLACEHOLDER in yaml_text:
+        on_disk, _text, error = read_yaml_mapping_with_text(config_path)
+        if not error:
+            merged = restore_redacted_secrets(incoming, on_disk)
+            try:
+                import yaml
+            except Exception as exc:
+                raise ValueError("PyYAML is required to edit YAML config") from exc
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                yaml.safe_dump(merged, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            return
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml_text.rstrip() + "\n", encoding="utf-8")
 
@@ -239,7 +301,21 @@ def update_yaml_values(config_path: Path, updates: dict[str, Any]) -> None:
         field = fields.get(str(key))
         if not field:
             raise ValueError(f"unsupported config key: {key}")
-        set_nested(mapping, field.key, coerce_field_value(field, value))
+        is_empty = value is None or (isinstance(value, str) and value.strip() == "")
+        if is_empty and field.kind in {"number", "text", "json"}:
+            # Clearing a field means "unset / fall back to the runtime default",
+            # not "persist 0 / empty". Removing the key lets Hermes use its own
+            # default instead of writing a semantically different literal value.
+            delete_nested(mapping, field.key)
+        else:
+            coerced = coerce_field_value(field, value)
+            # Structured fields are rendered with inline secrets redacted to the
+            # placeholder; re-inject the on-disk secret when a placeholder comes
+            # back so editing a provider block never wipes its `api_key`.
+            if field.kind == "json" and isinstance(coerced, (dict, list)):
+                _found, on_disk_value = get_nested(mapping, field.key)
+                coerced = restore_redacted_secrets(coerced, on_disk_value if _found else None)
+            set_nested(mapping, field.key, coerced)
     try:
         import yaml
     except Exception as exc:
@@ -341,6 +417,28 @@ def set_nested(mapping: dict[str, Any], path: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
+def delete_nested(mapping: dict[str, Any], path: str) -> None:
+    parts = path.split(".")
+    # Walk to the parent of the leaf, tracking the chain so we can prune
+    # now-empty intermediate dicts after removing the leaf.
+    chain: list[tuple[dict[str, Any], str]] = []
+    current: Any = mapping
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return
+        chain.append((current, part))
+        current = current[part]
+    if not isinstance(current, dict):
+        return
+    current.pop(parts[-1], None)
+    for parent, part in reversed(chain):
+        child = parent.get(part)
+        if isinstance(child, dict) and not child:
+            parent.pop(part, None)
+        else:
+            break
+
+
 def coerce_field_value(field: ConfigField, value: Any) -> Any:
     if value is None:
         return ""
@@ -395,12 +493,124 @@ def is_sensitive_key(key: str) -> bool:
     return bool(SENSITIVE_RE.search(key))
 
 
+def redact_sensitive(value: Any, replacement) -> Any:
+    """Return a deep copy of *value* with any nested mapping entry whose key
+    matches SENSITIVE_RE replaced.
+
+    ``replacement`` may be a constant string or a callable taking the original
+    value and returning its redacted form. Lists are walked element-wise so
+    secrets nested in e.g. ``fallback_providers`` are also covered.
+    """
+
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and is_sensitive_key(key) and not isinstance(item, (dict, list)):
+                if item in (None, ""):
+                    result[key] = item
+                else:
+                    result[key] = replacement(item) if callable(replacement) else replacement
+            else:
+                result[key] = redact_sensitive(item, replacement)
+        return result
+    if isinstance(value, list):
+        return [redact_sensitive(item, replacement) for item in value]
+    return value
+
+
+def restore_redacted_secrets(incoming: Any, original: Any) -> Any:
+    """Walk *incoming* and, wherever a sensitive leaf still holds the redaction
+    placeholder, substitute the corresponding value from *original* (the
+    on-disk config). Prevents a redacted GET/POST round-trip from clobbering
+    real inline credentials with the placeholder.
+    """
+
+    if isinstance(incoming, dict):
+        original_map = original if isinstance(original, dict) else {}
+        result: dict[Any, Any] = {}
+        for key, item in incoming.items():
+            orig_item = original_map.get(key)
+            if (
+                isinstance(key, str)
+                and is_sensitive_key(key)
+                and isinstance(item, str)
+                and item == REDACTED_PLACEHOLDER
+            ):
+                # The placeholder must be backed by a real saved secret. If the
+                # key has no scalar value on disk (e.g. it was renamed, or the
+                # structure changed) we must NOT silently substitute "" — that
+                # would wipe the credential. Fail closed so the admin re-enters it.
+                if isinstance(orig_item, str) and orig_item not in ("", REDACTED_PLACEHOLDER):
+                    result[key] = orig_item
+                else:
+                    raise ValueError(
+                        f"cannot restore the redacted secret for '{key}': it has no saved "
+                        f"value (the field may have been renamed or reordered). Re-enter the "
+                        f"real secret value instead of submitting the placeholder."
+                    )
+            else:
+                result[key] = restore_redacted_secrets(item, orig_item)
+        return result
+    if isinstance(incoming, list):
+        original_list = original if isinstance(original, list) else []
+        # Match by stable identity (the element's non-secret fields) rather than
+        # by list index, so reordering or resizing a list (e.g. fallback_providers)
+        # never restores a secret onto the wrong entry. Each original element is
+        # consumed at most once; an unmatched element gets no original, so any
+        # placeholder inside it fails closed in the dict branch above.
+        remaining = list(original_list)
+        result_list = []
+        for index, item in enumerate(incoming):
+            sig = _redaction_identity(item)
+            orig_item = None
+            for pos, candidate in enumerate(remaining):
+                if _redaction_identity(candidate) == sig:
+                    orig_item = remaining.pop(pos)
+                    break
+            if orig_item is None and index < len(original_list):
+                # Fall back to positional only when signatures also agree, so an
+                # in-place edit of a non-secret field still restores its secret.
+                positional = original_list[index]
+                if _redaction_identity(positional) == sig and positional in remaining:
+                    orig_item = positional
+                    remaining.remove(positional)
+            result_list.append(restore_redacted_secrets(item, orig_item))
+        return result_list
+    return incoming
+
+
+def _redaction_identity(value: Any) -> Any:
+    """A hashable fingerprint of *value* that ignores sensitive leaves and
+    redaction placeholders, used to match list elements across a redacted
+    round-trip without relying on positional order."""
+
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                sorted(
+                    (str(k), _redaction_identity(v))
+                    for k, v in value.items()
+                    if not (isinstance(k, str) and is_sensitive_key(k))
+                )
+            ),
+        )
+    if isinstance(value, list):
+        return ("list", tuple(_redaction_identity(v) for v in value))
+    if value == REDACTED_PLACEHOLDER:
+        return ("scalar", None)
+    return ("scalar", value)
+
+
 def mask_value(value: str) -> str:
+    # Use a fixed-width mask so the rendered hint never encodes the secret's
+    # length, and never reveal any prefix. Only long values expose a short
+    # trailing suffix as a recognition hint.
     if not value:
         return ""
-    if len(value) <= 8:
-        return "*" * len(value)
-    return f"{value[:3]}...{value[-4:]}"
+    if len(value) < 12:
+        return "********"
+    return f"...{value[-4:]}"
 
 
 def read_env_file(path: Path) -> dict[str, str]:

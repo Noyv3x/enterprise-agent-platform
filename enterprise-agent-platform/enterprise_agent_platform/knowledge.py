@@ -1,10 +1,31 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
 from .db import Database, now_ts
+
+
+def _resolve_max_content_chars() -> int:
+    """Per-document content cap (characters).
+
+    Defaults generously (~2M characters, well below the 5MB request-body cap)
+    so legitimate long enterprise documents are accepted while a handful of
+    pathologically large docs cannot bloat the FTS index or Cognee ingestion.
+    A value <= 0 disables the limit.
+    """
+    raw = os.getenv("ENTERPRISE_KB_MAX_CONTENT_CHARS", "").strip()
+    if not raw:
+        return 2_000_000
+    try:
+        return int(raw)
+    except ValueError:
+        return 2_000_000
+
+
+MAX_CONTENT_CHARS = _resolve_max_content_chars()
 
 
 @dataclass(frozen=True)
@@ -38,12 +59,50 @@ class KnowledgeBase:
         source: str = "",
         created_by: int | None = None,
     ) -> dict[str, Any]:
+        doc, _created = self.add_document_with_status(
+            title=title, content=content, summary=summary, source=source, created_by=created_by
+        )
+        return doc
+
+    def add_document_with_status(
+        self,
+        *,
+        title: str,
+        content: str,
+        summary: str = "",
+        source: str = "",
+        created_by: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Like ``add_document`` but also reports whether a NEW row was created.
+
+        ``created`` is False on a dedup hit (an identical document already
+        existed), letting callers skip re-queuing Cognee ingestion for a no-op
+        re-submit so duplicates do not re-flood the graph backend.
+        """
         title = title.strip()
         content = content.strip()
+        source = source.strip()
         if not title:
             raise ValueError("title is required")
         if not content:
             raise ValueError("content is required")
+        if MAX_CONTENT_CHARS > 0 and len(content) > MAX_CONTENT_CHARS:
+            raise ValueError(f"content exceeds {MAX_CONTENT_CHARS} characters")
+        # Dedup on insert: re-submitting an identical document (same title,
+        # content, and source) should not create a duplicate row, which would
+        # otherwise be independently FTS-indexed and re-queued for Cognee
+        # ingestion. Return the existing document instead so callers stay
+        # idempotent (e.g. UI double-clicks, automated re-syncs).
+        existing = self.db.query_one(
+            """
+            SELECT id FROM knowledge_documents
+            WHERE title = ? AND content = ? AND source = ?
+            ORDER BY id LIMIT 1
+            """,
+            (title, content, source),
+        )
+        if existing:
+            return (self.get_document(int(existing["id"])) or {}, False)
         if not summary:
             summary = summarize_content(content)
         ts = now_ts()
@@ -52,9 +111,9 @@ class KnowledgeBase:
             INSERT INTO knowledge_documents(title, summary, content, source, created_by, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (title, summary.strip(), content, source.strip(), created_by, ts, ts),
+            (title, summary.strip(), content, source, created_by, ts, ts),
         )
-        return self.get_document(doc_id) or {}
+        return (self.get_document(doc_id) or {}, True)
 
     def get_document(self, document_id: int) -> dict[str, Any] | None:
         return self.db.query_one(
@@ -64,6 +123,19 @@ class KnowledgeBase:
             """,
             (document_id,),
         )
+
+    def delete_document(self, document_id: int) -> bool:
+        """Remove a document. Returns True when a row was deleted.
+
+        The knowledge_fts DELETE trigger keeps the FTS index in sync
+        automatically. Callers that mirror to an external backend (e.g. Cognee)
+        are responsible for signalling that backend separately.
+        """
+        cur = self.db.execute(
+            "DELETE FROM knowledge_documents WHERE id = ?",
+            (document_id,),
+        )
+        return cur.rowcount > 0
 
     def list_documents(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         return self.db.query(
@@ -107,12 +179,16 @@ class KnowledgeBase:
                 ]
             except Exception:
                 pass
-        pattern = f"%{query}%"
+        # Escape LIKE metacharacters so user-supplied % and _ are matched
+        # literally on this fallback path. The backslash must be escaped first
+        # so the ESCAPE char it introduces stays literal.
+        safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
         rows = self.db.query(
-            """
+            r"""
             SELECT id, title, summary, source
             FROM knowledge_documents
-            WHERE title LIKE ? OR summary LIKE ? OR content LIKE ?
+            WHERE title LIKE ? ESCAPE '\' OR summary LIKE ? ESCAPE '\' OR content LIKE ? ESCAPE '\'
             ORDER BY updated_at DESC
             LIMIT ?
             """,

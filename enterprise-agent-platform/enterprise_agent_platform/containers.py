@@ -108,6 +108,61 @@ class ContainerManager:
             backend=backend,
         )
 
+    def remove_private_container(self, user_id: int) -> None:
+        """Tear down a user's sandbox and forget it.
+
+        Best-effort: force-removes the docker container (a single ``docker rm
+        -f`` both stops and deletes it) and always clears the ``private_agents``
+        row so a re-activated user gets a fresh container/name. Docker errors
+        are swallowed (with a timeout) so this never raises into the
+        deactivation/admin flow that calls it.
+        """
+        row = self.db.query_one("SELECT * FROM private_agents WHERE user_id = ?", (user_id,))
+        if row and row["container_name"]:
+            try:
+                self._run(
+                    ["docker", "rm", "-f", row["container_name"]],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except Exception:
+                # Never let a failed teardown block the caller; the row is
+                # cleared below regardless so state stays consistent.
+                pass
+        self.db.execute("DELETE FROM private_agents WHERE user_id = ?", (user_id,))
+
+    def reap_idle_containers(self, *, idle_hours: float | None = None) -> int:
+        """Reclaim per-user docker containers that have been idle (no private
+        message refreshing ``updated_at``) for longer than ``idle_hours``.
+
+        This catches users who simply stopped messaging without being
+        deactivated. Returns the number of containers torn down. Best-effort:
+        individual failures are swallowed so one bad container cannot stall the
+        sweep. Disabled when the resolved idle threshold is <= 0.
+        """
+        if idle_hours is None:
+            try:
+                idle_hours = float(os.getenv("ENTERPRISE_CONTAINER_IDLE_HOURS", "0") or "0")
+            except ValueError:
+                idle_hours = 0.0
+        if not idle_hours or idle_hours <= 0:
+            return 0
+        cutoff = now_ts() - int(idle_hours * 3600)
+        rows = self.db.query(
+            "SELECT user_id FROM private_agents WHERE container_name != '' AND updated_at < ?",
+            (cutoff,),
+        )
+        reaped = 0
+        for row in rows:
+            try:
+                self.remove_private_container(int(row["user_id"]))
+                reaped += 1
+            except Exception:
+                continue
+        return reaped
+
     def _resolve_backend(self) -> str:
         if self.config.container_backend == "local":
             return "local"
@@ -125,22 +180,95 @@ class ContainerManager:
         except Exception:
             return "local"
 
+    def _hardened_user_flag(self) -> list[str]:
+        """Run the sandbox as the same non-root identity that owns the
+        bind-mounted workspace, so files written into /workspace are not
+        root-owned on the host and a container escape does not start as uid 0.
+
+        Operators can override with ENTERPRISE_CONTAINER_USER (e.g. ``""`` to
+        disable, or ``1000:1000``); on non-POSIX hosts os.getuid is absent and
+        we simply omit the flag.
+        """
+        override = os.getenv("ENTERPRISE_CONTAINER_USER")
+        if override is not None:
+            override = override.strip()
+            return ["--user", override] if override else []
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is None or getgid is None:
+            return []
+        uid = getuid()
+        # Running as root on the host gains nothing from --user 0:0, so skip it
+        # and let the image's own user apply.
+        if uid == 0:
+            return []
+        return ["--user", f"{uid}:{getgid()}"]
+
     def _hardening_flags(self) -> list[str]:
         """Restrict the per-user agent sandbox so a compromised agent has a
         narrow host foothold: drop all capabilities, forbid privilege
-        escalation, and cap pids/memory/cpu/network."""
+        escalation, run as a non-root user, and cap pids/memory (incl. swap)/cpu.
+
+        Network is restricted only when hardening is enabled: it defaults to a
+        deny-by-default value (``none``) unless an explicit network is
+        configured via ``container_network`` / ``ENTERPRISE_CONTAINER_NETWORK``
+        (or ``ENTERPRISE_CONTAINER_HARDEN_NETWORK`` to change the hardened
+        default). A read-only rootfs with tmpfs scratch dirs can be enabled via
+        ``ENTERPRISE_CONTAINER_READONLY`` for workloads that do not write to the
+        image (it defaults off because ``pip install`` and similar need a
+        writable rootfs).
+        """
         flags: list[str] = []
         if self.config.container_harden:
             flags += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
+            flags += self._hardened_user_flag()
             if self.config.container_pids_limit and self.config.container_pids_limit > 0:
                 flags += ["--pids-limit", str(int(self.config.container_pids_limit))]
             if self.config.container_memory:
                 flags += ["--memory", self.config.container_memory]
-            if self.config.container_cpus:
-                flags += ["--cpus", self.config.container_cpus]
-        if self.config.container_network:
+                # Pin total memory+swap to the RAM cap so the limit cannot be
+                # bypassed by swapping. ENTERPRISE_CONTAINER_MEMORY_SWAP lets
+                # operators deliberately grant swap headroom (or "-1" for
+                # unlimited swap, matching docker's semantics).
+                swap = os.getenv("ENTERPRISE_CONTAINER_MEMORY_SWAP", "").strip() or self.config.container_memory
+                flags += ["--memory-swap", swap]
+            # Apply a CPU cap by default (1.0) so the documented cap actually
+            # holds. To DISABLE it, set container_cpus (ENTERPRISE_CONTAINER_CPUS)
+            # or ENTERPRISE_CONTAINER_CPUS_DEFAULT to the literal "0"/"0.0"; an
+            # empty value falls back to the 1.0 default rather than disabling.
+            cpus = self.config.container_cpus or os.getenv("ENTERPRISE_CONTAINER_CPUS_DEFAULT", "1.0").strip()
+            if cpus and cpus not in {"0", "0.0"}:
+                flags += ["--cpus", cpus]
+            # Optional writable-layer disk quota. Off by default because
+            # --storage-opt size= only works on specific storage drivers
+            # (overlay2 on xfs with pquota, devicemapper) and otherwise makes
+            # `docker run` fail; operators opt in by setting a size string such
+            # as "2G".
+            storage_size = os.getenv("ENTERPRISE_CONTAINER_STORAGE_SIZE", "").strip()
+            if storage_size:
+                flags += ["--storage-opt", f"size={storage_size}"]
+            if self._env_truthy("ENTERPRISE_CONTAINER_READONLY", False):
+                flags += ["--read-only"]
+                # Provide writable scratch space so the keep-alive process and
+                # common tooling (tmp, pip cache under HOME) still function.
+                for mount in ("/tmp", "/run", "/home"):
+                    flags += ["--tmpfs", f"{mount}:rw,nosuid,nodev"]
+            network = (
+                self.config.container_network
+                or os.getenv("ENTERPRISE_CONTAINER_HARDEN_NETWORK", "none").strip()
+                or "none"
+            )
+            flags += ["--network", network]
+        elif self.config.container_network:
             flags += ["--network", self.config.container_network]
         return flags
+
+    @staticmethod
+    def _env_truthy(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     def _ensure_docker(
         self,
@@ -168,8 +296,20 @@ class ContainerManager:
             container_id = parts[0] if parts else ""
             status = parts[1] if len(parts) > 1 else "unknown"
             if status != "running":
-                self._run(["docker", "start", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-                status = "running"
+                started = self._run(
+                    ["docker", "start", name],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15,
+                )
+                # Reflect reality instead of asserting "running": a failed start
+                # (image gone, daemon error, OOM on prior run) must not be
+                # reported to the agent prompt/UI as a live container.
+                if started.returncode == 0:
+                    status = "running"
+                # else: keep the inspected status (e.g. "exited"/"created").
             return PrivateContainer(user_id, session_id, name, container_id, status, str(workspace), "docker")
 
         cmd = [

@@ -5,8 +5,9 @@ import sqlite3
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 def now_ts() -> int:
@@ -81,11 +82,25 @@ class Database:
         return holder.conn
 
     def close(self) -> None:
+        """Mark the database closed and reclaim this thread's connection.
+
+        Callers must join every DB-touching thread (request handlers, agent
+        workers, the ingest loop) BEFORE calling close(); otherwise an in-flight
+        statement on another thread's connection can race a shutdown that closes
+        it. To avoid that cross-thread race we only close the connection owned by
+        the calling thread here. Connections owned by other threads are left to
+        their _ConnectionHolder.__del__ (invoked when that thread's thread-local
+        storage is torn down on thread exit), so a slow worker that has not yet
+        finished keeps a valid handle until it does.
+        """
         self._closed = True
+        own = getattr(self._local, "holder", None)
         with self._holders_lock:
-            holders = list(self._holders)
-        for holder in holders:
-            holder.close()
+            # Drop tracking references so the holders become eligible for GC; do
+            # not force-close other threads' connections out from under them.
+            self._holders.clear()
+        if own is not None:
+            own.close()
         try:
             self._local.holder = None
         except Exception:
@@ -237,10 +252,70 @@ class Database:
                 END;
                 """
             )
+            # The AFTER triggers only sync rows changed after they exist, so an
+            # index created on a DB that already has documents (migrated from a
+            # build without FTS5, or where FTS5 was unavailable on a prior boot)
+            # starts empty and never backfills. Detect that divergence and
+            # rebuild once. Note: count(*) on an external-content FTS5 table
+            # reflects the source table's rowids, not what is actually indexed,
+            # so it can never be used to spot an empty index. The internal
+            # knowledge_fts_docsize shadow table holds one row per indexed
+            # document, which is the reliable signal. 'rebuild' is idempotent
+            # and cheap when the index is already in sync.
+            doc_count = self._conn.execute(
+                "SELECT count(*) FROM knowledge_documents"
+            ).fetchone()[0]
+            if doc_count > 0 and self._fts_index_is_stale(doc_count):
+                self._conn.execute(
+                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
+                )
             self.fts_available = True
         except sqlite3.OperationalError:
             # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
             self.fts_available = False
+
+    def _fts_index_is_stale(self, doc_count: int) -> bool:
+        """Report whether the FTS index is missing rows that exist in the source.
+
+        Uses the internal knowledge_fts_docsize shadow table, which holds one
+        row per indexed document, because count(*) on an external-content FTS5
+        table mirrors the source table and so always matches doc_count. If the
+        shadow table cannot be read (an unexpected FTS5 internal layout), assume
+        a rebuild is warranted; 'rebuild' is idempotent so the worst case is one
+        extra cheap pass.
+        """
+        try:
+            indexed = self._conn.execute(
+                "SELECT count(*) FROM knowledge_fts_docsize"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return True
+        return indexed < doc_count
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run several writes on this thread's connection as one transaction.
+
+        Yields the thread-local connection. Statements issued through the
+        yielded connection (conn.execute/executemany) are committed together on
+        clean exit and rolled back on any exception, so a multi-row write such
+        as a message plus its attachment rows lands atomically instead of being
+        committed one statement at a time. The per-statement helpers below keep
+        their immediate commits for single writes; callers that need atomicity
+        should issue their statements through this connection directly and avoid
+        the auto-committing helpers inside the block.
+        """
+        conn = self._conn
+        try:
+            yield conn
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        else:
+            conn.commit()
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         conn = self._conn

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +21,8 @@ DEFAULT_SERVICE_NAME = "enterprise-agent-platform.service"
 DEFAULT_PIP_INSTALL_ATTEMPTS = 3
 DEFAULT_PIP_NETWORK_RETRIES = 8
 DEFAULT_PIP_TIMEOUT_SECONDS = 120
+DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
+DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
 
 
 class DeploymentError(RuntimeError):
@@ -128,15 +134,19 @@ class DeploymentManager:
             self.ensure_submodules()
         self.ensure_source_repos()
         self.ensure_platform_venv()
-        if prepare_runtime:
-            self.prepare_platform_runtime(host=host, port=port)
 
         if mode == "prepare":
+            # No service is (re)started in this mode, so the runtime must be
+            # prepared here from the deploy process.
+            if prepare_runtime:
+                self.prepare_platform_runtime(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.public_url(host, port))
         if mode == "service":
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.public_url(host, port), service_path=str(service_path), service_started=True)
         if mode == "foreground":
+            # The foreground server prepares the runtime on startup in its own
+            # single process, so no separate prepare step is needed here.
             self.run_foreground(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.public_url(host, port), foreground_started=True)
         if mode != "auto":
@@ -300,17 +310,149 @@ class DeploymentManager:
         self.runner.run(["systemctl", "--user", "daemon-reload"], timeout=30)
         self.runner.run(["systemctl", "--user", "enable", self.paths.service_name], timeout=60)
         self.runner.run(["systemctl", "--user", "restart", self.paths.service_name], timeout=60)
+        self.ensure_user_linger()
+        self.wait_for_service_ready(host=host, port=port)
         return self.paths.service_path
+
+    def ensure_user_linger(self) -> None:
+        """Best-effort enable systemd user linger so the service survives logout.
+
+        A ``systemctl --user`` instance is created at login and torn down when the
+        user's last session ends unless linger is enabled; without it user units
+        also do not start at boot. Enabling linger can be polkit-gated, so every
+        step is best-effort and never raises.
+        """
+        if not shutil.which("loginctl"):
+            self._warn_linger_disabled("loginctl is not available")
+            return
+        username = _current_username()
+        if not username:
+            self._warn_linger_disabled("could not determine the current username")
+            return
+        if self._linger_enabled(username):
+            return
+        self.runner.run(["loginctl", "enable-linger", username], timeout=20, check=False)
+        if self._linger_enabled(username):
+            return
+        self._warn_linger_disabled(f"run: loginctl enable-linger {username} (may require sudo)")
+
+    def _linger_enabled(self, username: str) -> bool:
+        # This query needs captured stdout to read the Linger value, which the
+        # streaming SubprocessRunner does not capture. Only probe linger state
+        # for real deployments; with an injected runner (tests) degrade to
+        # "unknown/off" so behaviour stays deterministic and offline.
+        if not isinstance(self.runner, SubprocessRunner):
+            return False
+        stdout = _capture_command_stdout(
+            ["loginctl", "show-user", "--value", "--property=Linger", username]
+        )
+        return stdout.strip().lower() == "yes"
+
+    @staticmethod
+    def _warn_linger_disabled(detail: str) -> None:
+        print(
+            "WARNING: systemd user linger is not enabled. The platform will stop "
+            "when your login session ends and will NOT start at boot. "
+            f"To make it durable, {detail}.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def wait_for_service_ready(self, *, host: str, port: int) -> None:
+        """Verify the unit is active (and ideally answering HTTP) after restart.
+
+        ``Type=simple`` units are reported active as soon as the main process is
+        forked, so ``systemctl restart`` succeeds even for a crash-looping
+        service. Poll ``systemctl --user is-active`` to catch a service that
+        never stays up, and probe the configured host/port so a deploy does not
+        report success for a platform that never becomes reachable.
+        """
+        deadline = time.monotonic() + service_ready_timeout_seconds()
+        active = False
+        while True:
+            state = self.runner.run(
+                ["systemctl", "--user", "is-active", self.paths.service_name],
+                timeout=20,
+                check=False,
+            )
+            if state.returncode == 0:
+                active = True
+                break
+            failed = self.runner.run(
+                ["systemctl", "--user", "is-failed", self.paths.service_name],
+                timeout=20,
+                check=False,
+            )
+            if failed.returncode == 0:
+                self._raise_service_failed("the systemd unit reported a failed state")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+        if not active:
+            self._raise_service_failed("the systemd unit did not become active in time")
+        if not self._wait_for_service_http(host=host, port=port, deadline=deadline):
+            print(
+                f"WARNING: the platform unit is active but {self.public_url(host, port)} did "
+                "not respond yet. Check './deploy.sh status' and './deploy.sh logs'.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _wait_for_service_http(self, *, host: str, port: int, deadline: float) -> bool:
+        # Supplementary HTTP readiness probe. The systemd is-active check above is
+        # the authoritative gate; this only confirms the server is answering.
+        # Share the full readiness window: runtime prepare (venv/install, plugin
+        # copy) runs before the socket is bound, so a hard 5s cap routinely fired
+        # a spurious "did not respond" warning on a perfectly healthy deploy.
+        probe_deadline = deadline
+        url = self.public_url(host, port)
+        while True:
+            if _probe_http_ready(url):
+                return True
+            if time.monotonic() >= probe_deadline:
+                return False
+            time.sleep(0.5)
+
+    def _raise_service_failed(self, reason: str) -> None:
+        tail = self._service_log_tail()
+        message = f"the platform service did not start cleanly: {reason}."
+        if tail:
+            message += f"\nRecent logs:\n{tail}"
+        message += "\nInspect with './deploy.sh status' and './deploy.sh logs'."
+        raise DeploymentError(message)
+
+    def _service_log_tail(self) -> str:
+        # Diagnostic tail needs captured stdout; only gather it for real
+        # deployments so an injected runner (tests) is never asked to shell out.
+        if not isinstance(self.runner, SubprocessRunner) or not shutil.which("journalctl"):
+            return ""
+        return _capture_command_stdout(
+            ["journalctl", "--user", "-u", self.paths.service_name, "-n", "50", "--no-pager"]
+        ).strip()
 
     def run_foreground(self, *, host: str, port: int) -> None:
         env = os.environ.copy()
         env.update(runtime_env(self.paths, host=host, port=port))
-        self.runner.run(
-            [str(self.paths.platform_cli), "serve", "--host", host, "--port", str(port), "--data", str(self.paths.data_dir)],
-            cwd=self.paths.platform_dir,
-            env=env,
-            timeout=None,
-        )
+        try:
+            result = self.runner.run(
+                [str(self.paths.platform_cli), "serve", "--host", host, "--port", str(port), "--data", str(self.paths.data_dir)],
+                cwd=self.paths.platform_dir,
+                env=env,
+                timeout=None,
+                check=False,
+            )
+        except KeyboardInterrupt:
+            # Operator stopped the foreground server (Ctrl-C); the child handles
+            # its own shutdown, so exit cleanly without a traceback.
+            return
+        returncode = getattr(result, "returncode", 0) or 0
+        # A clean exit (0) or a signal-driven shutdown (negative returncode, or the
+        # 130/143 SIGINT/SIGTERM conventions) is a normal stop. A positive exit
+        # code means the server failed to start (e.g. the port is already in use
+        # or the config is invalid) and must surface rather than being silently
+        # reported as a successful foreground deploy.
+        if returncode > 0 and returncode not in (130, 143):
+            self._raise_service_failed(f"the foreground server exited with code {returncode}")
 
     @staticmethod
     def public_url(host: str, port: int) -> str:
@@ -357,6 +499,10 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         f"ExecStart={exec_start}",
         "Restart=on-failure",
         "RestartSec=5",
+        # Give the platform room to bring managed runtimes (Hermes/Firecrawl)
+        # up and down; the default 90s stop window can be too short to stop
+        # them gracefully, which would otherwise escalate to SIGKILL.
+        f"TimeoutStopSec={service_stop_timeout_seconds()}",
         "",
         "[Install]",
         "WantedBy=default.target",
@@ -416,6 +562,59 @@ def positive_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def service_ready_timeout_seconds() -> int:
+    return positive_int_env(
+        "ENTERPRISE_SERVICE_READY_TIMEOUT", DEFAULT_SERVICE_READY_TIMEOUT_SECONDS
+    )
+
+
+def service_stop_timeout_seconds() -> int:
+    return positive_int_env(
+        "ENTERPRISE_SERVICE_STOP_TIMEOUT", DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS
+    )
+
+
+def _current_username() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # pragma: no cover - depends on the host environment
+        return os.getenv("USER", "") or os.getenv("LOGNAME", "")
+
+
+def _capture_command_stdout(cmd: list[str], *, timeout: float = 20.0) -> str:
+    """Run a read-only query command and return its stdout (best-effort)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout or ""
+
+
+def _probe_http_ready(base_url: str) -> bool:
+    base = base_url.rstrip("/")
+    if not base:
+        return False
+    for path in ("/", "/healthz", "/login"):
+        try:
+            request = urllib.request.Request(f"{base}{path}", method="GET")
+            with urllib.request.urlopen(request, timeout=1.0) as response:
+                if 200 <= response.status < 500:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500:
+                return True
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            continue
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:

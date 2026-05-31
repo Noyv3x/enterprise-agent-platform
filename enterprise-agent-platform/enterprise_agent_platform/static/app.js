@@ -20,6 +20,7 @@ const state = {
   mentionTargets: [],
   typingUsers: [],
   documents: [],
+  knowledgeSearch: { query: "", results: null },
   selectedDocument: null,
   users: [],
   permissionGroups: [],
@@ -59,7 +60,7 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const typingState = { key: null, active: false, lastSent: 0, stopTimer: null };
 const composerState = { composing: false, renderDeferred: false };
-const mentionState = { active: false, selected: 0, options: [], range: null, menu: null };
+const mentionState = { active: false, selected: 0, options: [], range: null, menu: null, input: null };
 
 /* ---------------------------------------------------------------- api */
 async function api(path, options = {}) {
@@ -353,7 +354,7 @@ function renderLogin() {
       state.busy ? icon("loader", { size: 18, cls: "spin" }) : null,
       h("span", { text: state.busy ? "正在登录…" : "登录" }),
     ]),
-    h("div", { class: "error", text: state.error }),
+    h("div", { class: "error", role: "alert", text: state.error }),
   ]);
   return h("main", { class: "auth" }, [
     h("aside", { class: "auth__aside" }, [
@@ -375,12 +376,32 @@ function renderShell() {
   if (!hasPermission("private_agent") && state.activeView === "private") state.activeView = "channel";
   return h("div", { class: `shell ${state.sidebarOpen ? "is-open" : ""}` }, [
     renderSidebar(),
-    h("div", { class: "scrim", onclick: closeSidebar }),
+    h("button", { class: "scrim", type: "button", "aria-label": "关闭菜单", tabindex: state.sidebarOpen ? "0" : "-1", onclick: closeSidebar }),
     h("main", { class: "main" }, [renderTopbar(), renderContent()]),
   ]);
 }
 
-function closeSidebar() { state.sidebarOpen = false; render(); }
+// On mobile (<=800px) the sidebar slides off-canvas; expose that to AT/keyboard
+// so its controls are not focusable while it is closed and off-screen.
+function sidebarHiddenForA11y() {
+  return !state.sidebarOpen && window.matchMedia("(max-width: 800px)").matches;
+}
+
+function openSidebar() {
+  state.sidebarOpen = true;
+  render();
+  // Move focus into the drawer so screen-reader/keyboard focus follows the
+  // disclosure. afterRender already runs on the next frame; do this after it.
+  requestAnimationFrame(() => app.querySelector("#app-sidebar .nav__item")?.focus());
+}
+
+function closeSidebar() {
+  const wasOpen = state.sidebarOpen;
+  state.sidebarOpen = false;
+  render();
+  // Return focus to the control that opened the drawer.
+  if (wasOpen) requestAnimationFrame(() => app.querySelector(".menu-btn")?.focus());
+}
 
 function renderSidebar() {
   const navSpecs = [
@@ -406,7 +427,8 @@ function renderSidebar() {
         }, [h("span", { class: "channel__hash", text: "#" }), h("span", { class: "channel__name", text: channel.name })]))
     : [h("div", { class: "muted", style: "padding:4px 10px;font-size:12.5px", text: "暂无频道，创建一个开始协作。" })];
 
-  return h("aside", { class: "sidebar" }, [
+  const hidden = sidebarHiddenForA11y();
+  return h("aside", { class: "sidebar", id: "app-sidebar", inert: hidden, "aria-hidden": hidden ? "true" : null }, [
     h("div", { class: "sidebar__head" }, [brand()]),
     h("div", { class: "sidebar__scroll" }, [
       h("div", {}, [h("div", { class: "section-label", text: "工作区" }), h("nav", { class: "nav" }, navItems)]),
@@ -464,7 +486,7 @@ function renderSidebarFoot() {
 function renderTopbar() {
   const info = topbarInfo();
   return h("header", { class: "topbar" }, [
-    h("button", { class: "icon-btn menu-btn", title: "打开菜单", "aria-label": "打开菜单", onclick: () => { state.sidebarOpen = true; render(); } }, [icon("menu")]),
+    h("button", { class: "icon-btn menu-btn", title: "打开菜单", "aria-label": "打开菜单", "aria-expanded": String(state.sidebarOpen), "aria-controls": "app-sidebar", onclick: openSidebar }, [icon("menu")]),
     h("div", { class: "topbar__title-wrap" }, [
       h("div", { class: "topbar__title" }, [
         info.hash ? h("span", { class: "hash", text: "#" }) : icon(info.icon, { size: 18, cls: "muted" }),
@@ -507,7 +529,8 @@ function renderChat(mode) {
   const scopeId = scopeIdFor(mode);
   const draftKey = composerDraftKey(mode, scopeId);
   const selectedFiles = state.draftFiles[draftKey] || [];
-  const mentionMenu = h("div", { class: "mention-menu", role: "listbox", hidden: true });
+  const mentionMenuId = `mention-menu-${scopeTypeFor(mode)}-${scopeId}`;
+  const mentionMenu = h("div", { class: "mention-menu", role: "listbox", id: mentionMenuId, hidden: true });
   const fileInput = h("input", {
     class: "composer__file-input",
     type: "file",
@@ -530,6 +553,11 @@ function renderChat(mode) {
       ? (mode === "private" ? "给你的私人 Agent 发消息…" : `在 #${activeChannel()?.name || "频道"} 发消息，@agent 呼叫 Agent…`)
       : "当前权限组只能查看内容",
     "aria-label": "消息输入框",
+    role: mode === "channel" ? "combobox" : null,
+    "aria-haspopup": mode === "channel" ? "listbox" : null,
+    "aria-autocomplete": mode === "channel" ? "list" : null,
+    "aria-controls": mode === "channel" ? mentionMenuId : null,
+    "aria-expanded": mode === "channel" ? "false" : null,
     oninput: (e) => {
       state.drafts[draftKey] = e.target.value;
       autoGrow(e.target);
@@ -583,13 +611,21 @@ function renderChat(mode) {
     state._scrollChatToBottom = true;
     notifyTyping(mode, scopeId, false);
     const sent = await postChatMessage(mode, scopeId, content, files);
-    if (!sent) state.draftFiles[draftKey] = files;
+    if (!sent) {
+      // Send failed: restore the user's typed text and files so nothing is lost,
+      // then refocus the composer (postChatMessage's finally already re-rendered
+      // with the draft cleared, so we must render again after restoring state).
+      state.drafts[draftKey] = content;
+      if (files.length) state.draftFiles[draftKey] = files;
+      state._focusComposer = true;
+      render();
+    }
   };
 
   let body;
   if (noChannel) {
     body = emptyState("hash", "还没有频道", "在左侧创建一个频道，开始与团队和 Agent 协作。");
-  } else if (!messages.length && !isAgentActive(agentStatusFor(mode))) {
+  } else if (!messages.length && !isAgentActive(agentStatusFor(mode)) && agentStatusFor(mode)?.state !== "error") {
     body = mode === "private"
       ? emptyState("bot", "开启你的私人 Agent", "这是仅你可见的助手。发送第一条消息试试看。")
       : emptyState("message", "暂无消息", "成为第一个在该频道发言的人。需要时 @agent。");
@@ -601,6 +637,13 @@ function renderChat(mode) {
       for (const streamingMessage of agentStreamingMessages(status, mode)) {
         items.push(renderMessage(streamingMessage));
       }
+    } else if (status && status.state === "error") {
+      // Terminal failure where even the error reply could not be persisted as a
+      // chat message; surface it inline instead of rendering nothing.
+      items.push(h("article", { class: "msg msg--agent msg--activity" }, [
+        h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
+        renderAgentWorkCard(status, { active: false }),
+      ]));
     }
     if (mode === "channel" && state.typingUsers.length) items.push(renderTypingUsers(state.typingUsers));
     body = h("div", { class: "messages__inner" }, items);
@@ -878,16 +921,19 @@ function updateMentionMenu(input, menu, mode) {
   mentionState.options = options;
   mentionState.range = range;
   mentionState.menu = menu;
+  mentionState.input = input;
   renderMentionMenu(input, menu);
 }
 
 function renderMentionMenu(input, menu) {
   const options = mentionState.options || [];
+  const optionId = (index) => `${menu.id || "mention-menu"}-opt-${index}`;
   menu.replaceChildren(...options.map((option, index) =>
     h("button", {
       class: `mention-option ${index === mentionState.selected ? "is-active" : ""}`,
       type: "button",
       role: "option",
+      id: optionId(index),
       "aria-selected": index === mentionState.selected,
       onmousedown: (event) => {
         event.preventDefault();
@@ -908,6 +954,11 @@ function renderMentionMenu(input, menu) {
     ])
   ));
   menu.hidden = false;
+  if (input) {
+    input.setAttribute("aria-expanded", "true");
+    if (options.length) input.setAttribute("aria-activedescendant", optionId(mentionState.selected));
+    else input.removeAttribute("aria-activedescendant");
+  }
 }
 
 function handleMentionKey(event, input, menu, mode, scopeId, draftKey) {
@@ -962,11 +1013,16 @@ function hideMentionMenu(menu) {
     menu.hidden = true;
     menu.replaceChildren();
   }
+  const input = mentionState.input;
+  if (input && (!menu || input.getAttribute("aria-controls") === menu.id)) {
+    if (input.getAttribute("role") === "combobox") input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+  }
   mentionState.active = false;
   mentionState.selected = 0;
   mentionState.options = [];
   mentionState.range = null;
-  if (!menu || mentionState.menu === menu) mentionState.menu = null;
+  if (!menu || mentionState.menu === menu) { mentionState.menu = null; mentionState.input = null; }
 }
 
 function renderTypingUsers(users) {
@@ -1026,26 +1082,38 @@ function renderKnowledge() {
   const source = h("input", { placeholder: "来源（URL、系统名等）" });
   const summary = h("input", { placeholder: "摘要（可留空）" });
   const content = h("textarea", { placeholder: "正文内容…" });
-  const search = h("input", { placeholder: "搜索标题或正文…", "aria-label": "搜索知识库" });
+  const searchQuery = state.knowledgeSearch.query || "";
+  const searchResults = state.knowledgeSearch.results;
+  const isSearching = !!searchQuery && Array.isArray(searchResults);
+  const search = h("input", { placeholder: "搜索标题或正文…", "aria-label": "搜索知识库", value: searchQuery });
 
-  const docCards = state.documents.length
-    ? state.documents.map((doc) =>
-        h("div", { class: "doc-card" }, [
-          h("div", { class: "doc-card__title" }, [icon("doc"), h("span", { text: doc.title })]),
-          doc.summary ? h("div", { class: "doc-card__summary", text: doc.summary }) : null,
-          h("div", { class: "doc-card__actions" }, [
-            h("button", {
-              class: "btn btn--sm",
-              onclick: async () => {
-                await withBusy(async () => {
-                  const result = await api(`/api/knowledge/documents/${doc.id}`);
-                  state.selectedDocument = result.document;
-                });
-              },
-            }, [icon("doc", { size: 14 }), h("span", { text: "查看正文" })]),
-          ]),
-        ]))
-    : [emptyState("doc", "知识库为空", "在左侧表单中录入第一条企业知识。")];
+  const docCard = (doc) =>
+    h("div", { class: "doc-card" }, [
+      h("div", { class: "doc-card__title" }, [icon("doc"), h("span", { text: doc.title })]),
+      doc.summary ? h("div", { class: "doc-card__summary", text: doc.summary }) : null,
+      h("div", { class: "doc-card__actions" }, [
+        h("button", {
+          class: "btn btn--sm",
+          onclick: async () => {
+            await withBusy(async () => {
+              const result = await api(`/api/knowledge/documents/${doc.id}`);
+              state.selectedDocument = result.document;
+            });
+          },
+        }, [icon("doc", { size: 14 }), h("span", { text: "查看正文" })]),
+      ]),
+    ]);
+
+  const listSource = isSearching ? searchResults : state.documents;
+  const emptyCard = isSearching
+    ? emptyState("search", "没有匹配结果", `未找到与“${searchQuery}”相关的条目。`)
+    : emptyState("doc", "知识库为空", "在左侧表单中录入第一条企业知识。");
+  const docCards = listSource.length ? listSource.map(docCard) : [emptyCard];
+
+  const clearSearch = () => {
+    state.knowledgeSearch = { query: "", results: null };
+    render();
+  };
 
   const sections = [];
   if (canManage) {
@@ -1078,12 +1146,30 @@ function renderKnowledge() {
     h("form", {
       onsubmit: async (event) => {
         event.preventDefault();
+        const query = search.value.trim();
+        if (!query) { clearSearch(); return; }
+        // Search results are kept separate from the full library so a search
+        // never shrinks the visible document list permanently.
         await withBusy(async () => {
-          const result = await api(`/api/knowledge/search?q=${encodeURIComponent(search.value)}`);
-          state.documents = result.results;
+          const result = await api(`/api/knowledge/search?q=${encodeURIComponent(query)}`);
+          state.knowledgeSearch = { query, results: result.results || [] };
         });
       },
-    }, [h("div", { class: "search-field" }, [icon("search"), search])]),
+    }, [
+      h("div", { class: "search-field" }, [
+        icon("search"),
+        search,
+        isSearching
+          ? h("button", { class: "icon-btn search-field__clear", type: "button", title: "清除搜索", "aria-label": "清除搜索，显示全部条目", onclick: clearSearch }, [icon("close", { size: 15 })])
+          : null,
+      ]),
+    ]),
+    isSearching
+      ? h("div", { class: "list__note" }, [
+          h("span", { text: `搜索“${searchQuery}”：${searchResults.length} 条结果` }),
+          h("button", { class: "btn btn--sm", type: "button", onclick: clearSearch }, [h("span", { text: "显示全部" })]),
+        ])
+      : null,
     h("div", { class: "list" }, docCards),
     state.selectedDocument ? renderDocViewer() : null,
   ]));
@@ -2223,6 +2309,7 @@ async function loadPrivateMessages() {
 async function loadDocuments() {
   const result = await api("/api/knowledge/documents");
   state.documents = result.documents;
+  state.knowledgeSearch = { query: "", results: null };
 }
 async function loadUsers() {
   const result = await api("/api/users");
@@ -2331,6 +2418,8 @@ function stopPolling() {
 
 let scopeStream = null;
 let scopeStreamKey = null;
+let scopeStreamReconnect = null;
+const SSE_RECONNECT_MS = 3000;
 
 function currentScopeStreamUrl() {
   if (state.activeView === "channel" && state.activeChannelId) return `/api/channels/${state.activeChannelId}/events`;
@@ -2339,6 +2428,10 @@ function currentScopeStreamUrl() {
 }
 
 function closeScopeStream() {
+  if (scopeStreamReconnect) {
+    clearTimeout(scopeStreamReconnect);
+    scopeStreamReconnect = null;
+  }
   if (scopeStream) {
     try { scopeStream.close(); } catch (_) {}
   }
@@ -2348,7 +2441,8 @@ function closeScopeStream() {
 
 // Keep a single Server-Sent Events stream open for the active conversation so
 // agent activity and new messages surface immediately instead of waiting for
-// the poll. The browser auto-reconnects on error; the fallback poll covers gaps.
+// the poll. The browser auto-reconnects on network-level drops (readyState 0);
+// readyState 2 (CLOSED) is terminal and we reconnect ourselves below.
 function syncScopeStream() {
   if (!state.user || typeof EventSource === "undefined") return;
   const url = currentScopeStreamUrl();
@@ -2363,12 +2457,22 @@ function syncScopeStream() {
   });
   es.addEventListener("error", () => {
     if (scopeStream !== es) return;
-    // readyState 2 (CLOSED) means the browser gave up (e.g. the session
-    // expired and the request 401'd). Clean up and probe auth so an expired
-    // session drops to login promptly instead of waiting for the poll.
+    // readyState 2 (CLOSED) is the terminal, non-reconnecting state. It happens
+    // on session expiry (the reconnect request 401s) or a transient proxy 5xx.
+    // Probe auth: a valid session means it was a transport blip, so schedule a
+    // reconnect with a short delay instead of relying on an incidental render;
+    // an invalid session drops to login via api()'s 401 handling.
     if (es.readyState === 2) {
       closeScopeStream();
-      api("/api/auth/me").catch(() => {});
+      api("/api/auth/me")
+        .then(() => {
+          if (scopeStreamReconnect) return;
+          scopeStreamReconnect = setTimeout(() => {
+            scopeStreamReconnect = null;
+            if (state.user && !document.hidden) syncScopeStream();
+          }, SSE_RECONNECT_MS);
+        })
+        .catch(() => {});
     }
   });
 }
@@ -2490,7 +2594,46 @@ async function withBusy(fn) {
   }
 }
 
+let globalListenersReady = false;
+function setupGlobalListeners() {
+  if (globalListenersReady) return;
+  globalListenersReady = true;
+
+  // Escape closes the open mobile drawer for keyboard users.
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.sidebarOpen) {
+      event.preventDefault();
+      closeSidebar();
+    }
+  });
+
+  // Re-evaluate the off-canvas drawer's inert/aria-hidden state when the
+  // viewport crosses the mobile breakpoint.
+  const mobileQuery = window.matchMedia("(max-width: 800px)");
+  const onBreakpointChange = () => { if (state.user) render(); };
+  if (mobileQuery.addEventListener) mobileQuery.addEventListener("change", onBreakpointChange);
+  else if (mobileQuery.addListener) mobileQuery.addListener(onBreakpointChange);
+
+  // Pause the poll/SSE on hidden tabs to avoid wasted server load; catch up and
+  // re-establish real-time updates when the tab becomes visible again.
+  document.addEventListener("visibilitychange", () => {
+    if (!state.user) return;
+    if (document.hidden) {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      closeScopeStream();
+    } else {
+      refreshActiveChat();
+      startPolling();
+      syncScopeStream();
+    }
+  });
+
+  // Release the server-side SSE connection promptly when the tab goes away.
+  window.addEventListener("pagehide", () => { closeScopeStream(); });
+}
+
 async function boot() {
+  setupGlobalListeners();
   try {
     const result = await api("/api/auth/me");
     state.user = result.user;

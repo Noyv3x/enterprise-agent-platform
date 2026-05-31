@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -100,6 +101,12 @@ class OAuthFlowManager:
     def __init__(self, http_client: OAuthHTTPClient | None = None):
         self.http = http_client or OAuthHTTPClient()
         self._sessions: dict[str, dict[str, Any]] = {}
+        # Guards every read/mutation of ``_sessions``. The server is a
+        # ThreadingHTTPServer (one thread per request), so overlapping start/
+        # poll/complete calls mutate this dict concurrently. The lock is only
+        # ever held around in-memory dict touches, never around the blocking
+        # urllib network calls, so unrelated flows are not serialized.
+        self._lock = threading.Lock()
 
     def _prune_sessions(self) -> None:
         """Evict timed-out flow sessions (and the oldest if still over cap).
@@ -108,12 +115,13 @@ class OAuthFlowManager:
         session is otherwise only removed when it is explicitly polled/completed.
         """
         now = time.time()
-        for flow_id in [fid for fid, s in self._sessions.items() if now > float(s.get("expires_at", 0))]:
-            self._sessions.pop(flow_id, None)
-        if len(self._sessions) > MAX_OAUTH_SESSIONS:
-            ordered = sorted(self._sessions.items(), key=lambda kv: float(kv[1].get("expires_at", 0)))
-            for flow_id, _ in ordered[: len(self._sessions) - MAX_OAUTH_SESSIONS]:
+        with self._lock:
+            for flow_id in [fid for fid, s in self._sessions.items() if now > float(s.get("expires_at", 0))]:
                 self._sessions.pop(flow_id, None)
+            if len(self._sessions) > MAX_OAUTH_SESSIONS:
+                ordered = sorted(self._sessions.items(), key=lambda kv: float(kv[1].get("expires_at", 0)))
+                for flow_id, _ in ordered[: len(self._sessions) - MAX_OAUTH_SESSIONS]:
+                    self._sessions.pop(flow_id, None)
 
     def start(self, provider: str) -> dict[str, Any]:
         provider = normalize_oauth_provider(provider)
@@ -130,7 +138,7 @@ class OAuthFlowManager:
         if provider != "openai-codex":
             raise OAuthFlowError(400, "this provider does not use polling")
         if time.time() > float(session["expires_at"]):
-            self._sessions.pop(flow_id, None)
+            self._drop_session(flow_id)
             raise OAuthFlowError(410, "OAuth verification timed out; start again")
         response = self.http.post_json(
             CODEX_DEVICE_TOKEN_URL,
@@ -162,7 +170,7 @@ class OAuthFlowManager:
         refresh_token = str(tokens.data.get("refresh_token") or "").strip()
         if not access_token or not refresh_token:
             raise OAuthFlowError(502, "Codex token exchange did not return access and refresh tokens")
-        self._sessions.pop(flow_id, None)
+        self._drop_session(flow_id)
         return {
             "flow_id": flow_id,
             "provider": provider,
@@ -177,7 +185,7 @@ class OAuthFlowManager:
         if provider != "xai-oauth":
             raise OAuthFlowError(400, "this provider does not use callback paste completion")
         if time.time() > float(session["expires_at"]):
-            self._sessions.pop(flow_id, None)
+            self._drop_session(flow_id)
             raise OAuthFlowError(410, "OAuth verification timed out; start again")
         callback = _parse_callback_url(callback_url)
         if callback.get("error"):
@@ -208,7 +216,7 @@ class OAuthFlowManager:
         refresh_token = str(response.data.get("refresh_token") or "").strip()
         if not access_token or not refresh_token:
             raise OAuthFlowError(502, "Grok token exchange did not return access and refresh tokens")
-        self._sessions.pop(flow_id, None)
+        self._drop_session(flow_id)
         return {
             "flow_id": flow_id,
             "provider": provider,
@@ -248,7 +256,7 @@ class OAuthFlowManager:
             "poll_interval": max(3, interval),
             "expires_at": time.time() + max(60, expires_in),
         }
-        self._sessions[flow_id] = session
+        self._store_session(session)
         return self._pending_response(session, "waiting_for_user")
 
     def _start_xai(self) -> dict[str, Any]:
@@ -290,7 +298,7 @@ class OAuthFlowManager:
             "state": state,
             "expires_at": time.time() + 900,
         }
-        self._sessions[flow_id] = session
+        self._store_session(session)
         return self._pending_response(session, "waiting_for_callback")
 
     def _pending_response(self, session: dict[str, Any], status: str) -> dict[str, Any]:
@@ -308,10 +316,19 @@ class OAuthFlowManager:
         return response
 
     def _get_session(self, provider: str, flow_id: str) -> dict[str, Any]:
-        session = self._sessions.get(flow_id)
+        with self._lock:
+            session = self._sessions.get(flow_id)
         if not session or session.get("provider") != provider:
             raise OAuthFlowError(404, "OAuth verification session not found; start again")
         return session
+
+    def _drop_session(self, flow_id: str) -> None:
+        with self._lock:
+            self._sessions.pop(flow_id, None)
+
+    def _store_session(self, session: dict[str, Any]) -> None:
+        with self._lock:
+            self._sessions[session["flow_id"]] = session
 
 
 def normalize_oauth_provider(value: str | None) -> str:

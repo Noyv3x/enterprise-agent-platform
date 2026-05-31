@@ -167,9 +167,21 @@ class PlatformRuntimeManager:
         self.command_runner = command_runner or SubprocessCommandRunner()
         self.setting_provider = setting_provider
         self._lock = threading.RLock()
+        # Cached "Hermes was healthy at <monotonic ts>" so the steady-state hot
+        # path can skip the heavy prepare()+probe under the broad lock within a
+        # short TTL. See _hermes_recent_health / ensure_hermes_ready.
+        self._hermes_health_checked_at: float | None = None
+        # Fingerprint of the inputs that prepare_hermes() materializes; lets the
+        # hot path skip the rmtree/copytree + config/env rewrite when nothing
+        # has changed since the last successful prepare.
+        self._hermes_prepared_fingerprint: str | None = None
         self._hermes_process: ProcessLike | None = None
         self._camofox_process: ProcessLike | None = None
         self._firecrawl_process: ProcessLike | None = None
+        # When Firecrawl was launched via the managed `docker compose up` stack,
+        # remember the (compose argv, cwd) needed to tear it down so stop/close
+        # can run `docker compose down` instead of orphaning the containers.
+        self._firecrawl_compose_teardown: tuple[list[str], Path | None] | None = None
         self._hermes_last_started_at: int | None = None
         self._camofox_last_started_at: int | None = None
         self._firecrawl_last_started_at: int | None = None
@@ -224,6 +236,9 @@ class PlatformRuntimeManager:
         state = "prepared" if available else "missing"
         error = "" if available else detail
         self._hermes_last_error = error
+        # Record the fingerprint of what we just materialized so the hot path can
+        # detect when nothing changed and skip a redundant prepare.
+        self._hermes_prepared_fingerprint = self._hermes_prepare_fingerprint() if available else None
         return RuntimeStatus(
             "hermes",
             True,
@@ -239,6 +254,17 @@ class PlatformRuntimeManager:
         )
 
     def ensure_hermes_ready(self, *, wait: bool = True) -> RuntimeStatus:
+        if not self._managed_hermes_enabled():
+            return self.hermes_status(refresh=False)
+        # Steady-state hot path: when Hermes was confirmed healthy very recently
+        # and nothing the platform materializes has changed, skip the expensive
+        # prepare() (plugin rmtree/copytree + config/.env rewrite) and the
+        # serialized health probe. Every agent message hits this method, so this
+        # avoids per-message filesystem churn and lock-held probing.
+        if self._hermes_steady_state_ready():
+            cached = self._cached_hermes_running_status()
+            if cached is not None:
+                return cached
         with self._lock:
             if not self._managed_hermes_enabled():
                 return self.hermes_status(refresh=False)
@@ -251,9 +277,77 @@ class PlatformRuntimeManager:
                 return current
             if self._hermes_process is None or self._hermes_process.poll() is not None:
                 self._start_hermes()
-            if wait and self._effective_startup_wait_seconds() > 0:
-                return self._wait_for_hermes()
-            return self.hermes_status(refresh=True)
+            started_process = self._hermes_process
+            should_wait = wait and self._effective_startup_wait_seconds() > 0
+        # Release the broad lock before the blocking startup wait so status
+        # polls, other runtimes' ensure_*_ready, and graceful shutdown stay
+        # responsive while Hermes is warming up.
+        if should_wait:
+            return self._wait_for_hermes(started_process)
+        return self.hermes_status(refresh=True)
+
+    def _hermes_steady_state_ready(self) -> bool:
+        """True when a recent successful probe + unchanged inputs let us skip prepare."""
+        checked_at = self._hermes_health_checked_at
+        if checked_at is None:
+            return False
+        ttl = self._hermes_health_cache_ttl()
+        if ttl <= 0 or (time.monotonic() - checked_at) > ttl:
+            return False
+        if self._hermes_prepared_fingerprint is None:
+            return False
+        return self._hermes_prepared_fingerprint == self._hermes_prepare_fingerprint()
+
+    def _cached_hermes_running_status(self) -> RuntimeStatus | None:
+        """Synthesize the 'running' status from a recent successful probe.
+
+        Returns None when there is no live process backing the cache, so a
+        stale cache can never report a dead Hermes as healthy.
+        """
+        proc = self._hermes_process
+        if proc is None or proc.poll() is not None:
+            return None
+        home = self.config.managed_hermes_home
+        return RuntimeStatus(
+            "hermes",
+            True,
+            True,
+            "running",
+            "Hermes API server is reachable",
+            pid=proc.pid,
+            url=self._hermes_health_url(),
+            path=str(home),
+            last_started_at=self._hermes_last_started_at,
+            source=self._hermes_source_label(),
+            install_state=self._hermes_install_state(),
+        )
+
+    @staticmethod
+    def _hermes_health_cache_ttl() -> float:
+        raw = os.environ.get("ENTERPRISE_HERMES_HEALTH_CACHE_SECONDS")
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        return 5.0
+
+    def _hermes_prepare_fingerprint(self) -> str:
+        """Fingerprint of the inputs prepare_hermes() materializes into HERMES_HOME."""
+        try:
+            parts = [
+                str(self.config.managed_hermes_home),
+                str(self._effective_hermes_repo()),
+                self._effective_hermes_model(),
+                self._effective_hermes_provider(),
+                self._effective_hermes_provider_base_url(),
+                self._effective_hermes_api_url(),
+                self._effective_install_extras(),
+                "1" if self._managed_venv_ready() else "0",
+            ]
+        except Exception:
+            return ""
+        return "\0".join(parts)
 
     def restart_hermes(self) -> RuntimeStatus:
         with self._lock:
@@ -266,6 +360,10 @@ class PlatformRuntimeManager:
             if proc is not None:
                 self._terminate_process(proc, timeout=8)
             self._hermes_process = None
+            # Invalidate the steady-state caches so the hot path re-prepares and
+            # re-probes after a stop/restart instead of trusting a stale flag.
+            self._hermes_health_checked_at = None
+            self._hermes_prepared_fingerprint = None
             return self.hermes_status(refresh=False)
 
     def hermes_status(self, *, refresh: bool = True) -> RuntimeStatus:
@@ -279,7 +377,13 @@ class PlatformRuntimeManager:
             pid = self._hermes_process.pid
             process_running = self._hermes_process.poll() is None
         install_state = self._hermes_install_state()
-        healthy = self._probe_hermes_health() if refresh else False
+        if refresh:
+            healthy = self._probe_hermes_health()
+            # Track when the last successful probe happened so the hot path can
+            # serve a cached "running" status without re-probing every message.
+            self._hermes_health_checked_at = time.monotonic() if healthy else None
+        else:
+            healthy = False
         if healthy:
             return RuntimeStatus(
                 "hermes",
@@ -529,7 +633,38 @@ class PlatformRuntimeManager:
             return self.prepare_cognee()
 
     def cognee_status(self) -> RuntimeStatus:
-        return self.prepare_cognee()
+        """Report Cognee readiness without side effects.
+
+        Unlike prepare_cognee(), this does not seed os.environ, create
+        directories, or mutate sys.path, so the status/settings UI poll stays a
+        read-only query. Seeding stays on the explicit prepare/ensure path that
+        actually materializes the runtime before use.
+        """
+        if not self._managed_cognee_enabled():
+            return RuntimeStatus("cognee", False, False, "external", "managed Cognee disabled")
+        repo = self._effective_cognee_repo()
+        available = repo.exists() or str(repo) in sys.path or _module_importable("cognee")
+        if not available:
+            error = self._cognee_last_error or f"Cognee repository/package not found at {repo}"
+            return RuntimeStatus(
+                "cognee",
+                True,
+                False,
+                "missing",
+                path=str(self.config.cognee_runtime_dir),
+                error=error,
+                source=str(repo),
+            )
+        return RuntimeStatus(
+            "cognee",
+            True,
+            True,
+            "prepared",
+            "Cognee local storage and import path are managed by the platform",
+            path=str(self.config.cognee_runtime_dir),
+            error=self._cognee_last_error,
+            source=str(repo),
+        )
 
     def prepare_camofox(self) -> RuntimeStatus:
         if not self._managed_camofox_enabled():
@@ -564,14 +699,21 @@ class PlatformRuntimeManager:
                 return current
             if self._camofox_process is None or self._camofox_process.poll() is not None:
                 self._start_camofox()
-            if wait:
-                return self._wait_for_runtime("camofox")
-            return self.camofox_status(refresh=True)
+            started_process = self._camofox_process
+            should_wait = wait
+        # Release the broad lock before the (now much larger) cold-start wait so
+        # status polls, the Hermes/Firecrawl ensure_* paths, and shutdown stay
+        # responsive while the browser package downloads.
+        if should_wait:
+            return self._wait_for_runtime("camofox", started_process)
+        return self.camofox_status(refresh=True)
 
     def restart_camofox(self) -> RuntimeStatus:
         with self._lock:
             self.stop_camofox()
-            return self.ensure_camofox_ready(wait=True)
+        # ensure_camofox_ready manages the lock itself and releases it across the
+        # cold-start wait, so do not hold the broad lock around it here.
+        return self.ensure_camofox_ready(wait=True)
 
     def stop_camofox(self) -> RuntimeStatus:
         with self._lock:
@@ -603,7 +745,8 @@ class PlatformRuntimeManager:
                 True,
                 False,
                 "starting",
-                "Camofox process is running; health check is not ready yet",
+                "Camofox process is running; health check is not ready yet "
+                "(first launch downloads the browser package and may take a few minutes)",
                 pid=pid,
                 url=self._effective_camofox_url(),
                 path=str(runtime_dir),
@@ -638,7 +781,7 @@ class PlatformRuntimeManager:
         command, cwd, detail = self._firecrawl_command()
         available = bool(command)
         if available and cwd is not None:
-            self._ensure_firecrawl_env(cwd)
+            self._ensure_firecrawl_env()
         self._firecrawl_last_error = "" if available else detail
         return RuntimeStatus(
             "firecrawl",
@@ -665,19 +808,67 @@ class PlatformRuntimeManager:
                 return current
             if self._firecrawl_process is None or self._firecrawl_process.poll() is not None:
                 self._start_firecrawl()
-            if wait:
-                return self._wait_for_runtime("firecrawl")
-            return self.firecrawl_status(refresh=True)
+            started_process = self._firecrawl_process
+            should_wait = wait
+        # Release the broad lock before the (now much larger) cold-start wait so
+        # status polls, the Hermes/Camofox ensure_* paths, and shutdown stay
+        # responsive while docker pulls the multi-hundred-MB images.
+        if should_wait:
+            return self._wait_for_runtime("firecrawl", started_process)
+        return self.firecrawl_status(refresh=True)
 
     def restart_firecrawl(self) -> RuntimeStatus:
         with self._lock:
             self.stop_firecrawl()
-            return self.ensure_firecrawl_ready(wait=True)
+        # ensure_firecrawl_ready manages the lock itself and releases it across
+        # the cold-start wait, so do not hold the broad lock around it here.
+        return self.ensure_firecrawl_ready(wait=True)
 
     def stop_firecrawl(self) -> RuntimeStatus:
         with self._lock:
+            self._teardown_firecrawl_compose()
             self._stop_process("_firecrawl_process")
             return self.firecrawl_status(refresh=False)
+
+    def _teardown_firecrawl_compose(self) -> None:
+        """Tear down the managed Firecrawl compose stack before dropping the CLI.
+
+        `docker compose up` is an attached client; the api/playwright/postgres/
+        redis/rabbitmq containers are owned by the daemon, not the CLI's process
+        group, so killing the CLI orphans them and leaks port 3002 and DB
+        volumes. Run `docker compose down --remove-orphans` first so the stack is
+        actually stopped and removed.
+        """
+        teardown = self._firecrawl_compose_teardown
+        if teardown is None:
+            return
+        down_command, cwd = teardown
+        log_path = self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log"
+        env = os.environ.copy()
+        env["DOCKER_BUILDKIT"] = env.get("DOCKER_BUILDKIT") or "1"
+        env["COMPOSE_DOCKER_CLI_BUILD"] = env.get("COMPOSE_DOCKER_CLI_BUILD") or "1"
+        try:
+            self.command_runner.run(
+                down_command,
+                cwd=cwd,
+                env=env,
+                log_path=log_path,
+                timeout=self._firecrawl_compose_down_timeout(),
+            )
+        except Exception as exc:
+            self._firecrawl_last_error = f"Firecrawl compose teardown failed: {exc}"
+        finally:
+            self._firecrawl_compose_teardown = None
+
+    @staticmethod
+    def _firecrawl_compose_down_timeout() -> float:
+        raw = os.environ.get("ENTERPRISE_FIRECRAWL_COMPOSE_DOWN_TIMEOUT_SECONDS")
+        if raw:
+            try:
+                return max(1.0, float(raw))
+            except ValueError:
+                pass
+        return 90.0
 
     def firecrawl_status(self, *, refresh: bool = True) -> RuntimeStatus:
         if not self._managed_firecrawl_enabled():
@@ -704,7 +895,8 @@ class PlatformRuntimeManager:
                 True,
                 False,
                 "starting",
-                "Firecrawl process is running; API health check is not ready yet",
+                "Firecrawl process is running; API health check is not ready yet "
+                "(first launch pulls the Docker images and may take several minutes)",
                 pid=pid,
                 url=self._effective_firecrawl_api_url(),
                 path=str(cwd or self.config.firecrawl_runtime_dir),
@@ -778,6 +970,9 @@ class PlatformRuntimeManager:
         if not command:
             self._firecrawl_last_error = detail
             return
+        # Materialize the managed .env (under the data dir) before launch so the
+        # --env-file argv resolves to a real file.
+        self._ensure_firecrawl_env()
         env = os.environ.copy()
         env.update({
             "DOCKER_BUILDKIT": env.get("DOCKER_BUILDKIT") or "1",
@@ -787,13 +982,39 @@ class PlatformRuntimeManager:
             "PORT": str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002),
         })
         log_path = self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log"
+        teardown = self._firecrawl_compose_teardown_command(command, cwd)
         try:
             self._firecrawl_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
             self._firecrawl_last_started_at = now_ts()
             self._firecrawl_last_error = ""
+            self._firecrawl_compose_teardown = teardown
         except Exception as exc:
             self._firecrawl_last_error = str(exc)
             self._firecrawl_process = None
+            self._firecrawl_compose_teardown = None
+
+    def _firecrawl_compose_teardown_command(
+        self, up_command: list[str], cwd: Path | None
+    ) -> tuple[list[str], Path | None] | None:
+        """Build the `docker compose ... down` argv mirroring the launch command.
+
+        Only the managed compose stack (no user-configured command) is torn
+        down; a user-provided _effective_firecrawl_command is left to the
+        operator and handled by the plain _stop_process path.
+        """
+        if self._effective_firecrawl_command():
+            return None
+        if up_command[:2] != ["docker", "compose"]:
+            return None
+        # Preserve the `--env-file`/`-f` flags from the up argv (everything
+        # before the trailing `up ...` verb) and swap the verb for `down`.
+        try:
+            up_index = up_command.index("up")
+        except ValueError:
+            return None
+        prefix = up_command[1:up_index]  # drop the leading "docker"
+        down_command = ["docker", *prefix, "down", "--remove-orphans"]
+        return (down_command, cwd)
 
     def _stop_process(self, attr: str) -> None:
         proc = getattr(self, attr)
@@ -847,27 +1068,36 @@ class PlatformRuntimeManager:
             return ""
         return f"{name} process exited with code {returncode}; see {log_path}"
 
-    def _wait_for_hermes(self) -> RuntimeStatus:
+    def _wait_for_hermes(self, process: ProcessLike | None = None) -> RuntimeStatus:
+        # Snapshot the launched process handle so the wait loop does not need the
+        # broad lock; default to the current handle for direct/legacy callers.
+        proc = process if process is not None else self._hermes_process
         deadline = time.monotonic() + self._effective_startup_wait_seconds()
         while time.monotonic() < deadline:
             status = self.hermes_status(refresh=True)
             if status.available:
                 return status
-            if self._hermes_process is not None and self._hermes_process.poll() is not None:
+            # No live process to wait for (launch failed or never started, or it
+            # has already exited): the failure is already known, so return the
+            # freshly refreshed status immediately instead of sleeping out the
+            # whole startup window.
+            if proc is None or proc.poll() is not None:
                 return status
             time.sleep(0.25)
         return self.hermes_status(refresh=True)
 
-    def _wait_for_runtime(self, name: str) -> RuntimeStatus:
-        deadline = time.monotonic() + self._effective_startup_wait_seconds()
-        status_fn = self.camofox_status if name == "camofox" else self.firecrawl_status
+    def _wait_for_runtime(self, name: str, process: ProcessLike | None = None) -> RuntimeStatus:
+        # Snapshot the launched process handle so the busy-poll does not need the
+        # broad lock held; default to the current handle for direct callers.
         process_attr = "_camofox_process" if name == "camofox" else "_firecrawl_process"
+        proc = process if process is not None else getattr(self, process_attr)
+        status_fn = self.camofox_status if name == "camofox" else self.firecrawl_status
+        deadline = time.monotonic() + self._runtime_startup_wait_seconds(name)
         while time.monotonic() < deadline:
             status = status_fn(refresh=True)
             if status.available:
                 return status
-            proc = getattr(self, process_attr)
-            if proc is not None and proc.poll() is not None:
+            if proc is None or proc.poll() is not None:
                 return status
             time.sleep(0.25)
         return status_fn(refresh=True)
@@ -877,10 +1107,60 @@ class PlatformRuntimeManager:
         dest = home / "plugins" / HERMES_PLUGIN_DIR
         if not source.exists():
             raise FileNotFoundError(f"enterprise Hermes plugin source not found: {source}")
+        signature = self._plugin_source_signature(source)
+        marker = dest / ".enterprise_plugin_signature"
         if dest.exists():
-            shutil.rmtree(dest)
+            try:
+                if marker.read_text(encoding="utf-8").strip() == signature:
+                    # Already up to date — skip the rmtree/copytree so the hot
+                    # path does not churn the filesystem (and so a live Hermes
+                    # process never sees the plugin dir momentarily vanish).
+                    return
+            except OSError:
+                pass
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, dest)
+        # Copy into a sibling temp dir and atomically swap it in, so a running
+        # process scanning the plugins dir never observes a half-copied or
+        # missing directory.
+        staging = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
+        if staging.exists():
+            shutil.rmtree(staging)
+        shutil.copytree(source, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (staging / ".enterprise_plugin_signature").write_text(signature, encoding="utf-8")
+        previous = dest.with_name(f"{dest.name}.old.{os.getpid()}")
+        if dest.exists():
+            os.replace(str(dest), str(previous))
+        try:
+            os.replace(str(staging), str(dest))
+        except OSError:
+            # Restore the previous copy if the swap-in failed.
+            if previous.exists() and not dest.exists():
+                os.replace(str(previous), str(dest))
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous, ignore_errors=True)
+
+    @staticmethod
+    def _plugin_source_signature(source: Path) -> str:
+        """Content fingerprint of the plugin source tree (excluding caches)."""
+        import hashlib
+
+        digest = hashlib.sha256()
+        for path in sorted(source.rglob("*")):
+            rel = path.relative_to(source)
+            if any(part == "__pycache__" for part in rel.parts) or path.suffix == ".pyc":
+                continue
+            digest.update(str(rel).encode("utf-8"))
+            digest.update(b"\0")
+            if path.is_file():
+                try:
+                    digest.update(path.read_bytes())
+                except OSError:
+                    pass
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     def _ensure_hermes_config(self, home: Path) -> None:
         path = home / "config.yaml"
@@ -1003,6 +1283,14 @@ class PlatformRuntimeManager:
         state = providers.get("openai-codex")
         if not isinstance(state, dict):
             state = {}
+        if not self._db_oauth_supersedes(state, refresh_token):
+            # auth.json already holds a populated token block that the platform
+            # has not been told to replace (the DB still carries the same token
+            # the platform previously synced). Managed Hermes rotates Codex
+            # refresh tokens on every refresh and writes the new pair back into
+            # auth.json; overwriting with the stale DB copy here would replay a
+            # consumed refresh token and force re-login, so leave it untouched.
+            return False
         original = json.dumps(state, sort_keys=True)
         tokens = dict(state.get("tokens") or {})
         tokens["access_token"] = access_token
@@ -1010,6 +1298,7 @@ class PlatformRuntimeManager:
         state["tokens"] = tokens
         state["auth_mode"] = "chatgpt"
         state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        state["platform_synced_refresh_token"] = refresh_token
         changed = original != json.dumps(state, sort_keys=True)
         providers["openai-codex"] = state
         return changed
@@ -1022,6 +1311,11 @@ class PlatformRuntimeManager:
         state = providers.get("xai-oauth")
         if not isinstance(state, dict):
             state = {}
+        if not self._db_oauth_supersedes(state, refresh_token):
+            # See _upsert_codex_oauth: keep the Hermes-rotated token in auth.json
+            # authoritative unless the DB carries a genuinely new credential
+            # (a fresh interactive login changes the stored refresh token).
+            return False
         original = json.dumps(state, sort_keys=True)
         tokens = dict(state.get("tokens") or {})
         tokens["access_token"] = access_token
@@ -1033,9 +1327,42 @@ class PlatformRuntimeManager:
         state["tokens"] = tokens
         state["auth_mode"] = "oauth_pkce"
         state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        state["platform_synced_refresh_token"] = refresh_token
         changed = original != json.dumps(state, sort_keys=True)
         providers["xai-oauth"] = state
         return changed
+
+    @staticmethod
+    def _db_oauth_supersedes(state: dict[str, Any], db_refresh_token: str) -> bool:
+        """Decide whether the DB credential should overwrite the auth.json block.
+
+        Managed Hermes owns refresh-token rotation and persists the rotated pair
+        into auth.json, while the platform settings DB is only written by an
+        interactive login. To keep Hermes rotations from being clobbered without
+        a service.py-side change, the platform records the refresh token it last
+        synced into auth.json as ``platform_synced_refresh_token``. The DB copy
+        wins only when:
+
+        * auth.json has no populated refresh token yet (first-time bootstrap), or
+        * the DB refresh token differs from the one the platform last synced,
+          which only happens after a fresh interactive login (Hermes rotations
+          never touch the DB, so the synced marker keeps matching the DB).
+
+        When the DB token still equals the synced marker but the live auth.json
+        token has moved on, that is a Hermes rotation and auth.json stays
+        authoritative.
+        """
+        tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
+        existing_refresh = str(tokens.get("refresh_token") or "")
+        if not existing_refresh:
+            return True
+        synced = str(state.get("platform_synced_refresh_token") or "")
+        if not synced:
+            # Pre-existing auth.json from before this marker was introduced: only
+            # overwrite if the DB credential actually differs, so an identical
+            # value is left in place and a genuinely fresh login still wins.
+            return db_refresh_token != existing_refresh
+        return db_refresh_token != synced
 
     def _first_secret(self, *keys: str) -> str:
         for key in keys:
@@ -1048,6 +1375,20 @@ class PlatformRuntimeManager:
         env = os.environ.copy()
         env.update(self._hermes_child_values())
         env["HERMES_HOME"] = str(self.config.managed_hermes_home)
+        # Point the managed Hermes process at a dedicated scratch dir under the
+        # platform data dir (mirrored by EnterpriseService._managed_media_tmp_dir)
+        # so generated media lands in a trusted media root. The shared system
+        # temp dir is intentionally NOT an allowed media root, so without this
+        # MEDIA: attachments written to the default /tmp would be refused.
+        scratch = self.config.managed_hermes_home / "tmp"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        scratch_str = str(scratch)
+        env["TMPDIR"] = scratch_str
+        env["TEMP"] = scratch_str
+        env["TMP"] = scratch_str
         repo = self._effective_hermes_repo()
         patch_path = Path(__file__).resolve().parent / "hermes_runtime_patch"
         python_path_parts = [str(patch_path)]
@@ -1135,10 +1476,18 @@ class PlatformRuntimeManager:
         if compose_file is None:
             return ([], repo, f"Firecrawl repository is missing a Docker Compose file: {repo}")
         override = self._ensure_firecrawl_compose_override()
+        # Source the managed .env from the platform data dir instead of letting
+        # compose pick up repo/.env, so the generated secret never lands in the
+        # submodule working tree. The file is materialized by prepare_firecrawl /
+        # _start_firecrawl; building the argv stays side-effect free for status
+        # polls (which also call this helper).
+        env_file = self._firecrawl_env_path()
         return (
             [
                 "docker",
                 "compose",
+                "--env-file",
+                str(env_file),
                 "-f",
                 compose_file.name,
                 "-f",
@@ -1180,8 +1529,15 @@ class PlatformRuntimeManager:
             override.write_text(text, encoding="utf-8")
         return override
 
-    def _ensure_firecrawl_env(self, repo: Path) -> None:
-        env_path = repo / ".env"
+    def _firecrawl_env_path(self) -> Path:
+        # Keep the managed Firecrawl .env (which carries a generated
+        # BULL_AUTH_KEY secret) under the platform data directory rather than
+        # inside the firecrawl submodule working tree, per AGENTS.md guidance to
+        # keep managed runtime state out of the repo.
+        return self.config.firecrawl_runtime_dir / ".env"
+
+    def _ensure_firecrawl_env(self) -> Path:
+        env_path = self._firecrawl_env_path()
         values = _read_env_file(env_path)
         port = str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002)
         defaults = {
@@ -1195,8 +1551,10 @@ class PlatformRuntimeManager:
             if not values.get(key):
                 values[key] = value
                 changed = True
-        if changed:
+        if changed or not env_path.exists():
+            env_path.parent.mkdir(parents=True, exist_ok=True)
             _write_env_file(env_path, values)
+        return env_path
 
     def _firecrawl_bull_auth_key(self) -> str:
         for key in ("FIRECRAWL_BULL_AUTH_KEY", "BULL_AUTH_KEY"):
@@ -1248,10 +1606,23 @@ class PlatformRuntimeManager:
             return "http://127.0.0.1:8642/health"
         return urllib.parse.urlunparse((scheme, netloc, "/health", "", "", ""))
 
+    # Cognee env keys that name a directory the platform should materialize.
+    _COGNEE_DIR_KEYS = (
+        "DATA_ROOT_DIRECTORY",
+        "SYSTEM_ROOT_DIRECTORY",
+        "CACHE_ROOT_DIRECTORY",
+        "COGNEE_LOGS_DIR",
+    )
+
     def _seed_cognee_env(self) -> None:
         values = self._cognee_env_values()
-        for path in values.values():
-            if path.startswith("/") or path.startswith("~"):
+        # Only mkdir the known directory keys. Iterating every merged .env value
+        # would blindly create directory trees for arbitrary path-like values
+        # (e.g. a sqlite file path or migration db path that starts with "/"),
+        # which can later break Cognee when it opens that path as a file.
+        for key in self._COGNEE_DIR_KEYS:
+            path = values.get(key)
+            if path and (path.startswith("/") or path.startswith("~")):
                 Path(path).expanduser().mkdir(parents=True, exist_ok=True)
         for key, value in values.items():
             os.environ[key] = value
@@ -1313,6 +1684,32 @@ class PlatformRuntimeManager:
             return max(0.0, float(raw))
         except ValueError:
             return self.config.runtime_startup_wait_seconds
+
+    def _runtime_startup_wait_seconds(self, name: str) -> float:
+        """Warm-up budget for the heavier managed runtimes.
+
+        Camofox (npx package + browser download) and Firecrawl
+        (``docker compose up --pull missing`` over multi-hundred-MB images) take
+        far longer than Hermes to become healthy on a cold start, so they get
+        their own, larger budgets instead of reusing the Hermes-tuned value.
+        Both honour the Hermes startup wait as a floor and an env override.
+        """
+        env_key = f"ENTERPRISE_{name.upper()}_STARTUP_WAIT_SECONDS"
+        raw = os.environ.get(env_key)
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        # Honour an explicit no-wait configuration (0): operators who opt into
+        # async startup — and the test suite — must not be forced to block on
+        # the larger cold-start floor. Only apply the heavier default when a
+        # startup wait is actually requested.
+        base = self._effective_startup_wait_seconds()
+        if base <= 0:
+            return 0.0
+        default = 300.0 if name == "firecrawl" else 120.0
+        return max(default, base)
 
     def _effective_hermes_timeout_seconds(self) -> float:
         raw = self._runtime_setting(HERMES_SETTING_TIMEOUT)
@@ -1555,12 +1952,27 @@ def _read_yaml_mapping(path: Path) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _write_text_if_changed(path: Path, text: str) -> None:
+    """Write ``text`` only when it differs from the current file content.
+
+    Avoids rewriting managed config/.env files on every hot-path prepare when
+    nothing actually changed (reduces I/O churn and lock-held work).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            return
+    except OSError:
+        pass
+    path.write_text(text, encoding="utf-8")
+
+
 def _write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         import yaml
 
-        path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        _write_text_if_changed(path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
     except Exception:
         enabled = data.get("plugins", {}).get("enabled", [HERMES_PLUGIN_KEY])
         lines = ["plugins:", "  enabled:"]
@@ -1572,7 +1984,7 @@ def _write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
                 value = model.get(key)
                 if value is not None and str(value) != "":
                     lines.append(f"  {key}: {_quote_yaml_scalar(str(value))}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_text_if_changed(path, "\n".join(lines) + "\n")
 
 
 def _quote_yaml_scalar(value: str) -> str:
@@ -1599,7 +2011,13 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
     # provider URLs, so they are written 0600 like auth.json rather than with
     # the default umask.
     lines = [f"{key}={_quote_env(value)}" for key, value in sorted(values.items())]
-    _write_text_secure(path, "\n".join(lines) + "\n")
+    text = "\n".join(lines) + "\n"
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            return
+    except OSError:
+        pass
+    _write_text_secure(path, text)
 
 
 def _quote_env(value: str) -> str:

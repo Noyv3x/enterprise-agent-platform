@@ -6,7 +6,6 @@ import secrets
 import hashlib
 import mimetypes
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -63,6 +62,16 @@ class UploadedFile:
 
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+# Cumulative per-uploader storage budget for attachment blobs. Bounds deliberate
+# or accidental disk exhaustion by any authenticated chat/private-agent user.
+# 0 disables the quota.
+ATTACHMENT_QUOTA_BYTES = max(0, int(os.getenv("ENTERPRISE_ATTACHMENT_QUOTA_BYTES", str(2 * 1024 * 1024 * 1024)) or "0"))
+# Sliding-window per-user upload rate limit. Caps how many attachment-bearing
+# messages a single user can send within the window, providing lightweight
+# backpressure against storage floods. Only messages that carry attachments are
+# counted, so ordinary chat is unaffected. 0 disables the limiter.
+UPLOAD_RATE_LIMIT_WINDOW_SECONDS = max(1, int(os.getenv("ENTERPRISE_UPLOAD_RATE_WINDOW_SECONDS", "60") or "60"))
+MAX_UPLOADS_PER_WINDOW = max(0, int(os.getenv("ENTERPRISE_MAX_UPLOADS_PER_WINDOW", "30") or "0"))
 MIN_PASSWORD_LENGTH = 8
 BOOTSTRAP_ADMIN_PASSWORD_FILE = "bootstrap-admin-password.txt"
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
@@ -71,14 +80,31 @@ MAX_LOGIN_FAILURES = 8
 # force (rotating source IPs / X-Forwarded-For) against one username is still
 # bounded even though the per-(user, client) limit alone could be evaded.
 MAX_LOGIN_FAILURES_PER_USER = 50
+# Hard ceiling on the number of distinct keys retained in the in-memory login
+# failure maps. Usernames are attacker-controlled even for invalid logins, so
+# without this bound a flood of distinct usernames could grow the maps without
+# limit. When the cap is exceeded we sweep expired entries and, if still over,
+# evict the oldest-by-last-timestamp entries (bounded LRU).
+MAX_LOGIN_FAILURE_KEYS = 10_000
 # Bound in-memory agent state so a flood of @agent messages or many idle
 # conversations cannot grow memory without limit.
 MAX_AGENT_QUEUE_DEPTH = 64
 MAX_TRACKED_CONVERSATIONS = 1000
+# Global ceiling on concurrent in-flight Hermes generations. Each conversation
+# still drains its own queue in FIFO order, but only this many replies hit the
+# Hermes backend (and hold a thread/socket) at once, providing backpressure so a
+# burst of distinct active conversations cannot exhaust threads/sockets or
+# overwhelm Hermes.
+MAX_CONCURRENT_AGENT_RUNS = max(1, int(os.getenv("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS", "8") or "8"))
 # Cognee ingestion is heavy; it runs on a background worker so document creation
 # never blocks the request thread (and, via the DB, every other request).
 MAX_INGEST_QUEUE_DEPTH = 256
 MAX_TRACKED_INGEST_RESULTS = 1000
+# Bounded retry for transient Cognee ingest failures. A failed job is re-queued
+# with a short capped backoff up to this many attempts before it is dropped and
+# counted as a permanent failure (surfaced in knowledge_status).
+MAX_INGEST_ATTEMPTS = max(1, int(os.getenv("ENTERPRISE_INGEST_MAX_ATTEMPTS", "3") or "3"))
+INGEST_RETRY_BACKOFF_CAP_SECONDS = 30
 SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
     "image/png",
     "image/jpeg",
@@ -183,24 +209,70 @@ class EnterpriseService:
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
+        # Global backpressure on concurrent in-flight Hermes generations.
+        self._agent_run_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_AGENT_RUNS)
         self._auth_lock = threading.RLock()
         self._login_failures: dict[tuple[str, str], Deque[float]] = {}
         self._login_failures_by_user: dict[str, Deque[float]] = {}
+        # Per-user upload timestamps for the sliding-window rate limiter.
+        self._upload_rate: dict[int, Deque[float]] = {}
+        # Fixed dummy hash so authentication spends a comparable amount of time
+        # whether or not the username exists, eliminating a timing oracle.
+        self._dummy_password_hash = hash_password(secrets.token_urlsafe(16))
         self._ingest_lock = threading.Lock()
         self._ingest_queue: Deque[dict[str, Any]] = deque()
         self._ingest_thread: threading.Thread | None = None
         self._ingest_results: dict[int, dict[str, Any]] = {}
+        # Operator-visible counters for documents that exhausted ingest retries.
+        self._ingest_failed_count = 0
+        self._ingest_last_error = ""
+        # Background reclaimer for idle per-user containers. Disabled (no thread)
+        # unless ENTERPRISE_CONTAINER_IDLE_HOURS > 0.
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: threading.Thread | None = None
         self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
             self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_hermes_ready(wait=False)
+        self._start_container_reaper()
+
+    def _start_container_reaper(self) -> None:
+        """Start a daemon thread that periodically reclaims idle per-user
+        containers, so a user who simply stops messaging (without being
+        deactivated) does not leak a running container. No-op unless
+        ENTERPRISE_CONTAINER_IDLE_HOURS > 0; for the local-workspace backend the
+        sweep is a cheap query that matches nothing."""
+        try:
+            idle_hours = float(os.getenv("ENTERPRISE_CONTAINER_IDLE_HOURS", "0") or "0")
+        except ValueError:
+            idle_hours = 0.0
+        if idle_hours <= 0:
+            return
+        interval = max(300.0, min(idle_hours * 3600.0, 3600.0))
+
+        def _loop() -> None:
+            while not self._closed:
+                try:
+                    self.containers.reap_idle_containers(idle_hours=idle_hours)
+                except Exception:
+                    pass
+                # Wake immediately on shutdown; otherwise sweep on each interval.
+                if self._reaper_stop.wait(interval):
+                    return
+
+        self._reaper_thread = threading.Thread(target=_loop, name="container-reaper", daemon=True)
+        self._reaper_thread.start()
 
     def close(self) -> None:
         with self._conversation_lock:
             self._closed = True
             workers = list(self._agent_workers.values())
+        self._reaper_stop.set()
+        reaper = self._reaper_thread
+        if reaper is not None:
+            reaper.join(timeout=2)
         for worker in workers:
             worker.join(timeout=2)
         with self._ingest_lock:
@@ -327,13 +399,29 @@ class EnterpriseService:
         except ServiceError as exc:
             self._record_login_failure(str(username).strip().lower()[:80] or "invalid", client_id)
             raise ServiceError(401, "invalid username or password") from exc
+        # Per-(user, client) limit blocks a single source brute forcing one
+        # account, regardless of whether the supplied password is correct.
         self._check_login_rate_limit(clean_username, client_id)
         user = self.db.query_one(
             "SELECT * FROM users WHERE username = ? AND active = 1",
             (clean_username,),
         )
-        if not user or not verify_password(password, user["password_hash"]):
+        # Always run a PBKDF2 verification, even when the user does not exist, so
+        # wall-clock time does not reveal whether a username is valid (timing
+        # oracle). The dummy result is discarded.
+        if user:
+            password_ok = verify_password(password, user["password_hash"])
+        else:
+            verify_password(password, self._dummy_password_hash)
+            password_ok = False
+        if not password_ok:
             self._record_login_failure(clean_username, client_id)
+            # The per-user ceiling only bounds wrong-password attempts; a correct
+            # credential is never blocked by it (avoids remote account-lockout
+            # DoS). Surface the ceiling as a 429 so a distributed brute force
+            # against one account still sees backpressure.
+            if self._login_failures_over_user_limit(clean_username):
+                raise ServiceError(429, "too many failed login attempts; try again later")
             raise ServiceError(401, "invalid username or password")
         self._clear_login_failures(clean_username, client_id)
         self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), user["id"]))
@@ -346,25 +434,34 @@ class EnterpriseService:
         with self._auth_lock:
             per_client = self._login_failures.get(key)
             if per_client:
-                self._trim_login_failures(per_client, now)
+                self._trim_login_failures(per_client, now, self._login_failures, key)
                 if len(per_client) >= MAX_LOGIN_FAILURES:
                     raise ServiceError(429, "too many failed login attempts; try again later")
-            per_user = self._login_failures_by_user.get(key[0])
-            if per_user:
-                self._trim_login_failures(per_user, now)
-                if len(per_user) >= MAX_LOGIN_FAILURES_PER_USER:
-                    raise ServiceError(429, "too many failed login attempts; try again later")
+
+    def _login_failures_over_user_limit(self, username: str) -> bool:
+        """Return True when the per-account wrong-password ceiling is reached."""
+        user_key = self._login_failure_key(username, "")[0]
+        now = time.time()
+        with self._auth_lock:
+            per_user = self._login_failures_by_user.get(user_key)
+            if not per_user:
+                return False
+            self._trim_login_failures(per_user, now, self._login_failures_by_user, user_key)
+            return len(per_user) >= MAX_LOGIN_FAILURES_PER_USER
 
     def _record_login_failure(self, username: str, client_id: str) -> None:
         key = self._login_failure_key(username, client_id)
         now = time.time()
         with self._auth_lock:
-            for failures in (
-                self._login_failures.setdefault(key, deque()),
-                self._login_failures_by_user.setdefault(key[0], deque()),
-            ):
-                self._trim_login_failures(failures, now)
-                failures.append(now)
+            client_failures = self._login_failures.setdefault(key, deque())
+            self._trim_login_failures(client_failures, now)
+            client_failures.append(now)
+            user_failures = self._login_failures_by_user.setdefault(key[0], deque())
+            self._trim_login_failures(user_failures, now)
+            user_failures.append(now)
+            # Bound the number of distinct keys so attacker-controlled usernames
+            # cannot grow the maps without limit (memory-exhaustion DoS).
+            self._evict_stale_login_failures_locked(now)
 
     def _clear_login_failures(self, username: str, client_id: str) -> None:
         key = self._login_failure_key(username, client_id)
@@ -373,10 +470,38 @@ class EnterpriseService:
             self._login_failures_by_user.pop(key[0], None)
 
     @staticmethod
-    def _trim_login_failures(failures: Deque[float], now: float) -> None:
+    def _trim_login_failures(
+        failures: Deque[float],
+        now: float,
+        parent: dict[Any, Deque[float]] | None = None,
+        key: Any = None,
+    ) -> None:
         cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
         while failures and failures[0] < cutoff:
             failures.popleft()
+        # Drop the key from its parent map once it has no recent failures left,
+        # so emptied entries do not accumulate.
+        if parent is not None and not failures:
+            parent.pop(key, None)
+
+    def _evict_stale_login_failures_locked(self, now: float) -> None:
+        """Bound the login-failure maps. Caller must hold ``_auth_lock``.
+
+        First sweep entries whose newest failure has aged out of the window;
+        if a map is still over the key cap, evict the oldest-by-last-timestamp
+        entries (bounded LRU).
+        """
+        cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+        for store in (self._login_failures, self._login_failures_by_user):
+            if len(store) <= MAX_LOGIN_FAILURE_KEYS:
+                continue
+            for k in [k for k, dq in store.items() if not dq or dq[-1] < cutoff]:
+                store.pop(k, None)
+            if len(store) <= MAX_LOGIN_FAILURE_KEYS:
+                continue
+            ordered = sorted(store.items(), key=lambda item: item[1][-1] if item[1] else 0.0)
+            for k, _dq in ordered[: len(store) - MAX_LOGIN_FAILURE_KEYS]:
+                store.pop(k, None)
 
     @staticmethod
     def _login_failure_key(username: str, client_id: str) -> tuple[str, str]:
@@ -503,7 +628,15 @@ class EnterpriseService:
         return self.get_user(user_id) or {}
 
     def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
-        return self.update_user(actor, user_id, {"active": False})
+        result = self.update_user(actor, user_id, {"active": False})
+        # Reclaim the user's private agent container so a deactivated account
+        # does not leave a running/leaked container behind (best-effort; the
+        # method swallows backend errors and always clears the private_agents row).
+        try:
+            self.containers.remove_private_container(int(user_id))
+        except Exception:
+            pass
+        return result
 
     @staticmethod
     def public_user(row: dict[str, Any]) -> dict[str, Any]:
@@ -787,6 +920,8 @@ class EnterpriseService:
         uploads = self._normalize_uploaded_files(attachments)
         if not content and not uploads:
             raise ServiceError(400, "message content is required")
+        if uploads:
+            self._enforce_upload_rate_limit(actor.get("id"))
         generation = self.account_generation_config(actor)
         scope_id = str(channel_id)
         agent_content = channel_agent_request(content)
@@ -900,6 +1035,8 @@ class EnterpriseService:
         uploads = self._normalize_uploaded_files(attachments)
         if not content and not uploads:
             raise ServiceError(400, "message content is required")
+        if uploads:
+            self._enforce_upload_rate_limit(actor.get("id"))
         generation = self.account_generation_config(actor)
         scope_id = str(actor["id"])
         user_msg = self._append_message(
@@ -1237,7 +1374,11 @@ class EnterpriseService:
                     **info,
                     "configured": configured or bool(runtime_status.get("configured")),
                     "active": active_provider == provider,
-                    "last_refresh": self._oauth_last_refresh(provider) or runtime_status.get("last_refresh"),
+                    # Hermes owns token refresh and keeps auth.json current, so
+                    # prefer the runtime value; the DB write time is only a
+                    # fallback before Hermes has written auth.json (e.g. right
+                    # after a credential import).
+                    "last_refresh": runtime_status.get("last_refresh") or self._oauth_last_refresh(provider),
                 }
             )
         return {"providers": providers, "active_provider": active_provider}
@@ -1309,11 +1450,18 @@ class EnterpriseService:
         provider = normalize_hermes_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
-        self._select_oauth_provider(provider)
+        # Do NOT switch the live Hermes provider here: authentication has not yet
+        # completed and no tokens exist. Switching now would point the running
+        # agent at a token-less provider if the admin abandons the flow. The
+        # provider only becomes active in _store_oauth_flow_result once tokens are
+        # stored. Surface the in-progress target for the UI without mutating
+        # runtime config.
         try:
             flow = self.oauth_flows.start(provider)
         except OAuthFlowError as exc:
             raise ServiceError(exc.status, exc.message) from exc
+        if isinstance(flow, dict):
+            flow.setdefault("target_provider", provider)
         return {"flow": flow, **self.oauth_provider_status(actor)}
 
     def poll_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1345,14 +1493,20 @@ class EnterpriseService:
 
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_MANAGE_KNOWLEDGE)
-        doc = self.knowledge.add_document(
+        doc, created = self.knowledge.add_document_with_status(
             title=str(body.get("title", "")),
             summary=str(body.get("summary", "")),
             content=str(body.get("content", "")),
             source=str(body.get("source", "")),
             created_by=actor["id"],
         )
-        doc["cognee"] = self._queue_cognee_ingest(doc)
+        # Only enqueue Cognee ingestion for a genuinely new document; a dedup hit
+        # (identical re-submit) must not re-flood the graph backend with a
+        # duplicate add+cognify of content it already holds.
+        if created:
+            doc["cognee"] = self._queue_cognee_ingest(doc)
+        else:
+            doc["cognee"] = {"attempted": False, "available": True, "deduplicated": True}
         return doc
 
     def _queue_cognee_ingest(self, doc: dict[str, Any]) -> dict[str, Any]:
@@ -1376,6 +1530,7 @@ class EnterpriseService:
                     "title": doc["title"],
                     "content": doc["content"],
                     "source": doc.get("source", ""),
+                    "attempts": 0,
                 }
             )
             while len(self._ingest_queue) > MAX_INGEST_QUEUE_DEPTH:
@@ -1400,14 +1555,44 @@ class EnterpriseService:
                 )
             except Exception as exc:  # never let a bad ingest kill the worker
                 result = {"attempted": True, "available": True, "error": str(exc)}
-            if result.get("error"):
-                print(f"Cognee ingest failed for document {job.get('document_id')}: {result['error']}", file=sys.stderr)
+            error = result.get("error")
+            if error and self._retry_ingest_job(job, str(error)):
+                # Re-queued for another attempt; do not record a terminal result.
+                continue
+            if error:
+                print(f"Cognee ingest failed for document {job.get('document_id')}: {error}", file=sys.stderr)
+                with self._ingest_lock:
+                    self._ingest_failed_count += 1
+                    self._ingest_last_error = str(error)
             doc_id = job.get("document_id")
             if doc_id is not None:
                 with self._ingest_lock:
                     self._ingest_results[int(doc_id)] = result
                     while len(self._ingest_results) > MAX_TRACKED_INGEST_RESULTS:
                         self._ingest_results.pop(next(iter(self._ingest_results)), None)
+
+    def _retry_ingest_job(self, job: dict[str, Any], error: str) -> bool:
+        """Re-queue a failed ingest job with capped backoff.
+
+        Returns True when the job was re-queued for another attempt, False when
+        retries are exhausted, the service is closing, or the queue is full.
+        """
+        attempts = int(job.get("attempts", 0)) + 1
+        if attempts >= MAX_INGEST_ATTEMPTS:
+            return False
+        backoff = min(2 ** attempts, INGEST_RETRY_BACKOFF_CAP_SECONDS)
+        print(
+            f"Cognee ingest attempt {attempts} failed for document {job.get('document_id')}: "
+            f"{error}; retrying in {backoff}s",
+            file=sys.stderr,
+        )
+        time.sleep(backoff)
+        with self._ingest_lock:
+            if self._closed or len(self._ingest_queue) >= MAX_INGEST_QUEUE_DEPTH:
+                return False
+            job["attempts"] = attempts
+            self._ingest_queue.append(job)
+            return True
 
     def cognee_ingest_result(self, document_id: int) -> dict[str, Any] | None:
         with self._ingest_lock:
@@ -1422,7 +1607,9 @@ class EnterpriseService:
         if self.config.knowledge_backend == "cognee":
             return _dedupe_knowledge_hits(cognee_hits or local)[:limit]
         # Local (bm25-ranked) results lead; cognee graph results follow. Dedupe
-        # so the same document is not surfaced twice across backends.
+        # only removes same-keyspace duplicates (e.g. a repeated local id);
+        # local and cognee hits use disjoint id keyspaces and are never collapsed
+        # together (see _dedupe_knowledge_hits).
         return _dedupe_knowledge_hits(local + cognee_hits)[:limit]
 
     def get_knowledge_document(self, document_id: int) -> dict[str, Any]:
@@ -1449,6 +1636,8 @@ class EnterpriseService:
     def knowledge_status(self) -> dict[str, Any]:
         with self._ingest_lock:
             ingest_pending = len(self._ingest_queue)
+            ingest_failed = self._ingest_failed_count
+            ingest_last_error = self._ingest_last_error
         fts = bool(getattr(self.db, "fts_available", False))
         return {
             "local": {
@@ -1460,6 +1649,8 @@ class EnterpriseService:
             "mode": self.config.knowledge_backend,
             "dataset": self.config.cognee_dataset,
             "ingest_pending": ingest_pending,
+            "ingest_failed": ingest_failed,
+            "ingest_last_error": ingest_last_error,
         }
 
     def get_setting(self, key: str) -> str | None:
@@ -1694,6 +1885,9 @@ class EnterpriseService:
         excess = len(self._agent_status) - MAX_TRACKED_CONVERSATIONS
         for _, key in prunable[:excess]:
             self._agent_status.pop(key, None)
+            # These keys are idle with no queued work and no live worker, so the
+            # companion entries (if any) are empty residue; drop them too.
+            self._drop_empty_conversation_maps_locked(key)
 
     def _enqueue_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         scope_type = str(task["scope_type"])
@@ -1724,39 +1918,94 @@ class EnterpriseService:
             return self._copy_status(status)
 
     def _agent_worker(self, key: str) -> None:
-        while True:
-            with self._conversation_lock:
-                queue = self._agent_queues.get(key)
-                if self._closed or not queue:
+        # Wrapped in try/finally so the worker is always unregistered (and any
+        # empty queue dropped) even on an unexpected BaseException, preventing a
+        # conversation from being stuck in a non-idle state with a dead worker.
+        try:
+            while True:
+                with self._conversation_lock:
+                    queue = self._agent_queues.get(key)
+                    if self._closed or not queue:
+                        scope_type, scope_id = self._split_conversation_key(key)
+                        self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
+                        self._drop_empty_conversation_maps_locked(key)
+                        self._agent_workers.pop(key, None)
+                        return
+                    task = queue.popleft()
+                    self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
+
+                error = ""
+                error_persisted = True
+                try:
+                    # Only N replies hit the Hermes backend (and hold a thread /
+                    # socket) at once; each conversation still drains its own
+                    # queue in FIFO order while queued runs wait on the semaphore.
+                    with self._agent_run_semaphore:
+                        if task["scope_type"] == "channel":
+                            self._send_channel_agent_reply(task)
+                        else:
+                            self._send_private_agent_reply(task)
+                except Exception as exc:
+                    error = str(exc)
+                    try:
+                        self._append_agent_error(task, error)
+                    except Exception as persist_exc:
+                        # The user-facing error message could not be persisted
+                        # (e.g. transient DB lock). Surface the secondary failure
+                        # instead of swallowing it so the conversation does not
+                        # silently fall idle with nothing rendered.
+                        error_persisted = False
+                        print(
+                            f"Failed to persist agent error for {key}: {persist_exc}",
+                            file=sys.stderr,
+                        )
+
+                with self._conversation_lock:
+                    queue = self._agent_queues.get(key)
+                    if queue:
+                        self._agent_status[key] = self._status_for_task(queue[0], "queued", queued_count=len(queue))
+                        continue
                     scope_type, scope_id = self._split_conversation_key(key)
-                    self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
+                    idle = self._idle_agent_status(scope_type, scope_id, last_error=error)
+                    if error and not error_persisted:
+                        # Keep a visible terminal error state: with no persisted
+                        # message and no live bubble the failure would otherwise
+                        # vanish from the UI entirely.
+                        idle["state"] = "error"
+                        idle["current_step"] = "Agent 回复失败"
+                        idle["activity"] = [
+                            {
+                                "stage": "error",
+                                "source": "platform",
+                                "label": "Agent 回复失败",
+                                "detail": error[:180],
+                                "line": agent_work_line("error", "Agent 回复失败", error[:180]),
+                                "at": now_ts(),
+                            }
+                        ]
+                    self._agent_status[key] = idle
+                    self._drop_empty_conversation_maps_locked(key)
                     self._agent_workers.pop(key, None)
                     return
-                task = queue.popleft()
-                self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
-
-            error = ""
-            try:
-                if task["scope_type"] == "channel":
-                    self._send_channel_agent_reply(task)
-                else:
-                    self._send_private_agent_reply(task)
-            except Exception as exc:
-                error = str(exc)
-                try:
-                    self._append_agent_error(task, error)
-                except Exception:
-                    pass
-
+        finally:
             with self._conversation_lock:
-                queue = self._agent_queues.get(key)
-                if queue:
-                    self._agent_status[key] = self._status_for_task(queue[0], "queued", queued_count=len(queue))
-                    continue
-                scope_type, scope_id = self._split_conversation_key(key)
-                self._agent_status[key] = self._idle_agent_status(scope_type, scope_id, last_error=error)
-                self._agent_workers.pop(key, None)
-                return
+                worker = self._agent_workers.get(key)
+                if worker is None or worker is threading.current_thread():
+                    self._agent_workers.pop(key, None)
+                    if not self._agent_queues.get(key):
+                        self._agent_queues.pop(key, None)
+
+    def _drop_empty_conversation_maps_locked(self, key: str) -> None:
+        """Remove empty companion-map entries for a conversation key.
+
+        Must be called while holding ``_conversation_lock``. ``_agent_status`` is
+        bounded separately by ``_prune_agent_status_locked``; this keeps the
+        unbounded companion maps (queues / typing) consistent with that cap.
+        """
+        if not self._agent_queues.get(key):
+            self._agent_queues.pop(key, None)
+        if not self._typing.get(key):
+            self._typing.pop(key, None)
 
     def _append_agent_error(self, task: dict[str, Any], error: str) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
@@ -2028,11 +2277,16 @@ class EnterpriseService:
         expired = [user_id for user_id, item in users.items() if float(item.get("expires_at", 0)) <= now]
         for user_id in expired:
             users.pop(user_id, None)
-        return [
+        result = [
             {"user_id": item["user_id"], "username": item["username"], "updated_at": item["updated_at"]}
             for user_id, item in users.items()
             if exclude_user_id is None or user_id != exclude_user_id
         ]
+        # Drop the now-empty outer entry so per-conversation typing state does not
+        # accumulate forever (update_typing's setdefault recreates it on demand).
+        if not users:
+            self._typing.pop(key, None)
+        return result
 
     def _append_message(
         self,
@@ -2059,14 +2313,25 @@ class EnterpriseService:
             (scope_type, str(scope_id), author_type, user_id, username, content, encode_json(metadata), now_ts()),
         )
         if attachments:
-            self._store_attachments(
-                message_id=msg_id,
-                scope_type=scope_type,
-                scope_id=str(scope_id),
-                uploader_user_id=user_id,
-                source=attachment_source,
-                attachments=attachments,
-            )
+            try:
+                self._store_attachments(
+                    message_id=msg_id,
+                    scope_type=scope_type,
+                    scope_id=str(scope_id),
+                    uploader_user_id=user_id,
+                    source=attachment_source,
+                    attachments=attachments,
+                )
+            except Exception:
+                # The message row is already committed with attachment_count=N
+                # but the blobs/rows failed to land. Remove the orphaned message
+                # (ON DELETE CASCADE clears any partial attachment rows) so we do
+                # not leave a message claiming attachments that do not exist.
+                try:
+                    self.db.execute("DELETE FROM messages WHERE id = ?", (int(msg_id),))
+                except Exception:
+                    pass
+                raise
         row = self.db.query_one("SELECT * FROM messages WHERE id = ?", (msg_id,))
         return self._message_from_row(row)
 
@@ -2097,17 +2362,20 @@ class EnterpriseService:
         source: str,
         attachments: list[UploadedFile],
     ) -> None:
+        self._enforce_attachment_quota(uploader_user_id, attachments)
         root = self._attachment_root()
         target_dir = root / scope_type / str(scope_id)
         target_dir.mkdir(parents=True, exist_ok=True)
         timestamp = now_ts()
-        for attachment in attachments:
-            digest = hashlib.sha256(attachment.data).hexdigest()
-            ext = safe_attachment_suffix(attachment.filename)
-            storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
-            target = root / storage_path
-            target.write_bytes(attachment.data)
-            try:
+        written: list[Path] = []
+        try:
+            for attachment in attachments:
+                digest = hashlib.sha256(attachment.data).hexdigest()
+                ext = safe_attachment_suffix(attachment.filename)
+                storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
+                target = root / storage_path
+                target.write_bytes(attachment.data)
+                written.append(target)
                 self.db.insert(
                     """
                     INSERT INTO attachments(
@@ -2130,12 +2398,44 @@ class EnterpriseService:
                         timestamp,
                     ),
                 )
-            except Exception:
+        except Exception:
+            # Roll back every file written in this batch so a mid-batch failure
+            # does not leave orphan blobs on disk. The attachment rows for this
+            # message are removed by the caller via ON DELETE CASCADE.
+            for path in written:
                 try:
-                    target.unlink()
+                    path.unlink()
                 except OSError:
                     pass
-                raise
+            raise
+
+    def _enforce_attachment_quota(self, uploader_user_id: int | None, attachments: list[UploadedFile]) -> None:
+        """Reject uploads that would exceed the per-uploader storage budget."""
+        if ATTACHMENT_QUOTA_BYTES <= 0 or uploader_user_id is None:
+            return
+        incoming = sum(len(attachment.data) for attachment in attachments)
+        if incoming <= 0:
+            return
+        existing = self.db.scalar(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE uploader_user_id = ?",
+            (int(uploader_user_id),),
+        )
+        if int(existing or 0) + incoming > ATTACHMENT_QUOTA_BYTES:
+            raise ServiceError(413, "attachment storage quota exceeded")
+
+    def _enforce_upload_rate_limit(self, uploader_user_id: int | None) -> None:
+        """Sliding-window per-user rate limit for attachment-bearing messages."""
+        if MAX_UPLOADS_PER_WINDOW <= 0 or uploader_user_id is None:
+            return
+        now = time.time()
+        cutoff = now - UPLOAD_RATE_LIMIT_WINDOW_SECONDS
+        with self._auth_lock:
+            timestamps = self._upload_rate.setdefault(int(uploader_user_id), deque())
+            while timestamps and timestamps[0] < cutoff:
+                timestamps.popleft()
+            if len(timestamps) >= MAX_UPLOADS_PER_WINDOW:
+                raise ServiceError(429, "upload rate limit exceeded; try again later")
+            timestamps.append(now)
 
     def _attachments_for_message(self, message_id: int, *, include_local_path: bool = False) -> list[dict[str, Any]]:
         rows = self.db.query(
@@ -2255,17 +2555,31 @@ class EnterpriseService:
         keys = ("id", "filename", "mime_type", "size_bytes", "sha256", "is_image", "local_path")
         return [{key: item[key] for key in keys if key in item} for item in attachments]
 
+    def _managed_media_tmp_dir(self) -> Path:
+        """Dedicated scratch dir for managed-Hermes generated media.
+
+        Lives under the platform data dir (not the shared system temp dir) so
+        Hermes can write generated files here without those files being readable
+        across tenants/processes. Managed Hermes should be pointed at this via
+        ``TMPDIR`` in its process environment.
+        """
+        return self.config.managed_hermes_home / "tmp"
+
     def _media_safe_data_subtrees(self, owner_id: int | None) -> list[Path]:
         """Subtrees under the platform data dir that ARE safe to read media from
-        (the agent's own workspace and the managed Hermes generated-media cache),
-        used to keep platform secrets unreadable even when the data dir overlaps
-        another allowed root such as the temp dir."""
+        (the agent's own workspace, the managed Hermes generated-media cache, and
+        the dedicated managed media scratch dir), used to keep platform secrets
+        unreadable even when the data dir overlaps another allowed root."""
         if owner_id is not None:
             workspace = self.config.workspace_dir / f"user-{int(owner_id)}"
         else:
             workspace = self.config.workspace_dir
         subtrees: list[Path] = []
-        for path in (workspace, self.config.managed_hermes_home / "cache"):
+        for path in (
+            workspace,
+            self.config.managed_hermes_home / "cache",
+            self._managed_media_tmp_dir(),
+        ):
             try:
                 subtrees.append(path.resolve())
             except OSError:
@@ -2277,14 +2591,17 @@ class EnterpriseService:
 
         For a private conversation only the owning user's workspace is allowed;
         a shared channel allows the whole workspace tree. Managed Hermes writes
-        generated documents/images/audio under its cache, so that subtree is
-        allowed too, plus the system temp dir and operator-configured
-        ``ENTERPRISE_MEDIA_ROOTS``. Platform secrets elsewhere under the data
-        directory (``platform.db``, the managed Hermes ``.env``, the bootstrap
-        admin password) are never readable — see ``_resolve_media_path``.
+        generated documents/images/audio under its cache and the dedicated
+        managed media scratch dir, so those subtrees are allowed, plus any
+        operator-configured ``ENTERPRISE_MEDIA_ROOTS``. The broad system temp dir
+        is intentionally NOT allowed: it is shared with other processes/users on
+        the host, so allowing it would let a prompt-injected agent exfiltrate
+        arbitrary readable temp files via ``MEDIA:`` tags. Platform secrets
+        elsewhere under the data directory (``platform.db``, the managed Hermes
+        ``.env``, the bootstrap admin password) are never readable — see
+        ``_resolve_media_path``.
         """
         candidates = list(self._media_safe_data_subtrees(owner_id))
-        candidates.append(Path(tempfile.gettempdir()))
         for raw in os.getenv("ENTERPRISE_MEDIA_ROOTS", "").split(os.pathsep):
             raw = raw.strip()
             if raw:
@@ -2495,9 +2812,16 @@ class EnterpriseService:
 
 
 def _dedupe_knowledge_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop hits sharing an id (e.g. a document returned by two backends),
-    preserving order. Cognee results carry distinct ids so they are not
-    collapsed together."""
+    """Drop hits that share the same id key, preserving order.
+
+    This only collapses duplicates within a single keyspace (e.g. a local
+    document id repeated in the local results). Local hits use integer document
+    ids while Cognee hits use synthetic ``cognee:N`` string ids, so the two
+    keyspaces never collide and local vs Cognee results are NEVER collapsed
+    together. True cross-backend dedup is not possible here because Cognee
+    returns synthesized graph chunks with no recoverable source-document
+    identity (constant title/source), so there is no key to match them on.
+    """
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
     for hit in hits:
@@ -2681,8 +3005,11 @@ def parse_bool(value: Any) -> bool:
 
 
 def mask_secret(value: str) -> str:
+    # Fixed-width mask so the rendered hint never encodes the secret's length and
+    # never reveals a prefix; only long values expose a short trailing suffix as a
+    # recognition hint. Kept consistent with internal_config.mask_value.
     if not value:
         return ""
-    if len(value) <= 8:
-        return "*" * len(value)
-    return f"{value[:3]}...{value[-4:]}"
+    if len(value) < 12:
+        return "********"
+    return f"...{value[-4:]}"

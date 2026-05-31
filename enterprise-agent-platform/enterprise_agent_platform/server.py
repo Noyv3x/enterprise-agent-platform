@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -24,17 +26,119 @@ from .service import BOOTSTRAP_ADMIN_PASSWORD_FILE, EnterpriseService, ServiceEr
 COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
-UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Only methods that are actually routed (none use PATCH today) need CSRF
+# same-origin enforcement; a method with no do_<METHOD> handler can never reach
+# the dispatcher, so listing it here would be dead.
+UNSAFE_METHODS = {"POST", "PUT", "DELETE"}
 # Server-sent events: how often the stream checks for scope changes, and the
 # max lifetime of one connection before the browser's EventSource reconnects.
 SSE_POLL_INTERVAL = 0.4
 SSE_MAX_SECONDS = 120
+# How often (seconds) an in-flight SSE stream re-validates the live session
+# token so deactivation / revocation / password-reset promptly ends the stream
+# instead of waiting for SSE_MAX_SECONDS or a client reconnect.
+SSE_AUTH_RECHECK_SECONDS = 5.0
+# Size of the buffer used when streaming file responses to the client so large
+# attachments are not fully materialized in memory.
+FILE_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+# Admission control: cap concurrent worker threads (and therefore the per-thread
+# SQLite connections / file descriptors they hold) and cap concurrent long-lived
+# SSE streams both globally and per user, so a scripted client cannot exhaust
+# server resources. Tunable via environment with safe defaults.
+MAX_CONCURRENT_REQUESTS = _env_int("ENTERPRISE_MAX_CONCURRENT_REQUESTS", 64)
+MAX_CONCURRENT_SSE_STREAMS = _env_int("ENTERPRISE_MAX_SSE_STREAMS", 256)
+MAX_SSE_STREAMS_PER_USER = _env_int("ENTERPRISE_MAX_SSE_STREAMS_PER_USER", 4)
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
+    # Streaming/SSE worker threads must not keep the process alive on shutdown,
+    # and a slightly larger accept backlog smooths bursts of new connections.
+    daemon_threads = True
+    request_queue_size = 128
+
     def __init__(self, server_address, RequestHandlerClass, service: EnterpriseService):
         super().__init__(server_address, RequestHandlerClass)
         self.service = service
+        # Bounded admission control across all worker threads.
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        # Per-worker-thread guard so a long-lived SSE stream can hand its general
+        # request slot back early (and finish_request won't double-release it).
+        self._local = threading.local()
+        # Concurrent SSE stream accounting (global + per-user) guarded by a lock.
+        self._sse_lock = threading.Lock()
+        self._sse_total = 0
+        self._sse_per_user: dict[Any, int] = {}
+
+    def process_request(self, request, client_address) -> None:
+        # Block new worker threads once the concurrency cap is reached rather
+        # than spawning an unbounded number of threads. The slot is released in
+        # finish_request below (which runs on the worker thread).
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # super().process_request normally hands the slot off to the worker
+            # thread; if it failed to start one, release the slot here so it is
+            # not leaked.
+            self._request_slots.release()
+            raise
+
+    def finish_request(self, request, client_address) -> None:
+        self._local.slot_released = False
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            # A long-lived SSE stream may have already handed its general request
+            # slot back via release_request_slot_once(); only release here if it
+            # has not, so the BoundedSemaphore is never over-released.
+            if not getattr(self._local, "slot_released", False):
+                self._request_slots.release()
+            self._local.slot_released = False
+
+    def release_request_slot_once(self) -> None:
+        """Release the current worker's general request slot ahead of finish_request.
+
+        Long-lived SSE streams call this once they are admitted (and bounded by
+        the separate SSE caps) so they do not pin one of the limited general
+        request slots for their entire lifetime — which would let a handful of
+        open streams starve all new connections. Idempotent per request."""
+        if getattr(self._local, "slot_released", False):
+            return
+        self._local.slot_released = True
+        self._request_slots.release()
+
+    def acquire_sse_slot(self, user_key: Any) -> bool:
+        """Reserve a slot for one SSE stream; False if a cap is exceeded."""
+        with self._sse_lock:
+            if self._sse_total >= MAX_CONCURRENT_SSE_STREAMS:
+                return False
+            if self._sse_per_user.get(user_key, 0) >= MAX_SSE_STREAMS_PER_USER:
+                return False
+            self._sse_total += 1
+            self._sse_per_user[user_key] = self._sse_per_user.get(user_key, 0) + 1
+            return True
+
+    def release_sse_slot(self, user_key: Any) -> None:
+        with self._sse_lock:
+            self._sse_total = max(0, self._sse_total - 1)
+            remaining = self._sse_per_user.get(user_key, 0) - 1
+            if remaining > 0:
+                self._sse_per_user[user_key] = remaining
+            else:
+                self._sse_per_user.pop(user_key, None)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -57,6 +161,32 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        # Same-origin SPA: no CORS preflight is required, but answer cleanly with
+        # an Allow advertisement and the standard security headers instead of the
+        # stdlib's bare HTML 501 page.
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
+        self.end_headers()
+
+    def send_error(self, code, message=None, explain=None):
+        # Route built-in error responses (e.g. 501 for an unimplemented method,
+        # 414 URI-too-long) through the JSON helper so they carry the same JSON
+        # envelope, Cache-Control: no-store, and security headers as every other
+        # response instead of the stdlib's default text/html error page.
+        try:
+            status = int(getattr(code, "value", code))
+        except (TypeError, ValueError):
+            return super().send_error(code, message, explain)
+        try:
+            text = message if isinstance(message, str) and message else "error"
+            self._json({"error": text}, status=status)
+        except Exception:
+            return super().send_error(code, message, explain)
 
     def _dispatch(self, method: str) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -146,7 +276,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
         if m and method == "GET":
-            limit = int(first(query, "limit", "100"))
+            limit = int_arg(query, "limit", 100)
             self._json({
                 "messages": service.list_messages(actor, "channel", m.group(1), limit=limit),
                 "agent_status": service.agent_status(actor, "channel", m.group(1)),
@@ -172,7 +302,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/private-agent/messages" and method == "GET":
-            limit = int(first(query, "limit", "100"))
+            limit = int_arg(query, "limit", 100)
             self._json({
                 "messages": service.list_messages(actor, "private", str(actor["id"]), limit=limit),
                 "agent_status": service.agent_status(actor, "private", str(actor["id"])),
@@ -199,7 +329,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/admin/channels/(\d+)/messages", path)
         if m and method == "GET":
-            limit = int(first(query, "limit", "200"))
+            limit = int_arg(query, "limit", 200)
             self._json(service.audit_channel_messages(actor, int(m.group(1)), limit=limit))
             return
         if m and method == "DELETE":
@@ -215,7 +345,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/admin/private-agent/conversations/(\d+)/messages", path)
         if m and method == "GET":
-            limit = int(first(query, "limit", "200"))
+            limit = int_arg(query, "limit", 200)
             self._json(service.audit_private_messages(actor, int(m.group(1)), limit=limit))
             return
 
@@ -229,7 +359,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"document": service.add_knowledge_document(actor, self._body_json())}, status=201)
             return
         if path == "/api/knowledge/search" and method == "GET":
-            self._json({"results": service.user_search_knowledge(actor, first(query, "q", ""), int(first(query, "limit", "5")))})
+            self._json({"results": service.user_search_knowledge(actor, first(query, "q", ""), int_arg(query, "limit", 5))})
             return
         m = re.fullmatch(r"/api/knowledge/documents/(\d+)", path)
         if m and method == "GET":
@@ -307,7 +437,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not service.validate_agent_tool_token(token):
             raise ServiceError(401, "invalid agent tool token")
         if path == "/api/agent/tools/knowledge/search" and method == "GET":
-            self._json({"results": service.search_knowledge(first(query, "q", ""), int(first(query, "limit", "5")))})
+            self._json({"results": service.search_knowledge(first(query, "q", ""), int_arg(query, "limit", 5))})
             return
         m = re.fullmatch(r"/api/agent/tools/knowledge/documents/(\d+)", path)
         if m and method == "GET":
@@ -397,54 +527,92 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream_file_handle(self, fh) -> None:
+        # Stream an already-open file in fixed-size chunks instead of buffering
+        # the whole file in memory; swallow client-disconnect errors like the SSE
+        # handler does (headers are already sent at this point).
+        try:
+            shutil.copyfileobj(fh, self.wfile, FILE_STREAM_CHUNK_BYTES)
+        except (BrokenPipeError, ConnectionError):
+            return
+
     def _serve_attachment(self, actor: dict[str, Any], attachment_id: int, *, download: bool) -> None:
         attachment, path = self.server.service.get_attachment_file(actor, attachment_id)
-        body = path.read_bytes()
         filename = str(attachment.get("filename") or "attachment")
         ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "attachment"
         mime_type = str(attachment.get("mime_type") or "application/octet-stream")
         disposition = "inline" if not download and is_safe_inline_attachment_mime(mime_type) else "attachment"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mime_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Disposition", f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}")
-        self.send_header("Cache-Control", "private, max-age=3600")
-        self._send_security_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        # Open and size the file BEFORE sending any header: an open/stat failure
+        # then raises while the response line is still unsent, so _dispatch can
+        # emit a clean 500 instead of a corrupt second response written after a
+        # 200 + Content-Length is already on the wire.
+        with path.open("rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}")
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self._send_security_headers()
+            self.end_headers()
+            self._stream_file_handle(fh)
 
     def _stream_scope_events(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> None:
         service = self.server.service
         # Authorize before emitting any response so a denial becomes a normal
         # JSON error (no headers are sent yet).
         service.agent_status(actor, scope_type, scope_id)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.send_header("X-Accel-Buffering", "no")
-        self._send_security_headers()
-        self.end_headers()
-        deadline = time.time() + SSE_MAX_SECONDS
-        last_token = None
+        # Admission control: bound the number of concurrent long-lived streams
+        # globally and per user so a scripted client cannot pin worker threads
+        # (and their per-thread SQLite connections) indefinitely. Reject before
+        # sending the event-stream headers so the client sees a clean JSON 503.
+        user_key = actor.get("id")
+        # Capture the raw session token once so the loop can re-validate the live
+        # session (active flag / token_version) without re-reading headers.
+        token = self._read_token()
+        if not self.server.acquire_sse_slot(user_key):
+            raise ServiceError(503, "too many concurrent event streams; retry shortly")
         try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self._send_security_headers()
+            self.end_headers()
+            # This stream is now bounded by the SSE caps (acquire_sse_slot above),
+            # so hand the general request slot back rather than pinning it for the
+            # whole stream lifetime — otherwise a handful of open streams could
+            # exhaust MAX_CONCURRENT_REQUESTS and starve all new connections.
+            self.server.release_request_slot_once()
+            deadline = time.time() + SSE_MAX_SECONDS
+            next_auth_check = time.time() + SSE_AUTH_RECHECK_SECONDS
+            last_token = None
             while time.time() < deadline:
+                now = time.time()
+                if now >= next_auth_check:
+                    # Promptly end the stream if the session was deactivated or
+                    # revoked (password reset / role change / explicit revoke)
+                    # rather than waiting for the SSE_MAX_SECONDS backstop.
+                    if not service.user_from_token(token):
+                        return
+                    next_auth_check = now + SSE_AUTH_RECHECK_SECONDS
                 status = service.agent_status(actor, scope_type, scope_id)
                 latest = service.latest_message_id(scope_type, scope_id)
                 stream = status.get("stream_message") or {}
-                token = (
+                token_tuple = (
                     latest,
                     status.get("state"),
                     status.get("updated_at"),
                     stream.get("content"),
                     len(status.get("stream_messages") or []),
                 )
-                if token != last_token:
+                if token_tuple != last_token:
                     payload = json.dumps(
                         {"agent_status": status, "latest_message_id": latest}, ensure_ascii=False
                     )
                     self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
-                    last_token = token
+                    last_token = token_tuple
                 else:
                     self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
@@ -453,6 +621,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             # Client disconnected or the scope became unavailable; just end the
             # stream (the browser's EventSource will reconnect if appropriate).
             return
+        finally:
+            self.server.release_sse_slot(user_key)
 
     def _serve_static(self, path: str) -> None:
         static_dir = Path(__file__).resolve().parent / "static"
@@ -465,13 +635,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         target = static_dir / clean
         if not target.exists() or not target.is_file():
             target = static_dir / "index.html"
-        body = target.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self._send_security_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        # Open before sending headers (see _serve_attachment) so an open failure
+        # cannot produce a corrupt double response after a 200 is already sent.
+        try:
+            fh = target.open("rb")
+        except OSError:
+            self._not_found()
+            return
+        with fh:
+            size = os.fstat(fh.fileno()).st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self._send_security_headers()
+            self.end_headers()
+            self._stream_file_handle(fh)
 
     def _not_found(self) -> None:
         self.send_response(HTTPStatus.NOT_FOUND)
@@ -582,6 +760,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 def first(query: dict[str, list[str]], key: str, default: str) -> str:
     values = query.get(key)
     return values[0] if values else default
+
+
+def int_arg(query: dict[str, list[str]], key: str, default: int) -> int:
+    """Parse an integer query parameter, returning a clean 400 (not a 500) when
+    the value is non-numeric."""
+    raw = first(query, key, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ServiceError(400, f"invalid {key} parameter") from exc
 
 
 def bearer_token(value: str) -> str | None:

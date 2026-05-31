@@ -1133,11 +1133,17 @@ class PlatformServiceTests(unittest.TestCase):
     def test_agent_media_tags_are_saved_as_returned_attachments(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as media_td:
             tmp = Path(td)
-            # Generated media lives outside the data dir (here a sibling temp
-            # dir, which is an allowed root) so it is not a platform secret.
+            # The broad system temp dir is no longer an implicit media root (it is
+            # shared host state, so trusting it would let a prompt-injected agent
+            # exfiltrate arbitrary readable temp files via MEDIA: tags). An
+            # operator allow-lists this generated-media directory explicitly via
+            # ENTERPRISE_MEDIA_ROOTS, the documented escape hatch alongside the
+            # managed Hermes scratch dirs that are trusted by default.
             media_path = Path(media_td) / "result.csv"
             media_path.write_text("a,b\n1,2\n", encoding="utf-8")
             agent = MediaReturningAgent(media_path)
+            previous_roots = os.environ.get("ENTERPRISE_MEDIA_ROOTS")
+            os.environ["ENTERPRISE_MEDIA_ROOTS"] = media_td
             service = EnterpriseService(make_config(tmp), agent_client=agent)
             try:
                 _, user = service.authenticate("admin", "admin")
@@ -1153,6 +1159,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(stored_path.read_text(encoding="utf-8"), "a,b\n1,2\n")
             finally:
                 service.close()
+                if previous_roots is None:
+                    os.environ.pop("ENTERPRISE_MEDIA_ROOTS", None)
+                else:
+                    os.environ["ENTERPRISE_MEDIA_ROOTS"] = previous_roots
 
     def test_agent_media_tags_outside_allowed_roots_are_refused(self):
         # A path that exists but lives outside the temp dir and the workspace
@@ -1486,7 +1496,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["camofox"]["url"], config.camofox_url)
                 self.assertEqual(status["firecrawl"]["managed"], True)
                 self.assertEqual(status["firecrawl"]["url"], config.firecrawl_api_url)
-                firecrawl_env_text = (tmp / "firecrawl" / ".env").read_text(encoding="utf-8")
+                # Managed Firecrawl secrets are written under the platform data
+                # dir (firecrawl_runtime_dir) rather than into the submodule tree,
+                # so runtime secrets never land in the repo working copy.
+                firecrawl_env_text = (config.firecrawl_runtime_dir / ".env").read_text(encoding="utf-8")
                 self.assertIn('PORT="13002"', firecrawl_env_text)
                 self.assertIn('HOST="0.0.0.0"', firecrawl_env_text)
                 self.assertIn('USE_DB_AUTHENTICATION="false"', firecrawl_env_text)

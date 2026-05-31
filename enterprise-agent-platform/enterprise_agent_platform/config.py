@@ -86,7 +86,7 @@ class PlatformConfig:
         base = base_dir or Path.cwd()
         data_dir = Path(os.getenv("ENTERPRISE_PLATFORM_DATA", base / "data")).expanduser()
         host = os.getenv("ENTERPRISE_PLATFORM_HOST", "127.0.0.1")
-        port = int(os.getenv("ENTERPRISE_PLATFORM_PORT", "8765"))
+        port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
         token_secret = os.getenv("ENTERPRISE_SESSION_SECRET") or secrets.token_urlsafe(32)
         return cls(
@@ -95,7 +95,7 @@ class PlatformConfig:
             port=port,
             public_base_url=os.getenv("ENTERPRISE_PUBLIC_BASE_URL", default_public).rstrip("/"),
             token_secret=token_secret,
-            token_ttl_seconds=int(os.getenv("ENTERPRISE_SESSION_TTL_SECONDS", str(8 * 60 * 60))),
+            token_ttl_seconds=_env_int("ENTERPRISE_SESSION_TTL_SECONDS", 8 * 60 * 60, minimum=1),
             agent_tool_token=os.getenv("ENTERPRISE_AGENT_TOOL_TOKEN"),
             agent_mode=os.getenv("ENTERPRISE_AGENT_MODE", "auto").strip().lower() or "auto",
             hermes_api_url=os.getenv(
@@ -104,7 +104,7 @@ class PlatformConfig:
             ),
             hermes_api_key=os.getenv("ENTERPRISE_HERMES_API_KEY", ""),
             hermes_model=os.getenv("ENTERPRISE_HERMES_MODEL", "hermes-agent"),
-            hermes_timeout_seconds=float(os.getenv("ENTERPRISE_HERMES_TIMEOUT_SECONDS", "240")),
+            hermes_timeout_seconds=_env_float("ENTERPRISE_HERMES_TIMEOUT_SECONDS", 240.0, minimum=1.0),
             knowledge_backend=os.getenv("ENTERPRISE_KB_BACKEND", "hybrid").strip().lower() or "hybrid",
             cognee_dataset=os.getenv("ENTERPRISE_COGNEE_DATASET", "enterprise_knowledge"),
             cognee_ingest_background=os.getenv("ENTERPRISE_COGNEE_INGEST_BACKGROUND", "1").strip().lower()
@@ -121,7 +121,7 @@ class PlatformConfig:
                 os.getenv("ENTERPRISE_HERMES_HOME", data_dir / "runtimes" / "hermes")
             ).expanduser(),
             hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
-            runtime_startup_wait_seconds=float(os.getenv("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", "8")),
+            runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
             hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "openai-codex").strip().lower() or "openai-codex",
             hermes_provider_base_url=os.getenv("ENTERPRISE_HERMES_PROVIDER_BASE_URL", "").strip().rstrip("/"),
             manage_camofox=os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
@@ -139,7 +139,7 @@ class PlatformConfig:
             container_memory=os.getenv("ENTERPRISE_CONTAINER_MEMORY", "512m").strip(),
             container_cpus=os.getenv("ENTERPRISE_CONTAINER_CPUS", "").strip(),
             container_network=os.getenv("ENTERPRISE_CONTAINER_NETWORK", "").strip(),
-            container_pids_limit=int(os.getenv("ENTERPRISE_CONTAINER_PIDS_LIMIT", "512") or "512"),
+            container_pids_limit=_env_int("ENTERPRISE_CONTAINER_PIDS_LIMIT", 512, minimum=1),
         )
 
 
@@ -158,3 +158,45 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid value for {name}: {raw!r} (expected an integer)") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"Invalid value for {name}: {value} (must be >= {minimum})")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"Invalid value for {name}: {value} (must be <= {maximum})")
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid value for {name}: {raw!r} (expected a number)") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"Invalid value for {name}: {value} (must be >= {minimum})")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"Invalid value for {name}: {value} (must be <= {maximum})")
+    return value

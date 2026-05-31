@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import base64
 import mimetypes
+import os
+import random
 import time
 import urllib.error
 import urllib.request
@@ -14,6 +16,14 @@ from .config import PlatformConfig
 
 
 HOUSEKEEPING_TOOLS = frozenset({"memory", "todo", "skill_manage", "session_search"})
+
+# HTTP statuses worth retrying because they typically indicate a transient,
+# server-side condition (e.g. the managed runtime still warming up).
+_RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
+
+
+class HermesStreamError(RuntimeError):
+    """Raised when a Hermes stream reports a terminal mid-stream failure."""
 
 
 @dataclass(frozen=True)
@@ -141,21 +151,124 @@ class HermesAgentClient:
         api_key = self.config.hermes_api_key or self.secret_provider("ENTERPRISE_HERMES_API_KEY") or self.secret_provider("API_SERVER_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        # Build the request once so the Idempotency-Key stays constant across
+        # retries — a rebuilt key (which embeds the current millisecond clock)
+        # would defeat server-side dedup.
         request = urllib.request.Request(
             self._effective_api_url(),
             data=json.dumps(body).encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self._effective_timeout_seconds()) as response:
+        # Only non-streaming requests may be retried on a transient connect
+        # failure: the Hermes server dedups them via the Idempotency-Key. A
+        # streaming request is NOT deduped server-side, so a retry after the
+        # first attempt may already have started an agent run could double-run
+        # the agent / double-post a reply. Retrying streaming is therefore unsafe.
+        response = self._open_with_retry(request, allow_retry=not body["stream"])
+        with response:
             response_session = response.headers.get("X-Hermes-Session-Id") or session_id
             content_type = str(response.headers.get("Content-Type") or "")
             if body["stream"] and "text/event-stream" in content_type:
+                # Once we begin consuming the streamed body it is no longer safe
+                # to retry, so streaming is handled outside the retry loop.
                 return self._read_streaming_response(response, response_session, progress_callback, content_callback)
             raw = json.loads(response.read().decode("utf-8"))
         result = self._result_from_completion(raw, response_session)
         emit_content(content_callback, result.content)
         return result
+
+    def _open_with_retry(self, request: urllib.request.Request, *, allow_retry: bool = True):
+        """Open the request with bounded retries for transient connect failures.
+
+        Retries only cover the connect/initial-status phase (before any response
+        body byte is consumed), so streamed output is never duplicated. The
+        request object — and therefore its Idempotency-Key — is reused unchanged
+        across attempts so the server can safely dedup any in-flight duplicate.
+
+        ``allow_retry`` must be False for streaming requests: those are not
+        deduped server-side, so a retry after a transient failure on the first
+        attempt could start a second agent run.
+        """
+        attempts = self._retry_attempts() if allow_retry else 1
+        base_delay = self._retry_base_delay()
+        timeout = self._effective_timeout_seconds()
+        last_exc: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return urllib.request.urlopen(request, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRYABLE_HTTP_STATUSES and attempt + 1 < attempts:
+                    last_exc = exc
+                    self._sleep_backoff(base_delay, attempt)
+                    continue
+                # Surface the server-provided error detail rather than the bare
+                # status line, which is all str(HTTPError) exposes.
+                raise self._http_error_to_value_error(exc) from exc
+            except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                if attempt + 1 < attempts:
+                    last_exc = exc
+                    self._sleep_backoff(base_delay, attempt)
+                    continue
+                raise
+        # Defensive: the loop always returns or raises, but keep mypy/readers happy.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Hermes request failed without raising")
+
+    @staticmethod
+    def _sleep_backoff(base_delay: float, attempt: int) -> None:
+        delay = base_delay * (2 ** attempt)
+        # Full jitter avoids synchronized retry storms across concurrent turns.
+        time.sleep(delay * (0.5 + random.random() * 0.5))
+
+    @staticmethod
+    def _http_error_to_value_error(exc: urllib.error.HTTPError) -> ValueError:
+        detail = ""
+        try:
+            body = exc.read(8192).decode("utf-8", "replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                detail = body[:500]
+            else:
+                if isinstance(parsed, dict):
+                    error = parsed.get("error")
+                    if isinstance(error, dict):
+                        detail = str(error.get("message") or "").strip()
+                    elif isinstance(error, str):
+                        detail = error.strip()
+                    if not detail:
+                        detail = str(parsed.get("message") or "").strip()
+                if not detail:
+                    detail = body[:500]
+        header_detail = ""
+        try:
+            header_detail = str(exc.headers.get("X-Hermes-Error") or "").strip()
+        except Exception:
+            header_detail = ""
+        if header_detail and header_detail not in detail:
+            detail = f"{detail} ({header_detail})" if detail else header_detail
+        if detail:
+            return ValueError(f"Hermes HTTP {exc.code}: {detail}")
+        return ValueError(f"Hermes HTTP {exc.code}: {exc.reason}")
+
+    def _retry_attempts(self) -> int:
+        raw = os.environ.get("ENTERPRISE_HERMES_RETRY_ATTEMPTS")
+        try:
+            return max(1, int(raw)) if raw is not None else 3
+        except (TypeError, ValueError):
+            return 3
+
+    def _retry_base_delay(self) -> float:
+        raw = os.environ.get("ENTERPRISE_HERMES_RETRY_BASE_DELAY")
+        try:
+            return max(0.0, float(raw)) if raw is not None else 0.25
+        except (TypeError, ValueError):
+            return 0.25
 
     @staticmethod
     def _result_from_completion(raw: dict[str, Any], response_session: str) -> AgentResult:
@@ -169,6 +282,7 @@ class HermesAgentClient:
         image_parts = []
         skipped = []
         total_inline_bytes = 0
+        budget = 5 * 1024 * 1024
         for attachment in attachments:
             if not attachment.get("is_image"):
                 continue
@@ -178,7 +292,12 @@ class HermesAgentClient:
             path = Path(local_path)
             try:
                 size = path.stat().st_size
-                if size <= 0 or total_inline_bytes + size > 5 * 1024 * 1024:
+                # base64 expands payload to ceil(n/3)*4 bytes (~33% larger); the
+                # budget must reflect the encoded bytes that actually go on the
+                # wire, not the raw file size. Estimate conservatively before
+                # reading so oversized files are skipped without a full read.
+                estimated_encoded = ((size + 2) // 3) * 4
+                if size <= 0 or total_inline_bytes + estimated_encoded > budget:
                     skipped.append(str(attachment.get("filename") or path.name))
                     continue
                 data = path.read_bytes()
@@ -187,8 +306,12 @@ class HermesAgentClient:
                 continue
             mime_type = str(attachment.get("mime_type") or mimetypes.guess_type(path.name)[0] or "image/png")
             encoded = base64.b64encode(data).decode("ascii")
+            encoded_len = len(encoded)
+            if total_inline_bytes + encoded_len > budget:
+                skipped.append(str(attachment.get("filename") or path.name))
+                continue
             image_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}})
-            total_inline_bytes += size
+            total_inline_bytes += encoded_len
 
         if not image_parts:
             return user_message
@@ -215,6 +338,7 @@ class HermesAgentClient:
     ) -> AgentResult:
         content_parts: list[str] = []
         last_cleared = ""
+        failure_message: str | None = None
         raw_events: list[dict[str, Any]] = []
         event_count = 0
         event_name = "message"
@@ -227,7 +351,7 @@ class HermesAgentClient:
             del raw_events[:-50]
 
         def dispatch_event() -> bool:
-            nonlocal event_name, data_lines, last_cleared
+            nonlocal event_name, data_lines, last_cleared, failure_message
             if not data_lines:
                 event_name = "message"
                 return False
@@ -239,7 +363,15 @@ class HermesAgentClient:
                 remember(event, data)
                 return True
             if event == "hermes.tool.progress":
-                payload = json.loads(data)
+                # Skip malformed frames instead of aborting the whole stream;
+                # one bad SSE frame must never discard an otherwise-complete
+                # response (mirrors the swallow-and-continue pattern used by
+                # _emit_progress / emit_content).
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    remember(event, {"_parse_error": data[:500]})
+                    return False
                 if isinstance(payload, dict):
                     remember(event, payload)
                     if is_substantive_tool_start(payload) and content_parts:
@@ -253,13 +385,32 @@ class HermesAgentClient:
                         emit_content_segment_break(content_callback)
                     self._emit_progress(progress_callback, payload)
                 return False
-            payload = json.loads(data)
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                remember(event, {"_parse_error": data[:500]})
+                return False
             remember(event, payload)
             if isinstance(payload, dict):
+                # Detect a terminal mid-stream failure before any text extraction
+                # so the server error is surfaced rather than masked (or, worse,
+                # returned verbatim as if it were assistant content).
+                detected = terminal_failure_message(payload)
+                if detected is not None:
+                    failure_message = detected
+                    return True
                 text = text_from_stream_payload(payload, already_streaming=bool(content_parts))
                 if text:
+                    # After a substantive tool break, a terminal full-text event
+                    # re-carries the pre-tool prose that was already streamed to
+                    # the live consumer. Keep the complete text in the final
+                    # result, but emit only the not-yet-streamed tail to the
+                    # callback so the live UI does not show the prose twice.
+                    new_text = text
+                    if not content_parts and last_cleared and text.startswith(last_cleared):
+                        new_text = text[len(last_cleared):]
                     content_parts.append(text)
-                    emit_content(content_callback, text)
+                    emit_content(content_callback, new_text)
             return False
 
         for raw_line in response:
@@ -290,6 +441,21 @@ class HermesAgentClient:
         # Prefer post-tool text; fall back to the last pre-tool prose so a
         # tool-only tail does not lose the model's earlier answer.
         content = "".join(content_parts) or last_cleared
+        if failure_message is not None:
+            raw["error"] = failure_message
+            if content:
+                # Some answer streamed before the agent crashed: surface it as a
+                # degraded partial rather than presenting it as complete.
+                return AgentResult(
+                    content=content,
+                    session_id=response_session,
+                    raw=raw,
+                    degraded=True,
+                )
+            # Nothing usable streamed: raise the real server-provided cause so it
+            # is preserved through AutoAgentClient's fallback path instead of the
+            # generic empty-stream message.
+            raise ValueError(f"Hermes agent failed mid-stream: {failure_message}")
         if not content:
             raise ValueError(f"Hermes returned an empty streaming response after {event_count} events")
         return AgentResult(content=content, session_id=response_session, raw=raw)
@@ -410,6 +576,36 @@ def is_substantive_tool_start(payload: dict[str, Any]) -> bool:
         return False
     tool = str(payload.get("tool") or payload.get("tool_name") or "").strip()
     return bool(tool) and not tool.startswith("_") and tool not in HOUSEKEEPING_TOOLS
+
+
+def terminal_failure_message(payload: dict[str, Any]) -> str | None:
+    """Return a failure message if the payload is a terminal failure signal.
+
+    Handles both stream shapes Hermes can emit on a mid-stream agent crash:
+    the Responses-API ``response.failed`` event (which carries
+    ``response.error.message``) and a chat-completions chunk whose
+    ``choices[0].finish_reason`` is ``"error"`` (which carries no message).
+    Returns ``None`` when the payload is not a terminal failure.
+    """
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "")
+    if event_type == "response.failed":
+        response = payload.get("response")
+        message = ""
+        if isinstance(response, dict):
+            error = response.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or "").strip()
+            elif isinstance(error, str):
+                message = error.strip()
+        return message or "Hermes agent failed mid-stream"
+    choices = payload.get("choices") or []
+    if isinstance(choices, list):
+        for choice in choices:
+            if isinstance(choice, dict) and str(choice.get("finish_reason") or "") == "error":
+                return "Hermes agent crashed mid-stream"
+    return None
 
 
 def text_from_stream_payload(payload: dict[str, Any], *, already_streaming: bool) -> str:
