@@ -47,13 +47,13 @@ class ContainerManager:
         username: str,
         secrets_env: dict[str, str],
     ) -> PrivateContainer:
-        session_id = f"enterprise-private-u{user_id}"
+        existing = self.db.query_one("SELECT * FROM private_agents WHERE user_id = ?", (user_id,))
+        session_id = str(existing["session_id"]) if existing and existing["session_id"] else f"enterprise-private-u{user_id}"
         workspace = self.config.workspace_dir / f"user-{user_id}"
         workspace.mkdir(parents=True, exist_ok=True)
-        existing = self.db.query_one("SELECT * FROM private_agents WHERE user_id = ?", (user_id,))
         backend = self._resolve_backend()
         if backend == "docker":
-            container = self._ensure_docker(user_id, username, workspace, secrets_env, existing)
+            container = self._ensure_docker(user_id, username, workspace, secrets_env, existing, session_id=session_id)
         else:
             container = PrivateContainer(
                 user_id=user_id,
@@ -106,6 +106,12 @@ class ContainerManager:
             container_status=row["container_status"],
             workspace_path=row["workspace_path"],
             backend=backend,
+        )
+
+    def update_private_session_id(self, user_id: int, session_id: str) -> None:
+        self.db.execute(
+            "UPDATE private_agents SET session_id = ?, updated_at = ? WHERE user_id = ?",
+            (session_id, now_ts(), user_id),
         )
 
     def remove_private_container(self, user_id: int) -> None:
@@ -277,8 +283,9 @@ class ContainerManager:
         workspace: Path,
         secrets_env: dict[str, str],
         existing: dict | None,
+        *,
+        session_id: str,
     ) -> PrivateContainer:
-        session_id = f"enterprise-private-u{user_id}"
         name = existing.get("container_name") if existing else ""
         if not name:
             suffix = hashlib.sha256(f"{user_id}:{username}".encode("utf-8")).hexdigest()[:10]

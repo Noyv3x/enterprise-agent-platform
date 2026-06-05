@@ -46,6 +46,21 @@ class RecordingAgent:
         )
 
 
+class RotatingSessionAgent:
+    def __init__(self, first_returned_session_id: str):
+        self.first_returned_session_id = first_returned_session_id
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        session_id = self.first_returned_session_id if len(self.calls) == 1 else kwargs["session_id"]
+        return AgentResult(
+            content=f"agent response to {kwargs['user_message']}",
+            session_id=session_id,
+            raw={"ok": True},
+        )
+
+
 class MediaReturningAgent:
     def __init__(self, media_path: Path):
         self.media_path = media_path
@@ -878,8 +893,7 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent.calls[-1]["session_id"], "enterprise-channel-1-main-agent")
             self.assertEqual(agent.calls[-1]["session_key"], "channel:1:main-agent")
             self.assertEqual(agent.calls[-1]["user_message"], "Administrator: What is the VPN access policy?")
-            self.assertIn({"role": "user", "content": "Administrator: VPN onboarding starts in the general channel."}, agent.calls[-1]["history"])
-            self.assertIn({"role": "user", "content": "Alice: I need device posture details before Friday."}, agent.calls[-1]["history"])
+            self.assertEqual(agent.calls[-1]["history"], [])
             self.assertIn("enterprise_kb_search", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
             work = agent_message["metadata"]["agent_work"]
@@ -890,6 +904,25 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(hermes_activity[0]["line"], '🔍 enterprise_kb_search: "VPN access policy"')
             self.assertEqual(hermes_activity[0]["tool_status"], "completed")
             service.close()
+
+    def test_channel_reuses_hermes_returned_session_after_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RotatingSessionAgent("compressed-channel-session")
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_channel_message(user, 1, "@agent first")
+                service.wait_for_agent_idle("channel", "1")
+                service.send_channel_message(user, 1, "@agent second")
+                service.wait_for_agent_idle("channel", "1")
+
+                self.assertEqual(agent.calls[0]["session_id"], "enterprise-channel-1-main-agent")
+                self.assertEqual(agent.calls[1]["session_id"], "compressed-channel-session")
+                self.assertEqual(agent.calls[0]["history"], [])
+                self.assertEqual(agent.calls[1]["history"], [])
+                self.assertEqual(agent.calls[1]["session_key"], "channel:1:main-agent")
+            finally:
+                service.close()
 
     def test_channel_agent_reply_exposes_streaming_content_while_running(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1233,6 +1266,25 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(service.private_status(member)["container"]["session_id"], "enterprise-private-u2")
             self.assertEqual(service.model_secret_env(), {})
             service.close()
+
+    def test_private_reuses_hermes_returned_session_after_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RotatingSessionAgent("compressed-private-session")
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                service.wait_for_agent_idle("private", str(user["id"]))
+                service.send_private_message(user, "second")
+                service.wait_for_agent_idle("private", str(user["id"]))
+
+                self.assertEqual(agent.calls[0]["session_id"], "enterprise-private-u1")
+                self.assertEqual(agent.calls[1]["session_id"], "compressed-private-session")
+                self.assertEqual(agent.calls[0]["history"], [])
+                self.assertEqual(agent.calls[1]["history"], [])
+                self.assertEqual(service.private_status(user)["container"]["session_id"], "compressed-private-session")
+            finally:
+                service.close()
 
     def test_admin_can_delete_channel_messages_by_id_before_time_and_clear(self):
         with tempfile.TemporaryDirectory() as td:

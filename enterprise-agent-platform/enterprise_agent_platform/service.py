@@ -90,6 +90,8 @@ MAX_LOGIN_FAILURE_KEYS = 10_000
 # conversations cannot grow memory without limit.
 MAX_AGENT_QUEUE_DEPTH = 64
 MAX_TRACKED_CONVERSATIONS = 1000
+HERMES_CHANNEL_SESSION_SETTING_PREFIX = "hermes_session:channel:"
+MAX_HERMES_SESSION_ID_LENGTH = 512
 # Global ceiling on concurrent in-flight Hermes generations. Each conversation
 # still drains its own queue in FIFO order, but only this many replies hit the
 # Hermes backend (and hold a thread/socket) at once, providing backpressure so a
@@ -984,11 +986,12 @@ class EnterpriseService:
         )
         system_prompt = self._channel_system_prompt(channel, suggestions)
         self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
+        session_id = self._channel_agent_session_id(scope_id)
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], prompt_content),
-            history=self._agent_history_before("channel", scope_id, int(user_msg["id"])),
-            session_id=f"enterprise-channel-{scope_id}-main-agent",
+            history=self._hermes_owned_history(),
+            session_id=session_id,
             session_key=f"channel:{scope_id}:main-agent",
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
@@ -1001,6 +1004,7 @@ class EnterpriseService:
             progress_callback=lambda event: self._record_hermes_progress("channel", scope_id, event),
             content_callback=lambda delta: self._record_agent_content_delta("channel", scope_id, delta),
         )
+        self._remember_channel_agent_session_id(scope_id, result.session_id)
         clean_content, generated_attachments = self._extract_generated_attachments(result.content)
         self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
         metadata = {
@@ -1090,7 +1094,7 @@ class EnterpriseService:
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=prompt_content,
-            history=self._agent_history_before("private", scope_id, int(user_msg["id"])),
+            history=self._hermes_owned_history(),
             session_id=container.session_id,
             session_key=f"private:{actor['id']}",
             metadata={
@@ -1105,6 +1109,9 @@ class EnterpriseService:
             progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
             content_callback=lambda delta: self._record_agent_content_delta("private", scope_id, delta),
         )
+        if self._valid_hermes_session_id(result.session_id):
+            self.containers.update_private_session_id(actor["id"], result.session_id)
+            container_data["session_id"] = result.session_id
         clean_content, generated_attachments = self._extract_generated_attachments(
             result.content, owner_id=int(scope_id)
         )
@@ -1136,7 +1143,7 @@ class EnterpriseService:
         container = self.containers.get_private_container(actor["id"])
         return {
             "container": container.to_dict() if container else None,
-            "session_id": f"enterprise-private-u{actor['id']}",
+            "session_id": container.session_id if container else f"enterprise-private-u{actor['id']}",
             "agent_status": self.agent_status(actor, "private", str(actor["id"])),
         }
 
@@ -2710,34 +2717,32 @@ class EnterpriseService:
             "created_at": row["created_at"],
         }
 
-    def _agent_history(self, scope_type: str, scope_id: str) -> list[dict[str, str]]:
-        messages = self._messages_for_scope(scope_type, scope_id, limit=30)
-        history: list[dict[str, str]] = []
-        for msg in messages[:-1]:
-            if msg["author_type"] == "user":
-                history.append({"role": "user", "content": self._history_message_content(msg)})
-            elif msg["author_type"] == "agent":
-                history.append({"role": "assistant", "content": self._history_message_content(msg)})
-        return history
+    @staticmethod
+    def _hermes_owned_history() -> list[dict[str, str]]:
+        """Hermes owns transcript continuity and context compression."""
+        return []
 
-    def _agent_history_before(self, scope_type: str, scope_id: str, before_message_id: int) -> list[dict[str, str]]:
-        rows = self.db.query(
-            """
-            SELECT * FROM messages
-            WHERE scope_type = ? AND scope_id = ? AND id < ?
-            ORDER BY id DESC
-            LIMIT 30
-            """,
-            (scope_type, str(scope_id), int(before_message_id)),
-        )
-        history: list[dict[str, str]] = []
-        for row in reversed(rows):
-            msg = self._message_from_row(row)
-            if msg["author_type"] == "user":
-                history.append({"role": "user", "content": self._history_message_content(msg)})
-            elif msg["author_type"] == "agent":
-                history.append({"role": "assistant", "content": self._history_message_content(msg)})
-        return history
+    @staticmethod
+    def _default_channel_agent_session_id(scope_id: str) -> str:
+        return f"enterprise-channel-{scope_id}-main-agent"
+
+    @staticmethod
+    def _valid_hermes_session_id(session_id: str | None) -> bool:
+        if not isinstance(session_id, str):
+            return False
+        if not session_id or len(session_id) > MAX_HERMES_SESSION_ID_LENGTH:
+            return False
+        return not any(ch in session_id for ch in "\r\n\x00")
+
+    def _channel_agent_session_id(self, scope_id: str) -> str:
+        stored = self.get_setting(f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent")
+        if self._valid_hermes_session_id(stored):
+            return str(stored)
+        return self._default_channel_agent_session_id(scope_id)
+
+    def _remember_channel_agent_session_id(self, scope_id: str, session_id: str | None) -> None:
+        if self._valid_hermes_session_id(session_id):
+            self.set_setting(f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent", str(session_id))
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self._messages_for_scope(scope_type, scope_id, limit=12)
