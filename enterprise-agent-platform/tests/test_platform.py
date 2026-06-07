@@ -316,6 +316,30 @@ class FakeOAuthHTTPClient:
         return OAuthHTTPResponse(404, {}, "not found")
 
 
+class FakeHermesBridge:
+    def __init__(self):
+        self.catalog_calls = []
+
+    def available(self):
+        return True
+
+    def model_catalog(self, provider, *, force_refresh=False):
+        self.catalog_calls.append((provider, force_refresh))
+        if provider == "openai-codex":
+            return {
+                "provider": "openai-codex",
+                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
+                "default_model": "gpt-5.5",
+            }
+        if provider == "xai-oauth":
+            return {
+                "provider": "xai-oauth",
+                "models": ["grok-4.3", "grok-4.20-0309-reasoning"],
+                "default_model": "grok-4.3",
+            }
+        return {"provider": provider, "models": [], "default_model": ""}
+
+
 def make_config(tmp: Path) -> PlatformConfig:
     return PlatformConfig(
         data_dir=tmp,
@@ -1376,7 +1400,7 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_admin_can_manage_account_permissions_and_model_policy(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 user = service.create_user(
@@ -1385,7 +1409,7 @@ class PlatformServiceTests(unittest.TestCase):
                     display_name="Alice",
                     position="Analyst",
                     permission_group="viewer",
-                    model_name="gpt-5.3-codex",
+                    model_name="gpt-5.4",
                     thinking_depth="low",
                     actor=admin,
                 )
@@ -1393,7 +1417,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(user["position"], "Analyst")
                 self.assertEqual(user["permission_group"], "viewer")
                 self.assertEqual(user["role"], "member")
-                self.assertEqual(user["model_name"], "gpt-5.3-codex")
+                self.assertEqual(user["model_name"], "gpt-5.4")
                 self.assertEqual(user["thinking_depth"], "low")
                 self.assertNotIn("chat", user["permissions"])
                 groups = {item["id"] for item in service.list_permission_groups(admin)}
@@ -1406,15 +1430,19 @@ class PlatformServiceTests(unittest.TestCase):
                     {
                         "position": "Engineering Manager",
                         "permission_group": "manager",
-                        "model_name": "grok-4.3",
+                        "model_name": "gpt-5.4",
                         "thinking_depth": "high",
                     },
                 )
                 self.assertEqual(updated["position"], "Engineering Manager")
                 self.assertEqual(updated["permission_group"], "manager")
                 self.assertIn("manage_knowledge", updated["permissions"])
-                self.assertEqual(updated["model_name"], "grok-4.3")
+                self.assertEqual(updated["model_name"], "gpt-5.4")
                 self.assertEqual(updated["thinking_depth"], "high")
+
+                with self.assertRaises(ServiceError) as model_error:
+                    service.update_user(admin, user["id"], {"model_name": "not-from-hermes"})
+                self.assertEqual(model_error.exception.status, 400)
 
                 _, member_actor = service.authenticate("alice", "alice-pass")
                 with self.assertRaises(ServiceError) as list_error:
@@ -1429,7 +1457,7 @@ class PlatformServiceTests(unittest.TestCase):
     def test_account_model_and_thinking_depth_are_used_for_agent_calls(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
-            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent, hermes_bridge=FakeHermesBridge())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.create_user(
@@ -1437,7 +1465,7 @@ class PlatformServiceTests(unittest.TestCase):
                     password="bob-pass",
                     display_name="Bob",
                     permission_group="member",
-                    model_name="grok-4.3",
+                    model_name="gpt-5.4",
                     thinking_depth="xhigh",
                     actor=admin,
                 )
@@ -1448,11 +1476,51 @@ class PlatformServiceTests(unittest.TestCase):
                 service.wait_for_agent_idle("private", str(bob["id"]))
                 agent_message = service.list_messages(bob, "private", str(bob["id"]))[-1]
 
-                self.assertEqual(agent.calls[-1]["model"], "grok-4.3")
+                self.assertEqual(agent.calls[-1]["model"], "gpt-5.4")
                 self.assertEqual(agent.calls[-1]["thinking_depth"], "xhigh")
                 self.assertEqual(agent.calls[-1]["reasoning_config"], {"enabled": True, "effort": "xhigh"})
-                self.assertEqual(agent_message["metadata"]["generation"]["model"], "grok-4.3")
+                self.assertEqual(agent_message["metadata"]["generation"]["model"], "gpt-5.4")
                 self.assertEqual(agent_message["metadata"]["generation"]["thinking_depth"], "xhigh")
+            finally:
+                service.close()
+
+    def test_generation_falls_back_when_system_model_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent, hermes_bridge=FakeHermesBridge())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_setting(runtime_module.HERMES_SETTING_MODEL, "gpt-5.3-codex")
+
+                result = service.send_private_message(admin, "draft a plan")
+                self.assertIsNone(result["agent_message"])
+                service.wait_for_agent_idle("private", str(admin["id"]))
+                agent_message = service.list_messages(admin, "private", str(admin["id"]))[-1]
+
+                self.assertEqual(agent.calls[-1]["model"], "gpt-5.5")
+                self.assertEqual(agent_message["metadata"]["generation"]["model"], "gpt-5.5")
+            finally:
+                service.close()
+
+    def test_admin_can_update_own_model_without_invalidating_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            try:
+                token, admin = service.authenticate("admin", "admin")
+                updated = service.update_user(
+                    admin,
+                    admin["id"],
+                    {
+                        "display_name": admin["display_name"],
+                        "position": admin.get("position", ""),
+                        "permission_group": "admin",
+                        "model_name": "gpt-5.4",
+                        "thinking_depth": admin.get("thinking_depth", "medium"),
+                        "active": True,
+                    },
+                )
+                self.assertEqual(updated["model_name"], "gpt-5.4")
+                self.assertIsNotNone(service.user_from_token(token))
             finally:
                 service.close()
 
@@ -1669,7 +1737,13 @@ class PlatformServiceTests(unittest.TestCase):
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
             runner = RecordingCommandRunner()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            bridge = FakeHermesBridge()
+            service = EnterpriseService(
+                make_config(tmp),
+                agent_client=RecordingAgent(),
+                runtime_command_runner=runner,
+                hermes_bridge=bridge,
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
                 result = service.update_hermes_config(
@@ -1678,7 +1752,7 @@ class PlatformServiceTests(unittest.TestCase):
                         "manage_hermes": True,
                         "repo_path": str(tmp / "hermes-agent"),
                         "api_url": "http://127.0.0.1:8766/v1/chat/completions",
-                        "model": "enterprise-hermes",
+                        "model": "gpt-5.4",
                         "install_extras": "dev",
                         "startup_wait_seconds": 3.5,
                         "api_key": "runtime-key",
@@ -1686,11 +1760,11 @@ class PlatformServiceTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result["config"]["api_port"], 8766)
-                self.assertEqual(result["config"]["model"], "enterprise-hermes")
+                self.assertEqual(result["config"]["model"], "gpt-5.4")
                 self.assertEqual(result["config"]["install_extras"], "dev")
                 env_text = (service.config.managed_hermes_home / ".env").read_text(encoding="utf-8")
                 self.assertIn('API_SERVER_PORT="8766"', env_text)
-                self.assertIn('API_SERVER_MODEL_NAME="enterprise-hermes"', env_text)
+                self.assertIn('API_SERVER_MODEL_NAME="gpt-5.4"', env_text)
                 self.assertIn('API_SERVER_KEY="runtime-key"', env_text)
                 self.assertEqual(
                     runner.calls[-1]["cmd"],
@@ -1839,7 +1913,13 @@ class PlatformServiceTests(unittest.TestCase):
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
             runner = RecordingCommandRunner()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
+            bridge = FakeHermesBridge()
+            service = EnterpriseService(
+                make_config(tmp),
+                agent_client=RecordingAgent(),
+                runtime_command_runner=runner,
+                hermes_bridge=bridge,
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
@@ -1858,7 +1938,8 @@ class PlatformServiceTests(unittest.TestCase):
                 auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
 
                 self.assertEqual(codex_config["provider"], "openai-codex")
-                self.assertEqual(codex_config["model"], "gpt-5.3-codex")
+                self.assertEqual(codex_config["model"], "gpt-5.5")
+                self.assertIn(("openai-codex", False), bridge.catalog_calls)
                 self.assertEqual(auth_store["active_provider"], "openai-codex")
                 self.assertEqual(auth_store["providers"]["openai-codex"]["auth_mode"], "chatgpt")
                 self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
@@ -1877,6 +1958,7 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertEqual(grok_config["provider"], "xai-oauth")
                 self.assertEqual(grok_config["model"], "grok-4.3")
+                self.assertIn(("xai-oauth", False), bridge.catalog_calls)
                 self.assertEqual(grok_config["provider_base_url"], "https://api.x.ai/v1")
                 self.assertEqual(auth_store["active_provider"], "xai-oauth")
                 self.assertEqual(auth_store["providers"]["xai-oauth"]["auth_mode"], "oauth_pkce")
@@ -1889,11 +1971,40 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_oauth_model_selection_is_validated_against_hermes_catalog(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            bridge = FakeHermesBridge()
+            service = EnterpriseService(
+                make_config(tmp),
+                agent_client=RecordingAgent(),
+                runtime_command_runner=RecordingCommandRunner(),
+                hermes_bridge=bridge,
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                config = service.hermes_config(admin)["config"]
+                self.assertEqual(
+                    config["model_catalog"]["openai-codex"]["models"],
+                    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
+                )
+
+                with self.assertRaises(ServiceError) as ctx:
+                    service.update_hermes_config(admin, {"provider": "codex", "model": "not-from-hermes"})
+                self.assertEqual(ctx.exception.status, 400)
+
+                updated = service.update_hermes_config(admin, {"provider": "codex", "model": "gpt-5.4"})
+                self.assertEqual(updated["config"]["model"], "gpt-5.4")
+                self.assertIn(("openai-codex", False), bridge.catalog_calls)
+            finally:
+                service.close()
+
     def test_platform_does_not_resurrect_relogin_required_codex_oauth_state(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
@@ -1964,6 +2075,7 @@ class PlatformServiceTests(unittest.TestCase):
                 make_config(tmp),
                 agent_client=RecordingAgent(),
                 oauth_http_client=FakeOAuthHTTPClient(),
+                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -1994,6 +2106,7 @@ class PlatformServiceTests(unittest.TestCase):
                 make_config(tmp),
                 agent_client=RecordingAgent(),
                 oauth_http_client=FakeOAuthHTTPClient(),
+                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -2033,11 +2146,13 @@ class PlatformServiceTests(unittest.TestCase):
                 make_config(source_dir),
                 agent_client=RecordingAgent(),
                 runtime_command_runner=RecordingCommandRunner(),
+                hermes_bridge=FakeHermesBridge(),
             )
             target = EnterpriseService(
                 make_config(target_dir),
                 agent_client=RecordingAgent(),
                 runtime_command_runner=RecordingCommandRunner(),
+                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, source_admin = source.authenticate("admin", "admin")
@@ -2605,7 +2720,11 @@ class PlatformHTTPTests(unittest.TestCase):
 
     def test_login_and_channel_message_over_http(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                hermes_bridge=FakeHermesBridge(),
+            )
             server, thread = serve_in_thread(make_config(Path(td)), service)
             host, port = server.server_address
             try:
@@ -2657,7 +2776,7 @@ class PlatformHTTPTests(unittest.TestCase):
                         "display_name": "HTTP User",
                         "position": "Designer",
                         "permission_group": "member",
-                        "model_name": "gpt-5.3-codex",
+                        "model_name": "gpt-5.4",
                         "thinking_depth": "minimal",
                     }),
                     headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
@@ -2666,7 +2785,7 @@ class PlatformHTTPTests(unittest.TestCase):
                 created_user = json.loads(res.read().decode("utf-8"))["user"]
                 self.assertEqual(res.status, 201)
                 self.assertEqual(created_user["position"], "Designer")
-                self.assertEqual(created_user["model_name"], "gpt-5.3-codex")
+                self.assertEqual(created_user["model_name"], "gpt-5.4")
 
                 conn.request(
                     "PUT",

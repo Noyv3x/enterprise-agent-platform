@@ -42,7 +42,6 @@ from .runtimes import (
     HERMES_SETTING_TIMEOUT,
     PlatformRuntimeManager,
     default_base_url_for_provider,
-    default_model_for_provider,
     normalize_hermes_provider,
 )
 
@@ -188,6 +187,7 @@ class EnterpriseService:
         runtime_process_launcher=None,
         runtime_command_runner=None,
         oauth_http_client=None,
+        hermes_bridge=None,
         container_command_runner=None,
         autostart_runtime: bool = True,
     ):
@@ -206,8 +206,9 @@ class EnterpriseService:
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.containers = ContainerManager(config, self.db, runner=container_command_runner)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
-        hermes_oauth_bridge = None if oauth_http_client is not None else HermesOAuthBridge(self.runtimes)
-        self.oauth_flows = OAuthFlowManager(oauth_http_client, hermes_bridge=hermes_oauth_bridge)
+        self.hermes_bridge = hermes_bridge or HermesOAuthBridge(self.runtimes)
+        oauth_flow_bridge = None if oauth_http_client is not None else self.hermes_bridge
+        self.oauth_flows = OAuthFlowManager(oauth_http_client, hermes_bridge=oauth_flow_bridge)
         self._conversation_lock = threading.RLock()
         self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
@@ -379,7 +380,7 @@ class EnterpriseService:
             raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
         display = display_name.strip() or username
         position = normalize_position(position)
-        model_name = normalize_model_name(model_name)
+        model_name = self._validate_account_model_name(model_name)
         thinking_depth = normalize_thinking_depth(thinking_depth)
         ts = now_ts()
         try:
@@ -599,7 +600,9 @@ class EnterpriseService:
             updates["permission_group"] = group
             updates["role"] = role_for_permission_group(group)
         if "model_name" in body or "model" in body:
-            updates["model_name"] = normalize_model_name(str(body.get("model_name", body.get("model", ""))))
+            updates["model_name"] = self._validate_account_model_name(
+                str(body.get("model_name", body.get("model", "")))
+            )
         if "thinking_depth" in body:
             updates["thinking_depth"] = normalize_thinking_depth(str(body.get("thinking_depth", "")))
         if "active" in body:
@@ -610,6 +613,7 @@ class EnterpriseService:
                 raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
             updates["password_hash"] = hash_password(password)
 
+        updates = _changed_user_updates(current, updates)
         if not updates:
             return self.get_user(user_id) or {}
         self._guard_admin_update(actor, current, updates)
@@ -1161,6 +1165,7 @@ class EnterpriseService:
             or self.get_secret("ENTERPRISE_HERMES_API_KEY")
             or self.get_secret("API_SERVER_KEY")
         )
+        config["model_catalog"] = self._oauth_model_catalogs()
         return {"config": config, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
 
     def hermes_internal_config(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -1287,12 +1292,14 @@ class EnterpriseService:
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ServiceError(400, "Hermes API URL must be an http(s) URL")
             self.set_setting(HERMES_SETTING_API_URL, api_url)
+        previous_provider = self._active_oauth_provider()
         provider = None
         if "provider" in body:
             provider = normalize_hermes_provider(str(body.get("provider", "") or "auto"))
             if provider not in SUPPORTED_OAUTH_PROVIDERS:
                 raise ServiceError(400, "Hermes provider must be Codex OAuth or Grok OAuth")
             self.set_setting(HERMES_SETTING_PROVIDER, provider)
+        provider_changed = provider is not None and provider != previous_provider
         if "provider_base_url" in body or "base_url" in body:
             raw_base_url = body.get("provider_base_url", body.get("base_url", ""))
             base_url = str(raw_base_url or "").strip().rstrip("/")
@@ -1303,15 +1310,15 @@ class EnterpriseService:
             self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, base_url)
         if "model" in body:
             model = str(body.get("model", "")).strip()
-            if provider and model in {"", "hermes-agent"}:
-                model = default_model_for_provider(provider) or model
-            if not model:
-                raise ServiceError(400, "Hermes model is required")
-            self.set_setting(HERMES_SETTING_MODEL, model)
-        elif provider:
-            default_model = default_model_for_provider(provider)
-            if default_model:
-                self.set_setting(HERMES_SETTING_MODEL, default_model)
+            if model or provider_changed:
+                model_provider = provider or previous_provider
+                if model_provider in SUPPORTED_OAUTH_PROVIDERS:
+                    model = self._resolve_oauth_model_selection(model_provider, model)
+                if not model:
+                    raise ServiceError(400, "Hermes model is required")
+                self.set_setting(HERMES_SETTING_MODEL, model)
+        elif provider and provider_changed:
+            self.set_setting(HERMES_SETTING_MODEL, self._default_oauth_model(provider))
             if not self.get_setting(HERMES_SETTING_PROVIDER_BASE_URL):
                 self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
         if "install_extras" in body:
@@ -1376,6 +1383,7 @@ class EnterpriseService:
         providers = []
         for provider in SUPPORTED_OAUTH_PROVIDERS:
             info = oauth_provider_info(provider)
+            catalog = self._oauth_model_catalog(provider)
             configured = self._oauth_tokens_configured(provider)
             runtime_status = runtime_oauth.get(provider, {}) if isinstance(runtime_oauth, dict) else {}
             last_auth_error = runtime_status.get("last_auth_error") if isinstance(runtime_status, dict) else None
@@ -1385,6 +1393,9 @@ class EnterpriseService:
             providers.append(
                 {
                     **info,
+                    "models": catalog["models"],
+                    "default_model": catalog["default_model"],
+                    "model_catalog_error": catalog["error"],
                     "configured": (configured or bool(runtime_status.get("configured"))) and not relogin_required,
                     "active": active_provider == provider,
                     # Hermes owns token refresh and keeps auth.json current, so
@@ -1402,6 +1413,7 @@ class EnterpriseService:
         providers: dict[str, dict[str, Any]] = {}
         for provider in SUPPORTED_OAUTH_PROVIDERS:
             info = oauth_provider_info(provider)
+            catalog = self._oauth_model_catalog(provider)
             credentials = {
                 key: value
                 for key in OAUTH_PROVIDER_SECRET_KEYS[provider]
@@ -1410,7 +1422,7 @@ class EnterpriseService:
             providers[provider] = {
                 "id": provider,
                 "label": info["label"],
-                "model": info["model"],
+                "model": catalog["default_model"],
                 "configured": self._oauth_tokens_configured(provider),
                 "credentials": credentials,
             }
@@ -1691,9 +1703,9 @@ class EnterpriseService:
         return {}
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
-        model = normalize_model_name(str(actor.get("model_name") or ""))
-        if not model:
-            model = str(self.runtimes.hermes_runtime_config().get("model") or self.config.hermes_model)
+        runtime_model = normalize_model_name(str(self.runtimes.hermes_runtime_config().get("model") or self.config.hermes_model))
+        model = normalize_model_name(str(actor.get("model_name") or "")) or runtime_model
+        model = self._validated_generation_model(model, fallback_model=runtime_model)
         thinking_depth = normalize_thinking_depth(str(actor.get("thinking_depth") or DEFAULT_THINKING_DEPTH))
         return {
             "model": model,
@@ -1786,9 +1798,95 @@ class EnterpriseService:
 
     def _select_oauth_provider(self, provider: str) -> None:
         self.set_setting(HERMES_SETTING_PROVIDER, provider)
-        self.set_setting(HERMES_SETTING_MODEL, default_model_for_provider(provider))
+        self.set_setting(HERMES_SETTING_MODEL, self._default_oauth_model(provider))
         self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
         self.runtimes.prepare_hermes()
+
+    def _oauth_model_catalogs(self) -> dict[str, dict[str, Any]]:
+        return {provider: self._oauth_model_catalog(provider) for provider in SUPPORTED_OAUTH_PROVIDERS}
+
+    def _oauth_model_catalog(self, provider: str) -> dict[str, Any]:
+        provider = normalize_hermes_provider(provider)
+        result: dict[str, Any] = {
+            "provider": provider,
+            "models": [],
+            "default_model": "",
+            "source": "hermes",
+            "error": "",
+        }
+        bridge = self.hermes_bridge
+        try:
+            if bridge is None or not bridge.available():
+                result["error"] = "Hermes model catalog is not available"
+                return result
+            catalog = bridge.model_catalog(provider)
+        except OAuthFlowError as exc:
+            result["error"] = exc.message
+            return result
+        except Exception as exc:
+            result["error"] = str(exc) or type(exc).__name__
+            return result
+
+        models = _clean_model_ids(catalog.get("models") if isinstance(catalog, dict) else [])
+        default_model = str(catalog.get("default_model") or "").strip() if isinstance(catalog, dict) else ""
+        if default_model not in models:
+            default_model = models[0] if models else ""
+        result["models"] = models
+        result["default_model"] = default_model
+        return result
+
+    def _default_oauth_model(self, provider: str) -> str:
+        catalog = self._oauth_model_catalog(provider)
+        default_model = catalog["default_model"]
+        if default_model:
+            return default_model
+        label = oauth_provider_info(provider)["label"]
+        detail = f": {catalog['error']}" if catalog.get("error") else ""
+        raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+
+    def _resolve_oauth_model_selection(self, provider: str, model: str) -> str:
+        catalog = self._oauth_model_catalog(provider)
+        models = catalog["models"]
+        if not models:
+            label = oauth_provider_info(provider)["label"]
+            detail = f": {catalog['error']}" if catalog.get("error") else ""
+            raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+        clean = str(model or "").strip()
+        if clean in {"", "hermes-agent"}:
+            clean = catalog["default_model"] or models[0]
+        if clean not in models:
+            label = oauth_provider_info(provider)["label"]
+            raise ServiceError(400, f"Hermes model must be selected from the Hermes catalog for {label}")
+        return clean
+
+    def _validate_account_model_name(self, model: str) -> str:
+        clean = normalize_model_name(model)
+        if clean in {"", "hermes-agent"}:
+            return ""
+        provider = self._active_oauth_provider()
+        catalog = self._oauth_model_catalog(provider)
+        models = catalog["models"]
+        label = oauth_provider_info(provider)["label"]
+        if not models:
+            detail = f": {catalog['error']}" if catalog.get("error") else ""
+            raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+        if clean not in models:
+            raise ServiceError(400, f"Account model must be selected from the Hermes catalog for {label}")
+        return clean
+
+    def _validated_generation_model(self, model: str, *, fallback_model: str = "") -> str:
+        clean = normalize_model_name(model)
+        fallback = normalize_model_name(fallback_model)
+        provider = self._active_oauth_provider()
+        catalog = self._oauth_model_catalog(provider)
+        models = catalog["models"]
+        if not models:
+            return clean or fallback
+        if clean in models:
+            return clean
+        if fallback in models:
+            return fallback
+        return catalog["default_model"] or models[0]
 
     def _store_oauth_flow_result(self, provider: str, flow: dict[str, Any]) -> None:
         tokens = flow.pop("tokens", None)
@@ -2894,6 +2992,38 @@ def normalize_model_name(value: str) -> str:
     if len(clean) > 120 or re.search(r"[\r\n\x00]", clean):
         raise ServiceError(400, "invalid model name")
     return clean
+
+
+def _changed_user_updates(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    changed: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key == "password_hash":
+            changed[key] = value
+            continue
+        if key == "active":
+            if int(value) != int(current.get(key) or 0):
+                changed[key] = value
+            continue
+        current_value = current.get(key)
+        if str(value or "") != str(current_value or ""):
+            changed[key] = value
+    return changed
+
+
+def _clean_model_ids(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    models: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        model = str(value or "").strip()
+        if not model or len(model) > 160 or re.search(r"[\r\n\x00]", model):
+            continue
+        if model in seen:
+            continue
+        seen.add(model)
+        models.append(model)
+    return models
 
 
 def normalize_thinking_depth(value: str) -> str:

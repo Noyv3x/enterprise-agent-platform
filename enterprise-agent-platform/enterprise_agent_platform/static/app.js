@@ -633,7 +633,7 @@ function renderChat(mode) {
     const items = messages.map(renderMessage);
     const status = agentStatusFor(mode);
     if (isAgentActive(status)) {
-      items.push(renderAgentActivity(status));
+      items.push(hasAgentProcessSteps(status) ? renderAgentActivity(status) : renderAgentTyping(status));
       for (const streamingMessage of agentStreamingMessages(status, mode)) {
         items.push(renderMessage(streamingMessage));
       }
@@ -757,7 +757,7 @@ function renderMessage(message) {
         ? h("div", { class: "msg__suggest" }, suggestions.map((s) =>
             h("span", { class: "chip" }, [h("span", { class: "chip__id", text: `kb:${s.id}` }), h("span", { text: s.title })])))
         : null,
-      agentWork ? renderAgentWorkCard(agentWork, { active: false }) : null,
+      agentWork && hasAgentProcessSteps(agentWork) ? renderAgentWorkCard(agentWork, { active: false }) : null,
     ]),
   ]);
 }
@@ -799,6 +799,13 @@ function renderAgentActivity(status) {
   return h("article", { class: "msg msg--agent msg--activity" }, [
     h("div", { class: "msg__avatar" }, [icon("bot", { size: 18 })]),
     renderAgentWorkCard(status, { active: true }),
+  ]);
+}
+
+function renderAgentTyping(status) {
+  return h("div", { class: "typing-line typing-line--agent" }, [
+    h("span", { text: agentStatusText(status) || "Agent 正在处理" }),
+    h("div", { class: "typing__dots" }, [h("i"), h("i"), h("i")]),
   ]);
 }
 
@@ -862,6 +869,10 @@ function agentWorkTitle(work) {
 function agentProcessLines(work) {
   const steps = work?.activity || [];
   return steps.filter(isAgentProcessStep).map((step) => step.line || agentStepLine(step)).filter(Boolean);
+}
+
+function hasAgentProcessSteps(work) {
+  return agentProcessLines(work).length > 0;
 }
 
 function isAgentProcessStep(step) {
@@ -1266,7 +1277,8 @@ function renderAccountManagement() {
   const password = h("input", { type: "password", autocomplete: "new-password", placeholder: "初始密码" });
   const position = h("input", { placeholder: "职位，例如 项目经理" });
   const permissionGroup = permissionGroupSelect(groups, "member");
-  const modelName = h("input", { placeholder: state.hermesConfig?.config?.model || "默认模型" });
+  const accountModel = accountModelControl("");
+  const modelName = accountModel.select;
   const thinkingDepth = thinkingDepthSelect("medium");
 
   const createForm = h("form", {
@@ -1300,7 +1312,7 @@ function renderAccountManagement() {
       field("初始密码", password),
       field("职位", position),
       field("权限组", permissionGroup),
-      field("模型型号", modelName),
+      field("模型型号", accountModel.control),
       field("思考深度", thinkingDepth),
     ]),
     h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [icon("plus", { size: 16 }), h("span", { text: "创建账户" })]),
@@ -1320,7 +1332,8 @@ function renderAccountRow(user, groups) {
   const displayName = h("input", { value: user.display_name || "" });
   const position = h("input", { value: user.position || "", placeholder: "职位" });
   const permissionGroup = permissionGroupSelect(groups, user.permission_group || "member");
-  const modelName = h("input", { value: user.model_name || "", placeholder: state.hermesConfig?.config?.model || "默认模型" });
+  const accountModel = accountModelControl(user.model_name || "");
+  const modelName = accountModel.select;
   const thinkingDepth = thinkingDepthSelect(user.thinking_depth || "medium");
   const active = h("input", { type: "checkbox" });
   active.checked = !!user.active;
@@ -1363,7 +1376,7 @@ function renderAccountRow(user, groups) {
       field("显示名称", displayName),
       field("职位", position),
       field("权限组", permissionGroup),
-      field("模型型号", modelName),
+      field("模型型号", accountModel.control),
       field("思考深度", thinkingDepth),
       field("重置密码", password),
       h("label", { class: "check-row account-row__active" }, [
@@ -1588,6 +1601,53 @@ async function runHermesInstall() {
   });
 }
 
+function hermesModelCatalog(providerId) {
+  const normalized = ["openai-codex", "xai-oauth"].includes(providerId) ? providerId : "openai-codex";
+  const fromConfig = state.hermesConfig?.config?.model_catalog?.[normalized];
+  if (fromConfig && typeof fromConfig === "object") return fromConfig;
+  const fromOAuth = (state.oauthProviders?.providers || []).find((item) => item.id === normalized);
+  if (fromOAuth) {
+    return {
+      models: fromOAuth.models || [],
+      default_model: fromOAuth.default_model || "",
+      error: fromOAuth.model_catalog_error || "",
+    };
+  }
+  return { models: [], default_model: "", error: "Hermes 模型目录不可用" };
+}
+
+function activeHermesProviderId() {
+  const provider = state.oauthProviders?.active_provider || state.hermesConfig?.config?.provider || "openai-codex";
+  return ["openai-codex", "xai-oauth"].includes(provider) ? provider : "openai-codex";
+}
+
+function accountModelControl(selectedModel = "") {
+  const providerId = activeHermesProviderId();
+  const catalog = hermesModelCatalog(providerId);
+  const models = Array.isArray(catalog.models) ? catalog.models : [];
+  const defaultModel = catalog.default_model || state.hermesConfig?.config?.model || "系统默认";
+  const select = h("select");
+  const hint = h("div", { class: "field-help" });
+  select.replaceChildren(
+    h("option", { value: "", text: `系统默认 (${defaultModel})` }),
+    ...models.map((item) => h("option", { value: item, text: item })),
+  );
+  const clean = String(selectedModel || "").trim();
+  if (clean && models.includes(clean)) {
+    select.value = clean;
+  } else {
+    select.value = "";
+  }
+  if (clean && !models.includes(clean)) {
+    hint.textContent = `已保存模型 ${clean} 不在当前 Hermes 目录，保存后将改为系统默认。`;
+  } else if (models.length) {
+    hint.textContent = `${models.length} 个模型，来源：Hermes`;
+  } else {
+    hint.textContent = catalog.error || "当前仅可使用系统默认模型。";
+  }
+  return { select, control: h("div", { class: "field-stack" }, [select, hint]) };
+}
+
 function renderHermesConfig() {
   const hermes = state.hermesConfig?.config || {};
   const manageHermes = h("input", { type: "checkbox" });
@@ -1600,7 +1660,28 @@ function renderHermesConfig() {
   ]);
   provider.value = ["openai-codex", "xai-oauth"].includes(hermes.provider) ? hermes.provider : "openai-codex";
   const providerBaseUrl = h("input", { value: hermes.provider_base_url || "", placeholder: "默认使用所选 OAuth 供应商 endpoint" });
-  const model = h("input", { value: hermes.model || "" });
+  const model = h("select");
+  const modelHint = h("div", { class: "field-help" });
+  const syncModelOptions = (preferredModel = "") => {
+    const catalog = hermesModelCatalog(provider.value);
+    const models = Array.isArray(catalog.models) ? catalog.models : [];
+    const current = String(preferredModel || "").trim();
+    const fallback = String(catalog.default_model || "").trim();
+    if (!models.length) {
+      model.replaceChildren(h("option", { value: "", text: "Hermes 模型目录不可用" }));
+      model.value = "";
+      model.disabled = true;
+      modelHint.textContent = catalog.error || "需要先安装/启动托管 Hermes 后读取模型目录。";
+      return;
+    }
+    model.disabled = false;
+    model.replaceChildren(...models.map((item) => h("option", { value: item, text: item })));
+    model.value = models.includes(current) ? current : (models.includes(fallback) ? fallback : models[0]);
+    modelHint.textContent = `${models.length} 个模型，来源：Hermes`;
+  };
+  provider.addEventListener("change", () => syncModelOptions(""));
+  syncModelOptions(hermes.model || "");
+  const modelControl = h("div", { class: "field-stack" }, [model, modelHint]);
   const installExtras = h("input", { value: hermes.install_extras || "", placeholder: "可选，例如 dev" });
   const startupWait = h("input", { type: "number", min: "0", max: "120", step: "0.5", value: hermes.startup_wait_seconds ?? 8 });
   const timeoutSeconds = h("input", { type: "number", min: "1", max: "3600", step: "1", value: hermes.timeout_seconds ?? 240 });
@@ -1642,7 +1723,7 @@ function renderHermesConfig() {
         h("div", { class: "field--full" }, [field("API URL", apiUrl)]),
         field("API 供应商", provider),
         field("供应商 Base URL", providerBaseUrl),
-        field("模型", model),
+        field("模型", modelControl),
         field("安装 extras", installExtras),
         field("启动等待秒数", startupWait),
         field("请求超时秒数", timeoutSeconds),
@@ -1906,7 +1987,7 @@ function renderOAuthProviderCard(provider) {
       h("div", { class: "oauth-card__logo" }, [h("strong", { class: "mono", text: (provider.label || "?").trim().charAt(0) })]),
       h("div", {}, [
         h("div", { class: "oauth-card__label", text: provider.label }),
-        provider.model ? h("div", { class: "oauth-card__model", text: provider.model }) : null,
+        provider.default_model ? h("div", { class: "oauth-card__model", text: provider.default_model }) : null,
       ]),
     ]),
     statusBadge(!!provider.configured, provider.configured ? "已验证" : "未验证"),
@@ -1923,6 +2004,9 @@ function renderOAuthProviderCard(provider) {
 
   const children = [header, meta];
   if (errorText) children.push(h("div", { class: "oauth-error", role: "alert" }, [icon("alert", { size: 15 }), h("span", { text: errorText })]));
+  if (!provider.default_model && provider.model_catalog_error) {
+    children.push(h("div", { class: "oauth-error", role: "alert" }, [icon("alert", { size: 15 }), h("span", { text: provider.model_catalog_error })]));
+  }
   children.push(h("div", { class: "oauth-actions" }, [startButton]));
   if (flow?.kind === "device_code") children.push(renderCodexOAuthFlow(provider.id, flow));
   else if (flow?.kind === "manual_callback") children.push(renderGrokOAuthFlow(provider.id, flow, callbackValue));

@@ -36,6 +36,19 @@ def main():
             timeout_seconds=timeout,
             persist=True,
         )
+    elif action == "model_catalog":
+        from hermes_cli.models import cached_provider_model_ids, get_default_model_for_provider, normalize_provider
+
+        provider = normalize_provider(str(payload.get("provider") or ""))
+        models = cached_provider_model_ids(provider, force_refresh=bool(payload.get("force_refresh")))
+        default_model = get_default_model_for_provider(provider)
+        if default_model not in models:
+            default_model = models[0] if models else ""
+        result = {
+            "provider": provider,
+            "models": models,
+            "default_model": default_model,
+        }
     else:
         raise RuntimeError(f"unknown Hermes OAuth bridge action: {action}")
     print(json.dumps({"ok": True, "result": result}, separators=(",", ":")))
@@ -99,6 +112,16 @@ class HermesOAuthBridge:
             {
                 "callback_url": callback_url,
                 "flow_state": session,
+                "timeout_seconds": 30.0,
+            },
+        )
+
+    def model_catalog(self, provider: str, *, force_refresh: bool = False) -> dict[str, Any]:
+        return self._run(
+            "model_catalog",
+            {
+                "provider": provider,
+                "force_refresh": bool(force_refresh),
                 "timeout_seconds": 30.0,
             },
         )

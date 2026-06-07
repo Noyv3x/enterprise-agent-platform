@@ -55,12 +55,6 @@ FIRECRAWL_SETTING_API_URL = "firecrawl_api_url"
 FIRECRAWL_SETTING_COMMAND = "firecrawl_command"
 FIRECRAWL_COMPOSE_OVERRIDE = "docker-compose.enterprise.yaml"
 
-DEFAULT_PROVIDER_MODELS = {
-    "openai-codex": "gpt-5.3-codex",
-    "xai-oauth": "grok-4.3",
-}
-
-
 class ProcessLike(Protocol):
     pid: int
 
@@ -1931,10 +1925,6 @@ def default_base_url_for_provider(provider: str) -> str:
     provider = normalize_hermes_provider(provider)
     info = OAUTH_PROVIDER_INFO.get(provider)
     return str(info.get("base_url", "")) if info else ""
-
-
-def default_model_for_provider(provider: str) -> str:
-    return DEFAULT_PROVIDER_MODELS.get(normalize_hermes_provider(provider), "")
 
 
 def _iso_now() -> str:

@@ -32,14 +32,12 @@ OAUTH_PROVIDER_INFO = {
     "openai-codex": {
         "id": "openai-codex",
         "label": "Codex OAuth",
-        "model": "gpt-5.3-codex",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "flow": "device_code",
     },
     "xai-oauth": {
         "id": "xai-oauth",
         "label": "Grok OAuth",
-        "model": "grok-4.3",
         "base_url": "https://api.x.ai/v1",
         "flow": "manual_callback",
     },
