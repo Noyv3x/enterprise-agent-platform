@@ -378,6 +378,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/settings/agent-token" and method == "GET":
             self._json(service.agent_tool_token(actor))
             return
+        if path == "/api/system/security/config" and method == "GET":
+            self._json(service.platform_security_config(actor))
+            return
+        if path == "/api/system/security/config" and method == "PUT":
+            self._json(service.update_platform_security_config(actor, self._body_json()))
+            return
         if path == "/api/system/runtime" and method == "GET":
             self._json(service.runtime_status(actor))
             return
@@ -696,7 +702,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return "; ".join(attrs)
 
     def _secure_cookie_enabled(self) -> bool:
-        return urllib.parse.urlparse(self.server.service.config.public_base_url).scheme == "https"
+        return urllib.parse.urlparse(self.server.service.public_base_url()).scheme == "https"
 
     def _require_same_origin(self) -> None:
         # CSRF defenses only apply to ambient cookie auth. A request that carries
@@ -719,7 +725,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _allowed_origins(self) -> set[str]:
         origins = set()
-        public_origin = normalized_origin(self.server.service.config.public_base_url)
+        public_origin = normalized_origin(self.server.service.public_base_url())
         if public_origin:
             origins.add(public_origin)
         request_origin = normalized_origin(self._request_base_url())
@@ -728,7 +734,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return origins
 
     def _trusts_forwarded_headers(self) -> bool:
-        return bool(self.server.service.config.trust_forwarded_headers)
+        return bool(self.server.service.trust_forwarded_headers())
 
     def _request_base_url(self) -> str:
         # Only honour X-Forwarded-* when an operator has declared a trusted

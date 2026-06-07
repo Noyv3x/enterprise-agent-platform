@@ -39,6 +39,7 @@ const state = {
   hermesConfig: null,
   hermesInternalConfig: null,
   cogneeConfig: null,
+  securityConfig: null,
   oauthProviders: null,
   oauthFlows: {},
   oauthCallbackUrls: {},
@@ -175,6 +176,7 @@ const ADMIN_PAGES = [
   { id: "accounts", label: "账户权限", icon: "users", description: "企业账户、权限组与个人模型策略。" },
   { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
   { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
+  { id: "security", label: "公网安全", icon: "key", description: "反向代理、Cookie 与启动安全项。" },
   { id: "runtime", label: "运行时", icon: "server", description: "底层基座服务健康状态。" },
   { id: "hermes", label: "Hermes", icon: "settings", description: "Hermes config.yaml 与环境变量。" },
   { id: "cognee", label: "Cognee", icon: "library", description: "Cognee 环境变量配置。" },
@@ -1249,10 +1251,18 @@ function renderAdminPager(activeId) {
 }
 
 function adminPageBadge(pageId) {
+  const security = state.securityConfig?.config || {};
+  const securityWarnings = [
+    security.secure_cookie_enabled === false,
+    security.admin_default_password_active,
+    security.allow_default_admin_password,
+    security.listen_restart_required,
+  ].filter(Boolean).length;
   const value = {
     accounts: state.users.length,
     messages: (state.messageAudit?.privateConversations || []).filter((item) => item.message_count > 0).length,
     model: state.oauthProviders?.providers?.length || 0,
+    security: securityWarnings,
     runtime: state.runtimes ? Object.keys(state.runtimes).length : 0,
     secrets: state.secrets.filter((secret) => !isOAuthSecret(secret.key)).length,
   }[pageId];
@@ -1263,6 +1273,7 @@ function renderAdminPageSections(pageId) {
   if (pageId === "accounts") return [renderAccountManagement()];
   if (pageId === "messages") return [renderMessageAuditManagement()];
   if (pageId === "model") return [renderOAuthSettings(), renderHermesConfig()];
+  if (pageId === "security") return [renderSecuritySettings()];
   if (pageId === "runtime") return [renderRuntimeSettings()];
   if (pageId === "hermes") return [renderHermesInternalConfig()];
   if (pageId === "cognee") return [renderCogneeInternalConfig()];
@@ -1555,6 +1566,113 @@ function renderAuditMessageRow(message, { deletable = false, onDelete = null } =
         onclick: async () => onDelete && onDelete(),
       }, [icon("trash", { size: 16 })]),
     ]) : null,
+  ]);
+}
+
+function renderSecuritySettings() {
+  const security = state.securityConfig?.config || {};
+  const publicBaseUrl = h("input", {
+    value: security.public_base_url || "",
+    placeholder: "https://agent.example.com",
+  });
+  const trustedProxy = h("input", { type: "checkbox" });
+  trustedProxy.checked = !!security.trusted_proxy;
+  const host = h("input", { value: security.host || "127.0.0.1", placeholder: "127.0.0.1" });
+  const port = h("input", { type: "number", min: "1", max: "65535", step: "1", value: security.port || 8765 });
+  const sessionTtl = h("input", {
+    type: "number",
+    min: "60",
+    max: String(30 * 24 * 60 * 60),
+    step: "60",
+    value: security.session_ttl_seconds || 8 * 60 * 60,
+  });
+  const sessionSecret = h("input", {
+    type: "password",
+    autocomplete: "off",
+    placeholder: security.session_secret_configured ? "留空不修改" : "至少 32 字符",
+  });
+
+  const statusRows = [
+    securityStatusRow("Secure Cookie", !!security.secure_cookie_enabled, security.secure_cookie_enabled ? "已启用" : "未启用"),
+    securityStatusRow("Trusted Proxy", !!security.trusted_proxy, security.trusted_proxy ? "信任 X-Forwarded-* 头" : "未信任代理头"),
+    securityStatusRow("默认 admin/admin", !security.admin_default_password_active && !security.allow_default_admin_password, security.admin_default_password_active ? "当前可用" : (security.allow_default_admin_password ? "启动项允许" : "未启用")),
+    securityStatusRow("Session Secret", !!security.session_secret_configured, security.session_secret_source === "env" ? "来自环境变量" : "已持久化"),
+    securityStatusRow("监听地址", !security.listen_restart_required, `${security.applied_host || "-"}:${security.applied_port || "-"}${security.listen_restart_required ? "，有待重启配置" : ""}`),
+    securityStatusRow("Bootstrap 密码文件", !security.bootstrap_password_file_exists, security.bootstrap_password_file_exists ? "仍存在" : "不存在"),
+  ];
+
+  return h("section", { class: "card config-form security-config" }, [
+    cardHead("公网安全", "key", { desc: "公开到公网前确认 HTTPS 反代、Cookie、会话与监听边界。" }),
+    h("form", {
+      onsubmit: async (event) => {
+        event.preventDefault();
+        await withBusy(async () => {
+          const result = await api("/api/system/security/config", {
+            method: "PUT",
+            body: JSON.stringify({
+              public_base_url: publicBaseUrl.value,
+              trusted_proxy: trustedProxy.checked,
+              host: host.value,
+              port: port.value,
+              session_ttl_seconds: sessionTtl.value,
+              session_secret: sessionSecret.value,
+            }),
+          });
+          state.securityConfig = result;
+          sessionSecret.value = "";
+          const needsRestart = !!result.restart_required;
+          const secretRestart = !!result.session_secret_restart_required;
+          toast(
+            secretRestart
+              ? "已保存；重启后所有会话会失效"
+              : (needsRestart ? "已保存；部分启动项需要重启/重新部署后生效" : "公网安全配置已保存"),
+            { type: "ok", title: needsRestart || secretRestart ? "需要重启" : "完成" },
+          );
+          render();
+        });
+      },
+    }, [
+      h("div", { class: "config-grid" }, [
+        h("div", { class: "field--full" }, [field("公网 URL", h("div", { class: "field-stack" }, [
+          publicBaseUrl,
+          h("div", { class: "field-help", text: "设为 https:// 域名后，登录 Cookie 会带 Secure，写请求按该域名校验 Origin/Referer。" }),
+        ]))]),
+        h("label", { class: "check-row field--full" }, [
+          trustedProxy,
+          h("div", { class: "check-row__text" }, [
+            h("strong", { text: "信任反向代理头" }),
+            h("span", { text: "只在后端端口不能被公网直连时开启；用于真实客户端 IP、X-Forwarded-Host/Proto。" }),
+          ]),
+        ]),
+        field("监听 Host", h("div", { class: "field-stack" }, [
+          host,
+          h("div", { class: "field-help", text: `当前进程：${security.applied_host || "-"}，修改后需重启/重新部署。` }),
+        ])),
+        field("监听 Port", h("div", { class: "field-stack" }, [
+          port,
+          h("div", { class: "field-help", text: `当前进程：${security.applied_port || "-"}，修改后需重启/重新部署。` }),
+        ])),
+        field("Session TTL 秒", h("div", { class: "field-stack" }, [
+          sessionTtl,
+          h("div", { class: "field-help", text: "影响新签发的登录会话；建议公网保持有限时长。" }),
+        ])),
+        field("轮换 Session Secret", h("div", { class: "field-stack" }, [
+          sessionSecret,
+          h("div", { class: "field-help", text: "留空不修改；填入新值后重启会使所有旧会话失效。" }),
+        ])),
+      ]),
+      h("div", { class: "form-actions" }, [
+        h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [h("span", { text: "保存安全配置" })]),
+      ]),
+    ]),
+    h("div", { class: "security-status" }, statusRows),
+  ]);
+}
+
+function securityStatusRow(label, ok, value) {
+  return h("div", { class: "security-status__row" }, [
+    h("span", { text: label }),
+    statusBadge(ok, value),
   ]);
 }
 
@@ -2456,10 +2574,11 @@ async function loadSecrets() {
 }
 async function loadOAuthProviders() { state.oauthProviders = await api("/api/system/oauth/providers"); }
 async function loadRuntime() { state.runtimes = await api("/api/system/runtime"); }
+async function loadSecurityConfig() { state.securityConfig = await api("/api/system/security/config"); }
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
 async function loadHermesInternalConfig() { state.hermesInternalConfig = await api("/api/system/hermes/internal-config"); }
 async function loadCogneeConfig() { state.cogneeConfig = await api("/api/system/cognee/config"); }
-async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadHermesConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
+async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadSecurityConfig(), loadHermesConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
 async function loadMessageAudit() {
   const audit = messageAuditState();
   if (!state.channels.length) await loadChannels();

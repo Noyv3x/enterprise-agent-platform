@@ -132,6 +132,11 @@ PERMISSION_SYSTEM_SETTINGS = "system_settings"
 
 OAUTH_CREDENTIAL_EXPORT_KIND = "enterprise-agent-platform.oauth-credentials"
 OAUTH_CREDENTIAL_EXPORT_VERSION = 1
+PLATFORM_SETTING_PUBLIC_BASE_URL = "platform_public_base_url"
+PLATFORM_SETTING_TRUSTED_PROXY = "platform_trusted_proxy"
+PLATFORM_SETTING_HOST = "platform_host"
+PLATFORM_SETTING_PORT = "platform_port"
+PLATFORM_SETTING_SESSION_TTL = "platform_session_ttl_seconds"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
@@ -194,7 +199,7 @@ class EnterpriseService:
         self.config = config
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(config.db_path)
-        self.tokens = TokenSigner(self._resolve_session_secret(), config.token_ttl_seconds)
+        self.tokens = TokenSigner(self._resolve_session_secret(), self._effective_session_ttl_seconds())
         self.knowledge = KnowledgeBase(self.db)
         self.runtimes = PlatformRuntimeManager(
             config,
@@ -355,6 +360,137 @@ class EnterpriseService:
         secret = self.config.token_secret or secrets.token_urlsafe(32)
         self.set_setting("ENTERPRISE_SESSION_SECRET", secret, secret=True)
         return secret
+
+    def _effective_session_ttl_seconds(self) -> int:
+        value = self.get_setting(PLATFORM_SETTING_SESSION_TTL)
+        if value:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = self.config.token_ttl_seconds
+            return max(60, min(parsed, 30 * 24 * 60 * 60))
+        return int(self.config.token_ttl_seconds)
+
+    def public_base_url(self) -> str:
+        return (self.get_setting(PLATFORM_SETTING_PUBLIC_BASE_URL) or self.config.public_base_url).rstrip("/")
+
+    def trust_forwarded_headers(self) -> bool:
+        raw = self.get_setting(PLATFORM_SETTING_TRUSTED_PROXY)
+        if raw is not None:
+            return parse_bool(raw)
+        return bool(self.config.trust_forwarded_headers)
+
+    def platform_security_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        desired_host = self.get_setting(PLATFORM_SETTING_HOST) or self.config.host
+        desired_port = self._desired_platform_port()
+        public_base_url = self.public_base_url()
+        admin_row = self.db.query_one("SELECT password_hash FROM users WHERE username = ?", ("admin",))
+        admin_default_password_active = bool(admin_row and verify_password("admin", str(admin_row["password_hash"])))
+        session_secret_row = self.db.query_one(
+            "SELECT updated_at FROM settings WHERE key = ? AND secret = 1",
+            ("ENTERPRISE_SESSION_SECRET",),
+        )
+        env_session_secret = bool(os.getenv("ENTERPRISE_SESSION_SECRET"))
+        return {
+            "config": {
+                "public_base_url": public_base_url,
+                "secure_cookie_enabled": urllib.parse.urlparse(public_base_url).scheme == "https",
+                "trusted_proxy": self.trust_forwarded_headers(),
+                "host": desired_host,
+                "port": desired_port,
+                "applied_host": self.config.host,
+                "applied_port": self.config.port,
+                "listen_restart_required": desired_host != self.config.host or desired_port != self.config.port,
+                "session_ttl_seconds": self._effective_session_ttl_seconds(),
+                "session_secret_configured": env_session_secret or bool(session_secret_row),
+                "session_secret_source": "env" if env_session_secret else ("stored" if session_secret_row else "generated"),
+                "session_secret_updated_at": session_secret_row["updated_at"] if session_secret_row else None,
+                "allow_default_admin_password": bool(self.config.allow_insecure_bootstrap_password),
+                "admin_default_password_active": admin_default_password_active,
+                "bootstrap_password_file_exists": (self.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE).exists(),
+                "bootstrap_password_path": str(self.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE),
+            }
+        }
+
+    def update_platform_security_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        restart_required = False
+        session_secret_restart_required = False
+        if "public_base_url" in body:
+            public_base_url = self._validate_public_base_url(str(body.get("public_base_url") or ""))
+            self.set_setting(PLATFORM_SETTING_PUBLIC_BASE_URL, public_base_url)
+        if "trusted_proxy" in body:
+            self.set_setting(PLATFORM_SETTING_TRUSTED_PROXY, "1" if parse_bool(body.get("trusted_proxy")) else "0")
+        if "host" in body:
+            host = self._validate_listen_host(str(body.get("host") or ""))
+            self.set_setting(PLATFORM_SETTING_HOST, host)
+            restart_required = restart_required or host != self.config.host
+        if "port" in body:
+            port = self._validate_listen_port(body.get("port"))
+            self.set_setting(PLATFORM_SETTING_PORT, str(port))
+            restart_required = restart_required or port != self.config.port
+        if "session_ttl_seconds" in body:
+            ttl = self._validate_session_ttl(body.get("session_ttl_seconds"))
+            self.set_setting(PLATFORM_SETTING_SESSION_TTL, str(ttl))
+            self.tokens = TokenSigner(self._resolve_session_secret(), ttl)
+        session_secret = str(body.get("session_secret") or "").strip()
+        if session_secret:
+            if len(session_secret) < 32:
+                raise ServiceError(400, "session secret must be at least 32 characters")
+            self.set_setting("ENTERPRISE_SESSION_SECRET", session_secret, secret=True)
+            session_secret_restart_required = True
+            restart_required = True
+        result = self.platform_security_config(actor)
+        result["restart_required"] = restart_required
+        result["session_secret_restart_required"] = session_secret_restart_required
+        return result
+
+    def _desired_platform_port(self) -> int:
+        value = self.get_setting(PLATFORM_SETTING_PORT)
+        if value:
+            try:
+                return self._validate_listen_port(value)
+            except ServiceError:
+                return int(self.config.port)
+        return int(self.config.port)
+
+    @staticmethod
+    def _validate_public_base_url(value: str) -> str:
+        url = value.strip().rstrip("/")
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ServiceError(400, "public base URL must be an http(s) URL")
+        return url
+
+    @staticmethod
+    def _validate_listen_host(value: str) -> str:
+        host = value.strip()
+        if not host:
+            raise ServiceError(400, "listen host is required")
+        if len(host) > 253 or any(ch.isspace() for ch in host):
+            raise ServiceError(400, "listen host is invalid")
+        return host
+
+    @staticmethod
+    def _validate_listen_port(value: Any) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "listen port must be an integer") from exc
+        if port < 1 or port > 65535:
+            raise ServiceError(400, "listen port must be between 1 and 65535")
+        return port
+
+    @staticmethod
+    def _validate_session_ttl(value: Any) -> int:
+        try:
+            ttl = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "session TTL must be an integer") from exc
+        if ttl < 60 or ttl > 30 * 24 * 60 * 60:
+            raise ServiceError(400, "session TTL must be between 60 and 2592000 seconds")
+        return ttl
 
     def create_user(
         self,

@@ -4,6 +4,7 @@ import argparse
 import getpass
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -140,23 +141,23 @@ class DeploymentManager:
             # prepared here from the deploy process.
             if prepare_runtime:
                 self.prepare_platform_runtime(host=host, port=port)
-            return DeploymentResult(mode=mode, url=self.public_url(host, port))
+            return DeploymentResult(mode=mode, url=self.effective_public_url(host, port))
         if mode == "service":
             service_path = self.install_user_service(host=host, port=port)
-            return DeploymentResult(mode=mode, url=self.public_url(host, port), service_path=str(service_path), service_started=True)
+            return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
         if mode == "foreground":
             # The foreground server prepares the runtime on startup in its own
             # single process, so no separate prepare step is needed here.
             self.run_foreground(host=host, port=port)
-            return DeploymentResult(mode=mode, url=self.public_url(host, port), foreground_started=True)
+            return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), foreground_started=True)
         if mode != "auto":
             raise DeploymentError(f"unknown deploy mode: {mode}")
 
         if self.user_systemd_available():
             service_path = self.install_user_service(host=host, port=port)
-            return DeploymentResult(mode="service", url=self.public_url(host, port), service_path=str(service_path), service_started=True)
+            return DeploymentResult(mode="service", url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
         self.run_foreground(host=host, port=port)
-        return DeploymentResult(mode="foreground", url=self.public_url(host, port), foreground_started=True)
+        return DeploymentResult(mode="foreground", url=self.effective_public_url(host, port), foreground_started=True)
 
     def ensure_python_version(self) -> None:
         if sys.version_info < (3, 11):
@@ -279,14 +280,19 @@ class DeploymentManager:
         return result.returncode == 0
 
     def prepare_platform_runtime(self, *, host: str, port: int) -> dict[str, object]:
-        public_base_url = os.getenv("ENTERPRISE_PUBLIC_BASE_URL", self.public_url(host, port)).rstrip("/")
+        env_values = runtime_env(self.paths, host=host, port=port)
+        effective_host = env_values["ENTERPRISE_PLATFORM_HOST"]
+        effective_port = int(env_values["ENTERPRISE_PLATFORM_PORT"])
+        public_base_url = env_values["ENTERPRISE_PUBLIC_BASE_URL"].rstrip("/")
         config = PlatformConfig.from_env(self.paths.root)
         config = replace(
             config,
             data_dir=self.paths.data_dir,
-            host=host,
-            port=port,
+            host=effective_host,
+            port=effective_port,
             public_base_url=public_base_url,
+            trust_forwarded_headers=env_values.get("ENTERPRISE_TRUSTED_PROXY", "").strip().lower() in {"1", "true", "yes", "on"},
+            token_ttl_seconds=int(env_values.get("ENTERPRISE_SESSION_TTL_SECONDS") or config.token_ttl_seconds),
             hermes_repo=self.paths.hermes_repo,
             cognee_repo=self.paths.cognee_repo,
             firecrawl_repo=self.paths.firecrawl_repo,
@@ -432,7 +438,10 @@ class DeploymentManager:
 
     def run_foreground(self, *, host: str, port: int) -> None:
         env = os.environ.copy()
-        env.update(runtime_env(self.paths, host=host, port=port))
+        env_values = runtime_env(self.paths, host=host, port=port)
+        env.update(env_values)
+        host = env_values["ENTERPRISE_PLATFORM_HOST"]
+        port = int(env_values["ENTERPRISE_PLATFORM_PORT"])
         try:
             result = self.runner.run(
                 [str(self.paths.platform_cli), "serve", "--host", host, "--port", str(port), "--data", str(self.paths.data_dir)],
@@ -458,29 +467,44 @@ class DeploymentManager:
     def public_url(host: str, port: int) -> str:
         return os.getenv("ENTERPRISE_PUBLIC_BASE_URL", f"http://{host}:{port}").rstrip("/")
 
+    def effective_public_url(self, host: str, port: int) -> str:
+        return runtime_env(self.paths, host=host, port=port)["ENTERPRISE_PUBLIC_BASE_URL"].rstrip("/")
+
 
 def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, str]:
-    return {
+    settings = _deployment_platform_settings(paths.data_dir)
+    effective_host = settings.get("platform_host") or host
+    try:
+        effective_port = int(settings.get("platform_port") or port)
+    except ValueError:
+        effective_port = port
+    values = {
         "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
         "ENTERPRISE_HERMES_REPO": str(paths.hermes_repo),
         "ENTERPRISE_COGNEE_REPO": str(paths.cognee_repo),
         "ENTERPRISE_FIRECRAWL_REPO": str(paths.firecrawl_repo),
-        "ENTERPRISE_PLATFORM_HOST": host,
-        "ENTERPRISE_PLATFORM_PORT": str(port),
-        "ENTERPRISE_PUBLIC_BASE_URL": DeploymentManager.public_url(host, port),
+        "ENTERPRISE_PLATFORM_HOST": effective_host,
+        "ENTERPRISE_PLATFORM_PORT": str(effective_port),
+        "ENTERPRISE_PUBLIC_BASE_URL": settings.get("platform_public_base_url") or DeploymentManager.public_url(effective_host, effective_port),
     }
+    if "platform_trusted_proxy" in settings:
+        values["ENTERPRISE_TRUSTED_PROXY"] = settings["platform_trusted_proxy"]
+    if "platform_session_ttl_seconds" in settings:
+        values["ENTERPRISE_SESSION_TTL_SECONDS"] = settings["platform_session_ttl_seconds"]
+    return values
 
 
 def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
-    env_lines = [f"Environment={_systemd_quote(f'{key}={value}')}" for key, value in runtime_env(paths, host=host, port=port).items()]
+    env = runtime_env(paths, host=host, port=port)
+    env_lines = [f"Environment={_systemd_quote(f'{key}={value}')}" for key, value in env.items()]
     exec_start = " ".join(
         [
             _systemd_quote(str(paths.platform_cli)),
             "serve",
             "--host",
-            _systemd_quote(host),
+            _systemd_quote(env["ENTERPRISE_PLATFORM_HOST"]),
             "--port",
-            str(port),
+            env["ENTERPRISE_PLATFORM_PORT"],
             "--data",
             _systemd_quote(str(paths.data_dir)),
         ]
@@ -509,6 +533,31 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _deployment_platform_settings(data_dir: Path) -> dict[str, str]:
+    db_path = data_dir / "platform.db"
+    if not db_path.exists():
+        return {}
+    keys = {
+        "platform_host",
+        "platform_port",
+        "platform_public_base_url",
+        "platform_trusted_proxy",
+        "platform_session_ttl_seconds",
+    }
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({','.join('?' for _ in keys)})",
+                tuple(sorted(keys)),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {str(key): str(value) for key, value in rows if value is not None}
 
 
 def venv_package_hint(python_executable: str, venv_dir: Path, *, existing_broken: bool = False) -> str:

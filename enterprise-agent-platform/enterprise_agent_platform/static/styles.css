@@ -1283,6 +1283,34 @@ select {
 .config-form { max-width: 720px; }
 .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .config-grid .field--full { grid-column: 1 / -1; }
+.security-config { max-width: 860px; }
+.security-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px;
+}
+.security-status__row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.security-status__row > span:first-child {
+  color: var(--muted);
+  font-size: 12px;
+}
+.security-status__row .status {
+  min-width: 0;
+  max-width: 68%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .config-software { max-width: none; }
 .config-sections { display: flex; gap: 8px; flex-wrap: wrap; }
 .config-fields-form, .raw-config-form { display: grid; gap: 12px; }

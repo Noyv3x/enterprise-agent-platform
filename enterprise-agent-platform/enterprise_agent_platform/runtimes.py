@@ -1445,7 +1445,7 @@ class PlatformRuntimeManager:
             "API_SERVER_HOST": host,
             "API_SERVER_PORT": str(port),
             "API_SERVER_MODEL_NAME": self._effective_hermes_model(),
-            "ENTERPRISE_PLATFORM_URL": self.config.public_base_url,
+            "ENTERPRISE_PLATFORM_URL": self._effective_platform_url(),
             "ENTERPRISE_AGENT_TOOL_TOKEN": self.secret_provider("agent_tool_token") or "",
             "HERMES_ACCEPT_HOOKS": "1",
             "COGNEE_SKIP_CONNECTION_TEST": "true",
@@ -1696,6 +1696,9 @@ class PlatformRuntimeManager:
         if value:
             return str(value).strip().rstrip("/")
         return default_base_url_for_provider(provider)
+
+    def _effective_platform_url(self) -> str:
+        return (self._runtime_setting("platform_public_base_url") or self.config.public_base_url).strip().rstrip("/")
 
     def _effective_install_extras(self) -> str:
         return self._runtime_setting(HERMES_SETTING_INSTALL_EXTRAS) or self.config.hermes_install_extras

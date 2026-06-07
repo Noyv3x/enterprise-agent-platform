@@ -2589,6 +2589,85 @@ class PlatformHTTPTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
+    def test_security_config_can_enable_public_https_cookie_without_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                res.read()
+                cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertNotIn("Secure", cookie)
+
+                conn.request(
+                    "PUT",
+                    "/api/system/security/config",
+                    body=json.dumps(
+                        {
+                            "public_base_url": "https://agents.example",
+                            "trusted_proxy": True,
+                            "host": "127.0.0.1",
+                            "port": 8766,
+                            "session_ttl_seconds": 7200,
+                        }
+                    ),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                updated = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                security = updated["config"]
+                self.assertEqual(security["public_base_url"], "https://agents.example")
+                self.assertTrue(security["secure_cookie_enabled"])
+                self.assertTrue(security["trusted_proxy"])
+                self.assertTrue(security["listen_restart_required"])
+                self.assertEqual(security["session_ttl_seconds"], 7200)
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": "https://agents.example"},
+                )
+                res = conn.getresponse()
+                res.read()
+                secure_cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertIn("Secure", secure_cookie)
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_security_config_rejects_invalid_public_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                with self.assertRaises(ServiceError) as bad_url:
+                    service.update_platform_security_config(admin, {"public_base_url": "javascript:alert(1)"})
+                self.assertEqual(bad_url.exception.status, 400)
+                with self.assertRaises(ServiceError) as bad_port:
+                    service.update_platform_security_config(admin, {"port": 70000})
+                self.assertEqual(bad_port.exception.status, 400)
+                with self.assertRaises(ServiceError) as bad_secret:
+                    service.update_platform_security_config(admin, {"session_secret": "short"})
+                self.assertEqual(bad_secret.exception.status, 400)
+            finally:
+                service.close()
+
     def test_csrf_requires_origin_for_cookie_requests_but_exempts_bearer(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
