@@ -89,6 +89,39 @@ class HermesOAuthBridge:
             return False
         return bool(python.exists() and repo.exists())
 
+    def auth_helpers_available(self) -> bool:
+        if not self.available():
+            return False
+        try:
+            python = self.runtimes._hermes_venv_python()
+            repo = self.runtimes._effective_hermes_repo()
+            env = self.runtimes._hermes_process_env()
+            completed = subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    (
+                        "from hermes_cli import auth as a; "
+                        "required = ("
+                        "'start_codex_oauth_device_flow',"
+                        "'poll_codex_oauth_device_flow',"
+                        "'start_xai_oauth_manual_flow',"
+                        "'complete_xai_oauth_manual_flow'"
+                        "); "
+                        "raise SystemExit(0 if all(hasattr(a, name) for name in required) else 1)"
+                    ),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(repo) if repo.exists() else None,
+                env=env,
+                timeout=5.0,
+                check=False,
+            )
+        except Exception:
+            return False
+        return completed.returncode == 0
+
     def start(self, provider: str) -> dict[str, Any]:
         if provider == "openai-codex":
             return self._run("codex_start", {"timeout_seconds": 20.0})

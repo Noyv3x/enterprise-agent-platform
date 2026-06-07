@@ -406,6 +406,9 @@ class OAuthFlowManager:
         if self.hermes_bridge is None:
             return False
         try:
+            auth_helpers_available = getattr(self.hermes_bridge, "auth_helpers_available", None)
+            if callable(auth_helpers_available):
+                return bool(auth_helpers_available())
             return bool(self.hermes_bridge.available())
         except Exception:
             return False

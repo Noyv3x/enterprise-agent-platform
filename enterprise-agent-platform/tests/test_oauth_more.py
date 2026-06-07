@@ -119,6 +119,11 @@ class _FakeHermesOAuthBridge:
         }
 
 
+class _FakeHermesOAuthBridgeWithoutAuthHelpers(_FakeHermesOAuthBridge):
+    def auth_helpers_available(self):
+        return False
+
+
 def _codex_started_manager(token_responses):
     """Return a manager with a started Codex flow and its flow_id.
 
@@ -187,6 +192,24 @@ class OAuthPollTests(unittest.TestCase):
         self.assertEqual(bridge.calls[0], ("start", "openai-codex"))
         self.assertEqual(bridge.calls[1], ("poll_codex", "hermes-device", "HERMES-CODE"))
 
+    def test_codex_flow_falls_back_to_http_when_hermes_auth_helpers_missing(self):
+        http_client = _ScriptedOAuthHTTPClient(
+            {
+                CODEX_DEVICE_USER_CODE_URL: OAuthHTTPResponse(
+                    200,
+                    {"user_code": "HTTP-CODE", "device_auth_id": "http-device", "interval": 5, "expires_in": 900},
+                ),
+            }
+        )
+        bridge = _FakeHermesOAuthBridgeWithoutAuthHelpers()
+        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+
+        started = manager.start("openai-codex")
+
+        self.assertEqual(started["user_code"], "HTTP-CODE")
+        self.assertEqual(bridge.calls, [])
+        self.assertEqual(http_client.calls[0][0], "post_json")
+
     def test_xai_flow_uses_hermes_bridge_when_available(self):
         http_client = _ScriptedOAuthHTTPClient()
         bridge = _FakeHermesOAuthBridge()
@@ -208,6 +231,27 @@ class OAuthPollTests(unittest.TestCase):
             bridge.calls[1],
             ("complete_xai", "hermes-state", "http://127.0.0.1:56121/callback?code=ok&state=hermes-state"),
         )
+
+    def test_xai_flow_falls_back_to_http_when_hermes_auth_helpers_missing(self):
+        http_client = _ScriptedOAuthHTTPClient(
+            {
+                XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
+                    200,
+                    {
+                        "authorization_endpoint": "https://xai.example/authorize",
+                        "token_endpoint": "https://xai.example/token",
+                    },
+                ),
+            }
+        )
+        bridge = _FakeHermesOAuthBridgeWithoutAuthHelpers()
+        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+
+        started = manager.start("xai-oauth")
+
+        self.assertIn("https://xai.example/authorize?", started["authorize_url"])
+        self.assertEqual(bridge.calls, [])
+        self.assertEqual(http_client.calls[0], ("get_json", XAI_OAUTH_DISCOVERY_URL))
 
     def test_poll_pending_returns_not_complete_without_dropping_session(self):
         # 403 from the device-token endpoint means the user has not yet approved.
