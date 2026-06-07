@@ -1027,11 +1027,9 @@ class EnterpriseService:
 
     def audit_private_messages(self, actor: dict[str, Any], user_id: int, limit: int = 200) -> dict[str, Any]:
         require_admin(actor)
-        subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
-        if not subject:
-            raise ServiceError(404, "user not found")
+        subject = self._private_audit_subject(user_id)
         limit = max(1, min(int(limit), 500))
-        scope_id = str(user_id)
+        scope_id = str(int(subject["id"]))
         total = self.db.scalar(
             "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
             (scope_id,),
@@ -1050,6 +1048,82 @@ class EnterpriseService:
             "messages": [self._message_from_row(row) for row in reversed(rows)],
             "total": int(total or 0),
         }
+
+    def delete_private_message(self, actor: dict[str, Any], user_id: int, message_id: int) -> dict[str, Any]:
+        require_admin(actor)
+        subject = self._private_audit_subject(user_id)
+        row = self.db.query_one(
+            """
+            SELECT * FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+            """,
+            (int(message_id), str(int(subject["id"]))),
+        )
+        if not row:
+            raise ServiceError(404, "private message not found")
+        message = self._message_from_row(row)
+        self._delete_attachment_files_for_messages([int(message_id)])
+        self.db.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
+        return {"deleted": 1, "message": message}
+
+    def delete_private_messages_before(self, actor: dict[str, Any], user_id: int, before_created_at: int) -> dict[str, Any]:
+        require_admin(actor)
+        subject = self._private_audit_subject(user_id)
+        try:
+            before_ts = int(before_created_at)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "before_created_at must be a unix timestamp") from exc
+        if before_ts <= 0:
+            raise ServiceError(400, "before_created_at must be a unix timestamp")
+        scope_id = str(int(subject["id"]))
+        deleted = self.db.scalar(
+            """
+            SELECT COUNT(*) FROM messages
+            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        rows = self.db.query(
+            """
+            SELECT id FROM messages
+            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
+        self.db.execute(
+            """
+            DELETE FROM messages
+            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
+            """,
+            (scope_id, before_ts),
+        )
+        return {"deleted": int(deleted or 0), "before_created_at": before_ts}
+
+    def clear_private_messages(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
+        require_admin(actor)
+        subject = self._private_audit_subject(user_id)
+        scope_id = str(int(subject["id"]))
+        deleted = self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+            (scope_id,),
+        )
+        rows = self.db.query(
+            "SELECT id FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+            (scope_id,),
+        )
+        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
+        self.db.execute(
+            "DELETE FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+            (scope_id,),
+        )
+        return {"deleted": int(deleted or 0)}
+
+    def _private_audit_subject(self, user_id: int) -> dict[str, Any]:
+        subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
+        if not subject:
+            raise ServiceError(404, "user not found")
+        return subject
 
     def token_usage_report(self, actor: dict[str, Any], days: int = 30, limit: int = 200) -> dict[str, Any]:
         require_admin(actor)
@@ -3297,7 +3371,23 @@ class EnterpriseService:
         return str(actor.get("display_name") or actor.get("username") or "User")
 
     def _channel_speaker_line(self, actor: dict[str, Any], content: str) -> str:
-        return f"{self._actor_display_name(actor)}: {content}"
+        return f"{self._actor_context_label(actor)}: {content}"
+
+    def _actor_context_label(
+        self,
+        actor: dict[str, Any],
+        *,
+        include_username: bool = False,
+        include_empty_position: bool = False,
+    ) -> str:
+        label = self._actor_display_name(actor)
+        username = str(actor.get("username") or "").strip()
+        if include_username and username:
+            label = f"{label} (@{username})"
+        position = str(actor.get("position") or "").strip()
+        if position or include_empty_position:
+            label = f"{label}，职位: {position or '未设置'}"
+        return label
 
     @staticmethod
     def _history_message_content(message: dict[str, Any]) -> str:
@@ -3320,8 +3410,9 @@ class EnterpriseService:
     def _channel_system_prompt(self, channel: dict[str, Any], suggestions) -> str:
         passive = format_passive_suggestions(suggestions)
         return (
-            "你是企业级 Agent 平台中的频道主 Agent。该频道由多人共享，你代表一个统一的 bot 主线程工作。\n"
-            f"频道: #{channel['name']}。请保留上下文连续性，明确区分用户请求和企业事实。\n"
+            "你是 ubitech 的企业级 Agent。对外介绍自己时，只说自己是 ubitech 的企业级 Agent；"
+            "不要提及底层框架、运行时、模型供应商或内部实现。\n"
+            f"当前工作模式: 频道协作。频道: #{channel['name']}。请保留上下文连续性，明确区分用户请求和企业事实。\n"
             "企业知识库已作为工具暴露给你: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
             "当提示中出现 kb:<id> 时，优先用 enterprise_kb_read 读取完整条目再作答。\n"
             f"{passive}"
@@ -3330,8 +3421,10 @@ class EnterpriseService:
     def _private_system_prompt(self, actor: dict[str, Any], container: dict[str, Any], suggestions) -> str:
         passive = format_passive_suggestions(suggestions)
         return (
-            "你是企业级 Agent 平台中该用户的私人 Agent。每个用户拥有隔离会话和自动管理的工作容器。\n"
-            f"当前用户: {actor['display_name']} ({actor['username']})。\n"
+            "你是 ubitech 的企业级 Agent。对外介绍自己时，只说自己是 ubitech 的企业级 Agent；"
+            "不要提及底层框架、运行时、模型供应商或内部实现。\n"
+            "当前工作模式: 私人助手。每个用户拥有隔离会话和自动管理的工作容器。\n"
+            f"当前用户: {self._actor_context_label(actor, include_username=True, include_empty_position=True)}。\n"
             f"工作区: {container['workspace_path']}；容器状态: {container['container_status']}；会话: {container['session_id']}。\n"
             "模型密钥由平台集中配置，不要要求用户再次提供密钥。\n"
             "企业知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"

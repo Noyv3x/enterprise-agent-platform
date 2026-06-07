@@ -1590,6 +1590,8 @@ function renderMessageAuditManagement() {
 
   const messageId = h("input", { type: "number", min: "1", step: "1", placeholder: "消息 ID" });
   const beforeTime = h("input", { type: "datetime-local" });
+  const privateMessageId = h("input", { type: "number", min: "1", step: "1", placeholder: "消息 ID" });
+  const privateBeforeTime = h("input", { type: "datetime-local" });
   const channelMessages = audit.channelMessages || [];
 
   const channelRows = channelMessages.length
@@ -1603,7 +1605,10 @@ function renderMessageAuditManagement() {
   const selectedPrivateUserId = String(audit.auditPrivateUserId || "");
   const selectedConversation = conversations.find((item) => String(item.user_id) === selectedPrivateUserId);
   const privateRows = (audit.privateMessages || []).length
-    ? audit.privateMessages.map((message) => renderAuditMessageRow(message))
+    ? audit.privateMessages.map((message) => renderAuditMessageRow(message, {
+        deletable: true,
+        onDelete: () => deletePrivateMessage(selectedPrivateUserId, message.id),
+      }))
     : [h("div", { class: "muted", text: selectedConversation ? "该用户暂无私人 Agent 消息。" : "选择一个用户查看私人 Agent 会话。" })];
 
   return h("div", { class: "audit-grid" }, [
@@ -1667,6 +1672,43 @@ function renderMessageAuditManagement() {
           onclick: async () => withBusy(loadMessageAudit),
         }, [icon("refresh", { size: 14 }), h("span", { text: "刷新" })]),
       }),
+      h("div", { class: "audit-tools" }, [
+        h("form", {
+          class: "audit-tool",
+          onsubmit: async (event) => {
+            event.preventDefault();
+            const id = Number(privateMessageId.value);
+            if (!id) return toast("请输入要删除的消息 ID", { title: "缺少消息 ID" });
+            await deletePrivateMessage(selectedPrivateUserId, id);
+            privateMessageId.value = "";
+          },
+        }, [
+          field("精确删除", privateMessageId),
+          h("button", { class: "btn btn--danger", type: "submit", disabled: state.busy || !selectedPrivateUserId }, [icon("trash", { size: 15 }), h("span", { text: "删除 ID" })]),
+        ]),
+        h("form", {
+          class: "audit-tool",
+          onsubmit: async (event) => {
+            event.preventDefault();
+            const ts = unixFromDatetimeLocal(privateBeforeTime.value);
+            if (!ts) return toast("请选择删除截止时间", { title: "缺少时间" });
+            await deletePrivateMessagesBefore(selectedPrivateUserId, ts);
+            privateBeforeTime.value = "";
+          },
+        }, [
+          field("删除时间点前", privateBeforeTime),
+          h("button", { class: "btn btn--danger", type: "submit", disabled: state.busy || !selectedPrivateUserId }, [icon("trash", { size: 15 }), h("span", { text: "删除之前" })]),
+        ]),
+        h("div", { class: "audit-tool audit-tool--compact" }, [
+          h("span", { class: "field" }, [h("span", { text: "全部清空" }), h("span", { class: "muted", text: "清空当前用户私人会话" })]),
+          h("button", {
+            class: "btn btn--danger",
+            type: "button",
+            disabled: state.busy || !selectedPrivateUserId,
+            onclick: async () => clearPrivateMessages(selectedPrivateUserId),
+          }, [icon("trash", { size: 15 }), h("span", { text: "清空会话" })]),
+        ]),
+      ]),
       h("div", { class: "audit-private" }, [
         h("div", { class: "audit-conversations" }, conversations.length
           ? conversations.map(renderPrivateConversationItem)
@@ -2648,9 +2690,50 @@ async function clearChannelMessages(channelId) {
   });
 }
 
+async function deletePrivateMessage(userId, messageId) {
+  if (!userId || !messageId) return;
+  if (!window.confirm(`删除私人 Agent 消息 #${messageId}？`)) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/private-agent/conversations/${userId}/messages/${messageId}`, { method: "DELETE", body: "{}" });
+    await reloadAfterPrivateAuditChange(userId);
+    toast(`已删除 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+  });
+}
+
+async function deletePrivateMessagesBefore(userId, beforeCreatedAt) {
+  if (!userId || !beforeCreatedAt) return;
+  if (!window.confirm("删除该时间点之前的私人 Agent 消息？")) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/private-agent/conversations/${userId}/messages`, {
+      method: "DELETE",
+      body: JSON.stringify({ before_created_at: beforeCreatedAt }),
+    });
+    await reloadAfterPrivateAuditChange(userId);
+    toast(`已删除 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+  });
+}
+
+async function clearPrivateMessages(userId) {
+  if (!userId) return;
+  if (!window.confirm("清空当前用户的全部私人 Agent 消息？")) return;
+  await withBusy(async () => {
+    const result = await api(`/api/admin/private-agent/conversations/${userId}/messages`, {
+      method: "DELETE",
+      body: JSON.stringify({ clear_all: true }),
+    });
+    await reloadAfterPrivateAuditChange(userId);
+    toast(`已清空 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+  });
+}
+
 async function reloadAfterChannelAuditChange(channelId) {
   await Promise.all([loadChannels(), loadAuditChannelMessages(channelId)]);
   if (String(state.activeChannelId || "") === String(channelId)) await loadChannelMessages();
+}
+
+async function reloadAfterPrivateAuditChange(userId) {
+  await Promise.all([loadPrivateConversations(), loadAuditPrivateMessages(userId)]);
+  if (String(state.user?.id || "") === String(userId)) await loadPrivateMessages();
 }
 
 /* ---------------------------------------------------------------- loads */

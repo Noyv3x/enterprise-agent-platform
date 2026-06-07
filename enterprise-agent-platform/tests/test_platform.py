@@ -1255,6 +1255,36 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_agent_prompt_uses_ubitech_identity_and_includes_user_position(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    position="Product Manager",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, alice = service.authenticate("alice", "alice-pass")
+
+                service.send_private_message(alice, "draft a roadmap")
+                service.wait_for_agent_idle("private", str(alice["id"]))
+                private_prompt = agent.calls[-1]["system_prompt"]
+                self.assertIn("你是 ubitech 的企业级 Agent", private_prompt)
+                self.assertIn("不要提及底层框架", private_prompt)
+                self.assertIn("当前用户: Alice (@alice)，职位: Product Manager", private_prompt)
+                self.assertNotIn("Hermes", private_prompt)
+
+                service.send_channel_message(alice, 1, "@agent summarize status")
+                service.wait_for_agent_idle("channel", "1")
+                self.assertEqual(agent.calls[-1]["user_message"], "Alice，职位: Product Manager: summarize status")
+            finally:
+                service.close()
+
     def test_agent_media_tags_are_saved_as_returned_attachments(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as media_td:
             tmp = Path(td)
@@ -1463,6 +1493,70 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertFalse(retained["alice"]["active"])
                 self.assertEqual(retained["alice"]["message_count"], 2)
                 self.assertEqual(service.audit_private_messages(admin, alice["id"])["total"], 2)
+            finally:
+                service.close()
+
+    def test_admin_can_delete_private_agent_messages_by_id_before_time_and_clear(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, alice = service.authenticate("alice", "alice-pass")
+
+                first = service.send_private_message(alice, "first")["user_message"]
+                service.wait_for_agent_idle("private", str(alice["id"]))
+                second = service.send_private_message(alice, "second")["user_message"]
+                service.wait_for_agent_idle("private", str(alice["id"]))
+                third = service.send_private_message(alice, "third")["user_message"]
+                service.wait_for_agent_idle("private", str(alice["id"]))
+
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (1000, first["id"]))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE content = ?", (1100, "agent response to first"))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (2000, second["id"]))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE content = ?", (2100, "agent response to second"))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE id = ?", (3000, third["id"]))
+                service.db.execute("UPDATE messages SET created_at = ? WHERE content = ?", (3100, "agent response to third"))
+
+                audit = service.audit_private_messages(admin, alice["id"])
+                self.assertEqual(audit["total"], 6)
+                self.assertEqual(
+                    [message["content"] for message in audit["messages"]],
+                    ["first", "agent response to first", "second", "agent response to second", "third", "agent response to third"],
+                )
+
+                with self.assertRaises(ServiceError) as member_error:
+                    service.delete_private_message(alice, alice["id"], first["id"])
+                self.assertEqual(member_error.exception.status, 403)
+
+                deleted = service.delete_private_message(admin, alice["id"], second["id"])
+                self.assertEqual(deleted["deleted"], 1)
+                self.assertEqual(deleted["message"]["content"], "second")
+                self.assertEqual(
+                    [message["content"] for message in service.audit_private_messages(admin, alice["id"])["messages"]],
+                    ["first", "agent response to first", "agent response to second", "third", "agent response to third"],
+                )
+
+                with self.assertRaises(ServiceError) as wrong_scope_error:
+                    service.delete_private_message(admin, admin["id"], third["id"])
+                self.assertEqual(wrong_scope_error.exception.status, 404)
+
+                before = service.delete_private_messages_before(admin, alice["id"], 2500)
+                self.assertEqual(before["deleted"], 3)
+                self.assertEqual(
+                    [message["content"] for message in service.audit_private_messages(admin, alice["id"])["messages"]],
+                    ["third", "agent response to third"],
+                )
+
+                cleared = service.clear_private_messages(admin, alice["id"])
+                self.assertEqual(cleared["deleted"], 2)
+                self.assertEqual(service.audit_private_messages(admin, alice["id"])["total"], 0)
             finally:
                 service.close()
 
@@ -2923,6 +3017,7 @@ class PlatformHTTPTests(unittest.TestCase):
                 cookie = res.getheader("Set-Cookie")
                 self.assertEqual(res.status, 200)
                 self.assertEqual(body["user"]["username"], "admin")
+                admin = body["user"]
 
                 conn.request("GET", "/api/channels", headers={"Cookie": cookie})
                 res = conn.getresponse()
@@ -3074,6 +3169,41 @@ class PlatformHTTPTests(unittest.TestCase):
                 private_payload = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
                 self.assertIn("admin", {item["username"] for item in private_payload["conversations"]})
+
+                conn.request(
+                    "POST",
+                    "/api/private-agent/messages",
+                    body=json.dumps({"content": "private http"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                private_message_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 201)
+                self.assertEqual(private_message_payload["user_message"]["content"], "private http")
+                service.wait_for_agent_idle("private", str(admin["id"]))
+
+                conn.request(
+                    "GET",
+                    f"/api/admin/private-agent/conversations/{admin['id']}/messages?limit=10",
+                    headers={"Cookie": cookie},
+                )
+                res = conn.getresponse()
+                private_audit_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                private_http_message = next(
+                    message for message in private_audit_payload["messages"] if message["content"] == "private http"
+                )
+
+                conn.request(
+                    "DELETE",
+                    f"/api/admin/private-agent/conversations/{admin['id']}/messages/{private_http_message['id']}",
+                    body="{}",
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                private_delete_payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertEqual(private_delete_payload["deleted"], 1)
             finally:
                 server.shutdown()
                 server.server_close()
