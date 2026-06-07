@@ -1283,6 +1283,9 @@ class PlatformRuntimeManager:
         state = providers.get("openai-codex")
         if not isinstance(state, dict):
             state = {}
+        if self._oauth_relogin_error_matches_synced_db(state, refresh_token):
+            providers["openai-codex"] = state
+            return self._clear_provider_tokens_after_relogin_error(state)
         if not self._db_oauth_supersedes(state, refresh_token):
             # auth.json already holds a populated token block that the platform
             # has not been told to replace (the DB still carries the same token
@@ -1299,6 +1302,7 @@ class PlatformRuntimeManager:
         state["auth_mode"] = "chatgpt"
         state["last_refresh"] = state.get("last_refresh") or _iso_now()
         state["platform_synced_refresh_token"] = refresh_token
+        state.pop("last_auth_error", None)
         changed = original != json.dumps(state, sort_keys=True)
         providers["openai-codex"] = state
         return changed
@@ -1311,6 +1315,9 @@ class PlatformRuntimeManager:
         state = providers.get("xai-oauth")
         if not isinstance(state, dict):
             state = {}
+        if self._oauth_relogin_error_matches_synced_db(state, refresh_token):
+            providers["xai-oauth"] = state
+            return self._clear_provider_tokens_after_relogin_error(state)
         if not self._db_oauth_supersedes(state, refresh_token):
             # See _upsert_codex_oauth: keep the Hermes-rotated token in auth.json
             # authoritative unless the DB carries a genuinely new credential
@@ -1328,9 +1335,32 @@ class PlatformRuntimeManager:
         state["auth_mode"] = "oauth_pkce"
         state["last_refresh"] = state.get("last_refresh") or _iso_now()
         state["platform_synced_refresh_token"] = refresh_token
+        state.pop("last_auth_error", None)
         changed = original != json.dumps(state, sort_keys=True)
         providers["xai-oauth"] = state
         return changed
+
+    @staticmethod
+    def _oauth_relogin_error_matches_synced_db(state: dict[str, Any], db_refresh_token: str) -> bool:
+        """Return True when Hermes quarantined the DB credential we last synced."""
+        last_error = state.get("last_auth_error")
+        if not isinstance(last_error, dict) or not last_error.get("relogin_required"):
+            return False
+        synced = str(state.get("platform_synced_refresh_token") or "")
+        return bool(synced and db_refresh_token == synced)
+
+    @staticmethod
+    def _clear_provider_tokens_after_relogin_error(state: dict[str, Any]) -> bool:
+        original = json.dumps(state, sort_keys=True)
+        tokens = state.get("tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
+        else:
+            tokens = dict(tokens)
+        for key in ("access_token", "refresh_token", "id_token"):
+            tokens.pop(key, None)
+        state["tokens"] = tokens
+        return original != json.dumps(state, sort_keys=True)
 
     @staticmethod
     def _db_oauth_supersedes(state: dict[str, Any], db_refresh_token: str) -> bool:
@@ -1854,11 +1884,21 @@ class PlatformRuntimeManager:
         for provider in ("openai-codex", "xai-oauth"):
             state = providers.get(provider) if isinstance(providers, dict) else None
             tokens = state.get("tokens") if isinstance(state, dict) else None
+            last_auth_error = state.get("last_auth_error") if isinstance(state, dict) else None
+            if not isinstance(last_auth_error, dict):
+                last_auth_error = None
+            relogin_required = bool(last_auth_error and last_auth_error.get("relogin_required"))
             result[provider] = {
-                "configured": bool(isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token")),
+                "configured": bool(
+                    isinstance(tokens, dict)
+                    and tokens.get("access_token")
+                    and tokens.get("refresh_token")
+                    and not relogin_required
+                ),
                 "auth_store": str(path),
                 "last_refresh": state.get("last_refresh") if isinstance(state, dict) else None,
                 "active": store.get("active_provider") == provider,
+                "last_auth_error": dict(last_auth_error) if last_auth_error else None,
             }
         return result
 

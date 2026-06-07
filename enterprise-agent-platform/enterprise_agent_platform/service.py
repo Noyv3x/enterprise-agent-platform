@@ -20,6 +20,7 @@ from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AutoAgentClient, is_substantive_tool_start
+from .hermes_oauth_bridge import HermesOAuthBridge
 from .internal_config import (
     read_cognee_internal_config,
     read_hermes_internal_config,
@@ -205,7 +206,8 @@ class EnterpriseService:
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.containers = ContainerManager(config, self.db, runner=container_command_runner)
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
-        self.oauth_flows = OAuthFlowManager(oauth_http_client)
+        hermes_oauth_bridge = None if oauth_http_client is not None else HermesOAuthBridge(self.runtimes)
+        self.oauth_flows = OAuthFlowManager(oauth_http_client, hermes_bridge=hermes_oauth_bridge)
         self._conversation_lock = threading.RLock()
         self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
@@ -1376,16 +1378,21 @@ class EnterpriseService:
             info = oauth_provider_info(provider)
             configured = self._oauth_tokens_configured(provider)
             runtime_status = runtime_oauth.get(provider, {}) if isinstance(runtime_oauth, dict) else {}
+            last_auth_error = runtime_status.get("last_auth_error") if isinstance(runtime_status, dict) else None
+            if not isinstance(last_auth_error, dict):
+                last_auth_error = None
+            relogin_required = bool(last_auth_error and last_auth_error.get("relogin_required"))
             providers.append(
                 {
                     **info,
-                    "configured": configured or bool(runtime_status.get("configured")),
+                    "configured": (configured or bool(runtime_status.get("configured"))) and not relogin_required,
                     "active": active_provider == provider,
                     # Hermes owns token refresh and keeps auth.json current, so
                     # prefer the runtime value; the DB write time is only a
                     # fallback before Hermes has written auth.json (e.g. right
                     # after a credential import).
                     "last_refresh": runtime_status.get("last_refresh") or self._oauth_last_refresh(provider),
+                    "last_auth_error": dict(last_auth_error) if last_auth_error else None,
                 }
             )
         return {"providers": providers, "active_provider": active_provider}

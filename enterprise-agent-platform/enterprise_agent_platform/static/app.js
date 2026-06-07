@@ -1900,6 +1900,7 @@ function renderOAuthSettings() {
 function renderOAuthProviderCard(provider) {
   const flow = state.oauthFlows[provider.id];
   const callbackValue = state.oauthCallbackUrls[provider.id] || "";
+  const errorText = oauthProviderErrorText(provider);
   const header = h("div", { class: "oauth-card__head" }, [
     h("div", { class: "oauth-card__id" }, [
       h("div", { class: "oauth-card__logo" }, [h("strong", { class: "mono", text: (provider.label || "?").trim().charAt(0) })]),
@@ -1920,11 +1921,21 @@ function renderOAuthProviderCard(provider) {
     onclick: async () => startOAuthVerification(provider.id),
   }, [icon("shield", { size: 14 }), h("span", { text: provider.configured ? "重新验证" : "开始验证" })]);
 
-  const children = [header, meta, h("div", { class: "oauth-actions" }, [startButton])];
+  const children = [header, meta];
+  if (errorText) children.push(h("div", { class: "oauth-error", role: "alert" }, [icon("alert", { size: 15 }), h("span", { text: errorText })]));
+  children.push(h("div", { class: "oauth-actions" }, [startButton]));
   if (flow?.kind === "device_code") children.push(renderCodexOAuthFlow(provider.id, flow));
   else if (flow?.kind === "manual_callback") children.push(renderGrokOAuthFlow(provider.id, flow, callbackValue));
   if (flow?.complete) children.push(h("div", { class: "oauth-guide complete" }, [icon("checkCircle", { size: 16 }), h("span", { text: "验证完成，Hermes 已切换到该供应商。" })]));
   return h("div", { class: `oauth-card ${provider.active ? "is-active" : ""}` }, children);
+}
+
+function oauthProviderErrorText(provider) {
+  const authError = provider?.last_auth_error;
+  if (!authError || typeof authError !== "object") return "";
+  const message = String(authError.message || authError.detail || authError.code || "").trim();
+  if (!message) return "";
+  return authError.relogin_required ? `需要重新验证：${message}` : message;
 }
 
 function renderCodexOAuthFlow(providerId, flow) {

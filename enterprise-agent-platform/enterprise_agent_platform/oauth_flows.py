@@ -19,6 +19,7 @@ CODEX_DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/us
 CODEX_DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
+OAUTH_HTTP_USER_AGENT = "enterprise-agent-platform/0.1"
 
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -61,14 +62,14 @@ class OAuthHTTPResponse:
 
 class OAuthHTTPClient:
     def get_json(self, url: str, *, timeout: float = 20.0) -> OAuthHTTPResponse:
-        request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        request = urllib.request.Request(url, headers=_oauth_headers("application/json"), method="GET")
         return self._open(request, timeout=timeout)
 
     def post_json(self, url: str, body: dict[str, Any], *, timeout: float = 20.0) -> OAuthHTTPResponse:
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers=_oauth_headers("application/json"),
             method="POST",
         )
         return self._open(request, timeout=timeout)
@@ -77,7 +78,7 @@ class OAuthHTTPClient:
         request = urllib.request.Request(
             url,
             data=urllib.parse.urlencode(body).encode("utf-8"),
-            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            headers=_oauth_headers("application/x-www-form-urlencoded"),
             method="POST",
         )
         return self._open(request, timeout=timeout)
@@ -94,12 +95,21 @@ class OAuthHTTPClient:
             raise OAuthFlowError(502, f"OAuth network request failed: {exc}") from exc
 
 
+def _oauth_headers(content_type: str) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Content-Type": content_type,
+        "User-Agent": OAUTH_HTTP_USER_AGENT,
+    }
+
+
 MAX_OAUTH_SESSIONS = 100
 
 
 class OAuthFlowManager:
-    def __init__(self, http_client: OAuthHTTPClient | None = None):
+    def __init__(self, http_client: OAuthHTTPClient | None = None, hermes_bridge: Any | None = None):
         self.http = http_client or OAuthHTTPClient()
+        self.hermes_bridge = hermes_bridge
         self._sessions: dict[str, dict[str, Any]] = {}
         # Guards every read/mutation of ``_sessions``. The server is a
         # ThreadingHTTPServer (one thread per request), so overlapping start/
@@ -127,8 +137,12 @@ class OAuthFlowManager:
         provider = normalize_oauth_provider(provider)
         self._prune_sessions()
         if provider == "openai-codex":
+            if self._hermes_bridge_available():
+                return self._start_codex_via_hermes()
             return self._start_codex()
         if provider == "xai-oauth":
+            if self._hermes_bridge_available():
+                return self._start_xai_via_hermes()
             return self._start_xai()
         raise OAuthFlowError(400, f"unsupported OAuth provider: {provider}")
 
@@ -140,6 +154,16 @@ class OAuthFlowManager:
         if time.time() > float(session["expires_at"]):
             self._drop_session(flow_id)
             raise OAuthFlowError(410, "OAuth verification timed out; start again")
+        if session.get("auth_source") == "hermes" and self.hermes_bridge is not None:
+            result = self.hermes_bridge.poll_codex(session)
+            if not result.get("complete"):
+                return self._pending_response(session, str(result.get("status") or "waiting_for_user"))
+            self._drop_session(flow_id)
+            result["flow_id"] = flow_id
+            result.setdefault("provider", provider)
+            result.setdefault("status", "complete")
+            result.setdefault("complete", True)
+            return result
         response = self.http.post_json(
             CODEX_DEVICE_TOKEN_URL,
             {"device_auth_id": session["device_auth_id"], "user_code": session["user_code"]},
@@ -187,6 +211,14 @@ class OAuthFlowManager:
         if time.time() > float(session["expires_at"]):
             self._drop_session(flow_id)
             raise OAuthFlowError(410, "OAuth verification timed out; start again")
+        if session.get("auth_source") == "hermes" and self.hermes_bridge is not None:
+            result = self.hermes_bridge.complete_xai(session, callback_url)
+            self._drop_session(flow_id)
+            result["flow_id"] = flow_id
+            result.setdefault("provider", provider)
+            result.setdefault("status", "complete")
+            result.setdefault("complete", True)
+            return result
         callback = _parse_callback_url(callback_url)
         if callback.get("error"):
             detail = callback.get("error_description") or callback["error"]
@@ -259,6 +291,25 @@ class OAuthFlowManager:
         self._store_session(session)
         return self._pending_response(session, "waiting_for_user")
 
+    def _start_codex_via_hermes(self) -> dict[str, Any]:
+        flow = self.hermes_bridge.start("openai-codex")
+        flow_id = secrets.token_urlsafe(18)
+        session = {
+            "flow_id": flow_id,
+            "provider": "openai-codex",
+            "kind": "device_code",
+            "auth_source": "hermes",
+            "user_code": str(flow.get("user_code") or "").strip(),
+            "device_auth_id": str(flow.get("device_auth_id") or "").strip(),
+            "verification_url": str(flow.get("verification_url") or CODEX_DEVICE_VERIFICATION_URL).strip(),
+            "poll_interval": max(3, _positive_int(flow.get("poll_interval") or flow.get("interval"), 5)),
+            "expires_at": float(flow.get("expires_at") or (time.time() + _positive_int(flow.get("expires_in"), 900))),
+        }
+        if not session["user_code"] or not session["device_auth_id"]:
+            raise OAuthFlowError(502, "Hermes Codex device code response was missing required fields")
+        self._store_session(session)
+        return self._pending_response(session, str(flow.get("status") or "waiting_for_user"))
+
     def _start_xai(self) -> dict[str, Any]:
         discovery = self.http.get_json(XAI_OAUTH_DISCOVERY_URL, timeout=20.0)
         if discovery.status != 200:
@@ -301,6 +352,29 @@ class OAuthFlowManager:
         self._store_session(session)
         return self._pending_response(session, "waiting_for_callback")
 
+    def _start_xai_via_hermes(self) -> dict[str, Any]:
+        flow = self.hermes_bridge.start("xai-oauth")
+        flow_id = secrets.token_urlsafe(18)
+        session = {
+            "flow_id": flow_id,
+            "provider": "xai-oauth",
+            "kind": "manual_callback",
+            "auth_source": "hermes",
+            "authorize_url": str(flow.get("authorize_url") or "").strip(),
+            "redirect_uri": str(flow.get("redirect_uri") or XAI_REDIRECT_URI).strip(),
+            "token_endpoint": str(flow.get("token_endpoint") or "").strip(),
+            "discovery": flow.get("discovery") if isinstance(flow.get("discovery"), dict) else {},
+            "code_verifier": str(flow.get("code_verifier") or "").strip(),
+            "code_challenge": str(flow.get("code_challenge") or "").strip(),
+            "state": str(flow.get("state") or "").strip(),
+            "expires_at": float(flow.get("expires_at") or (time.time() + 900)),
+        }
+        required = ("authorize_url", "redirect_uri", "token_endpoint", "code_verifier", "code_challenge", "state")
+        if any(not session[key] for key in required):
+            raise OAuthFlowError(502, "Hermes Grok OAuth start response was missing required fields")
+        self._store_session(session)
+        return self._pending_response(session, str(flow.get("status") or "waiting_for_callback"))
+
     def _pending_response(self, session: dict[str, Any], status: str) -> dict[str, Any]:
         response = {
             "flow_id": session["flow_id"],
@@ -329,6 +403,14 @@ class OAuthFlowManager:
     def _store_session(self, session: dict[str, Any]) -> None:
         with self._lock:
             self._sessions[session["flow_id"]] = session
+
+    def _hermes_bridge_available(self) -> bool:
+        if self.hermes_bridge is None:
+            return False
+        try:
+            return bool(self.hermes_bridge.available())
+        except Exception:
+            return False
 
 
 def normalize_oauth_provider(value: str | None) -> str:

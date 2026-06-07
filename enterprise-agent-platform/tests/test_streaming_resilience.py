@@ -140,6 +140,26 @@ class StreamingResilienceTests(unittest.TestCase):
         self.assertIsInstance(exc, ValueError)
         self.assertIn(message, str(exc))
 
+    def test_chat_completion_error_chunk_surfaces_error_message(self):
+        message = "Provider authentication failed: No Codex credentials stored. Run `hermes auth` to authenticate."
+        events = [
+            "data: " + json.dumps({"choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n",
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "error"}],
+                    "error": {"message": message, "type": "server_error"},
+                }
+            )
+            + "\n\n",
+            "data: [DONE]\n\n",
+        ]
+        result, exc, _chunks = self._run_stream(events)
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, ValueError)
+        self.assertIn(message, str(exc))
+        self.assertNotIn("empty streaming response", str(exc))
+
     def test_response_failed_after_content_degrades_and_preserves_message(self):
         message = "tool execution aborted by sandbox"
         events = [
@@ -186,6 +206,13 @@ class StreamingResilienceTests(unittest.TestCase):
         result = terminal_failure_message(payload)
         self.assertIsNotNone(result)
         self.assertIn("crashed mid-stream", result)
+
+    def test_terminal_failure_message_finish_reason_error_uses_error_message(self):
+        payload = {
+            "choices": [{"delta": {}, "finish_reason": "error"}],
+            "error": {"message": "Provider authentication failed: token expired"},
+        }
+        self.assertEqual(terminal_failure_message(payload), "Provider authentication failed: token expired")
 
     def test_terminal_failure_message_normal_chunk_is_none(self):
         # A normal terminal chunk (finish_reason "stop") is not a failure.

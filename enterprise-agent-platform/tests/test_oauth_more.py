@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from enterprise_agent_platform.oauth_flows import (
@@ -12,7 +13,9 @@ from enterprise_agent_platform.oauth_flows import (
     MAX_OAUTH_SESSIONS,
     OAuthFlowError,
     OAuthFlowManager,
+    OAuthHTTPClient,
     OAuthHTTPResponse,
+    OAUTH_HTTP_USER_AGENT,
     XAI_OAUTH_DISCOVERY_URL,
 )
 from enterprise_agent_platform.runtimes import HERMES_SETTING_PROVIDER
@@ -56,6 +59,66 @@ class _ScriptedOAuthHTTPClient:
         return self._next(url)
 
 
+class _FakeHermesOAuthBridge:
+    def __init__(self):
+        self.calls = []
+
+    def available(self):
+        return True
+
+    def start(self, provider):
+        self.calls.append(("start", provider))
+        if provider == "openai-codex":
+            return {
+                "provider": "openai-codex",
+                "kind": "device_code",
+                "status": "waiting_for_user",
+                "complete": False,
+                "user_code": "HERMES-CODE",
+                "device_auth_id": "hermes-device",
+                "verification_url": "https://auth.openai.com/codex/device",
+                "poll_interval": 3,
+                "expires_in": 900,
+            }
+        return {
+            "provider": "xai-oauth",
+            "kind": "manual_callback",
+            "status": "waiting_for_callback",
+            "complete": False,
+            "authorize_url": "https://auth.x.ai/authorize?state=hermes-state",
+            "redirect_uri": "http://127.0.0.1:56121/callback",
+            "token_endpoint": "https://auth.x.ai/token",
+            "discovery": {"token_endpoint": "https://auth.x.ai/token"},
+            "code_verifier": "hermes-verifier",
+            "code_challenge": "hermes-challenge",
+            "state": "hermes-state",
+        }
+
+    def poll_codex(self, session):
+        self.calls.append(("poll_codex", session["device_auth_id"], session["user_code"]))
+        return {
+            "provider": "openai-codex",
+            "kind": "device_code",
+            "status": "complete",
+            "complete": True,
+            "tokens": {"access_token": "hermes-codex-access", "refresh_token": "hermes-codex-refresh"},
+        }
+
+    def complete_xai(self, session, callback_url):
+        self.calls.append(("complete_xai", session["state"], callback_url))
+        return {
+            "provider": "xai-oauth",
+            "kind": "manual_callback",
+            "status": "complete",
+            "complete": True,
+            "tokens": {
+                "access_token": "hermes-xai-access",
+                "refresh_token": "hermes-xai-refresh",
+                "id_token": "hermes-xai-id",
+            },
+        }
+
+
 def _codex_started_manager(token_responses):
     """Return a manager with a started Codex flow and its flow_id.
 
@@ -77,6 +140,75 @@ def _codex_started_manager(token_responses):
 
 
 class OAuthPollTests(unittest.TestCase):
+    def test_oauth_http_client_sets_explicit_user_agent(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(request, timeout):
+            captured["headers"] = dict(request.header_items())
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            response = OAuthHTTPClient().post_json(
+                CODEX_DEVICE_USER_CODE_URL,
+                {"client_id": "client"},
+                timeout=7.0,
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(captured["headers"]["User-agent"], OAUTH_HTTP_USER_AGENT)
+        self.assertEqual(captured["headers"]["Content-type"], "application/json")
+        self.assertEqual(captured["timeout"], 7.0)
+
+    def test_codex_flow_uses_hermes_bridge_when_available(self):
+        http_client = _ScriptedOAuthHTTPClient()
+        bridge = _FakeHermesOAuthBridge()
+        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+
+        started = manager.start("openai-codex")
+        self.assertEqual(started["user_code"], "HERMES-CODE")
+        completed = manager.poll("openai-codex", started["flow_id"])
+
+        self.assertTrue(completed["complete"])
+        self.assertEqual(completed["tokens"]["access_token"], "hermes-codex-access")
+        self.assertEqual(http_client.calls, [])
+        self.assertEqual(bridge.calls[0], ("start", "openai-codex"))
+        self.assertEqual(bridge.calls[1], ("poll_codex", "hermes-device", "HERMES-CODE"))
+
+    def test_xai_flow_uses_hermes_bridge_when_available(self):
+        http_client = _ScriptedOAuthHTTPClient()
+        bridge = _FakeHermesOAuthBridge()
+        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+
+        started = manager.start("xai-oauth")
+        self.assertEqual(started["authorize_url"], "https://auth.x.ai/authorize?state=hermes-state")
+        completed = manager.complete(
+            "xai-oauth",
+            started["flow_id"],
+            "http://127.0.0.1:56121/callback?code=ok&state=hermes-state",
+        )
+
+        self.assertTrue(completed["complete"])
+        self.assertEqual(completed["tokens"]["access_token"], "hermes-xai-access")
+        self.assertEqual(http_client.calls, [])
+        self.assertEqual(bridge.calls[0], ("start", "xai-oauth"))
+        self.assertEqual(
+            bridge.calls[1],
+            ("complete_xai", "hermes-state", "http://127.0.0.1:56121/callback?code=ok&state=hermes-state"),
+        )
+
     def test_poll_pending_returns_not_complete_without_dropping_session(self):
         # 403 from the device-token endpoint means the user has not yet approved.
         manager, _client, flow_id = _codex_started_manager([OAuthHTTPResponse(403, {}, "authorization_pending")])

@@ -727,7 +727,7 @@ class PlatformServiceTests(unittest.TestCase):
                     messages = service.list_messages(user, "channel", "1")
 
                     self.assertNotIn("(agent returned an empty response)", messages[-1]["content"])
-                    self.assertIn("Hermes API is not reachable", messages[-1]["content"])
+                    self.assertIn("Hermes Agent request did not complete", messages[-1]["content"])
                     self.assertTrue(messages[-1]["metadata"]["degraded"])
                 finally:
                     service.close()
@@ -1597,7 +1597,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(python_path[0], patch_path)
                 self.assertEqual(python_path[1], str(tmp / "hermes-agent"))
                 self.assertTrue(agent_message["metadata"]["degraded"])
-                self.assertIn("Hermes API is not reachable", agent_message["content"])
+                self.assertIn("Hermes Agent request did not complete", agent_message["content"])
             finally:
                 service.close()
 
@@ -1886,6 +1886,54 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn("default: grok-4.3", config_text)
                 self.assertIn('HERMES_INFERENCE_PROVIDER="xai-oauth"', env_text)
                 self.assertIn('HERMES_XAI_BASE_URL="https://api.x.ai/v1"', env_text)
+            finally:
+                service.close()
+
+    def test_platform_does_not_resurrect_relogin_required_codex_oauth_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+                service.update_hermes_config(admin, {"provider": "codex", "model": "hermes-agent"})
+
+                auth_path = service.config.managed_hermes_home / "auth.json"
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+                state = auth_store["providers"]["openai-codex"]
+                state["last_auth_error"] = {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "message": "Codex refresh token was already consumed by another client.",
+                    "reason": "credential_pool_refresh_failure",
+                    "relogin_required": True,
+                    "at": "2026-06-07T01:37:29Z",
+                }
+                auth_path.write_text(json.dumps(auth_store), encoding="utf-8")
+
+                service.runtimes.prepare_hermes()
+
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+                state = auth_store["providers"]["openai-codex"]
+                self.assertNotIn("access_token", state["tokens"])
+                self.assertNotIn("refresh_token", state["tokens"])
+                codex_status = next(
+                    item for item in service.oauth_provider_status(admin)["providers"] if item["id"] == "openai-codex"
+                )
+                self.assertFalse(codex_status["configured"])
+                self.assertEqual(codex_status["last_auth_error"]["code"], "refresh_token_reused")
+
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access-2")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh-2")
+                service.runtimes.prepare_hermes()
+
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+                state = auth_store["providers"]["openai-codex"]
+                self.assertEqual(state["tokens"]["access_token"], "codex-access-2")
+                self.assertEqual(state["tokens"]["refresh_token"], "codex-refresh-2")
+                self.assertNotIn("last_auth_error", state)
             finally:
                 service.close()
 

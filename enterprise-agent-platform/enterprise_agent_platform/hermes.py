@@ -527,7 +527,7 @@ class AutoAgentClient:
             content_callback = fallback_kwargs.pop("content_callback", None)
             fallback = self.local.generate(**fallback_kwargs)
             content = (
-                "Hermes API is not reachable, so this response was produced by the local "
+                "Hermes Agent request did not complete, so this response was produced by the local "
                 f"platform fallback. Original error: {exc}\n\n{fallback.content}"
             )
             emit_content(content_callback, content)
@@ -594,18 +594,25 @@ def terminal_failure_message(payload: dict[str, Any]) -> str | None:
         response = payload.get("response")
         message = ""
         if isinstance(response, dict):
-            error = response.get("error")
-            if isinstance(error, dict):
-                message = str(error.get("message") or "").strip()
-            elif isinstance(error, str):
-                message = error.strip()
+            message = _stream_error_message(response.get("error"))
         return message or "Hermes agent failed mid-stream"
+    top_level_error = _stream_error_message(payload.get("error"))
+    if event_type == "error" and top_level_error:
+        return top_level_error
     choices = payload.get("choices") or []
     if isinstance(choices, list):
         for choice in choices:
             if isinstance(choice, dict) and str(choice.get("finish_reason") or "") == "error":
-                return "Hermes agent crashed mid-stream"
+                return _stream_error_message(choice.get("error")) or top_level_error or "Hermes agent crashed mid-stream"
     return None
+
+
+def _stream_error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("detail") or "").strip()
+    if isinstance(error, str):
+        return error.strip()
+    return ""
 
 
 def text_from_stream_payload(payload: dict[str, Any], *, already_streaming: bool) -> str:

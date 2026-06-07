@@ -1238,6 +1238,20 @@ select {
 .oauth-card__model { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
 .oauth-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 4px; }
 .oauth-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.oauth-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger-line);
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.oauth-error svg { flex: 0 0 auto; margin-top: 1px; }
 .oauth-guide {
   border: 1px solid var(--accent-line);
   border-radius: var(--r-sm);
