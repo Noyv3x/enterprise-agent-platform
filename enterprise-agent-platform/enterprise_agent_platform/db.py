@@ -168,6 +168,29 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id, id);
                 CREATE INDEX IF NOT EXISTS idx_attachments_scope ON attachments(scope_type, scope_id, id);
 
+                CREATE TABLE IF NOT EXISTS token_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    scope_name TEXT NOT NULL DEFAULT '',
+                    request_message_id INTEGER,
+                    response_message_id INTEGER,
+                    provider TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    raw_usage_json TEXT NOT NULL DEFAULT '{}',
+                    degraded INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_token_usage_user_time ON token_usage_events(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_token_usage_scope_time ON token_usage_events(scope_type, scope_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_token_usage_model_time ON token_usage_events(provider, model, created_at);
+
                 CREATE TABLE IF NOT EXISTS private_agents (
                     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     session_id TEXT NOT NULL,

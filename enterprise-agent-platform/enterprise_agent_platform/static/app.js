@@ -34,6 +34,8 @@ const state = {
     privateMessages: [],
     privateTotal: 0,
   },
+  tokenUsage: null,
+  tokenUsageDays: 30,
   secrets: [],
   runtimes: null,
   hermesConfig: null,
@@ -153,6 +155,7 @@ const ICONS = {
   doc: [["path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }], ["path", { d: "M14 2v6h6" }], ["line", { x1: 8, y1: 13, x2: 16, y2: 13 }], ["line", { x1: 8, y1: 17, x2: 13, y2: 17 }]],
   image: [["rect", { x: 3, y: 5, width: 18, height: 14, rx: 2 }], ["circle", { cx: 8.5, cy: 10, r: 1.5 }], ["path", { d: "M21 15l-4.5-4.5L7 19" }]],
   message: [["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }]],
+  barChart: [["line", { x1: 4, y1: 20, x2: 20, y2: 20 }], ["rect", { x: 6, y: 10, width: 3, height: 7, rx: 1 }], ["rect", { x: 11, y: 5, width: 3, height: 12, rx: 1 }], ["rect", { x: 16, y: 8, width: 3, height: 9, rx: 1 }]],
   trash: [["path", { d: "M3 6h18" }], ["path", { d: "M8 6V4h8v2" }], ["path", { d: "M19 6l-1 15H6L5 6" }], ["path", { d: "M10 11v6" }], ["path", { d: "M14 11v6" }]],
   link: [["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }], ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }]],
   users: [["path", { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }], ["circle", { cx: 9, cy: 7, r: 4 }], ["path", { d: "M22 21v-2a4 4 0 0 0-3-3.9" }], ["path", { d: "M16 3.1a4 4 0 0 1 0 7.8" }]],
@@ -174,6 +177,7 @@ const THINKING_DEPTH_OPTIONS = [
 ];
 const ADMIN_PAGES = [
   { id: "accounts", label: "账户权限", icon: "users", description: "企业账户、权限组与个人模型策略。" },
+  { id: "tokens", label: "Token 监控", icon: "barChart", description: "按账户、私聊/频道、供应商和模型查看消耗。" },
   { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
   { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
   { id: "security", label: "公网安全", icon: "key", description: "反向代理、Cookie 与启动安全项。" },
@@ -1240,6 +1244,7 @@ function renderAdminPager(activeId) {
       onclick: async () => {
         state.activeAdminPage = page.id;
         if (page.id === "messages") await withBusy(loadMessageAudit);
+        else if (page.id === "tokens") await withBusy(loadTokenUsage);
         else render();
       },
     }, [
@@ -1260,6 +1265,7 @@ function adminPageBadge(pageId) {
   ].filter(Boolean).length;
   const value = {
     accounts: state.users.length,
+    tokens: state.tokenUsage?.summary?.total_tokens ? formatCompactNumber(state.tokenUsage.summary.total_tokens) : 0,
     messages: (state.messageAudit?.privateConversations || []).filter((item) => item.message_count > 0).length,
     model: state.oauthProviders?.providers?.length || 0,
     security: securityWarnings,
@@ -1271,6 +1277,7 @@ function adminPageBadge(pageId) {
 
 function renderAdminPageSections(pageId) {
   if (pageId === "accounts") return [renderAccountManagement()];
+  if (pageId === "tokens") return [renderTokenUsageMonitoring()];
   if (pageId === "messages") return [renderMessageAuditManagement()];
   if (pageId === "model") return [renderOAuthSettings(), renderHermesConfig()];
   if (pageId === "security") return [renderSecuritySettings()];
@@ -1413,6 +1420,158 @@ function thinkingDepthSelect(selected) {
     h("option", { value, text: label })));
   select.value = selected;
   return select;
+}
+
+function renderTokenUsageMonitoring() {
+  const report = state.tokenUsage || {};
+  const summary = report.summary || {};
+  const days = h("select", {
+    onchange: async (event) => {
+      state.tokenUsageDays = Number(event.target.value) || 30;
+      await withBusy(loadTokenUsage);
+    },
+  }, [7, 30, 90, 365].map((value) => h("option", { value, text: `${value} 天` })));
+  days.value = String(state.tokenUsageDays || report.window?.days || 30);
+
+  const accountRows = report.by_account || [];
+  const detailRows = report.details || [];
+  const scopeRows = report.by_scope || [];
+  const modelRows = report.by_model || [];
+  return h("div", { class: "token-usage" }, [
+    h("section", { class: "card token-usage__overview" }, [
+      cardHead("Token 消耗总览", "barChart", {
+        desc: report.window ? `${formatTimestamp(report.window.since)} 至 ${formatTimestamp(report.window.until)}` : "暂无 token usage 数据",
+        extra: h("div", { class: "token-usage__filters" }, [
+          field("时间范围", days),
+          h("button", {
+            class: "btn btn--sm",
+            type: "button",
+            disabled: state.busy,
+            onclick: async () => withBusy(loadTokenUsage),
+          }, [icon("refresh", { size: 14 }), h("span", { text: "刷新" })]),
+        ]),
+      }),
+      h("div", { class: "metric-grid" }, [
+        usageMetric("总 Token", summary.total_tokens),
+        usageMetric("输入 Token", summary.input_tokens),
+        usageMetric("输出 Token", summary.output_tokens),
+        usageMetric("Agent 调用", summary.event_count, "次"),
+        usageMetric("涉及账户", summary.account_count, "个"),
+        usageMetric("频道/私聊", `${summary.channel_event_count || 0}/${summary.private_event_count || 0}`, "次"),
+      ]),
+    ]),
+    renderUsageTable(
+      "按账户汇总",
+      "每个企业账户在当前时间范围内触发的 Agent token 消耗。",
+      "users",
+      ["账户", "调用", "输入", "输出", "总计", "最近使用"],
+      accountRows,
+      (row) => [
+        userUsageCell(row),
+        h("span", { text: formatNumber(row.event_count) }),
+        h("span", { text: formatNumber(row.input_tokens) }),
+        h("span", { text: formatNumber(row.output_tokens) }),
+        h("strong", { text: formatNumber(row.total_tokens) }),
+        h("span", { text: formatTimestamp(row.last_used_at) || "-" }),
+      ],
+      "暂无账户 token 数据。",
+    ),
+    renderUsageTable(
+      "账户 / 渠道 / 模型明细",
+      "细分到每个账户在私聊或具体频道中使用的供应商和模型。",
+      "barChart",
+      ["账户", "渠道", "供应商 / 模型", "调用", "输入", "输出", "总计"],
+      detailRows,
+      (row) => [
+        userUsageCell(row),
+        h("span", { text: tokenScopeLabel(row) }),
+        h("span", { text: tokenModelLabel(row) }),
+        h("span", { text: formatNumber(row.event_count) }),
+        h("span", { text: formatNumber(row.input_tokens) }),
+        h("span", { text: formatNumber(row.output_tokens) }),
+        h("strong", { text: formatNumber(row.total_tokens) }),
+      ],
+      "暂无 token 明细。",
+    ),
+    h("div", { class: "token-usage__columns" }, [
+      renderUsageTable(
+        "按渠道汇总",
+        "区分私人 Agent 会话和具体频道。",
+        "message",
+        ["渠道", "调用", "输入", "输出", "总计"],
+        scopeRows,
+        (row) => [
+          h("span", { text: tokenScopeLabel(row) }),
+          h("span", { text: formatNumber(row.event_count) }),
+          h("span", { text: formatNumber(row.input_tokens) }),
+          h("span", { text: formatNumber(row.output_tokens) }),
+          h("strong", { text: formatNumber(row.total_tokens) }),
+        ],
+        "暂无渠道汇总。",
+      ),
+      renderUsageTable(
+        "按供应商和模型汇总",
+        "用于比较不同模型的 token 消耗。",
+        "shield",
+        ["供应商 / 模型", "调用", "输入", "输出", "总计"],
+        modelRows,
+        (row) => [
+          h("span", { text: tokenModelLabel(row) }),
+          h("span", { text: formatNumber(row.event_count) }),
+          h("span", { text: formatNumber(row.input_tokens) }),
+          h("span", { text: formatNumber(row.output_tokens) }),
+          h("strong", { text: formatNumber(row.total_tokens) }),
+        ],
+        "暂无模型汇总。",
+      ),
+    ]),
+  ]);
+}
+
+function usageMetric(label, value, suffix = "") {
+  const isText = typeof value === "string";
+  return h("div", { class: "metric-tile" }, [
+    h("span", { text: label }),
+    h("strong", { text: isText ? value : formatNumber(value) }),
+    suffix ? h("small", { text: suffix }) : null,
+  ]);
+}
+
+function renderUsageTable(title, desc, iconName, headers, rows, renderCells, emptyText) {
+  return h("section", { class: "card usage-card" }, [
+    cardHead(title, iconName, { desc }),
+    rows.length
+      ? h("div", { class: "usage-table", style: `--usage-cols:${headers.length}` }, [
+          h("div", { class: "usage-table__row usage-table__head" }, headers.map((item) => h("span", { text: item }))),
+          ...rows.map((row) => h("div", { class: "usage-table__row" }, renderCells(row))),
+        ])
+      : h("div", { class: "muted", text: emptyText }),
+  ]);
+}
+
+function userUsageCell(row) {
+  const name = row.display_name || row.username || `u${row.user_id || ""}`;
+  return h("span", { class: "usage-user" }, [
+    h("strong", { text: name }),
+    h("small", { text: row.username ? `@${row.username}` : `ID ${row.user_id || "-"}` }),
+  ]);
+}
+
+function tokenScopeLabel(row) {
+  if (row.scope_type === "private") return `私聊：${row.scope_name || row.display_name || row.username || row.scope_id}`;
+  if (row.scope_type === "channel") return row.scope_name || `频道 ${row.scope_id || ""}`;
+  return row.scope_name || row.scope_id || "-";
+}
+
+function tokenModelLabel(row) {
+  const provider = oauthProviderLabel(row.provider || "");
+  const model = row.model || "unknown";
+  return provider ? `${provider} / ${model}` : model;
+}
+
+function oauthProviderLabel(providerId) {
+  const provider = (state.oauthProviders?.providers || []).find((item) => item.id === providerId);
+  return provider?.label || providerId || "";
 }
 
 function renderMessageAuditManagement() {
@@ -2219,6 +2378,14 @@ function formatTimestamp(value) {
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
 }
+function formatNumber(value) {
+  const number = Number(value) || 0;
+  return new Intl.NumberFormat().format(number);
+}
+function formatCompactNumber(value) {
+  const number = Number(value) || 0;
+  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(number);
+}
 function formatFileSize(value) {
   let size = Math.max(0, Number(value) || 0);
   const units = ["B", "KB", "MB", "GB"];
@@ -2578,6 +2745,11 @@ async function loadSecurityConfig() { state.securityConfig = await api("/api/sys
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
 async function loadHermesInternalConfig() { state.hermesInternalConfig = await api("/api/system/hermes/internal-config"); }
 async function loadCogneeConfig() { state.cogneeConfig = await api("/api/system/cognee/config"); }
+async function loadTokenUsage() {
+  const days = encodeURIComponent(String(state.tokenUsageDays || 30));
+  state.tokenUsage = await api(`/api/admin/token-usage?days=${days}&limit=200`);
+  state.tokenUsageDays = state.tokenUsage?.window?.days || state.tokenUsageDays || 30;
+}
 async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadSecurityConfig(), loadHermesConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
 async function loadMessageAudit() {
   const audit = messageAuditState();
@@ -2588,7 +2760,7 @@ async function loadMessageAudit() {
   await Promise.all([loadAuditChannelMessages(audit.auditChannelId), loadPrivateConversations()]);
   await loadAuditPrivateMessages(audit.auditPrivateUserId);
 }
-async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings(), loadMessageAudit()]); }
+async function loadAdminPanel() { await Promise.all([loadUsers(), loadPermissionGroups(), loadSettings(), loadMessageAudit(), loadTokenUsage()]); }
 async function refreshActiveChat({ renderAfter = true } = {}) {
   if (!state.user || pollInFlight) return;
   const keepFocus = !!app.querySelector(".composer textarea:focus");

@@ -46,6 +46,21 @@ class RecordingAgent:
         )
 
 
+class UsageReportingAgent:
+    def __init__(self, usages):
+        self.usages = list(usages)
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        usage = self.usages[min(len(self.calls) - 1, len(self.usages) - 1)]
+        return AgentResult(
+            content=f"agent response to {kwargs['user_message']}",
+            session_id=kwargs["session_id"],
+            raw={"model": kwargs.get("model"), "usage": usage},
+        )
+
+
 class RotatingSessionAgent:
     def __init__(self, first_returned_session_id: str):
         self.first_returned_session_id = first_returned_session_id
@@ -398,6 +413,59 @@ def managed_python(home: Path) -> Path:
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_token_usage_report_tracks_account_scope_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = UsageReportingAgent(
+                [
+                    {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+                    {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+                ]
+            )
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=agent,
+                hermes_bridge=FakeHermesBridge(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="token-user",
+                    password="member-pass",
+                    display_name="Token User",
+                    role="member",
+                    actor=admin,
+                )
+                _, member_actor = service.authenticate("token-user", "member-pass")
+
+                service.send_channel_message(admin, 1, "@agent channel usage")
+                service.wait_for_agent_idle("channel", "1")
+                service.send_private_message(member_actor, "private usage")
+                service.wait_for_agent_idle("private", str(member["id"]))
+
+                report = service.token_usage_report(admin, days=30)
+                self.assertEqual(report["summary"]["event_count"], 2)
+                self.assertEqual(report["summary"]["input_tokens"], 15)
+                self.assertEqual(report["summary"]["output_tokens"], 7)
+                self.assertEqual(report["summary"]["total_tokens"], 22)
+
+                by_account = {row["username"]: row for row in report["by_account"]}
+                self.assertEqual(by_account["admin"]["total_tokens"], 14)
+                self.assertEqual(by_account["token-user"]["total_tokens"], 8)
+
+                detail_keys = {
+                    (row["username"], row["scope_type"], row["scope_name"], row["provider"], row["model"]): row
+                    for row in report["details"]
+                }
+                self.assertIn(("admin", "channel", "#general", "openai-codex", "gpt-5.5"), detail_keys)
+                self.assertIn(("token-user", "private", "Token User", "openai-codex", "gpt-5.5"), detail_keys)
+
+                channel_messages = service.list_messages(admin, "channel", "1")
+                agent_message = next(message for message in channel_messages if message["author_type"] == "agent")
+                self.assertEqual(agent_message["metadata"]["token_usage"]["total_tokens"], 14)
+                self.assertEqual(agent_message["metadata"]["token_usage"]["provider"], "openai-codex")
+            finally:
+                service.close()
+
     def test_hermes_client_uses_post_tool_stream_as_final_response(self):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -2521,6 +2589,41 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_token_usage_api_is_admin_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            _, admin = service.authenticate("admin", "admin")
+            service.create_user(
+                username="usage-member",
+                password="member-pass",
+                display_name="Usage Member",
+                role="member",
+                actor=admin,
+            )
+            admin_token, _ = service.authenticate("admin", "admin")
+            member_token, _ = service.authenticate("usage-member", "member-pass")
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/admin/token-usage", headers={"Authorization": f"Bearer {admin_token}"})
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertIn("summary", payload)
+
+                conn.request("GET", "/api/admin/token-usage", headers={"Authorization": f"Bearer {member_token}"})
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(payload["error"], "admin role required")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_http_security_headers_secure_cookie_and_csrf_origin_check(self):
         with tempfile.TemporaryDirectory() as td:
             config = replace(make_config(Path(td)), public_base_url="https://agents.example")

@@ -1023,6 +1023,112 @@ select {
 }
 .account-row__active { min-height: 100%; margin: 0; }
 
+/* Token usage */
+.token-usage {
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+}
+.token-usage__overview { min-width: 0; }
+.token-usage__filters {
+  display: flex;
+  align-items: end;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.token-usage__filters .field {
+  width: 130px;
+}
+.token-usage__columns {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 10px;
+}
+.metric-tile {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  align-content: center;
+  min-height: 74px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 12px;
+  background: var(--surface-2);
+}
+.metric-tile span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.metric-tile strong {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 21px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.metric-tile small {
+  color: var(--faint);
+  font-size: 11.5px;
+}
+.usage-card { min-width: 0; }
+.usage-table {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--line);
+}
+.usage-table__row {
+  min-width: max(720px, 100%);
+  display: grid;
+  grid-template-columns: repeat(var(--usage-cols), minmax(96px, 1fr));
+  gap: 1px;
+  background: var(--line);
+}
+.usage-table__row > * {
+  min-width: 0;
+  padding: 10px 11px;
+  background: var(--surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-table__head > * {
+  color: var(--muted);
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 650;
+}
+.usage-table strong {
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+.usage-user {
+  display: grid;
+  line-height: 1.25;
+}
+.usage-user strong,
+.usage-user small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-user small {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
 /* Message audit */
 .audit-grid { display: grid; gap: 16px; }
 .audit-card { min-width: 0; }
@@ -1456,7 +1562,7 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .audit-tools, .audit-private { grid-template-columns: 1fr; }
+  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 800px) {
@@ -1492,6 +1598,15 @@ select {
   .messages, .composer { padding-left: 14px; padding-right: 14px; }
   .panel { padding: 16px 14px 32px; }
   .msg { max-width: 100%; }
+  .token-usage__overview .card__head {
+    display: grid;
+  }
+  .token-usage__filters {
+    justify-content: flex-start;
+  }
+  .usage-table__row {
+    min-width: max(640px, 100%);
+  }
 }
 
 /* =====================================================================

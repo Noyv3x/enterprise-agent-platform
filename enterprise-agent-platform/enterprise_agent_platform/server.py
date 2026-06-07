@@ -348,6 +348,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             limit = int_arg(query, "limit", 200)
             self._json(service.audit_private_messages(actor, int(m.group(1)), limit=limit))
             return
+        if path == "/api/admin/token-usage" and method == "GET":
+            self._json(service.token_usage_report(actor, days=int_arg(query, "days", 30), limit=int_arg(query, "limit", 200)))
+            return
 
         if path == "/api/knowledge/documents" and method == "GET":
             self._json({"documents": service.list_knowledge_documents(actor)})

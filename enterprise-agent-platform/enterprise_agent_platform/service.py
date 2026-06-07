@@ -19,7 +19,7 @@ from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
-from .hermes import AgentClient, AutoAgentClient, is_substantive_tool_start
+from .hermes import AgentClient, AgentResult, AutoAgentClient, is_substantive_tool_start
 from .hermes_oauth_bridge import HermesOAuthBridge
 from .internal_config import (
     read_cognee_internal_config,
@@ -1051,6 +1051,268 @@ class EnterpriseService:
             "total": int(total or 0),
         }
 
+    def token_usage_report(self, actor: dict[str, Any], days: int = 30, limit: int = 200) -> dict[str, Any]:
+        require_admin(actor)
+        try:
+            clean_days = int(days)
+        except (TypeError, ValueError):
+            clean_days = 30
+        clean_days = max(1, min(clean_days, 3650))
+        try:
+            clean_limit = int(limit)
+        except (TypeError, ValueError):
+            clean_limit = 200
+        clean_limit = max(10, min(clean_limit, 1000))
+        until = now_ts()
+        since = until - clean_days * 24 * 60 * 60
+        params = (since,)
+        summary_row = self.db.query_one(
+            """
+            SELECT
+                COUNT(*) AS event_count,
+                COUNT(DISTINCT user_id) AS account_count,
+                SUM(CASE WHEN scope_type = 'private' THEN 1 ELSE 0 END) AS private_event_count,
+                SUM(CASE WHEN scope_type = 'channel' THEN 1 ELSE 0 END) AS channel_event_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                MAX(created_at) AS last_used_at
+            FROM token_usage_events
+            WHERE created_at >= ?
+            """,
+            params,
+        ) or {}
+        by_account = self.db.query(
+            """
+            SELECT
+                u.id AS user_id,
+                u.username,
+                u.display_name,
+                u.active,
+                COALESCE(stats.event_count, 0) AS event_count,
+                COALESCE(stats.input_tokens, 0) AS input_tokens,
+                COALESCE(stats.output_tokens, 0) AS output_tokens,
+                COALESCE(stats.total_tokens, 0) AS total_tokens,
+                stats.last_used_at AS last_used_at
+            FROM users u
+            LEFT JOIN (
+                SELECT
+                    user_id,
+                    COUNT(*) AS event_count,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    MAX(created_at) AS last_used_at
+                FROM token_usage_events
+                WHERE created_at >= ?
+                GROUP BY user_id
+            ) stats ON stats.user_id = u.id
+            ORDER BY total_tokens DESC, event_count DESC, last_used_at DESC
+            LIMIT ?
+            """,
+            (since, clean_limit),
+        )
+        by_scope = self.db.query(
+            """
+            SELECT
+                scope_type,
+                scope_id,
+                scope_name,
+                COUNT(*) AS event_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                MAX(created_at) AS last_used_at
+            FROM token_usage_events
+            WHERE created_at >= ?
+            GROUP BY scope_type, scope_id, scope_name
+            ORDER BY total_tokens DESC, event_count DESC, last_used_at DESC
+            LIMIT ?
+            """,
+            (since, clean_limit),
+        )
+        by_model = self.db.query(
+            """
+            SELECT
+                provider,
+                model,
+                COUNT(*) AS event_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                MAX(created_at) AS last_used_at
+            FROM token_usage_events
+            WHERE created_at >= ?
+            GROUP BY provider, model
+            ORDER BY total_tokens DESC, event_count DESC, last_used_at DESC
+            LIMIT ?
+            """,
+            (since, clean_limit),
+        )
+        details = self.db.query(
+            """
+            SELECT
+                e.user_id,
+                COALESCE(MAX(u.username), MAX(e.username), '') AS username,
+                COALESCE(MAX(u.display_name), MAX(e.display_name), MAX(e.username), '') AS display_name,
+                e.scope_type,
+                e.scope_id,
+                e.scope_name,
+                e.provider,
+                e.model,
+                COUNT(*) AS event_count,
+                COALESCE(SUM(e.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(e.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(e.total_tokens), 0) AS total_tokens,
+                MAX(e.created_at) AS last_used_at
+            FROM token_usage_events e
+            LEFT JOIN users u ON u.id = e.user_id
+            WHERE e.created_at >= ?
+            GROUP BY e.user_id, e.scope_type, e.scope_id, e.scope_name, e.provider, e.model
+            ORDER BY total_tokens DESC, event_count DESC, last_used_at DESC
+            LIMIT ?
+            """,
+            (since, clean_limit),
+        )
+        recent = self.db.query(
+            """
+            SELECT
+                e.*,
+                COALESCE(u.username, e.username, '') AS current_username,
+                COALESCE(u.display_name, e.display_name, e.username, '') AS current_display_name
+            FROM token_usage_events e
+            LEFT JOIN users u ON u.id = e.user_id
+            WHERE e.created_at >= ?
+            ORDER BY e.id DESC
+            LIMIT ?
+            """,
+            (since, min(clean_limit, 100)),
+        )
+        return {
+            "window": {"days": clean_days, "since": since, "until": until},
+            "summary": self._token_usage_summary_from_row(summary_row),
+            "by_account": [self._token_usage_aggregate_row(row) for row in by_account],
+            "by_scope": [self._token_usage_aggregate_row(row) for row in by_scope],
+            "by_model": [self._token_usage_aggregate_row(row) for row in by_model],
+            "details": [self._token_usage_aggregate_row(row) for row in details],
+            "recent": [self._token_usage_event_row(row) for row in recent],
+        }
+
+    @staticmethod
+    def _token_usage_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "event_count": int(row.get("event_count") or 0),
+            "account_count": int(row.get("account_count") or 0),
+            "private_event_count": int(row.get("private_event_count") or 0),
+            "channel_event_count": int(row.get("channel_event_count") or 0),
+            "input_tokens": int(row.get("input_tokens") or 0),
+            "output_tokens": int(row.get("output_tokens") or 0),
+            "total_tokens": int(row.get("total_tokens") or 0),
+            "last_used_at": row.get("last_used_at"),
+        }
+
+    @staticmethod
+    def _token_usage_aggregate_row(row: dict[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        for key in ("user_id", "event_count", "input_tokens", "output_tokens", "total_tokens", "last_used_at"):
+            if key in result and result[key] is not None:
+                result[key] = int(result[key])
+        if "active" in result:
+            result["active"] = bool(result["active"])
+        return result
+
+    @staticmethod
+    def _token_usage_event_row(row: dict[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        result["username"] = result.pop("current_username", None) or result.get("username") or ""
+        result["display_name"] = result.pop("current_display_name", None) or result.get("display_name") or result["username"]
+        result["raw_usage"] = decode_json(result.pop("raw_usage_json", "{}"))
+        for key in (
+            "id",
+            "user_id",
+            "request_message_id",
+            "response_message_id",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "created_at",
+        ):
+            if key in result and result[key] is not None:
+                result[key] = int(result[key])
+        result["degraded"] = bool(result.get("degraded"))
+        return result
+
+    def _token_usage_from_agent_result(self, result: AgentResult, generation: dict[str, Any]) -> dict[str, Any] | None:
+        usage = extract_token_usage(result.raw)
+        if usage is None:
+            return None
+        provider = normalize_hermes_provider(str(generation.get("provider") or self._active_oauth_provider()))
+        model = normalize_model_name(str(extract_model_name(result.raw) or generation.get("model") or ""))
+        return {
+            "provider": provider,
+            "model": model,
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "raw_usage": usage.get("raw_usage") if isinstance(usage.get("raw_usage"), dict) else {},
+            "degraded": bool(result.degraded),
+        }
+
+    @staticmethod
+    def _public_token_usage(usage: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": usage.get("provider") or "",
+            "model": usage.get("model") or "",
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "degraded": bool(usage.get("degraded")),
+        }
+
+    def _record_token_usage_event(
+        self,
+        task: dict[str, Any],
+        usage: dict[str, Any] | None,
+        *,
+        response_message_id: int,
+        scope_name: str,
+    ) -> None:
+        if not usage:
+            return
+        actor = task.get("actor") or {}
+        user_message = task.get("user_message") or {}
+        try:
+            self.db.insert(
+                """
+                INSERT INTO token_usage_events(
+                    user_id, username, display_name, scope_type, scope_id, scope_name,
+                    request_message_id, response_message_id, provider, model,
+                    input_tokens, output_tokens, total_tokens, raw_usage_json, degraded, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(actor.get("id") or 0),
+                    str(actor.get("username") or ""),
+                    self._actor_display_name(actor),
+                    str(task.get("scope_type") or ""),
+                    str(task.get("scope_id") or ""),
+                    str(scope_name or ""),
+                    int(user_message.get("id") or 0),
+                    int(response_message_id),
+                    str(usage.get("provider") or ""),
+                    str(usage.get("model") or ""),
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    int(usage.get("total_tokens") or 0),
+                    encode_json(usage.get("raw_usage") if isinstance(usage.get("raw_usage"), dict) else {}),
+                    1 if usage.get("degraded") else 0,
+                    now_ts(),
+                ),
+            )
+        except Exception as exc:
+            print(f"Failed to record token usage: {exc}", file=sys.stderr)
+
     def send_channel_message(
         self,
         actor: dict[str, Any],
@@ -1149,6 +1411,7 @@ class EnterpriseService:
         self._remember_channel_agent_session_id(scope_id, result.session_id)
         clean_content, generated_attachments = self._extract_generated_attachments(result.content)
         self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
+        token_usage = self._token_usage_from_agent_result(result, generation)
         metadata = {
             "session_id": result.session_id,
             "degraded": result.degraded,
@@ -1156,6 +1419,8 @@ class EnterpriseService:
             "knowledge_suggestions": [h.to_dict() for h in suggestions],
             "reply_to": self._reply_target(task),
         }
+        if token_usage:
+            metadata["token_usage"] = self._public_token_usage(token_usage)
         metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
         message = self._append_message(
             scope_type="channel",
@@ -1167,6 +1432,12 @@ class EnterpriseService:
             metadata=metadata,
             attachments=generated_attachments,
             attachment_source="hermes",
+        )
+        self._record_token_usage_event(
+            task,
+            token_usage,
+            response_message_id=int(message["id"]),
+            scope_name=f"#{channel['name']}",
         )
         return message
 
@@ -1258,6 +1529,7 @@ class EnterpriseService:
             result.content, owner_id=int(scope_id)
         )
         self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
+        token_usage = self._token_usage_from_agent_result(result, generation)
         metadata = {
             "session_id": result.session_id,
             "degraded": result.degraded,
@@ -1266,6 +1538,8 @@ class EnterpriseService:
             "knowledge_suggestions": [h.to_dict() for h in suggestions],
             "reply_to": self._reply_target(task),
         }
+        if token_usage:
+            metadata["token_usage"] = self._public_token_usage(token_usage)
         metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
         message = self._append_message(
             scope_type="private",
@@ -1277,6 +1551,12 @@ class EnterpriseService:
             metadata=metadata,
             attachments=generated_attachments,
             attachment_source="hermes",
+        )
+        self._record_token_usage_event(
+            task,
+            token_usage,
+            response_message_id=int(message["id"]),
+            scope_name=self._actor_display_name(actor),
         )
         return message
 
@@ -1839,11 +2119,13 @@ class EnterpriseService:
         return {}
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        provider = self._active_oauth_provider()
         runtime_model = normalize_model_name(str(self.runtimes.hermes_runtime_config().get("model") or self.config.hermes_model))
         model = normalize_model_name(str(actor.get("model_name") or "")) or runtime_model
         model = self._validated_generation_model(model, fallback_model=runtime_model)
         thinking_depth = normalize_thinking_depth(str(actor.get("thinking_depth") or DEFAULT_THINKING_DEPTH))
         return {
+            "provider": provider,
             "model": model,
             "thinking_depth": thinking_depth,
             "reasoning_config": reasoning_config_for_depth(thinking_depth),
@@ -3077,6 +3359,101 @@ def _dedupe_knowledge_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(hit)
     return result
+
+
+_USAGE_INPUT_KEYS = ("input_tokens", "prompt_tokens", "inputTokens", "promptTokens")
+_USAGE_OUTPUT_KEYS = ("output_tokens", "completion_tokens", "outputTokens", "completionTokens")
+_USAGE_TOTAL_KEYS = ("total_tokens", "totalTokens")
+
+
+def extract_token_usage(payload: Any) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(value, dict):
+            usage = value.get("usage")
+            if isinstance(usage, dict):
+                _append_usage_candidate(candidates, usage)
+            if _looks_like_usage_dict(value):
+                _append_usage_candidate(candidates, value)
+            for child in value.values():
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(payload)
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (
+            int(item.get("total_tokens") or 0),
+            int(item.get("input_tokens") or 0) + int(item.get("output_tokens") or 0),
+        ),
+    )
+
+
+def _append_usage_candidate(candidates: list[dict[str, Any]], raw_usage: dict[str, Any]) -> None:
+    input_tokens = _usage_int(raw_usage, _USAGE_INPUT_KEYS)
+    output_tokens = _usage_int(raw_usage, _USAGE_OUTPUT_KEYS)
+    total_tokens = _usage_int(raw_usage, _USAGE_TOTAL_KEYS)
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+    candidates.append(
+        {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "raw_usage": dict(raw_usage),
+        }
+    )
+
+
+def _looks_like_usage_dict(value: dict[str, Any]) -> bool:
+    keys = set(value.keys())
+    return bool(keys.intersection(_USAGE_INPUT_KEYS) or keys.intersection(_USAGE_OUTPUT_KEYS) or keys.intersection(_USAGE_TOTAL_KEYS))
+
+
+def _usage_int(data: dict[str, Any], keys: tuple[str, ...]) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        if isinstance(value, str):
+            clean = value.strip().replace(",", "")
+            if not clean:
+                continue
+            try:
+                return max(0, int(float(clean)))
+            except ValueError:
+                continue
+    return 0
+
+
+def extract_model_name(payload: Any) -> str:
+    found = ""
+
+    def walk(value: Any, depth: int = 0) -> None:
+        nonlocal found
+        if depth > 10:
+            return
+        if isinstance(value, dict):
+            model = value.get("model")
+            if isinstance(model, str) and model.strip():
+                found = model.strip()
+            for child in value.values():
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(payload)
+    return normalize_model_name(found)
 
 
 def require_admin(actor: dict[str, Any]) -> None:
