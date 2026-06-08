@@ -52,6 +52,10 @@ Platform code is Python 3.11+, 4-space indentation, `snake_case` for functions/m
 
 The platform uses `unittest`; add tests in `enterprise-agent-platform/tests/test_*.py`. Prefer deterministic fakes for Hermes, Cognee, Docker, and API-key-dependent behavior. Skip or isolate true external integration checks unless credentials and services are explicitly available.
 
+## Agent Prompt Guidelines
+
+When editing prompts sent to runtime agents, preserve the product-facing identity contract: agents should introduce themselves only as ubitech enterprise-grade Agents and must not mention underlying frameworks, runtimes, model providers, or internal implementation details to end users. Include available user context in agent prompts, including the user's position, for both private-agent and channel speaker context.
+
 ## Commit & Pull Request Guidelines
 
 The current top-level history uses concise imperative commits, e.g. `Initial enterprise agent platform workspace`. Continue with short, action-oriented subjects; add a scope when useful, such as `platform: manage Hermes runtime`.
