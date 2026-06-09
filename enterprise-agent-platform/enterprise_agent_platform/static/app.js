@@ -273,7 +273,14 @@ function afterRender(messageScroll) {
     if (ta) { ta.focus(); autoGrow(ta); }
     state._focusComposer = false;
   }
+  syncActiveAdminPager();
   syncScopeStream();
+}
+function syncActiveAdminPager() {
+  if (state.activeView !== "admin" || !window.matchMedia("(max-width: 800px)").matches) return;
+  const active = app.querySelector(".admin-pager__item.is-active");
+  if (!active) return;
+  active.scrollIntoView({ block: "nearest", inline: "center" });
 }
 function captureMessageScroll() {
   const msgs = app.querySelector(".messages");
