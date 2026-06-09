@@ -857,8 +857,9 @@ select {
   position: sticky;
   top: 0;
   z-index: 5;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
   padding: 6px;
   border: 1px solid var(--line);
@@ -869,8 +870,9 @@ select {
   min-width: 0;
 }
 .admin-pager__item {
-  min-width: 0;
+  min-width: max-content;
   min-height: 42px;
+  flex: 0 1 auto;
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -892,9 +894,8 @@ select {
 }
 .admin-pager__item svg { width: 16px; height: 16px; flex: 0 0 auto; }
 .admin-pager__item > span:not(.admin-pager__badge) {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: max-content;
+  overflow: visible;
   white-space: nowrap;
 }
 .admin-pager__badge {
@@ -1114,9 +1115,9 @@ select {
   background: var(--line);
 }
 .usage-table__row {
-  min-width: max(720px, 100%);
+  min-width: max(900px, 100%);
   display: grid;
-  grid-template-columns: repeat(var(--usage-cols), minmax(96px, 1fr));
+  grid-template-columns: repeat(var(--usage-cols), minmax(120px, 1fr));
   gap: 1px;
   background: var(--line);
 }
@@ -1124,9 +1125,9 @@ select {
   min-width: 0;
   padding: 10px 11px;
   background: var(--surface);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .usage-table__head > * {
   color: var(--muted);
@@ -1146,9 +1147,9 @@ select {
 .usage-user strong,
 .usage-user small {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .usage-user small {
   color: var(--muted);
@@ -1660,6 +1661,7 @@ select {
   .admin-panel { gap: 12px; }
   .admin-pager {
     display: flex;
+    flex-wrap: nowrap;
     gap: 6px;
     overflow-x: auto;
     overflow-y: hidden;
