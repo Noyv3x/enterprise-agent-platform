@@ -193,6 +193,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            if path.startswith("/api/telegram/webhook/"):
+                self._handle_telegram_webhook(method, path)
+                return
             if path.startswith("/api/") and method in UNSAFE_METHODS:
                 self._require_same_origin()
             if path.startswith("/api/agent/tools/"):
@@ -210,6 +213,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             self._json({"error": "internal server error"}, status=500)
+
+    def _handle_telegram_webhook(self, method: str, path: str) -> None:
+        if method != "POST":
+            self._json({"error": "method not allowed"}, status=405)
+            return
+        if not self.server.service.telegram_enabled():
+            raise ServiceError(404, "Telegram gateway is disabled")
+        if not self.server.service.telegram_bot_token():
+            raise ServiceError(503, "Telegram bot token is not configured")
+        expected = self.server.service.telegram_webhook_secret()
+        supplied = path.rsplit("/", 1)[-1]
+        header_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "").strip()
+        if not expected or (supplied != expected and header_secret != expected):
+            raise ServiceError(403, "invalid Telegram webhook secret")
+        body = self._body_json()
+        self._json(self.server.service.telegram_gateway_update(body))
 
     def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
@@ -322,6 +341,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/private-agent/status" and method == "GET":
             self._json(service.private_status(actor))
             return
+        if path == "/api/private-agent/telegram" and method == "GET":
+            self._json(service.telegram_private_config(actor))
+            return
+        if path == "/api/private-agent/telegram" and method == "PUT":
+            self._json(service.update_telegram_private_config(actor, self._body_json()))
+            return
+        if path == "/api/private-agent/telegram" and method == "DELETE":
+            self._json(service.unlink_telegram_private_config(actor))
+            return
 
         m = re.fullmatch(r"/api/admin/channels/(\d+)/messages/(\d+)", path)
         if m and method == "DELETE":
@@ -407,6 +435,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/system/hermes/config" and method == "PUT":
             self._json(service.update_hermes_config(actor, self._body_json()))
+            return
+        if path == "/api/system/telegram/config" and method == "GET":
+            self._json(service.telegram_admin_config(actor))
+            return
+        if path == "/api/system/telegram/config" and method == "PUT":
+            self._json(service.update_telegram_admin_config(actor, self._body_json()))
             return
         if path == "/api/system/hermes/internal-config" and method == "GET":
             self._json(service.hermes_internal_config(actor))

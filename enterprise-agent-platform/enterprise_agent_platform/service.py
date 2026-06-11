@@ -137,6 +137,11 @@ PLATFORM_SETTING_TRUSTED_PROXY = "platform_trusted_proxy"
 PLATFORM_SETTING_HOST = "platform_host"
 PLATFORM_SETTING_PORT = "platform_port"
 PLATFORM_SETTING_SESSION_TTL = "platform_session_ttl_seconds"
+TELEGRAM_SETTING_ENABLED = "telegram_enabled"
+TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
+TELEGRAM_SETTING_POLLING = "telegram_polling"
+TELEGRAM_SECRET_BOT_TOKEN = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
+TELEGRAM_SECRET_WEBHOOK_SECRET = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
@@ -240,6 +245,7 @@ class EnterpriseService:
         # unless ENTERPRISE_CONTAINER_IDLE_HOURS > 0.
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
+        self._telegram_gateway = None
         self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
@@ -247,6 +253,7 @@ class EnterpriseService:
             self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_hermes_ready(wait=False)
         self._start_container_reaper()
+        self._start_telegram_gateway()
 
     def _start_container_reaper(self) -> None:
         """Start a daemon thread that periodically reclaims idle per-user
@@ -279,6 +286,8 @@ class EnterpriseService:
         with self._conversation_lock:
             self._closed = True
             workers = list(self._agent_workers.values())
+        if self._telegram_gateway is not None:
+            self._telegram_gateway.stop()
         self._reaper_stop.set()
         reaper = self._reaper_thread
         if reaper is not None:
@@ -291,6 +300,23 @@ class EnterpriseService:
             ingest.join(timeout=2)
         self.runtimes.close()
         self.db.close()
+
+    def _start_telegram_gateway(self) -> None:
+        if not self.telegram_enabled() or not self.telegram_bot_token():
+            return
+        try:
+            from .telegram_gateway import TelegramGateway
+
+            self._telegram_gateway = TelegramGateway(self)
+            self._telegram_gateway.start()
+        except Exception as exc:
+            print(f"Failed to start Telegram gateway: {exc}", file=sys.stderr)
+
+    def _restart_telegram_gateway(self) -> None:
+        if self._telegram_gateway is not None:
+            self._telegram_gateway.stop()
+            self._telegram_gateway = None
+        self._start_telegram_gateway()
 
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
@@ -881,6 +907,242 @@ class EnterpriseService:
             (scope_type, str(scope_id)),
         )
         return int(row["mid"]) if row and row["mid"] is not None else 0
+
+    def wait_for_agent_message_after(
+        self,
+        scope_type: str,
+        scope_id: str,
+        after_id: int,
+        *,
+        timeout: float = 240.0,
+    ) -> dict[str, Any] | None:
+        deadline = time.time() + max(0.0, float(timeout))
+        scope_id = str(scope_id)
+        while True:
+            row = self.db.query_one(
+                """
+                SELECT * FROM messages
+                WHERE scope_type = ? AND scope_id = ? AND author_type = 'agent' AND id > ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (scope_type, scope_id, int(after_id)),
+            )
+            if row:
+                return self._message_from_row(row)
+            status = self.agent_status_for_system(scope_type, scope_id)
+            if status.get("state") == "idle" and time.time() >= deadline:
+                return None
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.2)
+
+    def agent_status_for_system(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+        key = self._conversation_key(scope_type, str(scope_id))
+        with self._conversation_lock:
+            return self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+
+    def telegram_enabled(self) -> bool:
+        raw = self.get_setting(TELEGRAM_SETTING_ENABLED)
+        if raw is None:
+            return bool(self.config.telegram_enabled)
+        return parse_bool(raw)
+
+    def telegram_polling_enabled(self) -> bool:
+        raw = self.get_setting(TELEGRAM_SETTING_POLLING)
+        if raw is None:
+            return bool(self.config.telegram_polling)
+        return parse_bool(raw)
+
+    def telegram_bot_token(self) -> str:
+        return self.get_secret(TELEGRAM_SECRET_BOT_TOKEN) or self.config.telegram_bot_token
+
+    def telegram_bot_username(self) -> str:
+        return (self.get_setting(TELEGRAM_SETTING_BOT_USERNAME) or self.config.telegram_bot_username or "").strip().lstrip("@")
+
+    def telegram_webhook_secret(self) -> str:
+        return self.get_secret(TELEGRAM_SECRET_WEBHOOK_SECRET) or self.config.telegram_webhook_secret
+
+    def telegram_gateway_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        from .telegram_gateway import TelegramGateway
+
+        return TelegramGateway(self, autostart=False).process_update(update)
+
+    def telegram_actor_for_user(self, telegram_user: dict[str, Any]) -> dict[str, Any]:
+        external_id = str(telegram_user.get("id") or "").strip()
+        if not external_id:
+            raise ServiceError(400, "Telegram user id is required")
+        row = self.db.query_one(
+            "SELECT user_id FROM external_identities WHERE provider = 'telegram' AND external_id = ?",
+            (external_id,),
+        )
+        if row:
+            user = self.get_user(int(row["user_id"]))
+            if user and user.get("active"):
+                self._refresh_telegram_identity(int(user["id"]), external_id, telegram_user)
+                return user
+        raise ServiceError(403, "Telegram user is not linked to a platform account")
+
+    def telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        identity = self.db.query_one(
+            """
+            SELECT external_id, username, display_name, updated_at
+            FROM external_identities
+            WHERE provider = 'telegram' AND user_id = ?
+            """,
+            (int(actor["id"]),),
+        )
+        return {
+            "gateway": self.telegram_public_config(),
+            "link": {
+                "telegram_user_id": identity["external_id"] if identity else "",
+                "telegram_username": identity["username"] if identity else "",
+                "telegram_display_name": identity["display_name"] if identity else "",
+                "updated_at": identity["updated_at"] if identity else None,
+            },
+        }
+
+    def update_telegram_private_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        external_id = self._validate_telegram_user_id(body.get("telegram_user_id"))
+        conflict = self.db.query_one(
+            """
+            SELECT user_id FROM external_identities
+            WHERE provider = 'telegram' AND external_id = ? AND user_id != ?
+            """,
+            (external_id, int(actor["id"])),
+        )
+        if conflict:
+            raise ServiceError(409, "Telegram user id is already linked to another account")
+        ts = now_ts()
+        existing = self.db.query_one(
+            "SELECT created_at FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+            (int(actor["id"]),),
+        )
+        self.db.execute(
+            "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+            (int(actor["id"]),),
+        )
+        self.db.execute(
+            """
+            INSERT INTO external_identities(
+                provider, external_id, user_id, username, display_name, metadata_json, created_at, updated_at
+            )
+            VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                external_id,
+                int(actor["id"]),
+                str(body.get("telegram_username") or "").strip().lstrip("@")[:80],
+                str(body.get("telegram_display_name") or "").strip()[:120],
+                encode_json({"configured_by": "user"}),
+                int(existing["created_at"]) if existing else ts,
+                ts,
+            ),
+        )
+        return self.telegram_private_config(actor)
+
+    def unlink_telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        self.db.execute(
+            "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+            (int(actor["id"]),),
+        )
+        return self.telegram_private_config(actor)
+
+    def telegram_public_config(self) -> dict[str, Any]:
+        return {
+            "enabled": self.telegram_enabled(),
+            "bot_username": self.telegram_bot_username(),
+            "polling": self.telegram_polling_enabled(),
+            "bot_token_configured": bool(self.telegram_bot_token()),
+            "webhook_secret_configured": bool(self.telegram_webhook_secret()),
+            "webhook_url": self.telegram_webhook_url(),
+        }
+
+    def telegram_webhook_url(self) -> str:
+        secret = self.telegram_webhook_secret()
+        if not secret:
+            return ""
+        return f"{self.public_base_url()}/api/telegram/webhook/{urllib.parse.quote(secret, safe='')}"
+
+    def telegram_admin_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        linked_rows = self.db.query(
+            """
+            SELECT e.external_id, e.username AS telegram_username, e.display_name AS telegram_display_name,
+                   e.updated_at, u.id AS user_id, u.username, u.display_name
+            FROM external_identities e
+            JOIN users u ON u.id = e.user_id
+            WHERE e.provider = 'telegram'
+            ORDER BY u.display_name, u.username
+            """
+        )
+        return {"config": self.telegram_public_config(), "linked_users": linked_rows}
+
+    def update_telegram_admin_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        if "enabled" in body:
+            self.set_setting(TELEGRAM_SETTING_ENABLED, "1" if parse_bool(body.get("enabled")) else "0")
+        if "polling" in body:
+            self.set_setting(TELEGRAM_SETTING_POLLING, "1" if parse_bool(body.get("polling")) else "0")
+        if "bot_username" in body:
+            username = str(body.get("bot_username") or "").strip().lstrip("@")
+            if username and not re.fullmatch(r"[A-Za-z0-9_]{3,80}", username):
+                raise ServiceError(400, "Telegram bot username is invalid")
+            self.set_setting(TELEGRAM_SETTING_BOT_USERNAME, username)
+        if "bot_token" in body:
+            token = str(body.get("bot_token") or "").strip()
+            if token:
+                self.set_setting(TELEGRAM_SECRET_BOT_TOKEN, token, secret=True)
+        if "webhook_secret" in body:
+            secret = str(body.get("webhook_secret") or "").strip()
+            if secret:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", secret):
+                    raise ServiceError(400, "Telegram webhook secret must be 8-128 URL-safe characters")
+                self.set_setting(TELEGRAM_SECRET_WEBHOOK_SECRET, secret, secret=True)
+        self._restart_telegram_gateway()
+        return self.telegram_admin_config(actor)
+
+    @staticmethod
+    def _validate_telegram_user_id(value: Any) -> str:
+        clean = str(value or "").strip()
+        if not re.fullmatch(r"[1-9][0-9]{4,20}", clean):
+            raise ServiceError(400, "Telegram user id must be a numeric id")
+        return clean
+
+    def _refresh_telegram_identity(self, user_id: int, external_id: str, telegram_user: dict[str, Any]) -> None:
+        ts = now_ts()
+        self.db.execute(
+            """
+            INSERT OR REPLACE INTO external_identities(
+                provider, external_id, user_id, username, display_name, metadata_json, created_at, updated_at
+            )
+            VALUES (
+                'telegram', ?, ?, ?, ?, ?,
+                COALESCE((SELECT created_at FROM external_identities WHERE provider = 'telegram' AND external_id = ?), ?),
+                ?
+            )
+            """,
+            (
+                external_id,
+                int(user_id),
+                str(telegram_user.get("username") or ""),
+                self._telegram_display_name(telegram_user),
+                encode_json({"user": telegram_user}),
+                external_id,
+                ts,
+                ts,
+            ),
+        )
+
+    @staticmethod
+    def _telegram_display_name(telegram_user: dict[str, Any]) -> str:
+        first = str(telegram_user.get("first_name") or "").strip()
+        last = str(telegram_user.get("last_name") or "").strip()
+        username = str(telegram_user.get("username") or "").strip()
+        return " ".join(part for part in (first, last) if part).strip() or username or f"Telegram {telegram_user.get('id')}"
 
     def audit_channel_messages(self, actor: dict[str, Any], channel_id: int, limit: int = 200) -> dict[str, Any]:
         require_admin(actor)

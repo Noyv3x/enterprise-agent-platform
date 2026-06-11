@@ -219,6 +219,19 @@ class Database:
                     secret INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS external_identities (
+                    provider TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(provider, external_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
                 """
             )
             self._ensure_user_columns()

@@ -87,6 +87,28 @@ rm -rf .venv
 
 只有在你明确希望自行运行外部 Hermes API server 时，才设置 `ENTERPRISE_MANAGE_HERMES=0`。
 
+## 平台 Telegram Gateway
+
+平台可以直接托管 Telegram Bot gateway。它不启用 Hermes 自带的 Telegram adapter，而是在平台层接收 Telegram private chat update，再统一路由到对应用户自己的私人 Agent。平台不会适配 Telegram 群组、超级群或频道；非私聊消息会被忽略。
+
+推荐在页面配置：
+
+- 管理员进入“管理面板 / Telegram”，配置启用状态、Bot Token、Bot 用户名、long polling 或 webhook secret。
+- 每个用户进入“私人 Agent”，在 Telegram 私聊区域绑定自己的 Telegram ID。绑定后，该 Telegram 账号发给 bot 的私聊会进入自己的私人 Agent。
+
+环境变量仍可作为首次启动或无页面配置时的兜底：
+
+```bash
+export ENTERPRISE_TELEGRAM_ENABLED=1
+export ENTERPRISE_TELEGRAM_BOT_TOKEN='123456:telegram-bot-token'
+export ENTERPRISE_TELEGRAM_BOT_USERNAME='your_bot_username'
+export ENTERPRISE_TELEGRAM_POLLING=1
+```
+
+默认使用 long polling。若要用 webhook，在管理面板中关闭 long polling 并保存 webhook secret，然后在 Telegram 侧设置管理面板显示的 webhook URL。
+
+用户可以向 bot 发送 `/start` 查看自己的 Telegram ID，再回平台绑定。
+
 ## Hermes 知识工具
 
 平台会维护本地 SQLite/FTS 索引，以支持快速 UI 读取和确定性运行。设置 `ENTERPRISE_KB_BACKEND=hybrid`（默认）时，平台也会尝试通过本地 `cognee` 仓库进行写入/搜索；设置 `ENTERPRISE_KB_BACKEND=local` 可在开发时跳过 Cognee。Cognee 的数据、系统文件、缓存和日志默认位于 `data/runtimes/cognee`。
@@ -105,6 +127,25 @@ rm -rf .venv
 ```bash
 export ENTERPRISE_CONTAINER_BACKEND=docker
 export ENTERPRISE_CONTAINER_IMAGE=python:3.11-slim
+```
+
+## 前端开发
+
+平台运行时仍从 `enterprise_agent_platform/static/` 服务静态文件；这些文件现在由 `frontend/` 下的 Vite + React + TypeScript 工程生成。当前业务界面逻辑保留为 `frontend/src/legacy-app.js`，由 React 入口启动，后续可以按页面逐步拆分为 React 组件。
+
+安装和构建前端：
+
+```bash
+cd enterprise-agent-platform/frontend
+npm install
+npm run check
+npm run build
+```
+
+本地开发服务器会把 `/api` 代理到默认平台后端 `http://127.0.0.1:8765`：
+
+```bash
+npm run dev
 ```
 
 ## 测试

@@ -56,6 +56,11 @@ class PlatformConfig:
     container_cpus: str = ""
     container_network: str = ""
     container_pids_limit: int = 512
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_bot_username: str = ""
+    telegram_webhook_secret: str = ""
+    telegram_polling: bool = True
 
     @property
     def db_path(self) -> Path:
@@ -140,6 +145,11 @@ class PlatformConfig:
             container_cpus=os.getenv("ENTERPRISE_CONTAINER_CPUS", "").strip(),
             container_network=os.getenv("ENTERPRISE_CONTAINER_NETWORK", "").strip(),
             container_pids_limit=_env_int("ENTERPRISE_CONTAINER_PIDS_LIMIT", 512, minimum=1),
+            telegram_enabled=_env_bool("ENTERPRISE_TELEGRAM_ENABLED", False),
+            telegram_bot_token=os.getenv("ENTERPRISE_TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_bot_username=os.getenv("ENTERPRISE_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
+            telegram_webhook_secret=os.getenv("ENTERPRISE_TELEGRAM_WEBHOOK_SECRET", "").strip(),
+            telegram_polling=_env_bool("ENTERPRISE_TELEGRAM_POLLING", True),
         )
 
 

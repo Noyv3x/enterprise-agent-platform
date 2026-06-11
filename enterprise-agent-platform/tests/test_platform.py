@@ -31,6 +31,7 @@ from enterprise_agent_platform.service import (
     ServiceError,
     UploadedFile,
 )
+from enterprise_agent_platform.telegram_gateway import TelegramGateway
 
 
 class RecordingAgent:
@@ -136,6 +137,28 @@ class ProgressAgent:
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
+
+
+class FakeTelegramBot:
+    def __init__(self):
+        self.sent = []
+        self.files_sent = []
+        self.files = {}
+
+    def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+
+    def send_file(self, **kwargs):
+        self.files_sent.append(kwargs)
+
+    def get_file(self, file_id):
+        return {"file_id": file_id, "file_path": self.files[file_id][0]}
+
+    def download_file(self, file_path):
+        for path, data in self.files.values():
+            if path == file_path:
+                return data
+        raise KeyError(file_path)
 
 
 class StreamingAgent:
@@ -1084,6 +1107,210 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["state"], "idle")
                 self.assertEqual(messages[-1]["content"], "normal channel message")
                 self.assertEqual(agent.calls, [])
+            finally:
+                service.close()
+
+    def test_telegram_private_message_routes_through_platform_private_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.update_telegram_private_config(user, {"telegram_user_id": "12345", "telegram_username": "alice_tg"})
+                result = gateway.process_update(
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 10,
+                            "chat": {"id": 12345, "type": "private"},
+                            "from": {"id": 12345, "username": "alice_tg", "first_name": "Alice"},
+                            "text": "private request",
+                        },
+                    }
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["scope_type"], "private")
+                self.assertEqual(len(agent.calls), 1)
+                self.assertEqual(agent.calls[0]["session_key"], f"private:{user['id']}")
+                self.assertEqual(result["scope_id"], str(user["id"]))
+                self.assertEqual(len(bot.sent), 1)
+                self.assertEqual(bot.sent[0]["chat_id"], 12345)
+                self.assertEqual(bot.sent[0]["reply_to_message_id"], 10)
+                self.assertIn("agent response to private request", bot.sent[0]["text"])
+                identity = service.db.query_one(
+                    "SELECT user_id FROM external_identities WHERE provider = 'telegram' AND external_id = '12345'"
+                )
+                self.assertIsNotNone(identity)
+            finally:
+                service.close()
+
+    def test_telegram_document_is_stored_as_platform_attachment(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            bot.files["file-1"] = ("documents/report.txt", b"hello from telegram")
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.update_telegram_private_config(user, {"telegram_user_id": "45678", "telegram_username": "doc_tg"})
+                result = gateway.process_update(
+                    {
+                        "update_id": 4,
+                        "message": {
+                            "message_id": 40,
+                            "chat": {"id": 45678, "type": "private"},
+                            "from": {"id": 45678, "username": "doc_tg", "first_name": "Doc"},
+                            "caption": "please inspect",
+                            "document": {
+                                "file_id": "file-1",
+                                "file_unique_id": "unique-1",
+                                "file_name": "report.txt",
+                                "mime_type": "text/plain",
+                                "file_size": 19,
+                            },
+                        },
+                    }
+                )
+
+                self.assertEqual(result["attachment_count"], 1)
+                self.assertEqual(len(agent.calls), 1)
+                self.assertEqual(agent.calls[0]["attachments"][0]["filename"], "report.txt")
+                self.assertEqual(agent.calls[0]["attachments"][0]["mime_type"], "text/plain")
+                messages = service._messages_for_scope("private", result["scope_id"])
+                self.assertEqual(messages[0]["attachments"][0]["filename"], "report.txt")
+            finally:
+                service.close()
+
+    def test_telegram_private_agent_generated_attachment_is_sent_back(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as media_td:
+            media_path = Path(media_td) / "result.csv"
+            media_path.write_text("a,b\n1,2\n", encoding="utf-8")
+            agent = MediaReturningAgent(media_path)
+            previous_roots = os.environ.get("ENTERPRISE_MEDIA_ROOTS")
+            os.environ["ENTERPRISE_MEDIA_ROOTS"] = media_td
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.update_telegram_private_config(user, {"telegram_user_id": "56789", "telegram_username": "media_tg"})
+                result = gateway.process_update(
+                    {
+                        "update_id": 5,
+                        "message": {
+                            "message_id": 50,
+                            "chat": {"id": 56789, "type": "private"},
+                            "from": {"id": 56789, "username": "media_tg", "first_name": "Media"},
+                            "text": "make a csv",
+                        },
+                    }
+                )
+
+                self.assertIsNotNone(result["agent_message_id"])
+                self.assertEqual(len(bot.sent), 1)
+                self.assertEqual(bot.sent[0]["text"], "created file")
+                self.assertEqual(len(bot.files_sent), 1)
+                self.assertEqual(bot.files_sent[0]["filename"], "result.csv")
+                self.assertEqual(bot.files_sent[0]["content_type"], "text/csv")
+            finally:
+                service.close()
+                if previous_roots is None:
+                    os.environ.pop("ENTERPRISE_MEDIA_ROOTS", None)
+                else:
+                    os.environ["ENTERPRISE_MEDIA_ROOTS"] = previous_roots
+
+    def test_telegram_unlinked_private_message_replies_with_binding_hint(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                result = gateway.process_update(
+                    {
+                        "update_id": 6,
+                        "message": {
+                            "message_id": 60,
+                            "chat": {"id": 67890, "type": "private"},
+                            "from": {"id": 67890, "username": "unlinked_tg", "first_name": "Unlinked"},
+                            "text": "hello",
+                        },
+                    }
+                )
+
+                self.assertEqual(result["ignored"], "unlinked telegram user")
+                self.assertEqual(agent.calls, [])
+                self.assertEqual(len(bot.sent), 1)
+                self.assertIn("67890", bot.sent[0]["text"])
+            finally:
+                service.close()
+
+    def test_telegram_group_messages_are_ignored_without_platform_channel_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                result = gateway.process_update(
+                    {
+                        "update_id": 3,
+                        "message": {
+                            "message_id": 30,
+                            "chat": {"id": -1002, "type": "group", "title": "General"},
+                            "from": {"id": 34567, "username": "carol_tg", "first_name": "Carol"},
+                            "text": "normal group note",
+                        },
+                    }
+                )
+
+                self.assertEqual(result["ignored"], "non-private chat")
+                self.assertEqual(agent.calls, [])
+                self.assertEqual(bot.sent, [])
+                self.assertEqual(service._messages_for_scope("channel", "1"), [])
+            finally:
+                service.close()
+
+    def test_telegram_settings_and_per_user_link_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="tg-member",
+                    password="member-password",
+                    display_name="Telegram Member",
+                    actor=admin,
+                    permission_group="member",
+                )
+
+                config = service.update_telegram_admin_config(
+                    admin,
+                    {
+                        "enabled": True,
+                        "polling": False,
+                        "bot_username": "enterprise_private_bot",
+                        "bot_token": "123456:token",
+                        "webhook_secret": "secret-token",
+                    },
+                )
+                self.assertTrue(config["config"]["enabled"])
+                self.assertFalse(config["config"]["polling"])
+                self.assertTrue(config["config"]["bot_token_configured"])
+                self.assertIn("/api/telegram/webhook/secret-token", config["config"]["webhook_url"])
+
+                mine = service.update_telegram_private_config(
+                    admin,
+                    {"telegram_user_id": "123456789", "telegram_username": "admin_tg"},
+                )
+                self.assertEqual(mine["link"]["telegram_user_id"], "123456789")
+                with self.assertRaises(ServiceError) as ctx:
+                    service.update_telegram_private_config(member, {"telegram_user_id": "123456789"})
+                self.assertEqual(ctx.exception.status, 409)
             finally:
                 service.close()
 
@@ -2683,6 +2910,55 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_telegram_webhook_uses_gateway_secret_instead_of_cookie_csrf(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(
+                make_config(Path(td)),
+                telegram_enabled=True,
+                telegram_bot_token="123456:token",
+                telegram_webhook_secret="telegram-secret",
+            )
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            seen = []
+
+            def fake_update(body):
+                seen.append(body)
+                return {"ok": True, "seen": body.get("update_id")}
+
+            service.telegram_gateway_update = fake_update
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                body = json.dumps({"update_id": 99})
+                conn.request(
+                    "POST",
+                    "/api/telegram/webhook/telegram-secret",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 200)
+                self.assertEqual(payload, {"ok": True, "seen": 99})
+                self.assertEqual(seen, [{"update_id": 99}])
+
+                conn.request(
+                    "POST",
+                    "/api/telegram/webhook/wrong",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(payload["error"], "invalid Telegram webhook secret")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_token_usage_api_is_admin_only(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
