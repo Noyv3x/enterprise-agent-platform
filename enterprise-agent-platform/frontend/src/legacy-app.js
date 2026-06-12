@@ -40,7 +40,9 @@ const state = {
   runtimes: null,
   hermesConfig: null,
   telegramConfig: null,
+  autoUpdateConfig: null,
   privateTelegram: null,
+  privateTelegramExpanded: false,
   hermesInternalConfig: null,
   cogneeConfig: null,
   securityConfig: null,
@@ -183,6 +185,7 @@ const ADMIN_PAGES = [
   { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
   { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
   { id: "telegram", label: "Telegram", icon: "message", description: "Telegram 私聊网关与用户绑定状态。" },
+  { id: "updates", label: "自动更新", icon: "refresh", description: "监听上游代码提交并自动拉取部署。" },
   { id: "security", label: "公网安全", icon: "key", description: "反向代理、Cookie 与启动安全项。" },
   { id: "runtime", label: "运行时", icon: "server", description: "底层基座服务健康状态。" },
   { id: "hermes", label: "Hermes", icon: "settings", description: "Hermes config.yaml 与环境变量。" },
@@ -700,18 +703,15 @@ function renderPrivateTelegramConfig() {
   const payload = state.privateTelegram || {};
   const gateway = payload.gateway || {};
   const link = payload.link || {};
+  const expanded = !!state.privateTelegramExpanded;
   const telegramId = h("input", { value: link.telegram_user_id || "", placeholder: "例如 123456789", inputmode: "numeric" });
   const telegramUsername = h("input", { value: link.telegram_username || "", placeholder: "可选，不带 @" });
   const linked = !!link.telegram_user_id;
   const botName = gateway.bot_username ? `@${gateway.bot_username}` : "Telegram bot";
-  return h("section", { class: "telegram-link" }, [
-    h("div", { class: "telegram-link__meta" }, [
-      h("div", { class: "telegram-link__title" }, [icon("message", { size: 16 }), h("span", { text: "Telegram 私聊" })]),
-      h("div", { class: "telegram-link__sub", text: gateway.enabled
-        ? `${botName} ${linked ? "已绑定到你的私人 Agent" : "可绑定到你的私人 Agent"}`
-        : "管理员尚未启用 Telegram 私聊网关" }),
-    ]),
-    h("form", {
+  const status = gateway.enabled
+    ? `${botName} ${linked ? "已绑定" : "可绑定"}`
+    : "管理员尚未启用";
+  const form = expanded ? h("form", {
       class: "telegram-link__form",
       onsubmit: async (event) => {
         event.preventDefault();
@@ -745,7 +745,25 @@ function renderPrivateTelegramConfig() {
           },
         }, [h("span", { text: "解除" })]) : null,
       ]),
+    ]) : null;
+
+  return h("section", { class: `telegram-link ${expanded ? "is-open" : "is-collapsed"}` }, [
+    h("div", { class: "telegram-link__header" }, [
+      h("div", { class: "telegram-link__meta" }, [
+        h("div", { class: "telegram-link__title" }, [icon("message", { size: 16 }), h("span", { text: "Telegram 私聊" })]),
+        h("div", { class: "telegram-link__sub", text: status }),
+      ]),
+      h("button", {
+        class: "btn btn--sm",
+        type: "button",
+        "aria-expanded": expanded ? "true" : "false",
+        onclick: () => {
+          state.privateTelegramExpanded = !expanded;
+          render();
+        },
+      }, [h("span", { text: expanded ? "收起" : "配置" })]),
     ]),
+    form,
   ]);
 }
 
@@ -1333,6 +1351,7 @@ function adminPageBadge(pageId) {
     messages: (state.messageAudit?.privateConversations || []).filter((item) => item.message_count > 0).length,
     model: state.oauthProviders?.providers?.length || 0,
     telegram: state.telegramConfig?.config?.enabled ? (state.telegramConfig?.linked_users?.length || "on") : 0,
+    updates: state.autoUpdateConfig?.config?.enabled ? "on" : 0,
     security: securityWarnings,
     runtime: state.runtimes ? Object.keys(state.runtimes).length : 0,
     secrets: state.secrets.filter((secret) => !isOAuthSecret(secret.key)).length,
@@ -1346,6 +1365,7 @@ function renderAdminPageSections(pageId) {
   if (pageId === "messages") return [renderMessageAuditManagement()];
   if (pageId === "model") return [renderOAuthSettings(), renderHermesConfig()];
   if (pageId === "telegram") return [renderTelegramAdminConfig()];
+  if (pageId === "updates") return [renderAutoUpdateConfig()];
   if (pageId === "security") return [renderSecuritySettings()];
   if (pageId === "runtime") return [renderRuntimeSettings()];
   if (pageId === "hermes") return [renderHermesInternalConfig()];
@@ -2212,6 +2232,100 @@ function renderTelegramAdminConfig() {
   ]);
 }
 
+function renderAutoUpdateConfig() {
+  const payload = state.autoUpdateConfig || {};
+  const config = payload.config || {};
+  const status = payload.status || {};
+  const enabled = h("input", { type: "checkbox" });
+  enabled.checked = !!config.enabled;
+  const interval = h("input", { type: "number", min: "5", max: "3600", step: "1", value: config.interval_seconds || 30 });
+  const remote = h("input", { value: config.remote || "origin", placeholder: "origin" });
+  const branch = h("input", { value: config.branch || "", placeholder: "留空使用当前分支" });
+  const webhookSecret = h("input", {
+    type: "password",
+    autocomplete: "off",
+    placeholder: config.webhook_secret_configured ? "保持不变" : "至少 16 位 secret",
+  });
+  const webhookUrl = config.webhook_url || "启用后自动生成 webhook URL";
+  const updateState = status.in_progress
+    ? "检查中"
+    : status.update_started
+      ? "已触发更新"
+      : status.update_available
+        ? "发现更新"
+        : "待命";
+  const clean = !status.dirty;
+  return h("section", { class: "card config-form" }, [
+    cardHead("自动更新监听", "refresh", {
+      desc: "常驻监听上游分支；GitHub webhook 可秒级触发，轮询作为兜底。",
+      extra: statusBadge(!!config.enabled, config.enabled ? "已启用" : "未启用"),
+    }),
+    h("form", {
+      onsubmit: async (event) => {
+        event.preventDefault();
+        await withBusy(async () => {
+          await api("/api/system/auto-update/config", {
+            method: "PUT",
+            body: JSON.stringify({
+              enabled: enabled.checked,
+              interval_seconds: interval.value,
+              remote: remote.value,
+              branch: branch.value,
+              webhook_secret: webhookSecret.value,
+            }),
+          });
+          webhookSecret.value = "";
+          await loadAutoUpdateConfig();
+          toast("自动更新配置已保存", { type: "ok", title: "完成" });
+        });
+      },
+    }, [
+      h("div", { class: "config-grid" }, [
+        h("label", { class: "check-row" }, [
+          enabled,
+          h("div", { class: "check-row__text" }, [
+            h("strong", { text: "启用常驻监听" }),
+            h("span", { text: "收到 webhook 或轮询发现上游更新后自动执行 deploy.sh update" }),
+          ]),
+        ]),
+        field("轮询间隔（秒）", interval),
+        field("Git remote", remote),
+        field("分支", branch),
+        h("div", { class: "field--full" }, [field("Webhook Secret", webhookSecret)]),
+        h("div", { class: "field--full field-stack" }, [
+          h("span", { class: "field-help", text: "GitHub Webhook URL" }),
+          h("code", { class: "mono", text: webhookUrl }),
+        ]),
+      ]),
+      h("div", { class: "form-actions" }, [
+        h("button", { class: "btn btn--primary", type: "submit", disabled: state.busy }, [h("span", { text: "保存自动更新配置" })]),
+        h("button", {
+          class: "btn",
+          type: "button",
+          disabled: state.busy || !config.enabled,
+          onclick: async () => {
+            await withBusy(async () => {
+              await api("/api/system/auto-update/check", { method: "POST", body: "{}" });
+              await loadAutoUpdateConfig();
+              toast("已触发自动更新检查", { type: "ok", title: "已发送" });
+            });
+          },
+        }, [icon("refresh", { size: 15 }), h("span", { text: "立即检查" })]),
+      ]),
+    ]),
+    h("div", { class: "metric-grid metric-grid--compact" }, [
+      usageMetric("状态", updateState),
+      usageMetric("工作树", clean ? "干净" : "有本地改动"),
+      usageMetric("当前版本", shortSha(status.current_revision)),
+      usageMetric("远端版本", shortSha(status.remote_revision)),
+      usageMetric("最近检查", formatTime(status.last_check_at) || "-"),
+      usageMetric("最近触发", status.last_trigger || "-"),
+    ]),
+    status.last_error ? h("div", { class: "notice notice--warn", text: status.last_error }) : null,
+    status.dirty_summary ? h("pre", { class: "config-preview", text: status.dirty_summary }) : null,
+  ]);
+}
+
 function renderHermesInternalConfig() {
   const payload = state.hermesInternalConfig || {};
   const internal = payload.internal || {};
@@ -2579,6 +2693,10 @@ function formatTimestamp(value) {
 function formatNumber(value) {
   const number = Number(value) || 0;
   return new Intl.NumberFormat().format(number);
+}
+function shortSha(value) {
+  const text = String(value || "").trim();
+  return text ? text.slice(0, 7) : "-";
 }
 function formatCompactNumber(value) {
   const number = Number(value) || 0;
@@ -2989,6 +3107,7 @@ async function loadRuntime() { state.runtimes = await api("/api/system/runtime")
 async function loadSecurityConfig() { state.securityConfig = await api("/api/system/security/config"); }
 async function loadHermesConfig() { state.hermesConfig = await api("/api/system/hermes/config"); }
 async function loadTelegramConfig() { state.telegramConfig = await api("/api/system/telegram/config"); }
+async function loadAutoUpdateConfig() { state.autoUpdateConfig = await api("/api/system/auto-update/config"); }
 async function loadHermesInternalConfig() { state.hermesInternalConfig = await api("/api/system/hermes/internal-config"); }
 async function loadCogneeConfig() { state.cogneeConfig = await api("/api/system/cognee/config"); }
 async function loadTokenUsage() {
@@ -2996,7 +3115,7 @@ async function loadTokenUsage() {
   state.tokenUsage = await api(`/api/admin/token-usage?days=${days}&limit=200`);
   state.tokenUsageDays = state.tokenUsage?.window?.days || state.tokenUsageDays || 30;
 }
-async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadSecurityConfig(), loadHermesConfig(), loadTelegramConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
+async function loadSettings() { await Promise.all([loadSecrets(), loadRuntime(), loadSecurityConfig(), loadHermesConfig(), loadTelegramConfig(), loadAutoUpdateConfig(), loadHermesInternalConfig(), loadCogneeConfig(), loadOAuthProviders()]); }
 async function loadMessageAudit() {
   const audit = messageAuditState();
   if (!state.channels.length) await loadChannels();

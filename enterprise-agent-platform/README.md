@@ -66,6 +66,32 @@ rm -rf .venv
 ./deploy.sh logs
 ```
 
+## 自动更新监听
+
+平台可以常驻监听上游代码更新。管理员在“管理面板 / 自动更新”中开启后，平台会：
+
+- 接收 GitHub webhook，收到目标分支 push 后立即触发更新；
+- 按配置的短间隔轮询 `origin/main` 等远端分支作为兜底；
+- 仅在工作树干净且远端可 fast-forward 时执行现有 `./deploy.sh update`；
+- 通过 `deploy.sh update` 复用现有 submodule 同步、重新部署和失败回滚逻辑。
+
+推荐配置方式：
+
+1. 在“公网安全”中设置正确的 `ENTERPRISE_PUBLIC_BASE_URL`。
+2. 在“自动更新”中启用监听，确认 remote、branch 和轮询间隔。
+3. 复制页面显示的 GitHub Webhook URL 到仓库 Webhooks，事件选择 push。
+4. 可把同一个 Webhook Secret 填到 GitHub Secret；平台支持 `X-Hub-Signature-256` HMAC 校验。
+
+也可以用环境变量提供初始配置：
+
+```bash
+export ENTERPRISE_AUTO_UPDATE_ENABLED=1
+export ENTERPRISE_AUTO_UPDATE_INTERVAL_SECONDS=30
+export ENTERPRISE_AUTO_UPDATE_REMOTE=origin
+export ENTERPRISE_AUTO_UPDATE_BRANCH=main
+export ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET='change-this-secret'
+```
+
 ## 托管 Hermes
 
 无需单独安装或配置 Hermes。顶层部署脚本会初始化相邻的 `hermes-agent` 仓库；平台启动时会：

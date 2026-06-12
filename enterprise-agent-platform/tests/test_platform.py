@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -20,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from enterprise_agent_platform import runtimes as runtime_module
+from enterprise_agent_platform.auto_update import AutoUpdateManager
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
@@ -431,11 +434,109 @@ def make_fake_firecrawl_repo(path: Path) -> None:
     (path / "docker-compose.yml").write_text("services:\n  api:\n    image: firecrawl\n", encoding="utf-8")
 
 
+def git_run(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def git_commit_all(cwd: Path, message: str) -> None:
+    git_run(cwd, "add", ".")
+    subprocess.run(
+        ["git", "-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "-m", message],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+class FakeAutoUpdateConfig:
+    def __init__(self, *, enabled=True, interval=30, remote="origin", branch="main"):
+        self.enabled = enabled
+        self.interval = interval
+        self.remote = remote
+        self.branch = branch
+
+    def auto_update_enabled(self):
+        return self.enabled
+
+    def auto_update_interval_seconds(self):
+        return self.interval
+
+    def auto_update_remote(self):
+        return self.remote
+
+    def auto_update_branch(self):
+        return self.branch
+
+
+class FakeAutoUpdater:
+    def __init__(self):
+        self.triggers = []
+
+    def status(self):
+        return {"trigger_count": len(self.triggers)}
+
+    def trigger(self, reason):
+        self.triggers.append(reason)
+        return self.status()
+
+    def stop(self):
+        pass
+
+
 def managed_python(home: Path) -> Path:
     return home / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_auto_update_manager_detects_remote_commit_and_skips_dirty_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            remote = root / "remote.git"
+            downstream = root / "downstream"
+            upstream = root / "upstream"
+            git_run(root, "init", "--bare", str(remote))
+            downstream.mkdir()
+            git_run(downstream, "init")
+            git_run(downstream, "checkout", "-b", "main")
+            (downstream / "README.md").write_text("initial\n", encoding="utf-8")
+            deploy = downstream / "deploy.sh"
+            deploy.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            deploy.chmod(0o755)
+            git_commit_all(downstream, "initial")
+            git_run(downstream, "remote", "add", "origin", str(remote))
+            git_run(downstream, "push", "-u", "origin", "main")
+
+            git_run(root, "clone", str(remote), str(upstream))
+            git_run(upstream, "checkout", "main")
+            (upstream / "README.md").write_text("updated\n", encoding="utf-8")
+            git_commit_all(upstream, "updated")
+            git_run(upstream, "push", "origin", "main")
+
+            launched = []
+            manager = AutoUpdateManager(
+                FakeAutoUpdateConfig(branch="main"),
+                repo_root=downstream,
+                launcher=lambda reason: launched.append(reason) or [str(deploy), "update"],
+            )
+            status = manager.check_once("webhook")
+            self.assertTrue(status["update_available"])
+            self.assertTrue(status["update_started"])
+            self.assertEqual(launched, ["webhook"])
+            self.assertEqual(status["branch"], "main")
+
+            (downstream / "local-change.txt").write_text("dirty\n", encoding="utf-8")
+            dirty = manager.check_once("poll")
+            self.assertTrue(dirty["dirty"])
+            self.assertFalse(dirty["update_started"])
+            self.assertEqual(launched, ["webhook"])
+
     def test_token_usage_report_tracks_account_scope_provider_and_model(self):
         with tempfile.TemporaryDirectory() as td:
             agent = UsageReportingAgent(
@@ -2953,6 +3054,49 @@ class PlatformHTTPTests(unittest.TestCase):
                 payload = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 403)
                 self.assertEqual(payload["error"], "invalid Telegram webhook secret")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_auto_update_webhook_requires_secret_and_accepts_github_hmac(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            fake_updater = FakeAutoUpdater()
+            service._auto_updater = fake_updater
+            secret = "auto-update-secret-value"
+            service.set_setting("auto_update_enabled", "1")
+            service.set_setting("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", secret, secret=True)
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                body = json.dumps({"ref": "refs/heads/main"}).encode("utf-8")
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auto-update/webhook/wrong",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(denied["error"], "invalid auto update webhook secret")
+
+                signature = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+                conn.request(
+                    "POST",
+                    "/api/auto-update/webhook/wrong",
+                    body=body,
+                    headers={"Content-Type": "application/json", "X-Hub-Signature-256": signature},
+                )
+                res = conn.getresponse()
+                accepted = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 202)
+                self.assertTrue(accepted["accepted"])
+                self.assertEqual(fake_updater.triggers, ["webhook"])
             finally:
                 server.shutdown()
                 server.server_close()

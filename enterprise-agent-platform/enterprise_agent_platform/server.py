@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -193,6 +195,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            if path.startswith("/api/auto-update/webhook/"):
+                self._handle_auto_update_webhook(method, path)
+                return
             if path.startswith("/api/telegram/webhook/"):
                 self._handle_telegram_webhook(method, path)
                 return
@@ -229,6 +234,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(403, "invalid Telegram webhook secret")
         body = self._body_json()
         self._json(self.server.service.telegram_gateway_update(body))
+
+    def _handle_auto_update_webhook(self, method: str, path: str) -> None:
+        if method != "POST":
+            self._json({"error": "method not allowed"}, status=405)
+            return
+        expected = self.server.service.auto_update_webhook_secret()
+        if not expected:
+            raise ServiceError(503, "auto update webhook secret is not configured")
+        supplied = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+        header_secret = self.headers.get("X-Enterprise-Auto-Update-Secret", "").strip()
+        raw = self._body_bytes()
+        signed = self._valid_github_signature(expected, raw)
+        if not (
+            hmac.compare_digest(supplied, expected)
+            or (header_secret and hmac.compare_digest(header_secret, expected))
+            or signed
+        ):
+            raise ServiceError(403, "invalid auto update webhook secret")
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ServiceError(400, "invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise ServiceError(400, "JSON body must be an object")
+        self._json(self.server.service.auto_update_webhook(payload), status=202)
 
     def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
@@ -442,6 +472,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/telegram/config" and method == "PUT":
             self._json(service.update_telegram_admin_config(actor, self._body_json()))
             return
+        if path == "/api/system/auto-update/config" and method == "GET":
+            self._json(service.auto_update_config(actor))
+            return
+        if path == "/api/system/auto-update/config" and method == "PUT":
+            self._json(service.update_auto_update_config(actor, self._body_json()))
+            return
+        if path == "/api/system/auto-update/check" and method == "POST":
+            self._json(service.trigger_auto_update_check(actor), status=202)
+            return
         if path == "/api/system/hermes/internal-config" and method == "GET":
             self._json(service.hermes_internal_config(actor))
             return
@@ -520,10 +559,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def _body_json(self) -> dict[str, Any]:
-        length = self._content_length()
-        if length > MAX_BODY_BYTES:
-            raise ServiceError(413, "request body too large")
-        raw = self.rfile.read(length) if length else b"{}"
+        raw = self._body_bytes(default=b"{}")
         try:
             data = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -538,6 +574,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._body_multipart_message(content_type)
         body = self._body_json()
         return str(body.get("content", "")), []
+
+    def _body_bytes(self, *, default: bytes = b"") -> bytes:
+        length = self._content_length()
+        if length > MAX_BODY_BYTES:
+            raise ServiceError(413, "request body too large")
+        return self.rfile.read(length) if length else default
 
     def _body_multipart_message(self, content_type: str) -> tuple[str, list[UploadedFile]]:
         length = self._content_length()
@@ -810,6 +852,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             return str(self.client_address[0])
         except Exception:
             return "unknown"
+
+    def _valid_github_signature(self, secret: str, raw: bytes) -> bool:
+        supplied = self.headers.get("X-Hub-Signature-256", "").strip()
+        if not supplied.startswith("sha256="):
+            return False
+        digest = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(supplied, f"sha256={digest}")
 
 
 def first(query: dict[str, list[str]], key: str, default: str) -> str:

@@ -61,6 +61,11 @@ class PlatformConfig:
     telegram_bot_username: str = ""
     telegram_webhook_secret: str = ""
     telegram_polling: bool = True
+    auto_update_enabled: bool = False
+    auto_update_interval_seconds: int = 30
+    auto_update_remote: str = "origin"
+    auto_update_branch: str = ""
+    auto_update_webhook_secret: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -150,6 +155,11 @@ class PlatformConfig:
             telegram_bot_username=os.getenv("ENTERPRISE_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
             telegram_webhook_secret=os.getenv("ENTERPRISE_TELEGRAM_WEBHOOK_SECRET", "").strip(),
             telegram_polling=_env_bool("ENTERPRISE_TELEGRAM_POLLING", True),
+            auto_update_enabled=_env_bool("ENTERPRISE_AUTO_UPDATE_ENABLED", False),
+            auto_update_interval_seconds=_env_int("ENTERPRISE_AUTO_UPDATE_INTERVAL_SECONDS", 30, minimum=5),
+            auto_update_remote=os.getenv("ENTERPRISE_AUTO_UPDATE_REMOTE", "origin").strip() or "origin",
+            auto_update_branch=os.getenv("ENTERPRISE_AUTO_UPDATE_BRANCH", "").strip(),
+            auto_update_webhook_secret=os.getenv("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", "").strip(),
         )
 
 

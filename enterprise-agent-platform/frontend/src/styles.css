@@ -493,16 +493,15 @@ select {
 .chat--with-toolbar { grid-template-rows: auto 1fr auto; }
 .telegram-link {
   width: min(860px, calc(100% - 40px));
-  margin: 14px auto 0;
-  padding: 12px;
+  margin: 10px auto 0;
+  padding: 8px 10px;
   border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
   background: var(--surface-2);
   display: grid;
-  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 1.6fr);
-  gap: 12px;
-  align-items: end;
+  gap: 10px;
 }
+.telegram-link__header { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .telegram-link__meta { min-width: 0; display: grid; gap: 4px; }
 .telegram-link__title { display: flex; gap: 8px; align-items: center; font-weight: 650; }
 .telegram-link__sub { color: var(--muted); font-size: 12px; line-height: 1.35; }
@@ -1099,6 +1098,9 @@ select {
   grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
   gap: 10px;
 }
+.metric-grid--compact { margin-top: 14px; }
+.metric-grid--compact .metric-tile { min-height: 64px; }
+.metric-grid--compact .metric-tile strong { font-size: 16px; }
 .metric-tile {
   min-width: 0;
   display: grid;
@@ -1543,6 +1545,33 @@ select {
   font-size: 12.5px;
   overflow-wrap: anywhere;
 }
+.notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.notice--warn {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.config-preview {
+  margin: 10px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
 .check-row {
   display: flex;
   align-items: center;
@@ -1624,8 +1653,9 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private, .telegram-link, .telegram-link__form { grid-template-columns: 1fr; }
-  .telegram-link { width: calc(100% - 28px); margin-top: 10px; }
+  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private, .telegram-link__form { grid-template-columns: 1fr; }
+  .telegram-link { width: calc(100% - 28px); }
+  .telegram-link__header { align-items: flex-start; }
   .telegram-link__actions { justify-content: flex-start; }
   .panel__header,
   .card__head {

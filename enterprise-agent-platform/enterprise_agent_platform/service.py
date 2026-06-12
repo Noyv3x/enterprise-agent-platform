@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Deque
 
 from .auth import TokenSigner, hash_password, verify_password
+from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .containers import ContainerManager
@@ -142,6 +143,11 @@ TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
 TELEGRAM_SETTING_POLLING = "telegram_polling"
 TELEGRAM_SECRET_BOT_TOKEN = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
 TELEGRAM_SECRET_WEBHOOK_SECRET = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
+AUTO_UPDATE_SETTING_ENABLED = "auto_update_enabled"
+AUTO_UPDATE_SETTING_INTERVAL = "auto_update_interval_seconds"
+AUTO_UPDATE_SETTING_REMOTE = "auto_update_remote"
+AUTO_UPDATE_SETTING_BRANCH = "auto_update_branch"
+AUTO_UPDATE_SECRET_WEBHOOK_SECRET = "ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
@@ -199,6 +205,9 @@ class EnterpriseService:
         oauth_http_client=None,
         hermes_bridge=None,
         container_command_runner=None,
+        auto_update_runner=None,
+        auto_update_launcher=None,
+        auto_update_repo_root: Path | None = None,
         autostart_runtime: bool = True,
     ):
         self.config = config
@@ -246,6 +255,12 @@ class EnterpriseService:
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
         self._telegram_gateway = None
+        self._auto_updater = AutoUpdateManager(
+            self,
+            repo_root=auto_update_repo_root,
+            runner=auto_update_runner,
+            launcher=auto_update_launcher,
+        )
         self._closed = False
         self.ensure_bootstrap()
         self.runtimes.prepare()
@@ -254,6 +269,7 @@ class EnterpriseService:
             self.runtimes.ensure_hermes_ready(wait=False)
         self._start_container_reaper()
         self._start_telegram_gateway()
+        self._start_auto_update_listener()
 
     def _start_container_reaper(self) -> None:
         """Start a daemon thread that periodically reclaims idle per-user
@@ -288,6 +304,7 @@ class EnterpriseService:
             workers = list(self._agent_workers.values())
         if self._telegram_gateway is not None:
             self._telegram_gateway.stop()
+        self._auto_updater.stop()
         self._reaper_stop.set()
         reaper = self._reaper_thread
         if reaper is not None:
@@ -317,6 +334,10 @@ class EnterpriseService:
             self._telegram_gateway.stop()
             self._telegram_gateway = None
         self._start_telegram_gateway()
+
+    def _start_auto_update_listener(self) -> None:
+        if self.auto_update_enabled():
+            self._auto_updater.start()
 
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
@@ -1104,6 +1125,112 @@ class EnterpriseService:
                 self.set_setting(TELEGRAM_SECRET_WEBHOOK_SECRET, secret, secret=True)
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
+
+    def auto_update_enabled(self) -> bool:
+        raw = self.get_setting(AUTO_UPDATE_SETTING_ENABLED)
+        if raw is None:
+            return bool(self.config.auto_update_enabled)
+        return parse_bool(raw)
+
+    def auto_update_interval_seconds(self) -> int:
+        raw = self.get_setting(AUTO_UPDATE_SETTING_INTERVAL)
+        value = self.config.auto_update_interval_seconds
+        if raw:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = self.config.auto_update_interval_seconds
+        return max(5, min(int(value), 3600))
+
+    def auto_update_remote(self) -> str:
+        return (self.get_setting(AUTO_UPDATE_SETTING_REMOTE) or self.config.auto_update_remote or "origin").strip() or "origin"
+
+    def auto_update_branch(self) -> str:
+        return (self.get_setting(AUTO_UPDATE_SETTING_BRANCH) or self.config.auto_update_branch or "").strip()
+
+    def auto_update_webhook_secret(self) -> str:
+        return self.get_secret(AUTO_UPDATE_SECRET_WEBHOOK_SECRET) or self.config.auto_update_webhook_secret
+
+    def auto_update_webhook_url(self) -> str:
+        secret = self.auto_update_webhook_secret()
+        if not secret:
+            return ""
+        return f"{self.public_base_url()}/api/auto-update/webhook/{urllib.parse.quote(secret, safe='')}"
+
+    def auto_update_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        return {
+            "config": {
+                "enabled": self.auto_update_enabled(),
+                "interval_seconds": self.auto_update_interval_seconds(),
+                "remote": self.auto_update_remote(),
+                "branch": self.auto_update_branch(),
+                "webhook_secret_configured": bool(self.auto_update_webhook_secret()),
+                "webhook_url": self.auto_update_webhook_url(),
+            },
+            "status": self._auto_updater.status(),
+        }
+
+    def update_auto_update_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        if "enabled" in body:
+            self.set_setting(AUTO_UPDATE_SETTING_ENABLED, "1" if parse_bool(body.get("enabled")) else "0")
+        if "interval_seconds" in body:
+            try:
+                interval = int(body.get("interval_seconds"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "auto update interval must be an integer") from exc
+            if interval < 5 or interval > 3600:
+                raise ServiceError(400, "auto update interval must be between 5 and 3600 seconds")
+            self.set_setting(AUTO_UPDATE_SETTING_INTERVAL, str(interval))
+        if "remote" in body:
+            self.set_setting(AUTO_UPDATE_SETTING_REMOTE, self._validate_auto_update_git_name(str(body.get("remote") or "origin"), "remote"))
+        if "branch" in body:
+            branch = str(body.get("branch") or "").strip()
+            if branch:
+                branch = self._validate_auto_update_git_name(branch, "branch")
+            self.set_setting(AUTO_UPDATE_SETTING_BRANCH, branch)
+        if "webhook_secret" in body:
+            secret = str(body.get("webhook_secret") or "").strip()
+            if secret:
+                self.set_setting(AUTO_UPDATE_SECRET_WEBHOOK_SECRET, self._validate_auto_update_secret(secret), secret=True)
+        if self.auto_update_enabled() and not self.auto_update_webhook_secret():
+            self.set_setting(AUTO_UPDATE_SECRET_WEBHOOK_SECRET, secrets.token_urlsafe(32), secret=True)
+        if self.auto_update_enabled():
+            self._auto_updater.start()
+            self._auto_updater.trigger("config")
+        else:
+            self._auto_updater.stop()
+        return self.auto_update_config(actor)
+
+    def trigger_auto_update_check(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        if not self.auto_update_enabled():
+            return {"accepted": False, "reason": "auto update is disabled", "status": self._auto_updater.status()}
+        return {"accepted": True, "status": self._auto_updater.trigger("manual")}
+
+    def auto_update_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.auto_update_enabled():
+            return {"accepted": False, "reason": "auto update is disabled", "status": self._auto_updater.status()}
+        ref = str(payload.get("ref") or "").strip()
+        branch = self.auto_update_branch()
+        if ref.startswith("refs/heads/") and branch and ref.removeprefix("refs/heads/") != branch:
+            return {"accepted": False, "reason": f"ignored ref {ref}", "status": self._auto_updater.status()}
+        return {"accepted": True, "status": self._auto_updater.trigger("webhook")}
+
+    @staticmethod
+    def _validate_auto_update_git_name(value: str, label: str) -> str:
+        clean = value.strip()
+        if not clean or not re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", clean) or clean.startswith("-") or ".." in clean:
+            raise ServiceError(400, f"auto update {label} is invalid")
+        return clean
+
+    @staticmethod
+    def _validate_auto_update_secret(value: str) -> str:
+        clean = value.strip()
+        if len(clean) < 16 or len(clean) > 160 or any(ch.isspace() for ch in clean):
+            raise ServiceError(400, "auto update webhook secret must be 16-160 non-space characters")
+        return clean
 
     @staticmethod
     def _validate_telegram_user_id(value: Any) -> str:
