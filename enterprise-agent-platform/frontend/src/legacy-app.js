@@ -504,6 +504,10 @@ function renderSidebarFoot() {
 
 function renderTopbar() {
   const info = topbarInfo();
+  const actions = [
+    state.activeView === "private" ? renderPrivateTelegramAction() : null,
+    themeToggle(),
+  ];
   return h("header", { class: "topbar" }, [
     h("button", { class: "icon-btn menu-btn", title: "打开菜单", "aria-label": "打开菜单", "aria-expanded": String(state.sidebarOpen), "aria-controls": "app-sidebar", onclick: openSidebar }, [icon("menu")]),
     h("div", { class: "topbar__title-wrap" }, [
@@ -513,8 +517,31 @@ function renderTopbar() {
       ]),
       info.sub ? h("div", { class: "topbar__sub", text: info.sub }) : null,
     ]),
-    h("div", { class: "topbar__actions" }, [themeToggle()]),
+    h("div", { class: "topbar__actions" }, actions),
   ]);
+}
+
+function renderPrivateTelegramAction() {
+  const payload = state.privateTelegram || {};
+  const gateway = payload.gateway || {};
+  const link = payload.link || {};
+  const expanded = !!state.privateTelegramExpanded;
+  const linked = !!link.telegram_user_id;
+  const title = gateway.enabled
+    ? linked ? "Telegram 私聊已绑定" : "配置 Telegram 私聊"
+    : "Telegram 私聊未启用";
+  return h("button", {
+    class: `icon-btn private-telegram-trigger ${expanded ? "is-active" : ""} ${linked ? "is-linked" : ""}`,
+    type: "button",
+    title,
+    "aria-label": "Telegram 私聊设置",
+    "aria-expanded": expanded ? "true" : "false",
+    "aria-controls": "private-telegram-popover",
+    onclick: () => {
+      state.privateTelegramExpanded = !expanded;
+      render();
+    },
+  }, [icon("message")]);
 }
 
 function topbarInfo() {
@@ -537,7 +564,10 @@ function renderContent() {
   else if (state.activeView === "knowledge") view = renderKnowledge();
   else if (state.activeView === "admin") view = renderAdminPanel();
   else view = renderChat("channel");
-  return h("section", { class: `content ${animate ? "view-enter" : ""}` }, [view]);
+  return h("section", { class: `content ${animate ? "view-enter" : ""}` }, [
+    view,
+    state.activeView === "private" && state.privateTelegramExpanded ? renderPrivateTelegramConfig() : null,
+  ]);
 }
 
 /* ----------------------------------------------------------------- chat */
@@ -668,8 +698,7 @@ function renderChat(mode) {
     body = h("div", { class: "messages__inner" }, items);
   }
 
-  return h("div", { class: `chat ${mode === "private" ? "chat--with-toolbar" : ""}` }, [
-    mode === "private" ? renderPrivateTelegramConfig() : null,
+  return h("div", { class: "chat" }, [
     h("div", { class: "messages", "data-chat-key": `${scopeTypeFor(mode)}:${scopeId}` }, [body]),
     h("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); submit(); } }, [
       h("div", { class: "composer__wrap" }, [
@@ -703,7 +732,6 @@ function renderPrivateTelegramConfig() {
   const payload = state.privateTelegram || {};
   const gateway = payload.gateway || {};
   const link = payload.link || {};
-  const expanded = !!state.privateTelegramExpanded;
   const telegramId = h("input", { value: link.telegram_user_id || "", placeholder: "例如 123456789", inputmode: "numeric" });
   const telegramUsername = h("input", { value: link.telegram_username || "", placeholder: "可选，不带 @" });
   const linked = !!link.telegram_user_id;
@@ -711,7 +739,7 @@ function renderPrivateTelegramConfig() {
   const status = gateway.enabled
     ? `${botName} ${linked ? "已绑定" : "可绑定"}`
     : "管理员尚未启用";
-  const form = expanded ? h("form", {
+  const form = h("form", {
       class: "telegram-link__form",
       onsubmit: async (event) => {
         event.preventDefault();
@@ -745,23 +773,29 @@ function renderPrivateTelegramConfig() {
           },
         }, [h("span", { text: "解除" })]) : null,
       ]),
-    ]) : null;
+    ]);
 
-  return h("section", { class: `telegram-link ${expanded ? "is-open" : "is-collapsed"}` }, [
+  return h("section", {
+    class: "telegram-link",
+    id: "private-telegram-popover",
+    role: "dialog",
+    "aria-label": "Telegram 私聊设置",
+  }, [
     h("div", { class: "telegram-link__header" }, [
       h("div", { class: "telegram-link__meta" }, [
         h("div", { class: "telegram-link__title" }, [icon("message", { size: 16 }), h("span", { text: "Telegram 私聊" })]),
         h("div", { class: "telegram-link__sub", text: status }),
       ]),
       h("button", {
-        class: "btn btn--sm",
+        class: "icon-btn telegram-link__close",
         type: "button",
-        "aria-expanded": expanded ? "true" : "false",
+        title: "收起",
+        "aria-label": "收起 Telegram 私聊设置",
         onclick: () => {
-          state.privateTelegramExpanded = !expanded;
+          state.privateTelegramExpanded = false;
           render();
         },
-      }, [h("span", { text: expanded ? "收起" : "配置" })]),
+      }, [icon("close", { size: 16 })]),
     ]),
     form,
   ]);
