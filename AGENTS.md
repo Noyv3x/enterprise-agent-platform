@@ -4,12 +4,12 @@
 
 This workspace ties together an enterprise platform and three upstream codebases.
 
-- `enterprise-agent-platform/`: primary platform code. Python package lives in `enterprise_agent_platform/`, browser assets in `enterprise_agent_platform/static/`, tests in `tests/`, and the managed Hermes knowledge plugin in `hermes_plugin/`.
+- `enterprise-agent-platform/`: primary platform code. Python package lives in `enterprise_agent_platform/`, frontend source lives in `frontend/`, generated browser assets are served from `enterprise_agent_platform/static/`, tests live in `tests/`, and the managed Hermes knowledge plugin lives in `hermes_plugin/`.
 - `hermes-agent/`: Git submodule for the Hermes runtime and OpenAI-compatible API server. Follow `hermes-agent/AGENTS.md` when editing this submodule.
 - `cognee/`: Git submodule for the optional knowledge graph backend. Follow `cognee/AGENTS.md` when editing this submodule.
 - `firecrawl/`: Git submodule for the managed self-hosted Firecrawl web runtime. Treat it as upstream code unless intentionally updating the pinned submodule revision.
 - Runtime data, databases, logs, workspaces, and secrets are intentionally ignored. Use `ENTERPRISE_PLATFORM_DATA` to relocate platform state.
-- This project depends on the underlying Hermes Agent and Cognee codebases. For platform adapter or integration changes involving either system, inspect the corresponding upstream submodule first so the change matches its runtime behavior and extension points.
+- This project depends on the underlying Hermes Agent, Cognee, and Firecrawl codebases. For platform adapter or integration changes involving any of them, inspect the corresponding upstream submodule first so the change matches its runtime behavior and extension points.
 
 ## Build, Test, and Development Commands
 
@@ -19,7 +19,18 @@ Use the top-level one-command deploy path for local bring-up:
 ./deploy.sh
 ```
 
-It initializes submodules, creates `.venv`, installs the platform package, prepares managed Hermes/Cognee/Firecrawl state, and starts the app through user-level systemd when available. Keep `hermes-agent/`, `cognee/`, and `firecrawl/` next to `enterprise-agent-platform/`; managed Hermes is installed from adjacent `hermes-agent/` source into `data/runtimes/hermes/venv`.
+It initializes submodules, creates the root `.venv`, installs the platform package, prepares managed Hermes/Cognee/Firecrawl state, and starts the app through user-level systemd when available. Keep `hermes-agent/`, `cognee/`, and `firecrawl/` next to `enterprise-agent-platform/`; managed Hermes is installed from adjacent `hermes-agent/` source into `$ENTERPRISE_PLATFORM_DATA/runtimes/hermes/venv`, defaulting to `enterprise-agent-platform/data/runtimes/hermes/venv`.
+
+Common deployment commands:
+
+```bash
+./deploy.sh update
+./deploy.sh service
+./deploy.sh foreground
+./deploy.sh status
+./deploy.sh restart
+./deploy.sh logs
+```
 
 Run the platform locally:
 
@@ -28,7 +39,7 @@ cd enterprise-agent-platform
 ENTERPRISE_ADMIN_PASSWORD='change-me' python3 -m enterprise_agent_platform serve
 ```
 
-Run focused verification for the platform:
+Run focused Python verification for the platform:
 
 ```bash
 cd enterprise-agent-platform
@@ -42,15 +53,39 @@ Or run both checks from the repository root:
 ./deploy.sh test
 ```
 
+Run frontend checks and rebuild generated static assets when changing the browser UI:
+
+```bash
+cd enterprise-agent-platform/frontend
+npm install
+npm run check
+npm run build
+```
+
+The frontend dev server proxies `/api` to the default platform backend:
+
+```bash
+cd enterprise-agent-platform/frontend
+npm run dev
+```
+
 Use submodule-specific commands only from the relevant submodule root.
 
 ## Coding Style & Naming Conventions
 
-Platform code is Python 3.11+, 4-space indentation, `snake_case` for functions/modules, `PascalCase` for classes, and type hints where they clarify interfaces. Keep stdlib-first patterns unless an existing dependency is already used. Static assets are plain HTML/CSS/JavaScript; keep UI code small and framework-free unless the project adopts a framework.
+Platform code is Python 3.11+, 4-space indentation, `snake_case` for functions/modules, `PascalCase` for classes, and type hints where they clarify interfaces. Keep stdlib-first patterns unless an existing dependency is already used. Frontend source is Vite + React + TypeScript in `enterprise-agent-platform/frontend/`; the current business UI still lives mostly in `frontend/src/legacy-app.js` and is bootstrapped by `frontend/src/main.tsx`. Do not hand-edit generated files in `enterprise_agent_platform/static/` unless you are intentionally updating a static-only asset; rebuild them from `frontend/` with `npm run build`.
 
 ## Testing Guidelines
 
-The platform uses `unittest`; add tests in `enterprise-agent-platform/tests/test_*.py`. Prefer deterministic fakes for Hermes, Cognee, Docker, and API-key-dependent behavior. Skip or isolate true external integration checks unless credentials and services are explicitly available.
+The platform uses `unittest`; add Python tests in `enterprise-agent-platform/tests/test_*.py`. Prefer deterministic fakes for Hermes, Cognee, Firecrawl, Docker, OAuth, Telegram, and API-key-dependent behavior. Skip or isolate true external integration checks unless credentials and services are explicitly available. For UI changes, run `npm run check` and `npm run build` from `enterprise-agent-platform/frontend/` in addition to the Python checks.
+
+## Runtime & Product Guidelines
+
+- Managed runtime state belongs under the platform data directory, including Hermes, Cognee, Firecrawl, Camofox, logs, generated env files, workspaces, and local databases. Do not write generated Firecrawl env files or compose overrides into the `firecrawl/` submodule tree.
+- Hermes model-provider auth is limited in the product UI to `Codex OAuth` and `Grok OAuth`, with OAuth credential import/export support. Do not reintroduce OpenAI, OpenRouter, or xAI API-key model-provider flows unless that product direction is explicitly requested.
+- The platform-managed Telegram gateway routes Telegram private chats to each user's private Agent. It intentionally does not use the Hermes Telegram adapter and ignores groups, supergroups, and channels.
+- Auto-update uses the admin-panel configuration, GitHub webhooks and/or polling, clean-worktree fast-forward checks, and the existing `./deploy.sh update` rollback path. Preserve that rollback behavior when changing deployment code.
+- `ENTERPRISE_PUBLIC_BASE_URL` controls public URL generation, secure cookies, and browser write-request origin checks when the app is behind HTTPS.
 
 ## Agent Prompt Guidelines
 
@@ -64,4 +99,4 @@ PRs should include a summary, affected directories, commands run, linked issues 
 
 ## Security & Configuration Tips
 
-Never commit `.env`, runtime databases, generated workspaces, API keys, or logs. Configure model credentials and Hermes runtime settings through the platform settings UI or environment variables. Keep managed Hermes/Cognee/Firecrawl state under the platform data directory.
+Never commit `.env`, runtime databases, generated workspaces, OAuth token exports, API keys, or logs. Configure OAuth credentials, tool secrets, public URL settings, Telegram settings, auto-update settings, and Hermes/Cognee/Firecrawl runtime settings through the platform settings UI or environment variables. Keep managed Hermes/Cognee/Firecrawl/Camofox state under the platform data directory.
