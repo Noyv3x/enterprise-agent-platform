@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import importlib.util
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +42,7 @@ class ConfigField:
     options: tuple[str, ...] = ()
     secret: bool = False
 
-    def to_dict(self, value: Any, *, configured: bool) -> dict[str, Any]:
+    def to_dict(self, value: Any, *, configured: bool, defaulted: bool = False) -> dict[str, Any]:
         secret = self.secret or is_sensitive_key(self.key)
         # Structured (e.g. JSON) values such as `providers`/`fallback_providers`
         # legitimately embed inline `api_key` secrets that the key-level
@@ -56,6 +59,8 @@ class ConfigField:
             "options": list(self.options),
             "secret": secret,
             "configured": configured,
+            "defaulted": bool(defaulted and not configured),
+            "source": "configured" if configured else ("default" if defaulted else "unset"),
             "value": "" if secret and configured else value_for_json(rendered),
             "masked": mask_value(str(value)) if secret and configured else "",
         }
@@ -225,7 +230,12 @@ COGNEE_ENV_FIELDS = (
 )
 
 
-def read_hermes_internal_config(config_path: Path, env_path: Path) -> dict[str, Any]:
+def read_hermes_internal_config(
+    config_path: Path,
+    env_path: Path,
+    default_config: dict[str, Any] | None = None,
+    default_error: str = "",
+) -> dict[str, Any]:
     mapping, yaml_text, error = read_yaml_mapping_with_text(config_path)
     env_values = read_env_file(env_path)
     return {
@@ -233,8 +243,9 @@ def read_hermes_internal_config(config_path: Path, env_path: Path) -> dict[str, 
         "env_path": str(env_path),
         "yaml_text": redact_yaml_text(mapping, yaml_text) if not error else yaml_text,
         "yaml_error": error,
+        "default_error": default_error,
         "sections": summarize_mapping(mapping),
-        "fields": fields_from_mapping(HERMES_YAML_FIELDS, mapping),
+        "fields": fields_from_mapping(HERMES_YAML_FIELDS, mapping, default_config or {}),
         "env": fields_from_env(HERMES_ENV_FIELDS, env_values),
     }
 
@@ -302,7 +313,7 @@ def update_yaml_values(config_path: Path, updates: dict[str, Any]) -> None:
         if not field:
             raise ValueError(f"unsupported config key: {key}")
         is_empty = value is None or (isinstance(value, str) and value.strip() == "")
-        if is_empty and field.kind in {"number", "text", "json"}:
+        if is_empty:
             # Clearing a field means "unset / fall back to the runtime default",
             # not "persist 0 / empty". Removing the key lets Hermes use its own
             # default instead of writing a semantically different literal value.
@@ -380,11 +391,22 @@ def summarize_mapping(mapping: dict[str, Any]) -> list[dict[str, Any]]:
     return sections
 
 
-def fields_from_mapping(fields: tuple[ConfigField, ...], mapping: dict[str, Any]) -> list[dict[str, Any]]:
+def fields_from_mapping(
+    fields: tuple[ConfigField, ...],
+    mapping: dict[str, Any],
+    default_mapping: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     result = []
+    defaults = default_mapping or {}
     for field in fields:
         found, value = get_nested(mapping, field.key)
-        result.append(field.to_dict(value if found else "", configured=found and is_configured_value(value)))
+        configured = found and is_configured_value(value)
+        if configured:
+            result.append(field.to_dict(value, configured=True))
+            continue
+        default_found, default_value = get_default_value(defaults, field.key)
+        defaulted = default_found and is_configured_value(default_value)
+        result.append(field.to_dict(default_value if defaulted else "", configured=False, defaulted=defaulted))
     return result
 
 
@@ -403,6 +425,20 @@ def get_nested(mapping: dict[str, Any], path: str) -> tuple[bool, Any]:
             return False, None
         current = current[part]
     return True, current
+
+
+def get_default_value(mapping: dict[str, Any], path: str) -> tuple[bool, Any]:
+    found, value = get_nested(mapping, path)
+    if found:
+        return True, value
+    # Hermes historically allowed the primary model to be a scalar at
+    # DEFAULT_CONFIG["model"], while enterprise editing exposes the normalized
+    # config.yaml shape as model.default.
+    if path == "model.default":
+        found, value = get_nested(mapping, "model")
+        if found and not isinstance(value, dict):
+            return True, value
+    return False, None
 
 
 def set_nested(mapping: dict[str, Any], path: str, value: Any) -> None:
@@ -487,6 +523,55 @@ def is_configured_value(value: Any) -> bool:
     if isinstance(value, str):
         return value != ""
     return True
+
+
+_HERMES_DEFAULT_CONFIG_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
+def load_hermes_default_config(repo_path: Path) -> tuple[dict[str, Any], str]:
+    """Load Hermes' upstream DEFAULT_CONFIG from an adjacent source checkout.
+
+    This imports only the configured Hermes source tree and returns a deep copy
+    of DEFAULT_CONFIG. Importing is used instead of AST literal evaluation
+    because Hermes' default dictionary contains a few computed values.
+    """
+
+    config_py = repo_path.expanduser() / "hermes_cli" / "config.py"
+    try:
+        stat = config_py.stat()
+    except OSError as exc:
+        return {}, f"Hermes default config not found: {config_py} ({exc})"
+    cache_key = str(config_py.resolve())
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _HERMES_DEFAULT_CONFIG_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return copy.deepcopy(cached[1]), ""
+    module_name = f"_enterprise_hermes_defaults_{abs(hash(cache_key))}"
+    spec = importlib.util.spec_from_file_location(module_name, config_py)
+    if spec is None or spec.loader is None:
+        return {}, f"Unable to load Hermes default config from {config_py}"
+    module = importlib.util.module_from_spec(spec)
+    repo = str(repo_path.expanduser().resolve())
+    inserted = False
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+        inserted = True
+    try:
+        spec.loader.exec_module(module)
+        defaults = getattr(module, "DEFAULT_CONFIG", None)
+        if not isinstance(defaults, dict):
+            return {}, f"Hermes DEFAULT_CONFIG is unavailable in {config_py}"
+        clean = copy.deepcopy(defaults)
+        _HERMES_DEFAULT_CONFIG_CACHE[cache_key] = (signature, clean)
+        return copy.deepcopy(clean), ""
+    except Exception as exc:
+        return {}, f"Failed to read Hermes default config: {exc}"
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(repo)
+            except ValueError:
+                pass
 
 
 def is_sensitive_key(key: str) -> bool:

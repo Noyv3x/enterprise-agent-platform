@@ -23,6 +23,7 @@ from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AgentResult, AutoAgentClient, is_substantive_tool_start
 from .hermes_oauth_bridge import HermesOAuthBridge
 from .internal_config import (
+    load_hermes_default_config,
     read_cognee_internal_config,
     read_hermes_internal_config,
     update_env_file,
@@ -2051,7 +2052,13 @@ class EnterpriseService:
         require_admin(actor)
         self.runtimes.prepare_hermes()
         config = self.runtimes.hermes_runtime_config()
-        internal = read_hermes_internal_config(Path(config["config_path"]), Path(config["env_path"]))
+        defaults, default_error = load_hermes_default_config(Path(config["repo_path"]))
+        internal = read_hermes_internal_config(
+            Path(config["config_path"]),
+            Path(config["env_path"]),
+            default_config=defaults,
+            default_error=default_error,
+        )
         return {"config": config, "internal": internal, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
 
     def update_hermes_internal_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:

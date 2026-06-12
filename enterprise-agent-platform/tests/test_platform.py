@@ -415,6 +415,16 @@ def make_fake_hermes_repo(path: Path) -> None:
     (path / "hermes_cli").mkdir(parents=True, exist_ok=True)
     (path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (path / "hermes_cli" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+    (path / "hermes_cli" / "secret_prompt.py").write_text("def masked_secret_prompt(*args, **kwargs): return ''\n", encoding="utf-8")
+    (path / "hermes_cli" / "config.py").write_text(
+        "DEFAULT_CONFIG = {\n"
+        "    'agent': {'max_turns': 90, 'api_max_retries': 3},\n"
+        "    'display': {'show_reasoning': False, 'streaming': True},\n"
+        "    'toolsets': ['hermes-cli'],\n"
+        "    'tool_output': {'max_bytes': 60000},\n"
+        "}\n",
+        encoding="utf-8",
+    )
     (path / "pyproject.toml").write_text(
         '[project]\nname = "hermes-agent-test"\nversion = "0.0.0"\n',
         encoding="utf-8",
@@ -2326,11 +2336,20 @@ class PlatformServiceTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
 
                 current = service.hermes_internal_config(admin)
-                yaml_keys = {item["key"] for item in current["internal"]["fields"]}
+                fields_by_key = {item["key"]: item for item in current["internal"]["fields"]}
+                yaml_keys = set(fields_by_key)
                 env_by_key = {item["key"]: item for item in current["internal"]["env"]}
 
                 self.assertIn("agent.max_turns", yaml_keys)
                 self.assertIn("display.show_reasoning", yaml_keys)
+                self.assertEqual(fields_by_key["agent.max_turns"]["value"], 90)
+                self.assertFalse(fields_by_key["agent.max_turns"]["configured"])
+                self.assertTrue(fields_by_key["agent.max_turns"]["defaulted"])
+                self.assertEqual(fields_by_key["display.show_reasoning"]["value"], False)
+                self.assertFalse(fields_by_key["display.show_reasoning"]["configured"])
+                self.assertTrue(fields_by_key["display.show_reasoning"]["defaulted"])
+                self.assertEqual(fields_by_key["toolsets"]["value"], "[\n  \"hermes-cli\"\n]")
+                self.assertTrue(fields_by_key["toolsets"]["defaulted"])
                 self.assertIn("API_SERVER_KEY", env_by_key)
                 self.assertTrue(env_by_key["API_SERVER_KEY"]["secret"])
                 self.assertEqual(env_by_key["API_SERVER_KEY"]["value"], "")

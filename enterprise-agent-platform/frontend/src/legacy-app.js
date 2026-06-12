@@ -2336,6 +2336,7 @@ function renderHermesInternalConfig() {
   return h("section", { class: "card config-software" }, [
     cardHead("Hermes 内部配置", "settings", { desc: internal.config_path || "config.yaml" }),
     internal.yaml_error ? h("div", { class: "config-warning", text: internal.yaml_error }) : null,
+    internal.default_error ? h("div", { class: "config-warning", text: internal.default_error }) : null,
     renderConfigSections(internal.sections || []),
     renderConfigFieldsForm({
       fields,
@@ -2444,7 +2445,10 @@ function renderConfigField(item, attr) {
   return h("label", { class: "config-field" }, [
     h("span", { class: "config-field__label" }, [
       h("strong", { text: item.label || item.key }),
-      h("code", { text: item.key }),
+      h("span", { class: "config-field__meta" }, [
+        item.defaulted ? h("span", { class: "config-field__source", text: "默认值" }) : null,
+        h("code", { text: item.key }),
+      ]),
     ]),
     configFieldControl(item, attr),
   ]);
@@ -2453,13 +2457,14 @@ function renderConfigField(item, attr) {
 function configFieldControl(item, attr) {
   const dataAttr = attr === "yamlKey" ? "data-yaml-key" : "data-env-key";
   const common = { [dataAttr]: item.key };
+  const hasDisplayValue = !!item.configured || !!item.defaulted;
   if (item.kind === "boolean") {
     const select = h("select", common, [
       h("option", { value: "", text: "未设置" }),
       h("option", { value: "true", text: "true" }),
       h("option", { value: "false", text: "false" }),
     ]);
-    if (item.configured) select.value = String(item.value === true || String(item.value).toLowerCase() === "true");
+    if (hasDisplayValue) select.value = String(item.value === true || String(item.value).toLowerCase() === "true");
     select.dataset.initial = select.value;
     return select;
   }
@@ -2468,13 +2473,13 @@ function configFieldControl(item, attr) {
       h("option", { value: "", text: "未设置" }),
       ...item.options.map((option) => h("option", { value: option, text: option })),
     ]);
-    select.value = item.configured ? String(item.value ?? "") : "";
+    select.value = hasDisplayValue ? String(item.value ?? "") : "";
     select.dataset.initial = select.value;
     return select;
   }
   if (item.kind === "json") {
     const textarea = h("textarea", { ...common, spellcheck: "false" });
-    textarea.value = item.configured ? String(item.value ?? "") : "";
+    textarea.value = hasDisplayValue ? String(item.value ?? "") : "";
     textarea.dataset.initial = textarea.value;
     return textarea;
   }
@@ -2485,7 +2490,7 @@ function configFieldControl(item, attr) {
     placeholder: item.secret && item.configured ? item.masked : "",
   };
   const input = h("input", attrs);
-  if (!item.secret && item.configured) input.value = String(item.value ?? "");
+  if (!item.secret && hasDisplayValue) input.value = String(item.value ?? "");
   input.dataset.initial = input.value;
   return input;
 }
