@@ -15,6 +15,7 @@ venv/
 env/
 
 # Enterprise platform runtime state
+/data/
 enterprise-agent-platform/data/
 enterprise-agent-platform/.env
 *.db
