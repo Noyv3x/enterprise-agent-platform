@@ -212,6 +212,20 @@ function icon(name, { size, cls, strokeWidth } = {}) {
   return svg;
 }
 
+function svgNode(tag, attrs = {}, children = []) {
+  const node = document.createElementNS(SVGNS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.setAttribute("class", value);
+    else if (key === "text") node.textContent = value;
+    else if (value !== false && value != null) node.setAttribute(key, String(value));
+  }
+  for (const child of Array.isArray(children) ? children : [children]) {
+    if (child == null || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
 /* --------------------------------------------------------------- theme */
 function currentTheme() {
   const attr = document.documentElement.dataset.theme;
@@ -1545,6 +1559,9 @@ function thinkingDepthSelect(selected) {
 function renderTokenUsageMonitoring() {
   const report = state.tokenUsage || {};
   const summary = report.summary || {};
+  const today = report.today || {};
+  const last7 = report.last_7_days || {};
+  const dailyUsage = Array.isArray(report.daily_usage) ? report.daily_usage : [];
   const days = h("select", {
     onchange: async (event) => {
       state.tokenUsageDays = Number(event.target.value) || 30;
@@ -1572,6 +1589,8 @@ function renderTokenUsageMonitoring() {
         ]),
       }),
       h("div", { class: "metric-grid" }, [
+        usageMetric("本日消耗", today.total_tokens),
+        usageMetric("近 7 日消耗", last7.total_tokens),
         usageMetric("总 Token", summary.total_tokens),
         usageMetric("输入 Token", summary.input_tokens),
         usageMetric("输出 Token", summary.output_tokens),
@@ -1579,6 +1598,7 @@ function renderTokenUsageMonitoring() {
         usageMetric("涉及账户", summary.account_count, "个"),
         usageMetric("频道/私聊", `${summary.channel_event_count || 0}/${summary.private_event_count || 0}`, "次"),
       ]),
+      renderTokenUsageCurve(dailyUsage),
     ]),
     renderUsageTable(
       "按账户汇总",
@@ -1655,6 +1675,81 @@ function usageMetric(label, value, suffix = "") {
     h("strong", { text: isText ? value : formatNumber(value) }),
     suffix ? h("small", { text: suffix }) : null,
   ]);
+}
+
+function renderTokenUsageCurve(rows) {
+  const daily = normalizeTokenDailyUsage(rows);
+  const maxTotal = Math.max(1, ...daily.map((row) => Number(row.total_tokens) || 0));
+  const width = 640;
+  const height = 170;
+  const padX = 26;
+  const padY = 18;
+  const usableWidth = width - padX * 2;
+  const usableHeight = height - padY * 2;
+  const points = daily.map((row, index) => {
+    const ratio = Math.max(0, (Number(row.total_tokens) || 0) / maxTotal);
+    const x = padX + (daily.length <= 1 ? 0 : index * (usableWidth / (daily.length - 1)));
+    const y = height - padY - ratio * usableHeight;
+    return { ...row, x, y };
+  });
+  const linePath = points.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+  const areaPath = points.length
+    ? `${linePath} L ${points[points.length - 1].x.toFixed(1)} ${height - padY} L ${points[0].x.toFixed(1)} ${height - padY} Z`
+    : "";
+  const total = daily.reduce((sum, row) => sum + (Number(row.total_tokens) || 0), 0);
+
+  return h("div", { class: "token-curve" }, [
+    h("div", { class: "token-curve__head" }, [
+      h("div", {}, [
+        h("strong", { text: "近 7 日消耗曲线" }),
+        h("span", { text: `${formatNumber(total)} tokens` }),
+      ]),
+      h("span", { class: "muted", text: daily.length ? `${daily[0].label} - ${daily[daily.length - 1].label}` : "" }),
+    ]),
+    svgNode("svg", { class: "token-curve__svg", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "近 7 日 token 消耗曲线", preserveAspectRatio: "none" }, [
+      svgNode("line", { class: "token-curve__axis", x1: padX, y1: height - padY, x2: width - padX, y2: height - padY }),
+      areaPath ? svgNode("path", { class: "token-curve__area", d: areaPath }) : null,
+      linePath ? svgNode("path", { class: "token-curve__line", d: linePath }) : null,
+      ...points.map((point) => svgNode("circle", { class: "token-curve__point", cx: point.x.toFixed(1), cy: point.y.toFixed(1), r: 4 }, [
+        svgNode("title", { text: `${point.date}: ${formatNumber(point.total_tokens)} tokens` }),
+      ])),
+    ]),
+    h("div", { class: "token-curve__labels" }, daily.map((row) =>
+      h("div", { class: "token-curve__label" }, [
+        h("span", { text: row.label }),
+        h("strong", { text: formatCompactNumber(row.total_tokens) }),
+      ])
+    )),
+  ]);
+}
+
+function normalizeTokenDailyUsage(rows) {
+  const items = (Array.isArray(rows) ? rows : []).slice(-7).map((row) => ({
+    date: row.date || "",
+    label: row.label || tokenUsageDateLabel(row.start_at || row.date),
+    input_tokens: Number(row.input_tokens) || 0,
+    output_tokens: Number(row.output_tokens) || 0,
+    total_tokens: Number(row.total_tokens) || 0,
+    event_count: Number(row.event_count) || 0,
+  }));
+  while (items.length < 7) {
+    items.unshift({
+      date: "",
+      label: "-",
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      event_count: 0,
+    });
+  }
+  return items;
+}
+
+function tokenUsageDateLabel(value) {
+  if (!value) return "-";
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
 }
 
 function renderUsageTable(title, desc, iconName, headers, rows, renderCells, emptyText) {

@@ -1529,6 +1529,8 @@ class EnterpriseService:
         clean_limit = max(10, min(clean_limit, 1000))
         until = now_ts()
         since = until - clean_days * 24 * 60 * 60
+        today_start = self._token_usage_day_start(until)
+        seven_day_start = self._token_usage_day_start(until, offset_days=-6)
         params = (since,)
         summary_row = self.db.query_one(
             """
@@ -1655,12 +1657,86 @@ class EnterpriseService:
         return {
             "window": {"days": clean_days, "since": since, "until": until},
             "summary": self._token_usage_summary_from_row(summary_row),
+            "today": self._token_usage_summary_between(today_start, until),
+            "last_7_days": self._token_usage_summary_between(seven_day_start, until),
+            "daily_usage": self._token_usage_daily_series(until),
             "by_account": [self._token_usage_aggregate_row(row) for row in by_account],
             "by_scope": [self._token_usage_aggregate_row(row) for row in by_scope],
             "by_model": [self._token_usage_aggregate_row(row) for row in by_model],
             "details": [self._token_usage_aggregate_row(row) for row in details],
             "recent": [self._token_usage_event_row(row) for row in recent],
         }
+
+    def _token_usage_summary_between(self, since: int, until: int) -> dict[str, Any]:
+        row = self.db.query_one(
+            """
+            SELECT
+                COUNT(*) AS event_count,
+                COUNT(DISTINCT user_id) AS account_count,
+                SUM(CASE WHEN scope_type = 'private' THEN 1 ELSE 0 END) AS private_event_count,
+                SUM(CASE WHEN scope_type = 'channel' THEN 1 ELSE 0 END) AS channel_event_count,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                MAX(created_at) AS last_used_at
+            FROM token_usage_events
+            WHERE created_at >= ? AND created_at <= ?
+            """,
+            (int(since), int(until)),
+        ) or {}
+        return self._token_usage_summary_from_row(row)
+
+    def _token_usage_daily_series(self, until: int) -> list[dict[str, Any]]:
+        day_starts = [self._token_usage_day_start(until, offset_days=offset) for offset in range(-6, 1)]
+        if not day_starts:
+            return []
+        buckets: dict[int, dict[str, Any]] = {}
+        account_sets: dict[int, set[int]] = {}
+        for start_at in day_starts:
+            next_start = self._token_usage_day_start(start_at, offset_days=1)
+            end_at = min(int(until), next_start - 1)
+            buckets[start_at] = {
+                "date": time.strftime("%Y-%m-%d", time.localtime(start_at)),
+                "label": time.strftime("%m/%d", time.localtime(start_at)),
+                "start_at": int(start_at),
+                "end_at": int(max(start_at, end_at)),
+                "event_count": 0,
+                "account_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            }
+            account_sets[start_at] = set()
+
+        rows = self.db.query(
+            """
+            SELECT user_id, created_at, input_tokens, output_tokens, total_tokens
+            FROM token_usage_events
+            WHERE created_at >= ? AND created_at <= ?
+            """,
+            (day_starts[0], int(until)),
+        )
+        for row in rows:
+            created_at = int(row.get("created_at") or 0)
+            day_start = self._token_usage_day_start(created_at)
+            bucket = buckets.get(day_start)
+            if bucket is None:
+                continue
+            bucket["event_count"] += 1
+            if row.get("user_id") is not None:
+                account_sets[day_start].add(int(row["user_id"]))
+            bucket["input_tokens"] += int(row.get("input_tokens") or 0)
+            bucket["output_tokens"] += int(row.get("output_tokens") or 0)
+            bucket["total_tokens"] += int(row.get("total_tokens") or 0)
+
+        for start_at in day_starts:
+            buckets[start_at]["account_count"] = len(account_sets[start_at])
+        return [buckets[start_at] for start_at in day_starts]
+
+    @staticmethod
+    def _token_usage_day_start(timestamp: int, *, offset_days: int = 0) -> int:
+        local = time.localtime(int(timestamp))
+        return int(time.mktime((local.tm_year, local.tm_mon, local.tm_mday + offset_days, 0, 0, 0, -1, -1, -1)))
 
     @staticmethod
     def _token_usage_summary_from_row(row: dict[str, Any]) -> dict[str, Any]:

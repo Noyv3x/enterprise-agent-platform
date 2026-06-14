@@ -581,6 +581,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(report["summary"]["input_tokens"], 15)
                 self.assertEqual(report["summary"]["output_tokens"], 7)
                 self.assertEqual(report["summary"]["total_tokens"], 22)
+                self.assertEqual(report["today"]["total_tokens"], 22)
+                self.assertEqual(report["last_7_days"]["total_tokens"], 22)
+                self.assertEqual(len(report["daily_usage"]), 7)
+                self.assertEqual(sum(day["total_tokens"] for day in report["daily_usage"]), 22)
+                self.assertEqual(report["daily_usage"][-1]["total_tokens"], 22)
 
                 by_account = {row["username"]: row for row in report["by_account"]}
                 self.assertEqual(by_account["admin"]["total_tokens"], 14)
@@ -597,6 +602,72 @@ class PlatformServiceTests(unittest.TestCase):
                 agent_message = next(message for message in channel_messages if message["author_type"] == "agent")
                 self.assertEqual(agent_message["metadata"]["token_usage"]["total_tokens"], 14)
                 self.assertEqual(agent_message["metadata"]["token_usage"]["provider"], "openai-codex")
+            finally:
+                service.close()
+
+    def test_token_usage_report_exposes_today_and_last_7_day_consumption(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                hermes_bridge=FakeHermesBridge(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                now = int(time.time())
+                today_start = service._token_usage_day_start(now)
+                two_days_ago = service._token_usage_day_start(now, offset_days=-2) + 60
+                eight_days_ago = service._token_usage_day_start(now, offset_days=-8) + 60
+
+                for created_at, total_tokens in (
+                    (today_start, 100),
+                    (two_days_ago, 70),
+                    (eight_days_ago, 9),
+                ):
+                    service.db.insert(
+                        """
+                        INSERT INTO token_usage_events(
+                            user_id, username, display_name, scope_type, scope_id, scope_name,
+                            request_message_id, response_message_id, provider, model,
+                            input_tokens, output_tokens, total_tokens, raw_usage_json, degraded, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(admin["id"]),
+                            "admin",
+                            "Administrator",
+                            "channel",
+                            "1",
+                            "#general",
+                            1,
+                            2,
+                            "openai-codex",
+                            "gpt-5.5",
+                            total_tokens // 2,
+                            total_tokens - (total_tokens // 2),
+                            total_tokens,
+                            "{}",
+                            0,
+                            created_at,
+                        ),
+                    )
+
+                report = service.token_usage_report(admin, days=30)
+                daily = {row["date"]: row for row in report["daily_usage"]}
+
+                self.assertEqual(report["summary"]["total_tokens"], 179)
+                self.assertEqual(report["today"]["total_tokens"], 100)
+                self.assertEqual(report["last_7_days"]["total_tokens"], 170)
+                self.assertEqual(len(report["daily_usage"]), 7)
+                self.assertEqual(sum(row["total_tokens"] for row in report["daily_usage"]), 170)
+                self.assertEqual(report["daily_usage"][-1]["start_at"], today_start)
+                self.assertEqual(report["daily_usage"][-1]["total_tokens"], 100)
+                self.assertEqual(
+                    daily[time.strftime("%Y-%m-%d", time.localtime(two_days_ago))]["total_tokens"],
+                    70,
+                )
+                self.assertNotIn(time.strftime("%Y-%m-%d", time.localtime(eight_days_ago)), daily)
             finally:
                 service.close()
 
