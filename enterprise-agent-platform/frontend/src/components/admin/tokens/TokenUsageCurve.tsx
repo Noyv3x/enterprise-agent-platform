@@ -1,0 +1,65 @@
+/* <TokenUsageCurve/> — the 7-day token consumption SVG curve (legacy
+   renderTokenUsageCurve, legacy-app.js:1680-1724). Geometry comes from
+   utils/tokenCurve (640×170, padX 26, padY 18, x-step 98, baseline y 152),
+   computed once per data change via useMemo. The viewBox + preserveAspectRatio
+   stretch the curve to the container width with no resize listener. */
+
+import { useMemo } from "react";
+import { formatCompactNumber, formatNumber } from "../../../utils/format";
+import { tokenCurve } from "../../../utils/tokenCurve";
+import type { TokenDailyUsageRow } from "../../../types";
+
+export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
+  const curve = useMemo(() => tokenCurve(rows), [rows]);
+  const { width, height, padX, padY, daily, points, linePath, areaPath, total } = curve;
+
+  return (
+    <div className="token-curve">
+      <div className="token-curve__head">
+        <div>
+          <strong>近 7 日消耗曲线</strong>
+          <span>{`${formatNumber(total)} tokens`}</span>
+        </div>
+        <span className="muted">
+          {daily.length ? `${daily[0].label} - ${daily[daily.length - 1].label}` : ""}
+        </span>
+      </div>
+      <svg
+        className="token-curve__svg"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="近 7 日 token 消耗曲线"
+        preserveAspectRatio="none"
+      >
+        <line
+          className="token-curve__axis"
+          x1={padX}
+          y1={height - padY}
+          x2={width - padX}
+          y2={height - padY}
+        />
+        {areaPath ? <path className="token-curve__area" d={areaPath} /> : null}
+        {linePath ? <path className="token-curve__line" d={linePath} /> : null}
+        {points.map((point, index) => (
+          <circle
+            key={index}
+            className="token-curve__point"
+            cx={point.x.toFixed(1)}
+            cy={point.y.toFixed(1)}
+            r={4}
+          >
+            <title>{`${point.date}: ${formatNumber(point.total_tokens)} tokens`}</title>
+          </circle>
+        ))}
+      </svg>
+      <div className="token-curve__labels">
+        {daily.map((row, index) => (
+          <div className="token-curve__label" key={index}>
+            <span>{row.label}</span>
+            <strong>{formatCompactNumber(row.total_tokens)}</strong>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
