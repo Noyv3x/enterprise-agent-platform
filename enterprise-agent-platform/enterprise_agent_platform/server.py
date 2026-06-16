@@ -279,6 +279,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/me" and method == "GET":
             self._json({"user": actor})
             return
+        if path == "/api/auth/me" and method == "PUT":
+            self._json({"user": service.update_current_user(actor, self._body_json())})
+            return
+        if path == "/api/auth/password" and method == "PUT":
+            token, user = service.change_current_user_password(actor, self._body_json())
+            self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
+            return
         m = re.fullmatch(r"/api/attachments/(\d+)", path)
         if m and method == "GET":
             self._serve_attachment(actor, int(m.group(1)), download=first(query, "download", "") in {"1", "true", "yes"})

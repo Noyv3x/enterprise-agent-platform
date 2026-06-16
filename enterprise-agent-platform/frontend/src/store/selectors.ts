@@ -104,6 +104,9 @@ export function topbarInfo(state: AppState): TopbarInfo {
   if (state.activeView === "admin") {
     return { title: "管理面板", icon: "shield", sub: activeAdminPage(state).description };
   }
+  if (state.activeView === "settings") {
+    return { title: "设置", icon: "settings", sub: "账户资料与密码" };
+  }
   const ch = activeChannel(state);
   const active = agentStatusText(agentStatusFor(state, "channel"));
   return {

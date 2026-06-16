@@ -188,6 +188,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   border-color: var(--accent);
   box-shadow: var(--ring);
 }
+input:disabled, textarea:disabled, select:disabled {
+  cursor: not-allowed;
+  color: var(--muted);
+  background: var(--surface-2);
+}
 textarea { resize: vertical; min-height: 88px; line-height: 1.55; }
 select {
   appearance: none;
@@ -1048,6 +1053,14 @@ select {
 .doc-viewer pre { margin: 0; padding: 14px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; color: var(--ink); }
 
 /* Settings rows */
+.settings-panel { width: min(900px, 100%); }
+.settings-card { gap: 16px; }
+.settings-form__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.settings-error { margin-top: -2px; }
 .account-admin { gap: 16px; }
 .account-create {
   border: 1px solid var(--line);
@@ -1778,7 +1791,7 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private, .telegram-link__form { grid-template-columns: 1fr; }
+  .kb-grid, .config-grid, .settings-form__grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private, .telegram-link__form { grid-template-columns: 1fr; }
   .telegram-link { right: 14px; width: min(520px, calc(100% - 28px)); }
   .telegram-link__header { align-items: flex-start; }
   .telegram-link__actions { justify-content: flex-start; }

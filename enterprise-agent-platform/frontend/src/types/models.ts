@@ -42,7 +42,7 @@ export type IconName =
   | "users";
 
 /** Top-level workspace view. */
-export type ActiveView = "channel" | "private" | "knowledge" | "admin";
+export type ActiveView = "channel" | "private" | "knowledge" | "settings" | "admin";
 
 /** Chat scope. Both names are used in the legacy code interchangeably. */
 export type ScopeType = "channel" | "private";

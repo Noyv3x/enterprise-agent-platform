@@ -45,6 +45,24 @@ export interface LoginResponse {
   user: User;
 }
 
+export interface UpdateCurrentUserRequest {
+  display_name: string;
+  position: string;
+}
+
+export interface UpdateCurrentUserResponse {
+  user: User;
+}
+
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
+}
+
+export interface ChangePasswordResponse {
+  user: User;
+}
+
 /* -------------------------------------------------------------- channels */
 
 export interface ChannelsResponse {

@@ -2025,6 +2025,58 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_member_can_update_own_profile_and_change_password(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    position="Analyst",
+                    permission_group="member",
+                    actor=admin,
+                )
+                old_token, member_actor = service.authenticate("alice", "alice-pass")
+
+                updated = service.update_current_user(
+                    member_actor,
+                    {
+                        "display_name": "Alice B.",
+                        "position": "Engineering",
+                        "permission_group": "admin",
+                        "active": False,
+                    },
+                )
+                self.assertEqual(updated["display_name"], "Alice B.")
+                self.assertEqual(updated["position"], "Engineering")
+                self.assertEqual(updated["permission_group"], "member")
+                self.assertTrue(updated["active"])
+
+                with self.assertRaises(ServiceError) as wrong_password:
+                    service.change_current_user_password(
+                        member_actor,
+                        {"current_password": "wrong-pass", "new_password": "new-alice-password"},
+                    )
+                self.assertEqual(wrong_password.exception.status, 400)
+                self.assertIsNotNone(service.user_from_token(old_token))
+
+                new_token, changed = service.change_current_user_password(
+                    member_actor,
+                    {"current_password": "alice-pass", "new_password": "new-alice-password"},
+                )
+                self.assertEqual(changed["id"], member["id"])
+                self.assertIsNone(service.user_from_token(old_token))
+                self.assertIsNotNone(service.user_from_token(new_token))
+                with self.assertRaises(ServiceError) as old_login:
+                    service.authenticate("alice", "alice-pass")
+                self.assertEqual(old_login.exception.status, 401)
+                _, fresh = service.authenticate("alice", "new-alice-password")
+                self.assertEqual(fresh["display_name"], "Alice B.")
+            finally:
+                service.close()
+
     def test_account_model_and_thinking_depth_are_used_for_agent_calls(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -3222,6 +3274,120 @@ class PlatformHTTPTests(unittest.TestCase):
                 payload = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 403)
                 self.assertEqual(payload["error"], "admin role required")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_http_current_user_settings_and_password_routes(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            _, admin = service.authenticate("admin", "admin")
+            service.create_user(
+                username="settings-member",
+                password="member-pass",
+                display_name="Settings Member",
+                position="Designer",
+                permission_group="member",
+                actor=admin,
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "settings-member", "password": "member-pass"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertEqual(payload["user"]["username"], "settings-member")
+                self.assertTrue(cookie)
+
+                conn.request(
+                    "PUT",
+                    "/api/auth/me",
+                    body=json.dumps(
+                        {
+                            "display_name": "Self Service User",
+                            "position": "Product Lead",
+                            "permission_group": "admin",
+                        }
+                    ),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                updated = json.loads(res.read().decode("utf-8"))["user"]
+                self.assertEqual(res.status, 200)
+                self.assertEqual(updated["display_name"], "Self Service User")
+                self.assertEqual(updated["position"], "Product Lead")
+                self.assertEqual(updated["permission_group"], "member")
+
+                conn.request(
+                    "PUT",
+                    "/api/auth/password",
+                    body=json.dumps(
+                        {"current_password": "wrong-pass", "new_password": "new-member-password"}
+                    ),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 400)
+                self.assertEqual(denied["error"], "current password is incorrect")
+
+                conn.request(
+                    "PUT",
+                    "/api/auth/password",
+                    body=json.dumps(
+                        {"current_password": "member-pass", "new_password": "new-member-password"}
+                    ),
+                    headers={"Content-Type": "application/json", "Cookie": cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                changed = json.loads(res.read().decode("utf-8"))
+                new_cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertEqual(changed["user"]["username"], "settings-member")
+                self.assertTrue(new_cookie)
+
+                conn.request("GET", "/api/auth/me", headers={"Cookie": cookie})
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 401)
+
+                conn.request("GET", "/api/auth/me", headers={"Cookie": new_cookie})
+                res = conn.getresponse()
+                me = json.loads(res.read().decode("utf-8"))["user"]
+                self.assertEqual(res.status, 200)
+                self.assertEqual(me["display_name"], "Self Service User")
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "settings-member", "password": "member-pass"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 401)
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "settings-member", "password": "new-member-password"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 200)
             finally:
                 server.shutdown()
                 server.server_close()

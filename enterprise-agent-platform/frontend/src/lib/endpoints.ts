@@ -11,6 +11,8 @@ import type {
   AuthMeResponse,
   AutoUpdateConfigResponse,
   AutoUpdateConfigUpdateRequest,
+  ChangePasswordRequest,
+  ChangePasswordResponse,
   ChannelCreateRequest,
   ChannelMessagesResponse,
   ChannelsResponse,
@@ -53,6 +55,8 @@ import type {
   TelegramConfigUpdateRequest,
   TokenUsageResponse,
   TypingRequest,
+  UpdateCurrentUserRequest,
+  UpdateCurrentUserResponse,
   UpdateUserRequest,
   UsersResponse,
 } from "../types";
@@ -83,6 +87,14 @@ export const EMPTY_BODY = "{}";
 export const endpoints = {
   /* auth */
   authMe: ep<void, AuthMeResponse>("GET", () => "/api/auth/me"),
+  updateCurrentUser: ep<UpdateCurrentUserRequest, UpdateCurrentUserResponse>(
+    "PUT",
+    () => "/api/auth/me",
+  ),
+  changePassword: ep<ChangePasswordRequest, ChangePasswordResponse>(
+    "PUT",
+    () => "/api/auth/password",
+  ),
   login: ep<LoginRequest, LoginResponse>("POST", () => "/api/auth/login"),
   logout: ep<void, unknown>("POST", () => "/api/auth/logout"),
 

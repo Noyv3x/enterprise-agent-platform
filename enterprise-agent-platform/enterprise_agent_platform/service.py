@@ -727,6 +727,55 @@ class EnterpriseService:
         row = self.db.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
         return self.public_user(row) if row else None
 
+    def update_current_user(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        user_id = int(actor["id"])
+        current = self.db.query_one("SELECT * FROM users WHERE id = ? AND active = 1", (user_id,))
+        if not current:
+            raise ServiceError(404, "user not found")
+
+        updates: dict[str, Any] = {}
+        if "display_name" in body:
+            display_name = str(body.get("display_name", "")).strip()
+            updates["display_name"] = display_name or current["username"]
+        if "position" in body:
+            updates["position"] = normalize_position(str(body.get("position", "")))
+
+        updates = _changed_user_updates(current, updates)
+        if not updates:
+            return self.get_user(user_id) or {}
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        self.db.execute(
+            f"UPDATE users SET {assignments} WHERE id = ?",
+            [*updates.values(), user_id],
+        )
+        return self.get_user(user_id) or {}
+
+    def change_current_user_password(self, actor: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        user_id = int(actor["id"])
+        current = self.db.query_one("SELECT * FROM users WHERE id = ? AND active = 1", (user_id,))
+        if not current:
+            raise ServiceError(404, "user not found")
+
+        current_password = str(body.get("current_password", "") or "")
+        new_password = str(body.get("new_password", body.get("password", "")) or "")
+        if not current_password:
+            raise ServiceError(400, "current password is required")
+        if not verify_password(current_password, str(current["password_hash"])):
+            raise ServiceError(400, "current password is incorrect")
+        if len(new_password) < MIN_PASSWORD_LENGTH:
+            raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+
+        self.db.execute(
+            "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
+            (hash_password(new_password), user_id),
+        )
+        updated = self.db.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if not updated:
+            raise ServiceError(404, "user not found")
+        user = self.public_user(updated)
+        token = self.tokens.issue(user_id, int(updated.get("token_version") or 1))
+        return token, user
+
     def list_users(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
         rows = self.db.query("SELECT * FROM users ORDER BY id")
