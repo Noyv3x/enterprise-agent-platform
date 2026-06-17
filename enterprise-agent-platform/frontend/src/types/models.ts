@@ -55,10 +55,13 @@ export type AuthorType = "user" | "agent" | (string & {});
 export type AgentState =
   | "queued"
   | "replying"
+  | "approval"
   | "error"
   | "complete"
   | "idle"
   | (string & {});
+
+export type AgentApprovalChoice = "once" | "session" | "always" | "deny";
 
 /* --------------------------------------------------------------- identity */
 
@@ -118,6 +121,16 @@ export interface ActivityStep {
   at?: number | string;
 }
 
+export interface AgentApprovalRequest {
+  run_id?: string;
+  command?: string;
+  description?: string;
+  pattern_key?: string;
+  pattern_keys?: string[];
+  choices?: AgentApprovalChoice[] | string[];
+  requested_at?: number;
+}
+
 /** A streaming agent message fragment (legacy-app.js:948, 2910-2917). */
 export interface StreamMsg {
   id?: Id;
@@ -147,6 +160,7 @@ export interface AgentWork {
   scope_type?: ScopeType;
   scope_id?: Id;
   activity?: ActivityStep[];
+  approval?: AgentApprovalRequest | null;
 }
 
 /** A live agent run status for a scope (superset of AgentWork). */

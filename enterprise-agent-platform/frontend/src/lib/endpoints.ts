@@ -11,6 +11,8 @@ import type {
   AuthMeResponse,
   AutoUpdateConfigResponse,
   AutoUpdateConfigUpdateRequest,
+  AgentApprovalSubmitRequest,
+  AgentApprovalSubmitResponse,
   ChangePasswordRequest,
   ChangePasswordResponse,
   ChannelCreateRequest,
@@ -113,6 +115,10 @@ export const endpoints = {
     "POST",
     (id) => `/api/channels/${id}/typing`,
   ),
+  channelAgentApproval: ep<AgentApprovalSubmitRequest, AgentApprovalSubmitResponse, [Id]>(
+    "POST",
+    (id) => `/api/channels/${id}/agent-approval`,
+  ),
   channelEvents: ep<void, never, [Id]>("GET", (id) => `/api/channels/${id}/events`),
 
   /* private agent */
@@ -123,6 +129,10 @@ export const endpoints = {
   postPrivateMessage: ep<PostMessageRequest | FormData, PostMessageResponse>(
     "POST",
     () => "/api/private-agent/messages",
+  ),
+  privateAgentApproval: ep<AgentApprovalSubmitRequest, AgentApprovalSubmitResponse>(
+    "POST",
+    () => "/api/private-agent/agent-approval",
   ),
   privateEvents: ep<void, never>("GET", () => "/api/private-agent/events"),
   privateTelegram: ep<void, PrivateTelegramResponse>(

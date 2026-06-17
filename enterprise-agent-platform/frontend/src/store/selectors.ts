@@ -72,12 +72,13 @@ export function agentStatusFor(
 }
 
 export function isAgentActive(status: AgentStatus | null | undefined): boolean {
-  return !!status && (status.state === "queued" || status.state === "replying");
+  return !!status && (status.state === "queued" || status.state === "replying" || status.state === "approval");
 }
 
 export function agentStatusText(status: AgentStatus | null | undefined): string {
   if (!isAgentActive(status)) return "";
   const target = status?.replying_to?.username || "用户";
+  if (status?.state === "approval") return `等待 ${target} 审批权限`;
   return status?.state === "queued" ? `Agent 准备回复 ${target}` : `Agent 正在回复 ${target}`;
 }
 

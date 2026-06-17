@@ -7,6 +7,7 @@ import os
 import random
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,10 +21,15 @@ HOUSEKEEPING_TOOLS = frozenset({"memory", "todo", "skill_manage", "session_searc
 # HTTP statuses worth retrying because they typically indicate a transient,
 # server-side condition (e.g. the managed runtime still warming up).
 _RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
+_RUNS_UNSUPPORTED_HTTP_STATUSES = frozenset({404, 405})
 
 
 class HermesStreamError(RuntimeError):
     """Raised when a Hermes stream reports a terminal mid-stream failure."""
+
+
+class HermesRunsUnsupported(RuntimeError):
+    """Raised when the target Hermes API does not expose /v1/runs."""
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,9 @@ class LocalAgentClient:
         emit_content(content_callback, content)
         return AgentResult(content=content, session_id=session_id, raw={"mode": "local"}, degraded=True)
 
+    def respond_approval(self, *, run_id: str, choice: str, resolve_all: bool = False) -> dict[str, Any]:
+        return {"run_id": run_id, "choice": choice, "resolved": 0, "local": True, "resolve_all": resolve_all}
+
 
 class HermesAgentClient:
     def __init__(self, config: PlatformConfig, secret_provider, runtime_config_provider=None):
@@ -115,6 +124,66 @@ class HermesAgentClient:
         self.runtime_config_provider = runtime_config_provider
 
     def generate(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, Any]],
+        session_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
+    ) -> AgentResult:
+        if progress_callback is None and content_callback is None:
+            return self._generate_via_chat_completions(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                history=history,
+                session_id=session_id,
+                session_key=session_key,
+                metadata=metadata,
+                attachments=attachments,
+                model=model,
+                thinking_depth=thinking_depth,
+                reasoning_config=reasoning_config,
+            )
+        try:
+            return self._generate_via_runs(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                history=history,
+                session_id=session_id,
+                session_key=session_key,
+                metadata=metadata,
+                attachments=attachments,
+                model=model,
+                thinking_depth=thinking_depth,
+                reasoning_config=reasoning_config,
+                progress_callback=progress_callback,
+                content_callback=content_callback,
+            )
+        except HermesRunsUnsupported:
+            return self._generate_via_chat_completions(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                history=history,
+                session_id=session_id,
+                session_key=session_key,
+                metadata=metadata,
+                attachments=attachments,
+                model=model,
+                thinking_depth=thinking_depth,
+                reasoning_config=reasoning_config,
+                progress_callback=progress_callback,
+                content_callback=content_callback,
+            )
+
+    def _generate_via_chat_completions(
         self,
         *,
         system_prompt: str,
@@ -142,15 +211,11 @@ class HermesAgentClient:
         if metadata:
             body["metadata"] = metadata
         self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
-        headers = {
-            "Content-Type": "application/json",
-            "X-Hermes-Session-Id": session_id,
-            "X-Hermes-Session-Key": session_key,
-            "Idempotency-Key": f"{session_id}:{int(time.time() * 1000)}",
-        }
-        api_key = self.config.hermes_api_key or self.secret_provider("ENTERPRISE_HERMES_API_KEY") or self.secret_provider("API_SERVER_KEY")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers = self._request_headers(
+            session_id=session_id,
+            session_key=session_key,
+            idempotency_key=f"{session_id}:{int(time.time() * 1000)}",
+        )
         # Build the request once so the Idempotency-Key stays constant across
         # retries — a rebuilt key (which embeds the current millisecond clock)
         # would defeat server-side dedup.
@@ -177,6 +242,99 @@ class HermesAgentClient:
         result = self._result_from_completion(raw, response_session)
         emit_content(content_callback, result.content)
         return result
+
+    def _generate_via_runs(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, Any]],
+        session_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
+    ) -> AgentResult:
+        effective_model = str(model or self._effective_model())
+        body: dict[str, Any] = {
+            "model": effective_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": self._content_with_images(user_message, attachments or []),
+                }
+            ],
+            "session_id": session_id,
+            "instructions": system_prompt,
+            "conversation_history": self._runs_conversation_history(history),
+        }
+        if metadata:
+            body["metadata"] = metadata
+        self._apply_reasoning_config(body, thinking_depth=thinking_depth, reasoning_config=reasoning_config)
+        headers = self._request_headers(session_id=session_id, session_key=session_key)
+        request = urllib.request.Request(
+            self._runs_api_url(),
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=self._effective_timeout_seconds())
+        except urllib.error.HTTPError as exc:
+            if exc.code in _RUNS_UNSUPPORTED_HTTP_STATUSES:
+                raise HermesRunsUnsupported(str(exc)) from exc
+            raise self._http_error_to_value_error(exc) from exc
+        with response:
+            content_type = str(response.headers.get("Content-Type") or "")
+            body_bytes = response.read()
+            if "text/event-stream" in content_type:
+                raise HermesRunsUnsupported("Hermes /v1/runs returned a chat stream")
+            try:
+                raw = json.loads(body_bytes.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise HermesRunsUnsupported("Hermes /v1/runs did not return JSON") from exc
+            response_session = response.headers.get("X-Hermes-Session-Id") or session_id
+        run_id = str(raw.get("run_id") or "").strip()
+        if not run_id:
+            raise HermesRunsUnsupported("Hermes /v1/runs response did not include run_id")
+        events_request = urllib.request.Request(
+            self._run_events_api_url(run_id),
+            headers=headers,
+            method="GET",
+        )
+        try:
+            events_response = urllib.request.urlopen(events_request, timeout=self._run_events_timeout_seconds())
+        except urllib.error.HTTPError as exc:
+            raise self._http_error_to_value_error(exc) from exc
+        with events_response:
+            return self._read_run_events(
+                events_response,
+                response_session,
+                run_id,
+                progress_callback,
+                content_callback,
+                start_payload=raw,
+                model=effective_model,
+            )
+
+    def respond_approval(self, *, run_id: str, choice: str, resolve_all: bool = False) -> dict[str, Any]:
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+        body = {"choice": str(choice or "").strip().lower(), "all": bool(resolve_all)}
+        request = urllib.request.Request(
+            self._run_approval_api_url(run_id),
+            data=json.dumps(body).encode("utf-8"),
+            headers=self._request_headers(session_id="", session_key=""),
+            method="POST",
+        )
+        response = self._open_with_retry(request, allow_retry=False)
+        with response:
+            return json.loads(response.read().decode("utf-8"))
 
     def _open_with_retry(self, request: urllib.request.Request, *, allow_retry: bool = True):
         """Open the request with bounded retries for transient connect failures.
@@ -460,6 +618,166 @@ class HermesAgentClient:
             raise ValueError(f"Hermes returned an empty streaming response after {event_count} events")
         return AgentResult(content=content, session_id=response_session, raw=raw)
 
+    def _read_run_events(
+        self,
+        response,
+        response_session: str,
+        run_id: str,
+        progress_callback: AgentProgressCallback | None,
+        content_callback: AgentContentCallback | None,
+        *,
+        start_payload: dict[str, Any],
+        model: str,
+    ) -> AgentResult:
+        content_parts: list[str] = []
+        final_output = ""
+        usage: dict[str, Any] | None = None
+        failure_message: str | None = None
+        raw_events: list[dict[str, Any]] = []
+        event_count = 0
+        data_lines: list[str] = []
+
+        def remember(payload: dict[str, Any]) -> None:
+            nonlocal event_count
+            event_count += 1
+            raw_events.append(payload)
+            del raw_events[:-50]
+
+        def dispatch_event() -> bool:
+            nonlocal data_lines, final_output, failure_message, usage
+            if not data_lines:
+                return False
+            data = "\n".join(data_lines)
+            data_lines = []
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                remember({"_parse_error": data[:500]})
+                return False
+            if not isinstance(payload, dict):
+                remember({"data": payload})
+                return False
+            remember(payload)
+            event_type = str(payload.get("event") or payload.get("type") or "").strip()
+            if event_type == "message.delta":
+                delta = text_from_content(payload.get("delta"))
+                if delta:
+                    content_parts.append(delta)
+                    emit_content(content_callback, delta)
+                return False
+            if event_type == "run.completed":
+                final_output = text_from_content(payload.get("output"))
+                raw_usage = payload.get("usage")
+                usage = raw_usage if isinstance(raw_usage, dict) else None
+                return True
+            if event_type in {"run.failed", "run.cancelled"}:
+                failure_message = str(payload.get("error") or event_type).strip() or event_type
+                return True
+            if event_type in {
+                "approval.request",
+                "approval.responded",
+                "tool.started",
+                "tool.completed",
+                "tool.failed",
+                "reasoning.available",
+            }:
+                self._emit_progress(progress_callback, payload)
+            return False
+
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if dispatch_event():
+                    break
+                continue
+            if line.startswith(":"):
+                continue
+            field, sep, value = line.partition(":")
+            if not sep:
+                continue
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "data":
+                data_lines.append(value)
+        if data_lines:
+            dispatch_event()
+
+        content = final_output or "".join(content_parts)
+        raw: dict[str, Any] = {
+            "mode": "runs",
+            "run_id": run_id,
+            "model": model,
+            "start": start_payload,
+            "event_count": event_count,
+            "events": raw_events,
+        }
+        if usage is not None:
+            raw["usage"] = usage
+        if failure_message is not None:
+            raw["error"] = failure_message
+            if content:
+                return AgentResult(content=content, session_id=response_session, raw=raw, degraded=True)
+            raise ValueError(f"Hermes run failed: {failure_message}")
+        if not content:
+            raise ValueError(f"Hermes run returned an empty response after {event_count} events")
+        return AgentResult(content=content, session_id=response_session, raw=raw)
+
+    def _request_headers(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if session_id:
+            headers["X-Hermes-Session-Id"] = session_id
+        if session_key:
+            headers["X-Hermes-Session-Key"] = session_key
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        api_key = (
+            self.config.hermes_api_key
+            or self.secret_provider("ENTERPRISE_HERMES_API_KEY")
+            or self.secret_provider("API_SERVER_KEY")
+        )
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    @staticmethod
+    def _runs_conversation_history(history: list[dict[str, Any]]) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for message in history[-30:]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            content = text_from_content(message.get("content")).strip()
+            if role and content:
+                normalized.append({"role": role, "content": content})
+        return normalized
+
+    def _runs_api_url(self) -> str:
+        return f"{self._effective_api_base_url()}/runs"
+
+    def _run_events_api_url(self, run_id: str) -> str:
+        quoted = urllib.parse.quote(run_id, safe="")
+        return f"{self._runs_api_url()}/{quoted}/events"
+
+    def _run_approval_api_url(self, run_id: str) -> str:
+        quoted = urllib.parse.quote(run_id, safe="")
+        return f"{self._runs_api_url()}/{quoted}/approval"
+
+    def _effective_api_base_url(self) -> str:
+        url = self._effective_api_url().rstrip("/")
+        for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses"):
+            if url.endswith(suffix):
+                url = url[: -len(suffix)]
+                break
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        return url
+
     def _runtime_config(self) -> dict[str, Any]:
         if self.runtime_config_provider is None:
             return {}
@@ -481,6 +799,14 @@ class HermesAgentClient:
             return max(1.0, float(raw)) if raw is not None else self.config.hermes_timeout_seconds
         except (TypeError, ValueError):
             return self.config.hermes_timeout_seconds
+
+    def _run_events_timeout_seconds(self) -> float:
+        raw = os.environ.get("ENTERPRISE_HERMES_RUN_EVENTS_TIMEOUT")
+        try:
+            configured = max(1.0, float(raw)) if raw is not None else 65.0
+        except (TypeError, ValueError):
+            configured = 65.0
+        return max(self._effective_timeout_seconds(), configured)
 
     @staticmethod
     def _apply_reasoning_config(
@@ -537,6 +863,13 @@ class AutoAgentClient:
                 raw={"mode": "auto-fallback", "error": str(exc)},
                 degraded=True,
             )
+
+    def respond_approval(self, *, run_id: str, choice: str, resolve_all: bool = False) -> dict[str, Any]:
+        if self.config.agent_mode == "local":
+            return self.local.respond_approval(run_id=run_id, choice=choice, resolve_all=resolve_all)
+        if self.runtime_manager is not None:
+            self.runtime_manager.ensure_hermes_ready(wait=True)
+        return self.hermes.respond_approval(run_id=run_id, choice=choice, resolve_all=resolve_all)
 
 
 def text_from_response_payload(payload: Any) -> str:

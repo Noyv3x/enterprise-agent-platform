@@ -10,12 +10,13 @@
 
 import { useRef, type ReactNode } from "react";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
-import { agentStatusFor, isAgentActive, scopeTypeFor } from "../../store/selectors";
+import { agentStatusFor, hasPermission, isAgentActive, scopeTypeFor } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { AgentStatus, ChatMode, Message, ScopeType, StreamMsg, TypingUser } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
 import { AgentActivity } from "./AgentActivity";
+import { AgentApprovalPrompt } from "./AgentApprovalPrompt";
 import { AgentTyping } from "./AgentTyping";
 import { AgentWorkCard, hasAgentProcessSteps } from "./AgentWorkCard";
 import { MessageBubble } from "./MessageBubble";
@@ -69,6 +70,9 @@ export function MessageList({
   const messages = useStore((state) => (mode === "private" ? state.privateMessages : state.messages));
   const status = useStore((state) => agentStatusFor(state, mode));
   const typingUsers = useStore((state) => (mode === "channel" ? state.typingUsers : EMPTY_TYPING));
+  const canApprove = useStore((state) =>
+    mode === "private" ? hasPermission(state, "private_agent") : hasPermission(state, "chat"),
+  );
 
   let body: ReactNode;
   if (noChannel) {
@@ -94,6 +98,16 @@ export function MessageList({
           <AgentTyping key="agent-typing" status={status} />
         ),
       );
+      if (status.approval && canApprove) {
+        items.push(
+          <AgentApprovalPrompt
+            approval={status.approval}
+            key="agent-approval"
+            mode={mode}
+            scopeId={scopeId}
+          />,
+        );
+      }
       for (const streamingMessage of agentStreamingMessages(status, mode, scopeType, scopeId)) {
         items.push(<MessageBubble key={String(streamingMessage.id)} message={streamingMessage} />);
       }

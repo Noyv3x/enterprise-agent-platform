@@ -32,6 +32,8 @@ import {
 } from "./loaders";
 import type {
   ActiveView,
+  AgentApprovalChoice,
+  AgentApprovalSubmitResponse,
   AgentStatus,
   AppState,
   ChannelMessagesResponse,
@@ -276,6 +278,38 @@ export async function sendMessage(
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
     toast(text, { type: "error", title: "发送失败" });
+    return false;
+  }
+}
+
+export async function respondAgentApproval(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+  choice: AgentApprovalChoice,
+): Promise<boolean> {
+  try {
+    const result =
+      mode === "private"
+        ? await api<AgentApprovalSubmitResponse>(endpoints.privateAgentApproval.path(), {
+            method: "POST",
+            body: JSON.stringify({ choice }),
+          })
+        : await api<AgentApprovalSubmitResponse>(endpoints.channelAgentApproval.path(scopeId), {
+            method: "POST",
+            body: JSON.stringify({ choice }),
+          });
+    store.dispatch({
+      type: "SET_AGENT_STATUS",
+      payload: { mode, scopeId, status: result.agent_status ?? null },
+    });
+    await refreshActiveChat(store);
+    toast("权限审批已提交", { type: "ok", title: "已处理" });
+    return true;
+  } catch (error) {
+    const text = error instanceof Error ? error.message || String(error) : String(error);
+    store.dispatch({ type: "SET_ERROR", payload: text });
+    toast(text, { type: "error", title: "审批失败" });
     return false;
   }
 }

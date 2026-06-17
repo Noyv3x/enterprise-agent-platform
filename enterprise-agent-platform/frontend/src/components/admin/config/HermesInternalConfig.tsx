@@ -36,12 +36,29 @@ export function HermesInternalConfig() {
   const fields = internal.fields || [];
   const envFields = internal.env || [];
   const sections = internal.sections || [];
+  const busy = useStore((state) => state.busy);
+  const approvalMode = String(fields.find((field) => field.key === "approvals.mode")?.value || "manual");
+  const yoloEnabled = approvalMode === "off";
 
   return (
     <section className="card config-software">
       <CardHead title="Hermes 内部配置" icon="settings" desc={internal.config_path || "config.yaml"} />
       {internal.yaml_error ? <div className="config-warning">{internal.yaml_error}</div> : null}
       {internal.default_error ? <div className="config-warning">{internal.default_error}</div> : null}
+      <label className="check-row config-yolo">
+        <input
+          checked={yoloEnabled}
+          disabled={busy}
+          onChange={(event) =>
+            void saveHermesYamlFields(store, { "approvals.mode": event.currentTarget.checked ? "off" : "manual" })
+          }
+          type="checkbox"
+        />
+        <span className="check-row__text">
+          <strong>YOLO 权限绕过</strong>
+          <span>{yoloEnabled ? "已关闭危险操作审批" : `当前审批模式: ${approvalMode || "manual"}`}</span>
+        </span>
+      </label>
       {sections.length ? (
         <div className="config-sections">
           {sections.slice(0, 18).map((section, index) => (

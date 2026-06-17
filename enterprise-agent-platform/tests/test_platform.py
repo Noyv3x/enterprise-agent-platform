@@ -50,6 +50,17 @@ class RecordingAgent:
         )
 
 
+class ApprovalRecordingAgent(RecordingAgent):
+    def __init__(self):
+        super().__init__()
+        self.approvals = []
+
+    def respond_approval(self, *, run_id, choice, resolve_all=False):
+        payload = {"run_id": run_id, "choice": choice, "resolve_all": resolve_all}
+        self.approvals.append(payload)
+        return {**payload, "resolved": 1}
+
+
 class UsageReportingAgent:
     def __init__(self, usages):
         self.usages = list(usages)
@@ -671,6 +682,39 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_agent_approval_status_can_be_responded_from_channel_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = ApprovalRecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service._record_hermes_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.request",
+                        "run_id": "run_42",
+                        "command": "rm -rf build",
+                        "description": "recursive delete",
+                        "choices": ["once", "session", "always", "deny"],
+                    },
+                )
+
+                status = service.agent_status(admin, "channel", "1")
+                self.assertEqual(status["state"], "approval")
+                self.assertEqual(status["approval"]["run_id"], "run_42")
+                self.assertEqual(status["approval"]["command"], "rm -rf build")
+
+                result = service.respond_agent_approval(admin, "channel", "1", "session")
+
+                self.assertEqual(agent.approvals, [{"run_id": "run_42", "choice": "session", "resolve_all": False}])
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["agent_status"]["state"], "replying")
+                self.assertIsNone(result["agent_status"]["approval"])
+                self.assertEqual(result["agent_status"]["current_step"], "权限审批已处理")
+            finally:
+                service.close()
+
     def test_hermes_client_uses_post_tool_stream_as_final_response(self):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -940,6 +984,113 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(events[0]["tool"], "enterprise_kb_search")
                 self.assertTrue(requests[-1]["body"]["stream"])
                 self.assertEqual(requests[-1]["headers"]["Authorization"], "Bearer test-key")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_hermes_client_reads_run_events_and_posts_approval_response(self):
+        requests = []
+        approvals = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if self.path == "/v1/runs":
+                    requests.append({"headers": dict(self.headers), "body": body})
+                    self.send_response(202)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"run_id": "run_1", "status": "started"}).encode("utf-8"))
+                    return
+                if self.path == "/v1/runs/run_1/approval":
+                    approvals.append({"headers": dict(self.headers), "body": body})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "object": "hermes.run.approval_response",
+                                "run_id": "run_1",
+                                "choice": body.get("choice"),
+                                "resolved": 1,
+                            }
+                        ).encode("utf-8")
+                    )
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path != "/v1/runs/run_1/events":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                events = [
+                    {"event": "message.delta", "run_id": "run_1", "delta": "Hello "},
+                    {
+                        "event": "approval.request",
+                        "run_id": "run_1",
+                        "command": "rm -rf build",
+                        "description": "recursive delete",
+                        "choices": ["once", "session", "always", "deny"],
+                    },
+                    {"event": "approval.responded", "run_id": "run_1", "choice": "once"},
+                    {"event": "message.delta", "run_id": "run_1", "delta": "world"},
+                    {
+                        "event": "run.completed",
+                        "run_id": "run_1",
+                        "output": "Hello world",
+                        "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                    },
+                ]
+                for event in events:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    hermes_api_key="test-key",
+                )
+                progress = []
+                chunks = []
+                client = HermesAgentClient(config, lambda name: "")
+                result = client.generate(
+                    system_prompt="system",
+                    user_message="question",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                    progress_callback=progress.append,
+                    content_callback=chunks.append,
+                )
+                response = client.respond_approval(run_id="run_1", choice="always", resolve_all=True)
+
+                self.assertEqual(result.content, "Hello world")
+                self.assertEqual(chunks, ["Hello ", "world"])
+                self.assertEqual([event["event"] for event in progress], ["approval.request", "approval.responded"])
+                self.assertEqual(result.raw["mode"], "runs")
+                self.assertEqual(result.raw["usage"]["total_tokens"], 3)
+                self.assertEqual(requests[0]["body"]["input"][0]["content"], "question")
+                self.assertEqual(requests[0]["body"]["instructions"], "system")
+                self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Key"], "channel:1:main-agent")
+                self.assertEqual(approvals[0]["body"], {"choice": "always", "all": True})
+                self.assertEqual(response["resolved"], 1)
         finally:
             server.shutdown()
             server.server_close()

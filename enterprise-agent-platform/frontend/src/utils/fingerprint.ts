@@ -63,6 +63,15 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
     stream_messages: (status.stream_messages || []).map(
       (item) => `${item.id}:${item.content || ""}:${item.updated_at || 0}`,
     ),
+    approval: status.approval
+      ? {
+          run_id: status.approval.run_id || "",
+          command: status.approval.command || "",
+          description: status.approval.description || "",
+          choices: status.approval.choices || [],
+          requested_at: status.approval.requested_at || 0,
+        }
+      : null,
     replying_to: status.replying_to
       ? {
           id: status.replying_to.id,

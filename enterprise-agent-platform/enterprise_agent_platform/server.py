@@ -348,6 +348,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             body = self._body_json()
             self._json(service.update_typing(actor, "channel", m.group(1), bool(body.get("typing"))))
             return
+        m = re.fullmatch(r"/api/channels/(\d+)/agent-approval", path)
+        if m and method == "POST":
+            body = self._body_json()
+            self._json(
+                service.respond_agent_approval(
+                    actor,
+                    "channel",
+                    m.group(1),
+                    str(body.get("choice", "")),
+                    bool(body.get("all") or body.get("resolve_all")),
+                )
+            )
+            return
         m = re.fullmatch(r"/api/channels/(\d+)/agent-status", path)
         if m and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "channel", m.group(1))})
@@ -371,6 +384,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/private-agent/agent-status" and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
+            return
+        if path == "/api/private-agent/agent-approval" and method == "POST":
+            body = self._body_json()
+            self._json(
+                service.respond_agent_approval(
+                    actor,
+                    "private",
+                    str(actor["id"]),
+                    str(body.get("choice", "")),
+                    bool(body.get("all") or body.get("resolve_all")),
+                )
+            )
             return
         if path == "/api/private-agent/events" and method == "GET":
             self._stream_scope_events(actor, "private", str(actor["id"]))
@@ -704,12 +729,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 status = service.agent_status(actor, scope_type, scope_id)
                 latest = service.latest_message_id(scope_type, scope_id)
                 stream = status.get("stream_message") or {}
+                approval = status.get("approval") or {}
                 token_tuple = (
                     latest,
                     status.get("state"),
                     status.get("updated_at"),
                     stream.get("content"),
                     len(status.get("stream_messages") or []),
+                    approval.get("run_id"),
+                    approval.get("command"),
+                    approval.get("description"),
                 )
                 if token_tuple != last_token:
                     payload = json.dumps(

@@ -4,6 +4,7 @@
    ===================================================================== */
 
 import type {
+  AgentApprovalChoice,
   AgentStatus,
   AutoUpdateConfigState,
   Channel,
@@ -92,6 +93,18 @@ export interface PostMessageRequest {
 
 export interface PostMessageResponse {
   user_message: Message;
+  agent_status?: AgentStatus | null;
+}
+
+export interface AgentApprovalSubmitRequest {
+  choice: AgentApprovalChoice;
+  all?: boolean;
+  resolve_all?: boolean;
+}
+
+export interface AgentApprovalSubmitResponse {
+  ok?: boolean;
+  approval?: unknown;
   agent_status?: AgentStatus | null;
 }
 

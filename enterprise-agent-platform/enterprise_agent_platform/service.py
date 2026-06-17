@@ -2950,6 +2950,47 @@ class EnterpriseService:
             status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
             return self._copy_status(status)
 
+    def respond_agent_approval(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        choice: str,
+        resolve_all: bool = False,
+    ) -> dict[str, Any]:
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        if scope_type == "channel":
+            require_permission(actor, PERMISSION_CHAT)
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        normalized_choice = aliases.get(str(choice or "").strip().lower(), str(choice or "").strip().lower())
+        if normalized_choice not in {"once", "session", "always", "deny"}:
+            raise ServiceError(400, "invalid approval choice")
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+            approval = dict(status.get("approval") or {})
+        run_id = str(approval.get("run_id") or "").strip()
+        if not run_id:
+            raise ServiceError(409, "no pending approval for this conversation")
+        responder = self._actor_display_name(actor)
+        respond = getattr(self.agent_client, "respond_approval", None)
+        if not callable(respond):
+            raise ServiceError(503, "agent approval response is not supported")
+        try:
+            approval_result = respond(run_id=run_id, choice=normalized_choice, resolve_all=bool(resolve_all))
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        except Exception as exc:
+            raise ServiceError(502, str(exc)) from exc
+        updated = self._mark_agent_approval_responded(
+            scope_type,
+            scope_id,
+            normalized_choice,
+            responder=responder,
+            approval_result=approval_result if isinstance(approval_result, dict) else {},
+        )
+        return {"ok": True, "approval": approval_result, "agent_status": updated}
+
     def update_typing(self, actor: dict[str, Any], scope_type: str, scope_id: str, typing: bool) -> dict[str, Any]:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         if scope_type == "channel":
@@ -3196,6 +3237,7 @@ class EnterpriseService:
             "last_error": "",
             "stream_messages": [],
             "stream_message": None,
+            "approval": None,
         }
 
     @staticmethod
@@ -3214,6 +3256,7 @@ class EnterpriseService:
             "last_error": last_error,
             "stream_messages": [],
             "stream_message": None,
+            "approval": None,
         }
 
     @staticmethod
@@ -3225,6 +3268,8 @@ class EnterpriseService:
         copied["stream_messages"] = [dict(item) for item in copied.get("stream_messages") or []]
         if copied.get("stream_message"):
             copied["stream_message"] = dict(copied["stream_message"])
+        if copied.get("approval"):
+            copied["approval"] = dict(copied["approval"])
         return copied
 
     def _record_agent_activity(
@@ -3308,10 +3353,23 @@ class EnterpriseService:
     def _record_hermes_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):
             return
+        event_type = str(event.get("event") or event.get("type") or event.get("event_type") or "").strip().lower()
+        if event_type == "approval.request":
+            self._record_agent_approval_request(scope_type, scope_id, event)
+            return
+        if event_type == "approval.responded":
+            self._mark_agent_approval_responded(
+                scope_type,
+                scope_id,
+                str(event.get("choice") or "").strip().lower(),
+                responder="Hermes",
+                approval_result=event,
+            )
+            return
         tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
         label = str(event.get("label") or event.get("preview") or tool).strip() or tool
         tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or event.get("id") or "").strip()
-        tool_status = str(event.get("status") or event.get("event_type") or "running").strip().lower()
+        tool_status = str(event.get("status") or event.get("event_type") or event.get("event") or "running").strip().lower()
         timestamp = now_ts()
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
@@ -3357,10 +3415,96 @@ class EnterpriseService:
                 activity.append(item_data)
             if is_substantive_tool_start(event):
                 status = self._finalize_stream_message(status, timestamp)
+            if status.get("state") == "approval":
+                status["state"] = "replying"
+                status["approval"] = None
             status["activity"] = activity[-30:]
             status["current_step"] = line
             status["updated_at"] = timestamp
             self._agent_status[key] = status
+
+    def _record_agent_approval_request(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
+        timestamp = now_ts()
+        key = self._conversation_key(scope_type, str(scope_id))
+        approval = self._approval_request_from_event(event, timestamp)
+        line = f"等待权限审批: {approval['description']}"
+        with self._conversation_lock:
+            status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            status = self._finalize_stream_message(status, timestamp)
+            activity = [dict(item) for item in status.get("activity") or []]
+            activity.append(
+                {
+                    "stage": "approval",
+                    "source": "hermes",
+                    "label": "等待权限审批",
+                    "detail": approval["description"],
+                    "line": line,
+                    "at": timestamp,
+                }
+            )
+            status["state"] = "approval"
+            status["approval"] = approval
+            status["activity"] = activity[-30:]
+            status["current_step"] = line
+            status["updated_at"] = timestamp
+            self._agent_status[key] = status
+
+    def _mark_agent_approval_responded(
+        self,
+        scope_type: str,
+        scope_id: str,
+        choice: str,
+        *,
+        responder: str,
+        approval_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_ts()
+        key = self._conversation_key(scope_type, str(scope_id))
+        choice_label = {
+            "once": "允许一次",
+            "session": "本会话允许",
+            "always": "始终允许",
+            "deny": "拒绝",
+        }.get(choice, choice or "已处理")
+        with self._conversation_lock:
+            status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            activity = [dict(item) for item in status.get("activity") or []]
+            activity.append(
+                {
+                    "stage": "approval.responded",
+                    "source": "platform",
+                    "label": "权限审批已处理",
+                    "detail": f"{responder}: {choice_label}",
+                    "line": f"权限审批已处理: {choice_label}",
+                    "at": timestamp,
+                    "approval_result": dict(approval_result or {}),
+                }
+            )
+            status["state"] = "replying" if status.get("state") in {"approval", "replying"} else status.get("state", "replying")
+            status["approval"] = None
+            status["activity"] = activity[-30:]
+            status["current_step"] = "权限审批已处理"
+            status["updated_at"] = timestamp
+            self._agent_status[key] = status
+            return self._copy_status(status)
+
+    @staticmethod
+    def _approval_request_from_event(event: dict[str, Any], timestamp: int) -> dict[str, Any]:
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            choices = ["once", "session", "always", "deny"]
+        pattern_keys = event.get("pattern_keys")
+        if not isinstance(pattern_keys, list):
+            pattern_keys = [event.get("pattern_key")] if event.get("pattern_key") else []
+        return {
+            "run_id": str(event.get("run_id") or "").strip(),
+            "command": str(event.get("command") or "").strip(),
+            "description": str(event.get("description") or "危险操作需要权限审批").strip(),
+            "pattern_key": str(event.get("pattern_key") or "").strip(),
+            "pattern_keys": [str(item) for item in pattern_keys if str(item or "").strip()],
+            "choices": [str(item) for item in choices if str(item or "").strip()],
+            "requested_at": int(float(event.get("timestamp") or timestamp)),
+        }
 
     def _agent_work_snapshot(self, task: dict[str, Any], state: str) -> dict[str, Any]:
         key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
@@ -3374,6 +3518,7 @@ class EnterpriseService:
             "current_step": status.get("current_step") or "",
             "started_at": status.get("started_at"),
             "updated_at": status.get("updated_at"),
+            "approval": status.get("approval"),
         }
 
     @staticmethod
