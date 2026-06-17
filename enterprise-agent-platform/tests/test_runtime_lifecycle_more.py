@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -111,6 +113,53 @@ class HermesProcessEnvTests(unittest.TestCase):
             self.assertTrue(scratch.is_dir())
             # The managed HERMES_HOME is still threaded through.
             self.assertEqual(env["HERMES_HOME"], str(manager.config.managed_hermes_home))
+
+
+class HermesRuntimePatchCompatibilityTests(unittest.TestCase):
+    def test_managed_hermes_patch_applies_to_pinned_submodule(self):
+        if shutil.which("git") is None:
+            self.skipTest("git is required to verify the Hermes runtime patch")
+
+        platform_root = Path(__file__).resolve().parents[1]
+        repo_root = platform_root.parent
+        hermes_repo = repo_root / "hermes-agent"
+        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
+
+        if not (hermes_repo / "gateway" / "platforms" / "api_server.py").exists():
+            self.skipTest("Hermes submodule is not initialized")
+        self.assertTrue(patch_path.exists(), f"managed Hermes patch is missing: {patch_path}")
+
+        before = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=hermes_repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        result = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn", str(patch_path)],
+            cwd=hermes_repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        after = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=hermes_repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(before.returncode, 0, before.stderr)
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertEqual(before.stdout, after.stdout)
+        if result.returncode != 0:
+            self.fail(
+                "Managed Hermes runtime patch no longer applies to the pinned hermes-agent submodule.\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
 
 
 class FirecrawlEnvLocationTests(unittest.TestCase):

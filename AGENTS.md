@@ -11,6 +11,16 @@ This workspace ties together an enterprise platform and three upstream codebases
 - Runtime data, databases, logs, workspaces, and secrets are intentionally ignored. Use `ENTERPRISE_PLATFORM_DATA` to relocate platform state.
 - This project depends on the underlying Hermes Agent, Cognee, and Firecrawl codebases. For platform adapter or integration changes involving any of them, inspect the corresponding upstream submodule first so the change matches its runtime behavior and extension points.
 
+## Upstream Submodule Boundary
+
+The platform is a wrapper/orchestration layer around upstream Hermes Agent, Cognee, and Firecrawl. Do not treat those submodules as owned application code.
+
+- Do not create commits, branches, pull requests, or push attempts against `hermes-agent/`, `cognee/`, or `firecrawl/` upstream repositories during normal platform work.
+- Do not update a pinned submodule revision unless the task is explicitly to bump that upstream dependency.
+- If a platform feature needs behavior that would otherwise require changing Hermes, Cognee, or Firecrawl, implement it in this repository's platform-owned code instead: adapters, managed runtime configuration, plugins, wrapper services, or runtime patches such as `enterprise_agent_platform/hermes_runtime_patch/`.
+- Inspect upstream submodule code freely to understand behavior and extension points, but keep the actual product change in platform-owned files.
+- If an upstream change is truly unavoidable, stop and get explicit direction about the target fork/branch/PR. Never assume permission to affect upstream `main`.
+
 ## Build, Test, and Development Commands
 
 Use the top-level one-command deploy path for local bring-up:

@@ -631,6 +631,7 @@ class HermesAgentClient:
     ) -> AgentResult:
         content_parts: list[str] = []
         final_output = ""
+        final_session_id = response_session
         usage: dict[str, Any] | None = None
         failure_message: str | None = None
         raw_events: list[dict[str, Any]] = []
@@ -644,7 +645,7 @@ class HermesAgentClient:
             del raw_events[:-50]
 
         def dispatch_event() -> bool:
-            nonlocal data_lines, final_output, failure_message, usage
+            nonlocal data_lines, final_output, final_session_id, failure_message, usage
             if not data_lines:
                 return False
             data = "\n".join(data_lines)
@@ -667,6 +668,9 @@ class HermesAgentClient:
                 return False
             if event_type == "run.completed":
                 final_output = text_from_content(payload.get("output"))
+                event_session = str(payload.get("session_id") or "").strip()
+                if event_session:
+                    final_session_id = event_session
                 raw_usage = payload.get("usage")
                 usage = raw_usage if isinstance(raw_usage, dict) else None
                 return True
@@ -716,11 +720,11 @@ class HermesAgentClient:
         if failure_message is not None:
             raw["error"] = failure_message
             if content:
-                return AgentResult(content=content, session_id=response_session, raw=raw, degraded=True)
+                return AgentResult(content=content, session_id=final_session_id, raw=raw, degraded=True)
             raise ValueError(f"Hermes run failed: {failure_message}")
         if not content:
             raise ValueError(f"Hermes run returned an empty response after {event_count} events")
-        return AgentResult(content=content, session_id=response_session, raw=raw)
+        return AgentResult(content=content, session_id=final_session_id, raw=raw)
 
     def _request_headers(
         self,

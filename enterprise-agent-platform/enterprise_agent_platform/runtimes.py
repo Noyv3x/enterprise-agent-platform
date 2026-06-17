@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import json
 import re
@@ -472,15 +473,16 @@ class PlatformRuntimeManager:
                 source=str(repo),
                 install_state="invalid-source",
             )
+        runtime_source = self._managed_hermes_source_dir()
         if not force and self._managed_venv_ready():
             return RuntimeStatus(
                 "hermes",
                 True,
                 True,
                 "installed",
-                "Hermes is installed from the adjacent source repository",
+                "Hermes is installed from a platform-managed patched source copy",
                 path=str(home),
-                source=str(repo),
+                source=str(runtime_source),
                 install_state="installed",
             )
         venv_dir = self._hermes_venv_dir()
@@ -489,6 +491,7 @@ class PlatformRuntimeManager:
         try:
             if force and venv_dir.exists():
                 shutil.rmtree(venv_dir)
+            runtime_source = self._prepare_managed_hermes_source(repo, force=force)
             result = self.command_runner.run(
                 [sys.executable, "-m", "venv", str(venv_dir)],
                 cwd=None,
@@ -498,26 +501,26 @@ class PlatformRuntimeManager:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"venv creation failed with exit code {result.returncode}")
-            install_target = self._editable_install_target(repo)
+            install_target = self._editable_install_target(runtime_source)
             result = self.command_runner.run(
                 [str(self._hermes_venv_python()), "-m", "pip", "install", "-e", install_target],
-                cwd=repo,
+                cwd=runtime_source,
                 env=env,
                 log_path=log_path,
                 timeout=900,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Hermes source install failed with exit code {result.returncode}")
-            self._write_install_marker(repo)
+            self._write_install_marker(repo, runtime_source)
             self._hermes_last_error = ""
             return RuntimeStatus(
                 "hermes",
                 True,
                 True,
                 "installed",
-                "Hermes is installed from the adjacent source repository",
+                "Hermes is installed from a platform-managed patched source copy",
                 path=str(home),
-                source=str(repo),
+                source=str(runtime_source),
                 install_state="installed",
             )
         except Exception as exc:
@@ -1413,12 +1416,12 @@ class PlatformRuntimeManager:
         env["TMPDIR"] = scratch_str
         env["TEMP"] = scratch_str
         env["TMP"] = scratch_str
-        repo = self._effective_hermes_repo()
+        source = self._effective_hermes_runtime_source()
         patch_path = Path(__file__).resolve().parent / "hermes_runtime_patch"
         python_path_parts = [str(patch_path)]
-        if repo.exists():
+        if source.exists():
             current = env.get("PYTHONPATH", "")
-            python_path_parts.append(str(repo))
+            python_path_parts.append(str(source))
             if current:
                 python_path_parts.append(current)
         elif env.get("PYTHONPATH"):
@@ -1465,15 +1468,15 @@ class PlatformRuntimeManager:
         return values
 
     def _hermes_command(self) -> tuple[list[str], Path | None, str]:
-        repo = self._effective_hermes_repo()
+        source = self._effective_hermes_runtime_source()
         venv_python = self._hermes_venv_python()
         if self._managed_venv_ready():
             return (
                 [str(venv_python), "-m", "hermes_cli.main", "gateway", "run", "--replace", "--quiet"],
-                repo,
-                f"managed source install: {repo}",
+                source,
+                f"managed patched source install: {source}",
             )
-        return ([], None, f"Hermes is not installed from source: {repo}")
+        return ([], None, f"Hermes is not installed from managed source: {source}")
 
     def _camofox_command(self) -> tuple[list[str], Path | None, str]:
         configured = self._effective_camofox_command()
@@ -1816,6 +1819,117 @@ class PlatformRuntimeManager:
             return self._hermes_venv_dir() / "Scripts" / "python.exe"
         return self._hermes_venv_dir() / "bin" / "python"
 
+    def _managed_hermes_source_dir(self) -> Path:
+        return self.config.managed_hermes_home / "source" / "hermes-agent"
+
+    def _managed_hermes_source_marker_path(self) -> Path:
+        return self.config.managed_hermes_home / "source" / "source.json"
+
+    def _hermes_platform_patch_path(self) -> Path:
+        return Path(__file__).resolve().parent / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
+
+    def _hermes_platform_patch_digest(self) -> str:
+        patch_path = self._hermes_platform_patch_path()
+        try:
+            return hashlib.sha256(patch_path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    def _hermes_repo_revision(self, repo: Path) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(repo),
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    def _hermes_source_metadata(self, repo: Path) -> dict[str, Any]:
+        patch_path = self._hermes_platform_patch_path()
+        return {
+            "source": str(repo),
+            "source_revision": self._hermes_repo_revision(repo),
+            "patch_path": str(patch_path),
+            "patch_digest": self._hermes_platform_patch_digest(),
+            "patch_applicable": self._hermes_platform_patch_applicable(repo),
+        }
+
+    def _hermes_platform_patch_applicable(self, source: Path) -> bool:
+        # Tiny fake repos in tests do not contain the upstream API server files
+        # this patch targets. Real Hermes sources do; if they drift, git apply
+        # will fail and surface the incompatibility during managed install.
+        return (source / "gateway" / "platforms" / "api_server.py").exists()
+
+    def _managed_hermes_source_ready(self, repo: Path) -> bool:
+        source = self._managed_hermes_source_dir()
+        marker_path = self._managed_hermes_source_marker_path()
+        if not (source / "pyproject.toml").exists() or not marker_path.exists():
+            return False
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        expected = self._hermes_source_metadata(repo)
+        return all(marker.get(key) == value for key, value in expected.items())
+
+    def _prepare_managed_hermes_source(self, repo: Path, *, force: bool = False) -> Path:
+        source = self._managed_hermes_source_dir()
+        if not force and self._managed_hermes_source_ready(repo):
+            return source
+
+        tmp_source = source.with_name(f"{source.name}.tmp")
+        if tmp_source.exists():
+            shutil.rmtree(tmp_source)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            repo,
+            tmp_source,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                ".venv",
+                "__pycache__",
+                ".pytest_cache",
+                ".mypy_cache",
+                ".ruff_cache",
+                "node_modules",
+            ),
+        )
+
+        metadata = self._hermes_source_metadata(repo)
+        if metadata["patch_applicable"]:
+            patch_path = self._hermes_platform_patch_path()
+            if not patch_path.exists():
+                raise RuntimeError(f"Managed Hermes patch not found: {patch_path}")
+            log_path = self.config.managed_hermes_home / "logs" / "managed-install.log"
+            result = self.command_runner.run(
+                ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+                cwd=tmp_source,
+                env=os.environ.copy(),
+                log_path=log_path,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Managed Hermes patch failed with exit code {result.returncode}")
+
+        if source.exists():
+            shutil.rmtree(source)
+        tmp_source.rename(source)
+        marker_path = self._managed_hermes_source_marker_path()
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+        return source
+
+    def _effective_hermes_runtime_source(self) -> Path:
+        source = self._managed_hermes_source_dir()
+        return source if source.exists() else self._effective_hermes_repo()
+
     def _install_marker_path(self) -> Path:
         return self.config.managed_hermes_home / HERMES_INSTALL_MARKER
 
@@ -1827,8 +1941,14 @@ class PlatformRuntimeManager:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except Exception:
             return False
+        repo = self._effective_hermes_repo()
+        source = self._managed_hermes_source_dir()
         return (
-            marker.get("source") == str(self._effective_hermes_repo())
+            self._managed_hermes_source_ready(repo)
+            and marker.get("source") == str(repo)
+            and marker.get("runtime_source") == str(source)
+            and marker.get("source_revision", "") == self._hermes_repo_revision(repo)
+            and marker.get("patch_digest", "") == self._hermes_platform_patch_digest()
             and marker.get("extras", "") == self._effective_install_extras()
         )
 
@@ -1853,9 +1973,12 @@ class PlatformRuntimeManager:
             return f"Hermes source has not been installed into the managed venv: {repo}"
         return ""
 
-    def _write_install_marker(self, repo: Path) -> None:
+    def _write_install_marker(self, repo: Path, runtime_source: Path) -> None:
         marker = {
             "source": str(repo),
+            "runtime_source": str(runtime_source),
+            "source_revision": self._hermes_repo_revision(repo),
+            "patch_digest": self._hermes_platform_patch_digest(),
             "extras": self._effective_install_extras(),
             "installed_at": now_ts(),
         }
@@ -1867,7 +1990,9 @@ class PlatformRuntimeManager:
         return f"{repo}[{extras}]" if extras else str(repo)
 
     def _hermes_source_label(self) -> str:
-        return str(self._effective_hermes_repo())
+        source = self._effective_hermes_runtime_source()
+        repo = self._effective_hermes_repo()
+        return f"{source} (patched from {repo})" if source != repo else str(repo)
 
     def _camofox_source_label(self) -> str:
         command, _cwd, detail = self._camofox_command()

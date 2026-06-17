@@ -1,0 +1,1900 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 62de3f2c5..5bd099158 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1117,6 +1117,7 @@ def init_agent(
+                 agent._memory_store = MemoryStore(
+                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                     user_char_limit=mem_config.get("user_char_limit", 1375),
++                    memory_scope_key=agent._gateway_session_key,
+                 )
+                 agent._memory_store.load_from_disk()
+         except Exception:
+@@ -1139,6 +1140,7 @@ def init_agent(
+                 if _mp and _mp.is_available():
+                     agent._memory_manager.add_provider(_mp)
+                 if agent._memory_manager.providers:
++                    _agent_scope_key = str(agent._gateway_session_key or "").strip()
+                     _init_kwargs = {
+                         "session_id": agent.session_id,
+                         "platform": platform or "cli",
+@@ -1170,15 +1172,23 @@ def init_agent(
+                     if agent._thread_id:
+                         _init_kwargs["thread_id"] = agent._thread_id
+                     # Thread gateway session key for stable per-chat Honcho session isolation
+-                    if agent._gateway_session_key:
+-                        _init_kwargs["gateway_session_key"] = agent._gateway_session_key
++                    if _agent_scope_key:
++                        _init_kwargs["gateway_session_key"] = _agent_scope_key
++                        _init_kwargs["agent_scope_key"] = _agent_scope_key
++                        # Providers that scope by user/agent id should not
++                        # collapse all API-server agents into one default user.
++                        _init_kwargs.setdefault("user_id", _agent_scope_key)
++                        _init_kwargs.setdefault("agent_id", _agent_scope_key)
+                     # Profile identity for per-profile provider scoping
+                     try:
+                         from hermes_cli.profiles import get_active_profile_name
+                         _profile = get_active_profile_name()
+-                        _init_kwargs["agent_identity"] = _profile
++                        _init_kwargs["agent_identity"] = _agent_scope_key or _profile
+                         _init_kwargs["agent_workspace"] = "hermes"
+                     except Exception:
++                        if _agent_scope_key:
++                            _init_kwargs["agent_identity"] = _agent_scope_key
++                            _init_kwargs["agent_workspace"] = "hermes"
+                         pass
+                     agent._memory_manager.initialize_all(**_init_kwargs)
+                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+@@ -1604,8 +1614,14 @@ def init_agent(
+         except Exception as _ce_err:
+             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
+ 
++    try:
++        from agent.runtime_cwd import resolve_context_cwd
++
++        _context_working_dir = resolve_context_cwd()
++    except Exception:
++        _context_working_dir = None
+     agent._subdirectory_hints = SubdirectoryHintTracker(
+-        working_dir=os.getenv("TERMINAL_CWD") or None,
++        working_dir=str(_context_working_dir) if _context_working_dir else (os.getenv("TERMINAL_CWD") or None),
+     )
+     agent._user_turn_count = 0
+ 
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 3e4e92a33..337629717 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1741,6 +1741,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+                     sort=next_args.get("sort"),
+                     db=session_db,
+                     current_session_id=agent.session_id,
++                    current_session_key=getattr(agent, "_gateway_session_key", None),
+                 ),
+                 next_args,
+             )
+diff --git a/agent/background_review.py b/agent/background_review.py
+index bf99ee528..4036c2f67 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -314,6 +314,7 @@ def build_memory_write_metadata(
+         ),
+         "session_id": agent.session_id or "",
+         "parent_session_id": agent._parent_session_id or "",
++        "gateway_session_key": getattr(agent, "_gateway_session_key", "") or "",
+         "platform": agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+         "tool_name": "memory",
+     }
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 06257ffd2..99509871f 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -514,12 +514,21 @@ def compress_context(
+             except Exception:
+                 os.environ["HERMES_SESSION_ID"] = agent.session_id
+             agent._session_db_created = False
++            try:
++                from agent.runtime_cwd import resolve_context_cwd
++
++                _context_cwd = resolve_context_cwd()
++                _session_cwd = str(_context_cwd) if _context_cwd else None
++            except Exception:
++                _session_cwd = None
+             agent._session_db.create_session(
+                 session_id=agent.session_id,
+                 source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                 model=agent.model,
+                 model_config=agent._session_init_model_config,
++                session_key=getattr(agent, "_gateway_session_key", None),
+                 parent_session_id=old_session_id,
++                cwd=_session_cwd,
+             )
+             agent._session_db_created = True
+             # Auto-number the title for the continuation session
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 26fcfaae3..9200243d7 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -729,7 +729,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
+     per process. Used only for non-local backends where the agent's tools
+     operate on a different machine than the host Hermes runs on.
+     """
+-    cwd_hint = os.getenv("TERMINAL_CWD", "")
++    try:
++        from agent.runtime_cwd import resolve_context_cwd
++
++        context_cwd = resolve_context_cwd()
++        cwd_hint = str(context_cwd) if context_cwd else os.getenv("TERMINAL_CWD", "")
++    except Exception:
++        cwd_hint = os.getenv("TERMINAL_CWD", "")
+     cache_key = (env_type, cwd_hint)
+     cached = _BACKEND_PROBE_CACHE.get(cache_key)
+     if cached is not None:
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index f908aedb8..d8ad33475 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -406,7 +406,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+                 try:
+                     cmd = function_args.get("command", "")
+                     if _is_destructive_command(cmd):
+-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
++                        if function_args.get("workdir"):
++                            cwd = function_args["workdir"]
++                        else:
++                            from agent.runtime_cwd import resolve_agent_cwd
++
++                            cwd = str(resolve_agent_cwd())
+                         agent._checkpoint_mgr.ensure_checkpoint(
+                             cwd, f"before terminal: {cmd[:60]}"
+                         )
+@@ -919,7 +924,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+             try:
+                 cmd = function_args.get("command", "")
+                 if _is_destructive_command(cmd):
+-                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
++                    if function_args.get("workdir"):
++                        cwd = function_args["workdir"]
++                    else:
++                        from agent.runtime_cwd import resolve_agent_cwd
++
++                        cwd = str(resolve_agent_cwd())
+                     agent._checkpoint_mgr.ensure_checkpoint(
+                         cwd, f"before terminal: {cmd[:60]}"
+                     )
+@@ -997,6 +1007,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                     sort=next_args.get("sort"),
+                     db=session_db,
+                     current_session_id=agent.session_id,
++                    current_session_key=getattr(agent, "_gateway_session_key", None),
+                 )
+             function_result, function_args = _run_agent_tool_execution_middleware(
+                 agent,
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 13e97f4bd..99e793401 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -956,6 +956,35 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         return raw, None
+ 
++    @staticmethod
++    def _workspace_cwd_from_body(body: Any) -> str:
++        """Return a request-scoped workspace cwd from safe metadata, if present."""
++        if not isinstance(body, dict):
++            return ""
++        metadata = body.get("metadata")
++        if not isinstance(metadata, dict):
++            return ""
++
++        candidates: List[Any] = [metadata.get("workspace_path")]
++        workspace = metadata.get("workspace")
++        if isinstance(workspace, dict):
++            candidates.append(workspace.get("path"))
++        container = metadata.get("container")
++        if isinstance(container, dict):
++            candidates.append(container.get("workspace_path"))
++
++        for raw in candidates:
++            value = str(raw or "").strip()
++            if not value or re.search(r"[\r\n\x00]", value):
++                continue
++            try:
++                path = Path(value).expanduser()
++                if path.is_absolute() and path.is_dir():
++                    return str(path.resolve())
++            except Exception:
++                continue
++        return ""
++
+     # ------------------------------------------------------------------
+     # Session DB helper
+     # ------------------------------------------------------------------
+@@ -1529,6 +1558,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        session_cwd = self._workspace_cwd_from_body(body)
+         history = self._conversation_history_for_session(session_id)
+         result, usage = await self._run_agent(
+             user_message=user_message,
+@@ -1536,6 +1566,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             ephemeral_system_prompt=system_prompt,
+             session_id=session_id,
+             gateway_session_key=gateway_session_key,
++            session_cwd=session_cwd,
+         )
+         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+@@ -1573,6 +1604,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        session_cwd = self._workspace_cwd_from_body(body)
+ 
+         loop = asyncio.get_running_loop()
+         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
+@@ -1627,6 +1659,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     stream_delta_callback=_delta,
+                     tool_progress_callback=_tool_progress,
+                     gateway_session_key=gateway_session_key,
++                    session_cwd=session_cwd,
+                 )
+                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+@@ -1807,6 +1840,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             session_id = _derive_chat_session_id(system_prompt, first_user)
+             # history already set from request body above
+ 
++        session_cwd = self._workspace_cwd_from_body(body)
+         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+         model_name = body.get("model", self._model_name)
+         created = int(time.time())
+@@ -1893,6 +1927,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                session_cwd=session_cwd,
+             ))
+             # Ensure SSE drain loops can terminate without relying on polling
+             # agent_task.done(), which can race with queue timeout checks.
+@@ -1912,6 +1947,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=system_prompt,
+                 session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                session_cwd=session_cwd,
+             )
+ 
+         idempotency_key = request.headers.get("Idempotency-Key")
+@@ -2871,6 +2907,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         # Reuse session from previous_response_id chain so the dashboard
+         # groups the entire conversation under one session entry.
+         session_id = stored_session_id or str(uuid.uuid4())
++        session_cwd = self._workspace_cwd_from_body(body)
+ 
+         stream = _coerce_request_bool(body.get("stream"), default=False)
+         if stream:
+@@ -2925,6 +2962,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                session_cwd=session_cwd,
+             ))
+             # Ensure SSE drain loops can terminate without relying on polling
+             # agent_task.done(), which can race with queue timeout checks.
+@@ -2958,6 +2996,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=instructions,
+                 session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                session_cwd=session_cwd,
+             )
+ 
+         idempotency_key = request.headers.get("Idempotency-Key")
+@@ -3468,6 +3507,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         tool_complete_callback=None,
+         agent_ref: Optional[list] = None,
+         gateway_session_key: Optional[str] = None,
++        session_cwd: Optional[str] = None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+@@ -3483,35 +3523,50 @@ class APIServerAdapter(BasePlatformAdapter):
+         loop = asyncio.get_running_loop()
+ 
+         def _run():
+-            agent = self._create_agent(
+-                ephemeral_system_prompt=ephemeral_system_prompt,
+-                session_id=session_id,
+-                stream_delta_callback=stream_delta_callback,
+-                tool_progress_callback=tool_progress_callback,
+-                tool_start_callback=tool_start_callback,
+-                tool_complete_callback=tool_complete_callback,
+-                gateway_session_key=gateway_session_key,
+-            )
+-            if agent_ref is not None:
+-                agent_ref[0] = agent
+-            effective_task_id = session_id or str(uuid.uuid4())
+-            result = agent.run_conversation(
+-                user_message=user_message,
+-                conversation_history=conversation_history,
+-                task_id=effective_task_id,
+-            )
+-            usage = {
+-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+-            }
+-            # Include the effective session ID in the result so callers
+-            # (e.g. X-Hermes-Session-Id header) can track compression-
+-            # triggered session rotations. (#16938)
+-            _eff_sid = getattr(agent, "session_id", session_id)
+-            if isinstance(_eff_sid, str) and _eff_sid:
+-                result["session_id"] = _eff_sid
+-            return result, usage
++            from gateway.session_context import clear_session_vars, set_session_vars
++
++            session_tokens = []
++            try:
++                session_tokens = set_session_vars(
++                    platform="api_server",
++                    session_key=gateway_session_key or "",
++                    cwd=session_cwd or "",
++                )
++                agent = self._create_agent(
++                    ephemeral_system_prompt=ephemeral_system_prompt,
++                    session_id=session_id,
++                    stream_delta_callback=stream_delta_callback,
++                    tool_progress_callback=tool_progress_callback,
++                    tool_start_callback=tool_start_callback,
++                    tool_complete_callback=tool_complete_callback,
++                    gateway_session_key=gateway_session_key,
++                )
++                if agent_ref is not None:
++                    agent_ref[0] = agent
++                effective_task_id = session_id or str(uuid.uuid4())
++                result = agent.run_conversation(
++                    user_message=user_message,
++                    conversation_history=conversation_history,
++                    task_id=effective_task_id,
++                )
++                usage = {
++                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
++                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
++                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
++                }
++                # Include the effective session ID in the result so callers
++                # (e.g. X-Hermes-Session-Id header) can track compression-
++                # triggered session rotations. (#16938)
++                _eff_sid = getattr(agent, "session_id", session_id)
++                if isinstance(_eff_sid, str) and _eff_sid:
++                    result["session_id"] = _eff_sid
++                return result, usage
++            finally:
++                if session_tokens:
++                    try:
++                        clear_session_vars(session_tokens)
++                    except Exception:
++                        pass
+ 
+         return await loop.run_in_executor(None, _run)
+ 
+@@ -3663,8 +3718,32 @@ class APIServerAdapter(BasePlatformAdapter):
+                     conversation_history.append({"role": msg["role"], "content": str(content)})
+ 
+         run_id = f"run_{uuid.uuid4().hex}"
+-        session_id = body.get("session_id") or stored_session_id or run_id
++        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
++        if provided_session_id:
++            if not self._api_key:
++                logger.warning(
++                    "Session continuation via X-Hermes-Session-Id rejected: "
++                    "no API key configured.  Set API_SERVER_KEY to enable "
++                    "session continuity."
++                )
++                return web.json_response(
++                    _openai_error(
++                        "Session continuation requires API key authentication. "
++                        "Configure API_SERVER_KEY to enable this feature."
++                    ),
++                    status=403,
++                )
++            if re.search(r'[\r\n\x00]', provided_session_id):
++                return web.json_response(
++                    _openai_error("Invalid session ID"),
++                    status=400,
++                )
++            session_id = provided_session_id
++            conversation_history = self._conversation_history_for_session(session_id)
++        else:
++            session_id = body.get("session_id") or stored_session_id or run_id
+         approval_session_key = gateway_session_key or session_id or run_id
++        session_cwd = self._workspace_cwd_from_body(body)
+         ephemeral_system_prompt = instructions
+         loop = asyncio.get_running_loop()
+         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+@@ -3700,13 +3779,26 @@ class APIServerAdapter(BasePlatformAdapter):
+         async def _run_and_close():
+             try:
+                 self._set_run_status(run_id, "running")
+-                agent = self._create_agent(
+-                    ephemeral_system_prompt=ephemeral_system_prompt,
+-                    session_id=session_id,
+-                    stream_delta_callback=_text_cb,
+-                    tool_progress_callback=event_cb,
+-                    gateway_session_key=gateway_session_key,
++                from gateway.session_context import clear_session_vars, set_session_vars
++
++                create_session_tokens = set_session_vars(
++                    platform="api_server",
++                    session_key=approval_session_key,
++                    cwd=session_cwd,
+                 )
++                try:
++                    agent = self._create_agent(
++                        ephemeral_system_prompt=ephemeral_system_prompt,
++                        session_id=session_id,
++                        stream_delta_callback=_text_cb,
++                        tool_progress_callback=event_cb,
++                        gateway_session_key=gateway_session_key,
++                    )
++                finally:
++                    try:
++                        clear_session_vars(create_session_tokens)
++                    except Exception:
++                        pass
+                 self._active_run_agents[run_id] = agent
+ 
+                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+@@ -3747,6 +3839,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                         session_tokens = set_session_vars(
+                             platform="api_server",
+                             session_key=approval_session_key,
++                            cwd=session_cwd,
+                         )
+                         register_gateway_notify(approval_session_key, _approval_notify)
+                         r = agent.run_conversation(
+@@ -3795,16 +3888,19 @@ class APIServerAdapter(BasePlatformAdapter):
+                     )
+                 else:
+                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
++                    effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+                     q.put_nowait({
+                         "event": "run.completed",
+                         "run_id": run_id,
+                         "timestamp": time.time(),
++                        "session_id": effective_session_id,
+                         "output": final_response,
+                         "usage": usage,
+                     })
+                     self._set_run_status(
+                         run_id,
+                         "completed",
++                        session_id=effective_session_id,
+                         output=final_response,
+                         usage=usage,
+                         last_event="run.completed",
+@@ -3871,9 +3967,9 @@ class APIServerAdapter(BasePlatformAdapter):
+         if hasattr(task, "add_done_callback"):
+             task.add_done_callback(self._background_tasks.discard)
+ 
+-        response_headers = (
+-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
+-        )
++        response_headers = {"X-Hermes-Session-Id": session_id}
++        if gateway_session_key:
++            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+         return web.json_response(
+             {"run_id": run_id, "status": "started"},
+             status=202,
+diff --git a/hermes_state.py b/hermes_state.py
+index d83580bee..cf74dd0db 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -33,7 +33,7 @@ T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+-SCHEMA_VERSION = 15
++SCHEMA_VERSION = 16
+ 
+ # ---------------------------------------------------------------------------
+ # WAL-compatibility fallback
+@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS sessions (
+     id TEXT PRIMARY KEY,
+     source TEXT NOT NULL,
+     user_id TEXT,
++    session_key TEXT,
+     model TEXT,
+     model_config TEXT,
+     system_prompt TEXT,
+@@ -314,6 +315,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
+ # existing databases. SCHEMA_SQL above is run by sqlite executescript
+ # which would otherwise fail on legacy DBs ("no such column: active").
+ DEFERRED_INDEX_SQL = """
++CREATE INDEX IF NOT EXISTS idx_sessions_session_key
++    ON sessions(session_key);
+ CREATE INDEX IF NOT EXISTS idx_messages_session_active
+     ON messages(session_id, active, timestamp);
+ """
+@@ -946,19 +949,21 @@ class SessionDB:
+         model_config: Dict[str, Any] = None,
+         system_prompt: str = None,
+         user_id: str = None,
++        session_key: str = None,
+         parent_session_id: str = None,
+         cwd: str = None,
+     ) -> None:
+         """Shared INSERT OR IGNORE for session rows."""
+         def _do(conn):
+             conn.execute(
+-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
++                """INSERT OR IGNORE INTO sessions (id, source, user_id, session_key, model, model_config,
+                    system_prompt, parent_session_id, cwd, started_at)
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (
+                     session_id,
+                     source,
+                     user_id,
++                    session_key,
+                     model,
+                     json.dumps(model_config) if model_config else None,
+                     system_prompt,
+@@ -972,7 +977,26 @@ class SessionDB:
+     def create_session(self, session_id: str, source: str, **kwargs) -> str:
+         """Create a new session record. Returns the session_id."""
+         self._insert_session_row(session_id, source, **kwargs)
++        session_key = kwargs.get("session_key")
++        if session_key:
++            self.update_session_key(session_id, str(session_key))
+         return session_id
++
++    def update_session_key(self, session_id: str, session_key: str) -> None:
++        """Persist the stable gateway/API session key for agent-scoped recall."""
++        session_id = str(session_id or "").strip()
++        session_key = str(session_key or "").strip()
++        if not session_id or not session_key:
++            return
++
++        def _do(conn):
++            conn.execute(
++                "UPDATE sessions SET session_key = ? WHERE id = ?",
++                (session_key, session_id),
++            )
++
++        self._execute_write(_do)
++
+     def end_session(self, session_id: str, end_reason: str) -> None:
+         """Mark a session as ended.
+ 
+@@ -1615,6 +1639,7 @@ class SessionDB:
+         include_archived: bool = False,
+         archived_only: bool = False,
+         id_query: str = None,
++        session_key: str = None,
+     ) -> List[Dict[str, Any]]:
+         """List sessions with preview (first user message) and last active timestamp.
+ 
+@@ -1677,6 +1702,9 @@ class SessionDB:
+             placeholders = ",".join("?" for _ in exclude_sources)
+             where_clauses.append(f"s.source NOT IN ({placeholders})")
+             params.extend(exclude_sources)
++        if session_key:
++            where_clauses.append("s.session_key = ?")
++            params.append(str(session_key))
+         if min_message_count > 0:
+             where_clauses.append("s.message_count >= ?")
+             params.append(min_message_count)
+@@ -2870,6 +2898,7 @@ class SessionDB:
+         offset: int = 0,
+         sort: str = None,
+         include_inactive: bool = False,
++        session_key: str = None,
+     ) -> List[Dict[str, Any]]:
+         """
+         Full-text search across session messages using FTS5.
+@@ -2940,6 +2969,10 @@ class SessionDB:
+             where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+             params.extend(exclude_sources)
+ 
++        if session_key:
++            where_clauses.append("s.session_key = ?")
++            params.append(str(session_key))
++
+         if role_filter:
+             role_placeholders = ",".join("?" for _ in role_filter)
+             where_clauses.append(f"m.role IN ({role_placeholders})")
+@@ -3016,6 +3049,9 @@ class SessionDB:
+                 if exclude_sources is not None:
+                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                     tri_params.extend(exclude_sources)
++                if session_key:
++                    tri_where.append("s.session_key = ?")
++                    tri_params.append(str(session_key))
+                 if role_filter:
+                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                     tri_params.extend(role_filter)
+@@ -3071,6 +3107,9 @@ class SessionDB:
+                 if exclude_sources is not None:
+                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                     like_params.extend(exclude_sources)
++                if session_key:
++                    like_where.append("s.session_key = ?")
++                    like_params.append(str(session_key))
+                 if role_filter:
+                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                     like_params.extend(role_filter)
+diff --git a/plugins/memory/byterover/__init__.py b/plugins/memory/byterover/__init__.py
+index eafd9b2cf..870e6f3ae 100644
+--- a/plugins/memory/byterover/__init__.py
++++ b/plugins/memory/byterover/__init__.py
+@@ -20,6 +20,8 @@ from __future__ import annotations
+ import json
+ import logging
+ import os
++import hashlib
++import re
+ import shutil
+ import subprocess
+ import threading
+@@ -113,10 +115,23 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT,
+         return {"success": False, "error": str(e)}
+ 
+ 
+-def _get_brv_cwd() -> Path:
++def _scope_dir_name(scope_key: str) -> str:
++    raw = str(scope_key or "").strip()
++    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
++    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip(".-") or "agent"
++    if len(safe) > 80:
++        safe = safe[:80].rstrip(".-") or "agent"
++    return f"{safe}-{digest}"
++
++
++def _get_brv_cwd(scope_key: str = "") -> Path:
+     """Profile-scoped working directory for the brv context tree."""
+     from hermes_constants import get_hermes_home
+-    return get_hermes_home() / "byterover"
++    base = get_hermes_home() / "byterover"
++    clean_scope = str(scope_key or "").strip()
++    if clean_scope:
++        return base / "agents" / _scope_dir_name(clean_scope)
++    return base
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -197,7 +212,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
+         ]
+ 
+     def initialize(self, session_id: str, **kwargs) -> None:
+-        self._cwd = str(_get_brv_cwd())
++        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key") or ""
++        self._cwd = str(_get_brv_cwd(str(scope_key or "")))
+         self._session_id = session_id
+         self._turn_count = 0
+         Path(self._cwd).mkdir(parents=True, exist_ok=True)
+diff --git a/plugins/memory/hindsight/__init__.py b/plugins/memory/hindsight/__init__.py
+index 2f94c08da..aef88d06a 100644
+--- a/plugins/memory/hindsight/__init__.py
++++ b/plugins/memory/hindsight/__init__.py
+@@ -30,6 +30,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import atexit
++import hashlib
+ import importlib
+ import json
+ import logging
+@@ -511,6 +512,18 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
+     return rendered or fallback
+ 
+ 
++def _scoped_default_bank_id(scope_key: str) -> str:
++    """Return a collision-resistant default Hindsight bank id for an agent scope."""
++    clean = str(scope_key or "").strip()
++    if not clean:
++        return "hermes"
++    digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:12]
++    segment = _sanitize_bank_segment(clean) or "agent"
++    if len(segment) > 80:
++        segment = segment[:80].strip("-_") or "agent"
++    return f"hermes-{segment}-{digest}"
++
++
+ # ---------------------------------------------------------------------------
+ # MemoryProvider implementation
+ # ---------------------------------------------------------------------------
+@@ -1149,6 +1162,9 @@ class HindsightMemoryProvider(MemoryProvider):
+         banks = cfg_get(self._config, "banks", "hermes", default={})
+         static_bank_id = self._config.get("bank_id") or banks.get("bankId", "hermes")
+         self._bank_id_template = self._config.get("bank_id_template", "") or ""
++        scope_key = str(kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key") or "").strip()
++        if scope_key and not self._bank_id_template and str(static_bank_id or "").strip() in {"", "hermes"}:
++            static_bank_id = _scoped_default_bank_id(scope_key)
+         self._bank_id = _resolve_bank_id_template(
+             self._bank_id_template,
+             fallback=static_bank_id,
+diff --git a/plugins/memory/holographic/__init__.py b/plugins/memory/holographic/__init__.py
+index 681ce7660..25014637a 100644
+--- a/plugins/memory/holographic/__init__.py
++++ b/plugins/memory/holographic/__init__.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import hashlib
+ import re
+ from typing import Any, Dict, List
+ 
+@@ -31,6 +32,15 @@ from hermes_cli.config import cfg_get
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _scope_dir_name(scope_key: str) -> str:
++    raw = str(scope_key or "").strip()
++    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
++    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip(".-") or "agent"
++    if len(safe) > 80:
++        safe = safe[:80].rstrip(".-") or "agent"
++    return f"{safe}-{digest}"
++
++
+ # ---------------------------------------------------------------------------
+ # Tool schemas (unchanged from original PR)
+ # ---------------------------------------------------------------------------
+@@ -159,7 +169,20 @@ class HolographicMemoryProvider(MemoryProvider):
+         from hermes_constants import get_hermes_home
+         _hermes_home = str(get_hermes_home())
+         _default_db = _hermes_home + "/memory_store.db"
+-        db_path = self._config.get("db_path", _default_db)
++        scope_key = str(kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key") or "").strip()
++        configured_db_path = self._config.get("db_path")
++        configured_text = str(configured_db_path or "").strip()
++        default_config_values = {
++            "",
++            _default_db,
++            "$HERMES_HOME/memory_store.db",
++            "${HERMES_HOME}/memory_store.db",
++        }
++        db_path = (
++            f"{_hermes_home}/memory_providers/holographic/agents/{_scope_dir_name(scope_key)}/memory_store.db"
++            if scope_key and configured_text in default_config_values
++            else (configured_db_path or _default_db)
++        )
+         # Expand $HERMES_HOME in user-supplied paths so config values like
+         # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both
+         # resolve to the active profile's directory.
+diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
+index 332b3ac94..82f18b754 100644
+--- a/plugins/memory/mem0/__init__.py
++++ b/plugins/memory/mem0/__init__.py
+@@ -204,10 +204,11 @@ class Mem0MemoryProvider(MemoryProvider):
+     def initialize(self, session_id: str, **kwargs) -> None:
+         self._config = _load_config()
+         self._api_key = self._config.get("api_key", "")
++        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key")
+         # Prefer gateway-provided user_id for per-user memory scoping;
+         # fall back to config/env default for CLI (single-user) sessions.
+-        self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
+-        self._agent_id = self._config.get("agent_id", "hermes")
++        self._user_id = kwargs.get("user_id") or scope_key or self._config.get("user_id", "hermes-user")
++        self._agent_id = kwargs.get("agent_id") or scope_key or self._config.get("agent_id", "hermes")
+         self._rerank = self._config.get("rerank", True)
+ 
+     def _read_filters(self) -> Dict[str, Any]:
+diff --git a/plugins/memory/openviking/__init__.py b/plugins/memory/openviking/__init__.py
+index 810f2db43..539e4ab56 100644
+--- a/plugins/memory/openviking/__init__.py
++++ b/plugins/memory/openviking/__init__.py
+@@ -470,8 +470,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
+         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
+         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
+         self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
+-        self._user = os.environ.get("OPENVIKING_USER", "default")
+-        self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
++        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key")
++        self._user = os.environ.get("OPENVIKING_USER") or kwargs.get("user_id") or scope_key or "default"
++        self._agent = os.environ.get("OPENVIKING_AGENT") or kwargs.get("agent_id") or scope_key or "hermes"
+         self._session_id = session_id
+         self._turn_count = 0
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 81ce10642..8c57e2c75 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -507,6 +507,13 @@ class AIAgent:
+         if self._session_db_created or not self._session_db:
+             return
+         source = self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")
++        try:
++            from agent.runtime_cwd import resolve_context_cwd
++
++            context_cwd = resolve_context_cwd()
++            session_cwd = str(context_cwd) if context_cwd else _launch_cwd_for_session(source)
++        except Exception:
++            session_cwd = _launch_cwd_for_session(source)
+         try:
+             self._session_db.create_session(
+                 session_id=self.session_id,
+@@ -515,8 +522,9 @@ class AIAgent:
+                 model_config=self._session_init_model_config,
+                 system_prompt=self._cached_system_prompt,
+                 user_id=None,
++                session_key=getattr(self, "_gateway_session_key", None),
+                 parent_session_id=self._parent_session_id,
+-                cwd=_launch_cwd_for_session(source),
++                cwd=session_cwd,
+             )
+             self._session_db_created = True
+         except Exception as e:
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index d6e1e5885..e588a6461 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -255,6 +255,114 @@ class TestRunStatus:
+                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                 assert status["session_id"] == "space-session"
+ 
++    @pytest.mark.asyncio
++    async def test_runs_with_provided_session_id_loads_history_from_db(self, auth_adapter):
++        """X-Hermes-Session-Id makes runs continue persisted Hermes history."""
++        db_history = [
++            {"role": "user", "content": "stored message"},
++            {"role": "assistant", "content": "stored reply"},
++        ]
++        mock_db = MagicMock()
++        mock_db.get_messages_as_conversation.return_value = db_history
++        auth_adapter._session_db = mock_db
++
++        app = _create_runs_app(auth_adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(auth_adapter, "_create_agent") as mock_create:
++                mock_agent = MagicMock()
++                mock_agent.run_conversation.return_value = {"final_response": "done"}
++                mock_agent.session_prompt_tokens = 0
++                mock_agent.session_completion_tokens = 0
++                mock_agent.session_total_tokens = 0
++                mock_create.return_value = mock_agent
++
++                resp = await cli.post(
++                    "/v1/runs",
++                    json={
++                        "input": "Continue",
++                        "session_id": "body-session",
++                        "conversation_history": [
++                            {"role": "user", "content": "client body history"},
++                        ],
++                    },
++                    headers={
++                        "X-Hermes-Session-Id": "existing-session",
++                        "Authorization": "Bearer sk-secret",
++                    },
++                )
++                assert resp.status == 202
++                assert resp.headers.get("X-Hermes-Session-Id") == "existing-session"
++                data = await resp.json()
++                run_id = data["run_id"]
++
++                for _ in range(20):
++                    status_resp = await cli.get(
++                        f"/v1/runs/{run_id}",
++                        headers={"Authorization": "Bearer sk-secret"},
++                    )
++                    assert status_resp.status == 200
++                    status = await status_resp.json()
++                    if status["status"] == "completed":
++                        break
++                    await asyncio.sleep(0.05)
++
++        assert status["session_id"] == "existing-session"
++        mock_db.get_messages_as_conversation.assert_called_once_with("existing-session")
++        mock_agent.run_conversation.assert_called_once()
++        call_kwargs = mock_agent.run_conversation.call_args.kwargs
++        assert call_kwargs["user_message"] == "Continue"
++        assert call_kwargs["conversation_history"] == db_history
++        assert call_kwargs["task_id"] == "existing-session"
++
++    @pytest.mark.asyncio
++    async def test_runs_metadata_workspace_sets_session_cwd(self, adapter, tmp_path):
++        workspace = tmp_path / "agent-workspace"
++        workspace.mkdir()
++        seen = {}
++
++        def _make_agent(**kwargs):
++            from agent.runtime_cwd import resolve_agent_cwd
++
++            seen["create_cwd"] = str(resolve_agent_cwd())
++            mock_agent = MagicMock()
++
++            def _run(user_message=None, conversation_history=None, task_id=None):
++                from agent.runtime_cwd import resolve_agent_cwd
++
++                seen["run_cwd"] = str(resolve_agent_cwd())
++                return {"final_response": "done"}
++
++            mock_agent.run_conversation.side_effect = _run
++            mock_agent.session_prompt_tokens = 0
++            mock_agent.session_completion_tokens = 0
++            mock_agent.session_total_tokens = 0
++            return mock_agent
++
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent", side_effect=_make_agent):
++                resp = await cli.post(
++                    "/v1/runs",
++                    json={
++                        "input": "hello",
++                        "metadata": {"workspace": {"path": str(workspace)}},
++                    },
++                )
++                assert resp.status == 202
++                data = await resp.json()
++                run_id = data["run_id"]
++
++                for _ in range(20):
++                    status_resp = await cli.get(f"/v1/runs/{run_id}")
++                    status = await status_resp.json()
++                    if status["status"] == "completed":
++                        break
++                    await asyncio.sleep(0.05)
++
++        expected = str(workspace.resolve())
++        assert seen["create_cwd"] == expected
++        assert seen["run_cwd"] == expected
++
+     @pytest.mark.asyncio
+     async def test_status_not_found_returns_404(self, adapter):
+         app = _create_runs_app(adapter)
+@@ -283,7 +391,10 @@ class TestRunEvents:
+         async with TestClient(TestServer(app)) as cli:
+             with patch.object(adapter, "_create_agent") as mock_create:
+                 mock_agent = MagicMock()
+-                mock_agent.run_conversation.return_value = {"final_response": "Hello!"}
++                mock_agent.run_conversation.return_value = {
++                    "final_response": "Hello!",
++                    "session_id": "rotated-session",
++                }
+                 mock_agent.session_prompt_tokens = 10
+                 mock_agent.session_completion_tokens = 5
+                 mock_agent.session_total_tokens = 15
+@@ -303,6 +414,7 @@ class TestRunEvents:
+                 # Should contain run.completed
+                 assert "run.completed" in body
+                 assert "Hello!" in body
++                assert "rotated-session" in body
+ 
+ 
+ 
+@@ -312,7 +424,10 @@ class TestRunEvents:
+         async with TestClient(TestServer(app)) as cli:
+             with patch.object(adapter, "_create_agent") as mock_create:
+                 mock_agent = MagicMock()
+-                mock_agent.run_conversation.return_value = {"final_response": "done"}
++                mock_agent.run_conversation.return_value = {
++                    "final_response": "done",
++                    "session_id": "existing-session",
++                }
+                 mock_agent.session_prompt_tokens = 0
+                 mock_agent.session_completion_tokens = 0
+                 mock_agent.session_total_tokens = 0
+diff --git a/tests/plugins/memory/test_hindsight_provider.py b/tests/plugins/memory/test_hindsight_provider.py
+index f49c22761..21b6c1309 100644
+--- a/tests/plugins/memory/test_hindsight_provider.py
++++ b/tests/plugins/memory/test_hindsight_provider.py
+@@ -24,6 +24,7 @@ from plugins.memory.hindsight import (
+     _build_embedded_profile_env,
+     _normalize_retain_tags,
+     _resolve_bank_id_template,
++    _scoped_default_bank_id,
+     _sanitize_bank_segment,
+ )
+ 
+@@ -1373,6 +1374,59 @@ class TestBankIdTemplate:
+         )
+         assert p._bank_id == "my-static-bank"
+ 
++    def test_provider_scopes_default_bank_id_by_agent_scope(self, tmp_path, monkeypatch):
++        config = {
++            "mode": "cloud",
++            "apiKey": "k",
++            "api_url": "http://x",
++            "bank_id": "hermes",
++        }
++        config_path = tmp_path / "hindsight" / "config.json"
++        config_path.parent.mkdir(parents=True, exist_ok=True)
++        config_path.write_text(json.dumps(config))
++        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
++
++        p = HindsightMemoryProvider()
++        p.initialize(
++            session_id="s1",
++            hermes_home=str(tmp_path),
++            platform="api_server",
++            agent_identity="private:1",
++            agent_scope_key="private:1",
++        )
++
++        assert p._bank_id == _scoped_default_bank_id("private:1")
++        assert p._bank_id.startswith("hermes-private-1-")
++
++    def test_provider_default_bank_scope_distinguishes_agents(self, tmp_path, monkeypatch):
++        config = {
++            "mode": "cloud",
++            "apiKey": "k",
++            "api_url": "http://x",
++            "bank_id": "hermes",
++        }
++        config_path = tmp_path / "hindsight" / "config.json"
++        config_path.parent.mkdir(parents=True, exist_ok=True)
++        config_path.write_text(json.dumps(config))
++        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
++
++        private = HindsightMemoryProvider()
++        private.initialize(
++            session_id="s-private",
++            hermes_home=str(tmp_path),
++            platform="api_server",
++            agent_scope_key="private:1",
++        )
++        channel = HindsightMemoryProvider()
++        channel.initialize(
++            session_id="s-channel",
++            hermes_home=str(tmp_path),
++            platform="api_server",
++            agent_scope_key="channel:1:main-agent",
++        )
++
++        assert private._bank_id != channel._bank_id
++
+     def test_provider_template_with_missing_profile_falls_back(self, tmp_path, monkeypatch):
+         config = {
+             "mode": "cloud",
+diff --git a/tests/run_agent/test_memory_provider_init.py b/tests/run_agent/test_memory_provider_init.py
+index 027129fbb..48dc74243 100644
+--- a/tests/run_agent/test_memory_provider_init.py
++++ b/tests/run_agent/test_memory_provider_init.py
+@@ -92,6 +92,40 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
+     assert provider.init_kwargs["platform"] == "feishu"
+ 
+ 
++def test_aiagent_forwards_gateway_session_key_as_memory_scope():
++    provider = RecordingMemoryProvider()
++    cfg = {"memory": {"provider": "recording"}, "agent": {}}
++
++    with (
++        patch("hermes_cli.config.load_config", return_value=cfg),
++        patch("plugins.memory.load_memory_provider", return_value=provider),
++        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        from run_agent import AIAgent
++
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="https://openrouter.ai/api/v1",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=False,
++            session_id="sess-scope",
++            platform="api_server",
++            gateway_session_key="private:1",
++        )
++
++    assert agent._memory_manager is not None
++    assert provider.init_session_id == "sess-scope"
++    assert provider.init_kwargs["gateway_session_key"] == "private:1"
++    assert provider.init_kwargs["agent_scope_key"] == "private:1"
++    assert provider.init_kwargs["user_id"] == "private:1"
++    assert provider.init_kwargs["agent_id"] == "private:1"
++    assert provider.init_kwargs["agent_identity"] == "private:1"
++
++
+ class CoreShadowProvider:
+     """Provider that tries to register tools shadowing built-in core tools."""
+ 
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index 043343177..344646c11 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -820,6 +820,21 @@ class TestFTS5Search:
+         sources = [r["source"] for r in results]
+         assert all(s == "telegram" for s in sources)
+ 
++    def test_search_with_session_key_filter(self, db):
++        db.create_session(session_id="s1", source="api_server", session_key="agent:a")
++        db.append_message("s1", role="user", content="shared needle from agent a")
++
++        db.create_session(session_id="s2", source="api_server", session_key="agent:b")
++        db.append_message("s2", role="user", content="shared needle from agent b")
++
++        results = db.search_messages("shared needle", session_key="agent:a")
++        assert [r["session_id"] for r in results] == ["s1"]
++
++    def test_create_session_updates_key_on_existing_row(self, db):
++        db.create_session(session_id="s1", source="api_server")
++        db.create_session(session_id="s1", source="api_server", session_key="agent:a")
++        assert db.get_session("s1")["session_key"] == "agent:a"
++
+     def test_search_default_sources_include_acp(self, db):
+         db.create_session(session_id="s1", source="acp")
+         db.append_message("s1", role="user", content="ACP question about Python")
+@@ -2723,6 +2738,15 @@ class TestListSessionsRich:
+         assert len(sessions) == 1
+         assert sessions[0]["id"] == "s1"
+ 
++    def test_rich_list_session_key_filter(self, db):
++        db.create_session("s1", "api_server", session_key="agent:a")
++        db.append_message("s1", "user", "agent a visible")
++        db.create_session("s2", "api_server", session_key="agent:b")
++        db.append_message("s2", "user", "agent b hidden")
++
++        sessions = db.list_sessions_rich(session_key="agent:a")
++        assert [s["id"] for s in sessions] == ["s1"]
++
+     def test_preview_newlines_collapsed(self, db):
+         db.create_session("s1", "cli")
+         db.append_message("s1", "user", "Line one\nLine two\nLine three")
+diff --git a/tests/tools/test_memory_tool.py b/tests/tools/test_memory_tool.py
+index f23deeff1..d0d7f8c3a 100644
+--- a/tests/tools/test_memory_tool.py
++++ b/tests/tools/test_memory_tool.py
+@@ -375,6 +375,38 @@ class TestMemoryStorePersistence:
+         store.load_from_disk()
+         assert len(store.memory_entries) == 2
+ 
++    def test_scoped_stores_use_independent_files(self, tmp_path, monkeypatch):
++        monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
++
++        store_a = MemoryStore(memory_scope_key="private:1")
++        store_b = MemoryStore(memory_scope_key="channel:1:main-agent")
++        store_a.load_from_disk()
++        store_b.load_from_disk()
++
++        assert store_a.memory_dir != store_b.memory_dir
++        assert store_a._path_for("memory") != store_b._path_for("memory")
++
++        store_a.add("memory", "only private agent can see this")
++        store_b.add("memory", "only channel agent can see this")
++
++        reloaded_a = MemoryStore(memory_scope_key="private:1")
++        reloaded_b = MemoryStore(memory_scope_key="channel:1:main-agent")
++        reloaded_a.load_from_disk()
++        reloaded_b.load_from_disk()
++
++        assert reloaded_a.memory_entries == ["only private agent can see this"]
++        assert reloaded_b.memory_entries == ["only channel agent can see this"]
++
++    def test_unscoped_store_preserves_profile_memory_path(self, tmp_path, monkeypatch):
++        monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
++
++        store = MemoryStore()
++        store.load_from_disk()
++        store.add("memory", "legacy profile-scoped memory")
++
++        assert store.memory_dir == tmp_path / "memories"
++        assert (tmp_path / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "legacy profile-scoped memory"
++
+ 
+ class TestMemoryStoreSnapshot:
+     def test_snapshot_frozen_at_load(self, store):
+diff --git a/tests/tools/test_session_search.py b/tests/tools/test_session_search.py
+index f564504e1..c7e5367bf 100644
+--- a/tests/tools/test_session_search.py
++++ b/tests/tools/test_session_search.py
+@@ -142,6 +142,51 @@ class TestBrowseShape:
+         assert any("Modpack" in (t or "") for t in titles)
+ 
+ 
++class TestSessionKeyScope:
++    def test_browse_only_lists_current_agent_sessions(self, db):
++        db.create_session("s_agent_a", source="api_server", session_key="agent:a")
++        db.append_message("s_agent_a", "user", "agent a browse marker")
++        db.create_session("s_agent_b", source="api_server", session_key="agent:b")
++        db.append_message("s_agent_b", "user", "agent b browse marker")
++
++        result = json.loads(session_search(db=db, current_session_key="agent:a"))
++        assert result["success"] is True
++        assert [r["session_id"] for r in result["results"]] == ["s_agent_a"]
++
++    def test_discovery_only_searches_current_agent_sessions(self, db):
++        db.create_session("s_agent_a", source="api_server", session_key="agent:a")
++        db.append_message("s_agent_a", "user", "scope needle belongs to agent a")
++        db.create_session("s_agent_b", source="api_server", session_key="agent:b")
++        db.append_message("s_agent_b", "user", "scope needle belongs to agent b")
++
++        result = json.loads(session_search(query="scope needle", db=db, current_session_key="agent:a"))
++        assert result["success"] is True
++        assert [r["session_id"] for r in result["results"]] == ["s_agent_a"]
++
++    def test_read_rejects_session_from_other_agent(self, db):
++        db.create_session("s_agent_a", source="api_server", session_key="agent:a")
++        db.append_message("s_agent_a", "user", "agent a content")
++        db.create_session("s_agent_b", source="api_server", session_key="agent:b")
++        db.append_message("s_agent_b", "user", "agent b content")
++
++        result = json.loads(session_search(session_id="s_agent_b", db=db, current_session_key="agent:a"))
++        assert result["success"] is False
++        assert "not found" in result["error"]
++
++    def test_scroll_rejects_session_from_other_agent(self, db):
++        db.create_session("s_agent_b", source="api_server", session_key="agent:b")
++        msg_id = db.append_message("s_agent_b", "user", "agent b scroll content")
++
++        result = json.loads(session_search(
++            session_id="s_agent_b",
++            around_message_id=msg_id,
++            db=db,
++            current_session_key="agent:a",
++        ))
++        assert result["success"] is False
++        assert "not found" in result["error"]
++
++
+ # =========================================================================
+ # Discovery shape (with query)
+ # =========================================================================
+diff --git a/tests/tools/test_shared_container_task_id.py b/tests/tools/test_shared_container_task_id.py
+index ab599fa85..78bde2d33 100644
+--- a/tests/tools/test_shared_container_task_id.py
++++ b/tests/tools/test_shared_container_task_id.py
+@@ -1,11 +1,14 @@
+ """
+ Regression tests for the shared-container task_id mapping.
+ 
+-The top-level agent and all delegate_task subagents share a single
+-terminal sandbox keyed by ``"default"``.  ``_resolve_container_task_id``
+-is the sole gatekeeper for which tool-call task_ids go to the shared
+-container vs. get their own isolated sandbox.  RL / benchmark
+-environments opt in to isolation by calling
++Without a gateway session key, the top-level agent and all delegate_task
++subagents share a single terminal sandbox keyed by ``"default"``.
++Gateway/API sessions get a sandbox key derived from their stable
++``HERMES_SESSION_KEY``, so separate enterprise agents do not share live
++cwd or background process state. ``_resolve_container_task_id`` is the
++sole gatekeeper for which tool-call task_ids go to the shared container
++vs. get their own isolated sandbox.  RL / benchmark environments opt in
++to isolation by calling
+ ``register_task_env_overrides(task_id, {...})`` before the agent loop;
+ every other task_id collapses back to ``"default"``.
+ 
+@@ -17,17 +20,26 @@ Docker Backend in ``website/docs/user-guide/configuration.md``.
+ 
+ import pytest
+ 
++from gateway.session_context import clear_session_vars, set_session_vars
+ from tools import terminal_tool
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def _clean_overrides():
+-    """Ensure no stray overrides from other tests leak in."""
++    """Ensure no stray overrides or environments from other tests leak in."""
+     before = dict(terminal_tool._task_env_overrides)
++    before_envs = dict(terminal_tool._active_environments)
++    before_last_activity = dict(terminal_tool._last_activity)
+     terminal_tool._task_env_overrides.clear()
++    terminal_tool._active_environments.clear()
++    terminal_tool._last_activity.clear()
+     yield
+     terminal_tool._task_env_overrides.clear()
+     terminal_tool._task_env_overrides.update(before)
++    terminal_tool._active_environments.clear()
++    terminal_tool._active_environments.update(before_envs)
++    terminal_tool._last_activity.clear()
++    terminal_tool._last_activity.update(before_last_activity)
+ 
+ 
+ def test_none_task_id_maps_to_default():
+@@ -54,6 +66,37 @@ def test_arbitrary_session_id_collapses_to_default():
+     assert terminal_tool._resolve_container_task_id("sess-123e4567-e89b-12d3") == "default"
+ 
+ 
++def test_gateway_session_key_maps_to_isolated_container_key():
++    tokens = set_session_vars(session_key="private:1")
++    try:
++        key = terminal_tool._resolve_container_task_id("sess-123")
++        assert key.startswith("gateway-private-1-")
++        assert key != "default"
++        # Delegate subagents inherit the same gateway session context and
++        # should share their parent agent's workspace environment.
++        assert terminal_tool._resolve_container_task_id("subagent-0-deadbeef") == key
++    finally:
++        clear_session_vars(tokens)
++
++
++def test_gateway_session_keys_get_distinct_container_keys():
++    first = set_session_vars(session_key="private:1")
++    try:
++        private_key = terminal_tool._resolve_container_task_id("sess-private")
++    finally:
++        clear_session_vars(first)
++
++    second = set_session_vars(session_key="channel:1:main-agent")
++    try:
++        channel_key = terminal_tool._resolve_container_task_id("sess-channel")
++    finally:
++        clear_session_vars(second)
++
++    assert private_key != channel_key
++    assert private_key.startswith("gateway-private-1-")
++    assert channel_key.startswith("gateway-channel-1-main-agent-")
++
++
+ def test_rl_task_with_override_keeps_its_own_id():
+     # RL / benchmark pattern: register a per-task image, then the task_id
+     # must survive ``_resolve_container_task_id`` so the rollout lands in
+@@ -105,3 +148,33 @@ def test_get_active_env_honours_rl_override():
+         terminal_tool.clear_task_env_overrides("rl-42")
+         terminal_tool._active_environments.pop("default", None)
+         terminal_tool._active_environments.pop("rl-42", None)
++
++
++def test_get_active_env_reads_gateway_scoped_environment():
++    tokens = set_session_vars(session_key="private:1")
++    try:
++        scoped_key = terminal_tool._resolve_container_task_id("sess-private")
++        scoped_env = object()
++        default_env = object()
++        terminal_tool._active_environments["default"] = default_env
++        terminal_tool._active_environments[scoped_key] = scoped_env
++
++        assert terminal_tool.get_active_env("sess-private") is scoped_env
++        assert terminal_tool.get_active_env("subagent-7-cafe") is scoped_env
++    finally:
++        clear_session_vars(tokens)
++
++
++def test_cleanup_vm_resolves_gateway_scoped_environment():
++    tokens = set_session_vars(session_key="private:1")
++    try:
++        scoped_key = terminal_tool._resolve_container_task_id("sess-private")
++        terminal_tool._active_environments[scoped_key] = object()
++        terminal_tool._last_activity[scoped_key] = 123.0
++
++        terminal_tool.cleanup_vm("sess-private")
++
++        assert scoped_key not in terminal_tool._active_environments
++        assert scoped_key not in terminal_tool._last_activity
++    finally:
++        clear_session_vars(tokens)
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index 40581e57f..add4f259c 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -1678,11 +1678,14 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
+     """
+     if mode != "project":
+         return staging_dir
+-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+-    if raw:
+-        expanded = os.path.expanduser(raw)
+-        if os.path.isdir(expanded):
+-            return expanded
++    try:
++        from agent.runtime_cwd import resolve_agent_cwd
++
++        resolved = resolve_agent_cwd()
++        if resolved.is_dir():
++            return str(resolved)
++    except Exception:
++        pass
+     here = os.getcwd()
+     if os.path.isdir(here):
+         return here
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index db982776d..67acd89c9 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -683,7 +683,14 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+     teaching subagents a fake container path while still helping them avoid
+     guessing `/workspace/...` for local repo tasks.
+     """
++    try:
++        from agent.runtime_cwd import resolve_context_cwd
++
++        context_cwd = resolve_context_cwd()
++    except Exception:
++        context_cwd = None
+     candidates = [
++        str(context_cwd) if context_cwd else None,
+         os.getenv("TERMINAL_CWD"),
+         getattr(
+             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index 45186ae6c..7b44a84b7 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -138,8 +138,12 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
+     if live:
+         base = Path(live).expanduser()
+     else:
+-        raw = os.environ.get("TERMINAL_CWD")
+-        base = Path(raw).expanduser() if raw else Path(os.getcwd())
++        try:
++            from agent.runtime_cwd import resolve_agent_cwd
++
++            base = resolve_agent_cwd()
++        except Exception:
++            base = Path(os.getcwd())
+     if not base.is_absolute():
+         # A relative base (".", "./sub", "..") is anchored to the process cwd
+         # once, here, so the result no longer depends on cwd at resolve() time.
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index 281c806ea..f2fea85c7 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -26,6 +26,8 @@ Design:
+ import json
+ import logging
+ import os
++import hashlib
++import re
+ import tempfile
+ import time
+ from contextlib import contextmanager
+@@ -52,9 +54,28 @@ logger = logging.getLogger(__name__)
+ # (HERMES_HOME env var changes) are always respected.  The old module-level
+ # constant was cached at import time and could go stale if a profile switch
+ # happened after the first import.
+-def get_memory_dir() -> Path:
+-    """Return the profile-scoped memories directory."""
+-    return get_hermes_home() / "memories"
++def _memory_scope_dir_name(scope_key: str) -> str:
++    """Return a filesystem-safe, stable directory name for an agent memory scope."""
++    raw = str(scope_key or "").strip()
++    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
++    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip(".-") or "agent"
++    if len(safe) > 80:
++        safe = safe[:80].rstrip(".-") or "agent"
++    return f"{safe}-{digest}"
++
++
++def get_memory_dir(scope_key: str | None = None) -> Path:
++    """Return the profile-scoped memories directory.
++
++    Without a scope key this preserves the historical profile-level memory
++    files. Gateway/API agents pass a stable session key so each enterprise
++    agent gets its own MEMORY.md and USER.md under ``memories/agents/``.
++    """
++    base = get_hermes_home() / "memories"
++    clean_scope = str(scope_key or "").strip()
++    if clean_scope:
++        return base / "agents" / _memory_scope_dir_name(clean_scope)
++    return base
+ 
+ ENTRY_DELIMITER = "\n§\n"
+ 
+@@ -121,14 +142,31 @@ class MemoryStore:
+         Tool responses always reflect this live state.
+     """
+ 
+-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
++    def __init__(
++        self,
++        memory_char_limit: int = 2200,
++        user_char_limit: int = 1375,
++        memory_scope_key: str = None,
++    ):
+         self.memory_entries: List[str] = []
+         self.user_entries: List[str] = []
+         self.memory_char_limit = memory_char_limit
+         self.user_char_limit = user_char_limit
++        self.memory_scope_key = str(memory_scope_key or "").strip()
+         # Frozen snapshot for system prompt -- set once at load_from_disk()
+         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+ 
++    @property
++    def memory_dir(self) -> Path:
++        """Directory backing this store's MEMORY.md and USER.md files."""
++        try:
++            return get_memory_dir(self.memory_scope_key or None)
++        except TypeError:
++            # Test suites and third-party harnesses sometimes monkeypatch the
++            # old no-argument helper. Keep those harnesses compatible; real
++            # runtime code uses the scoped signature above.
++            return get_memory_dir()
++
+     def load_from_disk(self):
+         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+ 
+@@ -147,7 +185,7 @@ class MemoryStore:
+         Scanning is deterministic from disk bytes, so the snapshot remains
+         stable for the entire session (prefix-cache invariant holds).
+         """
+-        mem_dir = get_memory_dir()
++        mem_dir = self.memory_dir
+         mem_dir.mkdir(parents=True, exist_ok=True)
+ 
+         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+@@ -242,9 +280,8 @@ class MemoryStore:
+                     pass
+             fd.close()
+ 
+-    @staticmethod
+-    def _path_for(target: str) -> Path:
+-        mem_dir = get_memory_dir()
++    def _path_for(self, target: str) -> Path:
++        mem_dir = self.memory_dir
+         if target == "user":
+             return mem_dir / "USER.md"
+         return mem_dir / "MEMORY.md"
+@@ -269,7 +306,7 @@ class MemoryStore:
+ 
+     def save_to_disk(self, target: str):
+         """Persist entries to the appropriate file. Called after every mutation."""
+-        get_memory_dir().mkdir(parents=True, exist_ok=True)
++        self.memory_dir.mkdir(parents=True, exist_ok=True)
+         self._write_file(self._path_for(target), self._entries_for(target))
+ 
+     def _entries_for(self, target: str) -> List[str]:
+@@ -720,4 +757,3 @@ registry.register(
+ 
+ 
+ 
+-
+diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
+index 7bbb26a2e..3260490c0 100644
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -86,6 +86,24 @@ def _resolve_to_parent(db, session_id: str) -> str:
+     return cur
+ 
+ 
++def _normalize_session_key(value: Any) -> Optional[str]:
++    clean = str(value or "").strip()
++    return clean or None
++
++
++def _session_visible_for_key(db, session_id: str, current_session_key: str = None) -> bool:
++    """Return True when a session belongs to the caller's scoped agent key."""
++    current_session_key = _normalize_session_key(current_session_key)
++    if not current_session_key:
++        return True
++    try:
++        meta = db.get_session(session_id) or {}
++    except Exception:
++        logging.debug("session_key visibility lookup failed for %s", session_id, exc_info=True)
++        return False
++    return str(meta.get("session_key") or "").strip() == current_session_key
++
++
+ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
+     """Slim a message row for the tool response. Keeps content even if empty."""
+     entry = {
+@@ -174,7 +192,13 @@ def _locate_session_db(session_id: str):
+     return None, None
+ 
+ 
+-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
++def _read_session(
++    db,
++    session_id: str,
++    head: int = 20,
++    tail: int = 10,
++    current_session_key: str = None,
++) -> str:
+     """Read shape: dump a whole session by id (head + tail when large).
+ 
+     Serves the linked-session case — the user dropped an @session reference and
+@@ -189,6 +213,9 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+         meta = {}
+     if not meta:
+         return tool_error(f"session_id not found: {session_id}", success=False)
++    current_session_key = _normalize_session_key(current_session_key)
++    if current_session_key and str(meta.get("session_key") or "").strip() != current_session_key:
++        return tool_error(f"session_id not found: {session_id}", success=False)
+ 
+     try:
+         rows = db.get_messages(session_id)
+@@ -223,13 +250,19 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+     return json.dumps(response, ensure_ascii=False)
+ 
+ 
+-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
++def _list_recent_sessions(
++    db,
++    limit: int,
++    current_session_id: str = None,
++    current_session_key: str = None,
++) -> str:
+     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+     try:
+         sessions = db.list_sessions_rich(
+             limit=limit + 5,
+             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+             order_by_last_active=True,
++            session_key=_normalize_session_key(current_session_key),
+         )  # fetch extra so we can skip current
+ 
+         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+@@ -272,6 +305,7 @@ def _scroll(
+     around_message_id: int,
+     window: int = 5,
+     current_session_id: str = None,
++    current_session_key: str = None,
+ ) -> str:
+     """Scroll shape: return a window of messages centered on an anchor.
+ 
+@@ -315,6 +349,9 @@ def _scroll(
+         session_meta = {}
+     if not session_meta:
+         return tool_error(f"session_id not found: {session_id}", success=False)
++    current_session_key = _normalize_session_key(current_session_key)
++    if current_session_key and str(session_meta.get("session_key") or "").strip() != current_session_key:
++        return tool_error(f"session_id not found: {session_id}", success=False)
+ 
+     # Fetch the window
+     try:
+@@ -345,7 +382,7 @@ def _scroll(
+         if owning and owning != session_id:
+             a_root = _resolve_to_parent(db, session_id)
+             o_root = _resolve_to_parent(db, owning)
+-            if a_root and o_root and a_root == o_root:
++            if a_root and o_root and a_root == o_root and _session_visible_for_key(db, owning, current_session_key):
+                 try:
+                     rebind_view = db.get_messages_around(owning, around_message_id, window=window)
+                     messages = rebind_view.get("window") or []
+@@ -397,6 +434,7 @@ def _discover(
+     limit: int,
+     sort: Optional[str],
+     current_session_id: str = None,
++    current_session_key: str = None,
+ ) -> str:
+     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+     role_list = role_filter if role_filter else ["user", "assistant"]
+@@ -409,6 +447,7 @@ def _discover(
+             limit=50,  # widen so dedup-by-lineage can find distinct sessions
+             offset=0,
+             sort=sort,
++            session_key=_normalize_session_key(current_session_key),
+         )
+     except Exception as e:
+         logging.error("FTS5 search failed: %s", e, exc_info=True)
+@@ -497,6 +536,7 @@ def session_search(
+     limit: int = 3,
+     db=None,
+     current_session_id: str = None,
++    current_session_key: str = None,
+     # Scroll shape
+     session_id: str = None,
+     around_message_id: int = None,
+@@ -526,6 +566,8 @@ def session_search(
+             from hermes_state import format_session_db_unavailable
+             return tool_error(format_session_db_unavailable(), success=False)
+ 
++    current_session_key = _normalize_session_key(current_session_key)
++
+     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
+     # Session ids never contain "/", so a slash unambiguously means profile/id —
+     # always strip the prefix off the id, and adopt the embedded profile only
+@@ -558,27 +600,29 @@ def session_search(
+             around_message_id=around_message_id,
+             window=window,
+             current_session_id=current_session_id,
++            current_session_key=current_session_key,
+         )
+ 
+     # Read shape: a session_id with no anchor → dump the whole session.
+     if isinstance(session_id, str) and session_id.strip():
+         sid = session_id.strip()
+-        result = _read_session(db, sid)
++        result = _read_session(db, sid, current_session_key=current_session_key)
+         if json.loads(result).get("success"):
+             return result
+ 
+         # Miss in the target profile — the model may have dropped the owning
+         # profile from the link. Scan every profile and read it from wherever
+         # it lives, tagging the profile it was found in.
+-        located, owner = _locate_session_db(sid)
+-        if located is not None:
+-            try:
+-                found = json.loads(_read_session(located, sid))
+-            finally:
+-                located.close()
+-            if found.get("success"):
+-                found["profile"] = owner
+-                return json.dumps(found, ensure_ascii=False)
++        if not current_session_key:
++            located, owner = _locate_session_db(sid)
++            if located is not None:
++                try:
++                    found = json.loads(_read_session(located, sid))
++                finally:
++                    located.close()
++                if found.get("success"):
++                    found["profile"] = owner
++                    return json.dumps(found, ensure_ascii=False)
+         return result
+ 
+     # Limit clamp [1, 10]
+@@ -591,7 +635,7 @@ def session_search(
+ 
+     # Browse shape: no query → recent sessions.
+     if not query or not isinstance(query, str) or not query.strip():
+-        return _list_recent_sessions(db, limit, current_session_id)
++        return _list_recent_sessions(db, limit, current_session_id, current_session_key)
+ 
+     # Parse role_filter
+     role_list: Optional[List[str]] = None
+@@ -612,6 +656,7 @@ def session_search(
+         limit=limit,
+         sort=sort_norm,
+         current_session_id=current_session_id,
++        current_session_key=current_session_key,
+     )
+ 
+ 
+@@ -777,6 +822,7 @@ registry.register(
+         profile=args.get("profile"),
+         db=kw.get("db"),
+         current_session_id=kw.get("current_session_id"),
++        current_session_key=kw.get("current_session_key"),
+     ),
+     check_fn=check_session_search_requirements,
+     emoji="🔍",
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 3e81eff9f..240d90b6d 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -32,6 +32,7 @@ Usage:
+ """
+ 
+ import importlib.util
++import hashlib
+ import json
+ import logging
+ import os
+@@ -988,17 +989,39 @@ def clear_task_env_overrides(task_id: str):
+     _task_env_overrides.pop(task_id, None)
+ 
+ 
++def _session_scoped_container_task_id() -> str:
++    """Return a stable terminal sandbox key for the current gateway session."""
++    try:
++        from gateway.session_context import get_session_env
++
++        session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
++    except Exception:
++        session_key = ""
++    if not session_key:
++        return ""
++
++    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12]
++    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", session_key).strip(".-") or "agent"
++    if len(safe) > 80:
++        safe = safe[:80].rstrip(".-") or "agent"
++    return f"gateway-{safe}-{digest}"
++
++
+ def _resolve_container_task_id(task_id: Optional[str]) -> str:
+     """
+     Map a tool-call ``task_id`` to the container/sandbox key used by
+     ``_active_environments``.
+ 
+-    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
+-    ``delegate_task`` children pass their own subagent ID so that
+-    file-state tracking, the active-subagents registry, and TUI events stay
+-    distinct per child -- but we deliberately collapse that ID back to
+-    ``"default"`` here so subagents share the parent's long-lived container
+-    (one bash, one /workspace, one set of installed packages).
++    Gateway/API sessions that provide ``HERMES_SESSION_KEY`` get a container
++    key derived from that stable agent scope, so enterprise private/channel
++    agents do not share live cwd, background processes, or sandbox state.
++    ``delegate_task`` children inherit the same context var and therefore
++    share their parent agent's workspace, while their own task_id still keeps
++    file-state tracking and TUI events distinct.
++
++    Without a gateway session key, the top-level agent passes ``task_id=None``
++    and lands on ``"default"``. Ordinary task ids also collapse to
++    ``"default"`` to preserve the CLI/shared-container contract.
+ 
+     Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
+     call ``register_task_env_overrides(task_id, {...})`` to request a
+@@ -1009,6 +1032,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
+     """
+     if task_id and task_id in _task_env_overrides:
+         return task_id
++    session_task_id = _session_scoped_container_task_id()
++    if session_task_id:
++        return session_task_id
+     return "default"
+ 
+ 
+@@ -1041,6 +1067,14 @@ def _safe_getcwd() -> str:
+     try:
+         return os.getcwd()
+     except FileNotFoundError:
++        try:
++            from agent.runtime_cwd import resolve_context_cwd
++
++            context_cwd = resolve_context_cwd()
++            if context_cwd and context_cwd.is_dir():
++                return str(context_cwd)
++        except Exception:
++            pass
+         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+ 
+ 
+@@ -1062,17 +1096,25 @@ def _get_env_config() -> Dict[str, Any]:
+     else:
+         default_cwd = "/root"
+ 
+-    # Read TERMINAL_CWD but sanity-check it for container backends.
++    try:
++        from agent.runtime_cwd import resolve_context_cwd
++
++        context_cwd = resolve_context_cwd()
++        raw_cwd = str(context_cwd) if context_cwd else os.getenv("TERMINAL_CWD", "")
++    except Exception:
++        raw_cwd = os.getenv("TERMINAL_CWD", "")
++
++    # Read the session cwd but sanity-check it for container backends.
+     # If Docker cwd passthrough is explicitly enabled, remap the host path to
+     # /workspace and track the original host path separately. Otherwise keep the
+     # normal sandbox behavior and discard host paths.
+-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
++    cwd = raw_cwd or default_cwd
+     if cwd:
+         cwd = os.path.expanduser(cwd)
+     host_cwd = None
+     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
+     if env_type == "docker" and mount_docker_cwd:
+-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
++        docker_cwd_source = raw_cwd or _safe_getcwd()
+         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+         if (
+             any(candidate.startswith(p) for p in host_prefixes)
+@@ -1481,18 +1523,28 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
+     # actual (potentially slow) env.cleanup() call to outside the lock
+     # so other tool calls aren't blocked.
+     env = None
++    raw_task_id = task_id or ""
+     with _env_lock:
+-        env = _active_environments.pop(task_id, None)
+-        _last_activity.pop(task_id, None)
++        resolved_task_id = raw_task_id
++        if resolved_task_id not in _active_environments:
++            resolved_task_id = _resolve_container_task_id(raw_task_id)
++        env = _active_environments.pop(resolved_task_id, None)
++        _last_activity.pop(resolved_task_id, None)
++        if raw_task_id != resolved_task_id:
++            _last_activity.pop(raw_task_id, None)
+ 
+     # Clean up per-task creation lock
+     with _creation_locks_lock:
+-        _creation_locks.pop(task_id, None)
++        _creation_locks.pop(resolved_task_id, None)
++        if raw_task_id != resolved_task_id:
++            _creation_locks.pop(raw_task_id, None)
+ 
+     # Invalidate stale file_ops cache entry
+     try:
+         from tools.file_tools import clear_file_ops_cache
+-        clear_file_ops_cache(task_id)
++        clear_file_ops_cache(resolved_task_id)
++        if raw_task_id != resolved_task_id:
++            clear_file_ops_cache(raw_task_id)
+     except ImportError:
+         pass
+ 
+@@ -1514,14 +1566,14 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
+         elif hasattr(env, 'terminate'):
+             env.terminate()
+ 
+-        logger.info("Manually cleaned up environment for task: %s", task_id)
++        logger.info("Manually cleaned up environment for task: %s", resolved_task_id)
+ 
+     except Exception as e:
+         error_str = str(e)
+         if "404" in error_str or "not found" in error_str.lower():
+-            logger.info("Environment for task %s already cleaned up", task_id)
++            logger.info("Environment for task %s already cleaned up", resolved_task_id)
+         else:
+-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
++            logger.warning("Error cleaning up environment for task %s: %s", resolved_task_id, e)
+ 
+ 
+ def _atexit_cleanup():

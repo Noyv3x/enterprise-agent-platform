@@ -1045,6 +1045,7 @@ class PlatformServiceTests(unittest.TestCase):
                     {
                         "event": "run.completed",
                         "run_id": "run_1",
+                        "session_id": "session-rotated",
                         "output": "Hello world",
                         "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
                     },
@@ -1082,12 +1083,14 @@ class PlatformServiceTests(unittest.TestCase):
                 response = client.respond_approval(run_id="run_1", choice="always", resolve_all=True)
 
                 self.assertEqual(result.content, "Hello world")
+                self.assertEqual(result.session_id, "session-rotated")
                 self.assertEqual(chunks, ["Hello ", "world"])
                 self.assertEqual([event["event"] for event in progress], ["approval.request", "approval.responded"])
                 self.assertEqual(result.raw["mode"], "runs")
                 self.assertEqual(result.raw["usage"]["total_tokens"], 3)
                 self.assertEqual(requests[0]["body"]["input"][0]["content"], "question")
                 self.assertEqual(requests[0]["body"]["instructions"], "system")
+                self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Id"], "session-1")
                 self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Key"], "channel:1:main-agent")
                 self.assertEqual(approvals[0]["body"], {"choice": "always", "all": True})
                 self.assertEqual(response["resolved"], 1)
@@ -1344,6 +1347,10 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent.calls[-1]["history"], [])
             self.assertIn("enterprise_kb_search", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
+            workspace = Path(agent.calls[-1]["metadata"]["workspace"]["path"])
+            self.assertTrue(workspace.is_dir())
+            self.assertEqual(agent.calls[-1]["metadata"]["workspace"]["scope"], "channel")
+            self.assertEqual(workspace.name, "channel-1")
             work = agent_message["metadata"]["agent_work"]
             self.assertEqual(work["state"], "complete")
             self.assertEqual(work["run_id"], f"channel:1:{result['user_message']['id']}")
@@ -1468,6 +1475,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(result["scope_type"], "private")
                 self.assertEqual(len(agent.calls), 1)
                 self.assertEqual(agent.calls[0]["session_key"], f"private:{user['id']}")
+                self.assertEqual(agent.calls[0]["metadata"]["workspace"]["scope"], "private")
+                self.assertEqual(
+                    agent.calls[0]["metadata"]["workspace"]["path"],
+                    agent.calls[0]["metadata"]["container"]["workspace_path"],
+                )
                 self.assertEqual(result["scope_id"], str(user["id"]))
                 self.assertEqual(len(bot.sent), 1)
                 self.assertEqual(bot.sent[0]["chat_id"], 12345)
@@ -2399,7 +2411,14 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn('USE_DB_AUTHENTICATION="false"', firecrawl_env_text)
                 self.assertIn('BULL_AUTH_KEY=', firecrawl_env_text)
                 install_commands = [call["cmd"] for call in runner.calls]
-                self.assertIn([str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")], install_commands)
+                runtime_source = hermes_home / "source" / "hermes-agent"
+                self.assertTrue(runtime_source.exists())
+                self.assertTrue((hermes_home / "source" / "source.json").exists())
+                self.assertFalse((tmp / "hermes-agent" / "source.json").exists())
+                self.assertIn(
+                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
+                    install_commands,
+                )
             finally:
                 service.close()
 
@@ -2426,7 +2445,8 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertTrue(launcher.calls)
                 launch = next(call for call in launcher.calls if "gateway" in call["cmd"])
-                self.assertEqual(launch["cwd"], tmp / "hermes-agent")
+                runtime_source = config.managed_hermes_home / "source" / "hermes-agent"
+                self.assertEqual(launch["cwd"], runtime_source)
                 self.assertEqual(launch["cmd"][0], str(managed_python(config.managed_hermes_home / "venv")))
                 self.assertIn("gateway", launch["cmd"])
                 self.assertEqual(launch["env"]["HERMES_HOME"], str(config.managed_hermes_home))
@@ -2437,7 +2457,7 @@ class PlatformServiceTests(unittest.TestCase):
                 python_path = launch["env"]["PYTHONPATH"].split(os.pathsep)
                 patch_path = str(Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch")
                 self.assertEqual(python_path[0], patch_path)
-                self.assertEqual(python_path[1], str(tmp / "hermes-agent"))
+                self.assertEqual(python_path[1], str(runtime_source))
                 self.assertTrue(agent_message["metadata"]["degraded"])
                 self.assertIn("Hermes Agent request did not complete", agent_message["content"])
             finally:
@@ -2484,7 +2504,7 @@ class PlatformServiceTests(unittest.TestCase):
 
             self.assertTrue(all(not process.running for process in launcher.processes))
 
-    def test_first_run_installs_hermes_from_adjacent_source(self):
+    def test_first_run_installs_hermes_from_managed_patched_source_copy(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_hermes_repo(tmp / "hermes-agent")
@@ -2492,17 +2512,19 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
             try:
                 hermes_home = service.config.managed_hermes_home
+                runtime_source = hermes_home / "source" / "hermes-agent"
                 self.assertTrue((hermes_home / "install.json").exists())
+                self.assertTrue(runtime_source.exists())
                 self.assertEqual(runner.calls[0]["cmd"][:3], [sys.executable, "-m", "venv"])
                 self.assertEqual(runner.calls[0]["cmd"][3], str(hermes_home / "venv"))
                 self.assertEqual(
                     runner.calls[1]["cmd"],
-                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(tmp / "hermes-agent")],
+                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
                 )
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)["hermes"]
                 self.assertEqual(status["install_state"], "installed")
-                self.assertEqual(status["source"], str(tmp / "hermes-agent"))
+                self.assertEqual(status["source"], f"{runtime_source} (patched from {tmp / 'hermes-agent'})")
             finally:
                 service.close()
 
@@ -2548,7 +2570,7 @@ class PlatformServiceTests(unittest.TestCase):
                         "pip",
                         "install",
                         "-e",
-                        f"{tmp / 'hermes-agent'}[dev]",
+                        f"{service.config.managed_hermes_home / 'source' / 'hermes-agent'}[dev]",
                     ],
                 )
             finally:

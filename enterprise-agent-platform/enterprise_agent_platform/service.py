@@ -1980,6 +1980,7 @@ class EnterpriseService:
         system_prompt = self._channel_system_prompt(channel, suggestions)
         self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         session_id = self._channel_agent_session_id(scope_id)
+        workspace_path = self._channel_agent_workspace(scope_id)
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], prompt_content),
@@ -1988,6 +1989,11 @@ class EnterpriseService:
             session_key=f"channel:{scope_id}:main-agent",
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "workspace": {
+                    "path": str(workspace_path),
+                    "scope": "channel",
+                    "scope_id": scope_id,
+                },
                 "attachments": self._attachment_metadata_for_agent(attachments),
             },
             attachments=attachments,
@@ -2102,6 +2108,11 @@ class EnterpriseService:
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
                 "container": container_data,
+                "workspace": {
+                    "path": container_data["workspace_path"],
+                    "scope": "private",
+                    "user_id": actor["id"],
+                },
                 "attachments": self._attachment_metadata_for_agent(attachments),
             },
             attachments=attachments,
@@ -4006,6 +4017,12 @@ class EnterpriseService:
     def _remember_channel_agent_session_id(self, scope_id: str, session_id: str | None) -> None:
         if self._valid_hermes_session_id(session_id):
             self.set_setting(f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent", str(session_id))
+
+    def _channel_agent_workspace(self, scope_id: str) -> Path:
+        safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(scope_id)).strip(".-") or "default"
+        path = self.config.workspace_dir / "channels" / f"channel-{safe_scope}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self._messages_for_scope(scope_type, scope_id, limit=12)
