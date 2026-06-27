@@ -2986,6 +2986,89 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_codex_oauth_relogin_refreshes_managed_auth_timestamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                auth_path = service.config.managed_hermes_home / "auth.json"
+                auth_path.parent.mkdir(parents=True, exist_ok=True)
+                auth_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "providers": {
+                                "openai-codex": {
+                                    "auth_mode": "chatgpt",
+                                    "tokens": {
+                                        "access_token": "old-access",
+                                        "refresh_token": "old-refresh",
+                                    },
+                                    "last_refresh": "2000-01-01T00:00:00Z",
+                                    "platform_synced_refresh_token": "old-refresh",
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "new-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "new-refresh")
+                service.runtimes.prepare_hermes()
+
+                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+                state = auth_store["providers"]["openai-codex"]
+                self.assertEqual(state["tokens"]["access_token"], "new-access")
+                self.assertEqual(state["tokens"]["refresh_token"], "new-refresh")
+                self.assertNotEqual(state["last_refresh"], "2000-01-01T00:00:00Z")
+            finally:
+                service.close()
+
+    def test_oauth_provider_status_uses_newer_settings_timestamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+                newer = 4_102_444_800
+                service.db.execute(
+                    "UPDATE settings SET updated_at = ? WHERE key = ?",
+                    (newer, "CODEX_OAUTH_ACCESS_TOKEN"),
+                )
+                auth_path = service.config.managed_hermes_home / "auth.json"
+                auth_path.parent.mkdir(parents=True, exist_ok=True)
+                auth_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "providers": {
+                                "openai-codex": {
+                                    "auth_mode": "chatgpt",
+                                    "tokens": {
+                                        "access_token": "codex-access",
+                                        "refresh_token": "codex-refresh",
+                                    },
+                                    "last_refresh": "2000-01-01T00:00:00Z",
+                                    "platform_synced_refresh_token": "codex-refresh",
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                status = service.oauth_provider_status(admin)
+                codex_status = next(item for item in status["providers"] if item["id"] == "openai-codex")
+                self.assertEqual(codex_status["last_refresh"], newer)
+            finally:
+                service.close()
+
     def test_grok_guided_oauth_flow_accepts_pasted_callback_url(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

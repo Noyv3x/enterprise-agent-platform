@@ -1297,7 +1297,7 @@ class PlatformRuntimeManager:
         tokens["refresh_token"] = refresh_token
         state["tokens"] = tokens
         state["auth_mode"] = "chatgpt"
-        state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        state["last_refresh"] = _iso_now()
         state["platform_synced_refresh_token"] = refresh_token
         state.pop("last_auth_error", None)
         changed = original != json.dumps(state, sort_keys=True)
@@ -1330,7 +1330,7 @@ class PlatformRuntimeManager:
         tokens.setdefault("token_type", "Bearer")
         state["tokens"] = tokens
         state["auth_mode"] = "oauth_pkce"
-        state["last_refresh"] = state.get("last_refresh") or _iso_now()
+        state["last_refresh"] = _iso_now()
         state["platform_synced_refresh_token"] = refresh_token
         state.pop("last_auth_error", None)
         changed = original != json.dumps(state, sort_keys=True)

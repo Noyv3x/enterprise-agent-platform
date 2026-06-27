@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque
 
@@ -2475,11 +2476,13 @@ class EnterpriseService:
                     "model_catalog_error": catalog["error"],
                     "configured": (configured or bool(runtime_status.get("configured"))) and not relogin_required,
                     "active": active_provider == provider,
-                    # Hermes owns token refresh and keeps auth.json current, so
-                    # prefer the runtime value; the DB write time is only a
-                    # fallback before Hermes has written auth.json (e.g. right
-                    # after a credential import).
-                    "last_refresh": runtime_status.get("last_refresh") or self._oauth_last_refresh(provider),
+                    # Hermes owns token refresh and keeps auth.json current, but
+                    # an interactive platform re-login updates settings before
+                    # Hermes necessarily writes a newer auth.json timestamp.
+                    "last_refresh": self._oauth_display_last_refresh(
+                        provider,
+                        runtime_status.get("last_refresh"),
+                    ),
                     "last_auth_error": dict(last_auth_error) if last_auth_error else None,
                 }
             )
@@ -3000,6 +3003,36 @@ class EnterpriseService:
             return None
         row = self.db.query_one("SELECT updated_at FROM settings WHERE key = ? AND secret = 1", (key,))
         return int(row["updated_at"]) if row and row.get("updated_at") else None
+
+    def _oauth_display_last_refresh(self, provider: str, runtime_value: Any) -> Any:
+        db_value = self._oauth_last_refresh(provider)
+        if not runtime_value:
+            return db_value
+        if not db_value:
+            return runtime_value
+        runtime_epoch = self._oauth_timestamp_epoch(runtime_value)
+        if runtime_epoch is None:
+            return runtime_value
+        return db_value if db_value >= runtime_epoch else runtime_value
+
+    @staticmethod
+    def _oauth_timestamp_epoch(value: Any) -> int | None:
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            return int(float(text))
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
 
     def agent_tool_token(self, actor: dict[str, Any]) -> dict[str, str]:
         require_admin(actor)
