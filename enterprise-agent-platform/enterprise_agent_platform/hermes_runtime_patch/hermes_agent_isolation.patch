@@ -1,8 +1,8 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 3a648c1b9..c0908981f 100644
+index 180e1d971..2687f7720 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -1128,6 +1128,7 @@ def init_agent(
+@@ -1174,6 +1174,7 @@ def init_agent(
                  agent._memory_store = MemoryStore(
                      memory_char_limit=mem_config.get("memory_char_limit", 2200),
                      user_char_limit=mem_config.get("user_char_limit", 1375),
@@ -10,7 +10,7 @@ index 3a648c1b9..c0908981f 100644
                  )
                  agent._memory_store.load_from_disk()
          except Exception:
-@@ -1150,6 +1151,7 @@ def init_agent(
+@@ -1196,6 +1197,7 @@ def init_agent(
                  if _mp and _mp.is_available():
                      agent._memory_manager.add_provider(_mp)
                  if agent._memory_manager.providers:
@@ -18,7 +18,7 @@ index 3a648c1b9..c0908981f 100644
                      _init_kwargs = {
                          "session_id": agent.session_id,
                          "platform": platform or "cli",
-@@ -1181,15 +1183,23 @@ def init_agent(
+@@ -1230,15 +1232,23 @@ def init_agent(
                      if agent._thread_id:
                          _init_kwargs["thread_id"] = agent._thread_id
                      # Thread gateway session key for stable per-chat Honcho session isolation
@@ -45,7 +45,7 @@ index 3a648c1b9..c0908981f 100644
                          pass
                      agent._memory_manager.initialize_all(**_init_kwargs)
                      _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
-@@ -1585,8 +1595,14 @@ def init_agent(
+@@ -1699,8 +1709,14 @@ def init_agent(
          except Exception as _ce_err:
              _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
  
@@ -62,10 +62,10 @@ index 3a648c1b9..c0908981f 100644
      agent._user_turn_count = 0
  
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 884866dc1..4c7afd660 100644
+index 3473eb0b5..eebaa6b3d 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
-@@ -1833,6 +1833,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+@@ -1843,6 +1843,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                      sort=next_args.get("sort"),
                      db=session_db,
                      current_session_id=agent.session_id,
@@ -74,10 +74,10 @@ index 884866dc1..4c7afd660 100644
                  next_args,
              )
 diff --git a/agent/background_review.py b/agent/background_review.py
-index 2c9703ba6..f9533cf97 100644
+index 564c54419..ea83e1cc0 100644
 --- a/agent/background_review.py
 +++ b/agent/background_review.py
-@@ -415,6 +415,7 @@ def build_memory_write_metadata(
+@@ -558,6 +558,7 @@ def build_memory_write_metadata(
          ),
          "session_id": agent.session_id or "",
          "parent_session_id": agent._parent_session_id or "",
@@ -86,36 +86,36 @@ index 2c9703ba6..f9533cf97 100644
          "tool_name": "memory",
      }
 diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
-index 318e67d0f..0b2470e6d 100644
+index 70d997631..00c6a7b85 100644
 --- a/agent/conversation_compression.py
 +++ b/agent/conversation_compression.py
-@@ -539,12 +539,21 @@ def compress_context(
-             except Exception:
-                 pass
-             agent._session_db_created = False
-+            try:
-+                from agent.runtime_cwd import resolve_context_cwd
+@@ -603,12 +603,21 @@ def compress_context(
+                     pass
+                 agent._session_db_created = False
+                 try:
++                    try:
++                        from agent.runtime_cwd import resolve_context_cwd
 +
-+                _context_cwd = resolve_context_cwd()
-+                _session_cwd = str(_context_cwd) if _context_cwd else None
-+            except Exception:
-+                _session_cwd = None
-             agent._session_db.create_session(
-                 session_id=agent.session_id,
-                 source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                 model=agent.model,
-                 model_config=agent._session_init_model_config,
-+                session_key=getattr(agent, "_gateway_session_key", None),
-                 parent_session_id=old_session_id,
-+                cwd=_session_cwd,
-             )
-             agent._session_db_created = True
-             # Auto-number the title for the continuation session
++                        _context_cwd = resolve_context_cwd()
++                        _session_cwd = str(_context_cwd) if _context_cwd else None
++                    except Exception:
++                        _session_cwd = None
+                     agent._session_db.create_session(
+                         session_id=agent.session_id,
+                         source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                         model=agent.model,
+                         model_config=agent._session_init_model_config,
++                        session_key=getattr(agent, "_gateway_session_key", None),
+                         parent_session_id=old_session_id,
++                        cwd=_session_cwd,
+                     )
+                 except Exception as _cs_err:
+                     # The child row could not be created (e.g. FK constraint,
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 82051ef49..931abd05f 100644
+index 1a87e66cd..705df4c91 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
-@@ -756,7 +756,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
+@@ -908,7 +908,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
      per process. Used only for non-local backends where the agent's tools
      operate on a different machine than the host Hermes runs on.
      """
@@ -131,10 +131,10 @@ index 82051ef49..931abd05f 100644
      cached = _BACKEND_PROBE_CACHE.get(cache_key)
      if cached is not None:
 diff --git a/agent/tool_executor.py b/agent/tool_executor.py
-index 144a29297..37d94ed5b 100644
+index 6845f7919..458e6852a 100644
 --- a/agent/tool_executor.py
 +++ b/agent/tool_executor.py
-@@ -406,7 +406,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+@@ -456,7 +456,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                  try:
                      cmd = function_args.get("command", "")
                      if _is_destructive_command(cmd):
@@ -148,7 +148,7 @@ index 144a29297..37d94ed5b 100644
                          agent._checkpoint_mgr.ensure_checkpoint(
                              cwd, f"before terminal: {cmd[:60]}"
                          )
-@@ -919,7 +924,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+@@ -1014,7 +1019,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
              try:
                  cmd = function_args.get("command", "")
                  if _is_destructive_command(cmd):
@@ -162,7 +162,7 @@ index 144a29297..37d94ed5b 100644
                      agent._checkpoint_mgr.ensure_checkpoint(
                          cwd, f"before terminal: {cmd[:60]}"
                      )
-@@ -997,6 +1007,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+@@ -1092,6 +1102,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                      sort=next_args.get("sort"),
                      db=session_db,
                      current_session_id=agent.session_id,
@@ -171,10 +171,10 @@ index 144a29297..37d94ed5b 100644
              function_result, function_args = _run_agent_tool_execution_middleware(
                  agent,
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index da86952a0..005b56744 100644
+index 2e7361c18..1227385f4 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -985,6 +985,35 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1038,6 +1038,35 @@ class APIServerAdapter(BasePlatformAdapter):
  
          return raw, None
  
@@ -210,7 +210,7 @@ index da86952a0..005b56744 100644
      # ------------------------------------------------------------------
      # Session DB helper
      # ------------------------------------------------------------------
-@@ -1562,6 +1591,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1640,6 +1669,7 @@ class APIServerAdapter(BasePlatformAdapter):
          system_prompt = body.get("system_message") or body.get("instructions")
          if system_prompt is not None and not isinstance(system_prompt, str):
              return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -218,7 +218,7 @@ index da86952a0..005b56744 100644
          history = self._conversation_history_for_session(session_id)
          result, usage = await self._run_agent(
              user_message=user_message,
-@@ -1569,6 +1599,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1647,6 +1677,7 @@ class APIServerAdapter(BasePlatformAdapter):
              ephemeral_system_prompt=system_prompt,
              session_id=session_id,
              gateway_session_key=gateway_session_key,
@@ -226,7 +226,7 @@ index da86952a0..005b56744 100644
          )
          effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
          final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-@@ -1606,6 +1637,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1684,6 +1715,7 @@ class APIServerAdapter(BasePlatformAdapter):
          system_prompt = body.get("system_message") or body.get("instructions")
          if system_prompt is not None and not isinstance(system_prompt, str):
              return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -234,7 +234,7 @@ index da86952a0..005b56744 100644
  
          loop = asyncio.get_running_loop()
          queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
-@@ -1660,6 +1692,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1738,6 +1770,7 @@ class APIServerAdapter(BasePlatformAdapter):
                      stream_delta_callback=_delta,
                      tool_progress_callback=_tool_progress,
                      gateway_session_key=gateway_session_key,
@@ -242,7 +242,7 @@ index da86952a0..005b56744 100644
                  )
                  final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                  effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-@@ -1840,6 +1873,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1923,6 +1956,7 @@ class APIServerAdapter(BasePlatformAdapter):
              session_id = _derive_chat_session_id(system_prompt, first_user)
              # history already set from request body above
  
@@ -250,7 +250,7 @@ index da86952a0..005b56744 100644
          completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
          model_name = body.get("model", self._model_name)
          created = int(time.time())
-@@ -1926,6 +1960,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2009,6 +2043,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  tool_complete_callback=_on_tool_complete,
                  agent_ref=agent_ref,
                  gateway_session_key=gateway_session_key,
@@ -258,7 +258,7 @@ index da86952a0..005b56744 100644
              ))
              # Ensure SSE drain loops can terminate without relying on polling
              # agent_task.done(), which can race with queue timeout checks.
-@@ -1945,6 +1980,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2028,6 +2063,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  ephemeral_system_prompt=system_prompt,
                  session_id=session_id,
                  gateway_session_key=gateway_session_key,
@@ -266,7 +266,7 @@ index da86952a0..005b56744 100644
              )
  
          idempotency_key = request.headers.get("Idempotency-Key")
-@@ -2904,6 +2940,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2992,6 +3028,7 @@ class APIServerAdapter(BasePlatformAdapter):
          # Reuse session from previous_response_id chain so the dashboard
          # groups the entire conversation under one session entry.
          session_id = stored_session_id or str(uuid.uuid4())
@@ -274,7 +274,7 @@ index da86952a0..005b56744 100644
  
          stream = _coerce_request_bool(body.get("stream"), default=False)
          if stream:
-@@ -2958,6 +2995,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3046,6 +3083,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  tool_complete_callback=_on_tool_complete,
                  agent_ref=agent_ref,
                  gateway_session_key=gateway_session_key,
@@ -282,7 +282,7 @@ index da86952a0..005b56744 100644
              ))
              # Ensure SSE drain loops can terminate without relying on polling
              # agent_task.done(), which can race with queue timeout checks.
-@@ -2991,6 +3029,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3079,6 +3117,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  ephemeral_system_prompt=instructions,
                  session_id=session_id,
                  gateway_session_key=gateway_session_key,
@@ -290,7 +290,23 @@ index da86952a0..005b56744 100644
              )
  
          idempotency_key = request.headers.get("Idempotency-Key")
-@@ -3501,6 +3540,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3671,6 +3710,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         chat_id: str = "",
+         session_key: str = "",
+         session_id: str = "",
++        cwd: str = "",
+     ) -> list:
+         """Bind session contextvars for an API-server agent run.
+
+@@ -3694,6 +3734,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             chat_id=chat_id,
+             session_key=session_key,
+             session_id=session_id,
++            cwd=cwd,
+             async_delivery=False,
+         )
+
+@@ -3709,6 +3750,7 @@ class APIServerAdapter(BasePlatformAdapter):
          tool_complete_callback=None,
          agent_ref: Optional[list] = None,
          gateway_session_key: Optional[str] = None,
@@ -298,42 +314,15 @@ index da86952a0..005b56744 100644
      ) -> tuple:
          """
          Create an agent and run a conversation in a thread executor.
-@@ -3518,13 +3558,15 @@ class APIServerAdapter(BasePlatformAdapter):
-         def _run():
-             from gateway.session_context import clear_session_vars, set_session_vars
- 
--            tokens = set_session_vars(
--                platform="api_server",
--                chat_id=session_id or "",
--                session_key=gateway_session_key or session_id or "",
--                session_id=session_id or "",
--            )
-+            session_tokens = []
+@@ -3730,6 +3772,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 chat_id=session_id or "",
+                 session_key=gateway_session_key or session_id or "",
+                 session_id=session_id or "",
++                cwd=session_cwd or "",
+             )
              try:
-+                session_tokens = set_session_vars(
-+                    platform="api_server",
-+                    chat_id=session_id or "",
-+                    session_key=gateway_session_key or session_id or "",
-+                    session_id=session_id or "",
-+                    cwd=session_cwd or "",
-+                )
                  agent = self._create_agent(
-                     ephemeral_system_prompt=ephemeral_system_prompt,
-                     session_id=session_id,
-@@ -3555,7 +3597,11 @@ class APIServerAdapter(BasePlatformAdapter):
-                     result["session_id"] = _eff_sid
-                 return result, usage
-             finally:
--                clear_session_vars(tokens)
-+                if session_tokens:
-+                    try:
-+                        clear_session_vars(session_tokens)
-+                    except Exception:
-+                        pass
- 
-         return await loop.run_in_executor(None, _run)
- 
-@@ -3707,8 +3753,32 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3916,8 +3959,32 @@ class APIServerAdapter(BasePlatformAdapter):
                      conversation_history.append({"role": msg["role"], "content": str(content)})
  
          run_id = f"run_{uuid.uuid4().hex}"
@@ -367,7 +356,7 @@ index da86952a0..005b56744 100644
          ephemeral_system_prompt = instructions
          loop = asyncio.get_running_loop()
          q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-@@ -3744,13 +3814,26 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3953,13 +4020,26 @@ class APIServerAdapter(BasePlatformAdapter):
          async def _run_and_close():
              try:
                  self._set_run_status(run_id, "running")
@@ -400,15 +389,15 @@ index da86952a0..005b56744 100644
                  self._active_run_agents[run_id] = agent
  
                  def _approval_notify(approval_data: Dict[str, Any]) -> None:
-@@ -3791,6 +3874,7 @@ class APIServerAdapter(BasePlatformAdapter):
-                         session_tokens = set_session_vars(
-                             platform="api_server",
+@@ -4007,6 +4087,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                         approval_token = set_current_session_key(approval_session_key)
+                         session_tokens = self._bind_api_server_session(
                              session_key=approval_session_key,
 +                            cwd=session_cwd,
                          )
                          register_gateway_notify(approval_session_key, _approval_notify)
                          r = agent.run_conversation(
-@@ -3839,16 +3923,19 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4055,16 +4136,19 @@ class APIServerAdapter(BasePlatformAdapter):
                      )
                  else:
                      final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -428,7 +417,7 @@ index da86952a0..005b56744 100644
                          output=final_response,
                          usage=usage,
                          last_event="run.completed",
-@@ -3915,9 +4002,9 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4131,9 +4215,9 @@ class APIServerAdapter(BasePlatformAdapter):
          if hasattr(task, "add_done_callback"):
              task.add_done_callback(self._background_tasks.discard)
  
@@ -442,10 +431,10 @@ index da86952a0..005b56744 100644
              {"run_id": run_id, "status": "started"},
              status=202,
 diff --git a/hermes_state.py b/hermes_state.py
-index 9653eae01..14f086e4c 100644
+index a7938f716..dd5875ca9 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -515,6 +515,7 @@ CREATE TABLE IF NOT EXISTS sessions (
+@@ -602,6 +602,7 @@ CREATE TABLE IF NOT EXISTS sessions (
      id TEXT PRIMARY KEY,
      source TEXT NOT NULL,
      user_id TEXT,
@@ -453,7 +442,7 @@ index 9653eae01..14f086e4c 100644
      model TEXT,
      model_config TEXT,
      system_prompt TEXT,
-@@ -594,6 +595,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
+@@ -684,6 +685,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
  # existing databases. SCHEMA_SQL above is run by sqlite executescript
  # which would otherwise fail on legacy DBs ("no such column: active").
  DEFERRED_INDEX_SQL = """
@@ -462,7 +451,7 @@ index 9653eae01..14f086e4c 100644
  CREATE INDEX IF NOT EXISTS idx_messages_session_active
      ON messages(session_id, active, timestamp);
  """
-@@ -1285,19 +1288,21 @@ class SessionDB:
+@@ -1433,19 +1436,21 @@ class SessionDB:
          model_config: Dict[str, Any] = None,
          system_prompt: str = None,
          user_id: str = None,
@@ -486,7 +475,7 @@ index 9653eae01..14f086e4c 100644
                      model,
                      json.dumps(model_config) if model_config else None,
                      system_prompt,
-@@ -1311,7 +1316,26 @@ class SessionDB:
+@@ -1459,7 +1464,26 @@ class SessionDB:
      def create_session(self, session_id: str, source: str, **kwargs) -> str:
          """Create a new session record. Returns the session_id."""
          self._insert_session_row(session_id, source, **kwargs)
@@ -513,7 +502,7 @@ index 9653eae01..14f086e4c 100644
      def end_session(self, session_id: str, end_reason: str) -> None:
          """Mark a session as ended.
  
-@@ -1990,6 +2014,7 @@ class SessionDB:
+@@ -2326,6 +2350,7 @@ class SessionDB:
          include_archived: bool = False,
          archived_only: bool = False,
          id_query: str = None,
@@ -521,17 +510,17 @@ index 9653eae01..14f086e4c 100644
      ) -> List[Dict[str, Any]]:
          """List sessions with preview (first user message) and last active timestamp.
  
-@@ -2046,6 +2071,9 @@ class SessionDB:
-             placeholders = ",".join("?" for _ in exclude_sources)
-             where_clauses.append(f"s.source NOT IN ({placeholders})")
-             params.extend(exclude_sources)
+@@ -2386,6 +2411,9 @@ class SessionDB:
+             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+             where_clauses.append(clause)
+             params.extend(clause_params)
 +        if session_key:
 +            where_clauses.append("s.session_key = ?")
 +            params.append(str(session_key))
          if min_message_count > 0:
              where_clauses.append("s.message_count >= ?")
              params.append(min_message_count)
-@@ -3262,6 +3290,7 @@ class SessionDB:
+@@ -3698,6 +3726,7 @@ class SessionDB:
          offset: int = 0,
          sort: str = None,
          include_inactive: bool = False,
@@ -539,7 +528,7 @@ index 9653eae01..14f086e4c 100644
      ) -> List[Dict[str, Any]]:
          """
          Full-text search across session messages using FTS5.
-@@ -3332,6 +3361,10 @@ class SessionDB:
+@@ -3775,6 +3804,10 @@ class SessionDB:
              where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
              params.extend(exclude_sources)
  
@@ -550,7 +539,7 @@ index 9653eae01..14f086e4c 100644
          if role_filter:
              role_placeholders = ",".join("?" for _ in role_filter)
              where_clauses.append(f"m.role IN ({role_placeholders})")
-@@ -3408,6 +3441,9 @@ class SessionDB:
+@@ -3852,6 +3885,9 @@ class SessionDB:
                  if exclude_sources is not None:
                      tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                      tri_params.extend(exclude_sources)
@@ -560,7 +549,7 @@ index 9653eae01..14f086e4c 100644
                  if role_filter:
                      tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                      tri_params.extend(role_filter)
-@@ -3463,6 +3499,9 @@ class SessionDB:
+@@ -3909,6 +3945,9 @@ class SessionDB:
                  if exclude_sources is not None:
                      like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                      like_params.extend(exclude_sources)
@@ -611,7 +600,7 @@ index 82f3a6daf..77f0d636a 100644
  # ---------------------------------------------------------------------------
 @@ -198,7 +213,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
          ]
- 
+
      def initialize(self, session_id: str, **kwargs) -> None:
 -        self._cwd = str(_get_brv_cwd())
 +        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key") or ""
@@ -620,10 +609,10 @@ index 82f3a6daf..77f0d636a 100644
          self._turn_count = 0
          Path(self._cwd).mkdir(parents=True, exist_ok=True)
 diff --git a/plugins/memory/hindsight/__init__.py b/plugins/memory/hindsight/__init__.py
-index c26e45a0e..6add8226f 100644
+index 9f5974b7b..6456f1709 100644
 --- a/plugins/memory/hindsight/__init__.py
 +++ b/plugins/memory/hindsight/__init__.py
-@@ -31,6 +31,7 @@ from __future__ import annotations
+@@ -32,6 +32,7 @@ from __future__ import annotations
  
  import asyncio
  import atexit
@@ -631,7 +620,7 @@ index c26e45a0e..6add8226f 100644
  import importlib
  import json
  import logging
-@@ -563,6 +564,18 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
+@@ -614,6 +615,18 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
      return rendered or fallback
  
  
@@ -650,7 +639,7 @@ index c26e45a0e..6add8226f 100644
  # ---------------------------------------------------------------------------
  # MemoryProvider implementation
  # ---------------------------------------------------------------------------
-@@ -1209,6 +1222,9 @@ class HindsightMemoryProvider(MemoryProvider):
+@@ -1286,6 +1299,9 @@ class HindsightMemoryProvider(MemoryProvider):
          banks = cfg_get(self._config, "banks", "hermes", default={})
          static_bank_id = self._config.get("bank_id") or banks.get("bankId", "hermes")
          self._bank_id_template = self._config.get("bank_id_template", "") or ""
@@ -711,47 +700,64 @@ index 681ce7660..25014637a 100644
          # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both
          # resolve to the active profile's directory.
 diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
-index 332b3ac94..82f18b754 100644
+index eccf6ad53..68c10a0f5 100644
 --- a/plugins/memory/mem0/__init__.py
 +++ b/plugins/memory/mem0/__init__.py
-@@ -204,10 +204,11 @@ class Mem0MemoryProvider(MemoryProvider):
-     def initialize(self, session_id: str, **kwargs) -> None:
+@@ -308,6 +308,7 @@ class Mem0MemoryProvider(MemoryProvider):
          self._config = _load_config()
+         self._mode = self._config.get("mode", "platform")
          self._api_key = self._config.get("api_key", "")
 +        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key")
-         # Prefer gateway-provided user_id for per-user memory scoping;
-         # fall back to config/env default for CLI (single-user) sessions.
--        self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
+         # Resolution order for user_id:
+         #   1. Operator-configured MEM0_USER_ID (env or $HERMES_HOME/mem0.json) —
+         #      the canonical principal, applied across every gateway so the same
+@@ -322,13 +323,14 @@ class Mem0MemoryProvider(MemoryProvider):
+         configured = self._config.get("user_id")
+         if configured == _DEFAULT_USER_ID:
+             configured = None
+-        self._user_id = configured or kwargs.get("user_id") or _DEFAULT_USER_ID
 -        self._agent_id = self._config.get("agent_id", "hermes")
-+        self._user_id = kwargs.get("user_id") or scope_key or self._config.get("user_id", "hermes-user")
++        self._user_id = configured or kwargs.get("user_id") or scope_key or _DEFAULT_USER_ID
 +        self._agent_id = kwargs.get("agent_id") or scope_key or self._config.get("agent_id", "hermes")
-         self._rerank = self._config.get("rerank", True)
+         self._channel = kwargs.get("platform") or "cli"
+         self._backend = self._create_backend()
+         if self._backend and not self._atexit_registered:
+             atexit.register(self._shutdown_backend)
+             self._atexit_registered = True
++        self._rerank = self._config.get("rerank", True)
  
      def _read_filters(self) -> Dict[str, Any]:
+         # Scoped to user_id only — by design — so recall surfaces memories
 diff --git a/plugins/memory/openviking/__init__.py b/plugins/memory/openviking/__init__.py
-index 3050eb9c4..d44972ec0 100644
+index c6ea6bc1d..fabbd369d 100644
 --- a/plugins/memory/openviking/__init__.py
 +++ b/plugins/memory/openviking/__init__.py
-@@ -484,8 +484,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
-         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
-         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
-         self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
--        self._user = os.environ.get("OPENVIKING_USER", "default")
--        self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
+@@ -2125,11 +2125,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
+
+     def initialize(self, session_id: str, **kwargs) -> None:
+         settings = _resolve_connection_settings(_load_hermes_openviking_config())
 +        scope_key = kwargs.get("agent_scope_key") or kwargs.get("gateway_session_key")
-+        self._user = os.environ.get("OPENVIKING_USER") or kwargs.get("user_id") or scope_key or "default"
-+        self._agent = os.environ.get("OPENVIKING_AGENT") or kwargs.get("agent_id") or scope_key or "hermes"
+         self._endpoint = settings["endpoint"]
+         self._api_key = settings["api_key"]
+         self._account = settings["account"]
+-        self._user = settings["user"]
+-        self._agent = settings["agent"]
++        configured_agent = settings["agent"]
++        if configured_agent == _DEFAULT_AGENT and (kwargs.get("agent_id") or scope_key):
++            configured_agent = ""
++        self._user = settings["user"] or kwargs.get("user_id") or scope_key or "default"
++        self._agent = configured_agent or kwargs.get("agent_id") or scope_key or _DEFAULT_AGENT
          self._session_id = session_id
          self._turn_count = 0
- 
+         warning_callback = (
 diff --git a/run_agent.py b/run_agent.py
-index bca3dd1e7..89d983684 100644
+index 8026b024e..ec15e970e 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -513,6 +513,13 @@ class AIAgent:
+@@ -527,6 +527,13 @@ class AIAgent:
          if self._session_db_created or not self._session_db:
              return
-         source = self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+         source = _session_source_for_agent(self.platform)
 +        try:
 +            from agent.runtime_cwd import resolve_context_cwd
 +
@@ -762,7 +768,7 @@ index bca3dd1e7..89d983684 100644
          try:
              self._session_db.create_session(
                  session_id=self.session_id,
-@@ -521,8 +528,9 @@ class AIAgent:
+@@ -535,8 +542,9 @@ class AIAgent:
                  model_config=self._session_init_model_config,
                  system_prompt=self._cached_system_prompt,
                  user_id=None,
@@ -774,7 +780,7 @@ index bca3dd1e7..89d983684 100644
              self._session_db_created = True
          except Exception as e:
 diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
-index 5514f63b9..990c3a34b 100644
+index 6fc95c254..49fed02da 100644
 --- a/tools/code_execution_tool.py
 +++ b/tools/code_execution_tool.py
 @@ -1695,11 +1695,14 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
@@ -798,10 +804,10 @@ index 5514f63b9..990c3a34b 100644
      if os.path.isdir(here):
          return here
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index b89e7f8db..ac1ab4301 100644
+index 9de91b671..e7f9d96ad 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -736,7 +736,14 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+@@ -746,7 +746,14 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
      teaching subagents a fake container path while still helping them avoid
      guessing `/workspace/...` for local repo tasks.
      """
@@ -817,12 +823,12 @@ index b89e7f8db..ac1ab4301 100644
          getattr(
              getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
 diff --git a/tools/file_tools.py b/tools/file_tools.py
-index 0eb7b2cb1..1ea0a2c70 100644
+index 59c721459..25b0815af 100644
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -224,7 +224,12 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
+@@ -273,7 +273,12 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
      if root:
-         base = Path(root).expanduser()
+         base = Path(_expand_tilde(root))
      else:
 -        base = Path(os.getcwd())
 +        try:
@@ -835,7 +841,7 @@ index 0eb7b2cb1..1ea0a2c70 100644
          # Last-resort anchoring: a live cwd should already be absolute, but if a
          # terminal backend ever reports a relative cwd, anchor it to the process
 diff --git a/tools/memory_tool.py b/tools/memory_tool.py
-index 6cedb405f..d672e8108 100644
+index 96a8a1a0a..ed190336c 100644
 --- a/tools/memory_tool.py
 +++ b/tools/memory_tool.py
 @@ -26,6 +26,8 @@ Design:
@@ -912,7 +918,7 @@ index 6cedb405f..d672e8108 100644
      def load_from_disk(self):
          """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
  
-@@ -147,7 +185,7 @@ class MemoryStore:
+@@ -146,7 +184,7 @@ class MemoryStore:
          Scanning is deterministic from disk bytes, so the snapshot remains
          stable for the entire session (prefix-cache invariant holds).
          """
@@ -921,7 +927,7 @@ index 6cedb405f..d672e8108 100644
          mem_dir.mkdir(parents=True, exist_ok=True)
  
          self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-@@ -242,9 +280,8 @@ class MemoryStore:
+@@ -241,9 +279,8 @@ class MemoryStore:
                      pass
              fd.close()
  
@@ -933,7 +939,7 @@ index 6cedb405f..d672e8108 100644
          if target == "user":
              return mem_dir / "USER.md"
          return mem_dir / "MEMORY.md"
-@@ -269,7 +306,7 @@ class MemoryStore:
+@@ -272,7 +309,7 @@ class MemoryStore:
  
      def save_to_disk(self, target: str):
          """Persist entries to the appropriate file. Called after every mutation."""
@@ -942,13 +948,13 @@ index 6cedb405f..d672e8108 100644
          self._write_file(self._path_for(target), self._entries_for(target))
  
      def _entries_for(self, target: str) -> List[str]:
-@@ -808,4 +845,3 @@ registry.register(
+@@ -1090,4 +1127,3 @@ registry.register(
  
  
  
 -
 diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
-index d96c9faec..ab13d25e8 100644
+index 3a1040e52..03e48da91 100644
 --- a/tools/session_search_tool.py
 +++ b/tools/session_search_tool.py
 @@ -87,6 +87,24 @@ def _resolve_to_parent(db, session_id: str) -> str:
@@ -1049,7 +1055,7 @@ index d96c9faec..ab13d25e8 100644
                  try:
                      rebind_view = db.get_messages_around(owning, around_message_id, window=window)
                      messages = rebind_view.get("window") or []
-@@ -398,6 +435,7 @@ def _discover(
+@@ -470,6 +507,7 @@ def _discover(
      limit: int,
      sort: Optional[str],
      current_session_id: str = None,
@@ -1057,7 +1063,7 @@ index d96c9faec..ab13d25e8 100644
  ) -> str:
      """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
      role_list = role_filter if role_filter else ["user", "assistant"]
-@@ -410,6 +448,7 @@ def _discover(
+@@ -484,6 +522,7 @@ def _discover(
              limit=50,  # widen so dedup-by-lineage can find distinct sessions
              offset=0,
              sort=sort,
@@ -1065,7 +1071,7 @@ index d96c9faec..ab13d25e8 100644
          )
      except Exception as e:
          logging.error("FTS5 search failed: %s", e, exc_info=True)
-@@ -498,6 +537,7 @@ def session_search(
+@@ -581,6 +620,7 @@ def session_search(
      limit: int = 3,
      db=None,
      current_session_id: str = None,
@@ -1073,7 +1079,7 @@ index d96c9faec..ab13d25e8 100644
      # Scroll shape
      session_id: str = None,
      around_message_id: int = None,
-@@ -527,6 +567,8 @@ def session_search(
+@@ -610,6 +650,8 @@ def session_search(
              from hermes_state import format_session_db_unavailable
              return tool_error(format_session_db_unavailable(), success=False)
  
@@ -1082,7 +1088,7 @@ index d96c9faec..ab13d25e8 100644
      # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
      # Session ids never contain "/", so a slash unambiguously means profile/id —
      # always strip the prefix off the id, and adopt the embedded profile only
-@@ -559,27 +601,29 @@ def session_search(
+@@ -642,27 +684,29 @@ def session_search(
              around_message_id=around_message_id,
              window=window,
              current_session_id=current_session_id,
@@ -1122,7 +1128,7 @@ index d96c9faec..ab13d25e8 100644
          return result
  
      # Limit clamp [1, 10]
-@@ -592,7 +636,7 @@ def session_search(
+@@ -675,7 +719,7 @@ def session_search(
  
      # Browse shape: no query → recent sessions.
      if not query or not isinstance(query, str) or not query.strip():
@@ -1131,7 +1137,7 @@ index d96c9faec..ab13d25e8 100644
  
      # Parse role_filter
      role_list: Optional[List[str]] = None
-@@ -613,6 +657,7 @@ def session_search(
+@@ -696,6 +740,7 @@ def session_search(
          limit=limit,
          sort=sort_norm,
          current_session_id=current_session_id,
@@ -1139,7 +1145,7 @@ index d96c9faec..ab13d25e8 100644
      )
  
  
-@@ -778,6 +823,7 @@ registry.register(
+@@ -874,6 +919,7 @@ registry.register(
          profile=args.get("profile"),
          db=kw.get("db"),
          current_session_id=kw.get("current_session_id"),
@@ -1148,7 +1154,7 @@ index d96c9faec..ab13d25e8 100644
      check_fn=check_session_search_requirements,
      emoji="🔍",
 diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
-index 71907a3a3..93182d12c 100644
+index 6a5a6af1f..5df921908 100644
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
 @@ -32,6 +32,7 @@ Usage:
@@ -1159,7 +1165,7 @@ index 71907a3a3..93182d12c 100644
  import json
  import logging
  import os
-@@ -999,17 +1000,39 @@ def clear_task_env_overrides(task_id: str):
+@@ -1097,17 +1098,39 @@ def clear_task_env_overrides(task_id: str):
      _task_env_overrides.pop(task_id, None)
  
  
@@ -1205,7 +1211,7 @@ index 71907a3a3..93182d12c 100644
  
      Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
      call ``register_task_env_overrides(task_id, {...})`` to request a
-@@ -1031,6 +1054,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
+@@ -1129,6 +1152,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
          overrides = _task_env_overrides[task_id]
          if set(overrides.keys()) & _ISOLATION_KEYS:
              return task_id
@@ -1215,7 +1221,7 @@ index 71907a3a3..93182d12c 100644
      return "default"
  
  
-@@ -1083,6 +1109,14 @@ def _safe_getcwd() -> str:
+@@ -1181,6 +1207,14 @@ def _safe_getcwd() -> str:
      try:
          return os.getcwd()
      except FileNotFoundError:
@@ -1230,7 +1236,7 @@ index 71907a3a3..93182d12c 100644
          return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
  
  
-@@ -1130,17 +1164,25 @@ def _get_env_config() -> Dict[str, Any]:
+@@ -1258,16 +1292,24 @@ def _get_env_config() -> Dict[str, Any]:
      else:
          default_cwd = "/root"
  
@@ -1252,14 +1258,13 @@ index 71907a3a3..93182d12c 100644
      if cwd:
          cwd = os.path.expanduser(cwd)
      host_cwd = None
-     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
      if env_type == "docker" and mount_docker_cwd:
 -        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
 +        docker_cwd_source = raw_cwd or _safe_getcwd()
          candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
          if (
-             any(candidate.startswith(p) for p in host_prefixes)
-@@ -1549,18 +1591,28 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
+             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
+@@ -1674,18 +1716,28 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
      # actual (potentially slow) env.cleanup() call to outside the lock
      # so other tool calls aren't blocked.
      env = None
@@ -1292,7 +1297,7 @@ index 71907a3a3..93182d12c 100644
      except ImportError:
          pass
  
-@@ -1582,14 +1634,14 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
+@@ -1707,14 +1759,14 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
          elif hasattr(env, 'terminate'):
              env.terminate()
  
