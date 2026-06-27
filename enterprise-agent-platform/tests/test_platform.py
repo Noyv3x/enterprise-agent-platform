@@ -1099,6 +1099,61 @@ class PlatformServiceTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=1)
 
+    def test_hermes_client_consumes_async_delegation_events(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append({"path": self.path, "headers": dict(self.headers)})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "object": "hermes.async_delegations",
+                            "count": 1,
+                            "events": [
+                                {
+                                    "type": "async_delegation",
+                                    "delegation_id": "deleg_1",
+                                    "session_key": "channel:1:main-agent",
+                                    "status": "error",
+                                    "error": "API call failed after 3 retries",
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                )
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                config = replace(
+                    make_config(Path(td)),
+                    agent_mode="hermes",
+                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    hermes_api_key="test-key",
+                )
+                client = HermesAgentClient(config, lambda name: "")
+                events = client.consume_async_delegations(session_key_prefixes=["channel:", "private:"])
+
+                self.assertEqual(events[0]["delegation_id"], "deleg_1")
+                self.assertIn("/api/async-delegations?", requests[-1]["path"])
+                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-1]["path"]).query)
+                self.assertEqual(parsed["consume"], ["1"])
+                self.assertEqual(parsed["session_key_prefix"], ["channel:", "private:"])
+                self.assertEqual(requests[-1]["headers"]["Authorization"], "Bearer test-key")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_hermes_client_streams_responses_api_output_text_events(self):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -1306,6 +1361,34 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(user["role"], "admin")
                 self.assertEqual(user["permission_group"], "admin")
                 self.assertIn("system_settings", user["permissions"])
+            finally:
+                service.close()
+
+    def test_async_delegation_failure_event_is_persisted_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                event = {
+                    "type": "async_delegation",
+                    "delegation_id": "deleg_failed",
+                    "session_key": "channel:1:main-agent",
+                    "goal": "整理整轨专辑",
+                    "status": "error",
+                    "error": "API call failed after 3 retries",
+                    "duration_seconds": 448.2,
+                }
+                service._handle_async_delegation_event(event)
+                service._handle_async_delegation_event(dict(event))
+
+                rows = service.db.query(
+                    "SELECT content, metadata_json FROM messages WHERE scope_type = 'channel' AND scope_id = '1' AND author_type = 'agent'"
+                )
+                self.assertEqual(len(rows), 1)
+                self.assertIn("后台子代理任务失败", rows[0]["content"])
+                self.assertIn("API call failed after 3 retries", rows[0]["content"])
+                metadata = json.loads(rows[0]["metadata_json"])
+                self.assertEqual(metadata["async_delegation_id"], "deleg_failed")
+                self.assertTrue(metadata["async_delegation"]["failed"])
             finally:
                 service.close()
 

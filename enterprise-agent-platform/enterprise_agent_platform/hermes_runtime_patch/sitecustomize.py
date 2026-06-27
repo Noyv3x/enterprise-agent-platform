@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
@@ -390,9 +392,209 @@ def _install_auxiliary_response_stream_patch() -> None:
     _record_patch_status("aux", "ok")
 
 
+def _install_api_async_delegation_patch() -> None:
+    """Expose API-server async delegation completions for platform polling.
+
+    Hermes' native gateway path reinjects ``delegate_task(background=true)``
+    completions into chat adapters. The API server adapter has no push channel
+    (`send()` is intentionally unsupported), so managed platform clients need a
+    small authenticated poll endpoint instead.
+    """
+
+    try:
+        from gateway.platforms import api_server as api_server_mod
+        from gateway import run as gateway_run_mod
+    except ModuleNotFoundError:
+        _record_patch_status("api_async", "no_module")
+        return
+    except Exception as exc:
+        _record_patch_status("api_async", f"import_error:{type(exc).__name__}")
+        return
+
+    adapter_cls = getattr(api_server_mod, "APIServerAdapter", None)
+    runner_cls = getattr(gateway_run_mod, "GatewayRunner", None)
+    if adapter_cls is None or runner_cls is None:
+        _record_patch_status("api_async", "missing_symbols")
+        return
+    if getattr(adapter_cls, "_enterprise_async_delegation_patch", False):
+        _record_patch_status("api_async", "ok")
+        return
+
+    try:
+        max_events = max(1, int(os.environ.get("ENTERPRISE_HERMES_ASYNC_QUEUE_MAX", "500") or "500"))
+    except (TypeError, ValueError):
+        max_events = 500
+    max_seen = max_events * 4
+    original_init = adapter_cls.__init__
+    original_connect = adapter_cls.connect
+    original_inject = runner_cls._inject_watch_notification
+
+    def _event_key(evt: dict[str, Any]) -> str:
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        if delegation_id:
+            return delegation_id
+        session_key = str(evt.get("session_key") or "").strip()
+        completed_at = str(evt.get("completed_at") or evt.get("duration_seconds") or "")
+        return f"{session_key}:{completed_at}:{evt.get('status') or ''}:{evt.get('goal') or ''}"
+
+    def _is_api_async_event(evt: Any) -> bool:
+        if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
+            return False
+        platform = str(evt.get("platform") or "").strip().lower()
+        if platform == "api_server":
+            return True
+        session_key = str(evt.get("session_key") or "").strip()
+        if not session_key:
+            return False
+        if session_key.startswith("agent:main:api_server:"):
+            return True
+        return not session_key.startswith("agent:main:")
+
+    def _init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self._enterprise_async_delegation_events = deque()
+        self._enterprise_async_delegation_seen = set()
+        self._enterprise_async_delegation_seen_order = deque()
+        self._enterprise_async_delegation_lock = threading.Lock()
+
+    def record_async_delegation_event(self: Any, evt: dict[str, Any], message: str = "") -> bool:
+        if not _is_api_async_event(evt):
+            return False
+        session_key = str(evt.get("session_key") or "").strip()
+        if not session_key:
+            return False
+        item = dict(evt)
+        if message:
+            item["message"] = message
+        item.setdefault("created_at", time.time())
+        key = _event_key(item)
+        with self._enterprise_async_delegation_lock:
+            if key in self._enterprise_async_delegation_seen:
+                return True
+            self._enterprise_async_delegation_seen.add(key)
+            self._enterprise_async_delegation_seen_order.append(key)
+            while len(self._enterprise_async_delegation_seen_order) > max_seen:
+                old_key = self._enterprise_async_delegation_seen_order.popleft()
+                self._enterprise_async_delegation_seen.discard(old_key)
+            self._enterprise_async_delegation_events.append(item)
+            while len(self._enterprise_async_delegation_events) > max_events:
+                self._enterprise_async_delegation_events.popleft()
+        return True
+
+    def _matching_async_events(
+        self: Any,
+        *,
+        session_key: str = "",
+        prefixes: list[str] | None = None,
+        consume: bool = False,
+    ) -> list[dict[str, Any]]:
+        clean_prefixes = [p for p in (prefixes or []) if p]
+
+        def matches(evt: dict[str, Any]) -> bool:
+            evt_key = str(evt.get("session_key") or "")
+            if session_key and evt_key != session_key:
+                return False
+            if clean_prefixes and not any(evt_key.startswith(prefix) for prefix in clean_prefixes):
+                return False
+            return True
+
+        with self._enterprise_async_delegation_lock:
+            matched: list[dict[str, Any]] = []
+            remaining = deque()
+            for evt in self._enterprise_async_delegation_events:
+                if matches(evt):
+                    matched.append(dict(evt))
+                    if not consume:
+                        remaining.append(evt)
+                else:
+                    remaining.append(evt)
+            if consume:
+                self._enterprise_async_delegation_events = remaining
+            return matched
+
+    async def _handle_async_delegations(self: Any, request: Any) -> Any:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        query = request.rel_url.query
+        consume_raw = str(query.get("consume", "")).strip().lower()
+        consume = consume_raw in {"1", "true", "yes", "on"}
+        session_key = str(query.get("session_key") or request.headers.get("X-Hermes-Session-Key", "")).strip()
+        try:
+            prefixes = [str(p).strip() for p in query.getall("session_key_prefix") if str(p).strip()]
+        except Exception:
+            prefixes = []
+        events = self._matching_async_events(
+            session_key=session_key,
+            prefixes=prefixes,
+            consume=consume,
+        )
+        return api_server_mod.web.json_response(
+            {
+                "object": "hermes.async_delegations",
+                "count": len(events),
+                "events": events,
+            }
+        )
+
+    async def connect(self: Any, *args: Any, **kwargs: Any) -> Any:
+        web_mod = getattr(api_server_mod, "web", None)
+        dispatcher_cls = getattr(web_mod, "UrlDispatcher", None)
+        if dispatcher_cls is None:
+            return await original_connect(self, *args, **kwargs)
+
+        original_add_get = dispatcher_cls.add_get
+        route_added = False
+
+        def add_get(router: Any, path: str, handler: Any, *h_args: Any, **h_kwargs: Any) -> Any:
+            nonlocal route_added
+            if not route_added and getattr(handler, "__self__", None) is self:
+                original_add_get(router, "/api/async-delegations", self._handle_async_delegations)
+                route_added = True
+            return original_add_get(router, path, handler, *h_args, **h_kwargs)
+
+        dispatcher_cls.add_get = add_get
+        try:
+            return await original_connect(self, *args, **kwargs)
+        finally:
+            dispatcher_cls.add_get = original_add_get
+
+    def _record_on_api_adapter(runner: Any, evt: dict[str, Any], synth_text: str) -> bool:
+        if not _is_api_async_event(evt):
+            return False
+        for platform, adapter in getattr(runner, "adapters", {}).items():
+            platform_name = getattr(platform, "value", str(platform))
+            if platform_name != "api_server":
+                continue
+            recorder = getattr(adapter, "record_async_delegation_event", None)
+            if callable(recorder):
+                return bool(recorder(evt, synth_text))
+        return False
+
+    async def _inject_watch_notification(self: Any, synth_text: str, evt: dict[str, Any]) -> None:
+        if _record_on_api_adapter(self, evt, synth_text):
+            logger.info(
+                "Enterprise Hermes patch: queued async delegation completion for API session %s",
+                evt.get("session_key", ""),
+            )
+            return
+        return await original_inject(self, synth_text, evt)
+
+    adapter_cls.__init__ = _init
+    adapter_cls.record_async_delegation_event = record_async_delegation_event
+    adapter_cls._matching_async_events = _matching_async_events
+    adapter_cls._handle_async_delegations = _handle_async_delegations
+    adapter_cls.connect = connect
+    adapter_cls._enterprise_async_delegation_patch = True
+    runner_cls._inject_watch_notification = _inject_watch_notification
+    runner_cls._enterprise_async_delegation_patch = True
+    _record_patch_status("api_async", "ok")
+
+
 try:
     _install_codex_response_stream_patch()
     _install_auxiliary_response_stream_patch()
+    _install_api_async_delegation_patch()
 except Exception as exc:
     # A genuine failure while installing (as opposed to the expected
     # "standalone Hermes, module absent" path, which is handled quietly inside

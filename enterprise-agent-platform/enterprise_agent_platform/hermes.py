@@ -336,6 +336,40 @@ class HermesAgentClient:
         with response:
             return json.loads(response.read().decode("utf-8"))
 
+    def consume_async_delegations(
+        self,
+        *,
+        session_key: str | None = None,
+        session_key_prefixes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[tuple[str, str]] = [("consume", "1")]
+        if session_key:
+            params.append(("session_key", session_key))
+        for prefix in session_key_prefixes or []:
+            clean = str(prefix or "").strip()
+            if clean:
+                params.append(("session_key_prefix", clean))
+        request = urllib.request.Request(
+            f"{self._async_delegations_api_url()}?{urllib.parse.urlencode(params)}",
+            headers=self._request_headers(session_id="", session_key=session_key or ""),
+            method="GET",
+        )
+        try:
+            response = urllib.request.urlopen(
+                request,
+                timeout=min(self._effective_timeout_seconds(), 10.0),
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in {404, 405}:
+                return []
+            raise self._http_error_to_value_error(exc) from exc
+        with response:
+            raw = json.loads(response.read().decode("utf-8") or "{}")
+        events = raw.get("events") if isinstance(raw, dict) else None
+        if not isinstance(events, list):
+            return []
+        return [event for event in events if isinstance(event, dict)]
+
     def _open_with_retry(self, request: urllib.request.Request, *, allow_retry: bool = True):
         """Open the request with bounded retries for transient connect failures.
 
@@ -772,6 +806,12 @@ class HermesAgentClient:
         quoted = urllib.parse.quote(run_id, safe="")
         return f"{self._runs_api_url()}/{quoted}/approval"
 
+    def _async_delegations_api_url(self) -> str:
+        base = self._effective_api_base_url().rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        return f"{base}/api/async-delegations"
+
     def _effective_api_base_url(self) -> str:
         url = self._effective_api_url().rstrip("/")
         for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses"):
@@ -874,6 +914,21 @@ class AutoAgentClient:
         if self.runtime_manager is not None:
             self.runtime_manager.ensure_hermes_ready(wait=True)
         return self.hermes.respond_approval(run_id=run_id, choice=choice, resolve_all=resolve_all)
+
+    def consume_async_delegations(
+        self,
+        *,
+        session_key: str | None = None,
+        session_key_prefixes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.config.agent_mode == "local":
+            return []
+        if self.runtime_manager is not None:
+            self.runtime_manager.ensure_hermes_ready(wait=False)
+        return self.hermes.consume_async_delegations(
+            session_key=session_key,
+            session_key_prefixes=session_key_prefixes,
+        )
 
 
 def text_from_response_payload(payload: Any) -> str:

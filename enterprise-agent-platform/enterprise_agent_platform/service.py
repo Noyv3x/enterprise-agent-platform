@@ -8,6 +8,7 @@ import mimetypes
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass
@@ -62,8 +63,16 @@ class UploadedFile:
     data: bytes
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or str(default))
+    except (TypeError, ValueError):
+        return default
+
+
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+ASYNC_DELEGATION_POLL_SECONDS = max(1.0, _float_env("ENTERPRISE_HERMES_ASYNC_POLL_SECONDS", 5.0))
 # Cumulative per-uploader storage budget for attachment blobs. Bounds deliberate
 # or accidental disk exhaustion by any authenticated chat/private-agent user.
 # 0 disables the quota.
@@ -255,6 +264,9 @@ class EnterpriseService:
         # unless ENTERPRISE_CONTAINER_IDLE_HOURS > 0.
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
+        self._async_delegation_stop = threading.Event()
+        self._async_delegation_thread: threading.Thread | None = None
+        self._async_delegation_seen: set[str] = set()
         self._telegram_gateway = None
         self._auto_updater = AutoUpdateManager(
             self,
@@ -271,6 +283,7 @@ class EnterpriseService:
         self._start_container_reaper()
         self._start_telegram_gateway()
         self._start_auto_update_listener()
+        self._start_async_delegation_watcher()
 
     def _start_container_reaper(self) -> None:
         """Start a daemon thread that periodically reclaims idle per-user
@@ -307,9 +320,13 @@ class EnterpriseService:
             self._telegram_gateway.stop()
         self._auto_updater.stop()
         self._reaper_stop.set()
+        self._async_delegation_stop.set()
         reaper = self._reaper_thread
         if reaper is not None:
             reaper.join(timeout=2)
+        async_delegation = self._async_delegation_thread
+        if async_delegation is not None:
+            async_delegation.join(timeout=2)
         for worker in workers:
             worker.join(timeout=2)
         with self._ingest_lock:
@@ -339,6 +356,44 @@ class EnterpriseService:
     def _start_auto_update_listener(self) -> None:
         if self.auto_update_enabled():
             self._auto_updater.start()
+
+    def _start_async_delegation_watcher(self) -> None:
+        if self.config.agent_mode == "local":
+            return
+        if not callable(getattr(self.agent_client, "consume_async_delegations", None)):
+            return
+        if self._async_delegation_thread is not None:
+            return
+
+        def _loop() -> None:
+            while not self._closed:
+                try:
+                    self._poll_async_delegation_events()
+                except Exception:
+                    # This watcher is a notification side channel; transient
+                    # Hermes/API failures must not bring down the service.
+                    pass
+                if self._async_delegation_stop.wait(ASYNC_DELEGATION_POLL_SECONDS):
+                    return
+
+        self._async_delegation_thread = threading.Thread(
+            target=_loop,
+            name="hermes-async-delegations",
+            daemon=True,
+        )
+        self._async_delegation_thread.start()
+
+    def _poll_async_delegation_events(self) -> None:
+        consumer = getattr(self.agent_client, "consume_async_delegations", None)
+        if not callable(consumer):
+            return
+        try:
+            events = consumer(session_key_prefixes=["channel:", "private:"])
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return
+        for event in events:
+            if isinstance(event, dict):
+                self._handle_async_delegation_event(event)
 
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
@@ -3171,6 +3226,98 @@ class EnterpriseService:
                     self._agent_workers.pop(key, None)
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
+
+    def _handle_async_delegation_event(self, event: dict[str, Any]) -> None:
+        scope = self._scope_from_async_delegation_session_key(str(event.get("session_key") or ""))
+        if scope is None:
+            return
+        event_id = self._async_delegation_event_id(event)
+        with self._conversation_lock:
+            if event_id in self._async_delegation_seen:
+                return
+            if self._async_delegation_message_exists(event_id):
+                self._async_delegation_seen.add(event_id)
+                return
+            self._async_delegation_seen.add(event_id)
+
+        scope_type, scope_id = scope
+        failed = self._async_delegation_failed(event)
+        title = "后台子代理任务失败" if failed else "后台子代理任务完成"
+        detail = str(event.get("error") or event.get("summary") or event.get("goal") or "")[:180]
+        self._record_agent_activity(scope_type, scope_id, "error" if failed else "complete", title, detail)
+        content = self._format_async_delegation_message(event, failed=failed)
+        metadata = {
+            "async_delegation_id": event_id,
+            "async_delegation": {
+                "delegation_id": str(event.get("delegation_id") or ""),
+                "session_key": str(event.get("session_key") or ""),
+                "status": str(event.get("status") or ""),
+                "goal": str(event.get("goal") or ""),
+                "model": str(event.get("model") or ""),
+                "duration_seconds": event.get("duration_seconds"),
+                "failed": failed,
+            },
+        }
+        self._append_message(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            author_type="agent",
+            user_id=None,
+            username="Main Agent" if scope_type == "channel" else "Private Agent",
+            content=content,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _scope_from_async_delegation_session_key(session_key: str) -> tuple[str, str] | None:
+        if session_key.startswith("channel:") and session_key.endswith(":main-agent"):
+            scope_id = session_key[len("channel:") : -len(":main-agent")]
+            return ("channel", scope_id) if scope_id else None
+        if session_key.startswith("private:"):
+            scope_id = session_key[len("private:") :]
+            return ("private", scope_id) if scope_id else None
+        return None
+
+    @staticmethod
+    def _async_delegation_event_id(event: dict[str, Any]) -> str:
+        delegation_id = str(event.get("delegation_id") or "").strip()
+        if delegation_id:
+            return delegation_id
+        return hashlib.sha256(encode_json(event).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _async_delegation_failed(event: dict[str, Any]) -> bool:
+        status = str(event.get("status") or "").strip().lower()
+        return bool(event.get("error")) or status in {"error", "failed", "cancelled", "interrupted"}
+
+    def _async_delegation_message_exists(self, event_id: str) -> bool:
+        needle = f'"async_delegation_id":"{event_id}"'
+        return bool(
+            self.db.scalar(
+                "SELECT id FROM messages WHERE metadata_json LIKE ? LIMIT 1",
+                (f"%{needle}%",),
+            )
+        )
+
+    @staticmethod
+    def _format_async_delegation_message(event: dict[str, Any], *, failed: bool) -> str:
+        goal = str(event.get("goal") or "").strip()
+        summary = str(event.get("summary") or "").strip()
+        error = str(event.get("error") or "").strip()
+        message = str(event.get("message") or "").strip()
+        duration = event.get("duration_seconds")
+        title = "后台子代理任务失败" if failed else "后台子代理任务完成"
+        lines = [f"{title}: {goal}" if goal else title]
+        if summary:
+            lines.extend(["", summary])
+        if error:
+            lines.extend(["", f"错误: {error}"])
+        if not summary and not error and message:
+            lines.extend(["", message])
+        if duration not in {None, ""}:
+            lines.extend(["", f"耗时: {duration} 秒"])
+        content = "\n".join(lines).strip()
+        return content[:8000] + ("\n…[已截断]" if len(content) > 8000 else "")
 
     def _drop_empty_conversation_maps_locked(self, key: str) -> None:
         """Remove empty companion-map entries for a conversation key.
