@@ -1315,3 +1315,297 @@ index 6a5a6af1f..5df921908 100644
  
  
  def _atexit_cleanup():
+
+diff --git a/gateway/run.py b/gateway/run.py
+index ea0ac5c51..4c6df387f 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2273,7 +2273,9 @@ def _parse_session_key(session_key: str) -> "dict | None":
+     """Parse a session key into its component parts.
+
+     Session keys follow the format
+-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
++    ``agent:{profile}:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
++    The legacy/default namespace is ``agent:main``; named profiles occupy the
++    same second segment (for example ``agent:coder:telegram:dm:123``).
+     Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
+     optionally ``thread_id`` keys, or None if the key doesn't match.
+
+@@ -2283,11 +2285,12 @@ def _parse_session_key(session_key: str) -> "dict | None":
+     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
+     """
+     parts = session_key.split(":")
+-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
++    if len(parts) >= 5 and parts[0] == "agent" and parts[1]:
+         result = {
+             "platform": parts[2],
+             "chat_type": parts[3],
+             "chat_id": parts[4],
++            "profile": parts[1],
+         }
+         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+             result["thread_id"] = parts[5]
+@@ -13697,7 +13700,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             chat_type=chat_type,
+             thread_id=str(evt.get("thread_id") or "").strip() or None,
+             user_id=str(evt.get("user_id") or "").strip() or None,
++            user_id_alt=str(evt.get("user_id_alt") or "").strip() or None,
+             user_name=str(evt.get("user_name") or "").strip() or None,
++            message_id=str(evt.get("message_id") or "").strip() or None,
++            profile=str(evt.get("profile") or "").strip() or None,
+         )
+
+     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
+@@ -13749,15 +13755,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         expects. Best-effort: a CLI-origin event (empty session_key) is left
+         as-is and simply won't route on the gateway.
+         """
+-        if evt.get("platform"):
+-            return  # already enriched
+         parsed = _parse_session_key(evt.get("session_key", "") or "")
+         if not parsed:
+             return
+-        evt["platform"] = parsed.get("platform", "")
+-        evt["chat_type"] = parsed.get("chat_type", "")
+-        evt["chat_id"] = parsed.get("chat_id", "")
+-        if parsed.get("thread_id"):
++        for key in ("platform", "chat_type", "chat_id", "profile"):
++            if not evt.get(key):
++                evt[key] = parsed.get(key, "")
++        if parsed.get("thread_id") and not evt.get("thread_id"):
+             evt["thread_id"] = parsed["thread_id"]
+
+     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 4a0571a18..5e3fd7e68 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -7576,6 +7576,7 @@ def _minimax_oauth_login(
+         )
+
+     now = datetime.now(timezone.utc)
++    last_refresh = now.isoformat().replace("+00:00", "Z")
+     expires_at_unix = _minimax_resolve_token_expiry_unix(
+         int(token_data["expired_in"]), now=now,
+     )
+@@ -7593,6 +7594,7 @@ def _minimax_oauth_login(
+         "refresh_token": token_data["refresh_token"],
+         "resource_url": token_data.get("resource_url"),
+         "obtained_at": now.isoformat(),
++        "last_refresh": last_refresh,
+         "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
+         "expires_in": expires_in_s,
+     }
+@@ -7654,6 +7656,7 @@ def _refresh_minimax_oauth_state(
+             relogin_required=True,
+         )
+     now_dt = datetime.now(timezone.utc)
++    last_refresh = now_dt.isoformat().replace("+00:00", "Z")
+     expires_at_unix = _minimax_resolve_token_expiry_unix(
+         int(payload["expired_in"]), now=now_dt,
+     )
+@@ -7663,6 +7666,7 @@ def _refresh_minimax_oauth_state(
+         "access_token": payload["access_token"],
+         "refresh_token": payload.get("refresh_token", state["refresh_token"]),
+         "obtained_at": now_dt.isoformat(),
++        "last_refresh": last_refresh,
+         "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
+         "expires_in": expires_in_s,
+     })
+@@ -7798,6 +7802,7 @@ def get_minimax_oauth_auth_status() -> Dict[str, Any]:
+         "provider": "minimax-oauth",
+         "region": state.get("region", "global"),
+         "expires_at": state.get("expires_at"),
++        "last_refresh": state.get("last_refresh") or state.get("obtained_at"),
+     }
+
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 3d4bf45b5..607cd257b 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -6090,6 +6090,7 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
+                 "token_preview": None,
+                 "expires_at": raw.get("expires_at"),
+                 "has_refresh_token": True,
++                "last_refresh": raw.get("last_refresh"),
+             }
+         if provider_id == "xai-oauth":
+             raw = hauth.get_xai_oauth_auth_status()
+@@ -7139,6 +7140,7 @@ def _minimax_poller(session_id: str) -> None:
+         # dashboard path; cn-region operators can still use the CLI
+         # flow which supports `--region cn`.
+         now = datetime.now(timezone.utc)
++        last_refresh = now.isoformat().replace("+00:00", "Z")
+         expires_at_ts = _minimax_resolve_token_expiry_unix(
+             int(token_data["expired_in"]), now=now,
+         )
+@@ -7155,6 +7157,7 @@ def _minimax_poller(session_id: str) -> None:
+             "refresh_token": token_data["refresh_token"],
+             "resource_url": token_data.get("resource_url"),
+             "obtained_at": now.isoformat(),
++            "last_refresh": last_refresh,
+             "expires_at": datetime.fromtimestamp(
+                 expires_at_ts, tz=timezone.utc
+             ).isoformat(),
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 92f58c83a..a4ab9621c 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -157,6 +157,7 @@ def dispatch_async_delegation(
+     role: str,
+     model: Optional[str],
+     session_key: str,
++    routing_metadata: Optional[Dict[str, Any]] = None,
+     runner: Callable[[], Dict[str, Any]],
+     interrupt_fn: Optional[Callable[[], None]] = None,
+     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+@@ -200,6 +201,7 @@ def dispatch_async_delegation(
+         "role": role,
+         "model": model,
+         "session_key": session_key,
++        "routing_metadata": dict(routing_metadata or {}),
+         "status": "running",
+         "dispatched_at": dispatched_at,
+         "completed_at": None,
+@@ -324,6 +326,21 @@ def _push_completion_event(
+         "completed_at": completed_at,
+         "exit_reason": result.get("exit_reason"),
+     }
++    routing_metadata = record.get("routing_metadata")
++    if isinstance(routing_metadata, dict):
++        for key in (
++            "platform",
++            "chat_type",
++            "chat_id",
++            "thread_id",
++            "user_id",
++            "user_id_alt",
++            "user_name",
++            "message_id",
++        ):
++            value = routing_metadata.get(key)
++            if value:
++                evt[key] = value
+     try:
+         process_registry.completion_queue.put(evt)
+     except Exception as exc:  # pragma: no cover
+@@ -342,6 +359,7 @@ def dispatch_async_delegation_batch(
+     role: str,
+     model: Optional[str],
+     session_key: str,
++    routing_metadata: Optional[Dict[str, Any]] = None,
+     runner: Callable[[], Dict[str, Any]],
+     interrupt_fn: Optional[Callable[[], None]] = None,
+     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+@@ -382,6 +400,7 @@ def dispatch_async_delegation_batch(
+         "role": role,
+         "model": model,
+         "session_key": session_key,
++        "routing_metadata": dict(routing_metadata or {}),
+         "status": "running",
+         "dispatched_at": dispatched_at,
+         "completed_at": None,
+@@ -494,6 +513,21 @@ def _finalize_batch(
+         "dispatched_at": dispatched_at,
+         "completed_at": completed_at,
+     }
++    routing_metadata = event_record.get("routing_metadata")
++    if isinstance(routing_metadata, dict):
++        for key in (
++            "platform",
++            "chat_type",
++            "chat_id",
++            "thread_id",
++            "user_id",
++            "user_id_alt",
++            "user_name",
++            "message_id",
++        ):
++            value = routing_metadata.get(key)
++            if value:
++                evt[key] = value
+     try:
+         process_registry.completion_queue.put(evt)
+     except Exception as exc:  # pragma: no cover
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e7f9d96ad..c59911146 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -2128,6 +2128,52 @@ def _recover_tasks_from_json_string(
+     return parsed, None
+
+
++def _async_delegation_routing_metadata(
++    parent_agent: Any,
++    session_key: str,
++) -> Dict[str, Any]:
++    """Capture gateway routing fields for detached delegation completions.
++
++    Async subagents finish on daemon worker threads after the parent turn has
++    returned.  The gateway can often reconstruct the route from session_key, but
++    profile-scoped keys and threaded/group channels need the original source
++    metadata for precise delivery.
++    """
++    metadata: Dict[str, Any] = {}
++    if session_key:
++        metadata["session_key"] = session_key
++
++    def _metadata_text(value: Any) -> Optional[str]:
++        if value is None:
++            return None
++        enum_value = getattr(value, "value", None)
++        if isinstance(enum_value, str):
++            value = enum_value
++        if not isinstance(value, (str, int, float)):
++            return None
++        text = str(value).strip()
++        return text or None
++
++    for attr, key in (
++        ("platform", "platform"),
++        ("_chat_type", "chat_type"),
++        ("_chat_id", "chat_id"),
++        ("_thread_id", "thread_id"),
++        ("_user_id", "user_id"),
++        ("_user_id_alt", "user_id_alt"),
++        ("_user_name", "user_name"),
++    ):
++        try:
++            value = getattr(parent_agent, attr, None)
++        except Exception:
++            value = None
++        text = _metadata_text(value)
++        if text:
++            metadata[key] = text
++
++    return metadata
++
++
+ def delegate_task(
+     goal: Optional[str] = None,
+     context: Optional[str] = None,
+@@ -2584,7 +2630,14 @@ def delegate_task(
+                 )
+             return json.dumps(_sync_result, ensure_ascii=False)
+
+-        _session_key = get_current_session_key(default="")
++        _session_key = (
++            get_current_session_key(default="")
++            or str(getattr(parent_agent, "_gateway_session_key", "") or "")
++        )
++        _routing_metadata = _async_delegation_routing_metadata(
++            parent_agent,
++            _session_key,
++        )
+         _child_agents = [c for (_, _, c) in children]
+
+         # Detach every child from the parent's interrupt-propagation list — the
+@@ -2623,6 +2676,7 @@ def delegate_task(
+             role=top_role,
+             model=creds["model"],
+             session_key=_session_key,
++            routing_metadata=_routing_metadata,
+             runner=_batch_runner,
+             interrupt_fn=_batch_interrupt,
+             max_async_children=_get_max_async_children(),
