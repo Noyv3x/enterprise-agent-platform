@@ -837,6 +837,22 @@ class EnterpriseService:
         rows = self.db.query("SELECT * FROM users ORDER BY id")
         return [self.public_user(row) for row in rows]
 
+    def impersonate_user(self, actor: dict[str, Any], user_id: int) -> tuple[str, dict[str, Any]]:
+        """Issue a normal session token for an active target user.
+
+        This is intentionally simple: after an admin chooses "impersonate", the
+        browser's current admin cookie is replaced with the target user's cookie,
+        exactly as if that user had just logged in.
+        """
+        require_admin(actor)
+        target = self.db.query_one("SELECT * FROM users WHERE id = ? AND active = 1", (int(user_id),))
+        if not target:
+            raise ServiceError(404, "user not found")
+        self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), target["id"]))
+        user = self.public_user(target)
+        token = self.tokens.issue(int(target["id"]), int(target.get("token_version") or 1))
+        return token, user
+
     def mention_targets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_permission(actor, PERMISSION_CHAT)
         rows = self.db.query("SELECT id, username, display_name, position FROM users WHERE active = 1 ORDER BY display_name, username")

@@ -25,6 +25,7 @@ import {
   loadCogneeConfig,
   loadHermesConfig,
   loadHermesInternalConfig,
+  loadInitial,
   loadMessageAudit,
   loadPrivateConversations,
   loadPrivateMessages,
@@ -46,6 +47,7 @@ import type {
   DeleteResultResponse,
   HermesConfigUpdateRequest,
   Id,
+  ImpersonateUserResponse,
   OAuthFlowResponse,
   OAuthImportResponse,
   SecurityConfigResponse,
@@ -92,6 +94,19 @@ export async function updateAccount(
     onSuccess?.();
     await loadUsers(store);
     toast(`已更新 ${username}`, { type: "ok", title: "完成" });
+  });
+}
+
+export async function impersonateAccount(store: AppStore, userId: Id): Promise<void> {
+  await runBusy(store, async () => {
+    const result = await api<ImpersonateUserResponse>(endpoints.impersonateUser.path(userId), {
+      method: "POST",
+      body: EMPTY_BODY,
+    });
+    store.dispatch({ type: "SET_USER", payload: result.user });
+    await loadInitial(store);
+    store.dispatch({ type: "SET_ACTIVE_VIEW", payload: store.getState().activeView });
+    toast(`已代入 ${result.user.display_name || result.user.username}`, { type: "ok", title: "完成" });
   });
 }
 

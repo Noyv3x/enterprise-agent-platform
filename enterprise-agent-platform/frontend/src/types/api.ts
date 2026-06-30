@@ -175,6 +175,10 @@ export interface UpdateUserRequest {
   password: string;
 }
 
+export interface ImpersonateUserResponse {
+  user: User;
+}
+
 export interface PermissionGroupsResponse {
   permission_groups: PermissionGroup[];
 }

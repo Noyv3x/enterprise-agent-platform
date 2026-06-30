@@ -31,6 +31,7 @@ import type {
   HermesConfigUpdateRequest,
   HermesInternalConfigResponse,
   HermesInternalConfigUpdateRequest,
+  ImpersonateUserResponse,
   KnowledgeSearchResponse,
   LoginRequest,
   LoginResponse,
@@ -167,6 +168,10 @@ export const endpoints = {
   users: ep<void, UsersResponse>("GET", () => "/api/users"),
   createUser: ep<CreateUserRequest, unknown>("POST", () => "/api/users"),
   updateUser: ep<UpdateUserRequest, unknown, [Id]>("PUT", (id) => `/api/users/${id}`),
+  impersonateUser: ep<void, ImpersonateUserResponse, [Id]>(
+    "POST",
+    (id) => `/api/users/${id}/impersonate`,
+  ),
   permissionGroups: ep<void, PermissionGroupsResponse>(
     "GET",
     () => "/api/permission-groups",

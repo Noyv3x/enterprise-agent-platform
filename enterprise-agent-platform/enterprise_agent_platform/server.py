@@ -314,6 +314,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             self._json({"user": user}, status=201)
             return
+        m = re.fullmatch(r"/api/users/(\d+)/impersonate", path)
+        if m and method == "POST":
+            token, user = service.impersonate_user(actor, int(m.group(1)))
+            self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
+            return
         m = re.fullmatch(r"/api/users/(\d+)", path)
         if m and method == "PUT":
             self._json({"user": service.update_user(actor, int(m.group(1)), self._body_json())})

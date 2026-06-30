@@ -8,7 +8,7 @@
    over the legacy full-teardown, which discarded unsaved edits on every render). */
 
 import { useRef, useState } from "react";
-import { updateAccount } from "../../../data/adminActions";
+import { impersonateAccount, updateAccount } from "../../../data/adminActions";
 import { initials } from "../../../utils/format";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { PermissionGroup, User } from "../../../types";
@@ -51,6 +51,10 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
       },
       () => setPassword(""),
     );
+  };
+
+  const handleImpersonate = () => {
+    void impersonateAccount(store, user.id);
   };
 
   return (
@@ -112,6 +116,15 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
         </label>
       </div>
       <div className="form-actions">
+        <button
+          className="btn btn--ghost btn--sm"
+          type="button"
+          disabled={busy || selfDisabled || !active}
+          onClick={handleImpersonate}
+          title={selfDisabled ? "当前已是此账号" : active ? "以此账号登录" : "账号已停用"}
+        >
+          <span>管理员代入</span>
+        </button>
         <button className="btn btn--primary btn--sm" type="submit" disabled={busy}>
           <span>保存账户</span>
         </button>

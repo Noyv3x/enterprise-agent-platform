@@ -3733,6 +3733,86 @@ class PlatformHTTPTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
+    def test_http_admin_can_impersonate_active_user(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            _, admin = service.authenticate("admin", "admin")
+            target = service.create_user(
+                username="impersonated-member",
+                password="member-pass",
+                display_name="Impersonated Member",
+                permission_group="member",
+                actor=admin,
+            )
+            disabled = service.create_user(
+                username="disabled-member",
+                password="member-pass",
+                display_name="Disabled Member",
+                permission_group="member",
+                actor=admin,
+            )
+            service.update_user(admin, int(disabled["id"]), {"active": False})
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                res = conn.getresponse()
+                res.read()
+                admin_cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertTrue(admin_cookie)
+
+                conn.request(
+                    "POST",
+                    f"/api/users/{disabled['id']}/impersonate",
+                    body="{}",
+                    headers={"Content-Type": "application/json", "Cookie": admin_cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                denied = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 404)
+                self.assertEqual(denied["error"], "user not found")
+
+                conn.request(
+                    "POST",
+                    f"/api/users/{target['id']}/impersonate",
+                    body="{}",
+                    headers={"Content-Type": "application/json", "Cookie": admin_cookie, "Origin": origin},
+                )
+                res = conn.getresponse()
+                body = json.loads(res.read().decode("utf-8"))
+                member_cookie = res.getheader("Set-Cookie")
+                self.assertEqual(res.status, 200)
+                self.assertEqual(body["user"]["username"], "impersonated-member")
+                self.assertTrue(member_cookie)
+                self.assertNotEqual(member_cookie, admin_cookie)
+
+                conn.request("GET", "/api/auth/me", headers={"Cookie": member_cookie})
+                res = conn.getresponse()
+                me = json.loads(res.read().decode("utf-8"))["user"]
+                self.assertEqual(res.status, 200)
+                self.assertEqual(me["username"], "impersonated-member")
+                self.assertEqual(me["permission_group"], "member")
+
+                conn.request("GET", "/api/users", headers={"Cookie": member_cookie})
+                res = conn.getresponse()
+                forbidden = json.loads(res.read().decode("utf-8"))
+                self.assertEqual(res.status, 403)
+                self.assertEqual(forbidden["error"], "admin role required")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_http_security_headers_secure_cookie_and_csrf_origin_check(self):
         with tempfile.TemporaryDirectory() as td:
             config = replace(make_config(Path(td)), public_base_url="https://agents.example")
