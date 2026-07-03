@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Enterprise Agent Platform" }]
 license = { text = "MIT" }
-dependencies = ["PyYAML>=6.0"]
+dependencies = ["PyYAML>=6.0", "websockets>=14,<16"]
 
 [project.scripts]
 enterprise-agent-platform = "enterprise_agent_platform.__main__:main"

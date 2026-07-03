@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .config import PlatformConfig
+from .hermes_relay import HermesRelayConnector
 
 
 HOUSEKEEPING_TOOLS = frozenset({"memory", "todo", "skill_manage", "session_search"})
@@ -875,22 +876,128 @@ class HermesAgentClient:
             body["reasoning_effort"] = effort
 
 
+class HermesRelayAgentClient:
+    def __init__(self, config: PlatformConfig, connector: HermesRelayConnector, runtime_config_provider=None):
+        self.config = config
+        self.connector = connector
+        self.runtime_config_provider = runtime_config_provider
+
+    def generate(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, Any]],
+        session_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        thinking_depth: str | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        progress_callback: AgentProgressCallback | None = None,
+        content_callback: AgentContentCallback | None = None,
+    ) -> AgentResult:
+        effective_model = str(model or self._effective_model())
+        effective_reasoning = self._effective_reasoning_config(
+            thinking_depth=thinking_depth,
+            reasoning_config=reasoning_config,
+        )
+        result = self.connector.submit_turn(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            session_id=session_id,
+            session_key=session_key,
+            metadata=metadata,
+            attachments=attachments,
+            model=effective_model,
+            reasoning_config=effective_reasoning,
+            timeout_seconds=self._effective_timeout_seconds(),
+            progress_callback=progress_callback,
+            content_callback=content_callback,
+        )
+        raw = dict(result.raw)
+        raw.setdefault("history_mode", "hermes-owned")
+        if history:
+            raw["platform_history_count"] = len(history)
+        return AgentResult(content=result.content, session_id=result.session_id, raw=raw, degraded=result.degraded)
+
+    def _runtime_config(self) -> dict[str, Any]:
+        if self.runtime_config_provider is None:
+            return {}
+        try:
+            data = self.runtime_config_provider()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _effective_model(self) -> str:
+        return str(self._runtime_config().get("model") or self.config.hermes_model)
+
+    def _effective_timeout_seconds(self) -> float:
+        raw = self._runtime_config().get("timeout_seconds")
+        try:
+            return max(1.0, float(raw)) if raw is not None else self.config.hermes_timeout_seconds
+        except (TypeError, ValueError):
+            return self.config.hermes_timeout_seconds
+
+    @staticmethod
+    def _effective_reasoning_config(
+        *,
+        thinking_depth: str | None,
+        reasoning_config: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        config = dict(reasoning_config or {})
+        depth = str(thinking_depth or "").strip().lower()
+        if not config and depth:
+            config = {"enabled": False} if depth == "none" else {"enabled": True, "effort": depth}
+        return config or None
+
+
 class AutoAgentClient:
     def __init__(self, config: PlatformConfig, secret_provider, runtime_manager=None):
         self.config = config
         self.runtime_manager = runtime_manager
         runtime_config_provider = runtime_manager.hermes_runtime_config if runtime_manager is not None else None
         self.hermes = HermesAgentClient(config, secret_provider, runtime_config_provider=runtime_config_provider)
+        self.relay_connector = HermesRelayConnector(config)
+        self.relay = HermesRelayAgentClient(config, self.relay_connector, runtime_config_provider=runtime_config_provider)
         self.local = LocalAgentClient()
+
+    def prepare_runtime(self) -> None:
+        if self._use_relay():
+            self.relay_connector.start()
+
+    def close(self) -> None:
+        self.relay_connector.stop()
+
+    def _use_relay(self) -> bool:
+        if self.runtime_manager is None or not self.relay_connector.enabled:
+            return False
+        try:
+            runtime_config = self.runtime_manager.hermes_runtime_config()
+        except Exception:
+            runtime_config = {}
+        if runtime_config.get("manage_hermes") is False:
+            return False
+        relay = runtime_config.get("relay") if isinstance(runtime_config, dict) else None
+        if isinstance(relay, dict) and relay.get("enabled") is False:
+            return False
+        return True
 
     def generate(self, **kwargs: Any) -> AgentResult:
         if self.config.agent_mode == "local":
             return self.local.generate(**kwargs)
         try:
+            if self._use_relay():
+                self.prepare_runtime()
+                if self.runtime_manager is not None:
+                    self.runtime_manager.ensure_hermes_ready(wait=True)
+                return self.relay.generate(**kwargs)
             if self.runtime_manager is not None:
                 self.runtime_manager.ensure_hermes_ready(wait=True)
             return self.hermes.generate(**kwargs)
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError, KeyError, ValueError) as exc:
             if self.config.agent_mode == "hermes":
                 raise
             fallback_kwargs = dict(kwargs)

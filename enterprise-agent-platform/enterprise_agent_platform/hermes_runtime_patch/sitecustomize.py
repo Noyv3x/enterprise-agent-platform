@@ -591,10 +591,99 @@ def _install_api_async_delegation_patch() -> None:
     _record_patch_status("api_async", "ok")
 
 
+def _install_relay_platform_patch() -> None:
+    """Preserve platform relay context and per-turn runtime overrides."""
+
+    try:
+        from gateway.relay import ws_transport as relay_ws_mod
+        from gateway import run as gateway_run_mod
+    except ModuleNotFoundError:
+        _record_patch_status("relay", "no_module")
+        return
+    except Exception as exc:
+        _record_patch_status("relay", f"import_error:{type(exc).__name__}")
+        return
+
+    runner_cls = getattr(gateway_run_mod, "GatewayRunner", None)
+    original_event_from_wire = getattr(relay_ws_mod, "_event_from_wire", None)
+    if runner_cls is None or original_event_from_wire is None:
+        _record_patch_status("relay", "missing_symbols")
+        return
+    if getattr(relay_ws_mod, "_enterprise_platform_relay_patch", False):
+        _record_patch_status("relay", "ok")
+        return
+
+    def _event_from_wire(raw: dict[str, Any]) -> Any:
+        event = original_event_from_wire(raw)
+        for name in (
+            "media_types",
+            "reply_to_text",
+            "reply_to_author_id",
+            "reply_to_author_name",
+            "reply_to_is_own_message",
+            "auto_skill",
+            "channel_prompt",
+            "raw_message",
+            "enterprise_turn_id",
+            "enterprise_session_id",
+            "enterprise_session_key",
+            "enterprise_model",
+            "enterprise_reasoning_config",
+        ):
+            if name in raw:
+                try:
+                    setattr(event, name, raw.get(name))
+                except Exception:
+                    pass
+        return event
+
+    original_handle = runner_cls._handle_message_with_agent
+    sentinel = object()
+
+    async def _handle_message_with_agent(self: Any, event: Any, source: Any, _quick_key: str, run_generation: int) -> Any:
+        session_key = str(_quick_key or "")
+        model = str(getattr(event, "enterprise_model", "") or "").strip()
+        reasoning = getattr(event, "enterprise_reasoning_config", None)
+        model_overrides = getattr(self, "_session_model_overrides", None)
+        reasoning_overrides = getattr(self, "_session_reasoning_overrides", None)
+        old_model = sentinel
+        old_reasoning = sentinel
+        if session_key and isinstance(model_overrides, dict):
+            old_model = model_overrides.get(session_key, sentinel)
+            if model:
+                model_overrides[session_key] = {"model": model}
+        if session_key:
+            if isinstance(reasoning_overrides, dict):
+                old_reasoning = reasoning_overrides.get(session_key, sentinel)
+            setter = getattr(self, "_set_session_reasoning_override", None)
+            if callable(setter) and isinstance(reasoning, dict):
+                setter(session_key, reasoning)
+        try:
+            return await original_handle(self, event, source, _quick_key, run_generation)
+        finally:
+            if session_key and isinstance(model_overrides, dict) and old_model is not sentinel:
+                model_overrides[session_key] = old_model
+            elif session_key and isinstance(model_overrides, dict) and model:
+                model_overrides.pop(session_key, None)
+            setter = getattr(self, "_set_session_reasoning_override", None)
+            if session_key and callable(setter) and isinstance(reasoning, dict):
+                if old_reasoning is sentinel:
+                    setter(session_key, None)
+                else:
+                    setter(session_key, old_reasoning)
+
+    relay_ws_mod._event_from_wire = _event_from_wire
+    relay_ws_mod._enterprise_platform_relay_patch = True
+    runner_cls._handle_message_with_agent = _handle_message_with_agent
+    runner_cls._enterprise_platform_relay_patch = True
+    _record_patch_status("relay", "ok")
+
+
 try:
     _install_codex_response_stream_patch()
     _install_auxiliary_response_stream_patch()
     _install_api_async_delegation_patch()
+    _install_relay_platform_patch()
 except Exception as exc:
     # A genuine failure while installing (as opposed to the expected
     # "standalone Hermes, module absent" path, which is handled quietly inside

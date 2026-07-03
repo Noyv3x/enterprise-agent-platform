@@ -338,6 +338,8 @@ class PlatformRuntimeManager:
                 self._effective_hermes_provider_base_url(),
                 self._effective_hermes_api_url(),
                 self._effective_install_extras(),
+                "1" if self._managed_hermes_relay_enabled() else "0",
+                self._effective_hermes_relay_url(),
                 "1" if self._managed_venv_ready() else "0",
             ]
         except Exception:
@@ -511,6 +513,16 @@ class PlatformRuntimeManager:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Hermes source install failed with exit code {result.returncode}")
+            if self._managed_hermes_relay_enabled():
+                result = self.command_runner.run(
+                    [str(self._hermes_venv_python()), "-m", "pip", "install", "websockets>=14,<16"],
+                    cwd=runtime_source,
+                    env=env,
+                    log_path=log_path,
+                    timeout=300,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"Hermes relay dependency install failed with exit code {result.returncode}")
             self._write_install_marker(repo, runtime_source)
             self._hermes_last_error = ""
             return RuntimeStatus(
@@ -554,6 +566,12 @@ class PlatformRuntimeManager:
             "install_extras": self._effective_install_extras(),
             "startup_wait_seconds": self._effective_startup_wait_seconds(),
             "timeout_seconds": self._effective_hermes_timeout_seconds(),
+            "relay": {
+                "enabled": self._managed_hermes_relay_enabled(),
+                "url": self._effective_hermes_relay_url(),
+                "host": self.config.hermes_relay_host,
+                "port": self.config.hermes_relay_port,
+            },
             "source_install": True,
             "venv_path": str(self._hermes_venv_dir()),
             "config_path": str(self.config.managed_hermes_home / "config.yaml"),
@@ -1465,6 +1483,10 @@ class PlatformRuntimeManager:
             values["XAI_BASE_URL"] = provider_base_url
         if api_key:
             values["API_SERVER_KEY"] = api_key
+        if self._managed_hermes_relay_enabled():
+            values["GATEWAY_RELAY_URL"] = self._effective_hermes_relay_url()
+            values["GATEWAY_RELAY_PLATFORMS"] = "relay"
+            values["GATEWAY_RELAY_BOT_IDS"] = json.dumps({"relay": {"botId": "enterprise-web"}})
         return values
 
     def _hermes_command(self) -> tuple[list[str], Path | None, str]:
@@ -1660,6 +1682,9 @@ class PlatformRuntimeManager:
             return self.config.manage_hermes
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _managed_hermes_relay_enabled(self) -> bool:
+        return self._managed_hermes_enabled() and bool(self.config.hermes_relay_enabled)
+
     def _managed_cognee_enabled(self) -> bool:
         value = self._runtime_setting(COGNEE_SETTING_MANAGED)
         if value is None:
@@ -1702,6 +1727,11 @@ class PlatformRuntimeManager:
 
     def _effective_platform_url(self) -> str:
         return (self._runtime_setting("platform_public_base_url") or self.config.public_base_url).strip().rstrip("/")
+
+    def _effective_hermes_relay_url(self) -> str:
+        host = (self.config.hermes_relay_host or "127.0.0.1").strip() or "127.0.0.1"
+        port = int(self.config.hermes_relay_port or 18766)
+        return f"ws://{host}:{port}/relay"
 
     def _effective_install_extras(self) -> str:
         return self._runtime_setting(HERMES_SETTING_INSTALL_EXTRAS) or self.config.hermes_install_extras

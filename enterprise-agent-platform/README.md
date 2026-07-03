@@ -100,12 +100,14 @@ export ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET='change-this-secret'
 - 创建 `data/runtimes/hermes/venv`，并通过 `pip install -e` 从相邻的 `../hermes-agent` 源码安装 Hermes；
 - 安装并启用 `enterprise-kb` 插件；
 - 在尚未配置时生成 API server key；
-- 使用托管 venv 以 `API_SERVER_ENABLED=true` 启动 Hermes gateway；
+- 使用托管 venv 以 `API_SERVER_ENABLED=true` 启动 Hermes gateway，并默认开启本地 Hermes relay connector；
 - 在设置页暴露安装、配置、状态和重启控制。
 
 设置页可以更新 Hermes 源码路径、API URL、模型名、安装 extras、启动等待时间和 API server key。修改安装 extras 或源码路径后，下次托管 prepare/install 操作会刷新 venv。
 
-平台会发送：
+托管模式下，平台会作为 Hermes 的网页版 relay connector 运行，Hermes gateway 会通过 `GATEWAY_RELAY_URL` 主动连接平台本地 WebSocket。可用 `ENTERPRISE_HERMES_RELAY_ENABLED=0` 关闭该路径并退回 Hermes API 兼容调用；relay 默认监听 `127.0.0.1:18766`，可用 `ENTERPRISE_HERMES_RELAY_HOST` 和 `ENTERPRISE_HERMES_RELAY_PORT` 调整。
+
+外部 Hermes API 兼容路径会发送：
 
 - `X-Hermes-Session-Id: enterprise-channel-<id>-main-agent` 用于共享频道 bot 线程。
 - `X-Hermes-Session-Id: enterprise-private-u<user_id>` 用于私人 Agent。

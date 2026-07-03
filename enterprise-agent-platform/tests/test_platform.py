@@ -25,6 +25,7 @@ from enterprise_agent_platform import runtimes as runtime_module
 from enterprise_agent_platform.auto_update import AutoUpdateManager
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
+from enterprise_agent_platform.hermes_relay import HermesRelayConnector
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
@@ -2604,12 +2605,88 @@ class PlatformServiceTests(unittest.TestCase):
                     runner.calls[1]["cmd"],
                     [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
                 )
+                self.assertEqual(
+                    runner.calls[2]["cmd"],
+                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "websockets>=14,<16"],
+                )
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)["hermes"]
                 self.assertEqual(status["install_state"], "installed")
                 self.assertEqual(status["source"], f"{runtime_source} (patched from {tmp / 'hermes-agent'})")
             finally:
                 service.close()
+
+    def test_hermes_relay_connector_uses_notify_as_final_reply_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            connector = HermesRelayConnector(make_config(tmp))
+            progress_events = []
+            content_deltas = []
+            turn = connector._build_turn(
+                system_prompt="system",
+                user_message="hello",
+                session_id="enterprise-private-u1",
+                session_key="private:1",
+                metadata={"actor": {"id": 1, "display_name": "Ada"}},
+                attachments=[],
+                model="gpt-5.4",
+                reasoning_config={"enabled": True, "effort": "low"},
+                progress_callback=progress_events.append,
+                content_callback=content_deltas.append,
+            )
+            with connector._turn_lock:
+                connector._turns_by_chat[turn.chat_id] = turn
+                connector._turns_by_id[turn.turn_id] = turn
+            try:
+                progress_result = connector._handle_outbound_action(
+                    {"op": "send", "chat_id": turn.chat_id, "content": "working", "metadata": {}}
+                )
+                self.assertTrue(progress_result["success"])
+                self.assertFalse(turn.done.is_set())
+                self.assertEqual(progress_events[-1]["event"], "relay.message")
+                self.assertEqual(content_deltas, [])
+
+                final_result = connector._handle_outbound_action(
+                    {
+                        "op": "send",
+                        "chat_id": turn.chat_id,
+                        "content": "final answer",
+                        "metadata": {"notify": True},
+                    }
+                )
+                self.assertTrue(final_result["success"])
+                self.assertTrue(turn.done.is_set())
+                self.assertEqual(turn.content, "final answer")
+                self.assertEqual(content_deltas, ["final answer"])
+            finally:
+                with connector._turn_lock:
+                    connector._turns_by_chat.clear()
+                    connector._turns_by_id.clear()
+
+    def test_hermes_relay_connector_normalizes_media_fallbacks(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            media_path = tmp / "runtimes" / "hermes" / "tmp" / "answer.txt"
+            media_path.parent.mkdir(parents=True, exist_ok=True)
+            media_path.write_text("generated", encoding="utf-8")
+            content = f"Created the file.\nFile: {media_path}"
+            self.assertEqual(
+                HermesRelayConnector(make_config(tmp))
+                ._build_turn(
+                    system_prompt="system",
+                    user_message="hello",
+                    session_id="enterprise-private-u1",
+                    session_key="private:1",
+                    metadata={},
+                    attachments=[],
+                    model=None,
+                    reasoning_config=None,
+                    progress_callback=None,
+                    content_callback=None,
+                )
+                ._normalize_final_content(content),
+                f"Created the file.\nMEDIA:{media_path}",
+            )
 
     def test_hermes_config_can_be_updated_from_platform(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2645,8 +2722,9 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn('API_SERVER_PORT="8766"', env_text)
                 self.assertIn('API_SERVER_MODEL_NAME="gpt-5.4"', env_text)
                 self.assertIn('API_SERVER_KEY="runtime-key"', env_text)
+                self.assertIn('GATEWAY_RELAY_URL="ws://127.0.0.1:18766/relay"', env_text)
                 self.assertEqual(
-                    runner.calls[-1]["cmd"],
+                    runner.calls[-2]["cmd"],
                     [
                         str(managed_python(service.config.managed_hermes_home / "venv")),
                         "-m",
@@ -2654,6 +2732,16 @@ class PlatformServiceTests(unittest.TestCase):
                         "install",
                         "-e",
                         f"{service.config.managed_hermes_home / 'source' / 'hermes-agent'}[dev]",
+                    ],
+                )
+                self.assertEqual(
+                    runner.calls[-1]["cmd"],
+                    [
+                        str(managed_python(service.config.managed_hermes_home / "venv")),
+                        "-m",
+                        "pip",
+                        "install",
+                        "websockets>=14,<16",
                     ],
                 )
             finally:

@@ -40,6 +40,9 @@ class PlatformConfig:
     hermes_home: Path | None = None
     hermes_install_extras: str = ""
     runtime_startup_wait_seconds: float = 8.0
+    hermes_relay_enabled: bool = True
+    hermes_relay_host: str = "127.0.0.1"
+    hermes_relay_port: int = 18766
     hermes_provider: str = "openai-codex"
     hermes_provider_base_url: str = ""
     manage_camofox: bool = True
@@ -132,6 +135,9 @@ class PlatformConfig:
             ).expanduser(),
             hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
             runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
+            hermes_relay_enabled=_env_bool("ENTERPRISE_HERMES_RELAY_ENABLED", True),
+            hermes_relay_host=os.getenv("ENTERPRISE_HERMES_RELAY_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            hermes_relay_port=_env_int("ENTERPRISE_HERMES_RELAY_PORT", 18766, minimum=1, maximum=65535),
             hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "openai-codex").strip().lower() or "openai-codex",
             hermes_provider_base_url=os.getenv("ENTERPRISE_HERMES_PROVIDER_BASE_URL", "").strip().rstrip("/"),
             manage_camofox=os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()

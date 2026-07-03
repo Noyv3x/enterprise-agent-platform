@@ -279,6 +279,12 @@ class EnterpriseService:
         self.ensure_bootstrap()
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
+            prepare_agent_runtime = getattr(self.agent_client, "prepare_runtime", None)
+            if callable(prepare_agent_runtime):
+                try:
+                    prepare_agent_runtime()
+                except Exception as exc:
+                    print(f"Failed to start Hermes relay connector: {exc}", file=sys.stderr)
             self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_hermes_ready(wait=False)
         self._start_container_reaper()
@@ -334,6 +340,12 @@ class EnterpriseService:
             ingest = self._ingest_thread
         if ingest is not None:
             ingest.join(timeout=2)
+        close_agent_client = getattr(self.agent_client, "close", None)
+        if callable(close_agent_client):
+            try:
+                close_agent_client()
+            except Exception:
+                pass
         self.runtimes.close()
         self.db.close()
 
@@ -2061,6 +2073,7 @@ class EnterpriseService:
             session_key=f"channel:{scope_id}:main-agent",
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "actor": self._agent_actor_metadata(task["actor"]),
                 "workspace": {
                     "path": str(workspace_path),
                     "scope": "channel",
@@ -2179,6 +2192,7 @@ class EnterpriseService:
             session_key=f"private:{actor['id']}",
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "actor": self._agent_actor_metadata(actor),
                 "container": container_data,
                 "workspace": {
                     "path": container_data["workspace_path"],
@@ -4248,6 +4262,15 @@ class EnterpriseService:
     @staticmethod
     def _actor_display_name(actor: dict[str, Any]) -> str:
         return str(actor.get("display_name") or actor.get("username") or "User")
+
+    @staticmethod
+    def _agent_actor_metadata(actor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": actor.get("id"),
+            "username": actor.get("username"),
+            "display_name": actor.get("display_name") or actor.get("username") or "User",
+            "position": actor.get("position") or "",
+        }
 
     def _channel_speaker_line(self, actor: dict[str, Any], content: str) -> str:
         return f"{self._actor_context_label(actor)}: {content}"
