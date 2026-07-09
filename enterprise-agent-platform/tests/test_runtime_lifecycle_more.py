@@ -1,3 +1,4 @@
+import ast
 import os
 import shutil
 import subprocess
@@ -160,6 +161,104 @@ class HermesRuntimePatchCompatibilityTests(unittest.TestCase):
                 f"stdout:\n{result.stdout}\n"
                 f"stderr:\n{result.stderr}"
             )
+
+    def test_managed_patch_keeps_upstream_native_contracts(self):
+        platform_root = Path(__file__).resolve().parents[1]
+        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
+        patch_text = patch_path.read_text(encoding="utf-8")
+
+        # Hermes now owns the session-key schema/upsert and per-run approval
+        # namespace. The platform patch may filter by session_key, but must not
+        # fork those native contracts or collapse approvals back to a shared
+        # conversation key.
+        self.assertNotIn("+    session_key TEXT", patch_text)
+        self.assertNotIn("+CREATE INDEX IF NOT EXISTS idx_sessions_session_key", patch_text)
+        self.assertIn("approval_session_key = run_id", patch_text)
+        self.assertNotIn("approval_session_key = gateway_session_key", patch_text)
+
+        # Profile identity remains an upstream profile concept. Enterprise
+        # agent isolation travels separately as agent_scope_key.
+        self.assertNotIn('agent_identity"] = _agent_scope_key', patch_text)
+        self.assertIn('agent_scope_key=getattr(agent, "_gateway_session_key", None)', patch_text)
+
+        # MiniMax auth timestamp changes were part of an older unrelated patch
+        # and must not hitch a ride on the managed isolation overlay.
+        self.assertNotIn("minimax", patch_text.lower())
+
+    def test_managed_patch_guards_scoped_runtime_boundaries(self):
+        platform_root = Path(__file__).resolve().parents[1]
+        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
+        patch_text = patch_path.read_text(encoding="utf-8")
+
+        # Repeated cleanup of an already-removed enterprise sandbox must be a
+        # no-op, not a fallback that tears down Hermes' unscoped `default` env.
+        self.assertIn(
+            're.fullmatch(r"gateway-.+-[0-9a-f]{12}", str(task_id))',
+            patch_text,
+        )
+        self.assertIn("_shares_parent_terminal_scope", patch_text)
+
+        # Stable agent scope and per-run approval scope intentionally differ:
+        # terminal state is durable per Agent, sudo credentials are not.
+        self.assertIn("approval_session_key = get_current_session_key", patch_text)
+        self.assertIn('return f"approval:{approval_session_key}"', patch_text)
+
+        # /v1/runs accepts a client session ID in JSON rather than a header,
+        # but it must enforce the same type, traversal and length boundary.
+        self.assertIn("not isinstance(requested_session_id, str)", patch_text)
+        self.assertIn("_is_path_unsafe(requested_session_id)", patch_text)
+        self.assertIn("len(requested_session_id) > self._MAX_SESSION_HEADER_LEN", patch_text)
+
+        # Scoped session search must not resolve duplicate titles or explicit
+        # profile selectors outside the caller's enterprise Agent namespace.
+        self.assertIn("session_key=current_session_key", patch_text)
+        self.assertIn("Cross-profile session access is unavailable", patch_text)
+
+        # Detached delegation needs the original reply anchor and profile to
+        # route completion events back to the correct gateway conversation.
+        self.assertIn('("HERMES_SESSION_MESSAGE_ID", "message_id")', patch_text)
+        self.assertIn('("HERMES_SESSION_PROFILE", "profile")', patch_text)
+
+    def test_sitecustomize_private_symbols_exist_in_pinned_submodule(self):
+        platform_root = Path(__file__).resolve().parents[1]
+        hermes_repo = platform_root.parent / "hermes-agent"
+        if not (hermes_repo / "gateway" / "platforms" / "api_server.py").exists():
+            self.skipTest("Hermes submodule is not initialized")
+
+        def parsed(relative_path: str) -> ast.Module:
+            path = hermes_repo / relative_path
+            self.assertTrue(path.exists(), f"Hermes private integration module is missing: {path}")
+            return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        def class_methods(relative_path: str, class_name: str) -> set[str]:
+            tree = parsed(relative_path)
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == class_name:
+                    return {
+                        child.name
+                        for child in node.body
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    }
+            self.fail(f"Hermes private integration class disappeared: {relative_path}:{class_name}")
+
+        def top_level_names(relative_path: str) -> set[str]:
+            return {
+                node.name
+                for node in parsed(relative_path).body
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
+        api_methods = class_methods("gateway/platforms/api_server.py", "APIServerAdapter")
+        self.assertTrue({"__init__", "connect"}.issubset(api_methods))
+
+        runner_methods = class_methods("gateway/run.py", "GatewayRunner")
+        self.assertTrue(
+            {"_inject_watch_notification", "_handle_message_with_agent"}.issubset(runner_methods)
+        )
+
+        self.assertIn("_event_from_wire", top_level_names("gateway/relay/ws_transport.py"))
+        self.assertIn("_CodexCompletionsAdapter", top_level_names("agent/auxiliary_client.py"))
+        self.assertTrue((hermes_repo / "agent" / "codex_runtime.py").is_file())
 
 
 class FirecrawlEnvLocationTests(unittest.TestCase):
