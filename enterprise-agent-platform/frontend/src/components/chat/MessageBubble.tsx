@@ -8,7 +8,7 @@
 import { memo } from "react";
 import { cx } from "../../lib/cx";
 import { initials } from "../../utils/format";
-import { messageFingerprint } from "../../utils/fingerprint";
+import { messageFingerprintKey } from "../../utils/fingerprint";
 import type { Message } from "../../types";
 import { Icon } from "../common/Icon";
 import { MessageAttachments } from "../common/MessageAttachments";
@@ -48,18 +48,7 @@ function MessageBubbleImpl({ message }: { message: Message }) {
   );
 }
 
-/** Render-affecting fingerprint (extends messageFingerprint with the streaming
- *  flag + suggestions, which it omits). Built by string concatenation rather than
- *  JSON.stringify since the memo comparator runs it for every row on each list
- *  re-render. */
-function bubbleKey(message: Message): string {
-  const suggestions = (message.metadata?.knowledge_suggestions || [])
-    .map((suggestion) => `${suggestion.id}:${suggestion.title}`)
-    .join(",");
-  return `${messageFingerprint(message)}|${message.metadata?.streaming ? 1 : 0}|${suggestions}`;
-}
-
 export const MessageBubble = memo(
   MessageBubbleImpl,
-  (prev, next) => bubbleKey(prev.message) === bubbleKey(next.message),
+  (prev, next) => messageFingerprintKey(prev.message) === messageFingerprintKey(next.message),
 );

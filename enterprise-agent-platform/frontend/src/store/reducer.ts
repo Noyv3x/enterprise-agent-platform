@@ -1,7 +1,6 @@
-/* Root reducer — composes the slice reducers. Each slice handles a disjoint set
-   of state fields, so chaining them is conflict-free; the cross-cutting
-   RESET_SESSION is intentionally handled by several slices (each resetting only
-   its own fields). The composed initial AppState is assembled here. */
+/* Root reducer — composes slice reducers for ordinary actions. RESET_SESSION is
+   intentionally handled here as a full-tree ownership boundary so new fields
+   cannot accidentally survive an account switch. */
 
 import type { Action, AppState } from "../types";
 import { adminInitial, adminReducer } from "./slices/admin";
@@ -19,6 +18,31 @@ export const initialAppState: AppState = {
 };
 
 export function rootReducer(state: AppState, action: Action): AppState {
+  // A session boundary is an ownership boundary. Reset the complete tree in one
+  // atomic transition so a slice added later cannot accidentally retain data
+  // from the previous account.
+  if (action.type === "RESET_SESSION") {
+    return {
+      ...initialAppState,
+      agentStatuses: { channels: {}, private: null },
+      drafts: {},
+      draftFiles: {},
+      expandedAgentRuns: {},
+      knowledgeSearch: { query: "", results: null },
+      messageAudit: {
+        auditChannelId: null,
+        channelMessages: [],
+        channelTotal: 0,
+        privateConversations: [],
+        auditPrivateUserId: null,
+        privateMessages: [],
+        privateTotal: 0,
+      },
+      oauthFlows: {},
+      oauthCallbackUrls: {},
+      pendingOperations: [],
+    };
+  }
   let next = state;
   next = authReducer(next, action);
   next = chatReducer(next, action);

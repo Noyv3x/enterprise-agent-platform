@@ -13,7 +13,7 @@ function scopeTypeFor(mode: ChatMode): "private" | "channel" {
 function flattenActivity(activity: AgentStatus["activity"]): string[] {
   return (activity || []).map(
     (item) =>
-      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool_status || ""}:${item.at}`,
+      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_status || ""}:${item.emoji || ""}:${item.at}`,
   );
 }
 
@@ -30,19 +30,41 @@ export function messageFingerprint(message: Message): unknown {
       filename: item.filename,
       mime_type: item.mime_type,
       size_bytes: item.size_bytes,
+      is_image: !!item.is_image,
       url: item.url,
+      download_url: item.download_url,
+      local_preview: !!item.local_preview,
     })),
     created_at: message.created_at,
     pending: !!message.metadata?.local_pending,
+    streaming: !!message.metadata?.streaming,
+    stream_segment: !!message.metadata?.stream_segment,
+    knowledge_suggestions: (message.metadata?.knowledge_suggestions || []).map((item) => ({
+      id: item.id,
+      title: item.title,
+      summary: item.summary || "",
+      source: item.source || "",
+      score: item.score ?? null,
+    })),
     agent_work: work
       ? {
           run_id: work.run_id,
           state: work.state,
           current_step: work.current_step || "",
+          queued_count: work.queued_count || 0,
+          started_at: work.started_at || 0,
+          scope_type: work.scope_type || "",
+          scope_id: work.scope_id == null ? "" : String(work.scope_id),
           activity: flattenActivity(work.activity),
         }
       : null,
   };
+}
+
+/** Stable value used by React.memo. Keeping this beside chatSnapshot ensures
+ * realtime suppression and row memoization observe the same render fields. */
+export function messageFingerprintKey(message: Message): string {
+  return JSON.stringify(messageFingerprint(message));
 }
 
 export function agentStatusFingerprint(status: AgentStatus | null | undefined): unknown {
@@ -51,6 +73,9 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
     run_id: status.run_id || "",
     state: status.state,
     queued_count: status.queued_count || 0,
+    started_at: status.started_at || 0,
+    scope_type: status.scope_type || "",
+    scope_id: status.scope_id == null ? "" : String(status.scope_id),
     current_step: status.current_step || "",
     activity: flattenActivity(status.activity),
     stream_message: status.stream_message
@@ -58,11 +83,19 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
           id: status.stream_message.id,
           content: status.stream_message.content || "",
           updated_at: status.stream_message.updated_at || 0,
+          active: status.stream_message.active !== false,
+          username: status.stream_message.username || "",
+          created_at: status.stream_message.created_at || 0,
         }
       : null,
-    stream_messages: (status.stream_messages || []).map(
-      (item) => `${item.id}:${item.content || ""}:${item.updated_at || 0}`,
-    ),
+    stream_messages: (status.stream_messages || []).map((item) => ({
+      id: item.id,
+      content: item.content || "",
+      updated_at: item.updated_at || 0,
+      active: item.active !== false,
+      username: item.username || "",
+      created_at: item.created_at || 0,
+    })),
     approval: status.approval
       ? {
           run_id: status.approval.run_id || "",

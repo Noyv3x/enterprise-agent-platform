@@ -37,7 +37,7 @@ import {
   loadUsers,
   type AppStore,
 } from "./loaders";
-import { runBusy } from "./sessionActions";
+import { resetSession, runBusy } from "./sessionActions";
 import type {
   AdminPageId,
   AutoUpdateConfigUpdateRequest,
@@ -55,6 +55,9 @@ import type {
   TelegramConfigUpdateRequest,
   UpdateUserRequest,
 } from "../types";
+
+const RUNTIME_RESTART_TIMEOUT_MS = 5 * 60_000;
+const RUNTIME_INSTALL_TIMEOUT_MS = 30 * 60_000;
 
 /* =============================================================== accounts */
 
@@ -103,6 +106,9 @@ export async function impersonateAccount(store: AppStore, userId: Id): Promise<v
       method: "POST",
       body: EMPTY_BODY,
     });
+    // The server cookie now belongs to another account. Cancel every request
+    // and atomically clear the outgoing account before hydrating the new one.
+    resetSession(store, { preservePendingOperations: true });
     store.dispatch({ type: "SET_USER", payload: result.user });
     await loadInitial(store);
     store.dispatch({ type: "SET_ACTIVE_VIEW", payload: store.getState().activeView });
@@ -442,7 +448,11 @@ export async function saveCogneeEnv(
  *  then reload ALL settings (same endpoint regardless of the button label). */
 export async function restartRuntime(store: AppStore, name: string): Promise<void> {
   await runBusy(store, async () => {
-    await api(endpoints.restartRuntime.path(name), { method: "POST", body: EMPTY_BODY });
+    await api(endpoints.restartRuntime.path(name), {
+      method: "POST",
+      body: EMPTY_BODY,
+      timeoutMs: RUNTIME_RESTART_TIMEOUT_MS,
+    });
     await loadSettings(store);
   });
 }
@@ -450,7 +460,11 @@ export async function restartRuntime(store: AppStore, name: string): Promise<voi
 /** legacy runHermesInstall (legacy-app.js:2130-2136). POST "{}", reload ALL. */
 export async function installHermes(store: AppStore): Promise<void> {
   await runBusy(store, async () => {
-    await api(endpoints.installHermes.path(), { method: "POST", body: EMPTY_BODY });
+    await api(endpoints.installHermes.path(), {
+      method: "POST",
+      body: EMPTY_BODY,
+      timeoutMs: RUNTIME_INSTALL_TIMEOUT_MS,
+    });
     await loadSettings(store);
     toast("已触发 Hermes 安装", { type: "ok", title: "完成" });
   });

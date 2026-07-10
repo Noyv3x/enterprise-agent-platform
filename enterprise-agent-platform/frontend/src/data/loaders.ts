@@ -8,7 +8,7 @@
    batches).
    ===================================================================== */
 
-import { api } from "../lib/api";
+import { api, isApiRequestCancelled } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
@@ -109,7 +109,11 @@ export async function loadMentionTargets(store: AppStore): Promise<void> {
   try {
     const result = await api<MentionTargetsResponse>(endpoints.mentionTargets.path());
     store.dispatch({ type: "SET_MENTION_TARGETS", payload: result.targets || [] });
-  } catch {
+  } catch (error) {
+    // A session reset invalidates the whole response, including this fallback.
+    // Re-throw so an outgoing account's cancelled loader cannot clear data that
+    // already belongs to the newly authenticated account.
+    if (isApiRequestCancelled(error)) throw error;
     // Mention autocomplete is best-effort; never block hydration on it.
     store.dispatch({ type: "SET_MENTION_TARGETS", payload: [] });
   }

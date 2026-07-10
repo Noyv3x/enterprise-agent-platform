@@ -16,7 +16,7 @@
    already lives in hooks/useTypingNotifier.ts).
    ===================================================================== */
 
-import { api, type ApiOptions } from "../lib/api";
+import { api, isApiRequestCancelled, type ApiOptions } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
 import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
@@ -240,7 +240,7 @@ export async function sendMessage(
   scopeId: string,
   content: string,
   files: File[],
-): Promise<boolean> {
+): Promise<boolean | null> {
   localMessageSeq += 1;
   const seq = localMessageSeq;
   const message = buildOptimisticMessage(store.getState(), mode, scopeId, content, files, seq);
@@ -274,6 +274,9 @@ export async function sendMessage(
     await refreshActiveChat(store);
     return true;
   } catch (error) {
+    // A logout/account switch already reset the optimistic state. Do not put the
+    // outgoing user's draft back into the newly active account.
+    if (isApiRequestCancelled(error)) return null;
     store.dispatch({ type: "REMOVE_OPTIMISTIC_MESSAGE", payload: { mode, scopeId, tempId: message.id } });
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
@@ -307,6 +310,7 @@ export async function respondAgentApproval(
     toast("权限审批已提交", { type: "ok", title: "已处理" });
     return true;
   } catch (error) {
+    if (isApiRequestCancelled(error)) return false;
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
     toast(text, { type: "error", title: "审批失败" });

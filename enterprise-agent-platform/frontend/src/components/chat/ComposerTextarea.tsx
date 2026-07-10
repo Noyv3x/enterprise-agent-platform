@@ -19,7 +19,7 @@ import type { MentionApi } from "../../hooks/useMention";
 
 /** Keys that drive mention nav themselves — they must NOT also trigger a generic
  *  menu recompute on keyup (legacy onkeyup guard, :638-640). */
-const MENU_NAV_KEYS = ["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"];
+const MENU_NAV_KEYS = ["ArrowDown", "ArrowUp", "Home", "End", "Enter", "Tab", "Escape"];
 
 export interface ComposerTextareaProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;

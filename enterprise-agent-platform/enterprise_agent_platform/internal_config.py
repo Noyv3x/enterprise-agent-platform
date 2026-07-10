@@ -3,8 +3,11 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import re
 import sys
+import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,14 @@ ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,100}$")
 # re-injected from the on-disk config so a redacted round-trip never clobbers
 # the real credential.
 REDACTED_PLACEHOLDER = "__REDACTED__"
+
+# Config writes are rare administrative operations, so one process-wide
+# re-entrant lock is preferable to a path-lock registry that can grow without
+# bound.  The lock covers each complete read/modify/write transaction: atomic
+# replace alone prevents torn reads, but without this lock two concurrent field
+# updates can both read the same old file and silently discard one another.
+_CONFIG_UPDATE_LOCK = threading.RLock()
+_PRIVATE_CONFIG_MODE = 0o600
 
 # Top-level YAML keys whose nested values legitimately carry inline secrets
 # (e.g. providers/auxiliary/delegation blocks define `api_key`). Their JSON
@@ -83,8 +94,6 @@ HERMES_YAML_FIELDS = (
     ConfigField("agent.gateway_timeout_warning", "超时警告秒数", "Agent", "number"),
     ConfigField("agent.gateway_notify_interval", "仍在工作提示间隔", "Agent", "number"),
     ConfigField("agent.image_input_mode", "图片输入模式", "Agent", "select", options=("auto", "native", "text")),
-    ConfigField("terminal.backend", "终端后端", "终端", "select", options=("local", "docker", "singularity", "modal", "ssh")),
-    ConfigField("terminal.cwd", "终端工作目录", "终端"),
     ConfigField("terminal.timeout", "终端命令超时", "终端", "number"),
     ConfigField("terminal.env_passthrough", "透传环境变量", "终端", "json"),
     ConfigField("terminal.shell_init_files", "Shell 初始化文件", "终端", "json"),
@@ -148,7 +157,6 @@ HERMES_ENV_FIELDS = (
     ConfigField("FIRECRAWL_API_KEY", "Firecrawl API Key", "工具密钥", secret=True),
     ConfigField("FIRECRAWL_API_URL", "Firecrawl API URL", "工具"),
     ConfigField("CAMOFOX_URL", "Camofox URL", "浏览器"),
-    ConfigField("TERMINAL_ENV", "终端环境后端覆盖", "终端"),
     ConfigField("TERMINAL_TIMEOUT", "终端超时覆盖", "终端", "number"),
     ConfigField("TERMINAL_LIFETIME_SECONDS", "终端环境生命周期", "终端", "number"),
     ConfigField("HERMES_ACCEPT_HOOKS", "自动接受 hooks", "插件", "boolean"),
@@ -281,71 +289,73 @@ def read_cognee_internal_config(env_path: Path, effective_env: dict[str, str] | 
 
 
 def update_yaml_text(config_path: Path, yaml_text: str) -> None:
-    incoming = validate_yaml_mapping(yaml_text)
-    # If the submitted text still carries the redaction placeholder (the raw
-    # dump is masked on read), re-inject the real on-disk secrets so a redacted
-    # round-trip never overwrites credentials with the placeholder.
-    if REDACTED_PLACEHOLDER in yaml_text:
-        on_disk, _text, error = read_yaml_mapping_with_text(config_path)
-        if not error:
-            merged = restore_redacted_secrets(incoming, on_disk)
-            try:
-                import yaml
-            except Exception as exc:
-                raise ValueError("PyYAML is required to edit YAML config") from exc
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(
-                yaml.safe_dump(merged, sort_keys=False, allow_unicode=True),
-                encoding="utf-8",
-            )
-            return
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml_text.rstrip() + "\n", encoding="utf-8")
+    with _CONFIG_UPDATE_LOCK:
+        incoming = validate_yaml_mapping(yaml_text)
+        rendered = yaml_text.rstrip() + "\n"
+        # If the submitted text still carries the redaction placeholder (the raw
+        # dump is masked on read), re-inject the real on-disk secrets so a redacted
+        # round-trip never overwrites credentials with the placeholder. Reading
+        # while holding the same lock as field updates makes this restoration and
+        # the following replace one indivisible config transaction.
+        if REDACTED_PLACEHOLDER in yaml_text:
+            on_disk, _text, error = read_yaml_mapping_with_text(config_path)
+            if not error:
+                merged = restore_redacted_secrets(incoming, on_disk)
+                try:
+                    import yaml
+                except Exception as exc:
+                    raise ValueError("PyYAML is required to edit YAML config") from exc
+                rendered = yaml.safe_dump(merged, sort_keys=False, allow_unicode=True)
+        _atomic_write_text(config_path, rendered)
 
 
 def update_yaml_values(config_path: Path, updates: dict[str, Any]) -> None:
-    mapping, _text, error = read_yaml_mapping_with_text(config_path)
-    if error:
-        raise ValueError(f"fix YAML before editing fields: {error}")
-    fields = {field.key: field for field in HERMES_YAML_FIELDS}
-    for key, value in updates.items():
-        field = fields.get(str(key))
-        if not field:
-            raise ValueError(f"unsupported config key: {key}")
-        is_empty = value is None or (isinstance(value, str) and value.strip() == "")
-        if is_empty:
-            # Clearing a field means "unset / fall back to the runtime default",
-            # not "persist 0 / empty". Removing the key lets Hermes use its own
-            # default instead of writing a semantically different literal value.
-            delete_nested(mapping, field.key)
-        else:
-            coerced = coerce_field_value(field, value)
-            # Structured fields are rendered with inline secrets redacted to the
-            # placeholder; re-inject the on-disk secret when a placeholder comes
-            # back so editing a provider block never wipes its `api_key`.
-            if field.kind == "json" and isinstance(coerced, (dict, list)):
-                _found, on_disk_value = get_nested(mapping, field.key)
-                coerced = restore_redacted_secrets(coerced, on_disk_value if _found else None)
-            set_nested(mapping, field.key, coerced)
-    try:
-        import yaml
-    except Exception as exc:
-        raise ValueError("PyYAML is required to edit YAML config") from exc
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump(mapping, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    with _CONFIG_UPDATE_LOCK:
+        mapping, _text, error = read_yaml_mapping_with_text(config_path)
+        if error:
+            raise ValueError(f"fix YAML before editing fields: {error}")
+        fields = {field.key: field for field in HERMES_YAML_FIELDS}
+        for key, value in updates.items():
+            field = fields.get(str(key))
+            if not field:
+                raise ValueError(f"unsupported config key: {key}")
+            is_empty = value is None or (isinstance(value, str) and value.strip() == "")
+            if is_empty:
+                # Clearing a field means "unset / fall back to the runtime default",
+                # not "persist 0 / empty". Removing the key lets Hermes use its own
+                # default instead of writing a semantically different literal value.
+                delete_nested(mapping, field.key)
+            else:
+                coerced = coerce_field_value(field, value)
+                # Structured fields are rendered with inline secrets redacted to the
+                # placeholder; re-inject the on-disk secret when a placeholder comes
+                # back so editing a provider block never wipes its `api_key`.
+                if field.kind == "json" and isinstance(coerced, (dict, list)):
+                    _found, on_disk_value = get_nested(mapping, field.key)
+                    coerced = restore_redacted_secrets(coerced, on_disk_value if _found else None)
+                set_nested(mapping, field.key, coerced)
+        try:
+            import yaml
+        except Exception as exc:
+            raise ValueError("PyYAML is required to edit YAML config") from exc
+        _atomic_write_text(
+            config_path,
+            yaml.safe_dump(mapping, sort_keys=False, allow_unicode=True),
+        )
 
 
 def update_env_file(env_path: Path, updates: dict[str, Any]) -> None:
-    values = read_env_file(env_path)
-    for key, value in updates.items():
-        clean = str(key).strip().upper()
-        if not ENV_KEY_RE.fullmatch(clean):
-            raise ValueError(f"invalid env key: {key}")
-        if value is None:
-            values.pop(clean, None)
-        else:
-            values[clean] = str(value)
-    write_env_file(env_path, values)
+    with _CONFIG_UPDATE_LOCK:
+        values = read_env_file(env_path)
+        for key, value in updates.items():
+            clean = str(key).strip().upper()
+            if not ENV_KEY_RE.fullmatch(clean):
+                raise ValueError(f"invalid env key: {key}")
+            if value is None:
+                values.pop(clean, None)
+            else:
+                values[clean] = str(value)
+        _write_env_file_locked(env_path, values)
 
 
 def read_yaml_mapping_with_text(path: Path) -> tuple[dict[str, Any], str, str]:
@@ -714,9 +724,55 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    with _CONFIG_UPDATE_LOCK:
+        _write_env_file_locked(path, values)
+
+
+def _write_env_file_locked(path: Path, values: dict[str, str]) -> None:
     lines = [f"{key}={quote_env(value)}" for key, value in sorted(values.items()) if ENV_KEY_RE.fullmatch(key)]
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    _atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = _PRIVATE_CONFIG_MODE) -> None:
+    """Durably replace ``path`` without ever truncating the live config.
+
+    The temporary file lives in the destination directory, is owner-only from
+    creation, and is fully flushed and fsynced before the single atomic replace.
+    No fallible operation follows ``os.replace``; consequently every exception
+    raised by this function leaves the previous destination intact. Temporary
+    files are removed on all pre-replace failures.
+    """
+
+    target = path.expanduser()
+    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.tmp-",
+        dir=str(target.parent),
+    )
+    temporary = Path(temporary_name)
+    open_fd = fd
+    try:
+        os.fchmod(open_fd, mode)
+        handle = os.fdopen(open_fd, "w", encoding="utf-8")
+        open_fd = -1  # ownership transferred to ``handle``
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        if open_fd >= 0:
+            try:
+                os.close(open_fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
 
 
 def quote_env(value: str) -> str:

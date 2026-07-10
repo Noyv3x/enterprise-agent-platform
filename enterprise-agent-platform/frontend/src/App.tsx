@@ -3,18 +3,21 @@
    all three. */
 
 import { AppGate } from "./components/shell/AppGate";
+import { ErrorBoundary } from "./components/common/ErrorBoundary";
 import { ThemeProvider } from "./context/ThemeContext";
 import { ToastProvider } from "./context/ToastContext";
 import { StoreProvider } from "./store/StoreProvider";
 
 export default function App() {
   return (
-    <ThemeProvider>
-      <ToastProvider>
-        <StoreProvider>
-          <AppGate />
-        </StoreProvider>
-      </ToastProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <ToastProvider>
+          <StoreProvider>
+            <AppGate />
+          </StoreProvider>
+        </ToastProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

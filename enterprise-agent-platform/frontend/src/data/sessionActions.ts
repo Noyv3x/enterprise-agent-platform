@@ -9,7 +9,7 @@
    handleSessionExpired() route through it so the 401 path no longer leaks blobs.
    ===================================================================== */
 
-import { api } from "../lib/api";
+import { api, isApiError, isApiRequestCancelled, resetApiSession } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
 import { hasPermission, isAdmin } from "../store/selectors";
@@ -42,10 +42,20 @@ function runSessionTeardowns(): void {
   }
 }
 
-function resetSession(store: AppStore): void {
+export function resetSession(
+  store: AppStore,
+  { preservePendingOperations = false }: { preservePendingOperations?: boolean } = {},
+): void {
+  const pendingOperations = preservePendingOperations
+    ? [...store.getState().pendingOperations]
+    : [];
+  resetApiSession();
   runSessionTeardowns();
   for (const message of store.getState().pendingMessages) revokeAttachmentUrls(message);
   store.dispatch({ type: "RESET_SESSION" });
+  for (const operationId of pendingOperations) {
+    store.dispatch({ type: "BEGIN_BUSY", payload: operationId });
+  }
 }
 
 /* ------------------------------------------------------------- lifecycle */
@@ -57,26 +67,40 @@ export function handleSessionExpired(store: AppStore): void {
   toast("会话已过期，请重新登录", { type: "error", title: "需要登录" });
 }
 
-export async function logout(store: AppStore): Promise<void> {
-  await api(endpoints.logout.path(), { method: "POST" }).catch(() => {});
+export function logout(store: AppStore): Promise<void> {
+  // Treat the click as the local session boundary immediately: sensitive state
+  // disappears and all requests owned by the outgoing account are invalidated
+  // before the best-effort server notification starts.
   resetSession(store);
+  return api(endpoints.logout.path(), {
+    method: "POST",
+    keepalive: true,
+    skipAuthHandling: true,
+  }).then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 /** The withBusy port: global busy flag + clear error; on throw store the error
  *  and toast it ONLY when logged in (login screen shows .error inline instead). */
 export async function runBusy(store: AppStore, fn: () => Promise<void> | void): Promise<void> {
-  store.dispatch({ type: "SET_BUSY", payload: true });
+  const operationId = `operation-${++busyOperationSequence}`;
+  store.dispatch({ type: "BEGIN_BUSY", payload: operationId });
   store.dispatch({ type: "SET_ERROR", payload: "" });
   try {
     await fn();
   } catch (error) {
+    if (isApiRequestCancelled(error)) return;
     const message = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: message });
     if (store.getState().user) toast(message, { type: "error", title: "操作失败" });
   } finally {
-    store.dispatch({ type: "SET_BUSY", payload: false });
+    store.dispatch({ type: "END_BUSY", payload: operationId });
   }
 }
+
+let busyOperationSequence = 0;
 
 /** Coerce the active view if the user lacks permission for it
  *  (legacy renderShell guard, legacy-app.js:408-409). */
@@ -93,6 +117,7 @@ export async function login(store: AppStore, username: string, password: string)
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
+  resetSession(store, { preservePendingOperations: true });
   store.dispatch({ type: "SET_USER", payload: result.user });
   await loadInitial(store);
   coerceActiveView(store);
@@ -100,13 +125,18 @@ export async function login(store: AppStore, username: string, password: string)
 
 /** Boot the session: probe /api/auth/me, hydrate, and coerce the view.
  *  The StrictMode-safe once-guard lives in <AppGate> (a useRef). */
-export async function boot(store: AppStore): Promise<void> {
+export type BootResult = "authenticated" | "anonymous" | "error";
+
+export async function boot(store: AppStore): Promise<BootResult> {
   try {
-    const result = await api<AuthMeResponse>(endpoints.authMe.path());
+    const result = await api<AuthMeResponse>(endpoints.authMe.path(), { skipAuthHandling: true });
     store.dispatch({ type: "SET_USER", payload: result.user });
     await loadInitial(store);
     coerceActiveView(store);
-  } catch {
-    store.dispatch({ type: "SET_USER", payload: null });
+    return "authenticated";
+  } catch (error) {
+    const result = isApiError(error, 401) || isApiRequestCancelled(error) ? "anonymous" : "error";
+    resetSession(store);
+    return result;
   }
 }

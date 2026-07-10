@@ -66,9 +66,11 @@ MAX_SSE_STREAMS_PER_USER = _env_int("ENTERPRISE_MAX_SSE_STREAMS_PER_USER", 4)
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
-    # Streaming/SSE worker threads must not keep the process alive on shutdown,
-    # and a slightly larger accept backlog smooths bursts of new connections.
-    daemon_threads = True
+    # Wait for in-flight workers before the service/database are closed. SSE
+    # workers observe ``shutdown_event`` below, so this remains bounded while
+    # preventing requests from running against an already-closed Database.
+    daemon_threads = False
+    block_on_close = True
     request_queue_size = 128
 
     def __init__(self, server_address, RequestHandlerClass, service: EnterpriseService):
@@ -83,6 +85,15 @@ class EnterpriseHTTPServer(ThreadingHTTPServer):
         self._sse_lock = threading.Lock()
         self._sse_total = 0
         self._sse_per_user: dict[Any, int] = {}
+        self.shutdown_event = threading.Event()
+
+    def begin_shutdown(self) -> None:
+        """Tell long-lived workers to finish before runtime/database teardown."""
+        self.shutdown_event.set()
+
+    def shutdown(self) -> None:
+        self.begin_shutdown()
+        super().shutdown()
 
     def process_request(self, request, client_address) -> None:
         # Block new worker threads once the concurrency cap is reached rather
@@ -722,7 +733,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             deadline = time.time() + SSE_MAX_SECONDS
             next_auth_check = time.time() + SSE_AUTH_RECHECK_SECONDS
             last_token = None
-            while time.time() < deadline:
+            while time.time() < deadline and not self.server.shutdown_event.is_set():
                 now = time.time()
                 if now >= next_auth_check:
                     # Promptly end the stream if the session was deactivated or
@@ -733,6 +744,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     next_auth_check = now + SSE_AUTH_RECHECK_SECONDS
                 status = service.agent_status(actor, scope_type, scope_id)
                 latest = service.latest_message_id(scope_type, scope_id)
+                typing = service.typing_users(actor, scope_type, scope_id)
                 stream = status.get("stream_message") or {}
                 approval = status.get("approval") or {}
                 token_tuple = (
@@ -744,10 +756,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                     approval.get("run_id"),
                     approval.get("command"),
                     approval.get("description"),
+                    tuple(
+                        (item.get("user_id"), item.get("updated_at"))
+                        for item in typing
+                    ),
                 )
                 if token_tuple != last_token:
                     payload = json.dumps(
-                        {"agent_status": status, "latest_message_id": latest}, ensure_ascii=False
+                        {
+                            "agent_status": status,
+                            "latest_message_id": latest,
+                            "typing": typing,
+                        },
+                        ensure_ascii=False,
                     )
                     self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
                     last_token = token_tuple
@@ -785,6 +806,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
             self.send_header("Content-Length", str(size))
+            if target.name in {"index.html", "theme-init.js", "app.js", "styles.css"}:
+                self.send_header("Cache-Control", "no-cache")
+            elif re.search(r"-[A-Za-z0-9_-]{8,}\.(?:js|css)$", target.name):
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            else:
+                self.send_header("Cache-Control", "public, max-age=3600")
             self._send_security_headers()
             self.end_headers()
             self._stream_file_handle(fh)
@@ -811,7 +838,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "connect-src 'self'; "
@@ -982,8 +1009,12 @@ def run_server(config: PlatformConfig | None = None) -> None:
                 signal.signal(signum, handler)
             except (ValueError, OSError):
                 pass
-        server.service.close()
+        # Stop/cancel long-lived HTTP workers first. ``server_close`` waits for
+        # non-daemon request threads, after which it is safe to close runtimes
+        # and the thread-affine Database connections they use.
+        server.begin_shutdown()
         server.server_close()
+        server.service.close()
 
 
 def serve_in_thread(config: PlatformConfig, service: EnterpriseService | None = None) -> tuple[EnterpriseHTTPServer, threading.Thread]:

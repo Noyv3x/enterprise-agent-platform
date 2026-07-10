@@ -193,6 +193,18 @@ export function useMention(params: UseMentionParams): MentionApi {
         forceRender();
         return true;
       }
+      if (event.key === "Home") {
+        event.preventDefault();
+        selectedRef.current = 0;
+        forceRender();
+        return true;
+      }
+      if (event.key === "End") {
+        event.preventDefault();
+        selectedRef.current = options.length - 1;
+        forceRender();
+        return true;
+      }
       if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
         applyMention(selectedRef.current);

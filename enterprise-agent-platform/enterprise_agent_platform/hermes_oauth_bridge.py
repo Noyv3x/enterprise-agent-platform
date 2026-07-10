@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import threading
+import time
 from typing import Any
 
 from .oauth_flows import OAuthFlowError
@@ -80,6 +83,8 @@ class HermesOAuthBridge:
     def __init__(self, runtimes: Any, *, timeout_seconds: float = 45.0):
         self.runtimes = runtimes
         self.timeout_seconds = timeout_seconds
+        self._catalog_lock = threading.RLock()
+        self._catalog_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def available(self) -> bool:
         try:
@@ -150,7 +155,16 @@ class HermesOAuthBridge:
         )
 
     def model_catalog(self, provider: str, *, force_refresh: bool = False) -> dict[str, Any]:
-        return self._run(
+        cache_key = str(provider or "").strip().lower()
+        ttl = self._model_catalog_ttl_seconds()
+        now = time.monotonic()
+        if not force_refresh and ttl > 0:
+            with self._catalog_lock:
+                cached = self._catalog_cache.get(cache_key)
+                if cached is not None and cached[0] > now:
+                    return self._copy_catalog(cached[1])
+
+        result = self._run(
             "model_catalog",
             {
                 "provider": provider,
@@ -158,6 +172,25 @@ class HermesOAuthBridge:
                 "timeout_seconds": 30.0,
             },
         )
+        if ttl > 0:
+            with self._catalog_lock:
+                self._catalog_cache[cache_key] = (now + ttl, self._copy_catalog(result))
+        return self._copy_catalog(result)
+
+    @staticmethod
+    def _copy_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+        copied = dict(catalog)
+        if isinstance(copied.get("models"), list):
+            copied["models"] = list(copied["models"])
+        return copied
+
+    @staticmethod
+    def _model_catalog_ttl_seconds() -> float:
+        raw = os.environ.get("ENTERPRISE_HERMES_MODEL_CATALOG_TTL_SECONDS")
+        try:
+            return max(0.0, float(raw)) if raw is not None else 300.0
+        except (TypeError, ValueError):
+            return 300.0
 
     def _run(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.available():

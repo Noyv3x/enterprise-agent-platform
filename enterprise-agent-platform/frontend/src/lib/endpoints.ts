@@ -140,7 +140,7 @@ export const endpoints = {
     "GET",
     () => "/api/private-agent/telegram",
   ),
-  updatePrivateTelegram: ep<PrivateTelegramUpdateRequest, unknown>(
+  updatePrivateTelegram: ep<PrivateTelegramUpdateRequest, PrivateTelegramResponse>(
     "PUT",
     () => "/api/private-agent/telegram",
   ),

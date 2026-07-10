@@ -189,6 +189,65 @@ class StreamingResilienceTests(unittest.TestCase):
         self.assertIsInstance(exc, ValueError)
         self.assertIn("empty streaming response", str(exc))
 
+    def test_eof_after_partial_content_is_degraded_without_done(self):
+        events = [
+            "data: " + json.dumps({"choices": [{"delta": {"content": "partial only"}}]}) + "\n\n",
+        ]
+        result, exc, chunks = self._run_stream(events)
+        self.assertIsNone(exc)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.content, "partial only")
+        self.assertEqual(chunks, ["partial only"])
+        self.assertIn("terminal completion", result.raw["error"])
+
+    def test_eof_without_content_or_terminal_raises_stream_error(self):
+        result, exc, _chunks = self._run_stream([": keep-alive\n\n"])
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, HermesStreamError)
+        self.assertIn("terminal completion", str(exc))
+
+    def test_response_completed_is_a_terminal_success_without_done(self):
+        events = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"choices": [{"message": {"content": "complete"}}]},
+                }
+            )
+            + "\n\n",
+        ]
+        result, exc, chunks = self._run_stream(events)
+        self.assertIsNone(exc)
+        self.assertIsNotNone(result)
+        self.assertFalse(result.degraded)
+        self.assertEqual(result.content, "complete")
+        self.assertEqual(chunks, ["complete"])
+
+    def test_run_events_eof_after_delta_is_degraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            client = HermesAgentClient(make_config(Path(td)), lambda name: "")
+            response = [
+                (
+                    "data: "
+                    + json.dumps({"event": "message.delta", "delta": "partial run"})
+                    + "\n\n"
+                ).encode("utf-8")
+            ]
+            result = client._read_run_events(
+                response,
+                "session-1",
+                "run-1",
+                None,
+                None,
+                start_payload={},
+                model="test-model",
+            )
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.content, "partial run")
+        self.assertIn("run.completed", result.raw["error"])
+
     # --- Pure-function coverage for the new terminal-failure detection ---
 
     def test_terminal_failure_message_response_failed_with_message(self):

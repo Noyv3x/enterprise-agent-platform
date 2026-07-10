@@ -12,9 +12,10 @@
      skipAuthHandling, so a 401 drops to login) and, if still authed + visible,
      schedule a single 3s reconnect;
    - hidden tabs close the stream and reopen on visible (legacy visibility pause);
-   - pagehide closes the stream; logout/401 close it via the session teardown. */
+   - pagehide closes the stream and pageshow restores it after BFCache resume;
+   - logout/401 close it via the session teardown. */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { SSE_RECONNECT_MS } from "../lib/constants";
@@ -22,14 +23,16 @@ import { registerSessionTeardown } from "../data/sessionActions";
 import { currentScopeStreamUrl, refreshActiveChat } from "../data/chatActions";
 import { useStore, useStoreHandle } from "../store/useStore";
 
-export function useRealtime(): void {
+export function useRealtime(): boolean {
   const store = useStoreHandle();
   const userId = useStore((state) => state.user?.id);
   const view = useStore((state) => state.activeView);
   const activeChannelId = useStore((state) => state.activeChannelId);
   const url = useStore(currentScopeStreamUrl);
+  const [connected, setConnected] = useState(false);
 
   useEffect(() => {
+    setConnected(false);
     if (!userId || !url || typeof EventSource === "undefined") return;
 
     let es: EventSource | null = null;
@@ -56,6 +59,7 @@ export function useRealtime(): void {
         }
         es = null;
       }
+      if (!disposed) setConnected(false);
     };
 
     const open = () => {
@@ -64,11 +68,15 @@ export function useRealtime(): void {
       close();
       const current = new EventSource(url, { withCredentials: true });
       es = current;
+      current.addEventListener("open", () => {
+        if (es === current && !disposed) setConnected(true);
+      });
       current.addEventListener("update", () => {
         if (es === current) void refreshActiveChat(store);
       });
       current.addEventListener("error", () => {
         if (es !== current) return;
+        if (!disposed) setConnected(false);
         // readyState 0 = the browser is auto-reconnecting; leave it. readyState 2
         // (CLOSED) is terminal — probe auth, then self-reconnect once if valid.
         if (current.readyState === 2) {
@@ -93,18 +101,23 @@ export function useRealtime(): void {
       else open();
     };
     const onPageHide = () => close();
+    const onPageShow = () => open();
 
     open();
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
     const unregister = registerSessionTeardown(close);
 
     return () => {
       disposed = true;
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
       unregister();
       close();
     };
   }, [userId, view, activeChannelId, url, store]);
+
+  return connected;
 }

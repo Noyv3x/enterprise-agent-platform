@@ -20,11 +20,12 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from enterprise_agent_platform import runtimes as runtime_module
 from enterprise_agent_platform.auto_update import AutoUpdateManager
 from enterprise_agent_platform.config import PlatformConfig
-from enterprise_agent_platform.hermes import AgentResult, HermesAgentClient
+from enterprise_agent_platform.hermes import AgentResult, AutoAgentClient, HermesAgentClient
 from enterprise_agent_platform.hermes_relay import HermesRelayConnector
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.server import serve_in_thread
@@ -410,8 +411,6 @@ def make_config(tmp: Path) -> PlatformConfig:
         knowledge_backend="local",
         cognee_dataset="enterprise_knowledge",
         cognee_ingest_background=True,
-        container_backend="local",
-        container_image="python:3.11-slim",
         cognee_repo=tmp / "cognee",
         hermes_repo=tmp / "hermes-agent",
         firecrawl_repo=tmp / "firecrawl",
@@ -517,6 +516,23 @@ def managed_python(home: Path) -> Path:
 
 
 class PlatformServiceTests(unittest.TestCase):
+    @staticmethod
+    def _complete_telegram_link(
+        service: EnterpriseService,
+        actor: dict,
+        telegram_id: str,
+        username: str,
+    ) -> dict:
+        # Tests that exercise outbox delivery explicitly opt into the same
+        # enabled state required by the production worker.
+        service.set_setting("telegram_enabled", "1")
+        challenge = service.update_telegram_private_config(actor, {})
+        code = challenge["pending"]["code"]
+        return service.complete_telegram_link(
+            code,
+            {"id": telegram_id, "username": username, "first_name": username},
+        )
+
     def test_auto_update_manager_detects_remote_commit_and_skips_dirty_tree(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -860,6 +876,70 @@ class PlatformServiceTests(unittest.TestCase):
         self.assertEqual(len(result.output), 1)
         self.assertEqual(result.output[0].content[0].text, "OK")
 
+    def test_hermes_async_delegation_outbox_survives_adapter_restart_until_ack(self):
+        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
+        spec = importlib.util.spec_from_file_location("enterprise_async_outbox_patch_test", patch_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class FakeAdapter:
+            def __init__(self):
+                pass
+
+            async def connect(self):
+                return None
+
+            async def _handle_runs(self, request):
+                return SimpleNamespace(status=202, body=b'{}')
+
+            def _check_auth(self, request):
+                return None
+
+        class FakeRunner:
+            async def _inject_watch_notification(self, synth_text, event):
+                return None
+
+        fake_api = types.ModuleType("gateway.platforms.api_server")
+        fake_api.APIServerAdapter = FakeAdapter
+        fake_api.web = SimpleNamespace(json_response=lambda payload, status=200: SimpleNamespace(body=payload, status=status))
+        fake_run = types.ModuleType("gateway.run")
+        fake_run.GatewayRunner = FakeRunner
+        fake_gateway = types.ModuleType("gateway")
+        fake_platforms = types.ModuleType("gateway.platforms")
+        fake_platforms.api_server = fake_api
+        fake_gateway.platforms = fake_platforms
+        fake_gateway.run = fake_run
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            sys.modules,
+            {
+                "gateway": fake_gateway,
+                "gateway.platforms": fake_platforms,
+                "gateway.platforms.api_server": fake_api,
+                "gateway.run": fake_run,
+            },
+        ), mock.patch.dict(os.environ, {"HERMES_HOME": td}):
+            module._install_api_async_delegation_patch()
+            first = FakeAdapter()
+            event = {
+                "type": "async_delegation",
+                "delegation_id": "durable-delegation",
+                "platform": "api_server",
+                "session_key": "private:1",
+                "parent_session_id": "session-1",
+                "status": "complete",
+            }
+            self.assertTrue(first.record_async_delegation_event(event))
+
+            restarted = FakeAdapter()
+            persisted = restarted._matching_async_events(prefixes=["private:"])
+            self.assertEqual([item["delegation_id"] for item in persisted], ["durable-delegation"])
+            event_id = persisted[0]["_enterprise_event_id"]
+            self.assertEqual(restarted._ack_async_events([event_id]), 1)
+            self.assertEqual(FakeAdapter()._matching_async_events(prefixes=["private:"]), [])
+
     def test_hermes_runtime_patch_backfills_auxiliary_codex_stream_output_null(self):
         patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
         spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_aux_test", patch_path)
@@ -1071,7 +1151,20 @@ class PlatformServiceTests(unittest.TestCase):
                 )
                 progress = []
                 chunks = []
-                client = HermesAgentClient(config, lambda name: "")
+                class RuntimeManager:
+                    def hermes_runtime_config(self):
+                        return {
+                            "manage_hermes": True,
+                            "model": config.hermes_model,
+                            # Even an explicitly enabled relay must not bypass
+                            # the Runs API's structured approval contract.
+                            "relay": {"enabled": True},
+                        }
+
+                    def ensure_hermes_ready(self, *, wait=True):
+                        return SimpleNamespace(available=True)
+
+                client = AutoAgentClient(config, lambda name: "", runtime_manager=RuntimeManager())
                 result = client.generate(
                     system_prompt="system",
                     user_message="question",
@@ -1082,9 +1175,17 @@ class PlatformServiceTests(unittest.TestCase):
                     content_callback=chunks.append,
                 )
                 response = client.respond_approval(run_id="run_1", choice="always", resolve_all=True)
+                unstreamed_result = client.generate(
+                    system_prompt="system",
+                    user_message="question without callbacks",
+                    history=[],
+                    session_id="session-1",
+                    session_key="channel:1:main-agent",
+                )
 
                 self.assertEqual(result.content, "Hello world")
                 self.assertEqual(result.session_id, "session-rotated")
+                self.assertEqual(unstreamed_result.raw["mode"], "runs")
                 self.assertEqual(chunks, ["Hello ", "world"])
                 self.assertEqual([event["event"] for event in progress], ["approval.request", "approval.responded"])
                 self.assertEqual(result.raw["mode"], "runs")
@@ -1093,8 +1194,12 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(requests[0]["body"]["instructions"], "system")
                 self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Id"], "session-1")
                 self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Key"], "channel:1:main-agent")
+                self.assertEqual(requests[1]["body"]["input"][0]["content"], "question without callbacks")
                 self.assertEqual(approvals[0]["body"], {"choice": "always", "all": True})
                 self.assertEqual(response["resolved"], 1)
+                self.assertTrue(client.hermes.require_runs)
+                self.assertFalse(client.relay_connector._started)
+                client.close()
         finally:
             server.shutdown()
             server.server_close()
@@ -1109,6 +1214,12 @@ class PlatformServiceTests(unittest.TestCase):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if query.get("ack_id"):
+                    self.wfile.write(
+                        json.dumps({"object": "hermes.async_delegations", "acked": len(query["ack_id"]), "events": []}).encode("utf-8")
+                    )
+                    return
                 self.wfile.write(
                     json.dumps(
                         {
@@ -1143,17 +1254,55 @@ class PlatformServiceTests(unittest.TestCase):
                 )
                 client = HermesAgentClient(config, lambda name: "")
                 events = client.consume_async_delegations(session_key_prefixes=["channel:", "private:"])
+                acked = client.ack_async_delegations(["deleg_1"])
 
                 self.assertEqual(events[0]["delegation_id"], "deleg_1")
-                self.assertIn("/api/async-delegations?", requests[-1]["path"])
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-1]["path"]).query)
-                self.assertEqual(parsed["consume"], ["1"])
+                self.assertEqual(acked, 1)
+                self.assertIn("/api/async-delegations?", requests[-2]["path"])
+                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-2]["path"]).query)
+                self.assertEqual(parsed["consume"], ["0"])
                 self.assertEqual(parsed["session_key_prefix"], ["channel:", "private:"])
-                self.assertEqual(requests[-1]["headers"]["Authorization"], "Bearer test-key")
+                self.assertEqual(requests[-2]["headers"]["Authorization"], "Bearer test-key")
+                ack_query = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-1]["path"]).query)
+                self.assertEqual(ack_query["ack_id"], ["deleg_1"])
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
+
+    def test_auto_agent_refuses_degraded_managed_hermes_before_api_call(self):
+        class DegradedRuntime:
+            def hermes_runtime_config(self):
+                return {"manage_hermes": True}
+
+            def ensure_hermes_ready(self, *, wait=True):
+                return SimpleNamespace(
+                    available=False,
+                    state="degraded",
+                    error="required runtime patch failed",
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), agent_mode="hermes")
+            client = AutoAgentClient(config, lambda name: "", runtime_manager=DegradedRuntime())
+            with mock.patch.object(client.hermes, "generate") as generate:
+                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
+                    client.generate(
+                        system_prompt="system",
+                        user_message="question",
+                        history=[],
+                        session_id="session-1",
+                        session_key="private:1",
+                    )
+                generate.assert_not_called()
+            with mock.patch.object(client.hermes, "respond_approval") as approval:
+                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
+                    client.respond_approval(run_id="run_1", choice="deny")
+                approval.assert_not_called()
+            with mock.patch.object(client.hermes, "consume_async_delegations") as consume:
+                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
+                    client.consume_async_delegations(session_key_prefixes=["private:"])
+                consume.assert_not_called()
 
     def test_hermes_client_streams_responses_api_output_text_events(self):
         class Handler(BaseHTTPRequestHandler):
@@ -1369,10 +1518,12 @@ class PlatformServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
+                scope = service._channel_agent_scope("1")
                 event = {
                     "type": "async_delegation",
                     "delegation_id": "deleg_failed",
                     "session_key": "channel:1:main-agent",
+                    "parent_session_id": scope.session_id,
                     "goal": "整理整轨专辑",
                     "status": "error",
                     "error": "API call failed after 3 retries",
@@ -1390,6 +1541,71 @@ class PlatformServiceTests(unittest.TestCase):
                 metadata = json.loads(rows[0]["metadata_json"])
                 self.assertEqual(metadata["async_delegation_id"], "deleg_failed")
                 self.assertTrue(metadata["async_delegation"]["failed"])
+            finally:
+                service.close()
+
+    def test_async_delegation_from_cleared_or_inactive_scope_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                old_channel_scope = service._channel_agent_scope("1")
+                service.clear_channel_messages(admin, 1)
+                service._handle_async_delegation_event(
+                    {
+                        "delegation_id": "stale-channel",
+                        "session_key": "channel:1:main-agent",
+                        "parent_session_id": old_channel_scope.session_id,
+                        "status": "complete",
+                    }
+                )
+
+                user = service.create_user(
+                    username="delegation-user",
+                    password="delegation-pass",
+                    display_name="Delegation User",
+                    permission_group="member",
+                    actor=admin,
+                )
+                private_scope = service.agent_scopes.ensure_private_scope(user["id"])
+                service.deactivate_user(admin, user["id"])
+                service._handle_async_delegation_event(
+                    {
+                        "delegation_id": "inactive-private",
+                        "session_key": f"private:{user['id']}",
+                        "parent_session_id": private_scope.session_id,
+                        "status": "complete",
+                    }
+                )
+
+                self.assertFalse(
+                    service.db.scalar(
+                        "SELECT 1 FROM messages WHERE metadata_json LIKE '%stale-channel%' OR metadata_json LIKE '%inactive-private%'"
+                    )
+                )
+            finally:
+                service.close()
+
+    def test_async_delegation_accepts_parent_session_before_compression_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                scope = service._channel_agent_scope("1")
+                service.agent_scopes.update_session_id(scope.scope_key, "compressed-child-session")
+                service._handle_async_delegation_event(
+                    {
+                        "delegation_id": "pre-compression-child",
+                        "session_key": "channel:1:main-agent",
+                        "parent_session_id": scope.session_id,
+                        "status": "complete",
+                        "summary": "background work survived compression",
+                    }
+                )
+                row = service.db.query_one(
+                    "SELECT content FROM messages WHERE metadata_json LIKE '%pre-compression-child%'"
+                )
+                self.assertIsNotNone(row)
+                self.assertIn("survived compression", row["content"])
             finally:
                 service.close()
 
@@ -1542,7 +1758,7 @@ class PlatformServiceTests(unittest.TestCase):
             gateway = TelegramGateway(service, bot=bot, autostart=False)
             try:
                 _, user = service.authenticate("admin", "admin")
-                service.update_telegram_private_config(user, {"telegram_user_id": "12345", "telegram_username": "alice_tg"})
+                self._complete_telegram_link(service, user, "12345", "alice_tg")
                 result = gateway.process_update(
                     {
                         "update_id": 1,
@@ -1562,8 +1778,9 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(agent.calls[0]["metadata"]["workspace"]["scope"], "private")
                 self.assertEqual(
                     agent.calls[0]["metadata"]["workspace"]["path"],
-                    agent.calls[0]["metadata"]["container"]["workspace_path"],
+                    agent.calls[0]["metadata"]["execution"]["workspace_path"],
                 )
+                self.assertNotIn("container", agent.calls[0]["metadata"])
                 self.assertEqual(result["scope_id"], str(user["id"]))
                 self.assertEqual(len(bot.sent), 1)
                 self.assertEqual(bot.sent[0]["chat_id"], 12345)
@@ -1576,6 +1793,392 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_telegram_link_command_is_one_time_and_updates_are_deduplicated(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                service.set_setting("telegram_enabled", "1")
+                _, user = service.authenticate("admin", "admin")
+                challenge = service.update_telegram_private_config(user, {})
+                command = challenge["pending"]["command"]
+                update = {
+                    "update_id": 77,
+                    "message": {
+                        "message_id": 70,
+                        "chat": {"id": 77777, "type": "private"},
+                        "from": {"id": 77777, "username": "proof_tg", "first_name": "Proof"},
+                        "text": command,
+                    },
+                }
+
+                linked = gateway.process_update(update)
+                duplicate = gateway.process_update(update)
+
+                self.assertTrue(linked["linked"])
+                self.assertEqual(duplicate["ignored"], "duplicate update")
+                self.assertEqual(len(bot.sent), 1)
+                config = service.telegram_private_config(user)
+                self.assertEqual(config["link"]["telegram_user_id"], "77777")
+                self.assertIsNone(config["pending"])
+                replay = gateway.process_update({**update, "update_id": 78})
+                self.assertFalse(replay["linked"])
+                self.assertIn("绑定失败", bot.sent[-1]["text"])
+                statuses = service.db.query(
+                    "SELECT update_id, status FROM telegram_updates ORDER BY update_id"
+                )
+                self.assertEqual(statuses, [
+                    {"update_id": 77, "status": "succeeded"},
+                    {"update_id": 78, "status": "succeeded"},
+                ])
+            finally:
+                service.close()
+
+    def test_concurrent_telegram_turns_deliver_only_their_exact_agent_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                self._complete_telegram_link(service, user, "88881", "concurrent_tg")
+                updates = [
+                    {
+                        "update_id": 801,
+                        "message": {
+                            "message_id": 101,
+                            "chat": {"id": 88881, "type": "private"},
+                            "from": {"id": 88881, "username": "concurrent_tg"},
+                            "text": "request-one",
+                        },
+                    },
+                    {
+                        "update_id": 802,
+                        "message": {
+                            "message_id": 102,
+                            "chat": {"id": 88881, "type": "private"},
+                            "from": {"id": 88881, "username": "concurrent_tg"},
+                            "text": "request-two",
+                        },
+                    },
+                ]
+                results: list[dict] = []
+                threads = [
+                    threading.Thread(target=lambda item=item: results.append(gateway.process_update(item)))
+                    for item in updates
+                ]
+                threads[0].start()
+                self.assertTrue(agent.started.wait(2))
+                threads[1].start()
+                time.sleep(0.05)
+                agent.release.set()
+                for thread in threads:
+                    thread.join(5)
+
+                self.assertEqual(len(results), 2)
+                delivered = {int(item["reply_to_message_id"]): item["text"] for item in bot.sent}
+                self.assertIn("request-one", delivered[101])
+                self.assertIn("request-two", delivered[102])
+                self.assertNotIn("request-two", delivered[101])
+                self.assertNotIn("request-one", delivered[102])
+                self.assertEqual(service.jobs.counts(kind="telegram_delivery")["succeeded"], 2)
+                self.assertFalse(any(thread.name.startswith("telegram-response-") for thread in threading.enumerate()))
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_queued_telegram_delivery_recovers_and_succeeded_job_is_not_repeated(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, user = first.authenticate("admin", "admin")
+                self._complete_telegram_link(first, user, "88882", "recovery_tg")
+                sent = first.send_private_message(user, "persist this delivery")
+                first.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+                user_message_id = int(sent["user_message"]["id"])
+                job = first.enqueue_telegram_delivery(
+                    actor=user,
+                    update_id=901,
+                    user_message_id=user_message_id,
+                    chat_id=88882,
+                    reply_to_message_id=201,
+                    message_thread_id=None,
+                )
+                self.assertEqual(job.status, "queued")
+            finally:
+                first.close()
+
+            second = EnterpriseService(config, agent_client=RecordingAgent())
+            second_bot = FakeTelegramBot()
+            TelegramGateway(second, bot=second_bot, autostart=False)
+            try:
+                completed = second.wait_for_telegram_delivery(job.id, timeout=5)
+                self.assertIsNotNone(completed)
+                self.assertEqual(completed.status, "succeeded")
+                self.assertEqual(completed.attempts, 1)
+                self.assertEqual(len(second_bot.sent), 1)
+                self.assertEqual(second_bot.sent[0]["reply_to_message_id"], 201)
+                self.assertIn("persist this delivery", second_bot.sent[0]["text"])
+            finally:
+                second.close()
+
+            third = EnterpriseService(config, agent_client=RecordingAgent())
+            third_bot = FakeTelegramBot()
+            TelegramGateway(third, bot=third_bot, autostart=False)
+            try:
+                time.sleep(0.4)
+                self.assertEqual(third.jobs.get(job.id).status, "succeeded")
+                self.assertEqual(third_bot.sent, [])
+            finally:
+                third.close()
+
+    def test_interrupted_telegram_update_replay_reuses_message_agent_job_and_outbox(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first_agent = RecordingAgent()
+            first = EnterpriseService(config, agent_client=first_agent)
+            first_bot = FakeTelegramBot()
+            first_gateway = TelegramGateway(first, bot=first_bot, autostart=False)
+            update = {
+                "update_id": 911,
+                "message": {
+                    "message_id": 211,
+                    "chat": {"id": 88891, "type": "private"},
+                    "from": {"id": 88891, "username": "replay_tg"},
+                    "text": "persist exactly once",
+                },
+            }
+            try:
+                _, user = first.authenticate("admin", "admin")
+                self._complete_telegram_link(first, user, "88891", "replay_tg")
+
+                # Model a crash after the complete route (message, Agent job and
+                # outbox all committed) but before process_update acknowledges
+                # the update with finish_telegram_update.
+                self.assertTrue(first.claim_telegram_update(911))
+                initial = first_gateway._process_claimed_update(update)
+                self.assertEqual(initial["delivery_status"], "succeeded")
+                self.assertEqual(
+                    first.db.scalar("SELECT status FROM telegram_updates WHERE update_id = 911"),
+                    "processing",
+                )
+                original_message_id = int(initial["user_message_id"])
+                original_agent_job_id = first.jobs.get_by_key(
+                    "agent", f"message:{original_message_id}"
+                ).id
+                original_delivery_job_id = int(initial["delivery_job_id"])
+                self.assertEqual(len(first_bot.sent), 1)
+            finally:
+                first.close()
+
+            second_agent = RecordingAgent()
+            second = EnterpriseService(config, agent_client=second_agent)
+            second_bot = FakeTelegramBot()
+            second_gateway = TelegramGateway(second, bot=second_bot, autostart=False)
+            try:
+                replay = second_gateway.process_update(update)
+
+                self.assertEqual(int(replay["user_message_id"]), original_message_id)
+                self.assertEqual(int(replay["delivery_job_id"]), original_delivery_job_id)
+                self.assertEqual(
+                    second.jobs.get_by_key("agent", f"message:{original_message_id}").id,
+                    original_agent_job_id,
+                )
+                self.assertEqual(
+                    second.db.scalar(
+                        """
+                        SELECT COUNT(*) FROM messages
+                        WHERE scope_type = 'private' AND scope_id = ? AND author_type = 'user'
+                        """,
+                        (str(user["id"]),),
+                    ),
+                    1,
+                )
+                self.assertEqual(second.jobs.counts(kind="agent")["succeeded"], 1)
+                self.assertEqual(second.jobs.counts(kind="telegram_delivery")["succeeded"], 1)
+                self.assertEqual(second_agent.calls, [])
+                self.assertEqual(second_bot.sent, [])
+                stored = second._messages_for_scope("private", str(user["id"]))[0]
+                self.assertEqual(stored["metadata"]["telegram_update_id"], 911)
+                self.assertEqual(
+                    second.db.scalar("SELECT status FROM telegram_updates WHERE update_id = 911"),
+                    "succeeded",
+                )
+            finally:
+                second.close()
+
+    def test_telegram_help_reply_is_not_sent_twice_after_pre_ack_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            update = {
+                "update_id": 913,
+                "message": {
+                    "message_id": 213,
+                    "chat": {"id": 88913, "type": "private"},
+                    "from": {"id": 88913, "username": "help_tg"},
+                    "text": "/help",
+                },
+            }
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            first.set_setting("telegram_enabled", "1")
+            first_bot = FakeTelegramBot()
+            first_gateway = TelegramGateway(first, bot=first_bot, autostart=False)
+            try:
+                self.assertTrue(first.claim_telegram_update(913))
+                initial = first_gateway._process_claimed_update(update)
+                self.assertEqual(initial["delivery_status"], "succeeded")
+                self.assertEqual(len(first_bot.sent), 1)
+                original_job_id = int(initial["delivery_job_id"])
+                self.assertEqual(
+                    first.db.scalar("SELECT status FROM telegram_updates WHERE update_id = 913"),
+                    "processing",
+                )
+            finally:
+                first.close()
+
+            second = EnterpriseService(config, agent_client=RecordingAgent())
+            second_bot = FakeTelegramBot()
+            second_gateway = TelegramGateway(second, bot=second_bot, autostart=False)
+            try:
+                replay = second_gateway.process_update(update)
+                self.assertEqual(replay["delivery_job_id"], original_job_id)
+                self.assertEqual(replay["delivery_status"], "succeeded")
+                self.assertEqual(second_bot.sent, [])
+            finally:
+                second.close()
+
+    def test_telegram_link_replay_recovers_crash_before_outbox_enqueue(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            first.set_setting("telegram_enabled", "1")
+            first_bot = FakeTelegramBot()
+            first_gateway = TelegramGateway(first, bot=first_bot, autostart=False)
+            try:
+                _, user = first.authenticate("admin", "admin")
+                command = first.update_telegram_private_config(user, {})["pending"]["command"]
+                update = {
+                    "update_id": 914,
+                    "message": {
+                        "message_id": 214,
+                        "chat": {"id": 88914, "type": "private"},
+                        "from": {"id": 88914, "username": "link_replay"},
+                        "text": command,
+                    },
+                }
+                self.assertTrue(first.claim_telegram_update(914))
+                with mock.patch.object(
+                    first,
+                    "enqueue_telegram_text_delivery",
+                    side_effect=SystemExit("simulated kill before outbox enqueue"),
+                ):
+                    with self.assertRaises(SystemExit):
+                        first_gateway._process_claimed_update(update)
+                self.assertEqual(first_bot.sent, [])
+                self.assertTrue(first.telegram_update_result(914).get("linked"))
+            finally:
+                first.close()
+
+            second = EnterpriseService(config, agent_client=RecordingAgent())
+            second_bot = FakeTelegramBot()
+            second_gateway = TelegramGateway(second, bot=second_bot, autostart=False)
+            try:
+                replay = second_gateway.process_update(update)
+                self.assertTrue(replay["linked"])
+                self.assertEqual(replay["delivery_status"], "succeeded")
+                self.assertEqual(len(second_bot.sent), 1)
+                self.assertIn("绑定成功", second_bot.sent[0]["text"])
+                self.assertNotIn("绑定失败", second_bot.sent[0]["text"])
+            finally:
+                second.close()
+
+    def test_disabled_telegram_outbox_waits_for_new_handler_after_reenable(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            old_bot = FakeTelegramBot()
+            old_gateway = TelegramGateway(service, bot=old_bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                challenge = service.update_telegram_private_config(user, {})
+                service.complete_telegram_link(
+                    challenge["pending"]["code"],
+                    {"id": "88892", "username": "disabled_tg"},
+                )
+                sent = service.send_private_message(user, "hold while disabled")
+                service.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+                delivery = service.enqueue_telegram_delivery(
+                    actor=user,
+                    update_id=912,
+                    user_message_id=int(sent["user_message"]["id"]),
+                    chat_id=88892,
+                    reply_to_message_id=212,
+                    message_thread_id=None,
+                )
+
+                time.sleep(0.4)
+                self.assertEqual(service.jobs.get(delivery.id).status, "queued")
+                self.assertEqual(old_bot.sent, [])
+
+                # Rotation disables the old registration before enabling and
+                # installing the replacement. Stopping the stale gateway after
+                # that must not unregister the newer generation.
+                service.unregister_telegram_delivery_handler()
+                service.set_setting("telegram_enabled", "1")
+                new_bot = FakeTelegramBot()
+                TelegramGateway(service, bot=new_bot, autostart=False)
+                old_gateway.stop()
+
+                completed = service.wait_for_telegram_delivery(delivery.id, timeout=5)
+                self.assertIsNotNone(completed)
+                self.assertEqual(completed.status, "succeeded")
+                self.assertEqual(old_bot.sent, [])
+                self.assertEqual(len(new_bot.sent), 1)
+                self.assertEqual(new_bot.sent[0]["reply_to_message_id"], 212)
+            finally:
+                service.close()
+
+    def test_ambiguous_telegram_send_failure_is_quarantined_not_repeated(self):
+        class FailingBot(FakeTelegramBot):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def send_message(self, **kwargs):
+                self.attempts += 1
+                raise RuntimeError("connection dropped after send")
+
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            failing = FailingBot()
+            gateway = TelegramGateway(service, bot=failing, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                self._complete_telegram_link(service, user, "88883", "ambiguous_tg")
+                result = gateway.process_update(
+                    {
+                        "update_id": 902,
+                        "message": {
+                            "message_id": 202,
+                            "chat": {"id": 88883, "type": "private"},
+                            "from": {"id": 88883, "username": "ambiguous_tg"},
+                            "text": "possibly delivered",
+                        },
+                    }
+                )
+                self.assertEqual(result["delivery_status"], "needs_review")
+                self.assertEqual(failing.attempts, 1)
+
+                replacement = FakeTelegramBot()
+                TelegramGateway(service, bot=replacement, autostart=False)
+                time.sleep(0.4)
+                self.assertEqual(replacement.sent, [])
+                self.assertEqual(service.jobs.get(result["delivery_job_id"]).status, "needs_review")
+            finally:
+                service.close()
+
     def test_telegram_document_is_stored_as_platform_attachment(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -1585,7 +2188,7 @@ class PlatformServiceTests(unittest.TestCase):
             gateway = TelegramGateway(service, bot=bot, autostart=False)
             try:
                 _, user = service.authenticate("admin", "admin")
-                service.update_telegram_private_config(user, {"telegram_user_id": "45678", "telegram_username": "doc_tg"})
+                self._complete_telegram_link(service, user, "45678", "doc_tg")
                 result = gateway.process_update(
                     {
                         "update_id": 4,
@@ -1626,7 +2229,7 @@ class PlatformServiceTests(unittest.TestCase):
             gateway = TelegramGateway(service, bot=bot, autostart=False)
             try:
                 _, user = service.authenticate("admin", "admin")
-                service.update_telegram_private_config(user, {"telegram_user_id": "56789", "telegram_username": "media_tg"})
+                self._complete_telegram_link(service, user, "56789", "media_tg")
                 result = gateway.process_update(
                     {
                         "update_id": 5,
@@ -1659,6 +2262,7 @@ class PlatformServiceTests(unittest.TestCase):
             bot = FakeTelegramBot()
             gateway = TelegramGateway(service, bot=bot, autostart=False)
             try:
+                service.set_setting("telegram_enabled", "1")
                 result = gateway.process_update(
                     {
                         "update_id": 6,
@@ -1674,7 +2278,8 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(result["ignored"], "unlinked telegram user")
                 self.assertEqual(agent.calls, [])
                 self.assertEqual(len(bot.sent), 1)
-                self.assertIn("67890", bot.sent[0]["text"])
+                self.assertIn("/link", bot.sent[0]["text"])
+                self.assertNotIn("67890", bot.sent[0]["text"])
             finally:
                 service.close()
 
@@ -1732,14 +2337,27 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(config["config"]["bot_token_configured"])
                 self.assertIn("/api/telegram/webhook/secret-token", config["config"]["webhook_url"])
 
-                mine = service.update_telegram_private_config(
-                    admin,
-                    {"telegram_user_id": "123456789", "telegram_username": "admin_tg"},
+                challenge = service.update_telegram_private_config(admin, {})
+                self.assertEqual(challenge["pending"]["status"], "pending")
+                self.assertIn("code", challenge["pending"])
+                pending_get = service.telegram_private_config(admin)
+                self.assertNotIn("code", pending_get["pending"])
+                service.complete_telegram_link(
+                    challenge["pending"]["code"],
+                    {"id": "123456789", "username": "admin_tg", "first_name": "Admin"},
                 )
+                mine = service.telegram_private_config(admin)
                 self.assertEqual(mine["link"]["telegram_user_id"], "123456789")
+                member_challenge = service.update_telegram_private_config(member, {})
                 with self.assertRaises(ServiceError) as ctx:
-                    service.update_telegram_private_config(member, {"telegram_user_id": "123456789"})
+                    service.complete_telegram_link(
+                        member_challenge["pending"]["code"],
+                        {"id": "123456789", "username": "admin_tg"},
+                    )
                 self.assertEqual(ctx.exception.status, 409)
+                with self.assertRaises(ServiceError) as raw_ctx:
+                    service.update_telegram_private_config(member, {"telegram_user_id": "999"})
+                self.assertEqual(raw_ctx.exception.status, 400)
             finally:
                 service.close()
 
@@ -1881,11 +2499,16 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertIsNone(result["agent_message"])
             service.wait_for_agent_idle("private", str(user["id"]))
 
-            container = service.private_status(user)["container"]
-            self.assertEqual(container["backend"], "local")
-            self.assertTrue(Path(container["workspace_path"]).exists())
+            status = service.private_status(user)
+            execution = status["execution"]
+            self.assertEqual(execution["backend"], "host")
+            self.assertEqual(execution["isolation"], "logical")
+            self.assertEqual(execution["scope_key"], "private:1")
+            self.assertTrue(Path(execution["workspace_path"]).exists())
+            self.assertIsNone(status["container"])
             self.assertEqual(agent.calls[-1]["session_id"], "enterprise-private-u1")
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
+            self.assertNotIn("container", agent.calls[-1]["metadata"])
             service.close()
 
     def test_private_agent_accepts_file_only_message_and_passes_file_path(self):
@@ -2000,6 +2623,42 @@ class PlatformServiceTests(unittest.TestCase):
         finally:
             probe.unlink(missing_ok=True)
 
+    def test_generated_media_enforces_aggregate_limit_as_one_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                workspace = Path(service.agent_scopes.ensure_private_scope(1).workspace_path)
+                first = workspace / "first.txt"
+                second = workspace / "second.txt"
+                first.write_bytes(b"abc")
+                second.write_bytes(b"def")
+                with mock.patch("enterprise_agent_platform.service.MAX_ATTACHMENTS_TOTAL_BYTES", 5):
+                    content, attachments = service._extract_generated_attachments(
+                        f"files\nMEDIA:{first}\nMEDIA:{second}",
+                        owner_id=1,
+                    )
+                self.assertEqual(attachments, [])
+                self.assertIn("exceeded attachment limits", content)
+            finally:
+                service.close()
+
+    def test_channel_generated_media_cannot_read_another_channel_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                first_scope = service.agent_scopes.ensure_channel_scope(1)
+                second_scope = service.agent_scopes.ensure_channel_scope(2)
+                foreign = Path(second_scope.workspace_path) / "foreign.txt"
+                foreign.write_text("other channel", encoding="utf-8")
+                content, attachments = service._extract_generated_attachments(
+                    f"result\nMEDIA:{foreign}",
+                    workspace_path=Path(first_scope.workspace_path),
+                )
+                self.assertEqual(attachments, [])
+                self.assertIn("outside the allowed media directories", content)
+            finally:
+                service.close()
+
     def test_agent_media_cannot_exfiltrate_data_dir_secrets(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -2041,7 +2700,7 @@ class PlatformServiceTests(unittest.TestCase):
 
             service.send_private_message(member, "private task")
             service.wait_for_agent_idle("private", str(member["id"]))
-            self.assertEqual(service.private_status(member)["container"]["session_id"], "enterprise-private-u2")
+            self.assertEqual(service.private_status(member)["execution"]["session_id"], "enterprise-private-u2")
             self.assertEqual(service.model_secret_env(), {})
             service.close()
 
@@ -2060,7 +2719,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(agent.calls[1]["session_id"], "compressed-private-session")
                 self.assertEqual(agent.calls[0]["history"], [])
                 self.assertEqual(agent.calls[1]["history"], [])
-                self.assertEqual(service.private_status(user)["container"]["session_id"], "compressed-private-session")
+                self.assertEqual(service.private_status(user)["execution"]["session_id"], "compressed-private-session")
             finally:
                 service.close()
 
@@ -2216,6 +2875,258 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_clear_private_conversation_cancels_inflight_reply_and_rotates_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                sent = service.send_private_message(admin, "do not restore this after clear")
+                self.assertTrue(agent.started.wait(timeout=2))
+                before = service.agent_scopes.get_private_scope(admin["id"])
+                self.assertIsNotNone(before)
+
+                cleared = service.clear_private_messages(admin, admin["id"])
+                self.assertEqual(cleared["deleted"], 1)
+                after = service.agent_scopes.get_private_scope(admin["id"])
+                self.assertIsNotNone(after)
+                self.assertNotEqual(after.session_id, before.session_id)
+                self.assertEqual(after.workspace_path, before.workspace_path)
+
+                agent.release.set()
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
+                self.assertEqual(service.audit_private_messages(admin, admin["id"])["messages"], [])
+                job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "failed")
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_clear_preserves_visible_history_when_session_rotation_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                sent = service.send_private_message(admin, "keep this if rotation fails")
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
+                before = service.agent_scopes.get_private_scope(admin["id"])
+                with mock.patch.object(
+                    service.agent_scopes,
+                    "rotate_session",
+                    side_effect=OSError("disk full"),
+                ):
+                    with self.assertRaises(OSError):
+                        service.clear_private_messages(admin, admin["id"])
+
+                after = service.agent_scopes.get_private_scope(admin["id"])
+                self.assertEqual(after.session_id, before.session_id)
+                messages = service.audit_private_messages(admin, admin["id"])["messages"]
+                self.assertEqual(messages[0]["id"], sent["user_message"]["id"])
+                self.assertEqual(len(messages), 2)
+            finally:
+                service.close()
+
+    def test_deactivate_user_cancels_inflight_private_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="cancelled-user",
+                    password="cancelled-pass",
+                    display_name="Cancelled User",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, user = service.authenticate("cancelled-user", "cancelled-pass")
+                sent = service.send_private_message(user, "long private operation")
+                self.assertTrue(agent.started.wait(timeout=2))
+
+                service.deactivate_user(admin, user["id"])
+                agent.release.set()
+                service.wait_for_agent_idle("private", str(user["id"]), timeout=3)
+
+                audit = service.audit_private_messages(admin, user["id"])
+                self.assertEqual([message["author_type"] for message in audit["messages"]], ["user"])
+                job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "failed")
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_stale_authenticated_actor_cannot_write_after_deactivation(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="stale-writer",
+                    password="stale-writer-pass",
+                    display_name="Stale Writer",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, stale_actor = service.authenticate("stale-writer", "stale-writer-pass")
+                service.deactivate_user(admin, stale_actor["id"])
+
+                with self.assertRaises(ServiceError) as private_error:
+                    service.send_private_message(stale_actor, "must not persist")
+                self.assertEqual(private_error.exception.status, 401)
+                with self.assertRaises(ServiceError) as channel_error:
+                    service.send_channel_message(stale_actor, 1, "must not persist")
+                self.assertEqual(channel_error.exception.status, 401)
+                self.assertFalse(
+                    service.db.scalar(
+                        "SELECT 1 FROM messages WHERE user_id = ?",
+                        (stale_actor["id"],),
+                    )
+                )
+            finally:
+                service.close()
+
+    def test_deleting_source_message_cancels_inflight_agent_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                sent = service.send_private_message(admin, "delete this active request")
+                self.assertTrue(agent.started.wait(timeout=2))
+
+                service.delete_private_message(admin, admin["id"], sent["user_message"]["id"])
+                agent.release.set()
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
+
+                self.assertEqual(service.audit_private_messages(admin, admin["id"])["messages"], [])
+                job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "failed")
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_attachment_write_and_message_delete_are_serialized(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            entered = threading.Event()
+            release = threading.Event()
+            append_errors = []
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                original_store = service._store_attachments
+
+                def blocked_store(**kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(timeout=3))
+                    return original_store(**kwargs)
+
+                def append_message():
+                    try:
+                        service._append_message(
+                            scope_type="private",
+                            scope_id=str(admin["id"]),
+                            author_type="user",
+                            user_id=admin["id"],
+                            username=admin["display_name"],
+                            content="attachment race",
+                            metadata={},
+                            attachments=[UploadedFile("race.txt", "text/plain", b"race")],
+                        )
+                    except BaseException as exc:
+                        append_errors.append(exc)
+
+                with mock.patch.object(service, "_store_attachments", side_effect=blocked_store):
+                    append_thread = threading.Thread(target=append_message)
+                    append_thread.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    message_id = int(
+                        service.db.scalar("SELECT id FROM messages WHERE content = 'attachment race'")
+                    )
+                    delete_thread = threading.Thread(
+                        target=service.delete_private_message,
+                        args=(admin, admin["id"], message_id),
+                    )
+                    delete_thread.start()
+                    time.sleep(0.05)
+                    self.assertTrue(delete_thread.is_alive())
+                    release.set()
+                    append_thread.join(timeout=3)
+                    delete_thread.join(timeout=3)
+
+                self.assertEqual(append_errors, [])
+                self.assertFalse(append_thread.is_alive())
+                self.assertFalse(delete_thread.is_alive())
+                self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
+                self.assertEqual(
+                    [path for path in service._attachment_root().rglob("*") if path.is_file()],
+                    [],
+                )
+            finally:
+                release.set()
+                service.close()
+
+    def test_startup_discards_message_interrupted_during_attachment_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, admin = first.authenticate("admin", "admin")
+                with mock.patch.object(first, "_store_attachments", side_effect=SystemExit("simulated kill")):
+                    with self.assertRaises(SystemExit):
+                        first._append_message(
+                            scope_type="private",
+                            scope_id=str(admin["id"]),
+                            author_type="user",
+                            user_id=admin["id"],
+                            username=admin["display_name"],
+                            content="must not run without its attachment",
+                            metadata={"generation": first.account_generation_config(admin)},
+                            attachments=[UploadedFile("required.txt", "text/plain", b"required")],
+                        )
+                pending = first.db.query_one(
+                    "SELECT metadata_json FROM messages WHERE content = ?",
+                    ("must not run without its attachment",),
+                )
+                self.assertIsNotNone(pending)
+                self.assertEqual(json.loads(pending["metadata_json"])["_attachment_commit"], "pending")
+            finally:
+                first.close()
+
+            agent = RecordingAgent()
+            second = EnterpriseService(config, agent_client=agent)
+            try:
+                time.sleep(0.1)
+                self.assertFalse(
+                    second.db.scalar(
+                        "SELECT 1 FROM messages WHERE content = ?",
+                        ("must not run without its attachment",),
+                    )
+                )
+                self.assertEqual(agent.calls, [])
+                self.assertEqual(second.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
+                self.assertEqual(
+                    [path for path in second._attachment_root().rglob("*") if path.is_file()],
+                    [],
+                )
+            finally:
+                second.close()
+
+    def test_data_directory_allows_only_one_live_service_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                with self.assertRaisesRegex(RuntimeError, "another enterprise platform instance"):
+                    EnterpriseService(config, agent_client=RecordingAgent())
+            finally:
+                first.close()
+
+            replacement = EnterpriseService(config, agent_client=RecordingAgent())
+            replacement.close()
+
     def test_admin_can_manage_account_permissions_and_model_policy(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
@@ -2269,6 +3180,48 @@ class PlatformServiceTests(unittest.TestCase):
                 with self.assertRaises(ServiceError) as update_error:
                     service.update_user(member_actor, admin["id"], {"position": "Owner"})
                 self.assertEqual(update_error.exception.status, 403)
+            finally:
+                service.close()
+
+    def test_concurrent_admin_deactivation_preserves_one_active_admin(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, first = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="second-admin",
+                    password="second-admin-pass",
+                    display_name="Second Admin",
+                    permission_group="admin",
+                    actor=first,
+                )
+                _, second = service.authenticate("second-admin", "second-admin-pass")
+                barrier = threading.Barrier(3)
+                outcomes: list[str] = []
+
+                def deactivate(actor, target_id):
+                    barrier.wait(timeout=5)
+                    try:
+                        service.update_user(actor, target_id, {"active": False})
+                        outcomes.append("ok")
+                    except ServiceError as exc:
+                        outcomes.append(f"error:{exc.status}")
+
+                threads = [
+                    threading.Thread(target=deactivate, args=(first, second["id"])),
+                    threading.Thread(target=deactivate, args=(second, first["id"])),
+                ]
+                for thread in threads:
+                    thread.start()
+                barrier.wait(timeout=5)
+                for thread in threads:
+                    thread.join(timeout=5)
+
+                self.assertEqual(sorted(outcomes), ["error:400", "ok"])
+                self.assertEqual(
+                    service.db.scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1"),
+                    1,
+                )
             finally:
                 service.close()
 
@@ -2490,7 +3443,7 @@ class PlatformServiceTests(unittest.TestCase):
                 # dir (firecrawl_runtime_dir) rather than into the submodule tree,
                 # so runtime secrets never land in the repo working copy.
                 firecrawl_env_text = (config.firecrawl_runtime_dir / ".env").read_text(encoding="utf-8")
-                self.assertIn('PORT="13002"', firecrawl_env_text)
+                self.assertIn('PORT="127.0.0.1:13002"', firecrawl_env_text)
                 self.assertIn('HOST="0.0.0.0"', firecrawl_env_text)
                 self.assertIn('USE_DB_AUTHENTICATION="false"', firecrawl_env_text)
                 self.assertIn('BULL_AUTH_KEY=', firecrawl_env_text)
@@ -2562,7 +3515,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["camofox"]["state"], "starting")
                 self.assertEqual(status["firecrawl"]["state"], "starting")
                 commands = [call["cmd"] for call in launcher.calls]
-                self.assertTrue(any("@askjo/camofox-browser@^1.5.2" in cmd for cmd in commands))
+                self.assertTrue(any("@askjo/camofox-browser@1.11.2" in cmd for cmd in commands))
                 self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
                 firecrawl_launch = next(call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"])
                 override_path = config.firecrawl_runtime_dir / "docker-compose.enterprise.yaml"
@@ -2573,15 +3526,16 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn("missing", firecrawl_launch["cmd"])
                 self.assertEqual(firecrawl_launch["env"]["DOCKER_BUILDKIT"], "1")
                 self.assertEqual(firecrawl_launch["env"]["COMPOSE_DOCKER_CLI_BUILD"], "1")
-                self.assertEqual(firecrawl_launch["env"]["PORT"], "13002")
+                self.assertEqual(firecrawl_launch["env"]["PORT"], "127.0.0.1:13002")
                 override_text = override_path.read_text(encoding="utf-8")
-                self.assertIn("ghcr.io/firecrawl/firecrawl:latest", override_text)
-                self.assertIn("ghcr.io/firecrawl/playwright-service:latest", override_text)
-                self.assertIn("ghcr.io/firecrawl/nuq-postgres:latest", override_text)
+                self.assertIn("ghcr.io/firecrawl/firecrawl@sha256:", override_text)
+                self.assertIn("ghcr.io/firecrawl/playwright-service@sha256:", override_text)
+                self.assertIn("ghcr.io/firecrawl/nuq-postgres@sha256:", override_text)
+                self.assertNotIn(":latest", override_text)
 
                 service.restart_runtime(admin, "camofox")
                 service.restart_runtime(admin, "firecrawl")
-                self.assertGreaterEqual(len([call for call in launcher.calls if "@askjo/camofox-browser@^1.5.2" in call["cmd"]]), 2)
+                self.assertGreaterEqual(len([call for call in launcher.calls if "@askjo/camofox-browser@1.11.2" in call["cmd"]]), 2)
                 self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"]]), 2)
             finally:
                 service.close()
@@ -2605,10 +3559,8 @@ class PlatformServiceTests(unittest.TestCase):
                     runner.calls[1]["cmd"],
                     [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
                 )
-                self.assertEqual(
-                    runner.calls[2]["cmd"],
-                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "websockets>=14,<16"],
-                )
+                self.assertEqual(len(runner.calls), 2)
+                self.assertFalse(any("websockets" in " ".join(call["cmd"]) for call in runner.calls))
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)["hermes"]
                 self.assertEqual(status["install_state"], "installed")
@@ -2639,7 +3591,12 @@ class PlatformServiceTests(unittest.TestCase):
                 connector._turns_by_id[turn.turn_id] = turn
             try:
                 progress_result = connector._handle_outbound_action(
-                    {"op": "send", "chat_id": turn.chat_id, "content": "working", "metadata": {}}
+                    {
+                        "op": "send",
+                        "chat_id": turn.chat_id,
+                        "content": "working",
+                        "metadata": {"enterprise_turn_id": turn.turn_id},
+                    }
                 )
                 self.assertTrue(progress_result["success"])
                 self.assertFalse(turn.done.is_set())
@@ -2651,7 +3608,7 @@ class PlatformServiceTests(unittest.TestCase):
                         "op": "send",
                         "chat_id": turn.chat_id,
                         "content": "final answer",
-                        "metadata": {"notify": True},
+                        "metadata": {"notify": True, "enterprise_turn_id": turn.turn_id},
                     }
                 )
                 self.assertTrue(final_result["success"])
@@ -2722,9 +3679,9 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn('API_SERVER_PORT="8766"', env_text)
                 self.assertIn('API_SERVER_MODEL_NAME="gpt-5.4"', env_text)
                 self.assertIn('API_SERVER_KEY="runtime-key"', env_text)
-                self.assertIn('GATEWAY_RELAY_URL="ws://127.0.0.1:18766/relay"', env_text)
+                self.assertNotIn("GATEWAY_RELAY_URL=", env_text)
                 self.assertEqual(
-                    runner.calls[-2]["cmd"],
+                    runner.calls[-1]["cmd"],
                     [
                         str(managed_python(service.config.managed_hermes_home / "venv")),
                         "-m",
@@ -2734,16 +3691,7 @@ class PlatformServiceTests(unittest.TestCase):
                         f"{service.config.managed_hermes_home / 'source' / 'hermes-agent'}[dev]",
                     ],
                 )
-                self.assertEqual(
-                    runner.calls[-1]["cmd"],
-                    [
-                        str(managed_python(service.config.managed_hermes_home / "venv")),
-                        "-m",
-                        "pip",
-                        "install",
-                        "websockets>=14,<16",
-                    ],
-                )
+                self.assertFalse(any("websockets" in " ".join(call["cmd"]) for call in runner.calls))
             finally:
                 service.close()
 
@@ -3428,6 +4376,206 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 service.close()
 
+    def test_durable_agent_jobs_recover_queued_and_quarantine_interrupted_work(self):
+        from enterprise_agent_platform.db import Database
+        from enterprise_agent_platform.jobs import DurableJobStore
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            seed = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, user = seed.authenticate("admin", "admin")
+                generation = seed.account_generation_config(user)
+                messages = []
+                for content in ("recover me", "do not repeat me"):
+                    messages.append(
+                        seed._append_message(
+                            scope_type="private",
+                            scope_id=str(user["id"]),
+                            author_type="user",
+                            user_id=user["id"],
+                            username=user["display_name"],
+                            content=content,
+                            metadata={"generation": generation},
+                        )
+                    )
+            finally:
+                seed.close()
+
+            db = Database(config.db_path)
+            ledger = DurableJobStore(db)
+            jobs = []
+            for message in messages:
+                job, _ = ledger.enqueue(
+                    kind="agent",
+                    dedupe_key=f"message:{message['id']}",
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                    payload={
+                        "scope_type": "private",
+                        "scope_id": str(user["id"]),
+                        "actor": user,
+                        "content": message["content"],
+                        "attachments": [],
+                        "generation": generation,
+                        "user_message": message,
+                    },
+                )
+                jobs.append(job)
+            ledger.mark_running(jobs[1].id, lease_seconds=3600)
+            db.close()
+
+            agent = RecordingAgent()
+            recovered = EnterpriseService(config, agent_client=agent)
+            try:
+                recovered.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+                self.assertEqual([call["user_message"] for call in agent.calls], ["recover me"])
+                self.assertEqual(recovered.jobs.get(jobs[0].id).status, "succeeded")
+                self.assertEqual(recovered.jobs.get(jobs[1].id).status, "needs_review")
+                status = recovered.private_status(user)
+                self.assertEqual(status["jobs"]["succeeded"], 1)
+                self.assertEqual(status["jobs"]["needs_review"], 1)
+            finally:
+                recovered.close()
+
+    def test_startup_restores_failed_agent_error_message_after_transient_write_failure(self):
+        class FailingAgent:
+            def generate(self, **kwargs):
+                raise RuntimeError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=FailingAgent())
+            try:
+                _, user = first.authenticate("admin", "admin")
+                with mock.patch.object(
+                    first,
+                    "_append_agent_error",
+                    side_effect=OSError("simulated message write failure"),
+                ):
+                    sent = first.send_private_message(user, "show a durable failure")
+                    first.wait_for_agent_idle("private", str(user["id"]), timeout=3)
+                job = first.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "failed")
+                self.assertIsNone(
+                    first.agent_message_replying_to("private", str(user["id"]), sent["user_message"]["id"])
+                )
+            finally:
+                first.close()
+
+            agent = RecordingAgent()
+            second = EnterpriseService(config, agent_client=agent)
+            try:
+                reply = second.agent_message_replying_to(
+                    "private",
+                    str(user["id"]),
+                    sent["user_message"]["id"],
+                )
+                self.assertIsNotNone(reply)
+                self.assertIn("provider unavailable", reply["content"])
+                self.assertEqual(reply["metadata"]["durable_job_id"], job.id)
+                self.assertEqual(agent.calls, [])
+            finally:
+                second.close()
+
+    def test_startup_reconciles_committed_success_before_job_terminal_update(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, user = first.authenticate("admin", "admin")
+                generation = first.account_generation_config(user)
+                user_message = first._append_message(
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                    author_type="user",
+                    user_id=user["id"],
+                    username=user["display_name"],
+                    content="already completed",
+                    metadata={"generation": generation},
+                )
+                task = {
+                    "scope_type": "private",
+                    "scope_id": str(user["id"]),
+                    "actor": user,
+                    "content": user_message["content"],
+                    "attachments": [],
+                    "generation": generation,
+                    "user_message": user_message,
+                }
+                job, _ = first.jobs.enqueue(
+                    kind="agent",
+                    dedupe_key=f"message:{user_message['id']}",
+                    payload=task,
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                )
+                self.assertIsNotNone(first.jobs.mark_running(job.id, lease_seconds=60))
+                first._append_message(
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                    author_type="agent",
+                    user_id=None,
+                    username="Private Agent",
+                    content="committed response",
+                    metadata={
+                        "durable_job_id": job.id,
+                        "reply_to": {"message_id": user_message["id"]},
+                        "agent_work": {"state": "complete"},
+                    },
+                )
+            finally:
+                first.close()
+
+            agent = RecordingAgent()
+            second = EnterpriseService(config, agent_client=agent)
+            try:
+                self.assertEqual(second.jobs.get(job.id).status, "succeeded")
+                replies = second.db.query(
+                    "SELECT content FROM messages WHERE author_type = 'agent' ORDER BY id"
+                )
+                self.assertEqual(replies, [{"content": "committed response"}])
+                self.assertEqual(agent.calls, [])
+            finally:
+                second.close()
+
+    def test_startup_repairs_user_message_committed_before_agent_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            seed = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, user = seed.authenticate("admin", "admin")
+                generation = seed.account_generation_config(user)
+                orphan = seed._append_message(
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                    author_type="user",
+                    user_id=user["id"],
+                    username=user["display_name"],
+                    content="recover the commit gap",
+                    metadata={
+                        "generation": generation,
+                        "agent_request_content": "recover the commit gap",
+                    },
+                )
+                self.assertIsNone(seed.jobs.get_by_key("agent", f"message:{orphan['id']}"))
+            finally:
+                seed.close()
+
+            agent = RecordingAgent()
+            recovered = EnterpriseService(config, agent_client=agent)
+            try:
+                recovered.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+                self.assertEqual([call["user_message"] for call in agent.calls], ["recover the commit gap"])
+                job = recovered.jobs.get_by_key("agent", f"message:{orphan['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "succeeded")
+                reply = recovered.agent_message_replying_to("private", str(user["id"]), orphan["id"])
+                self.assertIsNotNone(reply)
+            finally:
+                recovered.close()
+
     def test_cognee_ingest_runs_in_background(self):
         from enterprise_agent_platform.cognee_bridge import CogneeStatus
 
@@ -3462,6 +4610,34 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(result and result.get("available"))
             finally:
                 service.close()
+
+    def test_cognee_bridge_waits_for_cognify_inside_platform_worker(self):
+        from enterprise_agent_platform.cognee_bridge import CogneeBridge, CogneeStatus
+
+        class FakeCognee:
+            def __init__(self):
+                self.background_flags = []
+
+            async def add(self, payload, *, dataset_name, run_in_background):
+                self.background_flags.append(("add", run_in_background))
+                return {"added": True}
+
+            async def cognify(self, *, datasets, run_in_background):
+                self.background_flags.append(("cognify", run_in_background))
+                return {"completed": True}
+
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), knowledge_backend="hybrid", cognee_ingest_background=True)
+            bridge = CogneeBridge(config, lambda key: "")
+            fake = FakeCognee()
+            bridge._module = fake
+            bridge._status = CogneeStatus(True, "hybrid")
+            bridge._status_checked_at = time.time()
+
+            result = bridge.ingest_document(title="Policy", content="Body", source="test")
+
+            self.assertNotIn("error", result)
+            self.assertEqual(fake.background_flags, [("add", False), ("cognify", False)])
 
     def test_channel_and_private_reads_enforce_authorization(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3523,32 +4699,23 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_docker_backend_applies_isolation_hardening(self):
+    def test_host_backend_never_provisions_agent_container(self):
         with tempfile.TemporaryDirectory() as td:
-            config = replace(make_config(Path(td)), container_backend="docker")
             runner_calls: list[list[str]] = []
 
             def fake_run(cmd, **kwargs):
                 runner_calls.append(cmd)
-                if cmd[:2] == ["docker", "inspect"]:
-                    return SimpleNamespace(returncode=1, stdout="")
-                if cmd[:2] == ["docker", "run"]:
-                    return SimpleNamespace(returncode=0, stdout="cid123\n")
                 return SimpleNamespace(returncode=0, stdout="")
 
-            service = EnterpriseService(config, agent_client=RecordingAgent(), container_command_runner=fake_run)
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                container_command_runner=fake_run,
+            )
             try:
-                container = service.containers.ensure_private_container(user_id=1, username="admin", secrets_env={})
-                self.assertEqual(container.backend, "docker")
-                run_cmd = next(c for c in runner_calls if c[:2] == ["docker", "run"])
-                self.assertIn("--cap-drop", run_cmd)
-                self.assertIn("ALL", run_cmd)
-                self.assertIn("--security-opt", run_cmd)
-                self.assertIn("no-new-privileges", run_cmd)
-                self.assertIn("--pids-limit", run_cmd)
-                self.assertIn("--memory", run_cmd)
-                # No secrets are forwarded into the container with an empty env.
-                self.assertNotIn("-e", run_cmd)
+                scope = service.agent_scopes.ensure_private_scope(1)
+                self.assertEqual(scope.to_execution_dict()["backend"], "host")
+                self.assertEqual(runner_calls, [])
             finally:
                 service.close()
 
@@ -4105,7 +5272,15 @@ class PlatformHTTPTests(unittest.TestCase):
             server, thread = serve_in_thread(config, service)
             host, port = server.server_address
             try:
-                token, _ = service.authenticate("admin", "admin")
+                token, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="sse-typing-user",
+                    password="sse-typing-pass",
+                    display_name="SSE Alice",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, alice = service.authenticate("sse-typing-user", "sse-typing-pass")
                 conn = http.client.HTTPConnection(host, port, timeout=5)
                 conn.request("GET", "/api/channels/1/events", headers={"Authorization": f"Bearer {token}"})
                 res = conn.getresponse()
@@ -4130,6 +5305,26 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIsNotNone(event_block)
                 self.assertIn('"agent_status"', event_block)
                 self.assertIn('"latest_message_id"', event_block)
+
+                service.update_typing(alice, "channel", "1", True)
+                next_update = None
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    chunk = res.read(1)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n\n" in buf:
+                        block, buf = buf.split(b"\n\n", 1)
+                        text = block.decode("utf-8")
+                        if text.startswith("event: update"):
+                            next_update = text
+                            break
+                    if next_update:
+                        break
+                self.assertIsNotNone(next_update)
+                self.assertIn('"typing": [{', next_update)
+                self.assertIn("SSE Alice", next_update)
                 conn.close()
             finally:
                 server.shutdown()

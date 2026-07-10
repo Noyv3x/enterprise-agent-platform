@@ -116,10 +116,8 @@ export interface TypingRequest {
 
 export type PrivateTelegramResponse = PrivateTelegram;
 
-export interface PrivateTelegramUpdateRequest {
-  telegram_user_id: string;
-  telegram_username: string;
-}
+/** Creating a Telegram link challenge accepts an intentionally empty object. */
+export type PrivateTelegramUpdateRequest = Record<string, never>;
 
 /* --------------------------------------------------------------- mentions */
 

@@ -2,8 +2,8 @@
    of users who linked their Telegram (legacy renderTelegramAdminConfig,
    legacy-app.js:2274-2362). Two secret fields (bot_token / webhook_secret) are
    never seeded (empty = keep) and clear via the post-save re-seed
-   (loadTelegramConfig replaces telegramConfig). The linked table's grid columns
-   are driven by the inline --usage-cols custom property. */
+   (loadTelegramConfig replaces telegramConfig). The linked-user list uses native
+   table semantics and the shared responsive table wrapper. */
 
 import { useEffect, useState } from "react";
 import { saveTelegramConfig } from "../../../data/adminActions";
@@ -62,7 +62,7 @@ export function TelegramAdminConfig() {
       <CardHead
         title="Telegram 私聊网关"
         icon="message"
-        desc="全局 bot 由管理员配置；每个用户在私人 Agent 页面绑定自己的 Telegram ID。"
+        desc="全局 bot 由管理员配置；每个用户在私人 Agent 页面生成一次性代码完成绑定。"
         extra={
           <StatusBadge
             ok={!!config.enabled && !!config.bot_token_configured}
@@ -134,34 +134,35 @@ export function TelegramAdminConfig() {
           </button>
         </div>
       </form>
-      <div className="usage-table" style={{ marginTop: "14px" }}>
-        <div
-          className="usage-table__row usage-table__row--head"
-          style={{ "--usage-cols": 5 } as React.CSSProperties}
-        >
-          <div>平台用户</div>
-          <div>用户名</div>
-          <div>Telegram ID</div>
-          <div>Telegram 用户名</div>
-          <div>更新时间</div>
-        </div>
-        {linked.length ? (
-          linked.map((item, index) => (
-            <div
-              className="usage-table__row"
-              key={`${item.external_id ?? ""}-${index}`}
-              style={{ "--usage-cols": 5 } as React.CSSProperties}
-            >
-              <div>{item.display_name || item.username}</div>
-              <div>{item.username}</div>
-              <div className="mono">{item.external_id}</div>
-              <div>{item.telegram_username ? `@${item.telegram_username}` : "-"}</div>
-              <div>{formatTime(Number(item.updated_at) || undefined)}</div>
-            </div>
-          ))
-        ) : (
-          <div className="muted">暂无用户绑定 Telegram。</div>
-        )}
+      <div className="usage-table-wrap usage-table-wrap--spaced">
+        <table className="usage-table" aria-label="已绑定 Telegram 的平台用户">
+          <thead>
+            <tr className="usage-table__row usage-table__head">
+              <th scope="col">平台用户</th>
+              <th scope="col">用户名</th>
+              <th scope="col">Telegram ID</th>
+              <th scope="col">Telegram 用户名</th>
+              <th scope="col">更新时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            {linked.length ? (
+              linked.map((item, index) => (
+                <tr className="usage-table__row" key={`${item.external_id ?? ""}-${index}`}>
+                  <td>{item.display_name || item.username}</td>
+                  <td>{item.username}</td>
+                  <td className="mono">{item.external_id}</td>
+                  <td>{item.telegram_username ? `@${item.telegram_username}` : "-"}</td>
+                  <td>{formatTime(Number(item.updated_at) || undefined)}</td>
+                </tr>
+              ))
+            ) : (
+              <tr className="usage-table__row">
+                <td colSpan={5} className="muted">暂无用户绑定 Telegram。</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </section>
   );

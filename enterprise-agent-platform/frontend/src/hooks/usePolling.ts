@@ -13,12 +13,12 @@ import { useStore, useStoreHandle } from "../store/useStore";
 
 const POLL_INTERVAL_MS = 4000;
 
-export function usePolling(): void {
+export function usePolling(enabled = true): void {
   const store = useStoreHandle();
   const userId = useStore((state) => state.user?.id);
 
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || !enabled) return;
 
     let timer: number | null = null;
 
@@ -49,5 +49,5 @@ export function usePolling(): void {
       unregister();
       stop();
     };
-  }, [userId, store]);
+  }, [userId, enabled, store]);
 }

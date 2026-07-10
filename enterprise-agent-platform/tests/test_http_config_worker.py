@@ -3,26 +3,35 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import stat
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
+from enterprise_agent_platform import internal_config as internal_config_module
+from enterprise_agent_platform import runtimes as runtimes_module
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.hermes import AgentResult
 from enterprise_agent_platform.internal_config import (
     REDACTED_PLACEHOLDER,
+    read_env_file,
     read_yaml_mapping_with_text,
     redact_yaml_text,
+    update_env_file,
     update_yaml_text,
     update_yaml_values,
 )
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService
+from enterprise_agent_platform.runtimes import PlatformRuntimeManager
 
-from test_platform import RecordingAgent, make_config
+from test_platform import RecordingAgent, RecordingLauncher, make_config
 
 
 class FailingThenRecoveringAgent:
@@ -114,7 +123,10 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 self.assertIn("application/json", res2.getheader("Content-Type"))
                 self.assertEqual(res2.getheader("X-Frame-Options"), "DENY")
                 self.assertEqual(res2.getheader("X-Content-Type-Options"), "nosniff")
-                self.assertIn("frame-ancestors 'none'", res2.getheader("Content-Security-Policy"))
+                csp = res2.getheader("Content-Security-Policy")
+                self.assertIn("frame-ancestors 'none'", csp)
+                self.assertIn("script-src 'self';", csp)
+                self.assertNotIn("script-src 'self' 'unsafe-inline'", csp)
                 parsed = json.loads(patch_body)
                 self.assertIn("error", parsed)
                 # JSON envelope, not the stdlib default text/html error page.
@@ -127,6 +139,28 @@ class HTTPServerBehaviorTests(unittest.TestCase):
 
 
 class InternalConfigTests(unittest.TestCase):
+    @staticmethod
+    def _run_concurrently(operations) -> list[BaseException]:
+        barrier = threading.Barrier(len(operations) + 1)
+        errors: list[BaseException] = []
+
+        def run(operation) -> None:
+            try:
+                barrier.wait(timeout=5)
+                operation()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(operation,)) for operation in operations]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+        if any(thread.is_alive() for thread in threads):
+            errors.append(TimeoutError("concurrent config update did not finish"))
+        return errors
+
     def test_clearing_numeric_field_unsets_key_instead_of_writing_zero(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "config.yaml"
@@ -201,8 +235,207 @@ class InternalConfigTests(unittest.TestCase):
             self.assertEqual(after["providers"]["openai"]["api_key"], "sk-FIELD-SECRET-999")
             self.assertEqual(after["providers"]["openai"]["base_url"], "https://y")
 
+    def test_yaml_atomic_write_failures_keep_old_file_and_remove_temporary(self):
+        for failing_call in ("fsync", "replace"):
+            with self.subTest(failing_call=failing_call), tempfile.TemporaryDirectory() as td:
+                cfg = Path(td) / "config.yaml"
+                original = "model:\n  default: old-model\n"
+                cfg.write_text(original, encoding="utf-8")
+
+                with mock.patch.object(
+                    internal_config_module.os,
+                    failing_call,
+                    side_effect=OSError("injected write failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "injected write failure"):
+                        update_yaml_text(cfg, "model:\n  default: new-model\n")
+
+                self.assertEqual(cfg.read_text(encoding="utf-8"), original)
+                self.assertEqual(list(cfg.parent.glob(f".{cfg.name}.tmp-*")), [])
+
+    def test_env_atomic_write_failure_keeps_old_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            original = 'API_SERVER_HOST="127.0.0.1"\n'
+            env.write_text(original, encoding="utf-8")
+
+            with mock.patch.object(
+                internal_config_module.os,
+                "fsync",
+                side_effect=OSError("injected fsync failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected fsync failure"):
+                    update_env_file(env, {"API_SERVER_PORT": "8642"})
+
+            self.assertEqual(env.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(env.parent.glob(f".{env.name}.tmp-*")), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX mode bits are required")
+    def test_successful_yaml_and_env_updates_are_owner_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = root / "config.yaml"
+            env = root / ".env"
+            cfg.write_text("model:\n  default: old\n", encoding="utf-8")
+            env.write_text('API_SERVER_HOST="127.0.0.1"\n', encoding="utf-8")
+            cfg.chmod(0o644)
+            env.chmod(0o644)
+
+            update_yaml_values(cfg, {"model.default": "new"})
+            update_env_file(env, {"API_SERVER_PORT": "8642"})
+
+            self.assertEqual(stat.S_IMODE(cfg.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
+
+    def test_concurrent_yaml_field_updates_do_not_lose_siblings(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.yaml"
+            cfg.write_text("model:\n  default: base\n", encoding="utf-8")
+            updates = {
+                "agent.max_turns": 31,
+                "agent.api_max_retries": 4,
+                "agent.gateway_timeout": 90,
+                "terminal.timeout": 45,
+                "compression.threshold": 0.8,
+                "compression.protect_last_n": 6,
+                "display.compact": True,
+                "memory.memory_enabled": True,
+            }
+            real_safe_dump = yaml.safe_dump
+
+            def slow_safe_dump(*args, **kwargs):
+                # Widen the old read-then-write race: without a lock, every
+                # writer can read the same base document before any replace.
+                time.sleep(0.01)
+                return real_safe_dump(*args, **kwargs)
+
+            operations = [
+                lambda key=key, value=value: update_yaml_values(cfg, {key: value})
+                for key, value in updates.items()
+            ]
+            with mock.patch.object(yaml, "safe_dump", side_effect=slow_safe_dump):
+                errors = self._run_concurrently(operations)
+
+            self.assertEqual(errors, [])
+            loaded = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+            for key, expected in updates.items():
+                found, actual = internal_config_module.get_nested(loaded, key)
+                self.assertTrue(found, key)
+                self.assertEqual(actual, expected, key)
+
+    def test_concurrent_env_updates_do_not_lose_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            env.write_text('BASE_VALUE="kept"\n', encoding="utf-8")
+            updates = {f"WORKER_{index}": str(index) for index in range(12)}
+            real_atomic_write = internal_config_module._atomic_write_text
+
+            def slow_atomic_write(path, text, **kwargs):
+                # As above, keep writers in the read/write window long enough
+                # for a missing transaction lock to deterministically lose keys.
+                time.sleep(0.01)
+                return real_atomic_write(path, text, **kwargs)
+
+            operations = [
+                lambda key=key, value=value: update_env_file(env, {key: value})
+                for key, value in updates.items()
+            ]
+            with mock.patch.object(
+                internal_config_module,
+                "_atomic_write_text",
+                side_effect=slow_atomic_write,
+            ):
+                errors = self._run_concurrently(operations)
+
+            self.assertEqual(errors, [])
+            values = read_env_file(env)
+            self.assertEqual(values["BASE_VALUE"], "kept")
+            for key, expected in updates.items():
+                self.assertEqual(values.get(key), expected, key)
+
+    def test_runtime_refresh_and_admin_update_share_yaml_transaction(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config = make_config(tmp)
+            home = config.managed_hermes_home
+            home.mkdir(parents=True, exist_ok=True)
+            cfg = home / "config.yaml"
+            cfg.write_text("agent:\n  api_max_retries: 3\n", encoding="utf-8")
+            cfg.chmod(0o644)
+            manager = PlatformRuntimeManager(
+                config,
+                lambda _key: "",
+                process_launcher=RecordingLauncher(),
+            )
+
+            runtime_read = threading.Event()
+            real_read = runtimes_module._read_yaml_mapping
+            errors: list[BaseException] = []
+
+            def slow_runtime_read(path):
+                mapping = real_read(path)
+                runtime_read.set()
+                # Without the shared transaction lock this gives the admin
+                # writer time to commit agent.max_turns before the runtime
+                # overwrites it with the stale mapping it just read.
+                time.sleep(0.1)
+                return mapping
+
+            def refresh_runtime():
+                try:
+                    manager._ensure_hermes_config(home)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            def update_admin_field():
+                try:
+                    update_yaml_values(cfg, {"agent.max_turns": 73})
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            with mock.patch.object(
+                runtimes_module,
+                "_read_yaml_mapping",
+                side_effect=slow_runtime_read,
+            ):
+                runtime_thread = threading.Thread(target=refresh_runtime)
+                runtime_thread.start()
+                self.assertTrue(runtime_read.wait(timeout=2))
+                admin_thread = threading.Thread(target=update_admin_field)
+                admin_thread.start()
+                runtime_thread.join(timeout=3)
+                admin_thread.join(timeout=3)
+
+            self.assertFalse(runtime_thread.is_alive())
+            self.assertFalse(admin_thread.is_alive())
+            self.assertEqual(errors, [])
+            loaded = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["agent"]["max_turns"], 73)
+            self.assertEqual(loaded["agent"]["api_max_retries"], 3)
+            self.assertIn("enterprise-kb", loaded["plugins"]["enabled"])
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(cfg.stat().st_mode), 0o600)
+            self.assertEqual(list(home.glob(".config.yaml.tmp-*")), [])
+
 
 class ConfigFromEnvTests(unittest.TestCase):
+    def test_host_execution_defaults_disable_relay_and_warn_for_legacy_container_env(self):
+        key = "ENTERPRISE_CONTAINER_BACKEND"
+        previous = os.environ.get(key)
+        os.environ[key] = "docker"
+        try:
+            with self.assertWarnsRegex(RuntimeWarning, "deprecated and ignored"):
+                config = PlatformConfig.from_env(Path("/tmp"))
+            self.assertFalse(config.hermes_relay_enabled)
+            # Retained for one-release keyword-constructor compatibility only;
+            # the runtime never consumes this value.
+            self.assertEqual(config.container_backend, "docker")
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
     def test_non_numeric_port_raises_descriptive_value_error(self):
         previous = os.environ.get("ENTERPRISE_PLATFORM_PORT")
         os.environ["ENTERPRISE_PLATFORM_PORT"] = "not-a-number"
@@ -269,7 +502,7 @@ class AgentWorkerRecoveryTests(unittest.TestCase):
 
 
 class DeactivateUserTeardownTests(unittest.TestCase):
-    def test_deactivate_user_tears_down_private_container(self):
+    def test_deactivate_user_preserves_private_scope(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
@@ -283,36 +516,36 @@ class DeactivateUserTeardownTests(unittest.TestCase):
                 )
                 _, bob = service.authenticate("bob", "bob-pass")
 
-                # Provision the user's private (local) sandbox/state.
+                # Provision the user's private host-execution scope.
                 service.send_private_message(bob, "set up my workspace")
                 service.wait_for_agent_idle("private", str(bob["id"]))
-                self.assertIsNotNone(service.containers.get_private_container(bob["id"]))
+                before = service.agent_scopes.get_private_scope(bob["id"])
+                self.assertIsNotNone(before)
 
-                # Spy on the teardown call without breaking its real effect.
+                # Deactivation records lifecycle state without deleting the
+                # user's workspace/session, allowing a later reactivation.
                 recorded: list[int] = []
-                real_remove = service.containers.remove_private_container
+                real_deactivate = service.agent_scopes.deactivate_private_scope
 
                 def spy(user_id: int) -> None:
                     recorded.append(int(user_id))
-                    return real_remove(user_id)
+                    return real_deactivate(user_id)
 
-                service.containers.remove_private_container = spy  # type: ignore[method-assign]
+                service.agent_scopes.deactivate_private_scope = spy  # type: ignore[method-assign]
 
                 service.deactivate_user(admin, bob["id"])
 
-                # deactivate_user must reclaim the user's container by id, and the
-                # private_agents state must be forgotten afterwards.
                 self.assertEqual(recorded, [bob["id"]])
-                self.assertIsNone(service.containers.get_private_container(bob["id"]))
+                after = service.agent_scopes.get_private_scope(bob["id"])
+                self.assertIsNotNone(after)
+                self.assertEqual(after.session_id, before.session_id)
+                self.assertEqual(after.workspace_path, before.workspace_path)
             finally:
                 service.close()
 
-    def test_deactivate_user_clears_private_state_via_local_backend(self):
-        # End-to-end check that does not depend on monkeypatching: the local
-        # backend's remove_private_container deletes the private_agents row.
+    def test_deactivate_user_retains_private_state_end_to_end(self):
         with tempfile.TemporaryDirectory() as td:
-            config = replace(make_config(Path(td)), container_backend="local")
-            service = EnterpriseService(config, agent_client=RecordingAgent())
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 member = service.create_user(
@@ -325,10 +558,12 @@ class DeactivateUserTeardownTests(unittest.TestCase):
                 _, carol = service.authenticate("carol", "carol-pass")
                 service.send_private_message(carol, "workspace please")
                 service.wait_for_agent_idle("private", str(carol["id"]))
-                self.assertIsNotNone(service.containers.get_private_container(carol["id"]))
+                before = service.agent_scopes.get_private_scope(carol["id"])
+                self.assertIsNotNone(before)
 
                 service.deactivate_user(admin, carol["id"])
-                self.assertIsNone(service.containers.get_private_container(carol["id"]))
+                after = service.agent_scopes.get_private_scope(carol["id"])
+                self.assertEqual(after, before)
             finally:
                 service.close()
 

@@ -4,7 +4,7 @@
 
 ## 目录结构
 
-- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、托管工作区/容器、Codex OAuth/Grok OAuth 供应商验证、企业知识库、测试，以及 Hermes 知识工具插件。
+- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、宿主机工作区、Codex OAuth/Grok OAuth 供应商验证、企业知识库、测试，以及 Hermes 知识工具插件。
 - `hermes-agent/`：指向 `NousResearch/hermes-agent` 的 Git submodule，用作 Agent 运行时和 OpenAI 兼容 API 后端。
 - `cognee/`：指向 `topoteretes/cognee` 的 Git submodule，用作可选的企业知识图谱后端。
 
@@ -81,4 +81,4 @@ cd enterprise-agent-platform
 
 ## 运行时数据
 
-运行时数据库、工作区、本地容器、日志和密钥都不会提交到 Git。可以通过 `ENTERPRISE_PLATFORM_DATA` 指定平台数据目录。
+运行时数据库、独立 Agent 工作区、日志和密钥都不会提交到 Git。可以通过 `ENTERPRISE_PLATFORM_DATA` 指定平台数据目录。Agent 以可信内部成员模型在平台服务账号的宿主机环境执行，不创建每 Agent 容器；隔离边界是工作区、会话、记忆与浏览器 Profile，而不是恶意租户安全沙箱。

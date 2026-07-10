@@ -91,7 +91,13 @@ class CogneeBridge:
             cognify_result = asyncio.run(
                 cognee.cognify(
                     datasets=[dataset],
-                    run_in_background=self._ingest_background(),
+                    # ``asyncio.run`` owns a short-lived event loop. Cognee's
+                    # background mode only schedules an asyncio task and then
+                    # returns, so that task is cancelled as the loop closes
+                    # while the durable platform job is falsely marked done.
+                    # The platform worker is already the background boundary;
+                    # wait here for graph construction's real terminal state.
+                    run_in_background=False,
                 )
             )
             return {
@@ -105,6 +111,9 @@ class CogneeBridge:
             return {"attempted": True, "available": True, "dataset": dataset, "error": str(exc)}
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        limit = min(int(limit), 20)
+        if limit <= 0:
+            return []
         if self._backend() not in {"hybrid", "cognee"}:
             return []
         status = self.status()
@@ -119,7 +128,7 @@ class CogneeBridge:
                     query_text=query,
                     query_type=search_type,
                     datasets=[self._dataset()],
-                    top_k=max(1, min(int(limit), 20)),
+                    top_k=limit,
                 )
             )
         except Exception:

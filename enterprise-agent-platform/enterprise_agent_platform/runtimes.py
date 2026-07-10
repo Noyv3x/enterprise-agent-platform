@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import os
 import json
 import re
@@ -15,12 +16,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import internal_config as _internal_config
 from .config import PlatformConfig
+from .hermes_relay import _is_loopback_host, managed_relay_auth
 from .oauth_flows import OAUTH_PROVIDER_INFO, SUPPORTED_OAUTH_PROVIDERS, normalize_oauth_provider
 from .db import now_ts
 
@@ -55,6 +59,34 @@ FIRECRAWL_SETTING_REPO = "firecrawl_repo"
 FIRECRAWL_SETTING_API_URL = "firecrawl_api_url"
 FIRECRAWL_SETTING_COMMAND = "firecrawl_command"
 FIRECRAWL_COMPOSE_OVERRIDE = "docker-compose.enterprise.yaml"
+CAMOFOX_MANAGED_VERSION = "1.11.2"
+FIRECRAWL_IMAGE = "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c"
+FIRECRAWL_PLAYWRIGHT_IMAGE = "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2"
+FIRECRAWL_POSTGRES_IMAGE = "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"
+# Manifest-list digests corresponding to the upstream redis:alpine,
+# rabbitmq:3-management, and foundationdb/foundationdb:7.3.63 references.
+FIRECRAWL_REDIS_IMAGE = "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
+FIRECRAWL_RABBITMQ_IMAGE = "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
+FIRECRAWL_FOUNDATIONDB_IMAGE = "foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48"
+FIRECRAWL_SERVICE_IMAGES = (
+    ("api", FIRECRAWL_IMAGE),
+    ("playwright-service", FIRECRAWL_PLAYWRIGHT_IMAGE),
+    ("nuq-postgres", FIRECRAWL_POSTGRES_IMAGE),
+    ("redis", FIRECRAWL_REDIS_IMAGE),
+    ("rabbitmq", FIRECRAWL_RABBITMQ_IMAGE),
+    ("foundationdb", FIRECRAWL_FOUNDATIONDB_IMAGE),
+    ("foundationdb-init", FIRECRAWL_FOUNDATIONDB_IMAGE),
+)
+_MANAGED_HERMES_RELAY_ENV_KEYS = frozenset(
+    {
+        "GATEWAY_RELAY_URL",
+        "GATEWAY_RELAY_PLATFORMS",
+        "GATEWAY_RELAY_BOT_IDS",
+        "GATEWAY_RELAY_ID",
+        "GATEWAY_RELAY_SECRET",
+    }
+)
+_PLATFORM_SECRET_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_PASSWORD", "_API_KEY")
 
 class ProcessLike(Protocol):
     pid: int
@@ -126,6 +158,7 @@ class RuntimeStatus:
     last_started_at: int | None = None
     source: str = ""
     install_state: str = ""
+    patch_status: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +174,7 @@ class RuntimeStatus:
             "last_started_at": self.last_started_at,
             "source": self.source,
             "install_state": self.install_state,
+            "patch_status": dict(self.patch_status or {}),
         }
 
 
@@ -170,6 +204,7 @@ class PlatformRuntimeManager:
         # hot path skip the rmtree/copytree + config/env rewrite when nothing
         # has changed since the last successful prepare.
         self._hermes_prepared_fingerprint: str | None = None
+        self._hermes_patch_status: dict[str, Any] = {}
         self._hermes_process: ProcessLike | None = None
         self._camofox_process: ProcessLike | None = None
         self._firecrawl_process: ProcessLike | None = None
@@ -270,6 +305,8 @@ class PlatformRuntimeManager:
             current = self.hermes_status(refresh=True)
             if current.available:
                 return current
+            if current.state == "degraded":
+                return current
             if self._hermes_process is None or self._hermes_process.poll() is not None:
                 self._start_hermes()
             started_process = self._hermes_process
@@ -315,6 +352,7 @@ class PlatformRuntimeManager:
             last_started_at=self._hermes_last_started_at,
             source=self._hermes_source_label(),
             install_state=self._hermes_install_state(),
+            patch_status=self._hermes_patch_status,
         )
 
     @staticmethod
@@ -376,12 +414,45 @@ class PlatformRuntimeManager:
         install_state = self._hermes_install_state()
         if refresh:
             healthy = self._probe_hermes_health()
-            # Track when the last successful probe happened so the hot path can
-            # serve a cached "running" status without re-probing every message.
-            self._hermes_health_checked_at = time.monotonic() if healthy else None
+            # A healthy HTTP endpoint is not enough: the managed runtime also
+            # needs every required integration patch. Only cache readiness after
+            # both probes succeed, otherwise the hot path could turn a degraded
+            # result back into a synthetic "running" status.
+            self._hermes_health_checked_at = None
         else:
             healthy = False
         if healthy:
+            if refresh:
+                self._hermes_patch_status = self._probe_hermes_patch_status()
+            patch_status = dict(self._hermes_patch_status or {})
+            if patch_status.get("available") is not True or patch_status.get("ok") is not True:
+                failed = patch_status.get("failed")
+                if isinstance(failed, dict) and failed:
+                    failure_detail = ", ".join(
+                        f"{name}={state}" for name, state in sorted(failed.items())
+                    )
+                else:
+                    failure_detail = str(patch_status.get("error") or "patch status endpoint unavailable")
+                error = f"Required Hermes runtime patches are unavailable: {failure_detail}"
+                self._hermes_last_error = error
+                return RuntimeStatus(
+                    "hermes",
+                    True,
+                    False,
+                    "degraded",
+                    "Hermes API is reachable but required runtime patches are not healthy",
+                    pid=pid,
+                    url=self._hermes_health_url(),
+                    path=str(home),
+                    error=error,
+                    last_started_at=self._hermes_last_started_at,
+                    source=self._hermes_source_label(),
+                    install_state=install_state,
+                    patch_status=patch_status,
+                )
+            if refresh:
+                self._hermes_health_checked_at = time.monotonic()
+            self._hermes_last_error = ""
             return RuntimeStatus(
                 "hermes",
                 True,
@@ -394,6 +465,7 @@ class PlatformRuntimeManager:
                 last_started_at=self._hermes_last_started_at,
                 source=self._hermes_source_label(),
                 install_state=install_state,
+                patch_status=self._hermes_patch_status,
             )
         if process_running:
             return RuntimeStatus(
@@ -686,6 +758,29 @@ class PlatformRuntimeManager:
             return RuntimeStatus("camofox", False, False, "external", "managed Camofox disabled")
         runtime_dir = self.config.runtime_dir / "camofox"
         (runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
+        for directory in (
+            runtime_dir,
+            runtime_dir / "profiles",
+            runtime_dir / "cookies",
+            runtime_dir / "traces",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.chmod(0o700)
+            except OSError:
+                pass
+        url_error = self._managed_loopback_url_error("Camofox", self._effective_camofox_url())
+        if url_error:
+            self._camofox_last_error = url_error
+            return RuntimeStatus(
+                "camofox",
+                True,
+                False,
+                "invalid_config",
+                path=str(runtime_dir),
+                url=self._effective_camofox_url(),
+                error=url_error,
+            )
         command, _cwd, detail = self._camofox_command()
         available = bool(command)
         self._camofox_last_error = "" if available else detail
@@ -793,6 +888,18 @@ class PlatformRuntimeManager:
             return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
         self.config.firecrawl_runtime_dir.mkdir(parents=True, exist_ok=True)
         (self.config.firecrawl_runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
+        url_error = self._managed_loopback_url_error("Firecrawl", self._effective_firecrawl_api_url())
+        if url_error:
+            self._firecrawl_last_error = url_error
+            return RuntimeStatus(
+                "firecrawl",
+                True,
+                False,
+                "invalid_config",
+                path=str(self.config.firecrawl_runtime_dir),
+                url=self._effective_firecrawl_api_url(),
+                error=url_error,
+            )
         command, cwd, detail = self._firecrawl_command()
         available = bool(command)
         if available and cwd is not None:
@@ -971,7 +1078,29 @@ class PlatformRuntimeManager:
             return
         env = os.environ.copy()
         env["CAMOFOX_PORT"] = str(urllib.parse.urlparse(self._effective_camofox_url()).port or 9377)
-        log_path = self.config.runtime_dir / "camofox" / "logs" / "managed-camofox.log"
+        runtime_dir = self.config.runtime_dir / "camofox"
+        access_key = self._camofox_access_key()
+        env.update(
+            {
+                # Upstream accepts CAMOFOX_API_KEY in its Hermes client and
+                # CAMOFOX_ACCESS_KEY in the server-wide auth middleware. Use
+                # one generated value so every non-health route is protected.
+                "CAMOFOX_ACCESS_KEY": access_key,
+                "CAMOFOX_API_KEY": access_key,
+                "CAMOFOX_ADMIN_KEY": access_key,
+                "CAMOFOX_PROFILE_DIR": str(runtime_dir / "profiles"),
+                "CAMOFOX_COOKIES_DIR": str(runtime_dir / "cookies"),
+                "CAMOFOX_TRACES_DIR": str(runtime_dir / "traces"),
+                "CAMOFOX_CRASH_REPORT_ENABLED": "false",
+                "HOST": "127.0.0.1",
+                "CAMOFOX_HOST": "127.0.0.1",
+            }
+        )
+        preload = Path(__file__).resolve().parent / "hermes_runtime_patch" / "camofox_loopback.cjs"
+        existing_node_options = env.get("NODE_OPTIONS", "").strip()
+        preload_option = f"--require={preload}"
+        env["NODE_OPTIONS"] = " ".join(part for part in (existing_node_options, preload_option) if part)
+        log_path = runtime_dir / "logs" / "managed-camofox.log"
         try:
             self._camofox_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
             self._camofox_last_started_at = now_ts()
@@ -989,15 +1118,19 @@ class PlatformRuntimeManager:
         # --env-file argv resolves to a real file.
         self._ensure_firecrawl_env()
         env = os.environ.copy()
+        teardown = self._firecrawl_compose_teardown_command(command, cwd)
+        api_port = str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002)
         env.update({
             "DOCKER_BUILDKIT": env.get("DOCKER_BUILDKIT") or "1",
             "COMPOSE_DOCKER_CLI_BUILD": env.get("COMPOSE_DOCKER_CLI_BUILD") or "1",
             "USE_DB_AUTHENTICATION": "false",
-            "HOST": "0.0.0.0",
-            "PORT": str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002),
+            "HOST": "0.0.0.0" if teardown is not None else "127.0.0.1",
+            # Firecrawl's compose file interpolates PORT into the host-side
+            # ports entry. A three-part value binds only the loopback address;
+            # custom non-compose commands continue to receive a numeric port.
+            "PORT": f"127.0.0.1:{api_port}" if teardown is not None else api_port,
         })
         log_path = self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log"
-        teardown = self._firecrawl_compose_teardown_command(command, cwd)
         try:
             self._firecrawl_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
             self._firecrawl_last_started_at = now_ts()
@@ -1090,7 +1223,7 @@ class PlatformRuntimeManager:
         deadline = time.monotonic() + self._effective_startup_wait_seconds()
         while time.monotonic() < deadline:
             status = self.hermes_status(refresh=True)
-            if status.available:
+            if status.available or status.state == "degraded":
                 return status
             # No live process to wait for (launch failed or never started, or it
             # has already exited): the failure is already known, so return the
@@ -1178,25 +1311,29 @@ class PlatformRuntimeManager:
         return digest.hexdigest()
 
     def _ensure_hermes_config(self, home: Path) -> None:
-        path = home / "config.yaml"
-        data: dict[str, Any] = {}
-        if path.exists():
-            loaded = _read_yaml_mapping(path)
-            if loaded is not None:
-                data = loaded
-        plugins = data.setdefault("plugins", {})
-        if not isinstance(plugins, dict):
-            plugins = {}
-            data["plugins"] = plugins
-        enabled = plugins.setdefault("enabled", [])
-        if not isinstance(enabled, list):
-            enabled = []
-        enabled_set = {str(item) for item in enabled}
-        enabled_set.add(HERMES_PLUGIN_KEY)
-        plugins["enabled"] = sorted(enabled_set)
-        self._apply_managed_model_config(data)
-        self._apply_managed_tool_config(data)
-        _write_yaml_mapping(path, data)
+        # Share internal_config's transaction lock so an admin field update and
+        # the runtime's managed-key refresh cannot both read the same old YAML
+        # and then overwrite one another.
+        with _internal_config._CONFIG_UPDATE_LOCK:
+            path = home / "config.yaml"
+            data: dict[str, Any] = {}
+            if path.exists():
+                loaded = _read_yaml_mapping(path)
+                if loaded is not None:
+                    data = loaded
+            plugins = data.setdefault("plugins", {})
+            if not isinstance(plugins, dict):
+                plugins = {}
+                data["plugins"] = plugins
+            enabled = plugins.setdefault("enabled", [])
+            if not isinstance(enabled, list):
+                enabled = []
+            enabled_set = {str(item) for item in enabled}
+            enabled_set.add(HERMES_PLUGIN_KEY)
+            plugins["enabled"] = sorted(enabled_set)
+            self._apply_managed_model_config(data)
+            self._apply_managed_tool_config(data)
+            _write_yaml_mapping(path, data)
 
     def _apply_managed_model_config(self, data: dict[str, Any]) -> None:
         model_setting = self._runtime_setting(HERMES_SETTING_MODEL)
@@ -1242,6 +1379,10 @@ class PlatformRuntimeManager:
         return value
 
     def _apply_managed_tool_config(self, data: dict[str, Any]) -> None:
+        terminal = self._mapping_at(data, "terminal")
+        terminal["backend"] = "local"
+        terminal["persistent_shell"] = False
+
         web = self._mapping_at(data, "web")
         web["backend"] = "firecrawl"
         web["search_backend"] = "firecrawl"
@@ -1257,34 +1398,51 @@ class PlatformRuntimeManager:
         camofox["managed_persistence"] = True
 
     def _write_hermes_env(self, home: Path) -> None:
-        env_values = self._hermes_child_values()
-        path = home / ".env"
-        existing = _read_env_file(path)
-        existing.update(env_values)
-        _write_env_file(path, existing)
+        with _internal_config._CONFIG_UPDATE_LOCK:
+            env_values = self._hermes_child_values()
+            path = home / ".env"
+            existing = _read_env_file(path)
+            # These keys are wholly platform-managed. Remove the previous set
+            # before applying current values so an upgrade from relay=true to
+            # the new relay=false default cannot leave a live connector and its
+            # authentication secret behind in Hermes' override-loaded .env.
+            for key in _MANAGED_HERMES_RELAY_ENV_KEYS:
+                existing.pop(key, None)
+            existing.update(env_values)
+            _write_env_file(path, existing)
+            if not self._managed_hermes_relay_enabled():
+                try:
+                    (home / "relay-auth.json").unlink()
+                except FileNotFoundError:
+                    pass
 
     def _write_hermes_auth(self, home: Path) -> None:
         auth_path = home / "auth.json"
-        auth_store = _read_json_mapping(auth_path)
-        providers = auth_store.setdefault("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            auth_store["providers"] = providers
+        # Hermes refreshes one-time OAuth tokens under auth.lock. Share that
+        # exact cross-process lock across our full read/merge/replace sequence;
+        # otherwise a platform refresh can overwrite a token rotation that
+        # committed after our stale read.
+        with _internal_config._CONFIG_UPDATE_LOCK, _hermes_auth_store_lock(auth_path):
+            auth_store = _read_json_mapping(auth_path)
+            providers = auth_store.setdefault("providers", {})
+            if not isinstance(providers, dict):
+                providers = {}
+                auth_store["providers"] = providers
 
-        changed = False
-        changed |= self._upsert_codex_oauth(providers)
-        changed |= self._upsert_xai_oauth(providers)
+            changed = False
+            changed |= self._upsert_codex_oauth(providers)
+            changed |= self._upsert_xai_oauth(providers)
 
-        provider = self._effective_hermes_provider()
-        if provider in SUPPORTED_OAUTH_PROVIDERS and isinstance(providers.get(provider), dict):
-            if auth_store.get("active_provider") != provider:
-                auth_store["active_provider"] = provider
-                changed = True
+            provider = self._effective_hermes_provider()
+            if provider in SUPPORTED_OAUTH_PROVIDERS and isinstance(providers.get(provider), dict):
+                if auth_store.get("active_provider") != provider:
+                    auth_store["active_provider"] = provider
+                    changed = True
 
-        if changed:
-            auth_store["version"] = auth_store.get("version") or 2
-            auth_store["updated_at"] = _iso_now()
-            _write_json_secure(auth_path, auth_store)
+            if changed:
+                auth_store["version"] = auth_store.get("version") or 2
+                auth_store["updated_at"] = _iso_now()
+                _write_json_secure(auth_path, auth_store)
 
     def _upsert_codex_oauth(self, providers: dict[str, Any]) -> bool:
         access_token = self._first_secret(
@@ -1418,6 +1576,14 @@ class PlatformRuntimeManager:
 
     def _hermes_process_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        # The platform service may have bootstrap/admin/integration secrets in
+        # its own environment. Hermes receives only the explicit values below;
+        # unrelated ENTERPRISE_* credentials must not be inherited wholesale
+        # and later become visible to plugins or terminal subprocesses.
+        for key in list(env):
+            upper = key.upper()
+            if upper.startswith("ENTERPRISE_") and upper.endswith(_PLATFORM_SECRET_ENV_SUFFIXES):
+                env.pop(key, None)
         env.update(self._hermes_child_values())
         env["HERMES_HOME"] = str(self.config.managed_hermes_home)
         # Point the managed Hermes process at a dedicated scratch dir under the
@@ -1470,7 +1636,11 @@ class PlatformRuntimeManager:
             "ENTERPRISE_AGENT_TOOL_TOKEN": self.secret_provider("agent_tool_token") or "",
             "HERMES_ACCEPT_HOOKS": "1",
             "COGNEE_SKIP_CONNECTION_TEST": "true",
+            "TERMINAL_ENV": "local",
+            "TERMINAL_LOCAL_PERSISTENT": "false",
+            "TERMINAL_PERSISTENT_SHELL": "false",
             "CAMOFOX_URL": self._effective_camofox_url(),
+            "CAMOFOX_API_KEY": self._camofox_access_key(),
             "FIRECRAWL_API_URL": self._effective_firecrawl_api_url(),
         }
         provider = self._effective_hermes_provider()
@@ -1484,9 +1654,12 @@ class PlatformRuntimeManager:
         if api_key:
             values["API_SERVER_KEY"] = api_key
         if self._managed_hermes_relay_enabled():
+            relay_id, relay_secret = managed_relay_auth(self.config)
             values["GATEWAY_RELAY_URL"] = self._effective_hermes_relay_url()
             values["GATEWAY_RELAY_PLATFORMS"] = "relay"
             values["GATEWAY_RELAY_BOT_IDS"] = json.dumps({"relay": {"botId": "enterprise-web"}})
+            values["GATEWAY_RELAY_ID"] = relay_id
+            values["GATEWAY_RELAY_SECRET"] = relay_secret
         return values
 
     def _hermes_command(self) -> tuple[list[str], Path | None, str]:
@@ -1508,10 +1681,10 @@ class PlatformRuntimeManager:
             [
                 "npx",
                 "-y",
-                "@askjo/camofox-browser@^1.5.2",
+                f"@askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}",
             ],
             None,
-            "npm package: @askjo/camofox-browser",
+            f"npm package: @askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}",
         )
 
     def _firecrawl_command(self) -> tuple[list[str], Path | None, str]:
@@ -1560,19 +1733,15 @@ class PlatformRuntimeManager:
 
     def _ensure_firecrawl_compose_override(self) -> Path:
         override = self.config.firecrawl_runtime_dir / FIRECRAWL_COMPOSE_OVERRIDE
-        text = "\n".join(
-            [
-                "# Generated by Enterprise Agent Platform for managed local runtime.",
-                "services:",
-                "  api:",
-                "    image: ghcr.io/firecrawl/firecrawl:latest",
-                "  playwright-service:",
-                "    image: ghcr.io/firecrawl/playwright-service:latest",
-                "  nuq-postgres:",
-                "    image: ghcr.io/firecrawl/nuq-postgres:latest",
-                "",
-            ]
-        )
+        lines = [
+            "# Generated by Enterprise Agent Platform for managed local runtime.",
+            "# Every image is pinned to an immutable registry digest.",
+            "services:",
+        ]
+        for service, image in FIRECRAWL_SERVICE_IMAGES:
+            lines.extend((f"  {service}:", f"    image: {image}"))
+        lines.append("")
+        text = "\n".join(lines)
         override.parent.mkdir(parents=True, exist_ok=True)
         if not override.exists() or override.read_text(encoding="utf-8") != text:
             override.write_text(text, encoding="utf-8")
@@ -1590,14 +1759,17 @@ class PlatformRuntimeManager:
         values = _read_env_file(env_path)
         port = str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002)
         defaults = {
-            "PORT": port,
+            "PORT": f"127.0.0.1:{port}",
             "HOST": "0.0.0.0",
             "USE_DB_AUTHENTICATION": "false",
             "BULL_AUTH_KEY": self._firecrawl_bull_auth_key(),
         }
         changed = False
         for key, value in defaults.items():
-            if not values.get(key):
+            # PORT/HOST are managed security boundaries and must also repair
+            # files generated by older releases. Secrets remain stable once
+            # materialized.
+            if (key in {"PORT", "HOST"} and values.get(key) != value) or not values.get(key):
                 values[key] = value
                 changed = True
         if changed or not env_path.exists():
@@ -1615,6 +1787,37 @@ class PlatformRuntimeManager:
                 return str(value)
         return secrets.token_urlsafe(24)
 
+    def _camofox_access_key(self) -> str:
+        value = self._first_secret("CAMOFOX_ACCESS_KEY", "CAMOFOX_API_KEY")
+        if value:
+            return value
+        path = self.config.runtime_dir / "camofox" / "access-key"
+        try:
+            current = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            current = ""
+        if len(current) >= 32:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return current
+        value = secrets.token_urlsafe(48)
+        _write_text_secure(path, value + "\n")
+        return value
+
+    @staticmethod
+    def _managed_loopback_url_error(name: str, url: str) -> str:
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return f"Managed {name} URL must be an http(s) loopback URL"
+        if not _is_loopback_host(parsed.hostname):
+            return f"Managed {name} must listen on a loopback address"
+        return ""
+
     def _probe_hermes_health(self) -> bool:
         try:
             request = urllib.request.Request(self._hermes_health_url(), method="GET")
@@ -1623,14 +1826,52 @@ class PlatformRuntimeManager:
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return False
 
+    def _probe_hermes_patch_status(self) -> dict[str, Any]:
+        parsed = urllib.parse.urlparse(self._hermes_health_url())
+        url = urllib.parse.urlunparse(
+            (parsed.scheme or "http", parsed.netloc, "/api/enterprise-patch-status", "", "", "")
+        )
+        headers: dict[str, str] = {}
+        api_key = (
+            self.config.hermes_api_key
+            or self.secret_provider("ENTERPRISE_HERMES_API_KEY")
+            or self.secret_provider("API_SERVER_KEY")
+        )
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            request = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(request, timeout=0.8) as response:
+                if not 200 <= response.status < 300:
+                    return {"available": False, "error": f"HTTP {response.status}"}
+                payload = json.loads(response.read(64 * 1024).decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("object") != "enterprise.hermes_patch_status":
+                return {"available": False, "error": "unexpected response"}
+            return {
+                "available": True,
+                "ok": bool(payload.get("ok")),
+                "components": dict(payload.get("status") or {}),
+                "failed": dict(payload.get("failed") or {}),
+            }
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"available": False, "error": str(exc)[:300]}
+
     def _probe_camofox_health(self) -> bool:
-        return self._probe_http(self._effective_camofox_url(), ("/health",))
+        return self._probe_json_health(
+            self._effective_camofox_url(),
+            ("/health",),
+            lambda payload: payload.get("ok") is True and payload.get("engine") == "camoufox",
+        )
 
     def _probe_firecrawl_health(self) -> bool:
-        return self._probe_http(self._effective_firecrawl_api_url(), ("/health", "/v1/health", "/"))
+        return self._probe_json_health(
+            self._effective_firecrawl_api_url(),
+            ("/v0/health/liveness", "/"),
+            lambda payload: payload.get("status") == "ok" or payload.get("message") == "Firecrawl API",
+        )
 
     @staticmethod
-    def _probe_http(base_url: str, paths: tuple[str, ...]) -> bool:
+    def _probe_json_health(base_url: str, paths: tuple[str, ...], validator) -> bool:
         base = base_url.rstrip("/")
         if not base:
             return False
@@ -1638,12 +1879,13 @@ class PlatformRuntimeManager:
             try:
                 request = urllib.request.Request(f"{base}{path}", method="GET")
                 with urllib.request.urlopen(request, timeout=0.8) as response:
-                    if 200 <= response.status < 500:
+                    if not 200 <= response.status < 300:
+                        continue
+                    raw = response.read(64 * 1024)
+                    payload = json.loads(raw.decode("utf-8"))
+                    if isinstance(payload, dict) and bool(validator(payload)):
                         return True
-            except urllib.error.HTTPError as exc:
-                if 400 <= exc.code < 500:
-                    return True
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
                 continue
         return False
 
@@ -2099,6 +2341,24 @@ def _read_json_mapping(path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {"version": 2, "providers": {}}
 
 
+@contextmanager
+def _hermes_auth_store_lock(auth_path: Path):
+    """Share Hermes' ``auth.lock`` advisory lock for auth.json mutations."""
+
+    lock_path = auth_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _write_text_secure(path: Path, text: str) -> None:
     """Atomically write text to ``path`` with owner-only (0600) permissions.
 
@@ -2106,11 +2366,13 @@ def _write_text_secure(path: Path, text: str) -> None:
     are never briefly world/group readable, then atomically renamed into place.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(6)}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
     except Exception:
         try:
             tmp.unlink()
@@ -2149,18 +2411,19 @@ def _write_text_if_changed(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if path.exists() and path.read_text(encoding="utf-8") == text:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
             return
     except OSError:
         pass
-    path.write_text(text, encoding="utf-8")
+    _internal_config._atomic_write_text(path, text)
 
 
 def _write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         import yaml
-
-        _write_text_if_changed(path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
     except Exception:
         enabled = data.get("plugins", {}).get("enabled", [HERMES_PLUGIN_KEY])
         lines = ["plugins:", "  enabled:"]
@@ -2172,7 +2435,10 @@ def _write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
                 value = model.get(key)
                 if value is not None and str(value) != "":
                     lines.append(f"  {key}: {_quote_yaml_scalar(str(value))}")
-        _write_text_if_changed(path, "\n".join(lines) + "\n")
+        text = "\n".join(lines) + "\n"
+    else:
+        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    _write_text_if_changed(path, text)
 
 
 def _quote_yaml_scalar(value: str) -> str:

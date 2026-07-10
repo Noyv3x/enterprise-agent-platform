@@ -6,7 +6,7 @@
 
 - 基于账号和密码的登录，并使用签名的 HttpOnly session。
 - 基于频道的 Web 聊天。每个频道会路由到一个共享的 Hermes 主 Agent 线程。
-- 按用户隔离的私人 Agent。平台会为用户创建独立工作区，并在 Docker 可用时启动托管容器。
+- 按用户隔离的私人 Agent，以及按频道隔离的主 Agent。每个 Agent 拥有独立工作区、会话、记忆和浏览器 Profile，并由可信的平台服务账号在宿主机执行。
 - Codex OAuth 和 Grok OAuth 两种模型供应商验证。用户无需在私人 Agent 会话中输入模型密钥。
 - 企业知识库，支持文档写入、搜索、每轮被动建议、可选 Cognee 混合索引，以及 Hermes 工具调用。
 - 可在 Web 设置页管理 Hermes 和 Cognee 运行时。
@@ -100,12 +100,12 @@ export ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET='change-this-secret'
 - 创建 `data/runtimes/hermes/venv`，并通过 `pip install -e` 从相邻的 `../hermes-agent` 源码安装 Hermes；
 - 安装并启用 `enterprise-kb` 插件；
 - 在尚未配置时生成 API server key；
-- 使用托管 venv 以 `API_SERVER_ENABLED=true` 启动 Hermes gateway，并默认开启本地 Hermes relay connector；
+- 使用托管 venv 以 `API_SERVER_ENABLED=true` 启动 Hermes API server；
 - 在设置页暴露安装、配置、状态和重启控制。
 
 设置页可以更新 Hermes 源码路径、API URL、模型名、安装 extras、启动等待时间和 API server key。修改安装 extras 或源码路径后，下次托管 prepare/install 操作会刷新 venv。
 
-托管模式下，平台会作为 Hermes 的网页版 relay connector 运行，Hermes gateway 会通过 `GATEWAY_RELAY_URL` 主动连接平台本地 WebSocket。可用 `ENTERPRISE_HERMES_RELAY_ENABLED=0` 关闭该路径并退回 Hermes API 兼容调用；relay 默认监听 `127.0.0.1:18766`，可用 `ENTERPRISE_HERMES_RELAY_HOST` 和 `ENTERPRISE_HERMES_RELAY_PORT` 调整。
+平台产品请求固定使用 Hermes `/v1/runs` 与事件接口，从而保留稳定的 `run_id`、流式进度和危险操作审批回路；Runs 不可用时不会降级到无法关联审批的 chat/relay 请求（`auto` 开发模式仍可返回不执行工具的降级本地提示）。加固后的本地 relay connector 仅作为代码级集成测试组件保留，产品执行路径不会启动它；即使配置 relay 环境变量，Agent 请求仍固定走 Runs API。
 
 外部 Hermes API 兼容路径会发送：
 
@@ -122,7 +122,7 @@ export ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET='change-this-secret'
 推荐在页面配置：
 
 - 管理员进入“管理面板 / Telegram”，配置启用状态、Bot Token、Bot 用户名、long polling 或 webhook secret。
-- 每个用户进入“私人 Agent”，在 Telegram 私聊区域绑定自己的 Telegram ID。绑定后，该 Telegram 账号发给 bot 的私聊会进入自己的私人 Agent。
+- 每个用户进入“私人 Agent”，生成一次性绑定码，再在 Bot 私聊发送页面给出的 `/link CODE`（或 `/start CODE`）完成所有权验证。平台不接受手工填写 Telegram ID。绑定后，该 Telegram 账号发给 Bot 的私聊会进入自己的私人 Agent。
 
 环境变量仍可作为首次启动或无页面配置时的兜底：
 
@@ -135,7 +135,7 @@ export ENTERPRISE_TELEGRAM_POLLING=1
 
 默认使用 long polling。若要用 webhook，在管理面板中关闭 long polling 并保存 webhook secret，然后在 Telegram 侧设置管理面板显示的 webhook URL。
 
-用户可以向 bot 发送 `/start` 查看自己的 Telegram ID，再回平台绑定。
+未携带绑定码的 `/start` 只显示使用说明；绑定必须使用平台生成且短时有效的一次性代码。
 
 ## Hermes 知识工具
 
@@ -146,20 +146,19 @@ export ENTERPRISE_TELEGRAM_POLLING=1
 - `enterprise_kb_search(query, limit)`
 - `enterprise_kb_read(document_id)`
 
-## 容器行为
+## Agent 宿主机执行
 
-默认值为 `ENTERPRISE_CONTAINER_BACKEND=auto`。如果 `docker info` 成功，平台会使用 Docker；否则会在 `data/workspaces/user-<id>` 下创建本地工作区。
+Agent 终端固定由平台服务账号在宿主机执行，不创建每用户 Docker 容器。私人 Agent 使用
+`data/workspaces/user-<id>`，频道 Agent 使用
+`data/workspaces/channels/channel-<id>`；工作区、会话、记忆和浏览器 Profile 按稳定的
+Agent scope 分开。
 
-常用设置：
-
-```bash
-export ENTERPRISE_CONTAINER_BACKEND=docker
-export ENTERPRISE_CONTAINER_IMAGE=python:3.11-slim
-```
+这是面向可信企业成员的逻辑隔离，不是恶意租户安全沙箱。同一服务账号执行的 shell
+命令理论上可以通过绝对路径访问该账号可读的其他数据；敏感命令仍需按当前运行审批。
 
 ## 前端开发
 
-平台运行时仍从 `enterprise_agent_platform/static/` 服务静态文件；这些文件现在由 `frontend/` 下的 Vite + React + TypeScript 工程生成。当前业务界面逻辑保留为 `frontend/src/legacy-app.js`，由 React 入口启动，后续可以按页面逐步拆分为 React 组件。
+平台运行时仍从 `enterprise_agent_platform/static/` 服务静态文件；这些文件由 `frontend/` 下的 Vite + React + TypeScript 工程生成。业务界面以 `frontend/src/App.tsx` 为入口，并按 shell、聊天、管理配置等组件组织；不要直接编辑构建后的静态产物。
 
 安装和构建前端：
 
@@ -169,6 +168,11 @@ npm install
 npm run check
 npm run build
 ```
+
+`npm run build` 不会让 Vite 直接清空正在服务的 `static/`。它先在同一文件系统的临时目录
+完成构建，校验入口、带内容 hash 的 JS/CSS、主题脚本和 Logo，再以 `index.html` 的原子
+替换作为发布提交点；提交前失败会回滚并保留上一版线上资源。发布会保留上一版 hash 资源，
+避免已打开页面在切换瞬间请求旧资源时出现 404。
 
 本地开发服务器会把 `/api` 代理到默认平台后端 `http://127.0.0.1:8765`：
 

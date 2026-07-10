@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import ipaddress
 import json
+import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -16,6 +22,111 @@ from .config import PlatformConfig
 ProgressCallback = Callable[[dict[str, Any]], None]
 ContentCallback = Callable[[str | None], None]
 _MEDIA_FALLBACK_RE = re.compile(r"^(?P<label>.*(?:Image|Audio|Video|File):)\s*(?P<path>(?:~/|/).+?)\s*$")
+_MANAGED_RELAY_ID = "enterprise-managed-hermes"
+_MANAGED_RELAY_AUTH_FILE = "relay-auth.json"
+_RELAY_TOKEN_MAX_FUTURE_SECONDS = 10 * 60
+_relay_auth_lock = threading.Lock()
+
+
+def _is_loopback_host(host: str) -> bool:
+    clean = str(host or "").strip().strip("[]").lower()
+    if clean in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(clean).is_loopback
+    except ValueError:
+        return False
+
+
+def managed_relay_auth(config: PlatformConfig) -> tuple[str, str]:
+    """Return stable credentials shared by the local connector and Hermes.
+
+    Operators may supply both values through the environment. Otherwise the
+    platform creates an owner-only credential file under managed HERMES_HOME.
+    Keeping this outside the settings database lets the connector and runtime
+    manager share a secret without exposing it through an admin API.
+    """
+
+    configured_id = os.environ.get("ENTERPRISE_HERMES_RELAY_ID", "").strip()
+    configured_secret = os.environ.get("ENTERPRISE_HERMES_RELAY_SECRET", "").strip()
+    if bool(configured_id) != bool(configured_secret):
+        raise ValueError(
+            "ENTERPRISE_HERMES_RELAY_ID and ENTERPRISE_HERMES_RELAY_SECRET "
+            "must be configured together"
+        )
+    if configured_id and configured_secret:
+        if len(configured_secret) < 32:
+            raise ValueError("ENTERPRISE_HERMES_RELAY_SECRET must contain at least 32 characters")
+        return configured_id, configured_secret
+
+    home = config.managed_hermes_home
+    path = home / _MANAGED_RELAY_AUTH_FILE
+    with _relay_auth_lock:
+        home.mkdir(parents=True, exist_ok=True)
+        try:
+            home.chmod(0o700)
+        except OSError:
+            pass
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError, TypeError):
+            raw = {}
+        relay_id = str(raw.get("gateway_id") or "").strip() if isinstance(raw, dict) else ""
+        relay_secret = str(raw.get("secret") or "").strip() if isinstance(raw, dict) else ""
+        if relay_id and len(relay_secret) >= 32:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return relay_id, relay_secret
+
+        relay_id = _MANAGED_RELAY_ID
+        relay_secret = secrets.token_urlsafe(48)
+        payload = json.dumps(
+            {"gateway_id": relay_id, "secret": relay_secret, "version": 1},
+            sort_keys=True,
+        ) + "\n"
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(6)}")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(str(tmp), str(path))
+            path.chmod(0o600)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        return relay_id, relay_secret
+
+
+def verify_relay_upgrade_token(
+    token: str,
+    *,
+    gateway_id: str,
+    secret: str,
+    now: int | None = None,
+) -> bool:
+    """Verify the HMAC bearer emitted by Hermes' relay transport."""
+
+    clean = str(token or "").strip()
+    if not clean or not re.fullmatch(r"[A-Za-z0-9_-]+", clean):
+        return False
+    try:
+        padded = clean + "=" * (-len(clean) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        payload, expiry_text, signature = decoded.rsplit(":", 2)
+        expiry = int(expiry_text)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return False
+    current = int(time.time()) if now is None else int(now)
+    if payload != gateway_id or expiry <= current or expiry > current + _RELAY_TOKEN_MAX_FUTURE_SECONDS:
+        return False
+    signed = f"{payload}:{expiry}"
+    expected = hmac.new(secret.encode("utf-8"), signed.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
 @dataclass
@@ -174,9 +285,12 @@ class HermesRelayConnector:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: Any = None
         self._connections: set[Any] = set()
+        self._active_connection: Any = None
         self._turns_by_chat: dict[str, _RelayTurn] = {}
         self._turns_by_id: dict[str, _RelayTurn] = {}
         self._start_error: BaseException | None = None
+        self._relay_id: str | None = None
+        self._relay_secret: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -190,6 +304,10 @@ class HermesRelayConnector:
     def start(self) -> None:
         if not self.enabled:
             return
+        host = (self.config.hermes_relay_host or "127.0.0.1").strip() or "127.0.0.1"
+        if not _is_loopback_host(host):
+            raise ValueError("Managed Hermes relay must listen on a loopback address")
+        self._relay_id, self._relay_secret = managed_relay_auth(self.config)
         with self._lock:
             if self._started:
                 if self._start_error is not None:
@@ -221,6 +339,7 @@ class HermesRelayConnector:
                 self._loop = None
                 self._server = None
                 self._connections.clear()
+                self._active_connection = None
                 self._connection_ready.clear()
                 return
             try:
@@ -231,6 +350,7 @@ class HermesRelayConnector:
                 self._loop = None
                 self._server = None
                 self._connections.clear()
+                self._active_connection = None
                 self._connection_ready.clear()
                 return
         try:
@@ -248,6 +368,7 @@ class HermesRelayConnector:
             self._loop = None
             self._server = None
             self._connections.clear()
+            self._active_connection = None
             self._connection_ready.clear()
 
     def submit_turn(
@@ -279,6 +400,8 @@ class HermesRelayConnector:
             content_callback=content_callback,
         )
         with self._turn_lock:
+            if turn.chat_id in self._turns_by_chat:
+                raise RuntimeError("A Hermes relay turn is already active for this Agent")
             self._turns_by_chat[turn.chat_id] = turn
             self._turns_by_id[turn.turn_id] = turn
         try:
@@ -307,8 +430,10 @@ class HermesRelayConnector:
             return RelayTurnResult(content=content, session_id=session_id, raw=raw)
         finally:
             with self._turn_lock:
-                self._turns_by_chat.pop(turn.chat_id, None)
-                self._turns_by_id.pop(turn.turn_id, None)
+                if self._turns_by_chat.get(turn.chat_id) is turn:
+                    self._turns_by_chat.pop(turn.chat_id, None)
+                if self._turns_by_id.get(turn.turn_id) is turn:
+                    self._turns_by_id.pop(turn.turn_id, None)
 
     def _run_thread(self) -> None:
         loop = asyncio.new_event_loop()
@@ -348,6 +473,7 @@ class HermesRelayConnector:
             except Exception:
                 pass
         self._connections.clear()
+        self._active_connection = None
         self._connection_ready.clear()
 
     @staticmethod
@@ -365,6 +491,14 @@ class HermesRelayConnector:
                 await websocket.close(code=1008, reason="unsupported path")
             finally:
                 return
+        if not self._authenticate_socket(websocket):
+            await websocket.close(code=4401, reason="unauthorized")
+            return
+        if self._active_connection is not None and self._active_connection is not websocket:
+            await websocket.close(code=4409, reason="managed relay adapter already connected")
+            return
+        self._active_connection = websocket
+        self._connections.add(websocket)
         buffer = ""
         try:
             async for chunk in websocket:
@@ -375,8 +509,33 @@ class HermesRelayConnector:
                         await self._handle_frame(websocket, line)
         finally:
             self._connections.discard(websocket)
-            if not self._connections:
+            if self._active_connection is websocket:
+                self._active_connection = None
                 self._connection_ready.clear()
+
+    def _authenticate_socket(self, websocket: Any) -> bool:
+        relay_id = self._relay_id
+        relay_secret = self._relay_secret
+        if not relay_id or not relay_secret:
+            try:
+                relay_id, relay_secret = managed_relay_auth(self.config)
+            except (OSError, ValueError):
+                return False
+            self._relay_id, self._relay_secret = relay_id, relay_secret
+        request = getattr(websocket, "request", None)
+        headers = getattr(request, "headers", None) or getattr(websocket, "request_headers", None)
+        try:
+            authorization = str(headers.get("Authorization") or "") if headers is not None else ""
+        except Exception:
+            authorization = ""
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            return False
+        return verify_relay_upgrade_token(
+            token,
+            gateway_id=relay_id,
+            secret=relay_secret,
+        )
 
     async def _handle_frame(self, websocket: Any, line: str) -> None:
         try:
@@ -385,7 +544,11 @@ class HermesRelayConnector:
             return
         frame_type = str(frame.get("type") or "")
         if frame_type == "hello":
-            self._connections.add(websocket)
+            if websocket is not self._active_connection:
+                return
+            if str(frame.get("platform") or "") != "relay" or str(frame.get("botId") or "") != "enterprise-web":
+                await websocket.close(code=1008, reason="unsupported managed relay identity")
+                return
             self._connection_ready.set()
             await self._send_frame(websocket, {"type": "descriptor", "descriptor": self._descriptor()})
             return
@@ -402,7 +565,7 @@ class HermesRelayConnector:
             return
 
     async def _send_to_gateway(self, frame: dict[str, Any]) -> None:
-        websocket = next(iter(self._connections), None)
+        websocket = self._active_connection if self._connection_ready.is_set() else None
         if websocket is None:
             raise RuntimeError("Hermes relay adapter is not connected")
         await self._send_frame(websocket, frame)
@@ -416,7 +579,7 @@ class HermesRelayConnector:
         if op == "send":
             turn = self._turn_for_action(action)
             if turn is None:
-                return {"success": True, "message_id": f"relay-orphan-{uuid.uuid4().hex[:12]}"}
+                return {"success": False, "error": "unknown or mismatched relay turn"}
             return turn.apply_send(action)
         if op in {"typing", "edit"}:
             return {"success": True}
@@ -439,10 +602,12 @@ class HermesRelayConnector:
         turn_id = str(metadata.get("enterprise_turn_id") or "").strip()
         chat_id = str(action.get("chat_id") or metadata.get("chat_id") or "").strip()
         with self._turn_lock:
-            if turn_id and turn_id in self._turns_by_id:
-                return self._turns_by_id[turn_id]
-            if chat_id and chat_id in self._turns_by_chat:
-                return self._turns_by_chat[chat_id]
+            if not turn_id:
+                return None
+            turn = self._turns_by_id.get(turn_id)
+            if turn is None or (chat_id and chat_id != turn.chat_id):
+                return None
+            return turn
         return None
 
     def _build_turn(
@@ -461,7 +626,7 @@ class HermesRelayConnector:
     ) -> _RelayTurn:
         chat_id, chat_type, chat_name, user_id = self._chat_identity(session_key=session_key, session_id=session_id)
         media_urls, media_types = self._attachment_media(attachments)
-        turn_id = f"enterprise-relay-{uuid.uuid4().hex}"
+        turn_id = f"enterprise-relay-{secrets.token_urlsafe(32)}"
         raw_actor = metadata.get("actor") if isinstance(metadata.get("actor"), dict) else {}
         actor_id = str(raw_actor.get("id") or "").strip()
         if actor_id:

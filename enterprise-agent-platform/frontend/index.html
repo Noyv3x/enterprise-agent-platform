@@ -12,13 +12,7 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237080A0'/%3E%3Cpath d='M10 9v7a6 6 0 0 0 12 0V9' fill='none' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E"
     />
-    <script>
-      // Apply persisted theme before first paint to avoid a flash.
-      try {
-        var t = localStorage.getItem("eap-theme");
-        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
-      } catch (e) {}
-    </script>
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="react-root"></div>

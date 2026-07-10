@@ -1,8 +1,8 @@
-/* <UsageTable/> — a generic responsive usage table (legacy renderUsageTable,
-   legacy-app.js:1755-1765). The `--usage-cols` CSS var drives the grid columns;
-   rows scroll horizontally on small screens. Empty rows render the empty text. */
+/* <UsageTable/> — a generic responsive native table (legacy renderUsageTable,
+   legacy-app.js:1755-1765). Its wrapper scrolls horizontally on small screens;
+   native th/td semantics keep headers associated with cells for assistive tech. */
 
-import type { ReactNode } from "react";
+import { Children, Fragment, isValidElement, type ReactNode } from "react";
 import type { IconName } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 
@@ -15,6 +15,18 @@ export interface UsageTableProps<T> {
   /** Returns the cell elements for one row (their count must match `headers`). */
   renderRow: (row: T) => ReactNode;
   emptyText: string;
+}
+
+function flattenCells(node: ReactNode): ReactNode[] {
+  const cells: ReactNode[] = [];
+  Children.forEach(node, (child) => {
+    if (isValidElement<{ children?: ReactNode }>(child) && child.type === Fragment) {
+      cells.push(...flattenCells(child.props.children));
+    } else {
+      cells.push(child);
+    }
+  });
+  return cells;
 }
 
 export function UsageTable<T>({
@@ -30,20 +42,25 @@ export function UsageTable<T>({
     <section className="card usage-card">
       <CardHead title={title} icon={icon} desc={desc} />
       {rows.length ? (
-        <div
-          className="usage-table"
-          style={{ "--usage-cols": headers.length } as React.CSSProperties}
-        >
-          <div className="usage-table__row usage-table__head">
-            {headers.map((header) => (
-              <span key={header}>{header}</span>
-            ))}
-          </div>
-          {rows.map((row, index) => (
-            <div className="usage-table__row" key={index}>
-              {renderRow(row)}
-            </div>
-          ))}
+        <div className="usage-table-wrap">
+          <table className="usage-table" aria-label={title}>
+            <thead>
+              <tr className="usage-table__row usage-table__head">
+                {headers.map((header, index) => (
+                  <th scope="col" key={`${header}-${index}`}>{header}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, index) => (
+                <tr className="usage-table__row" key={index}>
+                  {flattenCells(renderRow(row)).map((cell, cellIndex) => (
+                    <td key={cellIndex}>{cell}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       ) : (
         <div className="muted">{emptyText}</div>

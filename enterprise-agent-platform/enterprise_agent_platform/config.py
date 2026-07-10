@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,8 +32,6 @@ class PlatformConfig:
     knowledge_backend: str
     cognee_dataset: str
     cognee_ingest_background: bool
-    container_backend: str
-    container_image: str
     cognee_repo: Path
     hermes_repo: Path
     manage_hermes: bool = True
@@ -40,7 +39,7 @@ class PlatformConfig:
     hermes_home: Path | None = None
     hermes_install_extras: str = ""
     runtime_startup_wait_seconds: float = 8.0
-    hermes_relay_enabled: bool = True
+    hermes_relay_enabled: bool = False
     hermes_relay_host: str = "127.0.0.1"
     hermes_relay_port: int = 18766
     hermes_provider: str = "openai-codex"
@@ -54,11 +53,6 @@ class PlatformConfig:
     firecrawl_command: str = ""
     allow_insecure_bootstrap_password: bool = False
     trust_forwarded_headers: bool = False
-    container_harden: bool = True
-    container_memory: str = "512m"
-    container_cpus: str = ""
-    container_network: str = ""
-    container_pids_limit: int = 512
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_bot_username: str = ""
@@ -69,6 +63,17 @@ class PlatformConfig:
     auto_update_remote: str = "origin"
     auto_update_branch: str = ""
     auto_update_webhook_secret: str = ""
+    # One-release constructor compatibility for deployments that still build
+    # PlatformConfig with the removed per-Agent container knobs. These values
+    # are deliberately ignored: Agents always execute on the trusted host with
+    # logical workspace/session separation.
+    container_backend: str = "auto"
+    container_image: str = "python:3.11-slim"
+    container_harden: bool = True
+    container_memory: str = "512m"
+    container_cpus: str = ""
+    container_network: str = ""
+    container_pids_limit: int = 512
 
     @property
     def db_path(self) -> Path:
@@ -102,6 +107,26 @@ class PlatformConfig:
         port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
         token_secret = os.getenv("ENTERPRISE_SESSION_SECRET") or secrets.token_urlsafe(32)
+        legacy_container_env = sorted(
+            name
+            for name in (
+                "ENTERPRISE_CONTAINER_BACKEND",
+                "ENTERPRISE_CONTAINER_IMAGE",
+                "ENTERPRISE_CONTAINER_HARDEN",
+                "ENTERPRISE_CONTAINER_MEMORY",
+                "ENTERPRISE_CONTAINER_CPUS",
+                "ENTERPRISE_CONTAINER_NETWORK",
+                "ENTERPRISE_CONTAINER_PIDS_LIMIT",
+            )
+            if name in os.environ
+        )
+        if legacy_container_env:
+            warnings.warn(
+                "Per-Agent container settings are deprecated and ignored because Agents now execute on the "
+                "trusted host: " + ", ".join(legacy_container_env),
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return cls(
             data_dir=data_dir,
             host=host,
@@ -122,8 +147,6 @@ class PlatformConfig:
             cognee_dataset=os.getenv("ENTERPRISE_COGNEE_DATASET", "enterprise_knowledge"),
             cognee_ingest_background=os.getenv("ENTERPRISE_COGNEE_INGEST_BACKGROUND", "1").strip().lower()
             in {"1", "true", "yes", "on"},
-            container_backend=os.getenv("ENTERPRISE_CONTAINER_BACKEND", "auto").strip().lower() or "auto",
-            container_image=os.getenv("ENTERPRISE_CONTAINER_IMAGE", "python:3.11-slim"),
             cognee_repo=Path(os.getenv("ENTERPRISE_COGNEE_REPO", _default_repo_path(base, "cognee"))).expanduser(),
             hermes_repo=Path(os.getenv("ENTERPRISE_HERMES_REPO", _default_repo_path(base, "hermes-agent"))).expanduser(),
             manage_hermes=os.getenv("ENTERPRISE_MANAGE_HERMES", "1").strip().lower()
@@ -135,7 +158,7 @@ class PlatformConfig:
             ).expanduser(),
             hermes_install_extras=os.getenv("ENTERPRISE_HERMES_INSTALL_EXTRAS", "").strip(),
             runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
-            hermes_relay_enabled=_env_bool("ENTERPRISE_HERMES_RELAY_ENABLED", True),
+            hermes_relay_enabled=_env_bool("ENTERPRISE_HERMES_RELAY_ENABLED", False),
             hermes_relay_host=os.getenv("ENTERPRISE_HERMES_RELAY_HOST", "127.0.0.1").strip() or "127.0.0.1",
             hermes_relay_port=_env_int("ENTERPRISE_HERMES_RELAY_PORT", 18766, minimum=1, maximum=65535),
             hermes_provider=os.getenv("ENTERPRISE_HERMES_PROVIDER", "openai-codex").strip().lower() or "openai-codex",
@@ -151,11 +174,6 @@ class PlatformConfig:
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
             allow_insecure_bootstrap_password=_env_bool("ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD", False),
             trust_forwarded_headers=_env_bool("ENTERPRISE_TRUSTED_PROXY", False),
-            container_harden=_env_bool("ENTERPRISE_CONTAINER_HARDEN", True),
-            container_memory=os.getenv("ENTERPRISE_CONTAINER_MEMORY", "512m").strip(),
-            container_cpus=os.getenv("ENTERPRISE_CONTAINER_CPUS", "").strip(),
-            container_network=os.getenv("ENTERPRISE_CONTAINER_NETWORK", "").strip(),
-            container_pids_limit=_env_int("ENTERPRISE_CONTAINER_PIDS_LIMIT", 512, minimum=1),
             telegram_enabled=_env_bool("ENTERPRISE_TELEGRAM_ENABLED", False),
             telegram_bot_token=os.getenv("ENTERPRISE_TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_bot_username=os.getenv("ENTERPRISE_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
@@ -166,6 +184,13 @@ class PlatformConfig:
             auto_update_remote=os.getenv("ENTERPRISE_AUTO_UPDATE_REMOTE", "origin").strip() or "origin",
             auto_update_branch=os.getenv("ENTERPRISE_AUTO_UPDATE_BRANCH", "").strip(),
             auto_update_webhook_secret=os.getenv("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", "").strip(),
+            container_backend=os.getenv("ENTERPRISE_CONTAINER_BACKEND", "auto").strip().lower() or "auto",
+            container_image=os.getenv("ENTERPRISE_CONTAINER_IMAGE", "python:3.11-slim").strip(),
+            container_harden=_env_bool("ENTERPRISE_CONTAINER_HARDEN", True),
+            container_memory=os.getenv("ENTERPRISE_CONTAINER_MEMORY", "512m").strip(),
+            container_cpus=os.getenv("ENTERPRISE_CONTAINER_CPUS", "").strip(),
+            container_network=os.getenv("ENTERPRISE_CONTAINER_NETWORK", "").strip(),
+            container_pids_limit=_env_int("ENTERPRISE_CONTAINER_PIDS_LIMIT", 512, minimum=1),
         )
 
 

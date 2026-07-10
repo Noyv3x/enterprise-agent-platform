@@ -11,10 +11,49 @@
 type SessionExpiredHandler = () => void;
 
 let sessionExpiredHandler: SessionExpiredHandler | null = null;
+let sessionGeneration = 0;
+const activeRequests = new Set<AbortController>();
+
+export const DEFAULT_API_TIMEOUT_MS = 60_000;
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export class ApiRequestCancelledError extends Error {
+  constructor() {
+    super("请求已取消");
+    this.name = "ApiRequestCancelledError";
+  }
+}
+
+export class ApiTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`请求超时（${Math.ceil(timeoutMs / 1000)} 秒）`);
+    this.name = "ApiTimeoutError";
+  }
+}
+
+export function isApiRequestCancelled(error: unknown): error is ApiRequestCancelledError {
+  return error instanceof ApiRequestCancelledError;
+}
+
+export function isApiError(error: unknown, status?: number): error is ApiError {
+  return error instanceof ApiError && (status === undefined || error.status === status);
+}
 
 /** AppGate registers the store's handleSessionExpired here at boot. */
-export function registerSessionExpiredHandler(fn: SessionExpiredHandler): void {
+export function registerSessionExpiredHandler(fn: SessionExpiredHandler): () => void {
   sessionExpiredHandler = fn;
+  return () => {
+    if (sessionExpiredHandler === fn) sessionExpiredHandler = null;
+  };
 }
 
 /** Invoked by api() on a 401 (unless skipAuthHandling). */
@@ -22,45 +61,91 @@ export function _invokeSessionExpired(): void {
   sessionExpiredHandler?.();
 }
 
+/** Abort every request owned by the outgoing account and advance the response
+ * generation. Even a fetch that wins the abort race is rejected before its
+ * payload can be dispatched into the next account's store. */
+export function resetApiSession(): void {
+  sessionGeneration += 1;
+  for (const controller of [...activeRequests]) controller.abort();
+  activeRequests.clear();
+}
+
 export interface ApiOptions extends RequestInit {
   /** Opt out of the automatic 401 → handleSessionExpired drop-to-login. */
   skipAuthHandling?: boolean;
+  /** Per-request timeout. Set to 0 only for an intentionally unbounded request. */
+  timeoutMs?: number;
 }
 
 export async function api<T = unknown>(path: string, options: ApiOptions = {}): Promise<T> {
-  const isForm = options.body instanceof FormData;
-  const res = await fetch(path, {
-    credentials: "include",
-    // For FormData, pass headers through untouched so the browser sets the
-    // multipart boundary. Otherwise default to JSON. `...options` is spread
-    // last to preserve the exact legacy object-construction order.
-    headers: isForm
-      ? ((options.headers as HeadersInit | undefined) || {})
-      : {
-          "Content-Type": "application/json",
-          ...((options.headers as Record<string, string> | undefined) || {}),
-        },
-    ...options,
-  });
-  const text = await res.text();
-  let data: unknown = {};
-  if (text) {
-    // The server always returns JSON, but a fronting proxy can emit an HTML
-    // 502/504 page (or an HTML login redirect); don't blow up on those.
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = {};
+  const generation = sessionGeneration;
+  const controller = new AbortController();
+  const {
+    skipAuthHandling = false,
+    timeoutMs = DEFAULT_API_TIMEOUT_MS,
+    signal: callerSignal,
+    ...requestOptions
+  } = options;
+  const isForm = requestOptions.body instanceof FormData;
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const abortFromCaller = () => controller.abort();
+
+  if (callerSignal?.aborted) controller.abort();
+  else callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+  activeRequests.add(controller);
+
+  try {
+    const res = await fetch(path, {
+      credentials: "include",
+      // For FormData, leave Content-Type unset so the browser supplies the
+      // multipart boundary. Explicit caller headers still take precedence.
+      headers: isForm
+        ? ((requestOptions.headers as HeadersInit | undefined) || {})
+        : {
+            "Content-Type": "application/json",
+            ...((requestOptions.headers as Record<string, string> | undefined) || {}),
+          },
+      ...requestOptions,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data: unknown = {};
+    if (text) {
+      // A proxy can emit an HTML 502/504 page; preserve a useful status error.
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = {};
+      }
     }
+    if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
+    if (res.status === 401 && !skipAuthHandling) {
+      _invokeSessionExpired();
+      if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
+    }
+    if (!res.ok) {
+      const err = data as { error?: string; detail?: string };
+      throw new ApiError(err.error || err.detail || `请求失败（${res.status}）`, res.status);
+    }
+    return data as T;
+  } catch (error) {
+    if (timedOut) throw new ApiTimeoutError(timeoutMs);
+    if (controller.signal.aborted || generation !== sessionGeneration) {
+      throw new ApiRequestCancelledError();
+    }
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    callerSignal?.removeEventListener("abort", abortFromCaller);
+    activeRequests.delete(controller);
   }
-  if (res.status === 401 && !options.skipAuthHandling) {
-    _invokeSessionExpired();
-  }
-  if (!res.ok) {
-    const err = data as { error?: string; detail?: string };
-    throw new Error(err.error || err.detail || `请求失败（${res.status}）`);
-  }
-  return data as T;
 }
 
 /* ---------------------------------------------------------------- safeUrl */

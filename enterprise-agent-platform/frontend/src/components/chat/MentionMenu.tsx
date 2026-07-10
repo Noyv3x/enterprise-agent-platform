@@ -13,7 +13,13 @@ import type { MentionApi } from "../../hooks/useMention";
 export function MentionMenu({ mention }: { mention: MentionApi }) {
   const { active, options, selected, menuId, optionId, choose, hover } = mention;
   return (
-    <div className="mention-menu" role="listbox" id={menuId} hidden={!active}>
+    <div
+      className="mention-menu"
+      role="listbox"
+      aria-label="可提及的用户和 Agent"
+      id={menuId}
+      hidden={!active}
+    >
       {active &&
         options.map((option, index) => (
           <button
@@ -21,6 +27,7 @@ export function MentionMenu({ mention }: { mention: MentionApi }) {
             className={cx("mention-option", index === selected && "is-active")}
             type="button"
             role="option"
+            tabIndex={-1}
             id={optionId(index)}
             aria-selected={index === selected}
             onMouseDown={(event) => {

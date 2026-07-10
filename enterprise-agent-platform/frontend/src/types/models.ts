@@ -232,9 +232,19 @@ export interface PrivateTelegramLink {
   telegram_username?: string;
 }
 
+export interface PrivateTelegramPending {
+  status: "pending";
+  expires_at: number;
+  /** Returned only by the PUT that creates/rotates the one-time challenge. */
+  code?: string;
+  /** Telegram command containing the code, e.g. `/link ABCD-EFGH`. */
+  command?: string;
+}
+
 export interface PrivateTelegram {
   gateway?: PrivateTelegramGateway;
-  link?: PrivateTelegramLink;
+  link?: PrivateTelegramLink | null;
+  pending?: PrivateTelegramPending | null;
 }
 
 /* ------------------------------------------------------------- knowledge */

@@ -317,6 +317,8 @@ select {
 /* ---- Aside already shows the logo on wide screens; avoid a duplicate in the card ---- */
 .auth__card .brand__logo { display: none; }
 .auth__card .brand__eyebrow { font-size: 11.5px; }
+.boot-status p { margin: 0; line-height: 1.55; }
+.boot-status__loading { display: flex; align-items: center; gap: 10px; color: var(--muted); }
 
 .field { display: grid; gap: 6px; }
 .field { min-width: 0; }
@@ -543,15 +545,66 @@ select {
 .telegram-link__meta { min-width: 0; display: grid; gap: 4px; }
 .telegram-link__title { display: flex; gap: 8px; align-items: center; font-weight: 650; }
 .telegram-link__sub { color: var(--muted); font-size: 12px; line-height: 1.35; }
-.telegram-link__form {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: end;
-}
+.telegram-link__body { min-width: 0; display: grid; gap: 10px; }
+.telegram-link__instructions { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.telegram-link .notice { margin-top: 0; }
 .telegram-link__actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 .telegram-link__close { width: 30px; height: 30px; }
+.telegram-link__account {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--ok-line);
+  border-radius: var(--r-sm);
+  background: var(--ok-soft);
+}
+.telegram-link__account > div { min-width: 0; display: grid; gap: 3px; }
+.telegram-link__account strong { overflow-wrap: anywhere; color: var(--ok); }
+.telegram-link__account span { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; }
+.telegram-challenge {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  padding: 11px 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.telegram-challenge__code { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.telegram-challenge__code span { color: var(--muted); font-size: 12px; }
+.telegram-challenge__code strong {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 16px;
+  letter-spacing: 0.06em;
+  overflow-wrap: anywhere;
+}
+.telegram-challenge__command { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.telegram-challenge__command code {
+  min-width: 0;
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.telegram-challenge__command .btn { flex: 0 0 auto; }
+.telegram-challenge__expiry { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; }
+.telegram-challenge__hint { color: var(--faint); font-size: 11.5px; line-height: 1.45; }
+.clipboard-proxy {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
 .messages {
   overflow-y: auto;
   padding: 22px 20px 8px;
@@ -1291,11 +1344,9 @@ select {
   overflow-wrap: anywhere;
 }
 .usage-card { min-width: 0; }
-.usage-table {
+.usage-table-wrap {
   min-width: 0;
   max-width: 100%;
-  display: grid;
-  gap: 1px;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
@@ -1303,20 +1354,26 @@ select {
   border-radius: var(--r-md);
   background: var(--line);
 }
+.usage-table-wrap--spaced { margin-top: 14px; }
+.usage-table {
+  width: 100%;
+  min-width: max(720px, 100%);
+  border-spacing: 1px;
+  background: var(--line);
+  table-layout: auto;
+}
 .usage-table__row {
-  min-width: max(900px, 100%);
-  display: grid;
-  grid-template-columns: repeat(var(--usage-cols), minmax(120px, 1fr));
-  gap: 1px;
   background: var(--line);
 }
 .usage-table__row > * {
-  min-width: 0;
+  min-width: 120px;
   padding: 10px 11px;
   background: var(--surface);
   overflow: visible;
   overflow-wrap: anywhere;
   white-space: normal;
+  text-align: left;
+  vertical-align: middle;
 }
 .usage-table__head > * {
   color: var(--muted);
@@ -1324,6 +1381,7 @@ select {
   font-size: 12px;
   font-weight: 650;
 }
+.usage-table__head th { border: 0; }
 .usage-table strong {
   font-family: var(--font-mono);
   font-weight: 700;
@@ -1834,10 +1892,14 @@ select {
    Responsive
    ===================================================================== */
 @media (max-width: 940px) {
-  .kb-grid, .config-grid, .settings-form__grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private, .telegram-link__form { grid-template-columns: 1fr; }
+  .kb-grid, .config-grid, .settings-form__grid, .account-create__grid, .account-row__grid, .token-usage__columns, .audit-tools, .audit-private { grid-template-columns: 1fr; }
   .telegram-link { right: 14px; width: min(520px, calc(100% - 28px)); }
   .telegram-link__header { align-items: flex-start; }
   .telegram-link__actions { justify-content: flex-start; }
+  .telegram-link__account, .telegram-challenge__command, .telegram-challenge__expiry {
+    align-items: flex-start;
+    flex-direction: column;
+  }
   .panel__header,
   .card__head {
     align-items: flex-start;
@@ -1922,11 +1984,9 @@ select {
   .token-usage__overview .card__head {
     display: grid;
   }
-  .usage-table__row {
-    min-width: max(560px, 100%);
-    grid-template-columns: repeat(var(--usage-cols), minmax(82px, 1fr));
-  }
+  .usage-table { min-width: max(560px, 100%); }
   .usage-table__row > * {
+    min-width: 82px;
     padding: 9px 10px;
     white-space: normal;
     overflow-wrap: anywhere;
@@ -2125,9 +2185,7 @@ select {
   .card {
     padding: 10px;
   }
-  .usage-table__row {
-    min-width: max(500px, 100%);
-  }
+  .usage-table { min-width: max(500px, 100%); }
   .oauth-code {
     font-size: 20px;
     letter-spacing: 0;

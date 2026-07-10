@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import sys
 import threading
 import time
@@ -153,6 +154,7 @@ class TelegramGateway:
         *,
         bot: TelegramBotAPI | None = None,
         autostart: bool = True,
+        wait_for_response: bool = True,
     ):
         self.service = service
         self.bot = bot or TelegramBotAPI(service.telegram_bot_token())
@@ -160,21 +162,46 @@ class TelegramGateway:
         self._thread: threading.Thread | None = None
         self._offset: int | None = None
         self._autostart = autostart
+        self._wait_for_response = wait_for_response
+        self._delivery_registration: int | None = None
+        register_delivery = getattr(self.service, "register_telegram_delivery_handler", None)
+        if callable(register_delivery):
+            self._delivery_registration = register_delivery(self._deliver_agent_response)
 
     def start(self) -> None:
         if not self._autostart or not self.service.telegram_polling_enabled():
             return
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._poll_loop, name="telegram-gateway", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        unregister_delivery = getattr(self.service, "unregister_telegram_delivery_handler", None)
+        if callable(unregister_delivery) and self._delivery_registration is not None:
+            unregister_delivery(self._delivery_registration)
+            self._delivery_registration = None
         if self._thread is not None:
             self._thread.join(timeout=3)
 
     def process_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        update_id = _int_or_none(update.get("update_id"))
+        if update_id is not None and not self.service.claim_telegram_update(update_id):
+            return {"ok": True, "ignored": "duplicate update", "update_id": update_id}
+        try:
+            result = self._process_claimed_update(update)
+        except BaseException as exc:
+            if update_id is not None:
+                self.service.finish_telegram_update(update_id, error=str(exc))
+            raise
+        if update_id is not None:
+            self.service.finish_telegram_update(update_id, ignored=bool(result.get("ignored")))
+        return result
+
+    def _process_claimed_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        update_id = _int_or_none(update.get("update_id"))
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
             return {"ok": True, "ignored": "unsupported update"}
@@ -187,22 +214,117 @@ class TelegramGateway:
         chat_type = str(chat.get("type") or "").lower()
         if chat_type != "private":
             return {"ok": True, "ignored": "non-private chat"}
+
+        replayed = self._existing_text_delivery_result(update_id)
+        if replayed is not None:
+            return replayed
+        stored_result = self.service.telegram_update_result(update_id)
+        if stored_result.get("linked"):
+            actor = self.service.get_user(int(stored_result.get("user_id") or 0)) or {}
+            text = (
+                "绑定成功。之后发送到此私聊的消息会进入 "
+                f"{actor.get('display_name') or actor.get('username') or '该用户'} 的私人 Agent。"
+            )
+            return self._queue_text_reply(update_id, message, text, stored_result)
+
         text = str(message.get("text") or message.get("caption") or "").strip()
+        command = re.match(r"^/(link|start)(?:@[A-Za-z0-9_]+)?(?:\s+(.+?))?\s*$", text, re.IGNORECASE)
+        if command and str(command.group(2) or "").strip():
+            try:
+                actor = self.service.complete_telegram_link(
+                    str(command.group(2)),
+                    sender,
+                    update_id=update_id,
+                )
+            except ServiceError as exc:
+                result = {"ok": True, "command": True, "linked": False}
+                return self._queue_text_reply(
+                    update_id,
+                    message,
+                    f"绑定失败：{exc.message}\n请在平台重新生成一次性绑定码。",
+                    result,
+                )
+            result = {"ok": True, "command": True, "linked": True, "user_id": int(actor["id"])}
+            return self._queue_text_reply(
+                update_id,
+                message,
+                f"绑定成功。之后发送到此私聊的消息会进入 {actor.get('display_name') or actor.get('username')} 的私人 Agent。",
+                result,
+            )
+        if command and str(command.group(1)).lower() == "link":
+            result = {"ok": True, "command": True, "linked": False}
+            return self._queue_text_reply(
+                update_id,
+                message,
+                "请发送完整命令：/link 一次性绑定码",
+                result,
+            )
+        if text.startswith("/start") or text.startswith("/help"):
+            result = {"ok": True, "command": True}
+            return self._queue_text_reply(update_id, message, self._help_text(sender), result)
         attachments, notes = self._attachments_for_message(message)
         if notes:
             text = (text + "\n\n" + "\n".join(notes)).strip()
         if not text and not attachments:
             return {"ok": True, "ignored": "empty message"}
-        if text.startswith("/start") or text.startswith("/help"):
-            self._send_reply(message, self._help_text(sender))
-            return {"ok": True, "command": True}
-
         try:
             actor = self.service.telegram_actor_for_user(sender)
         except ServiceError:
-            self._send_reply(message, self._unlinked_text(sender))
-            return {"ok": True, "ignored": "unlinked telegram user"}
-        return self._route_private(actor, message, text, attachments)
+            result = {"ok": True, "ignored": "unlinked telegram user"}
+            return self._queue_text_reply(update_id, message, self._unlinked_text(sender), result)
+        return self._route_private(
+            actor,
+            message,
+            text,
+            attachments,
+            update_id=update_id,
+        )
+
+    def _existing_text_delivery_result(self, update_id: int | None) -> dict[str, Any] | None:
+        delivery = self.service.telegram_text_delivery(update_id)
+        if delivery is None:
+            return None
+        if self._wait_for_response:
+            delivery = self.service.wait_for_telegram_delivery(
+                delivery.id,
+                timeout=self.service.config.hermes_timeout_seconds + 30,
+            ) or delivery
+        result = delivery.payload.get("result")
+        response = dict(result) if isinstance(result, dict) else {"ok": True}
+        response["delivery_job_id"] = delivery.id
+        response["delivery_status"] = delivery.status
+        return response
+
+    def _queue_text_reply(
+        self,
+        update_id: int | None,
+        message: dict[str, Any],
+        text: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if update_id is None:
+            # Telegram's Update contract always provides this id. Refuse an
+            # externally visible reply when the idempotency boundary is absent.
+            return {**result, "delivery_status": "rejected_missing_update_id"}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        delivery = self.service.enqueue_telegram_text_delivery(
+            update_id=update_id,
+            chat_id=chat.get("id"),
+            reply_to_message_id=_int_or_none(message.get("message_id")),
+            message_thread_id=_int_or_none(message.get("message_thread_id")),
+            text=text,
+            result=result,
+        )
+        if self._wait_for_response:
+            delivery = self.service.wait_for_telegram_delivery(
+                delivery.id,
+                timeout=self.service.config.hermes_timeout_seconds + 30,
+            ) or delivery
+        return {
+            **result,
+            "delivery_job_id": delivery.id,
+            "delivery_status": delivery.status,
+        }
 
     def _route_private(
         self,
@@ -210,26 +332,56 @@ class TelegramGateway:
         message: dict[str, Any],
         text: str,
         attachments: list[UploadedFile],
+        *,
+        update_id: int | None,
     ) -> dict[str, Any]:
         scope_id = str(actor["id"])
-        after_id = self.service.latest_message_id("private", scope_id)
-        result = self.service.send_private_message(actor, text, attachments)
-        agent = self.service.wait_for_agent_message_after(
-            "private",
-            scope_id,
-            after_id,
-            timeout=self.service.config.hermes_timeout_seconds + 30,
+        result = self.service.send_private_message(
+            actor,
+            text,
+            attachments,
+            telegram_update_id=update_id,
         )
-        if agent:
-            self._send_agent_response(actor, message, agent)
+        user_message_id = int(result["user_message"]["id"])
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        delivery = self.service.enqueue_telegram_delivery(
+            actor=actor,
+            update_id=update_id,
+            user_message_id=user_message_id,
+            chat_id=chat.get("id"),
+            reply_to_message_id=_int_or_none(message.get("message_id")),
+            message_thread_id=_int_or_none(message.get("message_thread_id")),
+        )
+        if self._wait_for_response:
+            delivery = self.service.wait_for_telegram_delivery(
+                delivery.id,
+                timeout=self.service.config.hermes_timeout_seconds + 30,
+            ) or delivery
+        agent = self.service.agent_message_replying_to("private", scope_id, user_message_id)
         return {
             "ok": True,
+            "accepted": True,
             "scope_type": "private",
             "scope_id": scope_id,
-            "user_message_id": result["user_message"]["id"],
+            "user_message_id": user_message_id,
             "agent_message_id": agent.get("id") if agent else None,
             "attachment_count": len(attachments),
+            "delivery_job_id": delivery.id,
+            "delivery_status": delivery.status,
         }
+
+    def _deliver_agent_response(
+        self,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+        agent_message: dict[str, Any],
+    ) -> None:
+        message = {
+            "message_id": payload.get("reply_to_message_id"),
+            "message_thread_id": payload.get("message_thread_id"),
+            "chat": {"id": payload.get("chat_id"), "type": "private"},
+        }
+        self._send_agent_response(actor, message, agent_message, raise_errors=True)
 
     def _attachments_for_message(self, message: dict[str, Any]) -> tuple[list[UploadedFile], list[str]]:
         descriptors = self._attachment_descriptors(message)
@@ -302,21 +454,22 @@ class TelegramGateway:
     def _help_text(self, sender: dict[str, Any]) -> str:
         return (
             "Telegram 私聊网关已连接。\n"
-            f"你的 Telegram ID 是：{sender.get('id')}\n"
-            "请在平台的「私人 Agent」页面绑定这个 ID。绑定后，私聊发送的消息会进入你自己的私人 Agent。"
+            "请在平台的「私人 Agent」页面生成一次性绑定码，然后在这里发送完整的 /link CODE 命令。\n"
+            "绑定成功后，私聊发送的消息会进入你自己的私人 Agent。"
         )
 
     def _unlinked_text(self, sender: dict[str, Any]) -> str:
         return (
             "这个 Telegram 账号还没有绑定到平台用户。\n"
-            f"Telegram ID：{sender.get('id')}\n"
-            "登录平台后打开「私人 Agent」，在 Telegram 绑定里保存这个 ID。"
+            "登录平台后打开「私人 Agent」，生成一次性绑定码，再回到这里发送 /link CODE。"
         )
 
-    def _send_reply(self, message: dict[str, Any], text: str) -> None:
+    def _send_reply(self, message: dict[str, Any], text: str, *, raise_errors: bool = False) -> None:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = chat.get("id")
         if chat_id is None:
+            if raise_errors:
+                raise RuntimeError("Telegram delivery is missing chat_id")
             return
         try:
             self.bot.send_message(
@@ -326,19 +479,37 @@ class TelegramGateway:
                 message_thread_id=_int_or_none(message.get("message_thread_id")),
             )
         except Exception as exc:
+            if raise_errors:
+                raise
             print(f"Failed to send Telegram reply: {exc}", file=sys.stderr)
 
-    def _send_agent_response(self, actor: dict[str, Any], message: dict[str, Any], agent_message: dict[str, Any]) -> None:
+    def _send_agent_response(
+        self,
+        actor: dict[str, Any],
+        message: dict[str, Any],
+        agent_message: dict[str, Any],
+        *,
+        raise_errors: bool = False,
+    ) -> None:
         content = str(agent_message.get("content") or "").strip()
         if content:
-            self._send_reply(message, content)
+            self._send_reply(message, content, raise_errors=raise_errors)
         for attachment in agent_message.get("attachments") or []:
-            self._send_attachment(actor, message, attachment)
+            self._send_attachment(actor, message, attachment, raise_errors=raise_errors)
 
-    def _send_attachment(self, actor: dict[str, Any], message: dict[str, Any], attachment: dict[str, Any]) -> None:
+    def _send_attachment(
+        self,
+        actor: dict[str, Any],
+        message: dict[str, Any],
+        attachment: dict[str, Any],
+        *,
+        raise_errors: bool = False,
+    ) -> None:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = chat.get("id")
         if chat_id is None:
+            if raise_errors:
+                raise RuntimeError("Telegram delivery is missing chat_id")
             return
         try:
             metadata, path = self.service.get_attachment_file(actor, int(attachment.get("id")))
@@ -351,18 +522,28 @@ class TelegramGateway:
                 message_thread_id=_int_or_none(message.get("message_thread_id")),
             )
         except Exception as exc:
+            if raise_errors:
+                raise
             print(f"Failed to send Telegram attachment: {exc}", file=sys.stderr)
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 updates = self.bot.get_updates(offset=self._offset, timeout=POLL_TIMEOUT_SECONDS)
+                # A configuration change can stop this gateway while the Bot
+                # API long-poll is still in flight. Never process the returned
+                # batch after stop: the replacement gateway (plus persistent
+                # update-id dedupe) owns it.
+                if self._stop.is_set():
+                    return
                 for update in updates:
+                    if self._stop.is_set():
+                        return
                     update_id = _int_or_none(update.get("update_id"))
-                    if update_id is not None:
-                        self._offset = update_id + 1
                     try:
                         self.process_update(update)
+                        if update_id is not None:
+                            self._offset = update_id + 1
                     except ServiceError as exc:
                         print(f"Telegram gateway rejected update: {exc.message}", file=sys.stderr)
                     except Exception as exc:

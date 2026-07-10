@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -107,6 +108,69 @@ class KnowledgeDedupTests(unittest.TestCase):
                 self.assertNotEqual(first["id"], second["id"])
                 count = db.scalar("SELECT count(*) FROM knowledge_documents")
                 self.assertEqual(count, 2)
+            finally:
+                db.close()
+
+    def test_concurrent_identical_insert_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "kb.db")
+            try:
+                kb = KnowledgeBase(db)
+                barrier = threading.Barrier(2)
+                results: list[tuple[int, bool]] = []
+                errors: list[BaseException] = []
+
+                def insert() -> None:
+                    try:
+                        barrier.wait()
+                        document, created = kb.add_document_with_status(
+                            title="Concurrent",
+                            content="one canonical document",
+                            source="sync",
+                        )
+                        results.append((int(document["id"]), created))
+                    except BaseException as exc:  # pragma: no cover - asserted below
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=insert) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 2)
+                self.assertEqual({item[0] for item in results}, {results[0][0]})
+                self.assertEqual(sum(1 for _doc_id, created in results if created), 1)
+                self.assertEqual(db.scalar("SELECT count(*) FROM knowledge_documents"), 1)
+            finally:
+                db.close()
+
+    def test_hash_migration_preserves_historical_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "kb.db")
+            try:
+                ts = 1
+                for _ in range(2):
+                    db.insert(
+                        """
+                        INSERT INTO knowledge_documents(
+                            title, summary, content, source, created_by, created_at, updated_at
+                        ) VALUES ('Legacy', 'summary', 'same body', 'sync', NULL, ?, ?)
+                        """,
+                        (ts, ts),
+                    )
+                ids_before = [row["id"] for row in db.query("SELECT id FROM knowledge_documents ORDER BY id")]
+
+                kb = KnowledgeBase(db)
+                ids_after = [row["id"] for row in db.query("SELECT id FROM knowledge_documents ORDER BY id")]
+                document, created = kb.add_document_with_status(
+                    title="Legacy", content="same body", source="sync"
+                )
+
+                self.assertEqual(ids_after, ids_before)
+                self.assertFalse(created)
+                self.assertEqual(document["id"], ids_before[0])
             finally:
                 db.close()
 

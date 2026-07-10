@@ -45,6 +45,7 @@ export interface AppState {
   /* auth slice */
   user: User | null;
   busy: boolean;
+  pendingOperations: string[];
   error: string;
 
   /* chat slice */
@@ -93,7 +94,7 @@ export interface AppState {
 
 /* ----------------------------- per-slice state sub-types (for slice files) */
 
-export type AuthSliceState = Pick<AppState, "user" | "busy" | "error">;
+export type AuthSliceState = Pick<AppState, "user" | "busy" | "pendingOperations" | "error">;
 
 export type ChatSliceState = Pick<
   AppState,
@@ -149,9 +150,13 @@ export type UiSliceState = Pick<AppState, "sidebarOpen">;
 interface ResetSessionAction {
   type: "RESET_SESSION";
 }
-interface SetBusyAction {
-  type: "SET_BUSY";
-  payload: boolean;
+interface BeginBusyAction {
+  type: "BEGIN_BUSY";
+  payload: string;
+}
+interface EndBusyAction {
+  type: "END_BUSY";
+  payload: string;
 }
 interface SetErrorAction {
   type: "SET_ERROR";
@@ -368,7 +373,8 @@ interface ToggleSidebarAction {
 export type Action =
   /* cross-cutting */
   | ResetSessionAction
-  | SetBusyAction
+  | BeginBusyAction
+  | EndBusyAction
   | SetErrorAction
   /* auth */
   | SetUserAction

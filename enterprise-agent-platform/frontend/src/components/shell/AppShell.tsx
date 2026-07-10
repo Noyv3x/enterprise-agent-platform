@@ -36,9 +36,10 @@ export function AppShell() {
   const sidebarOpen = useStore((state) => state.sidebarOpen);
   const isMobile = useMediaQuery("(max-width: 800px)");
 
-  // Shell-owned realtime + safety-net poll for the active scope.
-  useRealtime();
-  usePolling();
+  // Poll only while SSE is unavailable or reconnecting. A newly opened stream
+  // suppresses redundant full-message polling; any error re-enables it.
+  const realtimeConnected = useRealtime();
+  usePolling(!realtimeConnected);
 
   const closeSidebar = () => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
 

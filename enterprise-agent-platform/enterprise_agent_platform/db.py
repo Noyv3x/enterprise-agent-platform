@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
+
 
 def now_ts() -> int:
     return int(time.time())
@@ -51,7 +53,8 @@ class Database:
 
     def __init__(self, path: Path):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.path.parent)
+        ensure_private_file(self.path)
         self._local = threading.local()
         self._init_lock = threading.RLock()
         self._holders: "weakref.WeakSet[_ConnectionHolder]" = weakref.WeakSet()
@@ -66,6 +69,7 @@ class Database:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        tighten_sqlite_files(self.path)
         return conn
 
     @property
@@ -105,6 +109,7 @@ class Database:
             self._local.holder = None
         except Exception:
             pass
+        tighten_sqlite_files(self.path)
 
     def init_schema(self) -> None:
         with self._init_lock:
@@ -202,6 +207,36 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'host' CHECK(execution_backend = 'host'),
+                    legacy_container_name TEXT NOT NULL DEFAULT '',
+                    legacy_container_id TEXT NOT NULL DEFAULT '',
+                    legacy_cleanup_status TEXT NOT NULL DEFAULT 'not_needed'
+                        CHECK(legacy_cleanup_status IN ('not_needed', 'pending', 'removed', 'failed', 'skipped')),
+                    legacy_cleanup_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_scopes_type_id
+                    ON agent_scopes(scope_type, scope_id);
+
+                CREATE TABLE IF NOT EXISTS agent_scope_sessions (
+                    scope_key TEXT NOT NULL REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_scope_sessions_lookup
+                    ON agent_scope_sessions(scope_key, lifecycle_id, session_id);
+
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -232,9 +267,34 @@ class Database:
                     PRIMARY KEY(provider, external_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
+
+                CREATE TABLE IF NOT EXISTS telegram_link_challenges (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    code_hash TEXT NOT NULL UNIQUE,
+                    expires_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_link_challenges_expiry
+                    ON telegram_link_challenges(expires_at);
+
+                CREATE TABLE IF NOT EXISTS telegram_updates (
+                    update_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'queued'
+                        CHECK(status IN ('queued', 'processing', 'succeeded', 'failed', 'ignored')),
+                    received_at INTEGER NOT NULL,
+                    processed_at INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_updates_status
+                    ON telegram_updates(status, update_id);
                 """
             )
             self._ensure_user_columns()
+            self._migrate_private_agent_scopes()
+            self._ensure_agent_scope_columns()
+            self._ensure_telegram_update_columns()
             self._ensure_fts()
             self._conn.commit()
 
@@ -263,6 +323,79 @@ class Database:
         self._conn.execute(
             "UPDATE users SET thinking_depth = 'medium' WHERE thinking_depth IS NULL OR thinking_depth = ''"
         )
+
+    def _ensure_agent_scope_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(agent_scopes)").fetchall()}
+        if "lifecycle_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE agent_scopes ADD COLUMN lifecycle_id TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            "UPDATE agent_scopes SET lifecycle_id = lower(hex(randomblob(16))) WHERE lifecycle_id = ''"
+        )
+
+    def _ensure_telegram_update_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(telegram_updates)").fetchall()}
+        if "result_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE telegram_updates ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    def _migrate_private_agent_scopes(self) -> None:
+        """Import the legacy private-Agent row without mutating it.
+
+        ``private_agents`` is retained and dual-written for one release so a
+        rollback can still read the current session. ``agent_scopes`` is the
+        authoritative runtime state. Any
+        historical platform container is copied into explicit cleanup-tracking
+        columns so the host-execution manager can remove only known resources
+        and retain failures for a later retry.
+        """
+
+        rows = self._conn.execute("SELECT * FROM private_agents").fetchall()
+        workspace_root = self.path.parent / "workspaces"
+        for row in rows:
+            user_id = int(row["user_id"])
+            container_name = str(row["container_name"] or "")
+            cleanup_status = "pending" if container_name else "not_needed"
+            workspace = workspace_root / f"user-{user_id}"
+            self._conn.execute(
+                """
+                INSERT INTO agent_scopes(
+                    scope_key, scope_type, scope_id, session_id, workspace_path,
+                    execution_backend, legacy_container_name, legacy_container_id,
+                    legacy_cleanup_status, created_at, updated_at
+                ) VALUES (?, 'private', ?, ?, ?, 'host', ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    legacy_container_name = CASE
+                        WHEN agent_scopes.legacy_container_name = ''
+                        THEN excluded.legacy_container_name
+                        ELSE agent_scopes.legacy_container_name
+                    END,
+                    legacy_container_id = CASE
+                        WHEN agent_scopes.legacy_container_id = ''
+                        THEN excluded.legacy_container_id
+                        ELSE agent_scopes.legacy_container_id
+                    END,
+                    legacy_cleanup_status = CASE
+                        WHEN agent_scopes.legacy_cleanup_status = 'not_needed'
+                             AND excluded.legacy_container_name != ''
+                        THEN 'pending'
+                        ELSE agent_scopes.legacy_cleanup_status
+                    END
+                """,
+                (
+                    f"private:{user_id}",
+                    str(user_id),
+                    str(row["session_id"] or f"enterprise-private-u{user_id}"),
+                    str(workspace),
+                    container_name,
+                    str(row["container_id"] or ""),
+                    cleanup_status,
+                    int(row["created_at"]),
+                    int(row["updated_at"]),
+                ),
+            )
 
     def _ensure_fts(self) -> None:
         try:

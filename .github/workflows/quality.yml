@@ -1,0 +1,110 @@
+name: Quality gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Python 3.11
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: enterprise-agent-platform
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: enterprise-agent-platform/pyproject.toml
+
+      - name: Install platform
+        run: python -m pip install --no-input --editable .
+
+      - name: Compile Python sources
+        run: python -m compileall -q enterprise_agent_platform hermes_plugin tests
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+
+  frontend:
+    name: Node 24
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: enterprise-agent-platform/frontend
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: enterprise-agent-platform/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check frontend
+        run: npm run check
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build browser assets
+        run: npm run build
+
+      - name: Verify generated assets are committed
+        working-directory: .
+        shell: bash
+        run: |
+          static_dir="enterprise-agent-platform/enterprise_agent_platform/static"
+          git diff --exit-code -- "$static_dir"
+          if [[ -n "$(git status --porcelain --untracked-files=all -- "$static_dir")" ]]; then
+            echo "Generated browser assets are not in sync with frontend source." >&2
+            git status --short --untracked-files=all -- "$static_dir" >&2
+            exit 1
+          fi
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+
+  hermes-patch:
+    name: Hermes runtime patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify runtime patch applies cleanly
+        run: >-
+          git -C hermes-agent apply --check
+          ../enterprise-agent-platform/enterprise_agent_platform/hermes_runtime_patch/hermes_agent_isolation.patch

@@ -130,7 +130,17 @@ export function MessageList({
   }
 
   return (
-    <div className="messages" data-chat-key={scopeKey} ref={ref}>
+    <div
+      className="messages"
+      data-chat-key={scopeKey}
+      ref={ref}
+      role="log"
+      aria-label={mode === "private" ? "私人 Agent 消息" : "频道消息"}
+      aria-live="polite"
+      aria-relevant="additions text"
+      aria-busy={isAgentActive(status)}
+      tabIndex={0}
+    >
       {body}
     </div>
   );

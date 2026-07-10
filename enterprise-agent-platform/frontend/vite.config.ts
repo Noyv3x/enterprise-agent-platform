@@ -5,16 +5,19 @@ export default defineConfig({
   plugins: [react()],
   base: "/",
   build: {
-    outDir: "../enterprise_agent_platform/static",
-    emptyOutDir: false,
+    // Direct `vite build` is deliberately safe: it can only replace this local
+    // scratch directory. `npm run build` supplies a unique same-filesystem
+    // staging path and publishes it only after validation.
+    outDir: ".vite-static-staging",
+    emptyOutDir: true,
     target: "es2020",
     rollupOptions: {
       output: {
-        entryFileNames: "app.js",
-        chunkFileNames: "chunk-[name].js",
+        entryFileNames: "app-[hash].js",
+        chunkFileNames: "chunk-[name]-[hash].js",
         assetFileNames: (assetInfo) => {
           const name = assetInfo.names[0] ?? "";
-          return name.endsWith(".css") ? "styles.css" : "asset-[name][extname]";
+          return name.endsWith(".css") ? "styles-[hash].css" : "asset-[name]-[hash][extname]";
         }
       }
     }

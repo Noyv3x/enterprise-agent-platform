@@ -146,7 +146,7 @@ export function Composer({
     onBumpForceBottom();
     notify(false);
     const sent = await sendMessage(store, mode, scopeId, content, files);
-    if (!sent) {
+    if (sent === false) {
       // Restore the user's text + files so nothing is lost, then re-focus.
       setDraft(content);
       if (files.length) dispatch({ type: "SET_DRAFT_FILES", payload: { key: draftKey, files } });

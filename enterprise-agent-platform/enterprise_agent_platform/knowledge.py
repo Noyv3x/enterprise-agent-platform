@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -49,6 +50,45 @@ class KnowledgeHit:
 class KnowledgeBase:
     def __init__(self, db: Database):
         self.db = db
+        self._ensure_content_hash_schema()
+
+    @staticmethod
+    def _content_hash(title: str, content: str, source: str) -> str:
+        payload = "\x00".join((title, content, source)).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _ensure_content_hash_schema(self) -> None:
+        """Add/backfill the concurrent-safe document idempotency key."""
+
+        with self.db.transaction() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_documents)").fetchall()}
+            if "content_hash" not in columns:
+                conn.execute("ALTER TABLE knowledge_documents ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+            rows = conn.execute(
+                "SELECT id, title, content, source, content_hash FROM knowledge_documents ORDER BY id"
+            ).fetchall()
+            seen: dict[str, tuple[int, str, str, str]] = {}
+            for row in rows:
+                digest = self._content_hash(str(row["title"]), str(row["content"]), str(row["source"] or ""))
+                prior = seen.get(digest)
+                current = (int(row["id"]), str(row["title"]), str(row["content"]), str(row["source"] or ""))
+                if prior is not None:
+                    # Preserve every historical row (including exact duplicates)
+                    # because document ids may have been copied into audit logs
+                    # or external Cognee metadata. The oldest row retains the
+                    # canonical digest used for future idempotent inserts; later
+                    # rows receive stable id-qualified migration digests.
+                    digest = hashlib.sha256(f"{digest}:{current[0]}".encode("ascii")).hexdigest()
+                seen[digest] = current
+                if str(row["content_hash"] or "") != digest:
+                    conn.execute(
+                        "UPDATE knowledge_documents SET content_hash = ? WHERE id = ?",
+                        (digest, current[0]),
+                    )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_content_hash "
+                "ON knowledge_documents(content_hash) WHERE content_hash != ''"
+            )
 
     def add_document(
         self,
@@ -88,32 +128,28 @@ class KnowledgeBase:
             raise ValueError("content is required")
         if MAX_CONTENT_CHARS > 0 and len(content) > MAX_CONTENT_CHARS:
             raise ValueError(f"content exceeds {MAX_CONTENT_CHARS} characters")
-        # Dedup on insert: re-submitting an identical document (same title,
-        # content, and source) should not create a duplicate row, which would
-        # otherwise be independently FTS-indexed and re-queued for Cognee
-        # ingestion. Return the existing document instead so callers stay
-        # idempotent (e.g. UI double-clicks, automated re-syncs).
-        existing = self.db.query_one(
-            """
-            SELECT id FROM knowledge_documents
-            WHERE title = ? AND content = ? AND source = ?
-            ORDER BY id LIMIT 1
-            """,
-            (title, content, source),
-        )
-        if existing:
-            return (self.get_document(int(existing["id"])) or {}, False)
         if not summary:
             summary = summarize_content(content)
         ts = now_ts()
-        doc_id = self.db.insert(
-            """
-            INSERT INTO knowledge_documents(title, summary, content, source, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (title, summary.strip(), content, source, created_by, ts, ts),
-        )
-        return (self.get_document(doc_id) or {}, True)
+        content_hash = self._content_hash(title, content, source)
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO knowledge_documents(
+                    title, summary, content, source, created_by, created_at, updated_at, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(content_hash) WHERE content_hash != '' DO NOTHING
+                """,
+                (title, summary.strip(), content, source, created_by, ts, ts, content_hash),
+            )
+            row = conn.execute(
+                "SELECT id FROM knowledge_documents WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("knowledge document insert did not produce a row")
+        doc_id = int(row["id"])
+        return (self.get_document(doc_id) or {}, cursor.rowcount > 0)
 
     def get_document(self, document_id: int) -> dict[str, Any] | None:
         return self.db.query_one(

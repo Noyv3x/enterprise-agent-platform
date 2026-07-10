@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import secrets
@@ -10,17 +11,18 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque
+from typing import Any, Callable, Deque
 
 from .auth import TokenSigner, hash_password, verify_password
+from .agent_scopes import AgentExecutionScope, AgentScopeManager
 from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
-from .containers import ContainerManager
 from .db import Database, decode_json, encode_json, now_ts
 from .hermes import AgentClient, AgentResult, AutoAgentClient, is_substantive_tool_start
 from .hermes_oauth_bridge import HermesOAuthBridge
@@ -32,6 +34,7 @@ from .internal_config import (
     update_yaml_text,
     update_yaml_values,
 )
+from .jobs import DurableJob, DurableJobStore
 from .knowledge import KnowledgeBase, format_passive_suggestions
 from .oauth_flows import OAuthFlowError, OAuthFlowManager, SUPPORTED_OAUTH_PROVIDERS, oauth_provider_info
 from .runtimes import (
@@ -48,6 +51,7 @@ from .runtimes import (
     default_base_url_for_provider,
     normalize_hermes_provider,
 )
+from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
 
 class ServiceError(Exception):
@@ -55,6 +59,12 @@ class ServiceError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class _AgentTaskCancelled(Exception):
+    def __init__(self, message: str, *, needs_review: bool = False):
+        super().__init__(message)
+        self.needs_review = bool(needs_review)
 
 
 @dataclass(frozen=True)
@@ -73,11 +83,19 @@ def _float_env(name: str, default: float) -> float:
 
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+MAX_ATTACHMENTS_TOTAL_BYTES = max(
+    MAX_ATTACHMENT_BYTES,
+    int(os.getenv("ENTERPRISE_MAX_ATTACHMENTS_TOTAL_BYTES", str(100 * 1024 * 1024)) or "0"),
+)
 ASYNC_DELEGATION_POLL_SECONDS = max(1.0, _float_env("ENTERPRISE_HERMES_ASYNC_POLL_SECONDS", 5.0))
 # Cumulative per-uploader storage budget for attachment blobs. Bounds deliberate
 # or accidental disk exhaustion by any authenticated chat/private-agent user.
 # 0 disables the quota.
 ATTACHMENT_QUOTA_BYTES = max(0, int(os.getenv("ENTERPRISE_ATTACHMENT_QUOTA_BYTES", str(2 * 1024 * 1024 * 1024)) or "0"))
+GLOBAL_ATTACHMENT_QUOTA_BYTES = max(
+    0,
+    int(os.getenv("ENTERPRISE_GLOBAL_ATTACHMENT_QUOTA_BYTES", str(10 * 1024 * 1024 * 1024)) or "0"),
+)
 # Sliding-window per-user upload rate limit. Caps how many attachment-bearing
 # messages a single user can send within the window, providing lightweight
 # backpressure against storage floods. Only messages that carry attachments are
@@ -119,6 +137,18 @@ MAX_TRACKED_INGEST_RESULTS = 1000
 # counted as a permanent failure (surfaced in knowledge_status).
 MAX_INGEST_ATTEMPTS = max(1, int(os.getenv("ENTERPRISE_INGEST_MAX_ATTEMPTS", "3") or "3"))
 INGEST_RETRY_BACKOFF_CAP_SECONDS = 30
+AGENT_JOB_LEASE_SECONDS = max(60, int(os.getenv("ENTERPRISE_AGENT_JOB_LEASE_SECONDS", "3600") or "3600"))
+COGNEE_JOB_LEASE_SECONDS = max(60, int(os.getenv("ENTERPRISE_COGNEE_JOB_LEASE_SECONDS", "3600") or "3600"))
+TELEGRAM_LINK_TTL_SECONDS = max(60, min(int(os.getenv("ENTERPRISE_TELEGRAM_LINK_TTL_SECONDS", "600") or "600"), 3600))
+TELEGRAM_DELIVERY_JOB_KIND = "telegram_delivery"
+TELEGRAM_DELIVERY_LEASE_SECONDS = max(
+    60, int(os.getenv("ENTERPRISE_TELEGRAM_DELIVERY_LEASE_SECONDS", "600") or "600")
+)
+TELEGRAM_DELIVERY_POLL_SECONDS = max(
+    0.05, min(_float_env("ENTERPRISE_TELEGRAM_DELIVERY_POLL_SECONDS", 0.2), 2.0)
+)
+_DURABLE_AGENT_START_MESSAGE_SETTING = "durable_agent_jobs_start_message_id"
+TELEGRAM_LINK_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
     "image/png",
     "image/jpeg",
@@ -222,8 +252,25 @@ class EnterpriseService:
         autostart_runtime: bool = True,
     ):
         self.config = config
-        self.config.data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.config.data_dir)
+        self._instance_lock_fd: int | None = None
+        self._instance_lock_finalizer: weakref.finalize | None = None
+        self._acquire_instance_lock()
         self.db = Database(config.db_path)
+        self.jobs = DurableJobStore(self.db)
+        # Agent runs and Telegram sends can have external side effects. An
+        # interrupted running record is quarantined rather than blindly
+        # repeated; queued work remains recoverable and is claimed at least
+        # once after its exact Agent reply becomes available.
+        self.jobs.recover_interrupted(unsafe_kinds={"agent", TELEGRAM_DELIVERY_JOB_KIND})
+        # Telegram updates interrupted before acknowledgement are made
+        # claimable again. Telegram will redeliver an unacknowledged webhook or
+        # an uncommitted long-poll update; the update-id row remains the dedupe
+        # boundary for every completed delivery.
+        self.db.execute(
+            "UPDATE telegram_updates SET status = 'queued', last_error = ? WHERE status = 'processing'",
+            ("gateway interrupted by service restart",),
+        )
         self.tokens = TokenSigner(self._resolve_session_secret(), self._effective_session_ttl_seconds())
         self.knowledge = KnowledgeBase(self.db)
         self.runtimes = PlatformRuntimeManager(
@@ -234,14 +281,28 @@ class EnterpriseService:
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
-        self.containers = ContainerManager(config, self.db, runner=container_command_runner)
+        # ``container_command_runner`` remains as an internal constructor
+        # compatibility hook, but is used only to remove containers recorded by
+        # pre-host-execution installations.  No Agent container is provisioned.
+        self.agent_scopes = AgentScopeManager(
+            config,
+            self.db,
+            cleanup_runner=container_command_runner,
+        )
         self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
         self.hermes_bridge = hermes_bridge or HermesOAuthBridge(self.runtimes)
         oauth_flow_bridge = None if oauth_http_client is not None else self.hermes_bridge
         self.oauth_flows = OAuthFlowManager(oauth_http_client, hermes_bridge=oauth_flow_bridge)
         self._conversation_lock = threading.RLock()
+        # Message rows and their attachment files form one logical unit.  This
+        # lock closes the file-written/row-inserted window against concurrent
+        # administrative deletion; it is deliberately re-entrant because the
+        # high-level delete helpers call the lower-level file cleanup helper.
+        self._attachment_lock = threading.RLock()
         self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
+        self._agent_active_tasks: dict[str, dict[str, Any]] = {}
+        self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
         # Global backpressure on concurrent in-flight Hermes generations.
@@ -255,20 +316,23 @@ class EnterpriseService:
         # whether or not the username exists, eliminating a timing oracle.
         self._dummy_password_hash = hash_password(secrets.token_urlsafe(16))
         self._ingest_lock = threading.Lock()
+        self._ingest_condition = threading.Condition(self._ingest_lock)
         self._ingest_queue: Deque[dict[str, Any]] = deque()
         self._ingest_thread: threading.Thread | None = None
+        self._ingest_wakeup = threading.Event()
         self._ingest_results: dict[int, dict[str, Any]] = {}
         # Operator-visible counters for documents that exhausted ingest retries.
         self._ingest_failed_count = 0
         self._ingest_last_error = ""
-        # Background reclaimer for idle per-user containers. Disabled (no thread)
-        # unless ENTERPRISE_CONTAINER_IDLE_HOURS > 0.
-        self._reaper_stop = threading.Event()
-        self._reaper_thread: threading.Thread | None = None
         self._async_delegation_stop = threading.Event()
         self._async_delegation_thread: threading.Thread | None = None
         self._async_delegation_seen: set[str] = set()
         self._telegram_gateway = None
+        self._telegram_delivery_lock = threading.Lock()
+        self._telegram_delivery_wakeup = threading.Event()
+        self._telegram_delivery_thread: threading.Thread | None = None
+        self._telegram_delivery_handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None
+        self._telegram_delivery_generation = 0
         self._auto_updater = AutoUpdateManager(
             self,
             repo_root=auto_update_repo_root,
@@ -276,7 +340,18 @@ class EnterpriseService:
             launcher=auto_update_launcher,
         )
         self._closed = False
+        self._resources_closed = False
+        self._close_lock = threading.Lock()
         self.ensure_bootstrap()
+        self._cleanup_incomplete_attachment_messages()
+        self._cleanup_orphan_attachment_files()
+        # One-time compatibility cleanup. Failures stay tracked on the scope row
+        # and are retried at a later start; they never prevent the host backend
+        # from serving requests.
+        try:
+            self.agent_scopes.cleanup_legacy_containers()
+        except Exception as exc:
+            print(f"Failed to clean up legacy Agent containers: {exc}", file=sys.stderr)
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
             prepare_agent_runtime = getattr(self.agent_client, "prepare_runtime", None)
@@ -287,67 +362,466 @@ class EnterpriseService:
                     print(f"Failed to start Hermes relay connector: {exc}", file=sys.stderr)
             self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_hermes_ready(wait=False)
-        self._start_container_reaper()
+        self._recover_durable_work()
         self._start_telegram_gateway()
         self._start_auto_update_listener()
         self._start_async_delegation_watcher()
 
-    def _start_container_reaper(self) -> None:
-        """Start a daemon thread that periodically reclaims idle per-user
-        containers, so a user who simply stops messaging (without being
-        deactivated) does not leak a running container. No-op unless
-        ENTERPRISE_CONTAINER_IDLE_HOURS > 0; for the local-workspace backend the
-        sweep is a cheap query that matches nothing."""
-        try:
-            idle_hours = float(os.getenv("ENTERPRISE_CONTAINER_IDLE_HOURS", "0") or "0")
-        except ValueError:
-            idle_hours = 0.0
-        if idle_hours <= 0:
-            return
-        interval = max(300.0, min(idle_hours * 3600.0, 3600.0))
+    def close(self) -> None:
+        with self._close_lock:
+            if self._resources_closed:
+                return
+            with self._conversation_lock:
+                self._closed = True
+                workers = list(self._agent_workers.values())
+            self.unregister_telegram_delivery_handler()
+            if self._telegram_gateway is not None:
+                self._telegram_gateway.stop()
+            self._auto_updater.stop()
+            self._async_delegation_stop.set()
+            self._ingest_wakeup.set()
+            self._telegram_delivery_wakeup.set()
 
-        def _loop() -> None:
-            while not self._closed:
+            # First terminate scope-owned processes and the managed runtimes so
+            # blocked HTTP/Cognee calls return. The database deliberately stays
+            # open until every worker has observed shutdown and persisted its
+            # durable terminal state.
+            self._cleanup_all_agent_scopes()
+            close_agent_client = getattr(self.agent_client, "close", None)
+            if callable(close_agent_client):
                 try:
-                    self.containers.reap_idle_containers(idle_hours=idle_hours)
+                    close_agent_client()
                 except Exception:
                     pass
-                # Wake immediately on shutdown; otherwise sweep on each interval.
-                if self._reaper_stop.wait(interval):
-                    return
+            self.runtimes.close()
 
-        self._reaper_thread = threading.Thread(target=_loop, name="container-reaper", daemon=True)
-        self._reaper_thread.start()
+            async_delegation = self._async_delegation_thread
+            with self._ingest_lock:
+                ingest = self._ingest_thread
+            with self._telegram_delivery_lock:
+                telegram_delivery = self._telegram_delivery_thread
+            deadline = time.monotonic() + 15.0
+            for worker in [async_delegation, ingest, telegram_delivery, *workers]:
+                if worker is None or worker is threading.current_thread():
+                    continue
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
-    def close(self) -> None:
-        with self._conversation_lock:
-            self._closed = True
-            workers = list(self._agent_workers.values())
-        if self._telegram_gateway is not None:
-            self._telegram_gateway.stop()
-        self._auto_updater.stop()
-        self._reaper_stop.set()
-        self._async_delegation_stop.set()
-        reaper = self._reaper_thread
-        if reaper is not None:
-            reaper.join(timeout=2)
-        async_delegation = self._async_delegation_thread
-        if async_delegation is not None:
-            async_delegation.join(timeout=2)
-        for worker in workers:
-            worker.join(timeout=2)
-        with self._ingest_lock:
-            ingest = self._ingest_thread
-        if ingest is not None:
-            ingest.join(timeout=2)
-        close_agent_client = getattr(self.agent_client, "close", None)
-        if callable(close_agent_client):
+            live_workers = [
+                worker
+                for worker in [async_delegation, ingest, telegram_delivery, *workers]
+                if worker is not None and worker is not threading.current_thread() and worker.is_alive()
+            ]
+            if live_workers:
+                # Closing SQLite here would create a deterministic teardown race
+                # with the still-running worker. Leave it open for a later close
+                # attempt/process exit and make the condition operator-visible.
+                print(
+                    "Service shutdown deferred database close because workers are still active: "
+                    + ", ".join(worker.name for worker in live_workers),
+                    file=sys.stderr,
+                )
+                return
+            self.db.close()
+            self._release_instance_lock()
+            self._resources_closed = True
+
+    def _acquire_instance_lock(self) -> None:
+        """Enforce one service process per platform data directory.
+
+        SQLite serializes individual writes but cannot make the platform's
+        in-memory workers, lifecycle epochs, and external side effects a
+        multi-process transaction. The supported small-enterprise deployment is
+        therefore explicitly single-instance. ``flock`` is released by the
+        kernel on process death, making startup recovery proof that no prior
+        owner is still processing Telegram updates or Agent jobs.
+        """
+
+        lock_path = self.config.data_dir / ".enterprise-platform.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                f"another enterprise platform instance is already using {self.config.data_dir}"
+            ) from exc
+        except Exception:
+            os.close(fd)
+            raise
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        self._instance_lock_fd = fd
+        self._instance_lock_finalizer = weakref.finalize(self, os.close, fd)
+
+    def _release_instance_lock(self) -> None:
+        fd = self._instance_lock_fd
+        if fd is None:
+            return
+        self._instance_lock_fd = None
+        finalizer = self._instance_lock_finalizer
+        self._instance_lock_finalizer = None
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _cleanup_agent_scope(
+        self,
+        scope_key: str,
+        *,
+        lifecycle_id: str | None = None,
+        strict: bool = False,
+    ) -> None:
+        cleanup = getattr(self.agent_client, "cleanup_scope", None)
+        if not callable(cleanup):
+            return
+        try:
             try:
-                close_agent_client()
-            except Exception:
-                pass
-        self.runtimes.close()
-        self.db.close()
+                cleanup(scope_key, lifecycle_id=lifecycle_id)
+            except TypeError:
+                # Test/local adapters and one-release third-party integrations
+                # may still expose the pre-lifecycle signature.
+                cleanup(scope_key)
+        except Exception as exc:
+            if not strict:
+                print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
+                return
+            # A successful lifecycle mutation must not leave a known live run
+            # capable of further host-side tool effects. Restarting the managed
+            # runtime is the fail-closed fallback when targeted cancellation
+            # cannot be confirmed.
+            try:
+                status = self.runtimes.restart_hermes()
+            except Exception as restart_exc:
+                raise ServiceError(
+                    503,
+                    f"Agent scope was reset but Hermes cancellation failed: {restart_exc}",
+                ) from restart_exc
+            if not status.available:
+                raise ServiceError(
+                    503,
+                    f"Agent scope was reset but Hermes cancellation could not be confirmed: {status.error or exc}",
+                ) from exc
+
+    def _cleanup_all_agent_scopes(self) -> None:
+        for row in self.db.query("SELECT scope_key FROM agent_scopes ORDER BY scope_key"):
+            self._cleanup_agent_scope(str(row["scope_key"]))
+
+    def _task_scope_is_current(self, task: dict[str, Any]) -> bool:
+        key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
+        with self._conversation_lock:
+            lifecycle_current = (
+                not self._closed
+                and int(task.get("_scope_epoch") or 0) == int(self._agent_scope_epochs.get(key, 0))
+            )
+            if not lifecycle_current:
+                return False
+            job_id = int(task.get("_job_id") or 0)
+            if not job_id:
+                return True
+            job = self.jobs.get(job_id)
+            return job is not None and job.status == "running"
+
+    def _ensure_agent_task_can_run(self, task: dict[str, Any]) -> None:
+        if not self._task_scope_is_current(task):
+            with self._conversation_lock:
+                shutting_down = self._closed
+            raise _AgentTaskCancelled(
+                "service is shutting down" if shutting_down else "Agent conversation was reset",
+                needs_review=shutting_down,
+            )
+        actor = task.get("actor") or {}
+        user_id = actor.get("id")
+        current = self.get_user(int(user_id)) if user_id is not None else None
+        if not current or not current.get("active"):
+            raise _AgentTaskCancelled("Agent request cancelled because the user account is inactive")
+
+    def _cancel_agent_scope_work(
+        self,
+        scope_type: str,
+        scope_id: str,
+        *,
+        reason: str,
+        cleanup_runtime: bool = True,
+    ) -> None:
+        """Invalidate and terminally cancel active/queued work for a scope."""
+
+        scope_type = str(scope_type)
+        scope_id = str(scope_id)
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            self._agent_scope_epochs[key] = int(self._agent_scope_epochs.get(key, 0)) + 1
+            queued = list(self._agent_queues.pop(key, deque()))
+            self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
+            self._typing.pop(key, None)
+        queued_ids = {
+            int(task.get("_job_id") or 0)
+            for task in queued
+            if int(task.get("_job_id") or 0) > 0
+        }
+        timestamp = now_ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE durable_jobs
+                SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                WHERE kind = 'agent' AND scope_type = ? AND scope_id = ?
+                  AND status IN ('queued', 'running')
+                """,
+                (str(reason)[:2000], timestamp, scope_type, scope_id),
+            )
+            if scope_type == "private":
+                conn.execute(
+                    """
+                    UPDATE durable_jobs
+                    SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                    WHERE kind = ? AND scope_type = 'private' AND scope_id = ? AND status = 'queued'
+                    """,
+                    (str(reason)[:2000], timestamp, TELEGRAM_DELIVERY_JOB_KIND, scope_id),
+                )
+            # Queues are only a wake-up mechanism, but keeping this explicit set
+            # makes the intent clear and covers an in-memory task whose scope
+            # fields were malformed before validation.
+            for job_id in queued_ids:
+                conn.execute(
+                    """
+                    UPDATE durable_jobs
+                    SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('queued', 'running')
+                    """,
+                    (str(reason)[:2000], timestamp, job_id),
+                )
+
+        if scope_type == "private":
+            scope_key = self.agent_scopes.private_scope_key(int(scope_id))
+        else:
+            scope_key = self.agent_scopes.channel_scope_key(scope_id)
+        if cleanup_runtime and self.agent_scopes.get_scope(scope_key) is not None:
+            self._cleanup_agent_scope(scope_key)
+
+    def _recover_durable_work(self) -> None:
+        """Rebuild disposable wake-up queues from the SQLite work ledger."""
+
+        self._surface_interrupted_agent_jobs()
+        self._surface_failed_agent_jobs_without_message()
+        self._recover_agent_message_job_gaps()
+
+        # Recovery is the only producer for these disposable in-memory queues;
+        # silently truncating here strands every row after the limit until a
+        # later process restart. Small internal deployments can safely rebuild
+        # all queued ledger entries in one pass.
+        for job in self.jobs.queued("agent", limit=None):
+            task = dict(job.payload)
+            if not self._valid_recovered_agent_task(task):
+                self.jobs.mark_failed(job.id, "durable Agent payload is no longer valid")
+                continue
+            key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
+            task["_scope_epoch"] = int(self._agent_scope_epochs.get(key, 0))
+            task["_job_id"] = job.id
+            self._schedule_agent_task(task, enforce_limit=False)
+
+        recovered_ingest = []
+        for job in self.jobs.queued("cognee", limit=None):
+            payload = dict(job.payload)
+            if not payload.get("document_id"):
+                self.jobs.mark_failed(job.id, "durable Cognee payload is missing document_id")
+                continue
+            payload["_job_id"] = job.id
+            recovered_ingest.append(payload)
+        if recovered_ingest:
+            with self._ingest_lock:
+                self._ingest_queue.extend(recovered_ingest)
+                self._start_ingest_worker_locked()
+
+    def _surface_interrupted_agent_jobs(self) -> None:
+        """Persist one visible reply for side-effectful runs needing review."""
+
+        rows = self.db.query(
+            "SELECT id FROM durable_jobs WHERE kind = 'agent' AND status = 'needs_review' ORDER BY id"
+        )
+        for row in rows:
+            job = self.jobs.get(int(row["id"]))
+            if job is None:
+                continue
+            if self._durable_job_success_message_exists(job.id):
+                self.jobs.mark_succeeded(job.id, reconcile=True)
+                continue
+            if self._durable_job_message_exists(job.id):
+                continue
+            task = dict(job.payload)
+            if not self._valid_recovered_agent_task(task):
+                continue
+            task["_job_id"] = job.id
+            self._append_agent_error(
+                task,
+                "Agent execution was interrupted during restart; its side effects are uncertain and it was not run twice.",
+            )
+
+    def _surface_failed_agent_jobs_without_message(self) -> None:
+        """Repair a failed run whose user-visible error write also failed.
+
+        The ledger transition is intentionally independent from message I/O so
+        a transient SQLite/filesystem failure cannot leave work running. This
+        startup pass supplies the complementary at-least-once error message;
+        ``durable_job_id`` makes repeated starts idempotent.
+        """
+
+        for row in self.db.query(
+            "SELECT id FROM durable_jobs WHERE kind = 'agent' AND status = 'failed' ORDER BY id"
+        ):
+            job = self.jobs.get(int(row["id"]))
+            if job is None or self._durable_job_message_exists(job.id):
+                continue
+            task = dict(job.payload)
+            if not self._valid_recovered_agent_task(task):
+                continue
+            actor = task.get("actor") if isinstance(task.get("actor"), dict) else {}
+            current = self.get_user(int(actor.get("id") or 0))
+            if current is None or not current.get("active"):
+                # Deactivation is an intentional lifecycle cancellation, not a
+                # failed reply that should repopulate a private conversation.
+                continue
+            task["_job_id"] = job.id
+            try:
+                self._append_agent_error(
+                    task,
+                    job.last_error or "Agent execution failed before its error response could be saved.",
+                )
+            except Exception as exc:
+                print(f"Failed to restore Agent error message for job {job.id}: {exc}", file=sys.stderr)
+
+    def _recover_agent_message_job_gaps(self) -> None:
+        """Repair the narrow message-commit/job-enqueue crash window.
+
+        The first upgraded start records a high-water mark so historical chat
+        is never replayed. Every later start scans only messages created under
+        the durable-jobs release and recreates a missing idempotent job when no
+        Agent reply already targets that message.
+        """
+
+        raw_start = self.get_setting(_DURABLE_AGENT_START_MESSAGE_SETTING)
+        if raw_start is None:
+            high_water = int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") or 0)
+            self.set_setting(_DURABLE_AGENT_START_MESSAGE_SETTING, str(high_water))
+            return
+        try:
+            start_id = max(0, int(raw_start))
+        except (TypeError, ValueError):
+            start_id = int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") or 0)
+            self.set_setting(_DURABLE_AGENT_START_MESSAGE_SETTING, str(start_id))
+            return
+
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE id > ? AND author_type = 'user'
+            ORDER BY id
+            """,
+            (start_id,),
+        )
+        for row in rows:
+            message_id = int(row["id"])
+            metadata = decode_json(row.get("metadata_json"))
+            if str(row["scope_type"]) == "channel" and not bool(metadata.get("agent_mention")):
+                continue
+            if self.db.scalar(
+                "SELECT 1 FROM durable_jobs WHERE kind = 'agent' AND dedupe_key = ?",
+                (f"message:{message_id}",),
+            ):
+                continue
+            if self._message_has_agent_reply(str(row["scope_type"]), str(row["scope_id"]), message_id):
+                continue
+            task = self._recovered_agent_task_from_message(row, metadata)
+            if task is None:
+                continue
+            job, _ = self.jobs.enqueue(
+                kind="agent",
+                dedupe_key=f"message:{message_id}",
+                payload=task,
+                scope_type=str(row["scope_type"]),
+                scope_id=str(row["scope_id"]),
+            )
+            task = dict(job.payload)
+            task["_job_id"] = job.id
+            self._schedule_agent_task(task, enforce_limit=False)
+
+    def _recovered_agent_task_from_message(
+        self,
+        row: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        user_id = row.get("user_id")
+        actor = self.get_user(int(user_id)) if user_id is not None else None
+        if not actor or not actor.get("active"):
+            return None
+        scope_type = str(row["scope_type"])
+        scope_id = str(row["scope_id"])
+        user_message = self._message_from_row(row)
+        task: dict[str, Any] = {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "actor": actor,
+            "content": str(metadata.get("agent_request_content") or row.get("content") or ""),
+            "attachments": self._attachments_for_message(int(row["id"]), include_local_path=True),
+            "generation": metadata.get("generation") if isinstance(metadata.get("generation"), dict) else {},
+            "user_message": user_message,
+        }
+        if scope_type == "channel":
+            channel = self.db.query_one("SELECT * FROM channels WHERE id = ? AND archived = 0", (int(scope_id),))
+            if channel is None:
+                return None
+            task["channel"] = channel
+        return task
+
+    def _message_has_agent_reply(self, scope_type: str, scope_id: str, message_id: int) -> bool:
+        return self.agent_message_replying_to(scope_type, scope_id, message_id) is not None
+
+    def _durable_job_message_exists(self, job_id: int) -> bool:
+        rows = self.db.query(
+            "SELECT metadata_json FROM messages WHERE author_type = 'agent' ORDER BY id DESC"
+        )
+        for row in rows:
+            try:
+                stored_job_id = int(decode_json(row.get("metadata_json")).get("durable_job_id") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if stored_job_id == int(job_id):
+                return True
+        return False
+
+    def _durable_job_success_message_exists(self, job_id: int) -> bool:
+        rows = self.db.query(
+            "SELECT metadata_json FROM messages WHERE author_type = 'agent' ORDER BY id DESC"
+        )
+        for row in rows:
+            metadata = decode_json(row.get("metadata_json"))
+            try:
+                stored_job_id = int(metadata.get("durable_job_id") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            work = metadata.get("agent_work") if isinstance(metadata, dict) else None
+            if stored_job_id == int(job_id) and isinstance(work, dict) and work.get("state") == "complete":
+                return True
+        return False
+
+    def _valid_recovered_agent_task(self, task: dict[str, Any]) -> bool:
+        try:
+            scope_type = str(task["scope_type"])
+            scope_id = str(task["scope_id"])
+            user_message_id = int((task.get("user_message") or {})["id"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if scope_type not in {"channel", "private"} or not scope_id:
+            return False
+        return bool(
+            self.db.scalar(
+                "SELECT 1 FROM messages WHERE id = ? AND scope_type = ? AND scope_id = ?",
+                (user_message_id, scope_type, scope_id),
+            )
+        )
 
     def _start_telegram_gateway(self) -> None:
         if not self.telegram_enabled() or not self.telegram_bot_token():
@@ -355,12 +829,17 @@ class EnterpriseService:
         try:
             from .telegram_gateway import TelegramGateway
 
-            self._telegram_gateway = TelegramGateway(self)
+            self._telegram_gateway = TelegramGateway(self, wait_for_response=False)
             self._telegram_gateway.start()
         except Exception as exc:
             print(f"Failed to start Telegram gateway: {exc}", file=sys.stderr)
 
     def _restart_telegram_gateway(self) -> None:
+        # Revoke the sender before stopping/replacing the gateway.  The outbox
+        # worker checks this registration generation again immediately before
+        # transport I/O, so a disabled or rotated bot cannot consume queued
+        # deliveries through a stale handler.
+        self.unregister_telegram_delivery_handler()
         if self._telegram_gateway is not None:
             self._telegram_gateway.stop()
             self._telegram_gateway = None
@@ -402,11 +881,27 @@ class EnterpriseService:
             return
         try:
             events = consumer(session_key_prefixes=["channel:", "private:"])
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ValueError):
             return
+        ack = getattr(self.agent_client, "ack_async_delegations", None)
+        ack_ids: list[str] = []
         for event in events:
             if isinstance(event, dict):
-                self._handle_async_delegation_event(event)
+                try:
+                    handled = self._handle_async_delegation_event(event)
+                except Exception:
+                    # Leave the peeked event unacknowledged so a transient DB
+                    # failure is retried on the next poll.
+                    continue
+                event_id = str(event.get("_enterprise_event_id") or "").strip()
+                if handled and event_id:
+                    ack_ids.append(event_id)
+        if ack_ids and callable(ack):
+            try:
+                ack(ack_ids)
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ValueError):
+                # Message-level dedupe makes a later peek harmless.
+                pass
 
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
@@ -933,7 +1428,6 @@ class EnterpriseService:
         updates = _changed_user_updates(current, updates)
         if not updates:
             return self.get_user(user_id) or {}
-        self._guard_admin_update(actor, current, updates)
         # Invalidate existing sessions when credentials or privileges change, or
         # when the account is deactivated, so a captured token cannot outlive a
         # password reset or a permission downgrade.
@@ -946,19 +1440,50 @@ class EnterpriseService:
         assignments = ", ".join(f"{key} = ?" for key in updates)
         if bump_sessions:
             assignments += ", token_version = token_version + 1"
-        self.db.execute(
-            f"UPDATE users SET {assignments} WHERE id = ?",
-            [*updates.values(), user_id],
-        )
+        deactivating = updates.get("active") == 0
+        deactivated_scope: AgentExecutionScope | None = None
+        with self._conversation_lock:
+            if deactivating:
+                deactivated_scope = self.agent_scopes.get_scope(
+                    self.agent_scopes.private_scope_key(int(user_id))
+                )
+            with self.db.transaction() as conn:
+                # Serialize the invariant check with the mutation so two
+                # administrators cannot both demote/deactivate themselves as
+                # the other's presumed remaining administrator. The outer
+                # lifecycle lock also orders stale authenticated writes after
+                # this privilege/account change.
+                conn.execute("BEGIN IMMEDIATE")
+                locked = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if locked is None:
+                    raise ServiceError(404, "user not found")
+                self._guard_admin_update(actor, dict(locked), updates, conn=conn)
+                conn.execute(
+                    f"UPDATE users SET {assignments} WHERE id = ?",
+                    [*updates.values(), user_id],
+                )
+            if deactivating:
+                self._cancel_agent_scope_work(
+                    "private",
+                    str(int(user_id)),
+                    reason="Agent request cancelled because the user account was deactivated",
+                    cleanup_runtime=False,
+                )
+        if deactivating:
+            if deactivated_scope is not None:
+                self._cleanup_agent_scope(
+                    deactivated_scope.scope_key,
+                    lifecycle_id=deactivated_scope.lifecycle_id,
+                    strict=True,
+                )
         return self.get_user(user_id) or {}
 
     def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
         result = self.update_user(actor, user_id, {"active": False})
-        # Reclaim the user's private agent container so a deactivated account
-        # does not leave a running/leaked container behind (best-effort; the
-        # method swallows backend errors and always clears the private_agents row).
+        # Host execution keeps the user's scoped workspace, memory and session
+        # so an administrator can reactivate the account without data loss.
         try:
-            self.containers.remove_private_container(int(user_id))
+            self.agent_scopes.deactivate_private_scope(int(user_id))
         except Exception:
             pass
         return result
@@ -985,7 +1510,14 @@ class EnterpriseService:
             "last_login_at": row.get("last_login_at"),
         }
 
-    def _guard_admin_update(self, actor: dict[str, Any], current: dict[str, Any], updates: dict[str, Any]) -> None:
+    def _guard_admin_update(
+        self,
+        actor: dict[str, Any],
+        current: dict[str, Any],
+        updates: dict[str, Any],
+        *,
+        conn=None,
+    ) -> None:
         target_id = int(current["id"])
         next_role = str(updates.get("role", current["role"]))
         next_active = bool(updates.get("active", current["active"]))
@@ -995,10 +1527,16 @@ class EnterpriseService:
             if next_role != "admin":
                 raise ServiceError(400, "cannot remove your own admin permission")
         if current["role"] == "admin" and (next_role != "admin" or not next_active):
-            remaining = self.db.scalar(
-                "SELECT COUNT(*) FROM users WHERE id != ? AND role = 'admin' AND active = 1",
-                (target_id,),
-            )
+            if conn is None:
+                remaining = self.db.scalar(
+                    "SELECT COUNT(*) FROM users WHERE id != ? AND role = 'admin' AND active = 1",
+                    (target_id,),
+                )
+            else:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE id != ? AND role = 'admin' AND active = 1",
+                    (target_id,),
+                ).fetchone()[0]
             if not remaining:
                 raise ServiceError(400, "at least one active admin account is required")
 
@@ -1063,34 +1601,49 @@ class EnterpriseService:
         )
         return int(row["mid"]) if row and row["mid"] is not None else 0
 
-    def wait_for_agent_message_after(
+    def agent_message_replying_to(
         self,
         scope_type: str,
         scope_id: str,
-        after_id: int,
+        user_message_id: int,
+    ) -> dict[str, Any] | None:
+        """Return only the Agent message that explicitly targets one user turn."""
+
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = ? AND scope_id = ? AND author_type = 'agent' AND id > ?
+            ORDER BY id
+            """,
+            (str(scope_type), str(scope_id), int(user_message_id)),
+        )
+        for row in rows:
+            metadata = decode_json(row.get("metadata_json"))
+            reply_to = metadata.get("reply_to") if isinstance(metadata, dict) else None
+            try:
+                reply_message_id = int((reply_to or {}).get("message_id") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if reply_message_id == int(user_message_id):
+                return self._message_from_row(row)
+        return None
+
+    def wait_for_agent_reply_to(
+        self,
+        scope_type: str,
+        scope_id: str,
+        user_message_id: int,
         *,
         timeout: float = 240.0,
     ) -> dict[str, Any] | None:
-        deadline = time.time() + max(0.0, float(timeout))
-        scope_id = str(scope_id)
+        deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
-            row = self.db.query_one(
-                """
-                SELECT * FROM messages
-                WHERE scope_type = ? AND scope_id = ? AND author_type = 'agent' AND id > ?
-                ORDER BY id
-                LIMIT 1
-                """,
-                (scope_type, scope_id, int(after_id)),
-            )
-            if row:
-                return self._message_from_row(row)
-            status = self.agent_status_for_system(scope_type, scope_id)
-            if status.get("state") == "idle" and time.time() >= deadline:
+            message = self.agent_message_replying_to(scope_type, scope_id, user_message_id)
+            if message is not None:
+                return message
+            if time.monotonic() >= deadline:
                 return None
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.2)
+            time.sleep(min(TELEGRAM_DELIVERY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def agent_status_for_system(self, scope_type: str, scope_id: str) -> dict[str, Any]:
         key = self._conversation_key(scope_type, str(scope_id))
@@ -1121,7 +1674,306 @@ class EnterpriseService:
     def telegram_gateway_update(self, update: dict[str, Any]) -> dict[str, Any]:
         from .telegram_gateway import TelegramGateway
 
-        return TelegramGateway(self, autostart=False).process_update(update)
+        return TelegramGateway(self, autostart=False, wait_for_response=False).process_update(update)
+
+    def register_telegram_delivery_handler(
+        self,
+        handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None],
+    ) -> int:
+        """Install the current Bot API sender and start the bounded outbox worker."""
+
+        with self._telegram_delivery_lock:
+            self._telegram_delivery_generation += 1
+            self._telegram_delivery_handler = handler
+            generation = self._telegram_delivery_generation
+            self._ensure_telegram_delivery_worker_locked()
+        self._telegram_delivery_wakeup.set()
+        return generation
+
+    def unregister_telegram_delivery_handler(self, generation: int | None = None) -> None:
+        """Revoke one sender registration without disturbing a newer gateway."""
+
+        with self._telegram_delivery_lock:
+            if generation is not None and int(generation) != self._telegram_delivery_generation:
+                return
+            self._telegram_delivery_handler = None
+            self._telegram_delivery_generation += 1
+        self._telegram_delivery_wakeup.set()
+
+    def _ensure_telegram_delivery_worker_locked(self) -> None:
+        if self._closed or self._telegram_delivery_handler is None:
+            return
+        if self._telegram_delivery_thread is None or not self._telegram_delivery_thread.is_alive():
+            self._telegram_delivery_thread = threading.Thread(
+                target=self._telegram_delivery_worker,
+                name="telegram-delivery",
+                daemon=True,
+            )
+            self._telegram_delivery_thread.start()
+
+    def enqueue_telegram_delivery(
+        self,
+        *,
+        actor: dict[str, Any],
+        update_id: int | None,
+        user_message_id: int,
+        chat_id: int | str,
+        reply_to_message_id: int | None,
+        message_thread_id: int | None,
+    ) -> DurableJob:
+        payload = {
+            "update_id": update_id,
+            "user_id": int(actor["id"]),
+            "scope_type": "private",
+            "scope_id": str(actor["id"]),
+            "user_message_id": int(user_message_id),
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "message_thread_id": message_thread_id,
+        }
+        job, _ = self.jobs.enqueue(
+            kind=TELEGRAM_DELIVERY_JOB_KIND,
+            dedupe_key=f"message:{int(user_message_id)}",
+            payload=payload,
+            scope_type="private",
+            scope_id=str(actor["id"]),
+        )
+        with self._telegram_delivery_lock:
+            self._ensure_telegram_delivery_worker_locked()
+        self._telegram_delivery_wakeup.set()
+        return job
+
+    def enqueue_telegram_text_delivery(
+        self,
+        *,
+        update_id: int,
+        chat_id: int | str,
+        reply_to_message_id: int | None,
+        message_thread_id: int | None,
+        text: str,
+        result: dict[str, Any],
+    ) -> DurableJob:
+        payload = {
+            "delivery_type": "text",
+            "update_id": int(update_id),
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "message_thread_id": message_thread_id,
+            "text": str(text),
+            "result": dict(result),
+        }
+        job, _ = self.jobs.enqueue(
+            kind=TELEGRAM_DELIVERY_JOB_KIND,
+            dedupe_key=f"update:{int(update_id)}:reply",
+            payload=payload,
+            scope_type="telegram_update",
+            scope_id=str(int(update_id)),
+        )
+        with self._telegram_delivery_lock:
+            self._ensure_telegram_delivery_worker_locked()
+        self._telegram_delivery_wakeup.set()
+        return job
+
+    def telegram_text_delivery(self, update_id: int | None) -> DurableJob | None:
+        if update_id is None:
+            return None
+        return self.jobs.get_by_key(
+            TELEGRAM_DELIVERY_JOB_KIND,
+            f"update:{int(update_id)}:reply",
+        )
+
+    def telegram_update_result(self, update_id: int | None) -> dict[str, Any]:
+        if update_id is None:
+            return {}
+        row = self.db.query_one(
+            "SELECT result_json FROM telegram_updates WHERE update_id = ?",
+            (int(update_id),),
+        )
+        result = decode_json(row.get("result_json")) if row else {}
+        return result if isinstance(result, dict) else {}
+
+    def wait_for_telegram_delivery(self, job_id: int, *, timeout: float) -> DurableJob | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            job = self.jobs.get(int(job_id))
+            if job is None or job.status in {"succeeded", "failed", "needs_review"}:
+                return job
+            if time.monotonic() >= deadline:
+                return job
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _telegram_delivery_worker(self) -> None:
+        """Match exact replies, claim once, and deliver through one fixed worker."""
+
+        while not self._closed:
+            with self._telegram_delivery_lock:
+                handler = self._telegram_delivery_handler
+                generation = self._telegram_delivery_generation
+            if handler is None or not self.telegram_enabled():
+                self._telegram_delivery_wakeup.wait(TELEGRAM_DELIVERY_POLL_SECONDS)
+                self._telegram_delivery_wakeup.clear()
+                continue
+
+            try:
+                jobs = self.jobs.ready(TELEGRAM_DELIVERY_JOB_KIND, limit=1000)
+            except Exception as exc:
+                print(f"Telegram delivery worker could not read the outbox: {exc}", file=sys.stderr)
+                self._telegram_delivery_wakeup.wait(TELEGRAM_DELIVERY_POLL_SECONDS)
+                self._telegram_delivery_wakeup.clear()
+                continue
+            for job in jobs:
+                if self._closed:
+                    return
+                with self._telegram_delivery_lock:
+                    registration_is_current = (
+                        self._telegram_delivery_handler is handler
+                        and self._telegram_delivery_generation == generation
+                    )
+                if not registration_is_current or not self.telegram_enabled():
+                    break
+                try:
+                    self._process_telegram_delivery_job(job, handler, generation)
+                except Exception as exc:
+                    # Keep the fixed worker alive across an unexpected malformed
+                    # row or transient SQLite failure. A future pass/restart sees
+                    # the still-queued or running ledger state.
+                    print(f"Telegram delivery worker failed on job {job.id}: {exc}", file=sys.stderr)
+
+            self._telegram_delivery_wakeup.wait(TELEGRAM_DELIVERY_POLL_SECONDS)
+            self._telegram_delivery_wakeup.clear()
+
+    def _process_telegram_delivery_job(
+        self,
+        job: DurableJob,
+        handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None],
+        generation: int,
+    ) -> None:
+        payload = job.payload
+        text_delivery = str(payload.get("delivery_type") or "") == "text"
+        if text_delivery:
+            if payload.get("chat_id") is None or not str(payload.get("text") or "").strip():
+                self.jobs.mark_failed(job.id, "Telegram text delivery payload is invalid")
+                return
+            agent_message = {
+                "id": None,
+                "content": str(payload["text"]),
+                "attachments": [],
+                "metadata": {},
+            }
+            actor: dict[str, Any] = {}
+        else:
+            try:
+                user_message_id = int(payload["user_message_id"])
+                scope_type = str(payload["scope_type"])
+                scope_id = str(payload["scope_id"])
+            except (KeyError, TypeError, ValueError):
+                self.jobs.mark_failed(job.id, "Telegram delivery payload is invalid")
+                return
+
+            agent_message = self.agent_message_replying_to(
+                scope_type,
+                scope_id,
+                user_message_id,
+            )
+            if agent_message is None:
+                agent_job = self.jobs.get_by_key("agent", f"message:{user_message_id}")
+                if agent_job is None or agent_job.status not in {"failed", "needs_review"}:
+                    return
+                # Normally Agent failures persist an exactly-linked message.
+                agent_message = {
+                    "id": None,
+                    "content": "Agent 请求未能完成，请在平台中检查任务状态后重试。",
+                    "attachments": [],
+                    "metadata": {"reply_to": {"message_id": user_message_id}},
+                }
+            actor = self.get_user(int(payload.get("user_id") or 0)) or {}
+
+        claimed = self.jobs.mark_running(
+            job.id,
+            lease_seconds=TELEGRAM_DELIVERY_LEASE_SECONDS,
+        )
+        if claimed is None:
+            return
+        if not text_delivery and not actor.get("active"):
+            self.jobs.mark_failed(job.id, "Telegram delivery user is missing or inactive")
+            return
+        try:
+            # Reserve the current registration immediately before transport,
+            # but never hold the configuration lock across network I/O. A send
+            # already reserved before revocation may finish as an in-flight
+            # request; no later job can reserve the stale generation, and
+            # shutdown/token rotation cannot block for the Bot API's 60s file
+            # timeout merely trying to acquire this lock.
+            with self._telegram_delivery_lock:
+                if (
+                    self._closed
+                    or not self.telegram_enabled()
+                    or self._telegram_delivery_handler is not handler
+                    or self._telegram_delivery_generation != int(generation)
+                ):
+                    self.jobs.requeue(job.id, error="Telegram delivery handler was revoked")
+                    return
+            handler(actor, payload, agent_message)
+        except Exception as exc:
+            # A transport failure can be ambiguous: Telegram may have accepted
+            # the send before the response was lost. Quarantine instead of
+            # automatically duplicating a successful message.
+            self.jobs.mark_failed(job.id, str(exc), needs_review=True)
+            print(f"Telegram delivery {job.id} needs review: {exc}", file=sys.stderr)
+        else:
+            self.jobs.mark_succeeded(job.id)
+
+    def claim_telegram_update(self, update_id: int) -> bool:
+        """Atomically claim a Telegram update across webhook/poller workers."""
+
+        update_id = int(update_id)
+        ts = now_ts()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT status FROM telegram_updates WHERE update_id = ?",
+                (update_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO telegram_updates(update_id, status, received_at, last_error)
+                    VALUES (?, 'processing', ?, '')
+                    """,
+                    (update_id, ts),
+                )
+                claimed = True
+            elif str(row["status"]) in {"queued", "failed"}:
+                cursor = conn.execute(
+                    """
+                    UPDATE telegram_updates
+                    SET status = 'processing', processed_at = NULL, last_error = ''
+                    WHERE update_id = ? AND status IN ('queued', 'failed')
+                    """,
+                    (update_id,),
+                )
+                claimed = cursor.rowcount > 0
+            else:
+                claimed = False
+            if update_id % 100 == 0:
+                conn.execute(
+                    """
+                    DELETE FROM telegram_updates
+                    WHERE received_at < ? AND status IN ('succeeded', 'ignored')
+                    """,
+                    (ts - 30 * 24 * 60 * 60,),
+                )
+        return claimed
+
+    def finish_telegram_update(self, update_id: int, *, ignored: bool = False, error: str = "") -> None:
+        status = "failed" if error else ("ignored" if ignored else "succeeded")
+        self.db.execute(
+            """
+            UPDATE telegram_updates
+            SET status = ?, processed_at = ?, last_error = ?
+            WHERE update_id = ? AND status = 'processing'
+            """,
+            (status, now_ts(), str(error)[:2000], int(update_id)),
+        )
 
     def telegram_actor_for_user(self, telegram_user: dict[str, Any]) -> dict[str, Any]:
         external_id = str(telegram_user.get("id") or "").strip()
@@ -1140,6 +1992,11 @@ class EnterpriseService:
 
     def telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        ts = now_ts()
+        self.db.execute(
+            "DELETE FROM telegram_link_challenges WHERE expires_at <= ?",
+            (ts,),
+        )
         identity = self.db.query_one(
             """
             SELECT external_id, username, display_name, updated_at
@@ -1148,63 +2005,187 @@ class EnterpriseService:
             """,
             (int(actor["id"]),),
         )
+        pending = self.db.query_one(
+            "SELECT expires_at FROM telegram_link_challenges WHERE user_id = ? AND expires_at > ?",
+            (int(actor["id"]), ts),
+        )
         return {
             "gateway": self.telegram_public_config(),
-            "link": {
+            "link": ({
                 "telegram_user_id": identity["external_id"] if identity else "",
                 "telegram_username": identity["username"] if identity else "",
                 "telegram_display_name": identity["display_name"] if identity else "",
                 "updated_at": identity["updated_at"] if identity else None,
-            },
+            } if identity else None),
+            # A GET intentionally never reveals the one-time code again. The
+            # browser can still poll this expiry while waiting for Telegram to
+            # complete the proof-of-ownership flow.
+            "pending": ({"status": "pending", "expires_at": int(pending["expires_at"])} if pending else None),
+            "deliveries": self.jobs.counts(
+                kind=TELEGRAM_DELIVERY_JOB_KIND,
+                scope_type="private",
+                scope_id=str(actor["id"]),
+            ),
         }
 
     def update_telegram_private_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
-        external_id = self._validate_telegram_user_id(body.get("telegram_user_id"))
-        conflict = self.db.query_one(
-            """
-            SELECT user_id FROM external_identities
-            WHERE provider = 'telegram' AND external_id = ? AND user_id != ?
-            """,
-            (external_id, int(actor["id"])),
-        )
-        if conflict:
-            raise ServiceError(409, "Telegram user id is already linked to another account")
+        if body.get("telegram_user_id") not in {None, ""}:
+            raise ServiceError(400, "Telegram accounts must be linked with a one-time bot command")
+        code = self._new_telegram_link_code()
+        code_hash = self._telegram_link_code_hash(code)
         ts = now_ts()
-        existing = self.db.query_one(
-            "SELECT created_at FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
-            (int(actor["id"]),),
-        )
-        self.db.execute(
-            "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
-            (int(actor["id"]),),
-        )
-        self.db.execute(
-            """
-            INSERT INTO external_identities(
-                provider, external_id, user_id, username, display_name, metadata_json, created_at, updated_at
+        expires_at = ts + TELEGRAM_LINK_TTL_SECONDS
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM telegram_link_challenges WHERE expires_at <= ?", (ts,))
+            conn.execute(
+                """
+                INSERT INTO telegram_link_challenges(user_id, code_hash, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    code_hash = excluded.code_hash,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (int(actor["id"]), code_hash, expires_at, ts, ts),
             )
-            VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                external_id,
-                int(actor["id"]),
-                str(body.get("telegram_username") or "").strip().lstrip("@")[:80],
-                str(body.get("telegram_display_name") or "").strip()[:120],
-                encode_json({"configured_by": "user"}),
-                int(existing["created_at"]) if existing else ts,
-                ts,
-            ),
-        )
-        return self.telegram_private_config(actor)
+        result = self.telegram_private_config(actor)
+        result["pending"] = {
+            "status": "pending",
+            "expires_at": expires_at,
+            "code": code,
+            "command": f"/link {code}",
+        }
+        return result
 
     def unlink_telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
-        self.db.execute(
-            "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
-            (int(actor["id"]),),
-        )
+        with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+                (int(actor["id"]),),
+            )
+            conn.execute(
+                "DELETE FROM telegram_link_challenges WHERE user_id = ?",
+                (int(actor["id"]),),
+            )
         return self.telegram_private_config(actor)
+
+    def complete_telegram_link(
+        self,
+        code: str,
+        telegram_user: dict[str, Any],
+        *,
+        update_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Consume a one-time challenge and bind the speaking Telegram user."""
+
+        normalized = self._normalize_telegram_link_code(code)
+        if not normalized:
+            raise ServiceError(400, "Telegram binding code is invalid")
+        external_id = self._validate_telegram_user_id(telegram_user.get("id"))
+        code_hash = hashlib.sha256(normalized.encode("ascii")).hexdigest()
+        ts = now_ts()
+        with self.db.transaction() as conn:
+            # Consume the one-time proof under an immediate write lock so two
+            # simultaneous bot updates cannot both validate the same code.
+            conn.execute("BEGIN IMMEDIATE")
+            challenge = conn.execute(
+                """
+                SELECT c.user_id, c.expires_at, u.active
+                FROM telegram_link_challenges c
+                JOIN users u ON u.id = c.user_id
+                WHERE c.code_hash = ?
+                """,
+                (code_hash,),
+            ).fetchone()
+            if challenge is None or int(challenge["expires_at"]) <= ts:
+                conn.execute("DELETE FROM telegram_link_challenges WHERE code_hash = ?", (code_hash,))
+                raise ServiceError(400, "Telegram binding code is invalid or expired")
+            if not bool(challenge["active"]):
+                raise ServiceError(403, "Platform account is inactive")
+            user_id = int(challenge["user_id"])
+            conflict = conn.execute(
+                """
+                SELECT user_id FROM external_identities
+                WHERE provider = 'telegram' AND external_id = ? AND user_id != ?
+                """,
+                (external_id, user_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ServiceError(409, "This Telegram account is already linked to another platform user")
+            existing = conn.execute(
+                """
+                SELECT created_at FROM external_identities
+                WHERE provider = 'telegram' AND (user_id = ? OR external_id = ?)
+                ORDER BY CASE WHEN external_id = ? THEN 0 ELSE 1 END LIMIT 1
+                """,
+                (user_id, external_id, external_id),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO external_identities(
+                    provider, external_id, user_id, username, display_name,
+                    metadata_json, created_at, updated_at
+                ) VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    external_id,
+                    user_id,
+                    str(telegram_user.get("username") or "").strip().lstrip("@")[:80],
+                    self._telegram_display_name(telegram_user)[:120],
+                    encode_json({"configured_by": "telegram_challenge", "user": telegram_user}),
+                    int(existing["created_at"]) if existing else ts,
+                    ts,
+                ),
+            )
+            conn.execute("DELETE FROM telegram_link_challenges WHERE user_id = ?", (user_id,))
+            if update_id is not None:
+                conn.execute(
+                    """
+                    UPDATE telegram_updates
+                    SET result_json = ?
+                    WHERE update_id = ? AND status = 'processing'
+                    """,
+                    (
+                        encode_json(
+                            {
+                                "ok": True,
+                                "command": True,
+                                "linked": True,
+                                "user_id": user_id,
+                            }
+                        ),
+                        int(update_id),
+                    ),
+                )
+        actor = self.get_user(user_id)
+        if actor is None:
+            raise ServiceError(404, "Platform account no longer exists")
+        return actor
+
+    @classmethod
+    def _new_telegram_link_code(cls) -> str:
+        raw = "".join(secrets.choice(TELEGRAM_LINK_CODE_ALPHABET) for _ in range(8))
+        return f"{raw[:4]}-{raw[4:]}"
+
+    @staticmethod
+    def _normalize_telegram_link_code(value: Any) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
+        if len(normalized) != 8 or any(ch not in TELEGRAM_LINK_CODE_ALPHABET for ch in normalized):
+            return ""
+        return normalized
+
+    @classmethod
+    def _telegram_link_code_hash(cls, value: Any) -> str:
+        normalized = cls._normalize_telegram_link_code(value)
+        if not normalized:
+            raise ServiceError(400, "Telegram binding code is invalid")
+        return hashlib.sha256(normalized.encode("ascii")).hexdigest()
 
     def telegram_public_config(self) -> dict[str, Any]:
         return {
@@ -1238,25 +2219,39 @@ class EnterpriseService:
 
     def update_telegram_admin_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        if "enabled" in body:
-            self.set_setting(TELEGRAM_SETTING_ENABLED, "1" if parse_bool(body.get("enabled")) else "0")
-        if "polling" in body:
-            self.set_setting(TELEGRAM_SETTING_POLLING, "1" if parse_bool(body.get("polling")) else "0")
+        enabled = parse_bool(body.get("enabled")) if "enabled" in body else None
+        polling = parse_bool(body.get("polling")) if "polling" in body else None
+        username = None
+        token = None
+        webhook_secret = None
         if "bot_username" in body:
             username = str(body.get("bot_username") or "").strip().lstrip("@")
             if username and not re.fullmatch(r"[A-Za-z0-9_]{3,80}", username):
                 raise ServiceError(400, "Telegram bot username is invalid")
-            self.set_setting(TELEGRAM_SETTING_BOT_USERNAME, username)
         if "bot_token" in body:
             token = str(body.get("bot_token") or "").strip()
+        if "webhook_secret" in body:
+            webhook_secret = str(body.get("webhook_secret") or "").strip()
+            if webhook_secret and not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", webhook_secret):
+                raise ServiceError(400, "Telegram webhook secret must be 8-128 URL-safe characters")
+
+        # Validation happens first; then revoke the old token-bound transport
+        # before changing any live setting. This closes the rotation window in
+        # which the old Bot API client could otherwise consume queued outbox
+        # rows after a new token had already been persisted.
+        self.unregister_telegram_delivery_handler()
+        if "enabled" in body:
+            self.set_setting(TELEGRAM_SETTING_ENABLED, "1" if enabled else "0")
+        if "polling" in body:
+            self.set_setting(TELEGRAM_SETTING_POLLING, "1" if polling else "0")
+        if "bot_username" in body:
+            self.set_setting(TELEGRAM_SETTING_BOT_USERNAME, username or "")
+        if token is not None:
             if token:
                 self.set_setting(TELEGRAM_SECRET_BOT_TOKEN, token, secret=True)
-        if "webhook_secret" in body:
-            secret = str(body.get("webhook_secret") or "").strip()
-            if secret:
-                if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", secret):
-                    raise ServiceError(400, "Telegram webhook secret must be 8-128 URL-safe characters")
-                self.set_setting(TELEGRAM_SECRET_WEBHOOK_SECRET, secret, secret=True)
+        if webhook_secret is not None:
+            if webhook_secret:
+                self.set_setting(TELEGRAM_SECRET_WEBHOOK_SECRET, webhook_secret, secret=True)
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
 
@@ -1432,19 +2427,26 @@ class EnterpriseService:
     def delete_channel_message(self, actor: dict[str, Any], channel_id: int, message_id: int) -> dict[str, Any]:
         require_admin(actor)
         self.get_channel(actor, channel_id)
-        row = self.db.query_one(
-            """
-            SELECT * FROM messages
-            WHERE id = ? AND scope_type = 'channel' AND scope_id = ?
-            """,
-            (int(message_id), str(channel_id)),
-        )
-        if not row:
-            raise ServiceError(404, "channel message not found")
-        message = self._message_from_row(row)
-        self._delete_attachment_files_for_messages([int(message_id)])
-        self.db.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
-        return {"deleted": 1, "message": message}
+        with self._conversation_lock:
+            row = self.db.query_one(
+                """
+                SELECT * FROM messages
+                WHERE id = ? AND scope_type = 'channel' AND scope_id = ?
+                """,
+                (int(message_id), str(channel_id)),
+            )
+            if not row:
+                raise ServiceError(404, "channel message not found")
+            message = self._message_from_row(row)
+            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids([int(message_id)])
+            self._delete_message_ids(
+                [int(message_id)],
+                reason="Agent request cancelled because its source message was deleted",
+            )
+            result = {"deleted": 1, "message": message}
+        for scope_key in cleanup_scope_keys:
+            self._cleanup_agent_scope(scope_key, strict=True)
+        return result
 
     def delete_channel_messages_before(self, actor: dict[str, Any], channel_id: int, before_created_at: int) -> dict[str, Any]:
         require_admin(actor)
@@ -1456,48 +2458,68 @@ class EnterpriseService:
         if before_ts <= 0:
             raise ServiceError(400, "before_created_at must be a unix timestamp")
         scope_id = str(channel_id)
-        deleted = self.db.scalar(
-            """
-            SELECT COUNT(*) FROM messages
-            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        rows = self.db.query(
-            """
-            SELECT id FROM messages
-            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
-        self.db.execute(
-            """
-            DELETE FROM messages
-            WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        return {"deleted": int(deleted or 0), "before_created_at": before_ts}
+        with self._conversation_lock:
+            rows = self.db.query(
+                """
+                SELECT id FROM messages
+                WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
+                """,
+                (scope_id, before_ts),
+            )
+            message_ids = [int(row["id"]) for row in rows]
+            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids(message_ids)
+            deleted = self._delete_message_ids(
+                message_ids,
+                reason="Agent request cancelled because its source message was deleted",
+            )
+            result = {"deleted": deleted, "before_created_at": before_ts}
+        for scope_key in cleanup_scope_keys:
+            self._cleanup_agent_scope(scope_key, strict=True)
+        return result
 
     def clear_channel_messages(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
         require_admin(actor)
         self.get_channel(actor, channel_id)
-        scope_id = str(channel_id)
-        deleted = self.db.scalar(
-            "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
-            (scope_id,),
+        return self._clear_agent_conversation("channel", str(channel_id))
+
+    def _clear_agent_conversation(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+        """Atomically order clear against new sends and terminal Agent writes."""
+
+        with self._conversation_lock:
+            if scope_type == "channel":
+                agent_scope = self._channel_agent_scope(scope_id)
+            else:
+                agent_scope = self.agent_scopes.ensure_private_scope(int(scope_id))
+            # Rotate the durable Hermes lifecycle before deleting visible
+            # history. If this persistence step fails, the API fails with all
+            # messages intact; it can never report a partially cleared UI that
+            # silently reconnects to the old Hermes memory session.
+            self.agent_scopes.rotate_session(agent_scope.scope_key)
+            self._cancel_agent_scope_work(
+                scope_type,
+                scope_id,
+                reason=f"Agent request cancelled because the {scope_type} conversation was cleared",
+                cleanup_runtime=False,
+            )
+            deleted = self.db.scalar(
+                "SELECT COUNT(*) FROM messages WHERE scope_type = ? AND scope_id = ?",
+                (scope_type, scope_id),
+            )
+            rows = self.db.query(
+                "SELECT id FROM messages WHERE scope_type = ? AND scope_id = ?",
+                (scope_type, scope_id),
+            )
+            self._delete_message_ids(
+                [int(row["id"]) for row in rows],
+                reason=f"Agent request cancelled because the {scope_type} conversation was cleared",
+            )
+            result = {"deleted": int(deleted or 0)}
+        self._cleanup_agent_scope(
+            agent_scope.scope_key,
+            lifecycle_id=agent_scope.lifecycle_id,
+            strict=True,
         )
-        rows = self.db.query(
-            "SELECT id FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
-            (scope_id,),
-        )
-        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
-        self.db.execute(
-            "DELETE FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
-            (scope_id,),
-        )
-        return {"deleted": int(deleted or 0)}
+        return result
 
     def list_private_conversation_audits(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
@@ -1575,19 +2597,26 @@ class EnterpriseService:
     def delete_private_message(self, actor: dict[str, Any], user_id: int, message_id: int) -> dict[str, Any]:
         require_admin(actor)
         subject = self._private_audit_subject(user_id)
-        row = self.db.query_one(
-            """
-            SELECT * FROM messages
-            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
-            """,
-            (int(message_id), str(int(subject["id"]))),
-        )
-        if not row:
-            raise ServiceError(404, "private message not found")
-        message = self._message_from_row(row)
-        self._delete_attachment_files_for_messages([int(message_id)])
-        self.db.execute("DELETE FROM messages WHERE id = ?", (int(message_id),))
-        return {"deleted": 1, "message": message}
+        with self._conversation_lock:
+            row = self.db.query_one(
+                """
+                SELECT * FROM messages
+                WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+                """,
+                (int(message_id), str(int(subject["id"]))),
+            )
+            if not row:
+                raise ServiceError(404, "private message not found")
+            message = self._message_from_row(row)
+            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids([int(message_id)])
+            self._delete_message_ids(
+                [int(message_id)],
+                reason="Agent request cancelled because its source message was deleted",
+            )
+            result = {"deleted": 1, "message": message}
+        for scope_key in cleanup_scope_keys:
+            self._cleanup_agent_scope(scope_key, strict=True)
+        return result
 
     def delete_private_messages_before(self, actor: dict[str, Any], user_id: int, before_created_at: int) -> dict[str, Any]:
         require_admin(actor)
@@ -1599,48 +2628,30 @@ class EnterpriseService:
         if before_ts <= 0:
             raise ServiceError(400, "before_created_at must be a unix timestamp")
         scope_id = str(int(subject["id"]))
-        deleted = self.db.scalar(
-            """
-            SELECT COUNT(*) FROM messages
-            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        rows = self.db.query(
-            """
-            SELECT id FROM messages
-            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
-        self.db.execute(
-            """
-            DELETE FROM messages
-            WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
-            """,
-            (scope_id, before_ts),
-        )
-        return {"deleted": int(deleted or 0), "before_created_at": before_ts}
+        with self._conversation_lock:
+            rows = self.db.query(
+                """
+                SELECT id FROM messages
+                WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
+                """,
+                (scope_id, before_ts),
+            )
+            message_ids = [int(row["id"]) for row in rows]
+            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids(message_ids)
+            deleted = self._delete_message_ids(
+                message_ids,
+                reason="Agent request cancelled because its source message was deleted",
+            )
+            result = {"deleted": deleted, "before_created_at": before_ts}
+        for scope_key in cleanup_scope_keys:
+            self._cleanup_agent_scope(scope_key, strict=True)
+        return result
 
     def clear_private_messages(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
         require_admin(actor)
         subject = self._private_audit_subject(user_id)
         scope_id = str(int(subject["id"]))
-        deleted = self.db.scalar(
-            "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
-            (scope_id,),
-        )
-        rows = self.db.query(
-            "SELECT id FROM messages WHERE scope_type = 'private' AND scope_id = ?",
-            (scope_id,),
-        )
-        self._delete_attachment_files_for_messages([int(row["id"]) for row in rows])
-        self.db.execute(
-            "DELETE FROM messages WHERE scope_type = 'private' AND scope_id = ?",
-            (scope_id,),
-        )
-        return {"deleted": int(deleted or 0)}
+        return self._clear_agent_conversation("private", scope_id)
 
     def _private_audit_subject(self, user_id: int) -> dict[str, Any]:
         subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
@@ -2001,46 +3012,50 @@ class EnterpriseService:
             raise ServiceError(400, "message content is required")
         if uploads:
             self._enforce_upload_rate_limit(actor.get("id"))
-        generation = self.account_generation_config(actor)
         scope_id = str(channel_id)
         agent_content = channel_agent_request(content)
         if agent_content is not None and uploads:
             cleaned = AGENT_MENTION_RE.sub("", content).strip()
             cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
             agent_content = cleaned
-        user_msg = self._append_message(
-            scope_type="channel",
-            scope_id=scope_id,
-            author_type="user",
-            user_id=actor["id"],
-            username=actor["display_name"],
-            content=content,
-            metadata={
-                "generation": generation,
-                "agent_mention": agent_content is not None,
-                "attachment_count": len(uploads),
-            },
-            attachments=uploads,
-        )
-        if agent_content is None:
-            return {
-                "user_message": user_msg,
-                "agent_message": None,
-                "agent_status": self.agent_status(actor, "channel", scope_id),
-            }
-        agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-        status = self._enqueue_agent_reply(
-            {
-                "scope_type": "channel",
-                "scope_id": scope_id,
-                "channel": channel,
-                "actor": dict(actor),
-                "content": agent_content,
-                "attachments": agent_attachments,
-                "generation": generation,
-                "user_message": user_msg,
-            }
-        )
+        with self._conversation_lock:
+            actor = self._fresh_active_actor(actor)
+            require_permission(actor, PERMISSION_CHAT)
+            generation = self.account_generation_config(actor)
+            user_msg = self._append_message(
+                scope_type="channel",
+                scope_id=scope_id,
+                author_type="user",
+                user_id=actor["id"],
+                username=actor["display_name"],
+                content=content,
+                metadata={
+                    "generation": generation,
+                    "agent_mention": agent_content is not None,
+                    "agent_request_content": agent_content or "",
+                    "attachment_count": len(uploads),
+                },
+                attachments=uploads,
+            )
+            if agent_content is None:
+                return {
+                    "user_message": user_msg,
+                    "agent_message": None,
+                    "agent_status": self.agent_status(actor, "channel", scope_id),
+                }
+            agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
+            status = self._enqueue_agent_reply(
+                {
+                    "scope_type": "channel",
+                    "scope_id": scope_id,
+                    "channel": channel,
+                    "actor": dict(actor),
+                    "content": agent_content,
+                    "attachments": agent_attachments,
+                    "generation": generation,
+                    "user_message": user_msg,
+                }
+            )
         return {"user_message": user_msg, "agent_message": None, "agent_status": status}
 
     def _send_channel_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -2063,8 +3078,10 @@ class EnterpriseService:
         )
         system_prompt = self._channel_system_prompt(channel, suggestions)
         self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
-        session_id = self._channel_agent_session_id(scope_id)
-        workspace_path = self._channel_agent_workspace(scope_id)
+        agent_scope = self._channel_agent_scope(scope_id)
+        session_id = agent_scope.session_id
+        workspace_path = Path(agent_scope.workspace_path)
+        execution = agent_scope.to_execution_dict()
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], prompt_content),
@@ -2074,6 +3091,7 @@ class EnterpriseService:
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
                 "actor": self._agent_actor_metadata(task["actor"]),
+                "execution": execution,
                 "workspace": {
                     "path": str(workspace_path),
                     "scope": "channel",
@@ -2085,34 +3103,57 @@ class EnterpriseService:
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
-            progress_callback=lambda event: self._record_hermes_progress("channel", scope_id, event),
-            content_callback=lambda delta: self._record_agent_content_delta("channel", scope_id, delta),
+            progress_callback=lambda event: (
+                self._record_hermes_progress("channel", scope_id, event)
+                if self._task_scope_is_current(task)
+                else None
+            ),
+            content_callback=lambda delta: (
+                self._record_agent_content_delta("channel", scope_id, delta)
+                if self._task_scope_is_current(task)
+                else None
+            ),
         )
-        self._remember_channel_agent_session_id(scope_id, result.session_id)
-        clean_content, generated_attachments = self._extract_generated_attachments(result.content)
-        self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
+        self._ensure_agent_task_can_run(task)
+        clean_content, generated_attachments = self._extract_generated_attachments(
+            result.content,
+            workspace_path=workspace_path,
+        )
         token_usage = self._token_usage_from_agent_result(result, generation)
-        metadata = {
-            "session_id": result.session_id,
-            "degraded": result.degraded,
-            "generation": generation,
-            "knowledge_suggestions": [h.to_dict() for h in suggestions],
-            "reply_to": self._reply_target(task),
-        }
-        if token_usage:
-            metadata["token_usage"] = self._public_token_usage(token_usage)
-        metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
-        message = self._append_message(
-            scope_type="channel",
-            scope_id=scope_id,
-            author_type="agent",
-            user_id=None,
-            username="Main Agent",
-            content=clean_content,
-            metadata=metadata,
-            attachments=generated_attachments,
-            attachment_source="hermes",
-        )
+        with self._conversation_lock:
+            # Session persistence, terminal status and message insertion form a
+            # single lifecycle boundary against clear/deactivate.
+            self._ensure_agent_task_can_run(task)
+            self._remember_channel_agent_session_id(scope_id, result.session_id)
+            refreshed_scope = self.agent_scopes.get_scope(agent_scope.scope_key)
+            if refreshed_scope is not None:
+                execution = refreshed_scope.to_execution_dict()
+            self._record_agent_activity("channel", scope_id, "complete", "回复已生成", "保存到频道消息")
+            metadata = {
+                "session_id": result.session_id,
+                "degraded": result.degraded,
+                "execution": execution,
+                "generation": generation,
+                "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "reply_to": self._reply_target(task),
+            }
+            if task.get("_job_id"):
+                metadata["durable_job_id"] = int(task["_job_id"])
+            if token_usage:
+                metadata["token_usage"] = self._public_token_usage(token_usage)
+            metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
+            message = self._append_message(
+                scope_type="channel",
+                scope_id=scope_id,
+                author_type="agent",
+                user_id=None,
+                username="Main Agent",
+                content=clean_content,
+                metadata=metadata,
+                attachments=generated_attachments,
+                attachment_source="hermes",
+                attachment_uploader_user_id=int(task["actor"]["id"]),
+            )
         self._record_token_usage_event(
             task,
             token_usage,
@@ -2126,45 +3167,111 @@ class EnterpriseService:
         actor: dict[str, Any],
         content: str,
         attachments: list[UploadedFile] | None = None,
+        *,
+        telegram_update_id: int | None = None,
     ) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
         content = content.strip()
         uploads = self._normalize_uploaded_files(attachments)
         if not content and not uploads:
             raise ServiceError(400, "message content is required")
-        if uploads:
-            self._enforce_upload_rate_limit(actor.get("id"))
-        generation = self.account_generation_config(actor)
+        if telegram_update_id is not None:
+            try:
+                telegram_update_id = int(telegram_update_id)
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "Telegram update id is invalid") from exc
         scope_id = str(actor["id"])
-        user_msg = self._append_message(
-            scope_type="private",
-            scope_id=scope_id,
-            author_type="user",
-            user_id=actor["id"],
-            username=actor["display_name"],
-            content=content,
-            metadata={"generation": generation, "attachment_count": len(uploads)},
-            attachments=uploads,
-        )
-        agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-        current_container = self.containers.get_private_container(actor["id"])
-        status = self._enqueue_agent_reply(
-            {
-                "scope_type": "private",
-                "scope_id": scope_id,
-                "actor": dict(actor),
-                "content": content,
-                "attachments": agent_attachments,
-                "generation": generation,
-                "user_message": user_msg,
-            }
-        )
+        with self._conversation_lock:
+            actor = self._fresh_active_actor(actor)
+            require_permission(actor, PERMISSION_PRIVATE_AGENT)
+            default_generation = self.account_generation_config(actor)
+            user_msg = (
+                self._private_user_message_for_telegram_update(scope_id, telegram_update_id)
+                if telegram_update_id is not None
+                else None
+            )
+            if user_msg is None:
+                if uploads:
+                    self._enforce_upload_rate_limit(actor.get("id"))
+                metadata: dict[str, Any] = {
+                    "generation": default_generation,
+                    "attachment_count": len(uploads),
+                }
+                if telegram_update_id is not None:
+                    metadata["telegram_update_id"] = telegram_update_id
+                user_msg = self._append_message(
+                    scope_type="private",
+                    scope_id=scope_id,
+                    author_type="user",
+                    user_id=actor["id"],
+                    username=actor["display_name"],
+                    content=content,
+                    metadata=metadata,
+                    attachments=uploads,
+                )
+            stored_metadata = user_msg.get("metadata") if isinstance(user_msg.get("metadata"), dict) else {}
+            generation = (
+                stored_metadata.get("generation")
+                if isinstance(stored_metadata.get("generation"), dict)
+                else default_generation
+            )
+            task_content = str(user_msg.get("content") or "")
+            agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
+            agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
+            status = self._enqueue_agent_reply(
+                {
+                    "scope_type": "private",
+                    "scope_id": scope_id,
+                    "actor": dict(actor),
+                    "content": task_content,
+                    "attachments": agent_attachments,
+                    "generation": generation,
+                    "user_message": user_msg,
+                }
+            )
         return {
             "user_message": user_msg,
             "agent_message": None,
             "agent_status": status,
-            "container": current_container.to_dict() if current_container else None,
+            "execution": agent_scope.to_execution_dict(),
+            "container": None,
         }
+
+    def _fresh_active_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
+        """Revalidate a request actor at the serialized mutation boundary."""
+
+        try:
+            user_id = int(actor["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ServiceError(401, "authentication required") from exc
+        current = self.get_user(user_id)
+        if current is None or not current.get("active"):
+            raise ServiceError(401, "account is inactive")
+        return current
+
+    def _private_user_message_for_telegram_update(
+        self,
+        scope_id: str,
+        update_id: int,
+    ) -> dict[str, Any] | None:
+        """Find one replayed Telegram turn by parsing, never pattern matching, metadata."""
+
+        rows = self.db.query(
+            """
+            SELECT * FROM messages
+            WHERE scope_type = 'private' AND scope_id = ? AND author_type = 'user'
+            ORDER BY id DESC
+            """,
+            (str(scope_id),),
+        )
+        for row in rows:
+            metadata = decode_json(row.get("metadata_json"))
+            stored_update_id = metadata.get("telegram_update_id") if isinstance(metadata, dict) else None
+            # JSON Telegram update IDs are integers. Requiring that exact type
+            # avoids accidental matches against arbitrary string metadata.
+            if type(stored_update_id) is int and stored_update_id == int(update_id):
+                return self._message_from_row(row)
+        return None
 
     def _send_private_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         actor = task["actor"]
@@ -2175,27 +3282,23 @@ class EnterpriseService:
         scope_id = str(task["scope_id"])
         user_msg = task["user_message"]
         self._record_agent_activity("private", scope_id, "preparing", "准备私人工作区", f"u{actor['id']}")
-        container = self.containers.ensure_private_container(
-            user_id=actor["id"],
-            username=actor["username"],
-            secrets_env=self.model_secret_env(),
-        )
-        container_data = container.to_dict()
+        agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
+        execution = agent_scope.to_execution_dict()
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
-        system_prompt = self._private_system_prompt(actor, container_data, suggestions)
+        system_prompt = self._private_system_prompt(actor, agent_scope, suggestions)
         self._record_agent_activity("private", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=prompt_content,
             history=self._hermes_owned_history(),
-            session_id=container.session_id,
-            session_key=f"private:{actor['id']}",
+            session_id=agent_scope.session_id,
+            session_key=agent_scope.scope_key,
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
                 "actor": self._agent_actor_metadata(actor),
-                "container": container_data,
+                "execution": execution,
                 "workspace": {
-                    "path": container_data["workspace_path"],
+                    "path": agent_scope.workspace_path,
                     "scope": "private",
                     "user_id": actor["id"],
                 },
@@ -2205,39 +3308,56 @@ class EnterpriseService:
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
-            progress_callback=lambda event: self._record_hermes_progress("private", scope_id, event),
-            content_callback=lambda delta: self._record_agent_content_delta("private", scope_id, delta),
+            progress_callback=lambda event: (
+                self._record_hermes_progress("private", scope_id, event)
+                if self._task_scope_is_current(task)
+                else None
+            ),
+            content_callback=lambda delta: (
+                self._record_agent_content_delta("private", scope_id, delta)
+                if self._task_scope_is_current(task)
+                else None
+            ),
         )
-        if self._valid_hermes_session_id(result.session_id):
-            self.containers.update_private_session_id(actor["id"], result.session_id)
-            container_data["session_id"] = result.session_id
+        self._ensure_agent_task_can_run(task)
         clean_content, generated_attachments = self._extract_generated_attachments(
             result.content, owner_id=int(scope_id)
         )
-        self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
         token_usage = self._token_usage_from_agent_result(result, generation)
-        metadata = {
-            "session_id": result.session_id,
-            "degraded": result.degraded,
-            "container": container_data,
-            "generation": generation,
-            "knowledge_suggestions": [h.to_dict() for h in suggestions],
-            "reply_to": self._reply_target(task),
-        }
-        if token_usage:
-            metadata["token_usage"] = self._public_token_usage(token_usage)
-        metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
-        message = self._append_message(
-            scope_type="private",
-            scope_id=scope_id,
-            author_type="agent",
-            user_id=None,
-            username="Private Agent",
-            content=clean_content,
-            metadata=metadata,
-            attachments=generated_attachments,
-            attachment_source="hermes",
-        )
+        with self._conversation_lock:
+            self._ensure_agent_task_can_run(task)
+            if self._valid_hermes_session_id(result.session_id):
+                self.agent_scopes.update_session_id(agent_scope.scope_key, result.session_id)
+                refreshed_scope = self.agent_scopes.get_scope(agent_scope.scope_key)
+                if refreshed_scope is not None:
+                    execution = refreshed_scope.to_execution_dict()
+            self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
+            metadata = {
+                "session_id": result.session_id,
+                "degraded": result.degraded,
+                "execution": execution,
+                "generation": generation,
+                "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "reply_to": self._reply_target(task),
+            }
+            if task.get("_job_id"):
+                metadata["durable_job_id"] = int(task["_job_id"])
+            if token_usage:
+                metadata["token_usage"] = self._public_token_usage(token_usage)
+            metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
+            message = self._append_message(
+                scope_type="private",
+                scope_id=scope_id,
+                author_type="agent",
+                user_id=None,
+                username="Private Agent",
+                content=clean_content,
+                metadata=metadata,
+                attachments=generated_attachments,
+                attachment_source="hermes",
+                attachment_uploader_user_id=int(task["actor"]["id"]),
+            )
+        self._telegram_delivery_wakeup.set()
         self._record_token_usage_event(
             task,
             token_usage,
@@ -2248,11 +3368,15 @@ class EnterpriseService:
 
     def private_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
-        container = self.containers.get_private_container(actor["id"])
+        agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
         return {
-            "container": container.to_dict() if container else None,
-            "session_id": container.session_id if container else f"enterprise-private-u{actor['id']}",
+            "execution": agent_scope.to_execution_dict(),
+            "container": None,
+            "session_id": agent_scope.session_id,
             "agent_status": self.agent_status(actor, "private", str(actor["id"])),
+            "jobs": self.jobs.counts(
+                kind="agent", scope_type="private", scope_id=str(actor["id"])
+            ),
         }
 
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -2629,13 +3753,17 @@ class EnterpriseService:
 
     def add_knowledge_document(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_MANAGE_KNOWLEDGE)
-        doc, created = self.knowledge.add_document_with_status(
-            title=str(body.get("title", "")),
-            summary=str(body.get("summary", "")),
-            content=str(body.get("content", "")),
-            source=str(body.get("source", "")),
-            created_by=actor["id"],
-        )
+        try:
+            doc, created = self.knowledge.add_document_with_status(
+                title=str(body.get("title", "")),
+                summary=str(body.get("summary", "")),
+                content=str(body.get("content", "")),
+                source=str(body.get("source", "")),
+                created_by=actor["id"],
+            )
+        except ValueError as exc:
+            message = str(exc)
+            raise ServiceError(413 if message.startswith("content exceeds ") else 400, message) from exc
         # Only enqueue Cognee ingestion for a genuinely new document; a dedup hit
         # (identical re-submit) must not re-flood the graph backend with a
         # duplicate add+cognify of content it already holds.
@@ -2657,26 +3785,51 @@ class EnterpriseService:
             return self.cognee.ingest_document(
                 title=doc["title"], content=doc["content"], source=doc.get("source", "")
             )
+        document_id = int(doc.get("id") or 0)
+        job, _ = self.jobs.enqueue(
+            kind="cognee",
+            dedupe_key=f"document:{document_id}",
+            scope_type="knowledge",
+            scope_id=str(document_id),
+            payload={
+                "document_id": document_id,
+                "title": doc["title"],
+                "content": doc["content"],
+                "source": doc.get("source", ""),
+            },
+        )
+        if job.status != "queued":
+            return {
+                "attempted": True,
+                "available": True,
+                "queued": False,
+                "document_id": document_id,
+                "job_id": job.id,
+                "job_status": job.status,
+            }
+        payload = dict(job.payload)
+        payload["_job_id"] = job.id
         with self._ingest_lock:
             if self._closed:
                 return {"attempted": False, "available": False, "error": "service shutting down"}
-            self._ingest_queue.append(
-                {
-                    "document_id": doc.get("id"),
-                    "title": doc["title"],
-                    "content": doc["content"],
-                    "source": doc.get("source", ""),
-                    "attempts": 0,
-                }
+            if not any(int(item.get("_job_id") or 0) == job.id for item in self._ingest_queue):
+                self._ingest_queue.append(payload)
+            self._ingest_wakeup.set()
+            self._start_ingest_worker_locked()
+        return {
+            "attempted": True,
+            "available": True,
+            "queued": True,
+            "document_id": document_id,
+            "job_id": job.id,
+        }
+
+    def _start_ingest_worker_locked(self) -> None:
+        if self._ingest_thread is None or not self._ingest_thread.is_alive():
+            self._ingest_thread = threading.Thread(
+                target=self._ingest_worker, name="cognee-ingest", daemon=True
             )
-            while len(self._ingest_queue) > MAX_INGEST_QUEUE_DEPTH:
-                self._ingest_queue.popleft()
-            if self._ingest_thread is None or not self._ingest_thread.is_alive():
-                self._ingest_thread = threading.Thread(
-                    target=self._ingest_worker, name="cognee-ingest", daemon=True
-                )
-                self._ingest_thread.start()
-        return {"attempted": True, "available": True, "queued": True, "document_id": doc.get("id")}
+            self._ingest_thread.start()
 
     def _ingest_worker(self) -> None:
         while True:
@@ -2685,6 +3838,22 @@ class EnterpriseService:
                     self._ingest_thread = None
                     return
                 job = self._ingest_queue.popleft()
+            job_id = int(job.get("_job_id") or 0)
+            stored = self.jobs.get(job_id) if job_id else None
+            if stored is None or stored.status != "queued":
+                continue
+            delay = max(0, int(stored.available_at) - now_ts())
+            if delay:
+                with self._ingest_lock:
+                    # Put delayed retries behind newly accepted ready work so a
+                    # single backoff does not head-of-line block all ingestion.
+                    self._ingest_queue.append(job)
+                self._ingest_wakeup.clear()
+                self._ingest_wakeup.wait(min(delay, 1))
+                continue
+            claimed = self.jobs.mark_running(job_id, lease_seconds=COGNEE_JOB_LEASE_SECONDS)
+            if claimed is None:
+                continue
             try:
                 result = self.cognee.ingest_document(
                     title=job["title"], content=job["content"], source=job["source"]
@@ -2692,56 +3861,56 @@ class EnterpriseService:
             except Exception as exc:  # never let a bad ingest kill the worker
                 result = {"attempted": True, "available": True, "error": str(exc)}
             error = result.get("error")
-            if error and self._retry_ingest_job(job, str(error)):
-                # Re-queued for another attempt; do not record a terminal result.
+            if error and claimed.attempts < MAX_INGEST_ATTEMPTS:
+                backoff = min(2 ** claimed.attempts, INGEST_RETRY_BACKOFF_CAP_SECONDS)
+                print(
+                    f"Cognee ingest attempt {claimed.attempts} failed for document {job.get('document_id')}: "
+                    f"{error}; retrying in {backoff}s",
+                    file=sys.stderr,
+                )
+                self.jobs.requeue(job_id, delay_seconds=backoff, error=str(error))
+                with self._ingest_lock:
+                    if not self._closed:
+                        self._ingest_queue.append(job)
                 continue
             if error:
+                self.jobs.mark_failed(job_id, str(error))
                 print(f"Cognee ingest failed for document {job.get('document_id')}: {error}", file=sys.stderr)
                 with self._ingest_lock:
                     self._ingest_failed_count += 1
                     self._ingest_last_error = str(error)
+            else:
+                self.jobs.mark_succeeded(job_id)
             doc_id = job.get("document_id")
             if doc_id is not None:
                 with self._ingest_lock:
                     self._ingest_results[int(doc_id)] = result
                     while len(self._ingest_results) > MAX_TRACKED_INGEST_RESULTS:
                         self._ingest_results.pop(next(iter(self._ingest_results)), None)
-
-    def _retry_ingest_job(self, job: dict[str, Any], error: str) -> bool:
-        """Re-queue a failed ingest job with capped backoff.
-
-        Returns True when the job was re-queued for another attempt, False when
-        retries are exhausted, the service is closing, or the queue is full.
-        """
-        attempts = int(job.get("attempts", 0)) + 1
-        if attempts >= MAX_INGEST_ATTEMPTS:
-            return False
-        backoff = min(2 ** attempts, INGEST_RETRY_BACKOFF_CAP_SECONDS)
-        print(
-            f"Cognee ingest attempt {attempts} failed for document {job.get('document_id')}: "
-            f"{error}; retrying in {backoff}s",
-            file=sys.stderr,
-        )
-        time.sleep(backoff)
-        with self._ingest_lock:
-            if self._closed or len(self._ingest_queue) >= MAX_INGEST_QUEUE_DEPTH:
-                return False
-            job["attempts"] = attempts
-            self._ingest_queue.append(job)
-            return True
+                    self._ingest_condition.notify_all()
 
     def cognee_ingest_result(self, document_id: int) -> dict[str, Any] | None:
-        with self._ingest_lock:
-            result = self._ingest_results.get(int(document_id))
+        document_id = int(document_id)
+        deadline = time.monotonic() + 0.25
+        with self._ingest_condition:
+            while document_id not in self._ingest_results and time.monotonic() < deadline:
+                if self._ingest_thread is None or not self._ingest_thread.is_alive():
+                    break
+                self._ingest_condition.wait(timeout=max(0, deadline - time.monotonic()))
+            result = self._ingest_results.get(document_id)
             return dict(result) if result else None
 
     def search_knowledge(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         local = [hit.to_dict() for hit in self.knowledge.search(query, limit)]
         if len(local) >= limit and self.config.knowledge_backend != "cognee":
             return local[:limit]
-        cognee_hits = self.cognee.search(query, limit=max(0, limit - len(local)))
         if self.config.knowledge_backend == "cognee":
+            # Pure Cognee mode requests the full caller budget. Local hits are
+            # only a fallback and must not shrink a result set that replaces
+            # them when the graph backend succeeds.
+            cognee_hits = self.cognee.search(query, limit=limit)
             return _dedupe_knowledge_hits(cognee_hits or local)[:limit]
+        cognee_hits = self.cognee.search(query, limit=max(0, limit - len(local)))
         # Local (bm25-ranked) results lead; cognee graph results follow. Dedupe
         # only removes same-keyspace duplicates (e.g. a repeated local id);
         # local and cognee hits use disjoint id keyspaces and are never collapsed
@@ -2770,9 +3939,10 @@ class EnterpriseService:
         return self.get_knowledge_document(document_id)
 
     def knowledge_status(self) -> dict[str, Any]:
+        durable = self.jobs.counts(kind="cognee")
         with self._ingest_lock:
-            ingest_pending = len(self._ingest_queue)
-            ingest_failed = self._ingest_failed_count
+            ingest_pending = durable["queued"] + durable["running"]
+            ingest_failed = max(self._ingest_failed_count, durable["failed"] + durable["needs_review"])
             ingest_last_error = self._ingest_last_error
         fts = bool(getattr(self.db, "fts_available", False))
         return {
@@ -2787,6 +3957,7 @@ class EnterpriseService:
             "ingest_pending": ingest_pending,
             "ingest_failed": ingest_failed,
             "ingest_last_error": ingest_last_error,
+            "ingest_jobs": durable,
         }
 
     def get_setting(self, key: str) -> str | None:
@@ -3077,7 +4248,11 @@ class EnterpriseService:
         key = self._conversation_key(scope_type, scope_id)
         with self._conversation_lock:
             status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
-            return self._copy_status(status)
+            result = self._copy_status(status)
+        result["jobs"] = self.jobs.counts(
+            kind="agent", scope_type=scope_type, scope_id=scope_id
+        )
+        return result
 
     def respond_agent_approval(
         self,
@@ -3188,11 +4363,54 @@ class EnterpriseService:
         scope_type = str(task["scope_type"])
         scope_id = str(task["scope_id"])
         key = self._conversation_key(scope_type, scope_id)
+        task = dict(task)
+        with self._conversation_lock:
+            if self._closed:
+                raise ServiceError(503, "service is shutting down")
+            scope_epoch = int(self._agent_scope_epochs.get(key, 0))
+        # Epochs are process-local cancellation generations. Do not persist one
+        # in the durable payload: after a clean restart current queued work must
+        # rebase onto the new process's epoch zero.
+        task.pop("_scope_epoch", None)
+        try:
+            user_message_id = int((task.get("user_message") or {})["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ServiceError(500, "Agent task is missing its persisted user message") from exc
+        job, _ = self.jobs.enqueue(
+            kind="agent",
+            dedupe_key=f"message:{user_message_id}",
+            payload=task,
+            scope_type=scope_type,
+            scope_id=scope_id,
+        )
+        if job.status != "queued":
+            key = self._conversation_key(scope_type, scope_id)
+            with self._conversation_lock:
+                return self._copy_status(
+                    self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+                )
+        task = dict(job.payload)
+        task["_scope_epoch"] = scope_epoch
+        task["_job_id"] = job.id
+        try:
+            return self._schedule_agent_task(task, enforce_limit=True)
+        except Exception as exc:
+            self.jobs.mark_failed(job.id, str(exc))
+            raise
+
+    def _schedule_agent_task(self, task: dict[str, Any], *, enforce_limit: bool) -> dict[str, Any]:
+        scope_type = str(task["scope_type"])
+        scope_id = str(task["scope_id"])
+        key = self._conversation_key(scope_type, scope_id)
         with self._conversation_lock:
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
             queue = self._agent_queues.setdefault(key, deque())
-            if len(queue) >= MAX_AGENT_QUEUE_DEPTH:
+            job_id = int(task.get("_job_id") or 0)
+            if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):
+                status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+                return self._copy_status(status)
+            if enforce_limit and len(queue) >= MAX_AGENT_QUEUE_DEPTH:
                 raise ServiceError(429, "agent is busy; too many queued messages for this conversation")
             queue.append(task)
             status = self._agent_status.get(key)
@@ -3227,6 +4445,13 @@ class EnterpriseService:
                         self._agent_workers.pop(key, None)
                         return
                     task = queue.popleft()
+                    job_id = int(task.get("_job_id") or 0)
+                    if job_id and self.jobs.mark_running(job_id, lease_seconds=AGENT_JOB_LEASE_SECONDS) is None:
+                        # Another worker (or a terminal transition) already owns
+                        # this ledger entry. Never execute a side-effectful Agent
+                        # run unless this worker atomically claimed it.
+                        continue
+                    self._agent_active_tasks[key] = task
                     self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
 
                 error = ""
@@ -3236,26 +4461,54 @@ class EnterpriseService:
                     # socket) at once; each conversation still drains its own
                     # queue in FIFO order while queued runs wait on the semaphore.
                     with self._agent_run_semaphore:
+                        self._ensure_agent_task_can_run(task)
                         if task["scope_type"] == "channel":
                             self._send_channel_agent_reply(task)
                         else:
                             self._send_private_agent_reply(task)
+                    # The reply insertion itself is lifecycle-serialized by
+                    # ``_send_*_agent_reply``.  A reset that wins after that
+                    # insertion moves the ledger to ``failed`` and removes the
+                    # message; this CAS then becomes a harmless no-op.  A
+                    # shutdown that begins after a committed reply must not
+                    # quarantine already-successful work merely because the
+                    # in-memory epoch changed between commit and this update.
+                    if job_id:
+                        self.jobs.mark_succeeded(job_id)
+                except _AgentTaskCancelled as exc:
+                    error = str(exc)
+                    if job_id:
+                        self.jobs.mark_failed(job_id, error, needs_review=exc.needs_review)
                 except Exception as exc:
                     error = str(exc)
-                    try:
-                        self._append_agent_error(task, error)
-                    except Exception as persist_exc:
-                        # The user-facing error message could not be persisted
-                        # (e.g. transient DB lock). Surface the secondary failure
-                        # instead of swallowing it so the conversation does not
-                        # silently fall idle with nothing rendered.
-                        error_persisted = False
-                        print(
-                            f"Failed to persist agent error for {key}: {persist_exc}",
-                            file=sys.stderr,
-                        )
+                    with self._conversation_lock:
+                        shutting_down = self._closed
+                    if shutting_down:
+                        if job_id:
+                            self.jobs.mark_failed(job_id, error, needs_review=True)
+                        error_persisted = True
+                    else:
+                        try:
+                            self._append_agent_error(task, error, require_current=True)
+                        except _AgentTaskCancelled:
+                            # A reset/deactivation owns the terminal state; do
+                            # not recreate an error message after it completed.
+                            error_persisted = True
+                        except Exception as persist_exc:
+                            # The user-facing error message could not be persisted
+                            # (e.g. transient DB lock). Surface the secondary failure
+                            # instead of swallowing it so the conversation does not
+                            # silently fall idle with nothing rendered.
+                            error_persisted = False
+                            print(
+                                f"Failed to persist agent error for {key}: {persist_exc}",
+                                file=sys.stderr,
+                            )
+                        if job_id:
+                            self.jobs.mark_failed(job_id, error)
 
                 with self._conversation_lock:
+                    self._agent_active_tasks.pop(key, None)
                     queue = self._agent_queues.get(key)
                     if queue:
                         self._agent_status[key] = self._status_for_task(queue[0], "queued", queued_count=len(queue))
@@ -3285,52 +4538,79 @@ class EnterpriseService:
         finally:
             with self._conversation_lock:
                 worker = self._agent_workers.get(key)
+                self._agent_active_tasks.pop(key, None)
                 if worker is None or worker is threading.current_thread():
                     self._agent_workers.pop(key, None)
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
 
-    def _handle_async_delegation_event(self, event: dict[str, Any]) -> None:
+    def _handle_async_delegation_event(self, event: dict[str, Any]) -> bool:
         scope = self._scope_from_async_delegation_session_key(str(event.get("session_key") or ""))
         if scope is None:
-            return
+            return True
         event_id = self._async_delegation_event_id(event)
+        scope_type, scope_id = scope
         with self._conversation_lock:
+            if scope_type == "private":
+                try:
+                    private_user_id = int(scope_id)
+                except (TypeError, ValueError):
+                    return True
+                if private_user_id <= 0:
+                    return True
+                scope_key = self.agent_scopes.private_scope_key(private_user_id)
+            else:
+                private_user_id = None
+                scope_key = self.agent_scopes.channel_scope_key(scope_id)
+            current_scope = self.agent_scopes.get_scope(scope_key)
+            parent_session_id = str(event.get("parent_session_id") or "").strip()
+            # Async completions are delayed external events.  Bind them to the
+            # exact current Hermes session so a completion from before clear /
+            # session rotation cannot repopulate the new conversation. Missing
+            # lineage is rejected rather than guessed from the reusable
+            # session_key.
+            if current_scope is None or not parent_session_id:
+                return True
+            if not self.agent_scopes.session_belongs_to_current_lifecycle(scope_key, parent_session_id):
+                return True
+            if scope_type == "private":
+                user = self.get_user(int(private_user_id))
+                if user is None or not user.get("active"):
+                    return True
             if event_id in self._async_delegation_seen:
-                return
+                return True
             if self._async_delegation_message_exists(event_id):
                 self._async_delegation_seen.add(event_id)
-                return
+                return True
+            failed = self._async_delegation_failed(event)
+            title = "后台子代理任务失败" if failed else "后台子代理任务完成"
+            detail = str(event.get("error") or event.get("summary") or event.get("goal") or "")[:180]
+            self._record_agent_activity(scope_type, scope_id, "error" if failed else "complete", title, detail)
+            content = self._format_async_delegation_message(event, failed=failed)
+            metadata = {
+                "async_delegation_id": event_id,
+                "async_delegation": {
+                    "delegation_id": str(event.get("delegation_id") or ""),
+                    "session_key": str(event.get("session_key") or ""),
+                    "parent_session_id": parent_session_id,
+                    "status": str(event.get("status") or ""),
+                    "goal": str(event.get("goal") or ""),
+                    "model": str(event.get("model") or ""),
+                    "duration_seconds": event.get("duration_seconds"),
+                    "failed": failed,
+                },
+            }
+            self._append_message(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                author_type="agent",
+                user_id=None,
+                username="Main Agent" if scope_type == "channel" else "Private Agent",
+                content=content,
+                metadata=metadata,
+            )
             self._async_delegation_seen.add(event_id)
-
-        scope_type, scope_id = scope
-        failed = self._async_delegation_failed(event)
-        title = "后台子代理任务失败" if failed else "后台子代理任务完成"
-        detail = str(event.get("error") or event.get("summary") or event.get("goal") or "")[:180]
-        self._record_agent_activity(scope_type, scope_id, "error" if failed else "complete", title, detail)
-        content = self._format_async_delegation_message(event, failed=failed)
-        metadata = {
-            "async_delegation_id": event_id,
-            "async_delegation": {
-                "delegation_id": str(event.get("delegation_id") or ""),
-                "session_key": str(event.get("session_key") or ""),
-                "status": str(event.get("status") or ""),
-                "goal": str(event.get("goal") or ""),
-                "model": str(event.get("model") or ""),
-                "duration_seconds": event.get("duration_seconds"),
-                "failed": failed,
-            },
-        }
-        self._append_message(
-            scope_type=scope_type,
-            scope_id=scope_id,
-            author_type="agent",
-            user_id=None,
-            username="Main Agent" if scope_type == "channel" else "Private Agent",
-            content=content,
-            metadata=metadata,
-        )
-
+            return True
     @staticmethod
     def _scope_from_async_delegation_session_key(session_key: str) -> tuple[str, str] | None:
         if session_key.startswith("channel:") and session_key.endswith(":main-agent"):
@@ -3394,20 +4674,49 @@ class EnterpriseService:
         if not self._typing.get(key):
             self._typing.pop(key, None)
 
-    def _append_agent_error(self, task: dict[str, Any], error: str) -> None:
+    def _append_agent_error(
+        self,
+        task: dict[str, Any],
+        error: str,
+        *,
+        require_current: bool = False,
+    ) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
-        self._record_agent_activity(str(task["scope_type"]), str(task["scope_id"]), "error", "Agent 回复失败", error[:180])
         metadata = {"error": error, "reply_to": self._reply_target(task)}
+        if task.get("_job_id"):
+            metadata["durable_job_id"] = int(task["_job_id"])
         metadata["agent_work"] = self._agent_work_snapshot(task, state="error")
-        self._append_message(
-            scope_type=str(task["scope_type"]),
-            scope_id=str(task["scope_id"]),
-            author_type="agent",
-            user_id=None,
-            username=username,
-            content=f"Agent 回复失败: {error}",
-            metadata=metadata,
-        )
+        kwargs = {
+            "scope_type": str(task["scope_type"]),
+            "scope_id": str(task["scope_id"]),
+            "author_type": "agent",
+            "user_id": None,
+            "username": username,
+            "content": f"Agent 回复失败: {error}",
+            "metadata": metadata,
+        }
+        if require_current:
+            with self._conversation_lock:
+                self._ensure_agent_task_can_run(task)
+                self._record_agent_activity(
+                    str(task["scope_type"]),
+                    str(task["scope_id"]),
+                    "error",
+                    "Agent 回复失败",
+                    error[:180],
+                )
+                self._append_message(**kwargs)
+        else:
+            self._record_agent_activity(
+                str(task["scope_type"]),
+                str(task["scope_id"]),
+                "error",
+                "Agent 回复失败",
+                error[:180],
+            )
+            self._append_message(**kwargs)
+        if str(task["scope_type"]) == "private":
+            self._telegram_delivery_wakeup.set()
 
     def _normalize_conversation(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> tuple[str, str]:
         scope_type = str(scope_type).strip().lower()
@@ -3791,11 +5100,48 @@ class EnterpriseService:
         metadata: dict[str, Any],
         attachments: list[UploadedFile] | None = None,
         attachment_source: str = "upload",
+        attachment_uploader_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self._attachment_lock:
+            return self._append_message_with_attachments_locked(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                author_type=author_type,
+                user_id=user_id,
+                username=username,
+                content=content,
+                metadata=metadata,
+                attachments=attachments,
+                attachment_source=attachment_source,
+                attachment_uploader_user_id=attachment_uploader_user_id,
+            )
+
+    def _append_message_with_attachments_locked(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        author_type: str,
+        user_id: int | None,
+        username: str,
+        content: str,
+        metadata: dict[str, Any],
+        attachments: list[UploadedFile] | None = None,
+        attachment_source: str = "upload",
+        attachment_uploader_user_id: int | None = None,
     ) -> dict[str, Any]:
         attachments = list(attachments or [])
         metadata = dict(metadata)
         if attachments:
             metadata["attachment_count"] = len(attachments)
+        final_metadata = dict(metadata)
+        if attachments:
+            # The message row and attachment rows live in separate SQLite
+            # transactions because blob writes occur between them. Mark the row
+            # incomplete first; startup deletes any row left in this state by a
+            # hard process death, before durable Agent-gap recovery can execute
+            # a request with silently missing files.
+            metadata["_attachment_commit"] = "pending"
         msg_id = self.db.insert(
             """
             INSERT INTO messages(scope_type, scope_id, author_type, user_id, username, content, metadata_json, created_at)
@@ -3809,9 +5155,17 @@ class EnterpriseService:
                     message_id=msg_id,
                     scope_type=scope_type,
                     scope_id=str(scope_id),
-                    uploader_user_id=user_id,
+                    uploader_user_id=(
+                        int(attachment_uploader_user_id)
+                        if attachment_uploader_user_id is not None
+                        else user_id
+                    ),
                     source=attachment_source,
                     attachments=attachments,
+                )
+                self.db.execute(
+                    "UPDATE messages SET metadata_json = ? WHERE id = ?",
+                    (encode_json(final_metadata), int(msg_id)),
                 )
             except Exception:
                 # The message row is already committed with attachment_count=N
@@ -3819,7 +5173,10 @@ class EnterpriseService:
                 # (ON DELETE CASCADE clears any partial attachment rows) so we do
                 # not leave a message claiming attachments that do not exist.
                 try:
-                    self.db.execute("DELETE FROM messages WHERE id = ?", (int(msg_id),))
+                    self._delete_message_ids(
+                        [int(msg_id)],
+                        reason="message attachment commit failed",
+                    )
                 except Exception:
                     pass
                 raise
@@ -3832,6 +5189,7 @@ class EnterpriseService:
         if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
             raise ServiceError(400, f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed")
         normalized = []
+        total_bytes = 0
         for item in attachments:
             data = bytes(item.data or b"")
             if not data:
@@ -3840,6 +5198,12 @@ class EnterpriseService:
                 raise ServiceError(413, f"attachment exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB")
             filename = sanitize_attachment_filename(item.filename)
             content_type = normalize_attachment_mime(filename, item.content_type)
+            total_bytes += len(data)
+            if MAX_ATTACHMENTS_TOTAL_BYTES > 0 and total_bytes > MAX_ATTACHMENTS_TOTAL_BYTES:
+                raise ServiceError(
+                    413,
+                    f"attachments exceed {MAX_ATTACHMENTS_TOTAL_BYTES // (1024 * 1024)} MB total",
+                )
             normalized.append(UploadedFile(filename=filename, content_type=content_type, data=data))
         return normalized
 
@@ -3853,42 +5217,55 @@ class EnterpriseService:
         source: str,
         attachments: list[UploadedFile],
     ) -> None:
-        self._enforce_attachment_quota(uploader_user_id, attachments)
         root = self._attachment_root()
         target_dir = root / scope_type / str(scope_id)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(root / scope_type)
+        ensure_private_directory(target_dir)
         timestamp = now_ts()
         written: list[Path] = []
         try:
-            for attachment in attachments:
-                digest = hashlib.sha256(attachment.data).hexdigest()
-                ext = safe_attachment_suffix(attachment.filename)
-                storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
-                target = root / storage_path
-                target.write_bytes(attachment.data)
-                written.append(target)
-                self.db.insert(
-                    """
-                    INSERT INTO attachments(
-                        message_id, scope_type, scope_id, uploader_user_id, source,
-                        filename, storage_path, mime_type, size_bytes, sha256, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        message_id,
-                        scope_type,
-                        str(scope_id),
-                        uploader_user_id,
-                        source,
-                        attachment.filename,
-                        storage_path,
-                        attachment.content_type,
-                        len(attachment.data),
-                        digest,
-                        timestamp,
-                    ),
+            with self.db.transaction() as conn:
+                # Serialize quota check + rows so concurrent uploads cannot all
+                # pass an old SUM snapshot. Files are staged under owner-only
+                # directories and removed if the transaction fails.
+                conn.execute("BEGIN IMMEDIATE")
+                self._enforce_attachment_quota(
+                    uploader_user_id,
+                    attachments,
+                    conn=conn,
+                    scope_type=scope_type,
+                    scope_id=str(scope_id),
+                    source=source,
                 )
+                for attachment in attachments:
+                    digest = hashlib.sha256(attachment.data).hexdigest()
+                    ext = safe_attachment_suffix(attachment.filename)
+                    storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
+                    target = root / storage_path
+                    write_private_file_exclusive(target, attachment.data)
+                    written.append(target)
+                    conn.execute(
+                        """
+                        INSERT INTO attachments(
+                            message_id, scope_type, scope_id, uploader_user_id, source,
+                            filename, storage_path, mime_type, size_bytes, sha256, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message_id,
+                            scope_type,
+                            str(scope_id),
+                            uploader_user_id,
+                            source,
+                            attachment.filename,
+                            storage_path,
+                            attachment.content_type,
+                            len(attachment.data),
+                            digest,
+                            timestamp,
+                        ),
+                    )
         except Exception:
             # Roll back every file written in this batch so a mid-batch failure
             # does not leave orphan blobs on disk. The attachment rows for this
@@ -3900,19 +5277,39 @@ class EnterpriseService:
                     pass
             raise
 
-    def _enforce_attachment_quota(self, uploader_user_id: int | None, attachments: list[UploadedFile]) -> None:
+    def _enforce_attachment_quota(
+        self,
+        uploader_user_id: int | None,
+        attachments: list[UploadedFile],
+        *,
+        conn=None,
+        scope_type: str = "",
+        scope_id: str = "",
+        source: str = "upload",
+    ) -> None:
         """Reject uploads that would exceed the per-uploader storage budget."""
-        if ATTACHMENT_QUOTA_BYTES <= 0 or uploader_user_id is None:
-            return
         incoming = sum(len(attachment.data) for attachment in attachments)
         if incoming <= 0:
             return
-        existing = self.db.scalar(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE uploader_user_id = ?",
-            (int(uploader_user_id),),
-        )
-        if int(existing or 0) + incoming > ATTACHMENT_QUOTA_BYTES:
-            raise ServiceError(413, "attachment storage quota exceeded")
+        query_one = conn.execute if conn is not None else self.db._conn.execute
+        quota_user_id = uploader_user_id
+        if quota_user_id is None and source == "hermes" and scope_type == "private":
+            try:
+                quota_user_id = int(scope_id)
+            except (TypeError, ValueError):
+                quota_user_id = None
+        if ATTACHMENT_QUOTA_BYTES > 0 and quota_user_id is not None:
+            existing = query_one(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM attachments "
+                "WHERE uploader_user_id = ? OR (source = 'hermes' AND scope_type = 'private' AND scope_id = ?)",
+                (int(quota_user_id), str(quota_user_id)),
+            ).fetchone()[0]
+            if int(existing or 0) + incoming > ATTACHMENT_QUOTA_BYTES:
+                raise ServiceError(413, "attachment storage quota exceeded")
+        if GLOBAL_ATTACHMENT_QUOTA_BYTES > 0:
+            global_existing = query_one("SELECT COALESCE(SUM(size_bytes), 0) FROM attachments").fetchone()[0]
+            if int(global_existing or 0) + incoming > GLOBAL_ATTACHMENT_QUOTA_BYTES:
+                raise ServiceError(507, "global attachment storage quota exceeded")
 
     def _enforce_upload_rate_limit(self, uploader_user_id: int | None) -> None:
         """Sliding-window per-user rate limit for attachment-bearing messages."""
@@ -3935,24 +5332,141 @@ class EnterpriseService:
         )
         return [self._attachment_from_row(row, include_local_path=include_local_path) for row in rows]
 
-    def _delete_attachment_files_for_messages(self, message_ids: list[int]) -> None:
-        ids = [int(message_id) for message_id in message_ids if int(message_id) > 0]
+    def _delete_message_ids(self, message_ids: list[int], *, reason: str) -> int:
+        """Delete exact message ids and cancel work derived from those rows.
+
+        Callers may already hold ``_conversation_lock``; both locks are
+        re-entrant so all deletion paths share the same ordering.  The database
+        transition commits before best-effort unlinks. A crash after commit can
+        therefore leave only an unreferenced blob, which startup reconciliation
+        removes, never a live attachment row pointing at an intentionally
+        deleted message.
+        """
+
+        ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
         if not ids:
-            return
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        dedupe_keys = [f"message:{message_id}" for message_id in ids]
+        key_placeholders = ",".join("?" for _ in dedupe_keys)
+        with self._conversation_lock:
+            with self._attachment_lock:
+                paths = self._attachment_file_paths_for_messages(ids)
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        f"""
+                        UPDATE durable_jobs
+                        SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                        WHERE kind IN ('agent', ?)
+                          AND dedupe_key IN ({key_placeholders})
+                          AND status IN ('queued', 'running')
+                        """,
+                        (
+                            str(reason)[:2000],
+                            now_ts(),
+                            TELEGRAM_DELIVERY_JOB_KIND,
+                            *dedupe_keys,
+                        ),
+                    )
+                    cursor = conn.execute(
+                        f"DELETE FROM messages WHERE id IN ({placeholders})",
+                        ids,
+                    )
+                self._unlink_attachment_paths(paths)
+                return max(0, int(cursor.rowcount))
+
+    def _active_agent_scope_keys_for_message_ids(self, message_ids: list[int]) -> set[str]:
+        """Return Hermes scopes whose currently running source turn is deleted.
+
+        The caller holds ``_conversation_lock`` so the active-task snapshot is
+        ordered with both deletion and terminal Agent persistence.
+        """
+
+        wanted = {int(message_id) for message_id in message_ids if int(message_id) > 0}
+        scope_keys: set[str] = set()
+        for task in self._agent_active_tasks.values():
+            try:
+                message_id = int((task.get("user_message") or {})["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if message_id not in wanted:
+                continue
+            scope_type = str(task.get("scope_type") or "")
+            scope_id = str(task.get("scope_id") or "")
+            if scope_type == "private":
+                try:
+                    scope_keys.add(self.agent_scopes.private_scope_key(int(scope_id)))
+                except (TypeError, ValueError):
+                    continue
+            elif scope_type == "channel" and scope_id:
+                scope_keys.add(self.agent_scopes.channel_scope_key(scope_id))
+        return scope_keys
+
+    def _attachment_file_paths_for_messages(self, message_ids: list[int]) -> list[Path]:
+        ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
+        if not ids:
+            return []
         placeholders = ",".join("?" for _ in ids)
         rows = self.db.query(
             f"SELECT storage_path FROM attachments WHERE message_id IN ({placeholders})",
             ids,
         )
         root = self._attachment_root().resolve()
+        paths: list[Path] = []
         for row in rows:
             path = (root / str(row["storage_path"])).resolve()
             if root != path and root not in path.parents:
                 continue
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def _unlink_attachment_paths(paths: list[Path]) -> None:
+        for path in paths:
             try:
                 path.unlink()
             except OSError:
                 pass
+
+    def _cleanup_orphan_attachment_files(self) -> None:
+        """Remove attachment blobs that have no database row after a crash."""
+
+        with self._attachment_lock:
+            root = self._attachment_root().resolve()
+            referenced: set[Path] = set()
+            for row in self.db.query("SELECT storage_path FROM attachments"):
+                path = (root / str(row["storage_path"])).resolve()
+                if root != path and root not in path.parents:
+                    continue
+                referenced.add(path)
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    continue
+                if resolved not in referenced:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+    def _cleanup_incomplete_attachment_messages(self) -> None:
+        """Discard messages interrupted before their attachment commit."""
+
+        message_ids: list[int] = []
+        for row in self.db.query(
+            "SELECT id, metadata_json FROM messages WHERE metadata_json LIKE ?",
+            ('%"_attachment_commit":"pending"%',),
+        ):
+            metadata = decode_json(row.get("metadata_json"))
+            if isinstance(metadata, dict) and metadata.get("_attachment_commit") == "pending":
+                message_ids.append(int(row["id"]))
+        self._delete_message_ids(
+            message_ids,
+            reason="message attachment commit was interrupted by service restart",
+        )
 
     def get_attachment_file(self, actor: dict[str, Any], attachment_id: int) -> tuple[dict[str, Any], Path]:
         row = self.db.query_one("SELECT * FROM attachments WHERE id = ?", (int(attachment_id),))
@@ -4005,8 +5519,7 @@ class EnterpriseService:
 
     def _attachment_root(self) -> Path:
         root = self.config.data_dir / "attachments"
-        root.mkdir(parents=True, exist_ok=True)
-        return root
+        return ensure_private_directory(root)
 
     def _agent_prompt_content(
         self,
@@ -4056,12 +5569,18 @@ class EnterpriseService:
         """
         return self.config.managed_hermes_home / "tmp"
 
-    def _media_safe_data_subtrees(self, owner_id: int | None) -> list[Path]:
+    def _media_safe_data_subtrees(
+        self,
+        owner_id: int | None,
+        workspace_path: Path | None = None,
+    ) -> list[Path]:
         """Subtrees under the platform data dir that ARE safe to read media from
         (the agent's own workspace, the managed Hermes generated-media cache, and
         the dedicated managed media scratch dir), used to keep platform secrets
         unreadable even when the data dir overlaps another allowed root."""
-        if owner_id is not None:
+        if workspace_path is not None:
+            workspace = workspace_path
+        elif owner_id is not None:
             workspace = self.config.workspace_dir / f"user-{int(owner_id)}"
         else:
             workspace = self.config.workspace_dir
@@ -4077,11 +5596,16 @@ class EnterpriseService:
                 continue
         return subtrees
 
-    def _media_allowed_roots(self, owner_id: int | None) -> list[Path]:
+    def _media_allowed_roots(
+        self,
+        owner_id: int | None,
+        workspace_path: Path | None = None,
+    ) -> list[Path]:
         """Directories the platform will read agent-generated media from.
 
         For a private conversation only the owning user's workspace is allowed;
-        a shared channel allows the whole workspace tree. Managed Hermes writes
+        a channel response is restricted to that channel Agent's workspace.
+        Managed Hermes writes
         generated documents/images/audio under its cache and the dedicated
         managed media scratch dir, so those subtrees are allowed, plus any
         operator-configured ``ENTERPRISE_MEDIA_ROOTS``. The broad system temp dir
@@ -4092,7 +5616,7 @@ class EnterpriseService:
         ``.env``, the bootstrap admin password) are never readable — see
         ``_resolve_media_path``.
         """
-        candidates = list(self._media_safe_data_subtrees(owner_id))
+        candidates = list(self._media_safe_data_subtrees(owner_id, workspace_path))
         for raw in os.getenv("ENTERPRISE_MEDIA_ROOTS", "").split(os.pathsep):
             raw = raw.strip()
             if raw:
@@ -4105,7 +5629,12 @@ class EnterpriseService:
                 continue
         return roots
 
-    def _resolve_media_path(self, raw_path: str, owner_id: int | None) -> Path | None:
+    def _resolve_media_path(
+        self,
+        raw_path: str,
+        owner_id: int | None,
+        workspace_path: Path | None = None,
+    ) -> Path | None:
         """Resolve a model-supplied MEDIA: path, confining it to allowed roots.
 
         Symlinks are resolved before the containment check so a symlink inside
@@ -4119,7 +5648,7 @@ class EnterpriseService:
             return None
         if not candidate.is_file():
             return None
-        roots = self._media_allowed_roots(owner_id)
+        roots = self._media_allowed_roots(owner_id, workspace_path)
         if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
             return None
         # Even within an allowed root (e.g. the temp dir overlapping a data dir
@@ -4130,23 +5659,29 @@ class EnterpriseService:
         except OSError:
             return candidate
         if candidate == data_root or candidate.is_relative_to(data_root):
-            safe = self._media_safe_data_subtrees(owner_id)
+            safe = self._media_safe_data_subtrees(owner_id, workspace_path)
             if not any(candidate == s or candidate.is_relative_to(s) for s in safe):
                 return None
         return candidate
 
     def _extract_generated_attachments(
-        self, content: str, owner_id: int | None = None
+        self,
+        content: str,
+        owner_id: int | None = None,
+        workspace_path: Path | None = None,
     ) -> tuple[str, list[UploadedFile]]:
         content = str(content or "")
-        attachments: list[UploadedFile] = []
+        candidates: list[UploadedFile] = []
         missing: list[str] = []
         refused: list[str] = []
+        seen_paths: set[Path] = set()
+        candidate_total = 0
+        aggregate_limit_exceeded = False
         for match in MEDIA_TAG_RE.finditer(content):
             raw_path = clean_media_path(match.group("path"))
             if not raw_path:
                 continue
-            path = self._resolve_media_path(raw_path, owner_id)
+            path = self._resolve_media_path(raw_path, owner_id, workspace_path)
             if path is None:
                 # Distinguish "file is gone" from "file is outside the sandbox"
                 # for diagnostics, without reading anything out of scope.
@@ -4156,18 +5691,44 @@ class EnterpriseService:
                     exists = False
                 (refused if exists else missing).append(raw_path)
                 continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if len(candidates) >= MAX_ATTACHMENTS_PER_MESSAGE:
+                refused.append(raw_path)
+                continue
             try:
-                if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+                size = path.stat().st_size
+                if size > MAX_ATTACHMENT_BYTES:
                     refused.append(raw_path)
                     continue
-                data = path.read_bytes()
-                attachments.extend(
-                    self._normalize_uploaded_files(
-                        [UploadedFile(path.name, normalize_attachment_mime(path.name, ""), data)]
-                    )
+                if MAX_ATTACHMENTS_TOTAL_BYTES > 0 and candidate_total + size > MAX_ATTACHMENTS_TOTAL_BYTES:
+                    refused.append(raw_path)
+                    aggregate_limit_exceeded = True
+                    continue
+                with path.open("rb") as handle:
+                    data = handle.read(MAX_ATTACHMENT_BYTES + 1)
+                if len(data) > MAX_ATTACHMENT_BYTES:
+                    refused.append(raw_path)
+                    continue
+                candidates.append(
+                    UploadedFile(path.name, normalize_attachment_mime(path.name, ""), data)
                 )
-            except Exception:
+                candidate_total += len(data)
+            except OSError:
                 missing.append(raw_path)
+
+        if aggregate_limit_exceeded:
+            candidates = []
+        try:
+            attachments = self._normalize_uploaded_files(candidates)
+        except ServiceError as exc:
+            # A generated response must never bypass the same aggregate limits
+            # as a browser upload. Keep the textual answer visible while
+            # refusing the whole oversized batch instead of saving a partial,
+            # misleading set of files.
+            attachments = []
+            refused.append(f"generated attachment batch ({exc.message})")
 
         if not attachments and not missing and not refused:
             return content, []
@@ -4180,7 +5741,8 @@ class EnterpriseService:
             notes.append("Hermes returned file path(s) that the platform could not read: " + ", ".join(missing[:5]))
         if refused:
             notes.append(
-                "Hermes returned file path(s) outside the allowed media directories; they were not shared: "
+                "Hermes returned file path(s) that exceeded attachment limits or were outside the allowed media "
+                "directories; they were not shared: "
                 + ", ".join(refused[:5])
             )
         if notes:
@@ -4219,20 +5781,28 @@ class EnterpriseService:
         return not any(ch in session_id for ch in "\r\n\x00")
 
     def _channel_agent_session_id(self, scope_id: str) -> str:
-        stored = self.get_setting(f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent")
-        if self._valid_hermes_session_id(stored):
-            return str(stored)
-        return self._default_channel_agent_session_id(scope_id)
+        return self._channel_agent_scope(scope_id).session_id
 
     def _remember_channel_agent_session_id(self, scope_id: str, session_id: str | None) -> None:
         if self._valid_hermes_session_id(session_id):
-            self.set_setting(f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent", str(session_id))
+            self.agent_scopes.update_session_id(
+                self.agent_scopes.channel_scope_key(scope_id),
+                str(session_id),
+            )
 
     def _channel_agent_workspace(self, scope_id: str) -> Path:
-        safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(scope_id)).strip(".-") or "default"
-        path = self.config.workspace_dir / "channels" / f"channel-{safe_scope}"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return Path(self._channel_agent_scope(scope_id).workspace_path)
+
+    def _channel_agent_scope(self, scope_id: str) -> AgentExecutionScope:
+        # Read the old setting only when materializing a scope for the first
+        # time. New session state is written exclusively to agent_scopes.
+        legacy_session_id = self.get_setting(
+            f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent"
+        )
+        return self.agent_scopes.ensure_channel_scope(
+            scope_id,
+            legacy_session_id=legacy_session_id,
+        )
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self._messages_for_scope(scope_type, scope_id, limit=12)
@@ -4320,14 +5890,19 @@ class EnterpriseService:
             f"{passive}"
         )
 
-    def _private_system_prompt(self, actor: dict[str, Any], container: dict[str, Any], suggestions) -> str:
+    def _private_system_prompt(
+        self,
+        actor: dict[str, Any],
+        agent_scope: AgentExecutionScope,
+        suggestions,
+    ) -> str:
         passive = format_passive_suggestions(suggestions)
         return (
             "你是 ubitech 的企业级 Agent。对外介绍自己时，只说自己是 ubitech 的企业级 Agent；"
             "不要提及底层框架、运行时、模型供应商或内部实现。\n"
-            "当前工作模式: 私人助手。每个用户拥有隔离会话和自动管理的工作容器。\n"
+            "当前工作模式: 私人助手。每个用户拥有独立工作区、记忆和会话；命令在受信任的企业宿主机执行。\n"
             f"当前用户: {self._actor_context_label(actor, include_username=True, include_empty_position=True)}。\n"
-            f"工作区: {container['workspace_path']}；容器状态: {container['container_status']}；会话: {container['session_id']}。\n"
+            f"工作区: {agent_scope.workspace_path}；会话: {agent_scope.session_id}。\n"
             "模型密钥由平台集中配置，不要要求用户再次提供密钥。\n"
             "企业知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
             f"{passive}"

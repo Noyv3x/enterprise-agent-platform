@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "vite build",
-    "check": "tsc --noEmit"
+    "build": "node scripts/build-static.mjs",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.2.7",
@@ -18,6 +19,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "^6.0.3",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.10"
   }
 }

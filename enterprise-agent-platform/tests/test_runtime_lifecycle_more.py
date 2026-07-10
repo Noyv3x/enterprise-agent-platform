@@ -2,6 +2,7 @@ import ast
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -162,6 +163,180 @@ class HermesRuntimePatchCompatibilityTests(unittest.TestCase):
                 f"stderr:\n{result.stderr}"
             )
 
+    def test_applied_patch_propagates_relay_scope_to_runtime_and_cleanup(self):
+        """Exercise the installed patch, not merely its source text.
+
+        The platform scope must survive relay decoding, native session-key
+        construction, detached-delegation routing, and terminal cleanup key
+        derivation as one byte-identical value.
+        """
+        if shutil.which("git") is None:
+            self.skipTest("git is required to materialize the managed Hermes patch")
+
+        platform_root = Path(__file__).resolve().parents[1]
+        hermes_repo = platform_root.parent / "hermes-agent"
+        patch_path = (
+            platform_root
+            / "enterprise_agent_platform"
+            / "hermes_runtime_patch"
+            / "hermes_agent_isolation.patch"
+        )
+        if not (hermes_repo / "gateway" / "run.py").exists():
+            self.skipTest("Hermes submodule is not initialized")
+
+        with tempfile.TemporaryDirectory() as td:
+            patched = Path(td) / "hermes-agent"
+            shutil.copytree(
+                hermes_repo,
+                patched,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    ".venv",
+                    "__pycache__",
+                    ".pytest_cache",
+                    "node_modules",
+                    "website",
+                ),
+            )
+            applied = subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+                cwd=patched,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+
+            exercise = r'''
+import ast
+import hashlib
+import logging
+import re
+from types import SimpleNamespace
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
+from gateway.relay.ws_transport import _event_from_wire
+from gateway.session import SessionSource, build_session_key
+
+
+def load_function(path, name, extra_globals):
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=str(path))
+    node = None
+    for candidate in ast.walk(tree):
+        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef)) and candidate.name == name:
+            node = candidate
+            break
+    assert node is not None, name
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            node,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    namespace = dict(extra_globals)
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[name]
+
+
+_async_delegation_routing_metadata = load_function(
+    "tools/delegate_tool.py",
+    "_async_delegation_routing_metadata",
+    {"Any": Any, "Dict": Dict, "Optional": Optional},
+)
+_session_scoped_container_task_id = load_function(
+    "tools/terminal_tool.py",
+    "_session_scoped_container_task_id",
+    {"hashlib": hashlib, "re": re, "Optional": Optional},
+)
+_build_process_event_source = load_function(
+    "gateway/run.py",
+    "_build_process_event_source",
+    {
+        "logger": logging.getLogger("relay-scope-test"),
+        "Platform": Platform,
+        "_BUILTIN_PLATFORM_VALUES": _BUILTIN_PLATFORM_VALUES,
+        "_parse_session_key": lambda _key: None,
+    },
+)
+
+scope = "private:7"
+event = _event_from_wire({
+    "text": "hello",
+    "message_type": "text",
+    "message_id": "turn-7",
+    "enterprise_session_key": scope,
+    "source": {
+        "platform": "relay",
+        "chat_id": "enterprise-private-u7",
+        "chat_type": "dm",
+        "user_id": "u7",
+        "message_id": "turn-7",
+    },
+})
+assert event.source.enterprise_session_key == scope
+assert event.source.delivered_via_upstream_relay is True
+assert build_session_key(event.source) == scope
+
+# The same field on an ordinary/untrusted source must not override native keying.
+untrusted = SessionSource(
+    platform=Platform.RELAY,
+    chat_id="enterprise-private-u7",
+    chat_type="dm",
+    enterprise_session_key=scope,
+)
+assert build_session_key(untrusted) != scope
+
+# Detached delegation captures and later reconstructs the canonical key.
+parent = SimpleNamespace(
+    platform="relay",
+    _chat_type="dm",
+    _chat_id="enterprise-private-u7",
+    _thread_id=None,
+    _user_id="u7",
+    _user_id_alt=None,
+    _user_name="User 7",
+)
+routing = _async_delegation_routing_metadata(parent, scope)
+assert routing["session_key"] == scope
+
+runner = SimpleNamespace(
+    session_store=SimpleNamespace(_entries={}, _ensure_loaded=lambda: None),
+    _get_cached_session_source=lambda _key: None,
+)
+synthetic = _build_process_event_source(runner, {
+    "session_key": routing["session_key"],
+    "platform": routing["platform"],
+    "chat_type": routing["chat_type"],
+    "chat_id": routing["chat_id"],
+    "user_id": routing["user_id"],
+    "message_id": "turn-7",
+})
+assert synthetic is not None
+assert build_session_key(synthetic) == scope
+
+# Scope cleanup calls this exact derivation, so its process key must match the
+# task id used by terminal dispatch for the canonical Agent scope.
+digest = hashlib.sha256(scope.encode()).hexdigest()[:12]
+expected_task_id = f"gateway-private-7-{digest}"
+assert _session_scoped_container_task_id(scope) == expected_task_id
+'''
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(patched)
+            ran = subprocess.run(
+                [sys.executable, "-c", exercise],
+                cwd=patched,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+
     def test_managed_patch_keeps_upstream_native_contracts(self):
         platform_root = Path(__file__).resolve().parents[1]
         patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
@@ -278,7 +453,7 @@ class FirecrawlEnvLocationTests(unittest.TestCase):
             self.assertFalse((repo / ".env").exists())
             text = env_path.read_text(encoding="utf-8")
             self.assertIn("BULL_AUTH_KEY=", text)
-            self.assertIn('PORT="13002"', text)
+            self.assertIn('PORT="127.0.0.1:13002"', text)
             self.assertIn('USE_DB_AUTHENTICATION="false"', text)
 
     def test_prepare_firecrawl_materializes_env_in_runtime_dir(self):

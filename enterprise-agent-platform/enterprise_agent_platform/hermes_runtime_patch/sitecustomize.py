@@ -8,20 +8,24 @@ Hermes installs untouched.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import re
+import sqlite3
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Aggregated, process-visible status string the platform can surface after the
-# managed Hermes gateway starts. ``sitecustomize`` runs at interpreter startup
-# before logging is configured, so a log record may never reach a handler; an
-# environment marker survives so operators can detect a silent no-op patch.
+# Aggregated process-local status exposed through the authenticated managed
+# Hermes patch-status endpoint. The environment marker is also useful to code
+# running inside that child interpreter before the API adapter is connected.
 _PATCH_STATUS_ENV = "ENTERPRISE_HERMES_PATCH_STATUS"
 _patch_status: dict[str, str] = {}
 
@@ -36,6 +40,12 @@ def _record_patch_status(component: str, state: str) -> None:
         )
     except Exception:
         pass
+
+
+def _failed_patch_components(status: dict[str, str]) -> dict[str, str]:
+    """Return every required runtime component that did not install cleanly."""
+
+    return {name: state for name, state in status.items() if state != "ok"}
 
 
 def _event_value(event: Any, name: str, default: Any = None) -> Any:
@@ -427,7 +437,40 @@ def _install_api_async_delegation_patch() -> None:
     max_seen = max_events * 4
     original_init = adapter_cls.__init__
     original_connect = adapter_cls.connect
+    original_handle_runs = adapter_cls._handle_runs
     original_inject = runner_cls._inject_watch_notification
+
+    def _open_async_store(path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(path), timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS async_delegation_events (
+                event_id TEXT PRIMARY KEY,
+                event_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        connection.commit()
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return connection
+
+    def _init_async_store(self: Any) -> None:
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            home.chmod(0o700)
+        except OSError:
+            pass
+        path = home / "enterprise-async-delegations.sqlite3"
+        connection = _open_async_store(path)
+        connection.close()
+        self._enterprise_async_store_path = path
 
     def _event_key(evt: dict[str, Any]) -> str:
         delegation_id = str(evt.get("delegation_id") or "").strip()
@@ -456,6 +499,48 @@ def _install_api_async_delegation_patch() -> None:
         self._enterprise_async_delegation_seen = set()
         self._enterprise_async_delegation_seen_order = deque()
         self._enterprise_async_delegation_lock = threading.Lock()
+        self._enterprise_async_store_path = None
+        try:
+            _init_async_store(self)
+        except Exception as exc:
+            _record_patch_status("api_async", f"storage_error:{type(exc).__name__}")
+            logger.error("Enterprise Hermes patch: async outbox unavailable: %s", exc)
+        self._enterprise_run_scopes = {}
+        self._enterprise_cancelled_lifecycles = set()
+        self._enterprise_cancelled_lifecycle_order = deque()
+
+    async def _handle_runs(self: Any, request: Any) -> Any:
+        scope_key = str(request.headers.get("X-Hermes-Session-Key", "") or "").strip()
+        lifecycle_id = str(request.headers.get("X-Enterprise-Agent-Lifecycle", "") or "").strip()
+        if lifecycle_id and not re.fullmatch(r"[0-9a-f]{32}", lifecycle_id):
+            return api_server_mod.web.json_response(
+                {"error": "invalid Enterprise Agent lifecycle"},
+                status=400,
+            )
+        if scope_key and lifecycle_id and (scope_key, lifecycle_id) in self._enterprise_cancelled_lifecycles:
+            return api_server_mod.web.json_response(
+                {"error": "Enterprise Agent lifecycle was cancelled"},
+                status=409,
+            )
+        response = await original_handle_runs(self, request)
+        try:
+            if int(getattr(response, "status", 0) or 0) == 202:
+                payload = json.loads(bytes(getattr(response, "body", b"")).decode("utf-8"))
+                run_id = str(payload.get("run_id") or "").strip()
+                if run_id and scope_key:
+                    self._enterprise_run_scopes[run_id] = (scope_key, lifecycle_id)
+                    if len(self._enterprise_run_scopes) > 2000:
+                        active = set(getattr(self, "_active_run_tasks", {}))
+                        for old_run_id in list(self._enterprise_run_scopes):
+                            if old_run_id not in active:
+                                self._enterprise_run_scopes.pop(old_run_id, None)
+                            if len(self._enterprise_run_scopes) <= 1000:
+                                break
+        except Exception:
+            # Run startup already succeeded; bookkeeping failure must not turn
+            # a valid 202 response into a client-visible 500.
+            pass
+        return response
 
     def record_async_delegation_event(self: Any, evt: dict[str, Any], message: str = "") -> bool:
         if not _is_api_async_event(evt):
@@ -468,7 +553,41 @@ def _install_api_async_delegation_patch() -> None:
             item["message"] = message
         item.setdefault("created_at", time.time())
         key = _event_key(item)
+        item["_enterprise_event_id"] = key
         with self._enterprise_async_delegation_lock:
+            store_path = getattr(self, "_enterprise_async_store_path", None)
+            if store_path is not None:
+                try:
+                    connection = _open_async_store(store_path)
+                    with connection:
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO async_delegation_events(
+                                event_id, event_json, created_at
+                            ) VALUES (?, ?, ?)
+                            """,
+                            (
+                                key,
+                                json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+                                float(item.get("created_at") or time.time()),
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            DELETE FROM async_delegation_events
+                            WHERE event_id NOT IN (
+                                SELECT event_id FROM async_delegation_events
+                                ORDER BY created_at DESC, rowid DESC LIMIT ?
+                            )
+                            """,
+                            (max_events,),
+                        )
+                    connection.close()
+                    return True
+                except Exception as exc:
+                    _record_patch_status("api_async", f"storage_error:{type(exc).__name__}")
+                    logger.error("Enterprise Hermes patch: failed to persist async completion: %s", exc)
+                    return False
             if key in self._enterprise_async_delegation_seen:
                 return True
             self._enterprise_async_delegation_seen.add(key)
@@ -499,6 +618,31 @@ def _install_api_async_delegation_patch() -> None:
             return True
 
         with self._enterprise_async_delegation_lock:
+            store_path = getattr(self, "_enterprise_async_store_path", None)
+            if store_path is not None:
+                connection = _open_async_store(store_path)
+                rows = connection.execute(
+                    "SELECT event_id, event_json FROM async_delegation_events ORDER BY created_at, rowid"
+                ).fetchall()
+                matched = []
+                matched_ids = []
+                for row in rows:
+                    try:
+                        event = json.loads(str(row["event_json"]))
+                    except Exception:
+                        continue
+                    if isinstance(event, dict) and matches(event):
+                        matched.append(event)
+                        matched_ids.append(str(row["event_id"]))
+                if consume and matched_ids:
+                    placeholders = ",".join("?" for _ in matched_ids)
+                    with connection:
+                        connection.execute(
+                            f"DELETE FROM async_delegation_events WHERE event_id IN ({placeholders})",
+                            matched_ids,
+                        )
+                connection.close()
+                return matched
             matched: list[dict[str, Any]] = []
             remaining = deque()
             for evt in self._enterprise_async_delegation_events:
@@ -512,11 +656,44 @@ def _install_api_async_delegation_patch() -> None:
                 self._enterprise_async_delegation_events = remaining
             return matched
 
+    def _ack_async_events(self: Any, event_ids: list[str]) -> int:
+        wanted = {str(item or "").strip() for item in event_ids if str(item or "").strip()}
+        if not wanted:
+            return 0
+        with self._enterprise_async_delegation_lock:
+            store_path = getattr(self, "_enterprise_async_store_path", None)
+            if store_path is not None:
+                connection = _open_async_store(store_path)
+                placeholders = ",".join("?" for _ in wanted)
+                with connection:
+                    cursor = connection.execute(
+                        f"DELETE FROM async_delegation_events WHERE event_id IN ({placeholders})",
+                        list(wanted),
+                    )
+                acked = max(0, int(cursor.rowcount))
+                connection.close()
+                return acked
+            remaining = deque()
+            acked = 0
+            for evt in self._enterprise_async_delegation_events:
+                key = str(evt.get("_enterprise_event_id") or _event_key(evt))
+                if key in wanted:
+                    acked += 1
+                else:
+                    remaining.append(evt)
+            self._enterprise_async_delegation_events = remaining
+        return acked
+
     async def _handle_async_delegations(self: Any, request: Any) -> Any:
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         query = request.rel_url.query
+        try:
+            ack_ids = [str(item).strip() for item in query.getall("ack_id") if str(item).strip()][:500]
+        except Exception:
+            ack_ids = []
+        acked = self._ack_async_events(ack_ids)
         consume_raw = str(query.get("consume", "")).strip().lower()
         consume = consume_raw in {"1", "true", "yes", "on"}
         session_key = str(query.get("session_key") or request.headers.get("X-Hermes-Session-Key", "")).strip()
@@ -533,7 +710,115 @@ def _install_api_async_delegation_patch() -> None:
             {
                 "object": "hermes.async_delegations",
                 "count": len(events),
+                "acked": acked,
                 "events": events,
+            }
+        )
+
+    async def _handle_enterprise_patch_status(self: Any, request: Any) -> Any:
+        """Expose authenticated, process-local patch installation status."""
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        status = dict(_patch_status)
+        failed = _failed_patch_components(status)
+        return api_server_mod.web.json_response(
+            {
+                "object": "enterprise.hermes_patch_status",
+                "ok": not failed,
+                "status": status,
+                "failed": failed,
+            }
+        )
+
+    async def _handle_agent_scope_cleanup(self: Any, request: Any) -> Any:
+        """Terminate host background processes owned by one trusted Agent scope."""
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        scope_key = str(body.get("scope_key") or "").strip() if isinstance(body, dict) else ""
+        lifecycle_id = str(body.get("lifecycle_id") or "").strip() if isinstance(body, dict) else ""
+        if not re.fullmatch(
+            r"(?:private:[1-9][0-9]*|channel:[A-Za-z0-9_.-]+:main-agent)",
+            scope_key,
+        ):
+            return api_server_mod.web.json_response(
+                {"error": "invalid Agent scope key"},
+                status=400,
+            )
+        if lifecycle_id and not re.fullmatch(r"[0-9a-f]{32}", lifecycle_id):
+            return api_server_mod.web.json_response(
+                {"error": "invalid Agent lifecycle id"},
+                status=400,
+            )
+        if lifecycle_id:
+            lifecycle = (scope_key, lifecycle_id)
+            if lifecycle not in self._enterprise_cancelled_lifecycles:
+                self._enterprise_cancelled_lifecycles.add(lifecycle)
+                self._enterprise_cancelled_lifecycle_order.append(lifecycle)
+                while len(self._enterprise_cancelled_lifecycle_order) > 2000:
+                    expired = self._enterprise_cancelled_lifecycle_order.popleft()
+                    self._enterprise_cancelled_lifecycles.discard(expired)
+        stopped_runs = 0
+        try:
+            run_ids = [
+                run_id
+                for run_id, run_scope in list(getattr(self, "_enterprise_run_scopes", {}).items())
+                if (
+                    (run_scope[0] if isinstance(run_scope, tuple) else run_scope) == scope_key
+                    and (
+                        not lifecycle_id
+                        or (isinstance(run_scope, tuple) and run_scope[1] == lifecycle_id)
+                    )
+                )
+            ]
+            tasks = []
+            for run_id in run_ids:
+                agent = getattr(self, "_active_run_agents", {}).get(run_id)
+                task = getattr(self, "_active_run_tasks", {}).get(run_id)
+                if agent is not None:
+                    try:
+                        agent.interrupt("Enterprise Agent scope was reset")
+                    except Exception:
+                        pass
+                if task is not None and not task.done():
+                    task.cancel()
+                    tasks.append(task)
+                self._enterprise_run_scopes.pop(run_id, None)
+                stopped_runs += 1
+            if tasks:
+                try:
+                    await asyncio.wait(tasks, timeout=2.0)
+                except Exception:
+                    pass
+
+            from tools.process_registry import process_registry
+            from tools.terminal_tool import _session_scoped_container_task_id, cleanup_vm
+
+            task_id = _session_scoped_container_task_id(scope_key)
+            killed = process_registry.kill_all(task_id=task_id) if task_id else 0
+            if task_id:
+                cleanup_vm(task_id)
+            remaining = len(process_registry.list_sessions(task_id=task_id)) if task_id else 0
+        except Exception as exc:
+            logger.warning("Enterprise Hermes patch: scope cleanup failed for %s: %s", scope_key, exc)
+            return api_server_mod.web.json_response(
+                {"error": "Agent scope cleanup failed", "scope_key": scope_key},
+                status=500,
+            )
+        return api_server_mod.web.json_response(
+            {
+                "scope_key": scope_key,
+                "task_id": task_id,
+                "killed": int(killed),
+                "remaining": int(remaining),
+                "stopped_runs": int(stopped_runs),
             }
         )
 
@@ -544,20 +829,32 @@ def _install_api_async_delegation_patch() -> None:
             return await original_connect(self, *args, **kwargs)
 
         original_add_get = dispatcher_cls.add_get
+        original_add_post = dispatcher_cls.add_post
         route_added = False
+        cleanup_route_added = False
 
         def add_get(router: Any, path: str, handler: Any, *h_args: Any, **h_kwargs: Any) -> Any:
             nonlocal route_added
             if not route_added and getattr(handler, "__self__", None) is self:
                 original_add_get(router, "/api/async-delegations", self._handle_async_delegations)
+                original_add_get(router, "/api/enterprise-patch-status", self._handle_enterprise_patch_status)
                 route_added = True
             return original_add_get(router, path, handler, *h_args, **h_kwargs)
 
+        def add_post(router: Any, path: str, handler: Any, *h_args: Any, **h_kwargs: Any) -> Any:
+            nonlocal cleanup_route_added
+            if not cleanup_route_added and getattr(handler, "__self__", None) is self:
+                original_add_post(router, "/api/agent-scopes/cleanup", self._handle_agent_scope_cleanup)
+                cleanup_route_added = True
+            return original_add_post(router, path, handler, *h_args, **h_kwargs)
+
         dispatcher_cls.add_get = add_get
+        dispatcher_cls.add_post = add_post
         try:
             return await original_connect(self, *args, **kwargs)
         finally:
             dispatcher_cls.add_get = original_add_get
+            dispatcher_cls.add_post = original_add_post
 
     def _record_on_api_adapter(runner: Any, evt: dict[str, Any], synth_text: str) -> bool:
         if not _is_api_async_event(evt):
@@ -581,9 +878,13 @@ def _install_api_async_delegation_patch() -> None:
         return await original_inject(self, synth_text, evt)
 
     adapter_cls.__init__ = _init
+    adapter_cls._handle_runs = _handle_runs
     adapter_cls.record_async_delegation_event = record_async_delegation_event
     adapter_cls._matching_async_events = _matching_async_events
+    adapter_cls._ack_async_events = _ack_async_events
     adapter_cls._handle_async_delegations = _handle_async_delegations
+    adapter_cls._handle_enterprise_patch_status = _handle_enterprise_patch_status
+    adapter_cls._handle_agent_scope_cleanup = _handle_agent_scope_cleanup
     adapter_cls.connect = connect
     adapter_cls._enterprise_async_delegation_patch = True
     runner_cls._inject_watch_notification = _inject_watch_notification
@@ -679,15 +980,16 @@ def _install_relay_platform_patch() -> None:
     _record_patch_status("relay", "ok")
 
 
-try:
-    _install_codex_response_stream_patch()
-    _install_auxiliary_response_stream_patch()
-    _install_api_async_delegation_patch()
-    _install_relay_platform_patch()
-except Exception as exc:
-    # A genuine failure while installing (as opposed to the expected
-    # "standalone Hermes, module absent" path, which is handled quietly inside
-    # each installer) silently disables Codex streaming/backfill. Surface it at
-    # WARNING and record a process-visible marker the platform can read.
-    logger.warning("Enterprise Hermes runtime patch did not install: %s", exc)
-    _record_patch_status("install_error", repr(exc))
+for _component, _installer in (
+    ("codex", _install_codex_response_stream_patch),
+    ("aux", _install_auxiliary_response_stream_patch),
+    ("api_async", _install_api_async_delegation_patch),
+    ("relay", _install_relay_platform_patch),
+):
+    try:
+        _installer()
+    except Exception as exc:
+        # Install each component independently: one upstream incompatibility
+        # must not silently prevent unrelated safety/integration patches.
+        logger.warning("Enterprise Hermes runtime patch %s did not install: %s", _component, exc)
+        _record_patch_status(_component, f"install_error:{type(exc).__name__}:{exc}")

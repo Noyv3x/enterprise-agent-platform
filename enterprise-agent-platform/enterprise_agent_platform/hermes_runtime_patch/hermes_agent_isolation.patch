@@ -1,3 +1,25 @@
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index df045e576..e81087990 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -288,5 +288,16 @@ def _is_hermes_internal_secret(key: str) -> bool:
+     if upper.startswith("GATEWAY_RELAY_") and (
+         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
+     ):
+         return True
++    if upper.startswith("ENTERPRISE_") and upper.endswith(
++        ("_SECRET", "_TOKEN", "_PASSWORD", "_API_KEY")
++    ):
++        return True
++    if upper in {
++        "CAMOFOX_ACCESS_KEY",
++        "CAMOFOX_API_KEY",
++        "CAMOFOX_ADMIN_KEY",
++        "API_SERVER_KEY",
++    }:
++        return True
+     return False
+
 diff --git a/agent/agent_init.py b/agent/agent_init.py
 index f1666a1aa..72ffb9a99 100644
 --- a/agent/agent_init.py
@@ -527,7 +549,49 @@ index 54f38d1bb..5dc9452a6 100644
          }
          if len(parts) > 5 and parts[3] in {"dm", "thread"}:
              result["thread_id"] = parts[5]
-@@ -15303,7 +15306,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -15284,9 +15287,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         Falling back to the currently active foreground event is what causes
+         cross-topic bleed, so don't do that.
+         """
+-        from gateway.session import SessionSource
++        from gateway.session import SessionSource, normalize_enterprise_agent_scope_key
+-
++
+         session_key = str(evt.get("session_key") or "").strip()
++        def _with_enterprise_scope(source):
++            canonical = normalize_enterprise_agent_scope_key(session_key)
++            if canonical:
++                source.enterprise_session_key = canonical
++                source.delivered_via_upstream_relay = True
++            return source
++
+         derived_platform = ""
+         derived_chat_type = ""
+         derived_chat_id = ""
+@@ -15296,7 +15306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 self.session_store._ensure_loaded()
+                 entry = self.session_store._entries.get(session_key)
+                 if entry and getattr(entry, "origin", None):
+-                    return entry.origin
++                    return _with_enterprise_scope(entry.origin)
+             except Exception as exc:
+                 logger.debug(
+                     "Synthetic process-event session-store lookup failed for %s: %s",
+@@ -15306,7 +15316,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+-
++
+             cached_source = self._get_cached_session_source(session_key)
+             if cached_source is not None:
+-                return cached_source
++                return _with_enterprise_scope(cached_source)
+-
++
+             _parsed = _parse_session_key(session_key)
+             if _parsed:
+@@ -15349,10 +15359,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         return SessionSource(
+             platform=platform,
+             chat_id=chat_id,
              chat_type=chat_type,
              thread_id=str(evt.get("thread_id") or "").strip() or None,
              user_id=str(evt.get("user_id") or "").strip() or None,
@@ -535,10 +599,12 @@ index 54f38d1bb..5dc9452a6 100644
              user_name=str(evt.get("user_name") or "").strip() or None,
 +            message_id=str(evt.get("message_id") or "").strip() or None,
 +            profile=str(evt.get("profile") or "").strip() or None,
++            enterprise_session_key=normalize_enterprise_agent_scope_key(session_key),
++            delivered_via_upstream_relay=bool(normalize_enterprise_agent_scope_key(session_key)),
          )
  
      async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
-@@ -15360,15 +15366,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -15360,15 +15375,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          expects. Best-effort: a CLI-origin event (empty session_key) is left
          as-is and simply won't route on the gateway.
          """
@@ -1933,3 +1999,151 @@ index 44ef03af7..7b0640d3f 100644
      )
  
  
+diff --git a/tools/browser_camofox_state.py b/tools/browser_camofox_state.py
+--- a/tools/browser_camofox_state.py
++++ b/tools/browser_camofox_state.py
+@@ -27,16 +27,21 @@ def get_camofox_identity(task_id: Optional[str] = None) -> Dict[str, str]:
+     """Return the stable Hermes-managed Camofox identity for this profile.
+-
++
+-    The user identity is profile-scoped (same Hermes profile = same userId).
+-    The session key is scoped to the logical browser task so newly created
+-    tabs within the same profile reuse the same identity contract.
++    Managed gateway sessions use their stable Agent scope for both identities,
++    so private/channel Agents never share cookies or Camofox session state.
+     """
+     scope_root = str(get_camofox_state_dir())
+-    logical_scope = task_id or "default"
++    try:
++        from gateway.session_context import get_session_env
++
++        agent_scope = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
++    except Exception:
++        agent_scope = ""
++    logical_scope = agent_scope or task_id or "default"
+     user_digest = uuid.uuid5(
+         uuid.NAMESPACE_URL,
+-        f"camofox-user:{scope_root}",
++        f"camofox-user:{scope_root}:{logical_scope}",
+     ).hex[:10]
+     session_digest = uuid.uuid5(
+         uuid.NAMESPACE_URL,
+         f"camofox-session:{scope_root}:{logical_scope}",
+     ).hex[:16]
+
+diff --git a/gateway/relay/adapter.py b/gateway/relay/adapter.py
+--- a/gateway/relay/adapter.py
++++ b/gateway/relay/adapter.py
+@@ -74,11 +74,14 @@ class RelayAdapter(BasePlatformAdapter):
+         # chat belongs to (Phase 1.5 multi-platform-per-agent). One relay adapter
+         # fronts N platforms on one WS; an outbound reply must egress through the
+         # platform the inbound came from. We remember it per chat_id from the
++        # same inbound event whose unguessable message ID binds every reply to
++        # the exact platform turn at the managed connector.
+         # inbound event's source.platform and stamp it on the OutboundFrame so the
+         # connector dispatches to the right sender. Empty for a single-platform
+         # gateway (the connector falls back to its session default). See
+         # _capture_scope / send.
+         self._platform_by_chat: Dict[str, str] = {}
++        self._message_by_chat: Dict[str, str] = {}
+         self.supports_code_blocks = descriptor.markdown_dialect not in ("", "plain")
+         # Phase 7 Unit 7d-B: watches the transport for a terminal auth revocation
+         # (a 4401 close after a successful handshake = the operator opted this
+@@ -252,6 +255,10 @@ class RelayAdapter(BasePlatformAdapter):
+             chat = getattr(src, "chat_id", None)
+             if not chat:
+                 return
++            message_id = getattr(src, "message_id", None) or getattr(event, "message_id", None)
++            if message_id:
++                self._message_by_chat[str(chat)] = str(message_id)
++
+             # Phase 1.5: remember the underlying platform for this chat so the
+             # reply egresses through the right sender (one relay adapter fronts N
+             # platforms). source.platform is a Platform enum (e.g. Platform.DISCORD,
+@@ -289,6 +296,10 @@ class RelayAdapter(BasePlatformAdapter):
+         No-op when the relevant value is already present or unknown for this chat.
+         """
+         meta: Dict[str, Any] = dict(metadata or {})
++        if not meta.get("enterprise_turn_id"):
++            message_id = self._message_by_chat.get(str(chat_id))
++            if message_id:
++                meta["enterprise_turn_id"] = message_id
+         if not meta.get("scope_id"):
+             scope = self._scope_by_chat.get(str(chat_id))
+             if scope:
+diff --git a/gateway/session.py b/gateway/session.py
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -12,6 +12,7 @@ import hashlib
+ import logging
+ import os
+ import json
++import re
+ import threading
+ import uuid
+ from pathlib import Path
+@@ -176,6 +177,12 @@ class SessionSource:
+     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
+     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
++    # Internal platform-owned Agent scope. It is accepted only when the local
++    # relay transport also stamps delivered_via_upstream_relay, and is excluded
++    # from to_dict/from_dict so ordinary adapters and persisted peer data cannot
++    # forge a canonical runtime scope.
++    enterprise_session_key: Optional[str] = None
++
+     # Profile this inbound message is routed to in a multiplexing gateway
+     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
+     # None => the gateway's active/default profile. Drives both session-key
+@@ -868,6 +875,28 @@ def _session_key_namespace(profile: Optional[str]) -> str:
+     return f"agent:{profile}"
+-
++
+-
++
++_ENTERPRISE_AGENT_SCOPE_RE = re.compile(
++    r"(?:private:[1-9][0-9]*|channel:[A-Za-z0-9_.-]+:main-agent)"
++)
++
++
++def normalize_enterprise_agent_scope_key(value: object) -> Optional[str]:
++    """Return a valid platform-owned Agent scope key, otherwise None."""
++    if not isinstance(value, str):
++        return None
++    clean = value.strip()
++    return clean if _ENTERPRISE_AGENT_SCOPE_RE.fullmatch(clean) else None
++
++
++def enterprise_relay_session_key(source: SessionSource) -> Optional[str]:
++    """Return the authenticated relay scope that overrides native keying."""
++    if not getattr(source, "delivered_via_upstream_relay", False):
++        return None
++    return normalize_enterprise_agent_scope_key(
++        getattr(source, "enterprise_session_key", None)
++    )
++
++
+ def build_session_key(
+     source: SessionSource,
+     group_sessions_per_user: bool = True,
+@@ -904,2 +933,6 @@ def build_session_key(
+     """
++    enterprise_key = enterprise_relay_session_key(source)
++    if enterprise_key:
++        return enterprise_key
++
+     ns = _session_key_namespace(profile)
+diff --git a/gateway/relay/ws_transport.py b/gateway/relay/ws_transport.py
+--- a/gateway/relay/ws_transport.py
++++ b/gateway/relay/ws_transport.py
+@@ -129,6 +129,10 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
+         # config/credential scope — the same field the /p/<profile>/ HTTP
+         # prefix and per-credential polling adapters already set.
+         profile=src.get("profile"),
++        # Platform-owned logical Agent scope. build_session_key accepts this
++        # only together with delivered_via_upstream_relay, which is stamped
++        # locally below and cannot be supplied by an ordinary adapter.
++        enterprise_session_key=raw.get("enterprise_session_key"),
+         # Authentic upstream-trust signal: this event arrived over the
+         # per-instance-authenticated relay WS, so the connector already resolved
+         # it to this instance's owner-bound author. ``platform`` is the
