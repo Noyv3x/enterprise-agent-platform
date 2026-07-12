@@ -13,6 +13,7 @@
    textarea keeps focus and the 120ms blur-hide never wins first. */
 
 import { useCallback, useEffect, useReducer, useRef, type KeyboardEvent, type RefObject } from "react";
+import { t } from "../i18n";
 import type { ChatMode, MentionTarget } from "../types";
 
 interface MentionRange {
@@ -22,12 +23,14 @@ interface MentionRange {
 }
 
 /** Fallback single agent option when no targets are loaded (legacy :1042). */
-const FALLBACK_TARGET: MentionTarget = {
-  kind: "agent",
-  handle: "agent",
-  label: "Agent",
-  description: "呼叫频道 Agent",
-};
+function fallbackTarget(): MentionTarget {
+  return {
+    kind: "agent",
+    handle: "agent",
+    label: "Agent",
+    description: t("mention.agentDescription"),
+  };
+}
 
 const MAX_OPTIONS = 8;
 const BLUR_HIDE_MS = 120;
@@ -106,7 +109,7 @@ export function useMention(params: UseMentionParams): MentionApi {
 
   const computeOptions = useCallback(
     (query: string): MentionTarget[] => {
-      const targets = mentionTargets.length ? mentionTargets : [FALLBACK_TARGET];
+      const targets = mentionTargets.length ? mentionTargets : [fallbackTarget()];
       return targets
         .filter((target) => {
           const haystack =

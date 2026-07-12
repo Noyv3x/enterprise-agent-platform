@@ -15,6 +15,7 @@ import type { SecurityConfigValues } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { StatusBadge } from "../../common/StatusBadge";
+import { useI18n } from "../../../i18n";
 
 interface SecurityFormState {
   publicBaseUrl: string;
@@ -46,6 +47,7 @@ function StatusRow({ label, ok, value }: { label: string; ok: boolean; value: st
 }
 
 export function SecuritySettings() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const securityConfig = useStore((state) => state.securityConfig);
@@ -72,22 +74,22 @@ export function SecuritySettings() {
   return (
     <section className="card config-form security-config">
       <CardHead
-        title="公网安全"
+        title={t("admin.security.title")}
         icon="key"
-        desc="公开到公网前确认 HTTPS 反代、Cookie、会话与监听边界。"
+        desc={t("admin.security.description")}
       />
       <form onSubmit={handleSubmit}>
         <div className="config-grid">
           <div className="field--full">
-            <Field label="公网 URL">
+            <Field label={t("admin.security.publicUrl")}>
               <div className="field-stack">
                 <input
                   value={form.publicBaseUrl}
-                  placeholder="https://agent.example.com"
+                  placeholder={t("admin.security.publicUrlPlaceholder")}
                   onChange={(event) => setForm((prev) => ({ ...prev, publicBaseUrl: event.target.value }))}
                 />
                 <div className="field-help">
-                  设为 https:// 域名后，登录 Cookie 会带 Secure，写请求按该域名校验 Origin/Referer。
+                  {t("admin.security.publicUrlHint")}
                 </div>
               </div>
             </Field>
@@ -99,21 +101,21 @@ export function SecuritySettings() {
               onChange={(event) => setForm((prev) => ({ ...prev, trustedProxy: event.target.checked }))}
             />
             <div className="check-row__text">
-              <strong>信任反向代理头</strong>
-              <span>只在后端端口不能被公网直连时开启；用于真实客户端 IP、X-Forwarded-Host/Proto。</span>
+              <strong>{t("admin.security.trustProxy")}</strong>
+              <span>{t("admin.security.trustProxyHint")}</span>
             </div>
           </label>
-          <Field label="监听 Host">
+          <Field label={t("admin.security.host")}>
             <div className="field-stack">
               <input
                 value={form.host}
                 placeholder="127.0.0.1"
                 onChange={(event) => setForm((prev) => ({ ...prev, host: event.target.value }))}
               />
-              <div className="field-help">{`当前进程：${security.applied_host || "-"}，修改后需重启/重新部署。`}</div>
+              <div className="field-help">{t("admin.security.appliedRestartHint", { value: security.applied_host || "-" })}</div>
             </div>
           </Field>
-          <Field label="监听 Port">
+          <Field label={t("admin.security.port")}>
             <div className="field-stack">
               <input
                 type="number"
@@ -123,10 +125,10 @@ export function SecuritySettings() {
                 value={form.port}
                 onChange={(event) => setForm((prev) => ({ ...prev, port: event.target.value }))}
               />
-              <div className="field-help">{`当前进程：${security.applied_port || "-"}，修改后需重启/重新部署。`}</div>
+              <div className="field-help">{t("admin.security.appliedRestartHint", { value: security.applied_port || "-" })}</div>
             </div>
           </Field>
-          <Field label="Session TTL 秒">
+          <Field label={t("admin.security.sessionTtl")}>
             <div className="field-stack">
               <input
                 type="number"
@@ -136,66 +138,66 @@ export function SecuritySettings() {
                 value={form.sessionTtl}
                 onChange={(event) => setForm((prev) => ({ ...prev, sessionTtl: event.target.value }))}
               />
-              <div className="field-help">影响新签发的登录会话；建议公网保持有限时长。</div>
+              <div className="field-help">{t("admin.security.sessionTtlHint")}</div>
             </div>
           </Field>
-          <Field label="轮换 Session Secret">
+          <Field label={t("admin.security.rotateSecret")}>
             <div className="field-stack">
               <input
                 type="password"
                 autoComplete="off"
-                placeholder={security.session_secret_configured ? "留空不修改" : "至少 32 字符"}
+                placeholder={security.session_secret_configured ? t("admin.common.leaveBlank") : t("admin.security.secretPlaceholder")}
                 value={form.sessionSecret}
                 onChange={(event) => setForm((prev) => ({ ...prev, sessionSecret: event.target.value }))}
               />
-              <div className="field-help">留空不修改；填入新值后重启会使所有旧会话失效。</div>
+              <div className="field-help">{t("admin.security.rotateSecretHint")}</div>
             </div>
           </Field>
         </div>
         <div className="form-actions">
           <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>保存安全配置</span>
+            <span>{t("admin.security.save")}</span>
           </button>
         </div>
       </form>
       <div className="security-status">
         <StatusRow
-          label="Secure Cookie"
+          label={t("admin.security.secureCookie")}
           ok={!!security.secure_cookie_enabled}
-          value={security.secure_cookie_enabled ? "已启用" : "未启用"}
+          value={t(security.secure_cookie_enabled ? "admin.common.enabled" : "admin.common.disabled")}
         />
         <StatusRow
-          label="Trusted Proxy"
+          label={t("admin.security.trustedProxy")}
           ok={!!security.trusted_proxy}
-          value={security.trusted_proxy ? "信任 X-Forwarded-* 头" : "未信任代理头"}
+          value={t(security.trusted_proxy ? "admin.security.proxyTrusted" : "admin.security.proxyUntrusted")}
         />
         <StatusRow
-          label="默认 admin/admin"
+          label={t("admin.security.defaultAdmin")}
           ok={!security.admin_default_password_active && !security.allow_default_admin_password}
           value={
             security.admin_default_password_active
-              ? "当前可用"
+              ? t("admin.security.currentlyUsable")
               : security.allow_default_admin_password
-                ? "启动项允许"
-                : "未启用"
+                ? t("admin.security.allowedAtStartup")
+                : t("admin.common.disabled")
           }
         />
         <StatusRow
-          label="Session Secret"
+          label={t("admin.security.sessionSecret")}
           ok={!!security.session_secret_configured}
-          value={security.session_secret_source === "env" ? "来自环境变量" : "已持久化"}
+          value={t(security.session_secret_source === "env" ? "admin.security.fromEnv" : "admin.security.persisted")}
         />
         <StatusRow
-          label="监听地址"
+          label={t("admin.security.listenAddress")}
           ok={!security.listen_restart_required}
           value={`${security.applied_host || "-"}:${security.applied_port || "-"}${
-            security.listen_restart_required ? "，有待重启配置" : ""
+            security.listen_restart_required ? t("admin.security.pendingRestartSuffix") : ""
           }`}
         />
         <StatusRow
-          label="Bootstrap 密码文件"
+          label={t("admin.security.bootstrapFile")}
           ok={!security.bootstrap_password_file_exists}
-          value={security.bootstrap_password_file_exists ? "仍存在" : "不存在"}
+          value={t(security.bootstrap_password_file_exists ? "admin.security.exists" : "admin.security.notExists")}
         />
       </div>
     </section>

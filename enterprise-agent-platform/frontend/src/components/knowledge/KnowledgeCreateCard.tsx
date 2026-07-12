@@ -9,12 +9,14 @@ import { useState } from "react";
 import { toast } from "../../context/ToastContext";
 import { createDocument, loadDocuments } from "../../data/knowledgeActions";
 import { runBusy } from "../../data/sessionActions";
+import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { CardHead } from "../common/CardHead";
 import { Field } from "../common/Field";
 import { Icon } from "../common/Icon";
 
 export function KnowledgeCreateCard() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const [title, setTitle] = useState("");
@@ -24,7 +26,11 @@ export function KnowledgeCreateCard() {
 
   return (
     <section className="card">
-      <CardHead title="新增条目" icon="plus" desc="结构化录入知识，供 Agent 检索引用。" />
+      <CardHead
+        title={t("knowledge.createTitle")}
+        icon="plus"
+        desc={t("knowledge.createDescription")}
+      />
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -35,41 +41,41 @@ export function KnowledgeCreateCard() {
             setSummary("");
             setContent("");
             await loadDocuments(store);
-            toast("已保存知识条目", { type: "ok", title: "完成" });
+            toast(t("knowledge.saved"), { type: "ok", title: t("toast.complete") });
           });
         }}
       >
-        <Field label="标题">
+        <Field label={t("knowledge.title")}>
           <input
-            placeholder="标题"
+            placeholder={t("knowledge.title")}
             value={title}
             onChange={(event) => setTitle(event.target.value)}
           />
         </Field>
-        <Field label="来源">
+        <Field label={t("knowledge.source")}>
           <input
-            placeholder="来源（URL、系统名等）"
+            placeholder={t("knowledge.sourcePlaceholder")}
             value={source}
             onChange={(event) => setSource(event.target.value)}
           />
         </Field>
-        <Field label="摘要">
+        <Field label={t("knowledge.summary")}>
           <input
-            placeholder="摘要（可留空）"
+            placeholder={t("knowledge.summaryPlaceholder")}
             value={summary}
             onChange={(event) => setSummary(event.target.value)}
           />
         </Field>
-        <Field label="正文">
+        <Field label={t("knowledge.content")}>
           <textarea
-            placeholder="正文内容…"
+            placeholder={t("knowledge.contentPlaceholder")}
             value={content}
             onChange={(event) => setContent(event.target.value)}
           />
         </Field>
         <button className="btn btn--primary" type="submit" disabled={busy}>
           <Icon name="plus" size={16} />
-          <span>保存条目</span>
+          <span>{t("knowledge.save")}</span>
         </button>
       </form>
     </section>

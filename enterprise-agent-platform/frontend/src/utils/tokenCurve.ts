@@ -9,6 +9,7 @@
    ===================================================================== */
 
 import type { TokenDailyUsageRow } from "../types";
+import { getCurrentLocale, type Locale } from "../i18n";
 
 export const TOKEN_CURVE_GEOMETRY = {
   width: 640,
@@ -45,26 +46,39 @@ export interface TokenCurve {
 }
 
 /** value → MM/DD (zero-padded). number is UNIX seconds. "-" if blank/invalid. */
-export function tokenUsageDateLabel(value: number | string | null | undefined): string {
+export function tokenUsageDateLabel(
+  value: number | string | null | undefined,
+  locale: Locale = getCurrentLocale(),
+): string {
   if (!value) return "-";
-  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  let date: Date;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const [year, month, day] = value.split("-").map(Number);
+    date = new Date(year, month - 1, day);
+  } else {
+    date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  }
   if (Number.isNaN(date.getTime())) return "-";
-  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+  return new Intl.DateTimeFormat(locale, { month: "2-digit", day: "2-digit" }).format(date);
 }
 
 /** Always returns exactly 7 rows (left-padded with empty placeholders) so the
  *  curve + label grid never change width. */
 export function normalizeTokenDailyUsage(
   rows: readonly TokenDailyUsageRow[] | null | undefined,
+  locale: Locale = getCurrentLocale(),
 ): NormalizedDailyUsage[] {
-  const items: NormalizedDailyUsage[] = (Array.isArray(rows) ? rows : []).slice(-7).map((row) => ({
-    date: row.date || "",
-    label: row.label || tokenUsageDateLabel(row.start_at ?? row.date),
-    input_tokens: Number(row.input_tokens) || 0,
-    output_tokens: Number(row.output_tokens) || 0,
-    total_tokens: Number(row.total_tokens) || 0,
-    event_count: Number(row.event_count) || 0,
-  }));
+  const items: NormalizedDailyUsage[] = (Array.isArray(rows) ? rows : []).slice(-7).map((row) => {
+    const localizedLabel = tokenUsageDateLabel(row.start_at ?? row.date, locale);
+    return {
+      date: row.date || "",
+      label: localizedLabel === "-" ? row.label || "-" : localizedLabel,
+      input_tokens: Number(row.input_tokens) || 0,
+      output_tokens: Number(row.output_tokens) || 0,
+      total_tokens: Number(row.total_tokens) || 0,
+      event_count: Number(row.event_count) || 0,
+    };
+  });
   while (items.length < 7) {
     items.unshift({
       date: "",
@@ -79,8 +93,11 @@ export function normalizeTokenDailyUsage(
 }
 
 /** Compute the SVG path geometry for the 7-day token curve. */
-export function tokenCurve(rows: readonly TokenDailyUsageRow[] | null | undefined): TokenCurve {
-  const daily = normalizeTokenDailyUsage(rows);
+export function tokenCurve(
+  rows: readonly TokenDailyUsageRow[] | null | undefined,
+  locale: Locale = getCurrentLocale(),
+): TokenCurve {
+  const daily = normalizeTokenDailyUsage(rows, locale);
   const maxTotal = Math.max(1, ...daily.map((row) => Number(row.total_tokens) || 0));
   const { width, height, padX, padY } = TOKEN_CURVE_GEOMETRY;
   const usableWidth = width - padX * 2;

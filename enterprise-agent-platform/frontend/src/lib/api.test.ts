@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setCurrentLocale } from "../i18n";
 import {
   ApiError,
   ApiRequestCancelledError,
@@ -16,6 +17,7 @@ function response(status: number, body: unknown) {
 }
 
 afterEach(() => {
+  setCurrentLocale("zh-CN");
   resetApiSession();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -56,6 +58,16 @@ describe("api request lifecycle", () => {
   it("preserves HTTP status and server error text", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response(403, { error: "forbidden" })));
     const request = api("/api/protected");
-    await expect(request).rejects.toMatchObject<ApiError>({ status: 403, message: "forbidden" });
+    await expect(request).rejects.toMatchObject({ status: 403, message: "forbidden" });
+  });
+
+  it("localizes client-generated timeout and HTTP fallback errors", async () => {
+    setCurrentLocale("en");
+    expect(new ApiTimeoutError(1_000).message).toBe("Request timed out after 1 second");
+    vi.stubGlobal("fetch", vi.fn(async () => response(503, {})));
+    await expect(api("/api/unavailable")).rejects.toMatchObject({
+      status: 503,
+      message: "Request failed (503)",
+    });
   });
 });

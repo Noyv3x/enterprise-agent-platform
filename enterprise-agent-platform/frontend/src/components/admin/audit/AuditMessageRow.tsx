@@ -7,6 +7,7 @@ import { formatTimestamp } from "../../../utils/format";
 import type { Message } from "../../../types";
 import { Icon } from "../../common/Icon";
 import { MessageAttachments } from "../../common/MessageAttachments";
+import { useI18n } from "../../../i18n";
 
 export interface AuditMessageRowProps {
   message: Message;
@@ -15,13 +16,19 @@ export interface AuditMessageRowProps {
 }
 
 export function AuditMessageRow({ message, deletable = false, onDelete }: AuditMessageRowProps) {
-  const author = message.username || (message.author_type === "agent" ? "Agent" : "User");
+  const { t } = useI18n();
+  const author = message.username || t(message.author_type === "agent" ? "admin.audit.agent" : "admin.audit.user");
+  const authorType = message.author_type === "agent"
+    ? t("admin.audit.agent")
+    : message.author_type === "user"
+      ? t("admin.audit.user")
+      : message.author_type;
   return (
     <article className={cx("audit-message", `audit-message--${message.author_type}`)}>
       <div className="audit-message__meta">
         <span className="mono">{`#${message.id}`}</span>
         <strong>{author}</strong>
-        <span>{message.author_type}</span>
+        <span>{authorType}</span>
         <span>{formatTimestamp(message.created_at)}</span>
       </div>
       <div className="audit-message__body">{message.content}</div>
@@ -33,8 +40,8 @@ export function AuditMessageRow({ message, deletable = false, onDelete }: AuditM
           <button
             className="icon-btn"
             type="button"
-            title="删除消息"
-            aria-label="删除消息"
+            title={t("admin.audit.deleteMessage")}
+            aria-label={t("admin.audit.deleteMessage")}
             onClick={() => onDelete?.()}
           >
             <Icon name="trash" size={16} />

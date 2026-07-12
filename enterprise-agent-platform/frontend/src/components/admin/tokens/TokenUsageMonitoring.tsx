@@ -19,10 +19,12 @@ import { Icon } from "../../common/Icon";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
 import { TokenUsageCurve } from "./TokenUsageCurve";
 import { UsageTable } from "./UsageTable";
+import { useI18n } from "../../../i18n";
 
 const DAY_RANGES = [7, 30, 90, 365];
 
 export function TokenUsageMonitoring() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const report = useStore((state) => state.tokenUsage);
   const tokenUsageDays = useStore((state) => state.tokenUsageDays);
@@ -46,24 +48,25 @@ export function TokenUsageMonitoring() {
     return (
       <span className="usage-user">
         <strong>{name}</strong>
-        <small>{row.username ? `@${row.username}` : `ID ${row.user_id || "-"}`}</small>
+        <small>{row.username ? `@${row.username}` : t("admin.tokens.userId", { id: row.user_id || "-" })}</small>
       </span>
     );
   };
 
   const tokenScopeLabel = (row: TokenDetailRow | TokenScopeRow): string => {
     if (row.scope_type === "private") {
-      return `私聊：${row.scope_name || row.display_name || row.username || row.scope_id}`;
+      return t("admin.tokens.privateScope", { name: row.scope_name || row.display_name || row.username || row.scope_id || "-" });
     }
     if (row.scope_type === "channel") {
-      return row.scope_name || `频道 ${row.scope_id || ""}`;
+      return row.scope_name || t("admin.tokens.channelScope", { id: row.scope_id || "-" });
     }
     return String(row.scope_name || row.scope_id || "-");
   };
 
   const tokenModelLabel = (row: TokenDetailRow | TokenModelRow): string => {
-    const provider = oauthProviderLabel(row.provider || "", providers);
-    const model = row.model || "unknown";
+    const providerId = row.provider || "";
+    const provider = providerId === "openai-codex" ? t("admin.oauth.provider.codex") : providerId === "xai-oauth" ? t("admin.oauth.provider.grok") : oauthProviderLabel(providerId, providers);
+    const model = row.model || t("admin.common.unknown");
     return provider ? `${provider} / ${model}` : model;
   };
 
@@ -71,16 +74,16 @@ export function TokenUsageMonitoring() {
     <div className="token-usage">
       <section className="card token-usage__overview">
         <CardHead
-          title="Token 消耗总览"
+          title={t("admin.tokens.overview.title")}
           icon="barChart"
           desc={
             report?.window
-              ? `${formatTimestamp(report.window.since)} 至 ${formatTimestamp(report.window.until)}`
-              : "暂无 token usage 数据"
+              ? t("admin.tokens.range", { since: formatTimestamp(report.window.since), until: formatTimestamp(report.window.until) })
+              : t("admin.tokens.noUsage")
           }
           extra={
             <div className="token-usage__filters">
-              <Field label="时间范围">
+              <Field label={t("admin.tokens.timeRange")}>
                 <select
                   value={daysValue}
                   onChange={(event) =>
@@ -88,7 +91,7 @@ export function TokenUsageMonitoring() {
                   }
                 >
                   {DAY_RANGES.map((value) => (
-                    <option key={value} value={value}>{`${value} 天`}</option>
+                    <option key={value} value={value}>{t("admin.tokens.days", { count: value })}</option>
                   ))}
                 </select>
               </Field>
@@ -99,33 +102,33 @@ export function TokenUsageMonitoring() {
                 onClick={() => void refreshTokenUsage(store)}
               >
                 <Icon name="refresh" size={14} />
-                <span>刷新</span>
+                <span>{t("admin.common.refresh")}</span>
               </button>
             </div>
           }
         />
         <div className="metric-grid">
-          <UsageMetricTile label="本日消耗" value={today.total_tokens ?? 0} />
-          <UsageMetricTile label="近 7 日消耗" value={last7.total_tokens ?? 0} />
-          <UsageMetricTile label="总 Token" value={summary.total_tokens ?? 0} />
-          <UsageMetricTile label="输入 Token" value={summary.input_tokens ?? 0} />
-          <UsageMetricTile label="输出 Token" value={summary.output_tokens ?? 0} />
-          <UsageMetricTile label="Agent 调用" value={summary.event_count ?? 0} suffix="次" />
-          <UsageMetricTile label="涉及账户" value={summary.account_count ?? 0} suffix="个" />
+          <UsageMetricTile label={t("admin.tokens.today")} value={today.total_tokens ?? 0} />
+          <UsageMetricTile label={t("admin.tokens.last7")} value={last7.total_tokens ?? 0} />
+          <UsageMetricTile label={t("admin.tokens.total")} value={summary.total_tokens ?? 0} />
+          <UsageMetricTile label={t("admin.tokens.input")} value={summary.input_tokens ?? 0} />
+          <UsageMetricTile label={t("admin.tokens.output")} value={summary.output_tokens ?? 0} />
+          <UsageMetricTile label={t("admin.tokens.agentCalls")} value={summary.event_count ?? 0} suffix={t("admin.tokens.callsSuffix", { count: summary.event_count ?? 0 })} />
+          <UsageMetricTile label={t("admin.tokens.accountsInvolved")} value={summary.account_count ?? 0} suffix={t("admin.tokens.accountsSuffix", { count: summary.account_count ?? 0 })} />
           <UsageMetricTile
-            label="频道/私聊"
+            label={t("admin.tokens.channelPrivate")}
             value={`${summary.channel_event_count || 0}/${summary.private_event_count || 0}`}
-            suffix="次"
+            suffix={t("admin.tokens.callsSuffix", { count: (summary.channel_event_count || 0) + (summary.private_event_count || 0) })}
           />
         </div>
         <TokenUsageCurve rows={dailyUsage} />
       </section>
 
       <UsageTable<TokenAccountRow>
-        title="按账户汇总"
-        desc="每个账户在当前时间范围内触发的 Agent token 消耗。"
+        title={t("admin.tokens.byAccount.title")}
+        desc={t("admin.tokens.byAccount.description")}
         icon="users"
-        headers={["账户", "调用", "输入", "输出", "总计", "最近使用"]}
+        headers={[t("admin.tokens.header.account"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total"), t("admin.tokens.header.lastUsed")]}
         rows={accountRows}
         renderRow={(row) => (
           <>
@@ -137,14 +140,14 @@ export function TokenUsageMonitoring() {
             <span>{formatTimestamp(row.last_used_at) || "-"}</span>
           </>
         )}
-        emptyText="暂无账户 token 数据。"
+        emptyText={t("admin.tokens.byAccount.empty")}
       />
 
       <UsageTable<TokenDetailRow>
-        title="账户 / 渠道 / 模型明细"
-        desc="细分到每个账户在私聊或具体频道中使用的供应商和模型。"
+        title={t("admin.tokens.details.title")}
+        desc={t("admin.tokens.details.description")}
         icon="barChart"
-        headers={["账户", "渠道", "供应商 / 模型", "调用", "输入", "输出", "总计"]}
+        headers={[t("admin.tokens.header.account"), t("admin.tokens.header.scope"), t("admin.tokens.header.providerModel"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
         rows={detailRows}
         renderRow={(row) => (
           <>
@@ -157,15 +160,15 @@ export function TokenUsageMonitoring() {
             <strong>{formatNumber(row.total_tokens)}</strong>
           </>
         )}
-        emptyText="暂无 token 明细。"
+        emptyText={t("admin.tokens.details.empty")}
       />
 
       <div className="token-usage__columns">
         <UsageTable<TokenScopeRow>
-          title="按渠道汇总"
-          desc="区分私人 Agent 会话和具体频道。"
+          title={t("admin.tokens.byScope.title")}
+          desc={t("admin.tokens.byScope.description")}
           icon="message"
-          headers={["渠道", "调用", "输入", "输出", "总计"]}
+          headers={[t("admin.tokens.header.scope"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
           rows={scopeRows}
           renderRow={(row) => (
             <>
@@ -176,13 +179,13 @@ export function TokenUsageMonitoring() {
               <strong>{formatNumber(row.total_tokens)}</strong>
             </>
           )}
-          emptyText="暂无渠道汇总。"
+          emptyText={t("admin.tokens.byScope.empty")}
         />
         <UsageTable<TokenModelRow>
-          title="按供应商和模型汇总"
-          desc="用于比较不同模型的 token 消耗。"
+          title={t("admin.tokens.byModel.title")}
+          desc={t("admin.tokens.byModel.description")}
           icon="shield"
-          headers={["供应商 / 模型", "调用", "输入", "输出", "总计"]}
+          headers={[t("admin.tokens.header.providerModel"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
           rows={modelRows}
           renderRow={(row) => (
             <>
@@ -193,7 +196,7 @@ export function TokenUsageMonitoring() {
               <strong>{formatNumber(row.total_tokens)}</strong>
             </>
           )}
-          emptyText="暂无模型汇总。"
+          emptyText={t("admin.tokens.byModel.empty")}
         />
       </div>
     </div>

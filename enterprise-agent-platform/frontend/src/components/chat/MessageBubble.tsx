@@ -6,6 +6,7 @@
    here too (msg--pending / msg--streaming toggle the CSS badges + caret). */
 
 import { memo } from "react";
+import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { initials } from "../../utils/format";
 import { messageFingerprintKey } from "../../utils/fingerprint";
@@ -18,6 +19,7 @@ import { MessageBody } from "./MessageBody";
 import { MessageMeta } from "./MessageMeta";
 
 function MessageBubbleImpl({ message }: { message: Message }) {
+  const { t } = useI18n();
   const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
   const agentWork = message.metadata?.agent_work || null;
@@ -31,7 +33,7 @@ function MessageBubbleImpl({ message }: { message: Message }) {
       className={cx("msg", `msg--${message.author_type}`, pending && "msg--pending", streaming && "msg--streaming")}
     >
       {isUser ? (
-        <div className="msg__avatar">{initials(message.username || "你")}</div>
+        <div className="msg__avatar">{initials(message.username || t("chat.you"))}</div>
       ) : (
         <div className="msg__avatar">
           <Icon name="bot" size={18} />

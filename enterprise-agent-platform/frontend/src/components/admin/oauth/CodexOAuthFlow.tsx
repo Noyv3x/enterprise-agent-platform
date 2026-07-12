@@ -7,9 +7,16 @@
 import { pollOAuthVerification } from "../../../data/adminActions";
 import { safeUrl } from "../../../lib/api";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import { oauthStatusLabel } from "../../../utils/oauth";
 import type { OAuthDeviceCodeFlow } from "../../../types";
 import { Icon } from "../../common/Icon";
+import { useI18n } from "../../../i18n";
+
+function flowStatus(t: ReturnType<typeof useI18n>["t"], status: string | undefined): string {
+  if (status === "waiting_for_user") return t("admin.oauth.waitingForUser");
+  if (status === "waiting_for_callback") return t("admin.oauth.waitingForCallback");
+  if (status === "complete") return t("admin.oauth.complete");
+  return status || t("admin.oauth.waiting");
+}
 
 export interface CodexOAuthFlowProps {
   providerId: string;
@@ -17,13 +24,14 @@ export interface CodexOAuthFlowProps {
 }
 
 export function CodexOAuthFlow({ providerId, flow }: CodexOAuthFlowProps) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
 
   return (
     <div className="oauth-guide">
       <div className="oauth-line">
-        <span>验证页</span>
+        <span>{t("admin.oauth.verificationPage")}</span>
         <a href={safeUrl(flow.verification_url)} target="_blank" rel="noreferrer">
           <span>{flow.verification_url}</span>
           <Icon name="external" size={13} />
@@ -37,10 +45,10 @@ export function CodexOAuthFlow({ providerId, flow }: CodexOAuthFlowProps) {
           onClick={() => void pollOAuthVerification(store, providerId, flow.flow_id)}
         >
           <Icon name="refresh" size={14} />
-          <span>检查状态</span>
+          <span>{t("admin.oauth.checkStatus")}</span>
         </button>
         <span className="muted" style={{ fontSize: "12px" }} aria-live="polite">
-          {`状态：${oauthStatusLabel(flow.status)}`}
+          {t("admin.oauth.status", { status: flowStatus(t, flow.status) })}
         </span>
       </div>
     </div>

@@ -21,6 +21,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useI18n } from "../i18n";
 import { cx } from "../lib/cx";
 import { Icon } from "../components/common/Icon";
 
@@ -158,6 +159,7 @@ function ToastNode({
   onDismiss: () => void;
   onRemove: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div
       className={cx("toast", `toast--${item.type}`, item.leaving && "is-leaving")}
@@ -175,7 +177,13 @@ function ToastNode({
         {item.title ? <div className="toast__title">{item.title}</div> : null}
         <div className="toast__msg">{item.message}</div>
       </div>
-      <button className="icon-btn toast__close" type="button" title="关闭" onClick={onDismiss}>
+      <button
+        className="icon-btn toast__close"
+        type="button"
+        title={t("toast.close")}
+        aria-label={t("toast.close")}
+        onClick={onDismiss}
+      >
         <Icon name="close" size={16} />
       </button>
     </div>

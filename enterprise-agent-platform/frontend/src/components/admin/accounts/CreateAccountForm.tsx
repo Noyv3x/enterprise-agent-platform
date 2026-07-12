@@ -12,8 +12,10 @@ import { Icon } from "../../common/Icon";
 import { AccountModelSelect } from "./AccountModelSelect";
 import { PermissionGroupSelect } from "./PermissionGroupSelect";
 import { ThinkingDepthSelect } from "./ThinkingDepthSelect";
+import { useI18n } from "../../../i18n";
 
 export function CreateAccountForm({ groups }: { groups: PermissionGroup[] }) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
 
@@ -54,54 +56,54 @@ export function CreateAccountForm({ groups }: { groups: PermissionGroup[] }) {
   return (
     <form className="account-create" onSubmit={handleSubmit}>
       <div className="account-create__grid">
-        <Field label="用户名">
+        <Field label={t("admin.accounts.username")}>
           <input
-            placeholder="username"
+            placeholder={t("admin.accounts.usernamePlaceholder")}
             autoComplete="off"
             value={username}
             onChange={(event) => setUsername(event.target.value)}
           />
         </Field>
-        <Field label="显示名称">
+        <Field label={t("admin.accounts.displayName")}>
           <input
-            placeholder="显示名称"
+            placeholder={t("admin.accounts.displayName")}
             value={displayName}
             onChange={(event) => setDisplayName(event.target.value)}
           />
         </Field>
-        <Field label="初始密码">
+        <Field label={t("admin.accounts.initialPassword")}>
           <input
             type="password"
             autoComplete="new-password"
-            placeholder="初始密码"
+            placeholder={t("admin.accounts.initialPassword")}
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
         </Field>
-        <Field label="职位">
+        <Field label={t("admin.accounts.position")}>
           <input
-            placeholder="职位，例如 项目经理"
+            placeholder={t("admin.accounts.positionPlaceholder")}
             value={position}
             onChange={(event) => setPosition(event.target.value)}
           />
         </Field>
-        <Field label="权限组">
+        <Field label={t("admin.accounts.permissionGroup")}>
           <PermissionGroupSelect
             groups={groups}
             value={permissionGroup}
             onChange={setPermissionGroup}
           />
         </Field>
-        <Field label="模型型号">
+        <Field label={t("admin.accounts.model")}>
           <AccountModelSelect value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
         </Field>
-        <Field label="思考深度">
+        <Field label={t("admin.accounts.thinkingDepth")}>
           <ThinkingDepthSelect value={thinkingDepth} onChange={setThinkingDepth} />
         </Field>
       </div>
       <button className="btn btn--primary" type="submit" disabled={busy}>
         <Icon name="plus" size={16} />
-        <span>创建账户</span>
+        <span>{t("admin.accounts.create")}</span>
       </button>
     </form>
   );

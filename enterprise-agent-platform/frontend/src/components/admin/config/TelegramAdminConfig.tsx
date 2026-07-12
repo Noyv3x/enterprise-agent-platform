@@ -13,6 +13,7 @@ import type { TelegramConfigValues } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { StatusBadge } from "../../common/StatusBadge";
+import { useI18n } from "../../../i18n";
 
 interface TelegramFormState {
   enabled: boolean;
@@ -33,12 +34,13 @@ function seedForm(config: TelegramConfigValues): TelegramFormState {
 }
 
 export function TelegramAdminConfig() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const telegramConfig = useStore((state) => state.telegramConfig);
   const config = telegramConfig?.config || {};
   const linked = telegramConfig?.linked_users || [];
-  const webhookUrl = config.webhook_url || "保存 webhook secret 后生成 URL";
+  const webhookUrl = config.webhook_url || t("admin.telegram.webhookPlaceholder");
 
   const [form, setForm] = useState<TelegramFormState>(() => seedForm(telegramConfig?.config || {}));
 
@@ -60,13 +62,13 @@ export function TelegramAdminConfig() {
   return (
     <section className="card config-form">
       <CardHead
-        title="Telegram 私聊网关"
+        title={t("admin.telegram.title")}
         icon="message"
-        desc="全局 bot 由管理员配置；每个用户在私人 Agent 页面生成一次性代码完成绑定。"
+        desc={t("admin.telegram.description")}
         extra={
           <StatusBadge
             ok={!!config.enabled && !!config.bot_token_configured}
-            label={config.enabled ? "已启用" : "未启用"}
+            label={t(config.enabled ? "admin.common.enabled" : "admin.common.disabled")}
           />
         }
       />
@@ -79,8 +81,8 @@ export function TelegramAdminConfig() {
               onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))}
             />
             <div className="check-row__text">
-              <strong>启用 Telegram 私聊</strong>
-              <span>只接收 private chat，不处理群组或频道</span>
+              <strong>{t("admin.telegram.enable")}</strong>
+              <span>{t("admin.telegram.enableHint")}</span>
             </div>
           </label>
           <label className="check-row">
@@ -90,32 +92,32 @@ export function TelegramAdminConfig() {
               onChange={(event) => setForm((prev) => ({ ...prev, polling: event.target.checked }))}
             />
             <div className="check-row__text">
-              <strong>Long polling</strong>
-              <span>关闭后使用 webhook URL 接收 update</span>
+              <strong>{t("admin.telegram.longPolling")}</strong>
+              <span>{t("admin.telegram.longPollingHint")}</span>
             </div>
           </label>
-          <Field label="Bot 用户名">
+          <Field label={t("admin.telegram.botUsername")}>
             <input
               value={form.botUsername}
-              placeholder="your_bot_username"
+              placeholder={t("admin.telegram.botUsernamePlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, botUsername: event.target.value }))}
             />
           </Field>
-          <Field label="Bot Token">
+          <Field label={t("admin.telegram.botToken")}>
             <input
               type="password"
               autoComplete="off"
-              placeholder={config.bot_token_configured ? "保持不变" : "BotFather token"}
+                placeholder={config.bot_token_configured ? t("admin.common.keepUnchanged") : "BotFather token"}
               value={form.botToken}
               onChange={(event) => setForm((prev) => ({ ...prev, botToken: event.target.value }))}
             />
           </Field>
           <div className="field--full">
-            <Field label="Webhook Secret">
+            <Field label={t("admin.telegram.webhookSecret")}>
               <input
                 type="password"
                 autoComplete="off"
-                placeholder={config.webhook_secret_configured ? "保持不变" : "8-128 位 URL-safe secret"}
+                placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.telegram.secretPlaceholder")}
                 value={form.webhookSecret}
                 onChange={(event) =>
                   setForm((prev) => ({ ...prev, webhookSecret: event.target.value }))
@@ -124,25 +126,25 @@ export function TelegramAdminConfig() {
             </Field>
           </div>
           <div className="field--full field-stack">
-            <span className="field-help">Webhook URL</span>
+            <span className="field-help">{t("admin.telegram.webhookUrl")}</span>
             <code className="mono">{webhookUrl}</code>
           </div>
         </div>
         <div className="form-actions">
           <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>保存 Telegram 配置</span>
+            <span>{t("admin.telegram.save")}</span>
           </button>
         </div>
       </form>
       <div className="usage-table-wrap usage-table-wrap--spaced">
-        <table className="usage-table" aria-label="已绑定 Telegram 的平台用户">
+        <table className="usage-table" aria-label={t("admin.telegram.linkedAria")}>
           <thead>
             <tr className="usage-table__row usage-table__head">
-              <th scope="col">平台用户</th>
-              <th scope="col">用户名</th>
-              <th scope="col">Telegram ID</th>
-              <th scope="col">Telegram 用户名</th>
-              <th scope="col">更新时间</th>
+              <th scope="col">{t("admin.telegram.platformUser")}</th>
+              <th scope="col">{t("admin.accounts.username")}</th>
+              <th scope="col">{t("admin.telegram.telegramId")}</th>
+              <th scope="col">{t("admin.telegram.telegramUsername")}</th>
+              <th scope="col">{t("admin.telegram.updatedAt")}</th>
             </tr>
           </thead>
           <tbody>
@@ -158,7 +160,7 @@ export function TelegramAdminConfig() {
               ))
             ) : (
               <tr className="usage-table__row">
-                <td colSpan={5} className="muted">暂无用户绑定 Telegram。</td>
+                <td colSpan={5} className="muted">{t("admin.telegram.empty")}</td>
               </tr>
             )}
           </tbody>

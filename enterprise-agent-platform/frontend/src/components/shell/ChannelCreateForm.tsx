@@ -7,11 +7,13 @@ import { api } from "../../lib/api";
 import { endpoints } from "../../lib/endpoints";
 import { loadChannels } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
+import { useI18n } from "../../i18n";
 import { useStoreHandle } from "../../store/useStore";
 import { Icon } from "../common/Icon";
 
 export function ChannelCreateForm() {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const [name, setName] = useState("");
 
   return (
@@ -31,16 +33,16 @@ export function ChannelCreateForm() {
       }}
     >
       <input
-        placeholder="新频道名称"
-        aria-label="新频道名称"
+        placeholder={t("nav.channel.createPlaceholder")}
+        aria-label={t("nav.channel.createPlaceholder")}
         value={name}
         onChange={(event) => setName(event.target.value)}
       />
       <button
         className="icon-btn"
         type="submit"
-        title="创建频道"
-        aria-label="创建频道"
+        title={t("nav.channel.create")}
+        aria-label={t("nav.channel.create")}
         style={{ border: "1px solid var(--line-strong)" }}
       >
         <Icon name="plus" size={16} />

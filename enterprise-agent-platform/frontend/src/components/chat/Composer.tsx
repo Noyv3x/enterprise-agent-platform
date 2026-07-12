@@ -15,6 +15,7 @@
    re-focus (legacy submit restore, :677-685). */
 
 import { useCallback, useRef, type ChangeEvent } from "react";
+import { useI18n } from "../../i18n";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES } from "../../lib/constants";
 import { useAutoGrow } from "../../hooks/useAutoGrow";
 import { useMention } from "../../hooks/useMention";
@@ -53,6 +54,7 @@ export function Composer({
   const store = useStoreHandle();
   const dispatch = useDispatch();
   const toast = useToast();
+  const { t } = useI18n();
 
   const draft = useStore((state) => state.drafts[draftKey] || "");
   const rawFiles = useStore((state) => state.draftFiles[draftKey]);
@@ -96,7 +98,9 @@ export function Composer({
       const accepted: File[] = [];
       for (const file of incoming) {
         if (file.size > MAX_ATTACHMENT_BYTES) {
-          toast(`${file.name || "附件"} 超过 50 MB`, { title: "文件过大" });
+          toast(t("chat.attach.tooLarge", { name: file.name || t("chat.attachment"), limit: "50 MB" }), {
+            title: t("chat.attach.tooLargeTitle"),
+          });
           continue;
         }
         accepted.push(file);
@@ -104,12 +108,14 @@ export function Composer({
       if (!accepted.length) return;
       const next = [...current, ...accepted].slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
       if (current.length + accepted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-        toast(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`, { title: "附件过多" });
+        toast(t("chat.attach.tooMany", { count: MAX_ATTACHMENTS_PER_MESSAGE }), {
+          title: t("chat.attach.tooManyTitle"),
+        });
       }
       dispatch({ type: "SET_DRAFT_FILES", payload: { key: draftKey, files: next } });
       onBumpFocus();
     },
-    [store, dispatch, draftKey, toast, onBumpFocus],
+    [store, dispatch, draftKey, toast, t, onBumpFocus],
   );
 
   const removeFile = useCallback(

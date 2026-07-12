@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../../../store/useStore";
+import { useI18n } from "../../../i18n";
 
 export interface RawYamlFormProps {
   value: string;
@@ -14,6 +15,7 @@ export interface RawYamlFormProps {
 }
 
 export function RawYamlForm({ value, onSubmit }: RawYamlFormProps) {
+  const { t } = useI18n();
   const busy = useStore((state) => state.busy);
   const [text, setText] = useState(value);
   const lastSeeded = useRef(value);
@@ -33,17 +35,17 @@ export function RawYamlForm({ value, onSubmit }: RawYamlFormProps) {
         onSubmit(text);
       }}
     >
-      <div className="section-label">config.yaml</div>
+      <div className="section-label">{t("admin.config.hermesInternal.yamlFile")}</div>
       <textarea
         className="raw-config"
         spellCheck={false}
-        aria-label="Hermes config.yaml"
+        aria-label={t("admin.config.hermesInternal.yamlAria")}
         value={text}
         onChange={(event) => setText(event.target.value)}
       />
       <div className="form-actions">
         <button className="btn btn--primary" type="submit" disabled={busy}>
-          <span>保存 YAML</span>
+          <span>{t("admin.config.hermesInternal.saveYaml")}</span>
         </button>
       </div>
     </form>

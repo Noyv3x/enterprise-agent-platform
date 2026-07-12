@@ -7,20 +7,27 @@
 import { useEffect, useState } from "react";
 import { loadPrivateTelegram } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
+import { useI18n } from "../../i18n";
 import { api } from "../../lib/api";
 import { EMPTY_BODY, endpoints } from "../../lib/endpoints";
 import { useToast } from "../../hooks/useToast";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
 import type { PrivateTelegramPending, PrivateTelegramResponse } from "../../types";
-import { formatTimestamp } from "../../utils/format";
 import {
-  telegramChallengeRelativeLabel,
   telegramChallengeTiming,
   telegramLinkView,
 } from "../../utils/telegramLink";
 import { Icon } from "../common/Icon";
 
 const LINK_POLL_INTERVAL_MS = 3_000;
+
+function formatExpiryTimestamp(value: number | null | undefined, locale: string): string {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return String(value ?? "");
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
+    new Date(seconds * 1000),
+  );
+}
 
 async function copyText(value: string): Promise<boolean> {
   try {
@@ -52,13 +59,14 @@ export function TelegramLinkPopover() {
   const store = useStoreHandle();
   const dispatch = useDispatch();
   const toast = useToast();
+  const { locale, t } = useI18n();
 
   const busy = useStore((state) => state.busy);
   const telegram = useStore((state) => state.privateTelegram);
   const gateway = telegram?.gateway || {};
   const link = telegram?.link || {};
   const linked = !!link.telegram_user_id;
-  const botName = gateway.bot_username ? `@${gateway.bot_username}` : "Telegram bot";
+  const botName = gateway.bot_username ? `@${gateway.bot_username}` : t("chat.telegram.botFallback");
 
   const [localChallenge, setLocalChallenge] = useState<PrivateTelegramPending | null>(null);
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
@@ -72,12 +80,20 @@ export function TelegramLinkPopover() {
   const view = telegramLinkView(!!gateway.enabled, linked);
 
   const status = linked
-    ? `${botName} 已绑定`
+    ? t("chat.telegram.statusLinked", { bot: botName })
     : !gateway.enabled
-      ? "管理员尚未启用"
+      ? t("chat.telegram.statusDisabled")
       : pendingActive
-        ? `${botName} 等待确认`
-        : `${botName} 可绑定`;
+        ? t("chat.telegram.statusPending", { bot: botName })
+        : t("chat.telegram.statusAvailable", { bot: botName });
+
+  const relativeExpiry = !timing.valid
+    ? t("chat.telegram.expiryUnknown")
+    : timing.expired
+      ? t("chat.telegram.expired")
+      : timing.secondsRemaining < 60
+        ? t("chat.telegram.expiresSeconds", { count: timing.secondsRemaining })
+        : t("chat.telegram.expiresMinutes", { count: timing.minutesRemaining });
 
   useEffect(() => {
     if (linked) setLocalChallenge(null);
@@ -150,12 +166,12 @@ export function TelegramLinkPopover() {
         !String(challenge.code || "").trim() ||
         !String(challenge.command || "").trim()
       ) {
-        throw new Error("服务未返回可用的 Telegram 绑定码，请重试");
+        throw new Error(t("chat.telegram.errorNoCode"));
       }
       setLocalChallenge(challenge);
       setNowSeconds(Math.floor(Date.now() / 1000));
       setCopied(false);
-      toast("请在 Telegram 私聊中发送一次性绑定命令", { type: "ok", title: "绑定码已生成" });
+      toast(t("chat.telegram.generatedToast"), { type: "ok", title: t("chat.telegram.generatedTitle") });
     });
   };
 
@@ -163,9 +179,9 @@ export function TelegramLinkPopover() {
     if (!command) return;
     if (await copyText(command)) {
       setCopied(true);
-      toast("绑定命令已复制", { type: "ok", title: "已复制" });
+      toast(t("chat.telegram.copiedToast"), { type: "ok", title: t("chat.telegram.copied") });
     } else {
-      toast("无法自动复制，请手动选择绑定命令", { title: "复制失败" });
+      toast(t("chat.telegram.copyFailed"), { title: t("chat.telegram.copyFailedTitle") });
     }
   };
 
@@ -174,7 +190,7 @@ export function TelegramLinkPopover() {
       await api(endpoints.deletePrivateTelegram.path(), { method: "DELETE", body: EMPTY_BODY });
       setLocalChallenge(null);
       await loadPrivateTelegram(store);
-      toast("Telegram 绑定已解除", { type: "ok", title: "完成" });
+      toast(t("chat.telegram.unboundToast"), { type: "ok", title: t("chat.telegram.doneTitle") });
     });
   };
 
@@ -183,21 +199,21 @@ export function TelegramLinkPopover() {
       className="telegram-link"
       id="private-telegram-popover"
       role="dialog"
-      aria-label="Telegram 私聊设置"
+      aria-label={t("chat.telegram.settingsLabel")}
     >
       <div className="telegram-link__header">
         <div className="telegram-link__meta">
           <div className="telegram-link__title">
             <Icon name="message" size={16} />
-            <span>Telegram 私聊</span>
+            <span>{t("chat.telegram.title")}</span>
           </div>
           <div className="telegram-link__sub">{status}</div>
         </div>
         <button
           className="icon-btn telegram-link__close"
           type="button"
-          title="收起"
-          aria-label="收起 Telegram 私聊设置"
+          title={t("chat.telegram.collapse")}
+          aria-label={t("chat.telegram.collapseLabel")}
           onClick={() => dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false })}
         >
           <Icon name="close" size={16} />
@@ -208,46 +224,48 @@ export function TelegramLinkPopover() {
         {view === "linked" ? (
           <div className="telegram-link__account">
             <div>
-              <strong>{link.telegram_username ? `@${link.telegram_username}` : "Telegram 账户"}</strong>
+              <strong>{link.telegram_username ? `@${link.telegram_username}` : t("chat.telegram.accountFallback")}</strong>
               <span>{`ID ${link.telegram_user_id}`}</span>
             </div>
             <button className="btn btn--danger btn--sm" type="button" disabled={busy} onClick={onUnbind}>
-              解除绑定
+              {t("chat.telegram.unbind")}
             </button>
           </div>
         ) : view === "disabled" ? (
-          <div className="notice notice--warn">请联系管理员启用 Telegram 私聊网关后再绑定。</div>
+          <div className="notice notice--warn">{t("chat.telegram.disabledNotice")}</div>
         ) : (
           <>
             <p className="telegram-link__instructions">
-              {`在 Telegram 中打开 ${botName}，发送平台生成的一次性命令。绑定码仅显示一次。`}
+              {t("chat.telegram.instructions", { bot: botName })}
             </p>
             {challengeVisible ? (
               <div className="telegram-challenge">
                 <div className="telegram-challenge__code">
-                  <span>一次性绑定码</span>
+                  <span>{t("chat.telegram.code")}</span>
                   <strong>{code}</strong>
                 </div>
                 <div className="telegram-challenge__command">
                   <code>{command}</code>
                   <button className="btn btn--sm" type="button" onClick={onCopy}>
-                    {copied ? "已复制" : "复制命令"}
+                    {copied ? t("chat.telegram.copied") : t("chat.telegram.copyCommand")}
                   </button>
                 </div>
                 <div className="telegram-challenge__expiry">
-                  <span>{telegramChallengeRelativeLabel(timing)}</span>
-                  {timing.valid ? <span>{`截止 ${formatTimestamp(pending?.expires_at)}`}</span> : null}
+                  <span>{relativeExpiry}</span>
+                  {timing.valid ? (
+                    <span>{t("chat.telegram.expiresAt", { time: formatExpiryTimestamp(pending?.expires_at, locale) })}</span>
+                  ) : null}
                 </div>
                 <span className="telegram-challenge__hint">
-                  复制后，将完整命令发送到与 Bot 的私聊中；群组消息不会生效。
+                  {t("chat.telegram.commandHint")}
                 </span>
               </div>
             ) : pendingActive ? (
               <div className="notice notice--warn">
-                已有绑定请求等待确认，但一次性命令不会再次显示。请重新生成后立即复制。
+                {t("chat.telegram.pendingHidden")}
               </div>
             ) : timing.expired ? (
-              <div className="notice notice--warn">绑定码已过期，请重新生成。</div>
+              <div className="notice notice--warn">{t("chat.telegram.expiredNotice")}</div>
             ) : null}
             <div className="telegram-link__actions">
               <button
@@ -256,7 +274,7 @@ export function TelegramLinkPopover() {
                 disabled={busy}
                 onClick={() => void onGenerate()}
               >
-                {pending ? "重新生成绑定码" : "生成绑定码"}
+                {pending ? t("chat.telegram.regenerate") : t("chat.telegram.generate")}
               </button>
             </div>
           </>

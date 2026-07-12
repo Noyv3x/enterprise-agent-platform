@@ -15,6 +15,7 @@
 
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 
 export interface ConfirmDialogProps {
@@ -51,12 +52,13 @@ const dialogStyle: React.CSSProperties = {
 export function ConfirmDialog({
   message,
   title,
-  confirmText = "确定",
-  cancelText = "取消",
+  confirmText,
+  cancelText,
   danger,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  const { t } = useI18n();
   const panelRef = useRef<HTMLDivElement>(null);
   const onCancelRef = useRef(onCancel);
   onCancelRef.current = onCancel;
@@ -105,7 +107,7 @@ export function ConfirmDialog({
         className="card"
         role="dialog"
         aria-modal="true"
-        aria-label={title || "确认操作"}
+        aria-label={title || t("chat.confirm.label")}
         style={dialogStyle}
       >
         {title ? (
@@ -116,14 +118,14 @@ export function ConfirmDialog({
         <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{message}</p>
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <button className="btn btn--sm" type="button" onClick={onCancel}>
-            {cancelText}
+            {cancelText ?? t("chat.confirm.cancel")}
           </button>
           <button
             className={cx("btn", "btn--sm", danger ? "btn--danger" : "btn--primary")}
             type="button"
             onClick={onConfirm}
           >
-            {confirmText}
+            {confirmText ?? t("chat.confirm.confirm")}
           </button>
         </div>
       </div>

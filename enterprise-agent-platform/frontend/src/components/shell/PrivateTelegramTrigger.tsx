@@ -5,11 +5,13 @@
    id the private-agent spec (Phase 4a) renders. */
 
 import { cx } from "../../lib/cx";
+import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { Icon } from "../common/Icon";
 
 export function PrivateTelegramTrigger() {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const privateTelegram = useStore((state) => state.privateTelegram);
   const expanded = useStore((state) => state.privateTelegramExpanded);
 
@@ -18,16 +20,16 @@ export function PrivateTelegramTrigger() {
   const linked = !!link.telegram_user_id;
   const title = gateway.enabled
     ? linked
-      ? "Telegram 私聊已绑定"
-      : "配置 Telegram 私聊"
-    : "Telegram 私聊未启用";
+      ? t("nav.telegram.linked")
+      : t("nav.telegram.configure")
+    : t("nav.telegram.disabled");
 
   return (
     <button
       className={cx("icon-btn", "private-telegram-trigger", expanded && "is-active", linked && "is-linked")}
       type="button"
       title={title}
-      aria-label="Telegram 私聊设置"
+      aria-label={t("nav.telegram.settings")}
       aria-expanded={expanded}
       aria-controls="private-telegram-popover"
       onClick={() =>

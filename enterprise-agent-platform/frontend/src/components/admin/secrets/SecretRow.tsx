@@ -10,8 +10,10 @@ import { setSecret } from "../../../data/adminActions";
 import { useStoreHandle } from "../../../store/useStore";
 import type { Secret } from "../../../types";
 import { Icon } from "../../common/Icon";
+import { useI18n } from "../../../i18n";
 
 export function SecretRow({ secret }: { secret: Secret }) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const [value, setValue] = useState("");
 
@@ -26,18 +28,18 @@ export function SecretRow({ secret }: { secret: Secret }) {
         <Icon name="key" />
         <span className="secret-row__name">{secret.key}</span>
       </div>
-      <span className="secret-row__val">{secret.configured ? secret.masked : "empty"}</span>
+      <span className="secret-row__val">{secret.configured ? secret.masked : t("admin.secrets.emptyValue")}</span>
       <form onSubmit={handleSubmit}>
         <input
           type="password"
           autoComplete="off"
           aria-label={secret.key}
-          placeholder={secret.configured ? secret.masked : "未配置"}
+          placeholder={secret.configured ? secret.masked : t("admin.common.notConfigured")}
           value={value}
           onChange={(event) => setValue(event.target.value)}
         />
         <button className="btn btn--sm" type="submit">
-          设置
+          {t("admin.secrets.set")}
         </button>
       </form>
     </div>

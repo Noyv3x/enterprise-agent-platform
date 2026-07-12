@@ -22,6 +22,7 @@ import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
 import { AuditMessageRow } from "./AuditMessageRow";
+import { useI18n } from "../../../i18n";
 
 export interface ChannelAuditCardProps {
   confirm: UseConfirm["confirm"];
@@ -29,6 +30,7 @@ export interface ChannelAuditCardProps {
 }
 
 export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const channels = useStore((state) => state.channels);
   const channelMessages = useStore((state) => state.messageAudit.channelMessages);
@@ -43,11 +45,11 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
     event.preventDefault();
     const id = Number(messageId);
     if (!id) {
-      toast("请输入要删除的消息 ID", { title: "缺少消息 ID" });
+      toast(t("admin.audit.missingMessageId.detail"), { title: t("admin.audit.missingMessageId.title") });
       return;
     }
     void (async () => {
-      if (!(await confirm(`删除频道消息 #${id}？`, { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeleteChannelMessage", { id }), { danger: true }))) return;
       await deleteChannelMessage(store, channelId, id);
       setMessageId("");
     })();
@@ -57,11 +59,11 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
     event.preventDefault();
     const ts = unixFromDatetimeLocal(beforeTime);
     if (!ts) {
-      toast("请选择删除截止时间", { title: "缺少时间" });
+      toast(t("admin.audit.missingTime.detail"), { title: t("admin.audit.missingTime.title") });
       return;
     }
     void (async () => {
-      if (!(await confirm("删除该时间点之前的频道消息？", { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeleteChannelBefore"), { danger: true }))) return;
       await deleteChannelMessagesBefore(store, channelId, ts);
       setBeforeTime("");
     })();
@@ -69,14 +71,14 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
 
   const handleClear = () => {
     void (async () => {
-      if (!(await confirm("清空当前频道的全部消息？", { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmClearChannel"), { danger: true }))) return;
       await clearChannelMessages(store, channelId);
     })();
   };
 
   const handleRowDelete = (id: Id) => {
     void (async () => {
-      if (!(await confirm(`删除频道消息 #${id}？`, { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeleteChannelMessage", { id: String(id) }), { danger: true }))) return;
       await deleteChannelMessage(store, channelId, id);
     })();
   };
@@ -84,10 +86,10 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
   return (
     <section className="card audit-card">
       <CardHead
-        title="频道消息管理"
+        title={t("admin.audit.channel.title")}
         icon="message"
         desc={
-          channel ? `#${channel.name}：${channelTotal || 0} 条消息` : "选择频道后查看和删除消息"
+          channel ? t("admin.audit.channel.messageCount", { channel: channel.name, count: channelTotal || 0 }) : t("admin.audit.channel.selectHint")
         }
         extra={
           <button
@@ -97,12 +99,12 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
             onClick={() => void refreshAuditChannel(store, channelId)}
           >
             <Icon name="refresh" size={14} />
-            <span>刷新</span>
+            <span>{t("admin.common.refresh")}</span>
           </button>
         }
       />
       {channels.length ? (
-        <Field label="频道">
+        <Field label={t("admin.audit.channel.label")}>
           <select
             value={channelId}
             onChange={(event) => void selectAuditChannel(store, String(event.target.value || ""))}
@@ -117,23 +119,23 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
       ) : null}
       <div className="audit-tools">
         <form className="audit-tool" onSubmit={handleDeleteId}>
-          <Field label="精确删除">
+          <Field label={t("admin.audit.exactDelete")}>
             <input
               type="number"
               min="1"
               step="1"
-              placeholder="消息 ID"
+              placeholder={t("admin.audit.messageId")}
               value={messageId}
               onChange={(event) => setMessageId(event.target.value)}
             />
           </Field>
           <button className="btn btn--danger" type="submit" disabled={busy || !channelId}>
             <Icon name="trash" size={15} />
-            <span>删除 ID</span>
+            <span>{t("admin.audit.deleteId")}</span>
           </button>
         </form>
         <form className="audit-tool" onSubmit={handleDeleteBefore}>
-          <Field label="删除时间点前">
+          <Field label={t("admin.audit.deleteBeforeLabel")}>
             <input
               type="datetime-local"
               value={beforeTime}
@@ -142,13 +144,13 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
           </Field>
           <button className="btn btn--danger" type="submit" disabled={busy || !channelId}>
             <Icon name="trash" size={15} />
-            <span>删除之前</span>
+            <span>{t("admin.audit.deleteBefore")}</span>
           </button>
         </form>
         <div className="audit-tool audit-tool--compact">
           <span className="field">
-            <span>全部清空</span>
-            <span className="muted">清空当前频道消息</span>
+            <span>{t("admin.audit.clearAll")}</span>
+            <span className="muted">{t("admin.audit.channel.clearHint")}</span>
           </span>
           <button
             className="btn btn--danger"
@@ -157,7 +159,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
             onClick={handleClear}
           >
             <Icon name="trash" size={15} />
-            <span>清空频道</span>
+            <span>{t("admin.audit.channel.clear")}</span>
           </button>
         </div>
       </div>
@@ -172,7 +174,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
             />
           ))
         ) : (
-          <div className="muted">{channel ? "当前频道暂无消息。" : "暂无频道。"}</div>
+          <div className="muted">{t(channel ? "admin.audit.channel.empty" : "admin.audit.channel.none")}</div>
         )}
       </div>
     </section>

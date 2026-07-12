@@ -8,6 +8,8 @@
    at boot.
    ===================================================================== */
 
+import { t } from "../i18n";
+
 type SessionExpiredHandler = () => void;
 
 let sessionExpiredHandler: SessionExpiredHandler | null = null;
@@ -28,14 +30,15 @@ export class ApiError extends Error {
 
 export class ApiRequestCancelledError extends Error {
   constructor() {
-    super("请求已取消");
+    super(t("api.cancelled"));
     this.name = "ApiRequestCancelledError";
   }
 }
 
 export class ApiTimeoutError extends Error {
   constructor(timeoutMs: number) {
-    super(`请求超时（${Math.ceil(timeoutMs / 1000)} 秒）`);
+    const seconds = Math.ceil(timeoutMs / 1000);
+    super(t("api.timeout", { count: seconds }));
     this.name = "ApiTimeoutError";
   }
 }
@@ -132,7 +135,7 @@ export async function api<T = unknown>(path: string, options: ApiOptions = {}): 
     }
     if (!res.ok) {
       const err = data as { error?: string; detail?: string };
-      throw new ApiError(err.error || err.detail || `请求失败（${res.status}）`, res.status);
+      throw new ApiError(err.error || err.detail || t("api.failed", { status: res.status }), res.status);
     }
     return data as T;
   } catch (error) {

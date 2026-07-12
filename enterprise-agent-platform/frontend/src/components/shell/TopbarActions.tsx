@@ -4,6 +4,7 @@
 
 import { useStore } from "../../store/useStore";
 import { ThemeToggle } from "../common/ThemeToggle";
+import { LanguageSelect } from "../common/LanguageSelect";
 import { PrivateTelegramTrigger } from "./PrivateTelegramTrigger";
 
 export function TopbarActions() {
@@ -11,6 +12,7 @@ export function TopbarActions() {
   return (
     <div className="topbar__actions">
       {isPrivate ? <PrivateTelegramTrigger /> : null}
+      <LanguageSelect />
       <ThemeToggle />
     </div>
   );

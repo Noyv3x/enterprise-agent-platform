@@ -1,0 +1,171 @@
+import { defineMessages } from "../types";
+
+export const workspaceMessages = defineMessages({
+  "toast.complete": { "zh-CN": "完成", en: "Done", "zh-TW": "完成" },
+  "toast.operationFailed": { "zh-CN": "操作失败", en: "Operation failed", "zh-TW": "操作失敗" },
+  "toast.close": { "zh-CN": "关闭通知", en: "Dismiss notification", "zh-TW": "關閉通知" },
+
+  "session.expired": {
+    "zh-CN": "会话已过期，请重新登录",
+    en: "Your session has expired. Sign in again.",
+    "zh-TW": "工作階段已過期，請重新登入",
+  },
+  "session.loginRequired": { "zh-CN": "需要登录", en: "Sign-in required", "zh-TW": "需要登入" },
+  "api.cancelled": { "zh-CN": "请求已取消", en: "Request cancelled", "zh-TW": "請求已取消" },
+  "api.timeout": {
+    "zh-CN": "请求超时（{count} 秒）",
+    en: { one: "Request timed out after {count} second", other: "Request timed out after {count} seconds" },
+    "zh-TW": "請求逾時（{count} 秒）",
+  },
+  "api.failed": {
+    "zh-CN": "请求失败（{status}）",
+    en: "Request failed ({status})",
+    "zh-TW": "請求失敗（{status}）",
+  },
+
+  "account.loginRequiredDetail": {
+    "zh-CN": "请登录后查看账户设置。",
+    en: "Sign in to view account settings.",
+    "zh-TW": "請登入後查看帳戶設定。",
+  },
+  "account.profile": { "zh-CN": "账户资料", en: "Account profile", "zh-TW": "帳戶資料" },
+  "account.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },
+  "account.permissionGroup": { "zh-CN": "权限组", en: "Permission group", "zh-TW": "權限群組" },
+  "account.member": { "zh-CN": "成员", en: "Member", "zh-TW": "成員" },
+  "account.displayName": { "zh-CN": "显示名称", en: "Display name", "zh-TW": "顯示名稱" },
+  "account.position": { "zh-CN": "职位", en: "Position", "zh-TW": "職位" },
+  "account.saveProfile": { "zh-CN": "保存资料", en: "Save profile", "zh-TW": "儲存資料" },
+  "account.changePassword": { "zh-CN": "修改密码", en: "Change password", "zh-TW": "修改密碼" },
+  "account.currentPassword": { "zh-CN": "当前密码", en: "Current password", "zh-TW": "目前密碼" },
+  "account.newPassword": { "zh-CN": "新密码", en: "New password", "zh-TW": "新密碼" },
+  "account.confirmPassword": {
+    "zh-CN": "确认新密码",
+    en: "Confirm new password",
+    "zh-TW": "確認新密碼",
+  },
+  "account.updatePassword": { "zh-CN": "更新密码", en: "Update password", "zh-TW": "更新密碼" },
+  "account.passwordMismatch": {
+    "zh-CN": "两次输入的新密码不一致",
+    en: "The new passwords do not match",
+    "zh-TW": "兩次輸入的新密碼不一致",
+  },
+  "account.passwordMinLength": {
+    "zh-CN": "新密码至少 {count} 个字符",
+    en: { one: "The new password must be at least {count} character", other: "The new password must be at least {count} characters" },
+    "zh-TW": "新密碼至少需要 {count} 個字元",
+  },
+  "account.profileUpdated": {
+    "zh-CN": "账户信息已更新",
+    en: "Account information updated",
+    "zh-TW": "帳戶資訊已更新",
+  },
+  "account.passwordUpdated": {
+    "zh-CN": "密码已更新",
+    en: "Password updated",
+    "zh-TW": "密碼已更新",
+  },
+
+  "knowledge.viewDocument": { "zh-CN": "查看正文", en: "View document", "zh-TW": "檢視正文" },
+  "knowledge.documentRegion": { "zh-CN": "文档正文", en: "Document content", "zh-TW": "文件正文" },
+  "knowledge.untitledDocument": { "zh-CN": "文档", en: "DOCUMENT", "zh-TW": "文件" },
+  "knowledge.closeDocument": { "zh-CN": "关闭文档", en: "Close document", "zh-TW": "關閉文件" },
+  "knowledge.loading": { "zh-CN": "加载中…", en: "Loading…", "zh-TW": "載入中…" },
+  "knowledge.noResults": { "zh-CN": "没有匹配结果", en: "No matching results", "zh-TW": "沒有相符結果" },
+  "knowledge.noResultsDetail": {
+    "zh-CN": "未找到与“{query}”相关的条目。",
+    en: "No entries related to “{query}” were found.",
+    "zh-TW": "找不到與「{query}」相關的項目。",
+  },
+  "knowledge.empty": { "zh-CN": "知识库为空", en: "Knowledge base is empty", "zh-TW": "知識庫是空的" },
+  "knowledge.emptyDetail": {
+    "zh-CN": "在左侧表单中录入第一条知识。",
+    en: "Add the first entry using the form on the left.",
+    "zh-TW": "請使用左側表單新增第一筆知識。",
+  },
+  "knowledge.createTitle": { "zh-CN": "新增条目", en: "Add entry", "zh-TW": "新增項目" },
+  "knowledge.createDescription": {
+    "zh-CN": "结构化录入知识，供 Agent 检索引用。",
+    en: "Add structured knowledge for Agent search and reference.",
+    "zh-TW": "以結構化方式新增知識，供 Agent 搜尋及引用。",
+  },
+  "knowledge.saved": { "zh-CN": "已保存知识条目", en: "Knowledge entry saved", "zh-TW": "已儲存知識項目" },
+  "knowledge.title": { "zh-CN": "标题", en: "Title", "zh-TW": "標題" },
+  "knowledge.source": { "zh-CN": "来源", en: "Source", "zh-TW": "來源" },
+  "knowledge.sourcePlaceholder": {
+    "zh-CN": "来源（URL、系统名等）",
+    en: "Source (URL, system name, etc.)",
+    "zh-TW": "來源（URL、系統名稱等）",
+  },
+  "knowledge.summary": { "zh-CN": "摘要", en: "Summary", "zh-TW": "摘要" },
+  "knowledge.summaryPlaceholder": {
+    "zh-CN": "摘要（可留空）",
+    en: "Summary (optional)",
+    "zh-TW": "摘要（可留空）",
+  },
+  "knowledge.content": { "zh-CN": "正文", en: "Content", "zh-TW": "正文" },
+  "knowledge.contentPlaceholder": { "zh-CN": "正文内容…", en: "Document content…", "zh-TW": "正文內容…" },
+  "knowledge.save": { "zh-CN": "保存条目", en: "Save entry", "zh-TW": "儲存項目" },
+  "knowledge.library": { "zh-CN": "条目库", en: "Entry library", "zh-TW": "項目庫" },
+  "knowledge.documentCount": {
+    "zh-CN": "{count} 篇文档",
+    en: { one: "{count} document", other: "{count} documents" },
+    "zh-TW": "{count} 篇文件",
+  },
+  "knowledge.searchResults": {
+    "zh-CN": "搜索“{query}”：{count} 条结果",
+    en: { one: "Search “{query}”: {count} result", other: "Search “{query}”: {count} results" },
+    "zh-TW": "搜尋「{query}」：{count} 筆結果",
+  },
+  "knowledge.showAll": { "zh-CN": "显示全部", en: "Show all", "zh-TW": "顯示全部" },
+  "knowledge.searchPlaceholder": {
+    "zh-CN": "搜索标题或正文…",
+    en: "Search titles or content…",
+    "zh-TW": "搜尋標題或正文…",
+  },
+  "knowledge.searchLabel": { "zh-CN": "搜索知识库", en: "Search knowledge base", "zh-TW": "搜尋知識庫" },
+  "knowledge.clearSearch": { "zh-CN": "清除搜索", en: "Clear search", "zh-TW": "清除搜尋" },
+  "knowledge.clearSearchDetail": {
+    "zh-CN": "清除搜索，显示全部条目",
+    en: "Clear search and show all entries",
+    "zh-TW": "清除搜尋並顯示全部項目",
+  },
+
+  "mention.agentDescription": {
+    "zh-CN": "呼叫频道 Agent",
+    en: "Mention the channel Agent",
+    "zh-TW": "呼叫頻道 Agent",
+  },
+  "oauth.waitingForUser": {
+    "zh-CN": "等待网页登录",
+    en: "Waiting for browser sign-in",
+    "zh-TW": "等待網頁登入",
+  },
+  "oauth.waitingForCallback": {
+    "zh-CN": "等待回调 URL",
+    en: "Waiting for callback URL",
+    "zh-TW": "等待回呼 URL",
+  },
+  "oauth.complete": { "zh-CN": "已完成", en: "Complete", "zh-TW": "已完成" },
+  "oauth.waiting": { "zh-CN": "等待中", en: "Waiting", "zh-TW": "等待中" },
+  "oauth.reloginRequired": {
+    "zh-CN": "需要重新验证：{message}",
+    en: "Sign-in required again: {message}",
+    "zh-TW": "需要重新驗證：{message}",
+  },
+  "telegram.expiryUnknown": { "zh-CN": "有效期未知", en: "Expiry unknown", "zh-TW": "有效期限未知" },
+  "telegram.challengeExpired": {
+    "zh-CN": "绑定码已过期",
+    en: "Linking code expired",
+    "zh-TW": "綁定碼已過期",
+  },
+  "telegram.expiresInSeconds": {
+    "zh-CN": "{count} 秒后过期",
+    en: { one: "Expires in {count} second", other: "Expires in {count} seconds" },
+    "zh-TW": "{count} 秒後過期",
+  },
+  "telegram.expiresInMinutes": {
+    "zh-CN": "约 {count} 分钟后过期",
+    en: { one: "Expires in about {count} minute", other: "Expires in about {count} minutes" },
+    "zh-TW": "約 {count} 分鐘後過期",
+  },
+});

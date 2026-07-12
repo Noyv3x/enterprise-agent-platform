@@ -2,6 +2,7 @@
    admin account APIs, so members can update only their own profile/password. */
 
 import { toast } from "../context/ToastContext";
+import { t } from "../i18n";
 import { api } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type {
@@ -25,7 +26,7 @@ export async function updateCurrentUser(
     });
     store.dispatch({ type: "SET_USER", payload: result.user });
     onSuccess?.();
-    toast("账户信息已更新", { type: "ok", title: "完成" });
+    toast(t("account.profileUpdated"), { type: "ok", title: t("toast.complete") });
   });
 }
 
@@ -41,6 +42,6 @@ export async function changePassword(
     });
     store.dispatch({ type: "SET_USER", payload: result.user });
     onSuccess?.();
-    toast("密码已更新", { type: "ok", title: "完成" });
+    toast(t("account.passwordUpdated"), { type: "ok", title: t("toast.complete") });
   });
 }

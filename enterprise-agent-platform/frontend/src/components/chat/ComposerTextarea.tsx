@@ -13,6 +13,7 @@
    autoGrow is owned by the parent <Composer> (useAutoGrow on the same ref). */
 
 import { useLayoutEffect, type RefObject } from "react";
+import { useI18n } from "../../i18n";
 import { clipboardImageFiles } from "../../utils/composerFiles";
 import type { ChatMode } from "../../types";
 import type { MentionApi } from "../../hooks/useMention";
@@ -54,6 +55,7 @@ export function ComposerTextarea({
   onAddFiles,
   notify,
 }: ComposerTextareaProps) {
+  const { t } = useI18n();
   const channel = mode === "channel";
 
   // Apply a pending caret (set by mention insert) after the controlled value commits.
@@ -79,7 +81,7 @@ export function ComposerTextarea({
       value={value}
       disabled={disabled}
       placeholder={placeholder}
-      aria-label="消息输入框"
+      aria-label={t("chat.composer.inputLabel")}
       role={channel ? "combobox" : undefined}
       aria-haspopup={channel ? "listbox" : undefined}
       aria-autocomplete={channel ? "list" : undefined}

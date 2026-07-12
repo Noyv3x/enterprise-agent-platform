@@ -3,6 +3,7 @@
    2803-2806, 1787-1790.
    ===================================================================== */
 
+import { t } from "../i18n";
 import type { OAuthProvider } from "../types";
 
 /** Secrets whose key contains "_OAUTH_" are managed by the OAuth card, not the
@@ -11,14 +12,15 @@ export function isOAuthSecret(key: string): boolean {
   return key.includes("_OAUTH_");
 }
 
-const OAUTH_STATUS_LABELS: Record<string, string> = {
-  waiting_for_user: "等待网页登录",
-  waiting_for_callback: "等待回调 URL",
-  complete: "已完成",
-};
+const OAUTH_STATUS_KEYS = {
+  waiting_for_user: "oauth.waitingForUser",
+  waiting_for_callback: "oauth.waitingForCallback",
+  complete: "oauth.complete",
+} as const;
 
 export function oauthStatusLabel(status: string | null | undefined): string {
-  return (status ? OAUTH_STATUS_LABELS[status] : undefined) || status || "等待中";
+  const key = status ? OAUTH_STATUS_KEYS[status as keyof typeof OAUTH_STATUS_KEYS] : undefined;
+  return key ? t(key) : status || t("oauth.waiting");
 }
 
 /** Human error string derived from provider.last_auth_error. */
@@ -27,7 +29,7 @@ export function oauthProviderErrorText(provider: OAuthProvider | null | undefine
   if (!authError || typeof authError !== "object") return "";
   const message = String(authError.message || authError.detail || authError.code || "").trim();
   if (!message) return "";
-  return authError.relogin_required ? `需要重新验证：${message}` : message;
+  return authError.relogin_required ? t("oauth.reloginRequired", { message }) : message;
 }
 
 /** Label for a provider id, resolved against the loaded providers list

@@ -1,8 +1,25 @@
 /* <MessageMeta/> — the bubble meta row (legacy renderMessage meta, :884-889):
    author name, optional pending/streaming badges, and the formatted time. */
 
-import { formatTime } from "../../utils/format";
+import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
+
+function formatMessageTime(value: number | null | undefined, locale: string): string {
+  if (!value) return "";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  const time = date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+  return date.toDateString() === new Date().toDateString()
+    ? time
+    : `${date.toLocaleDateString(locale, { month: "numeric", day: "numeric" })} ${time}`;
+}
+
+function authorName(message: Message, isUser: boolean, translate: Translator): string {
+  if (isUser) return message.username || translate("chat.you");
+  if (message.username === "Private Agent") return translate("chat.privateAgent");
+  if (message.username === "Main Agent") return translate("chat.mainAgent");
+  return message.username || translate("chat.agent");
+}
 
 export function MessageMeta({
   message,
@@ -15,12 +32,13 @@ export function MessageMeta({
   pending: boolean;
   streaming: boolean;
 }) {
+  const { locale, t } = useI18n();
   return (
     <div className="msg__meta">
-      <span className="msg__name">{message.username || (isUser ? "你" : "Agent")}</span>
-      {pending ? <span className="msg__pending">发送中</span> : null}
-      {streaming ? <span className="msg__pending">生成中</span> : null}
-      <span className="msg__time">{formatTime(message.created_at)}</span>
+      <span className="msg__name">{authorName(message, isUser, t)}</span>
+      {pending ? <span className="msg__pending">{t("chat.message.sending")}</span> : null}
+      {streaming ? <span className="msg__pending">{t("chat.message.generating")}</span> : null}
+      <span className="msg__time">{formatMessageTime(message.created_at, locale)}</span>
     </div>
   );
 }

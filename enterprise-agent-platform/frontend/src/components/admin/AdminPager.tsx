@@ -8,8 +8,10 @@ import { ADMIN_PAGES } from "../../lib/constants";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { AdminPageId } from "../../types";
 import { AdminPagerItem } from "./AdminPagerItem";
+import { useI18n } from "../../i18n";
 
 export function AdminPager({ activeId }: { activeId: AdminPageId }) {
+  const { t } = useI18n();
   const isMobile = useMediaQuery("(max-width: 800px)");
   const activeRef = useRef<HTMLButtonElement>(null);
 
@@ -20,7 +22,7 @@ export function AdminPager({ activeId }: { activeId: AdminPageId }) {
   }, [activeId, isMobile]);
 
   return (
-    <nav className="admin-pager" aria-label="管理面板分页">
+    <nav className="admin-pager" aria-label={t("admin.pager.ariaLabel")}>
       {ADMIN_PAGES.map((page) => {
         const active = page.id === activeId;
         return (

@@ -4,20 +4,23 @@
 
 import { AppGate } from "./components/shell/AppGate";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
+import { I18nProvider } from "./i18n";
 import { ThemeProvider } from "./context/ThemeContext";
 import { ToastProvider } from "./context/ToastContext";
 import { StoreProvider } from "./store/StoreProvider";
 
 export default function App() {
   return (
-    <ErrorBoundary>
-      <ThemeProvider>
-        <ToastProvider>
-          <StoreProvider>
-            <AppGate />
-          </StoreProvider>
-        </ToastProvider>
-      </ThemeProvider>
-    </ErrorBoundary>
+    <I18nProvider>
+      <ErrorBoundary>
+        <ThemeProvider>
+          <ToastProvider>
+            <StoreProvider>
+              <AppGate />
+            </StoreProvider>
+          </ToastProvider>
+        </ThemeProvider>
+      </ErrorBoundary>
+    </I18nProvider>
   );
 }

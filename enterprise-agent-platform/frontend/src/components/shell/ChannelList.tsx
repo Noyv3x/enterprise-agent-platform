@@ -4,10 +4,12 @@
 
 import { cx } from "../../lib/cx";
 import { selectChannel } from "../../data/chatActions";
+import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 
 export function ChannelList() {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const channels = useStore((state) => state.channels);
   const activeView = useStore((state) => state.activeView);
   const activeChannelId = useStore((state) => state.activeChannelId);
@@ -30,7 +32,7 @@ export function ChannelList() {
         ))
       ) : (
         <div className="muted" style={{ padding: "4px 10px", fontSize: "12.5px" }}>
-          暂无频道，创建一个开始协作。
+          {t("nav.channels.empty")}
         </div>
       )}
     </div>

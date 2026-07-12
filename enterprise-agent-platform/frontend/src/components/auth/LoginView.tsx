@@ -7,14 +7,17 @@
 import { useState } from "react";
 import { login, runBusy } from "../../data/sessionActions";
 import { useStore, useStoreHandle } from "../../store/useStore";
+import { useI18n } from "../../i18n";
 import { Brand } from "../common/Brand";
 import { Field } from "../common/Field";
+import { LanguageSelect } from "../common/LanguageSelect";
 import { Spinner } from "../common/Spinner";
 
 export function LoginView() {
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const error = useStore((state) => state.error);
+  const { t } = useI18n();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
@@ -25,36 +28,37 @@ export function LoginView() {
       </aside>
       <div className="auth__main">
         <div className="auth__card">
+          <div className="auth__locale"><LanguageSelect /></div>
           <Brand />
-          <h1>登录</h1>
+          <h1>{t("auth.login")}</h1>
           <form
             onSubmit={(event) => {
               event.preventDefault();
               void runBusy(store, () => login(store, username, password));
             }}
           >
-            <Field label="用户名">
+            <Field label={t("auth.username")}>
               <input
                 name="username"
                 autoComplete="username"
-                placeholder="用户名"
+                placeholder={t("auth.username")}
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
               />
             </Field>
-            <Field label="密码">
+            <Field label={t("auth.password")}>
               <input
                 name="password"
                 type="password"
                 autoComplete="current-password"
-                placeholder="密码"
+                placeholder={t("auth.password")}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
               />
             </Field>
             <button className="btn btn--primary btn--lg btn--block" type="submit" disabled={busy}>
               {busy ? <Spinner size={18} /> : null}
-              <span>{busy ? "正在登录…" : "登录"}</span>
+              <span>{busy ? t("auth.loggingIn") : t("auth.login")}</span>
             </button>
             <div className="error" role="alert">
               {error}

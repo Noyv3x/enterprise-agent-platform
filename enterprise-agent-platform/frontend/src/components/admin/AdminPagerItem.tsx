@@ -10,6 +10,7 @@ import { useStoreHandle } from "../../store/useStore";
 import type { AdminPage } from "../../types";
 import { Icon } from "../common/Icon";
 import { AdminPageBadge } from "./AdminPageBadge";
+import { useI18n } from "../../i18n";
 
 export interface AdminPagerItemProps {
   page: AdminPage;
@@ -19,6 +20,7 @@ export interface AdminPagerItemProps {
 
 export function AdminPagerItem({ page, active, buttonRef }: AdminPagerItemProps) {
   const store = useStoreHandle();
+  const { t } = useI18n();
   return (
     <button
       ref={buttonRef}
@@ -28,7 +30,7 @@ export function AdminPagerItem({ page, active, buttonRef }: AdminPagerItemProps)
       onClick={() => void selectAdminPage(store, page.id)}
     >
       <Icon name={page.icon} size={16} />
-      <span>{page.label}</span>
+      <span>{t(`admin.page.${page.id}.label`)}</span>
       <AdminPageBadge pageId={page.id} />
     </button>
   );

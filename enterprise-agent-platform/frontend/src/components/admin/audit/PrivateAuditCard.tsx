@@ -22,12 +22,14 @@ import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
 import { AuditMessageRow } from "./AuditMessageRow";
 import { PrivateConversationItem } from "./PrivateConversationItem";
+import { useI18n } from "../../../i18n";
 
 export interface PrivateAuditCardProps {
   confirm: UseConfirm["confirm"];
 }
 
 export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const conversations = useStore((state) => state.messageAudit.privateConversations);
   const privateMessages = useStore((state) => state.messageAudit.privateMessages);
@@ -47,11 +49,11 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
     event.preventDefault();
     const id = Number(messageId);
     if (!id) {
-      toast("请输入要删除的消息 ID", { title: "缺少消息 ID" });
+      toast(t("admin.audit.missingMessageId.detail"), { title: t("admin.audit.missingMessageId.title") });
       return;
     }
     void (async () => {
-      if (!(await confirm(`删除私人 Agent 消息 #${id}？`, { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeletePrivateMessage", { id }), { danger: true }))) return;
       await deletePrivateMessage(store, selectedPrivateUserId, id);
       setMessageId("");
     })();
@@ -61,11 +63,11 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
     event.preventDefault();
     const ts = unixFromDatetimeLocal(beforeTime);
     if (!ts) {
-      toast("请选择删除截止时间", { title: "缺少时间" });
+      toast(t("admin.audit.missingTime.detail"), { title: t("admin.audit.missingTime.title") });
       return;
     }
     void (async () => {
-      if (!(await confirm("删除该时间点之前的私人 Agent 消息？", { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeletePrivateBefore"), { danger: true }))) return;
       await deletePrivateMessagesBefore(store, selectedPrivateUserId, ts);
       setBeforeTime("");
     })();
@@ -73,14 +75,14 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
 
   const handleClear = () => {
     void (async () => {
-      if (!(await confirm("清空当前用户的全部私人 Agent 消息？", { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmClearPrivate"), { danger: true }))) return;
       await clearPrivateMessages(store, selectedPrivateUserId);
     })();
   };
 
   const handleRowDelete = (id: Id) => {
     void (async () => {
-      if (!(await confirm(`删除私人 Agent 消息 #${id}？`, { danger: true }))) return;
+      if (!(await confirm(t("admin.audit.confirmDeletePrivateMessage", { id: String(id) }), { danger: true }))) return;
       await deletePrivateMessage(store, selectedPrivateUserId, id);
     })();
   };
@@ -88,9 +90,9 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
   return (
     <section className="card audit-card">
       <CardHead
-        title="私人 Agent 审计"
+        title={t("admin.audit.private.title")}
         icon="bot"
-        desc={`${conversations.filter((item) => (item.message_count || 0) > 0).length} 个用户有私人会话记录`}
+        desc={t("admin.audit.private.userCount", { count: conversations.filter((item) => (item.message_count || 0) > 0).length })}
         extra={
           <button
             className="btn btn--sm"
@@ -99,18 +101,18 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
             onClick={() => void refreshMessageAudit(store)}
           >
             <Icon name="refresh" size={14} />
-            <span>刷新</span>
+            <span>{t("admin.common.refresh")}</span>
           </button>
         }
       />
       <div className="audit-tools">
         <form className="audit-tool" onSubmit={handleDeleteId}>
-          <Field label="精确删除">
+          <Field label={t("admin.audit.exactDelete")}>
             <input
               type="number"
               min="1"
               step="1"
-              placeholder="消息 ID"
+              placeholder={t("admin.audit.messageId")}
               value={messageId}
               onChange={(event) => setMessageId(event.target.value)}
             />
@@ -121,11 +123,11 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
             disabled={busy || !selectedPrivateUserId}
           >
             <Icon name="trash" size={15} />
-            <span>删除 ID</span>
+            <span>{t("admin.audit.deleteId")}</span>
           </button>
         </form>
         <form className="audit-tool" onSubmit={handleDeleteBefore}>
-          <Field label="删除时间点前">
+          <Field label={t("admin.audit.deleteBeforeLabel")}>
             <input
               type="datetime-local"
               value={beforeTime}
@@ -138,13 +140,13 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
             disabled={busy || !selectedPrivateUserId}
           >
             <Icon name="trash" size={15} />
-            <span>删除之前</span>
+            <span>{t("admin.audit.deleteBefore")}</span>
           </button>
         </form>
         <div className="audit-tool audit-tool--compact">
           <span className="field">
-            <span>全部清空</span>
-            <span className="muted">清空当前用户私人会话</span>
+            <span>{t("admin.audit.clearAll")}</span>
+            <span className="muted">{t("admin.audit.private.clearHint")}</span>
           </span>
           <button
             className="btn btn--danger"
@@ -153,7 +155,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
             onClick={handleClear}
           >
             <Icon name="trash" size={15} />
-            <span>清空会话</span>
+            <span>{t("admin.audit.private.clear")}</span>
           </button>
         </div>
       </div>
@@ -169,7 +171,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
               />
             ))
           ) : (
-            <div className="muted">暂无用户可审计。</div>
+            <div className="muted">{t("admin.audit.private.noUsers")}</div>
           )}
         </div>
         <div className="audit-private__messages">
@@ -179,7 +181,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
                 <strong>{selectedConversation.display_name || selectedConversation.username}</strong>
                 <span>{`@${selectedConversation.username}`}</span>
               </div>
-              <span className="status">{`${privateTotal || 0} messages`}</span>
+              <span className="status">{t("admin.audit.messageCount", { count: privateTotal || 0 })}</span>
             </div>
           ) : null}
           <div className="audit-list">
@@ -194,9 +196,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
               ))
             ) : (
               <div className="muted">
-                {selectedConversation
-                  ? "该用户暂无私人 Agent 消息。"
-                  : "选择一个用户查看私人 Agent 会话。"}
+                {t(selectedConversation ? "admin.audit.private.empty" : "admin.audit.private.selectHint")}
               </div>
             )}
           </div>

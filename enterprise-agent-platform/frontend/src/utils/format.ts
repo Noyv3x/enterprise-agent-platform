@@ -3,6 +3,8 @@
    rounding/locale behavior. No hooks, no store reads.
    ===================================================================== */
 
+import { getCurrentLocale } from "../i18n";
+
 export function initials(name: unknown): string {
   const s = String(name ?? "?").trim();
   if (!s) return "?";
@@ -18,10 +20,11 @@ export function formatTime(value: number | null | undefined): string {
   if (!value) return "";
   const d = new Date(value * 1000);
   if (Number.isNaN(d.getTime())) return "";
-  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const locale = getCurrentLocale();
+  const hm = d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
   return d.toDateString() === new Date().toDateString()
     ? hm
-    : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+    : `${d.toLocaleDateString(locale, { month: "numeric", day: "numeric" })} ${hm}`;
 }
 
 /** number → seconds; string → Date(string). Falls back to String(value). */
@@ -29,12 +32,12 @@ export function formatTimestamp(value: number | string | null | undefined): stri
   if (!value) return "";
   const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString();
+  return date.toLocaleString(getCurrentLocale());
 }
 
 export function formatNumber(value: unknown): string {
   const number = Number(value) || 0;
-  return new Intl.NumberFormat().format(number);
+  return new Intl.NumberFormat(getCurrentLocale()).format(number);
 }
 
 export function shortSha(value: unknown): string {
@@ -44,7 +47,7 @@ export function shortSha(value: unknown): string {
 
 export function formatCompactNumber(value: unknown): string {
   const number = Number(value) || 0;
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat(getCurrentLocale(), {
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(number);
@@ -52,10 +55,15 @@ export function formatCompactNumber(value: unknown): string {
 
 export function formatFileSize(value: unknown): string {
   let size = Math.max(0, Number(value) || 0);
+  const locale = getCurrentLocale();
   const units = ["B", "KB", "MB", "GB"];
   for (const unit of units) {
     if (size < 1024 || unit === units[units.length - 1]) {
-      return unit === "B" ? `${Math.round(size)} ${unit}` : `${size.toFixed(1)} ${unit}`;
+      const amount = new Intl.NumberFormat(locale, {
+        minimumFractionDigits: unit === "B" ? 0 : 1,
+        maximumFractionDigits: unit === "B" ? 0 : 1,
+      }).format(unit === "B" ? Math.round(size) : size);
+      return `${amount} ${unit}`;
     }
     size /= 1024;
   }

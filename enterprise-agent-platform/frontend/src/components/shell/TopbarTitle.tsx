@@ -3,6 +3,7 @@
    selector with a shallow comparator so unrelated store changes don't re-render
    the title. When info.hash the prefix is a # span; otherwise an icon. */
 
+import { useI18n } from "../../i18n";
 import { topbarInfo } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { TopbarInfo } from "../../types";
@@ -13,7 +14,8 @@ function infoEqual(a: TopbarInfo, b: TopbarInfo): boolean {
 }
 
 export function TopbarTitle() {
-  const info = useStore(topbarInfo, infoEqual);
+  const { t } = useI18n();
+  const info = useStore((state) => topbarInfo(state, t), infoEqual);
   return (
     <div className="topbar__title-wrap">
       <div className="topbar__title">

@@ -15,6 +15,8 @@
 import { useStore } from "../../store/useStore";
 import type { ConfigFieldDescriptor } from "../../types";
 import { ConfigFieldControl, type ConfigAttr } from "./ConfigFieldControl";
+import { useI18n } from "../../i18n";
+import { CONFIG_FIELD_GROUP_KEYS, CONFIG_FIELD_LABEL_KEYS } from "../../i18n/messages/admin";
 
 export interface ConfigFormProps {
   fields: ConfigFieldDescriptor[];
@@ -25,18 +27,23 @@ export interface ConfigFormProps {
 
 interface FieldGroup {
   name: string;
+  labelKey?: (typeof CONFIG_FIELD_GROUP_KEYS)[string];
   items: ConfigFieldDescriptor[];
 }
 
 function groupFields(fields: ConfigFieldDescriptor[]): FieldGroup[] {
   const groups = new Map<string, ConfigFieldDescriptor[]>();
   for (const item of fields) {
-    const name = item.group || "配置";
+    const name = item.group || "";
     const items = groups.get(name) || [];
     items.push(item);
     groups.set(name, items);
   }
-  return [...groups.entries()].map(([name, items]) => ({ name, items }));
+  return [...groups.entries()].map(([name, items]) => ({
+    name,
+    labelKey: CONFIG_FIELD_GROUP_KEYS[items[0]?.key || ""],
+    items,
+  }));
 }
 
 function collectConfigUpdates(form: HTMLFormElement, attr: ConfigAttr): Record<string, string> {
@@ -57,10 +64,11 @@ function collectConfigUpdates(form: HTMLFormElement, attr: ConfigAttr): Record<s
 }
 
 export function ConfigForm({ fields, attr, buttonText, onSubmit }: ConfigFormProps) {
+  const { t } = useI18n();
   const busy = useStore((state) => state.busy);
 
   if (!fields.length) {
-    return <div className="muted">正在读取配置…</div>;
+    return <div className="muted">{t("admin.config.loading")}</div>;
   }
 
   const groups = groupFields(fields);
@@ -80,16 +88,16 @@ export function ConfigForm({ fields, attr, buttonText, onSubmit }: ConfigFormPro
           // First two groups default open, mirroring the legacy `open: index < 2`.
           <details className="config-group" key={group.name} open={index < 2}>
             <summary>
-              <span>{group.name}</span>
+              <span>{group.labelKey ? t(group.labelKey) : group.name || t("admin.config.group.configuration")}</span>
               <span className="nav__badge">{String(group.items.length)}</span>
             </summary>
             <div className="config-group__body">
               {group.items.map((item) => (
                 <label className="config-field" key={item.key}>
                   <span className="config-field__label">
-                    <strong>{item.label || item.key}</strong>
+                    <strong>{CONFIG_FIELD_LABEL_KEYS[item.key] ? t(CONFIG_FIELD_LABEL_KEYS[item.key]) : item.label || item.key}</strong>
                     <span className="config-field__meta">
-                      {item.defaulted ? <span className="config-field__source">默认值</span> : null}
+                      {item.defaulted ? <span className="config-field__source">{t("admin.config.defaultValue")}</span> : null}
                       <code>{item.key}</code>
                     </span>
                   </span>

@@ -11,8 +11,10 @@ import { EmptyState } from "../common/EmptyState";
 import { AdminPageContent } from "./AdminPageContent";
 import { AdminPageHeader } from "./AdminPageHeader";
 import { AdminPager } from "./AdminPager";
+import { useI18n } from "../../i18n";
 
 export function AdminPanel() {
+  const { t } = useI18n();
   const { isAdmin } = usePermissions();
   // activeAdminPage() returns the same object reference from ADMIN_PAGES while the
   // id is unchanged, so the selector is Object.is-stable across renders.
@@ -22,8 +24,8 @@ export function AdminPanel() {
     return (
       <EmptyState
         icon="shield"
-        title="需要管理员权限"
-        text="请使用管理员账户登录后访问管理面板。"
+        title={t("admin.access.title")}
+        text={t("admin.access.description")}
       />
     );
   }

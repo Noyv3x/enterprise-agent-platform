@@ -8,10 +8,12 @@
 import { useEffect, useState } from "react";
 import { clearSearch, searchKnowledge } from "../../data/knowledgeActions";
 import { runBusy } from "../../data/sessionActions";
+import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { Icon } from "../common/Icon";
 
 export function KnowledgeSearchForm() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const search = useStore((state) => state.knowledgeSearch);
   const isSearching = !!search.query && Array.isArray(search.results);
@@ -40,8 +42,8 @@ export function KnowledgeSearchForm() {
       <div className="search-field">
         <Icon name="search" />
         <input
-          placeholder="搜索标题或正文…"
-          aria-label="搜索知识库"
+          placeholder={t("knowledge.searchPlaceholder")}
+          aria-label={t("knowledge.searchLabel")}
           value={value}
           onChange={(event) => setValue(event.target.value)}
         />
@@ -49,8 +51,8 @@ export function KnowledgeSearchForm() {
           <button
             className="icon-btn search-field__clear"
             type="button"
-            title="清除搜索"
-            aria-label="清除搜索，显示全部条目"
+            title={t("knowledge.clearSearch")}
+            aria-label={t("knowledge.clearSearchDetail")}
             onClick={() => clearSearch(store)}
           >
             <Icon name="close" size={15} />

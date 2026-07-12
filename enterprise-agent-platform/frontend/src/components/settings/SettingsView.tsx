@@ -1,5 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { changePassword, updateCurrentUser } from "../../data/accountActions";
+import { useI18n } from "../../i18n";
+import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { CardHead } from "../common/CardHead";
 import { EmptyState } from "../common/EmptyState";
@@ -8,6 +10,7 @@ import { Field } from "../common/Field";
 const MIN_PASSWORD_LENGTH = 8;
 
 export function SettingsView() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const user = useStore((state) => state.user);
   const busy = useStore((state) => state.busy);
@@ -17,7 +20,7 @@ export function SettingsView() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [passwordError, setPasswordError] = useState("");
+  const [passwordError, setPasswordError] = useState<"mismatch" | "too-short" | "">("");
 
   useEffect(() => {
     setDisplayName(user?.display_name || user?.username || "");
@@ -28,13 +31,18 @@ export function SettingsView() {
     return (
       <div className="panel">
         <div className="panel__inner">
-          <EmptyState icon="settings" title="需要登录" text="请登录后查看账户设置。" />
+          <EmptyState
+            icon="settings"
+            title={t("session.loginRequired")}
+            text={t("account.loginRequiredDetail")}
+          />
         </div>
       </div>
     );
   }
 
-  const permissionLabel = user.permission_group_label || user.permission_group || user.role || "member";
+  const permissionId = user.permission_group || user.role || "member";
+  const permissionLabel = permissionGroupLabel(t, permissionId, user.permission_group_label);
 
   const handleProfileSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -47,11 +55,11 @@ export function SettingsView() {
   const handlePasswordSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (newPassword !== confirmPassword) {
-      setPasswordError("两次输入的新密码不一致");
+      setPasswordError("mismatch");
       return;
     }
     if (newPassword.length < MIN_PASSWORD_LENGTH) {
-      setPasswordError(`新密码至少 ${MIN_PASSWORD_LENGTH} 个字符`);
+      setPasswordError("too-short");
       return;
     }
     setPasswordError("");
@@ -73,26 +81,26 @@ export function SettingsView() {
     <div className="panel">
       <div className="panel__inner settings-panel">
         <section className="card settings-card">
-          <CardHead title="账户资料" icon="settings" />
+          <CardHead title={t("account.profile")} icon="settings" />
           <form onSubmit={handleProfileSubmit}>
             <div className="settings-form__grid">
-              <Field label="用户名">
+              <Field label={t("account.username")}>
                 <input value={user.username} disabled />
               </Field>
-              <Field label="权限组">
+              <Field label={t("account.permissionGroup")}>
                 <input value={permissionLabel} disabled />
               </Field>
-              <Field label="显示名称">
+              <Field label={t("account.displayName")}>
                 <input
                   autoComplete="name"
                   value={displayName}
                   onChange={(event) => setDisplayName(event.target.value)}
                 />
               </Field>
-              <Field label="职位">
+              <Field label={t("account.position")}>
                 <input
                   autoComplete="organization-title"
-                  placeholder="职位"
+                  placeholder={t("account.position")}
                   value={position}
                   onChange={(event) => setPosition(event.target.value)}
                 />
@@ -100,17 +108,17 @@ export function SettingsView() {
             </div>
             <div className="form-actions">
               <button className="btn btn--primary" type="submit" disabled={busy}>
-                <span>保存资料</span>
+                <span>{t("account.saveProfile")}</span>
               </button>
             </div>
           </form>
         </section>
 
         <section className="card settings-card">
-          <CardHead title="修改密码" icon="key" />
+          <CardHead title={t("account.changePassword")} icon="key" />
           <form onSubmit={handlePasswordSubmit}>
             <div className="settings-form__grid">
-              <Field label="当前密码">
+              <Field label={t("account.currentPassword")}>
                 <input
                   type="password"
                   autoComplete="current-password"
@@ -118,7 +126,7 @@ export function SettingsView() {
                   onChange={(event) => setCurrentPassword(event.target.value)}
                 />
               </Field>
-              <Field label="新密码">
+              <Field label={t("account.newPassword")}>
                 <input
                   type="password"
                   autoComplete="new-password"
@@ -126,7 +134,7 @@ export function SettingsView() {
                   onChange={(event) => setNewPassword(event.target.value)}
                 />
               </Field>
-              <Field label="确认新密码">
+              <Field label={t("account.confirmPassword")}>
                 <input
                   type="password"
                   autoComplete="new-password"
@@ -136,11 +144,15 @@ export function SettingsView() {
               </Field>
             </div>
             <div className="error settings-error" role="alert">
-              {passwordError}
+              {passwordError === "mismatch"
+                ? t("account.passwordMismatch")
+                : passwordError === "too-short"
+                  ? t("account.passwordMinLength", { count: MIN_PASSWORD_LENGTH })
+                  : ""}
             </div>
             <div className="form-actions">
               <button className="btn btn--primary" type="submit" disabled={busy}>
-                <span>更新密码</span>
+                <span>{t("account.updatePassword")}</span>
               </button>
             </div>
           </form>

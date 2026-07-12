@@ -14,14 +14,23 @@ import { Icon } from "../../common/Icon";
 import { StatusBadge } from "../../common/StatusBadge";
 import { CodexOAuthFlow } from "./CodexOAuthFlow";
 import { GrokOAuthFlow } from "./GrokOAuthFlow";
+import { useI18n, type Translator } from "../../../i18n";
+
+function providerLabel(t: Translator, id: string, fallback: string | undefined): string {
+  if (id === "openai-codex") return t("admin.oauth.provider.codex");
+  if (id === "xai-oauth") return t("admin.oauth.provider.grok");
+  return fallback || id;
+}
 
 export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const flow = useStore((state) => state.oauthFlows[provider.id]);
   const callbackValue = useStore((state) => state.oauthCallbackUrls[provider.id] || "");
   const errorText = oauthProviderErrorText(provider);
-  const logoChar = (provider.label || "?").trim().charAt(0);
+  const label = providerLabel(t, provider.id, provider.label);
+  const logoChar = (label || "?").trim().charAt(0);
 
   return (
     <div className={cx("oauth-card", provider.active && "is-active")}>
@@ -31,24 +40,24 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
             <strong className="mono">{logoChar}</strong>
           </div>
           <div>
-            <div className="oauth-card__label">{provider.label}</div>
+            <div className="oauth-card__label">{label}</div>
             {provider.default_model ? (
               <div className="oauth-card__model">{provider.default_model}</div>
             ) : null}
           </div>
         </div>
-        <StatusBadge ok={!!provider.configured} label={provider.configured ? "已验证" : "未验证"} />
+        <StatusBadge ok={!!provider.configured} label={t(provider.configured ? "admin.oauth.verified" : "admin.oauth.unverified")} />
       </div>
       <div className="oauth-meta">
         {provider.active ? (
           <span className="chip">
             <span className="dot" />
-            使用中
+            {t("admin.oauth.active")}
           </span>
         ) : null}
         {provider.last_refresh ? (
           <span className="muted" style={{ fontSize: "12px" }}>
-            {`更新于 ${formatTimestamp(provider.last_refresh)}`}
+            {t("admin.oauth.updatedAt", { time: formatTimestamp(provider.last_refresh) })}
           </span>
         ) : null}
       </div>
@@ -61,7 +70,11 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
       {!provider.default_model && provider.model_catalog_error ? (
         <div className="oauth-error" role="alert">
           <Icon name="alert" size={15} />
-          <span>{provider.model_catalog_error}</span>
+          <span>
+            {provider.model_catalog_error
+              ? t("admin.oauth.catalogError", { error: provider.model_catalog_error })
+              : t("admin.oauth.catalogUnavailable")}
+          </span>
         </div>
       ) : null}
       <div className="oauth-actions">
@@ -71,7 +84,7 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
           onClick={() => void startOAuthVerification(store, provider.id)}
         >
           <Icon name="shield" size={14} />
-          <span>{provider.configured ? "重新验证" : "开始验证"}</span>
+          <span>{t(provider.configured ? "admin.oauth.reverify" : "admin.oauth.startVerification")}</span>
         </button>
       </div>
       {flow?.kind === "device_code" ? <CodexOAuthFlow providerId={provider.id} flow={flow} /> : null}
@@ -81,7 +94,7 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
       {flow?.complete ? (
         <div className="oauth-guide complete">
           <Icon name="checkCircle" size={16} />
-          <span>验证完成，Hermes 已切换到该供应商。</span>
+          <span>{t("admin.oauth.completeDetail")}</span>
         </div>
       ) : null}
     </div>

@@ -22,6 +22,7 @@ import type {
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
+import { useI18n, type Translator } from "../../../i18n";
 
 const HERMES_PROVIDERS = ["openai-codex", "xai-oauth"];
 
@@ -41,7 +42,7 @@ function hermesModelCatalog(
       error: fromOAuth.model_catalog_error || "",
     };
   }
-  return { models: [], default_model: "", error: "Hermes 模型目录不可用" };
+  return { models: [], default_model: "", error: "unavailable" };
 }
 
 interface ResolvedModel {
@@ -54,6 +55,7 @@ interface ResolvedModel {
 /** Mirror of legacy syncModelOptions(preferredModel): derive the option list,
  *  the selected value and the hint from the catalog of `provider`. */
 function resolveModel(
+  t: Translator,
   provider: string,
   preferred: string,
   hermesConfig: HermesConfigState | null,
@@ -68,11 +70,13 @@ function resolveModel(
       models: [],
       value: "",
       disabled: true,
-      hint: catalog.error || "需要先安装/启动托管 Hermes 后读取模型目录。",
+      hint: catalog.error
+        ? t("admin.model.catalogError", { error: catalog.error })
+        : t("admin.hermes.modelInstallHint"),
     };
   }
   const value = models.includes(current) ? current : models.includes(fallback) ? fallback : models[0];
-  return { models, value, disabled: false, hint: `${models.length} 个模型，来源：Hermes` };
+  return { models, value, disabled: false, hint: t("admin.model.count", { count: models.length }) };
 }
 
 interface HermesFormState {
@@ -108,6 +112,7 @@ function seedForm(hermes: HermesConfigValues): HermesFormState {
 }
 
 export function HermesConfig() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const hermesConfig = useStore((state) => state.hermesConfig);
@@ -124,8 +129,8 @@ export function HermesConfig() {
   }, [hermesConfig]);
 
   const resolved = useMemo(
-    () => resolveModel(form.provider, form.modelPreferred, hermesConfig, oauthProviders),
-    [form.provider, form.modelPreferred, hermesConfig, oauthProviders],
+    () => resolveModel(t, form.provider, form.modelPreferred, hermesConfig, oauthProviders),
+    [form.provider, form.modelPreferred, hermesConfig, oauthProviders, t],
   );
 
   const handleSubmit = (event: React.FormEvent) => {
@@ -146,7 +151,7 @@ export function HermesConfig() {
 
   return (
     <section className="card config-form">
-      <CardHead title="Hermes 配置" icon="settings" desc="运行时来源、API 供应商与模型参数。" />
+      <CardHead title={t("admin.hermes.title")} icon="settings" desc={t("admin.hermes.description")} />
       <form onSubmit={handleSubmit}>
         <label className="check-row">
           <input
@@ -155,13 +160,13 @@ export function HermesConfig() {
             onChange={(event) => setForm((prev) => ({ ...prev, manageHermes: event.target.checked }))}
           />
           <div className="check-row__text">
-            <strong>由平台托管 Hermes</strong>
-            <span>自动安装与管理运行时生命周期</span>
+            <strong>{t("admin.hermes.managed")}</strong>
+            <span>{t("admin.hermes.managedHint")}</span>
           </div>
         </label>
         <div className="config-grid">
           <div className="field--full">
-            <Field label="源码路径">
+            <Field label={t("admin.hermes.sourcePath")}>
               <input
                 value={form.repoPath}
                 onChange={(event) => setForm((prev) => ({ ...prev, repoPath: event.target.value }))}
@@ -169,14 +174,14 @@ export function HermesConfig() {
             </Field>
           </div>
           <div className="field--full">
-            <Field label="API URL">
+            <Field label={t("admin.hermes.apiUrl")}>
               <input
                 value={form.apiUrl}
                 onChange={(event) => setForm((prev) => ({ ...prev, apiUrl: event.target.value }))}
               />
             </Field>
           </div>
-          <Field label="API 供应商">
+          <Field label={t("admin.hermes.provider")}>
             <select
               value={form.provider}
               onChange={(event) =>
@@ -185,20 +190,20 @@ export function HermesConfig() {
                 setForm((prev) => ({ ...prev, provider: event.target.value, modelPreferred: "" }))
               }
             >
-              <option value="openai-codex">Codex OAuth</option>
-              <option value="xai-oauth">Grok OAuth</option>
+              <option value="openai-codex">{t("admin.oauth.provider.codex")}</option>
+              <option value="xai-oauth">{t("admin.oauth.provider.grok")}</option>
             </select>
           </Field>
-          <Field label="供应商 Base URL">
+          <Field label={t("admin.hermes.providerBaseUrl")}>
             <input
               value={form.providerBaseUrl}
-              placeholder="默认使用所选 OAuth 供应商 endpoint"
+              placeholder={t("admin.hermes.providerBaseUrlPlaceholder")}
               onChange={(event) =>
                 setForm((prev) => ({ ...prev, providerBaseUrl: event.target.value }))
               }
             />
           </Field>
-          <Field label="模型">
+          <Field label={t("admin.hermes.model")}>
             <div className="field-stack">
               <select
                 value={resolved.value}
@@ -208,7 +213,7 @@ export function HermesConfig() {
                 }
               >
                 {resolved.disabled ? (
-                  <option value="">Hermes 模型目录不可用</option>
+                  <option value="">{t("admin.hermes.modelUnavailable")}</option>
                 ) : (
                   resolved.models.map((model) => (
                     <option key={model} value={model}>
@@ -220,14 +225,14 @@ export function HermesConfig() {
               <div className="field-help">{resolved.hint}</div>
             </div>
           </Field>
-          <Field label="安装 extras">
+          <Field label={t("admin.hermes.installExtras")}>
             <input
               value={form.installExtras}
-              placeholder="可选，例如 dev"
+              placeholder={t("admin.hermes.installExtrasPlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, installExtras: event.target.value }))}
             />
           </Field>
-          <Field label="启动等待秒数">
+          <Field label={t("admin.hermes.startupWait")}>
             <input
               type="number"
               min="0"
@@ -237,7 +242,7 @@ export function HermesConfig() {
               onChange={(event) => setForm((prev) => ({ ...prev, startupWait: event.target.value }))}
             />
           </Field>
-          <Field label="请求超时秒数">
+          <Field label={t("admin.hermes.requestTimeout")}>
             <input
               type="number"
               min="1"
@@ -249,11 +254,11 @@ export function HermesConfig() {
               }
             />
           </Field>
-          <Field label="API Server Key">
+          <Field label={t("admin.hermes.apiServerKey")}>
             <input
               type="password"
               autoComplete="off"
-              placeholder={hermes.api_key_configured ? "保持不变" : "API server key"}
+              placeholder={hermes.api_key_configured ? t("admin.common.keepUnchanged") : t("admin.hermes.apiServerKey")}
               value={form.apiKey}
               onChange={(event) => setForm((prev) => ({ ...prev, apiKey: event.target.value }))}
             />
@@ -261,7 +266,7 @@ export function HermesConfig() {
         </div>
         <div className="form-actions">
           <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>保存配置</span>
+            <span>{t("admin.hermes.save")}</span>
           </button>
           <button
             className="btn"
@@ -270,7 +275,7 @@ export function HermesConfig() {
             onClick={() => void installHermes(store)}
           >
             <Icon name="download" size={15} />
-            <span>从源码重装</span>
+            <span>{t("admin.hermes.reinstall")}</span>
           </button>
         </div>
       </form>

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "node scripts/build-static.mjs",
-    "check": "tsc --noEmit",
+    "check": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit",
     "test": "vitest run"
   },
   "dependencies": {

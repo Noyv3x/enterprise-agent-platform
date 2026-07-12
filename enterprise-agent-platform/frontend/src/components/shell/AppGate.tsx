@@ -12,14 +12,17 @@ import { registerSessionExpiredHandler } from "../../lib/api";
 import { ToastViewport } from "../../context/ToastContext";
 import { boot, handleSessionExpired } from "../../data/sessionActions";
 import { useStore, useStoreHandle } from "../../store/useStore";
+import { useI18n } from "../../i18n";
 import { LoginView } from "../auth/LoginView";
 import { Brand } from "../common/Brand";
+import { LanguageSelect } from "../common/LanguageSelect";
 import { Spinner } from "../common/Spinner";
 import { AppShell } from "./AppShell";
 
 export function AppGate() {
   const store = useStoreHandle();
   const user = useStore((state) => state.user);
+  const { t } = useI18n();
   const [attempt, setAttempt] = useState(0);
   const [bootStatus, setBootStatus] = useState<"loading" | "ready" | "error">("loading");
   const bootAttempt = useRef(-1);
@@ -58,11 +61,12 @@ export function AppGate() {
               role={bootStatus === "error" ? "alert" : "status"}
               aria-live="polite"
             >
+              <div className="auth__locale"><LanguageSelect /></div>
               <Brand />
-              <h1>{bootStatus === "error" ? "暂时无法连接" : "正在启动"}</h1>
+              <h1>{bootStatus === "error" ? t("boot.failed") : t("boot.connecting")}</h1>
               {bootStatus === "error" ? (
                 <>
-                  <p className="muted">无法连接 ubitech agent 服务，请检查网络后重试。</p>
+                  <p className="muted">{t("boot.failedDetail")}</p>
                   <button
                     className="btn btn--primary btn--lg"
                     type="button"
@@ -71,13 +75,13 @@ export function AppGate() {
                       setAttempt((value) => value + 1);
                     }}
                   >
-                    重试
+                    {t("common.retry")}
                   </button>
                 </>
               ) : (
                 <div className="boot-status__loading">
                   <Spinner size={20} />
-                  <span>正在恢复安全会话…</span>
+                  <span>{t("boot.restoringSession")}</span>
                 </div>
               )}
             </section>

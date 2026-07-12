@@ -14,6 +14,7 @@
 import { useEffect, useMemo, type MutableRefObject } from "react";
 import { useStore } from "../../../store/useStore";
 import type { HermesConfigState, HermesModelCatalog, OAuthProvidersState } from "../../../types";
+import { useI18n } from "../../../i18n";
 
 const HERMES_PROVIDERS = ["openai-codex", "xai-oauth"];
 
@@ -42,7 +43,7 @@ function hermesModelCatalog(
       error: fromOAuth.model_catalog_error || "",
     };
   }
-  return { models: [], default_model: "", error: "Hermes 模型目录不可用" };
+  return { models: [], default_model: "", error: "unavailable" };
 }
 
 export interface AccountModelSelectProps {
@@ -53,6 +54,7 @@ export interface AccountModelSelectProps {
 }
 
 export function AccountModelSelect({ value, onChange, coercedRef }: AccountModelSelectProps) {
+  const { t } = useI18n();
   const hermesConfig = useStore((state) => state.hermesConfig);
   const oauthProviders = useStore((state) => state.oauthProviders);
 
@@ -60,19 +62,21 @@ export function AccountModelSelect({ value, onChange, coercedRef }: AccountModel
     const providerId = activeHermesProviderId(oauthProviders, hermesConfig);
     const catalog = hermesModelCatalog(providerId, hermesConfig, oauthProviders);
     const list = Array.isArray(catalog.models) ? catalog.models : [];
-    const fallback = catalog.default_model || hermesConfig?.config?.model || "系统默认";
+    const fallback = catalog.default_model || hermesConfig?.config?.model || t("admin.model.systemDefault");
     const clean = String(value || "").trim();
     const coerced = clean && list.includes(clean) ? clean : "";
     let helpText: string;
     if (clean && !list.includes(clean)) {
-      helpText = `已保存模型 ${clean} 不在当前 Hermes 目录，保存后将改为系统默认。`;
+      helpText = t("admin.model.savedUnavailable", { model: clean });
     } else if (list.length) {
-      helpText = `${list.length} 个模型，来源：Hermes`;
+      helpText = t("admin.model.count", { count: list.length });
+    } else if (catalog.error) {
+      helpText = t("admin.model.catalogError", { error: catalog.error });
     } else {
-      helpText = catalog.error || "当前仅可使用系统默认模型。";
+      helpText = t("admin.model.defaultOnly");
     }
     return { models: list, defaultModel: fallback, help: helpText, selectValue: coerced };
-  }, [hermesConfig, oauthProviders, value]);
+  }, [hermesConfig, oauthProviders, t, value]);
 
   // Mirror the effective (coerced) value for the submit path. Re-derived from the
   // ORIGINAL `value` against the CURRENT catalog every render, so a late catalog
@@ -85,7 +89,7 @@ export function AccountModelSelect({ value, onChange, coercedRef }: AccountModel
   return (
     <div className="field-stack">
       <select value={selectValue} onChange={(event) => onChange(event.target.value)}>
-        <option value="">{`系统默认 (${defaultModel})`}</option>
+        <option value="">{t("admin.model.defaultOption", { model: defaultModel })}</option>
         {models.map((model) => (
           <option key={model} value={model}>
             {model}

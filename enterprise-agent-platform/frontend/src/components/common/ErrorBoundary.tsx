@@ -1,5 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { useI18n } from "../../i18n";
 import { Brand } from "./Brand";
+import { LanguageSelect } from "./LanguageSelect";
 
 interface ErrorBoundaryState {
   failed: boolean;
@@ -20,22 +22,28 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBound
 
   render(): ReactNode {
     if (!this.state.failed) return this.props.children;
-    return (
-      <main className="auth">
-        <aside className="auth__aside">
-          <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
-        </aside>
-        <div className="auth__main">
-          <section className="auth__card" role="alert" aria-labelledby="app-error-title">
-            <Brand />
-            <h1 id="app-error-title">页面暂时无法显示</h1>
-            <p className="muted">界面遇到意外错误。刷新后可以安全地重新加载当前会话。</p>
-            <button className="btn btn--primary btn--lg" type="button" onClick={() => location.reload()}>
-              重新加载
-            </button>
-          </section>
-        </div>
-      </main>
-    );
+    return <ErrorFallback />;
   }
+}
+
+function ErrorFallback() {
+  const { t } = useI18n();
+  return (
+    <main className="auth">
+      <aside className="auth__aside">
+        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
+      </aside>
+      <div className="auth__main">
+        <section className="auth__card" role="alert" aria-labelledby="app-error-title">
+          <div className="auth__locale"><LanguageSelect /></div>
+          <Brand />
+          <h1 id="app-error-title">{t("errorBoundary.title")}</h1>
+          <p className="muted">{t("errorBoundary.detail")}</p>
+          <button className="btn btn--primary btn--lg" type="button" onClick={() => location.reload()}>
+            {t("common.reload")}
+          </button>
+        </section>
+      </div>
+    </main>
+  );
 }

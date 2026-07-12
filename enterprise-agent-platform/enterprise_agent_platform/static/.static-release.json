@@ -1,8 +1,11 @@
 {
   "version": 1,
   "current_assets": [
+    "app-DRrzvbfu.js",
+    "styles-llDK1H1B.css"
+  ],
+  "previous_assets": [
     "app-DOdeepRw.js",
     "styles-DhP2iR-L.css"
-  ],
-  "previous_assets": []
+  ]
 }

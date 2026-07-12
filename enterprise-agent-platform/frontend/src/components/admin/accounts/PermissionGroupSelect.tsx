@@ -3,6 +3,10 @@
    set on the DOM after build. */
 
 import type { PermissionGroup } from "../../../types";
+import { useI18n } from "../../../i18n";
+import { permissionGroupLabel } from "../../../i18n/labels";
+
+export { permissionGroupLabel } from "../../../i18n/labels";
 
 export interface PermissionGroupSelectProps {
   groups: PermissionGroup[];
@@ -11,11 +15,12 @@ export interface PermissionGroupSelectProps {
 }
 
 export function PermissionGroupSelect({ groups, value, onChange }: PermissionGroupSelectProps) {
+  const { t } = useI18n();
   return (
     <select value={value} onChange={(event) => onChange(event.target.value)}>
       {groups.map((group) => (
         <option key={group.id} value={group.id}>
-          {group.label || group.id}
+          {permissionGroupLabel(t, group.id, group.label)}
         </option>
       ))}
     </select>

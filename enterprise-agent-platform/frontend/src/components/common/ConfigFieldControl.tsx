@@ -11,6 +11,8 @@
      the masked placeholder when configured. */
 
 import type { ConfigFieldDescriptor } from "../../types";
+import { useI18n } from "../../i18n";
+import { CONFIG_FIELD_OPTION_KEYS } from "../../i18n/messages/admin";
 
 export type ConfigAttr = "yamlKey" | "envKey";
 
@@ -20,6 +22,7 @@ export interface ConfigFieldControlProps {
 }
 
 export function ConfigFieldControl({ item, attr }: ConfigFieldControlProps) {
+  const { t } = useI18n();
   // The data-* attribute name and its dataset key the diff selector matches on.
   const dataKeyProp =
     attr === "yamlKey" ? { "data-yaml-key": item.key } : { "data-env-key": item.key };
@@ -31,9 +34,9 @@ export function ConfigFieldControl({ item, attr }: ConfigFieldControlProps) {
       : "";
     return (
       <select {...dataKeyProp} data-initial={initial} defaultValue={initial}>
-        <option value="">未设置</option>
-        <option value="true">true</option>
-        <option value="false">false</option>
+        <option value="">{t("admin.config.unset")}</option>
+        <option value="true">{t("admin.config.boolean.true")}</option>
+        <option value="false">{t("admin.config.boolean.false")}</option>
       </select>
     );
   }
@@ -47,10 +50,12 @@ export function ConfigFieldControl({ item, attr }: ConfigFieldControlProps) {
     const initial = item.options.some((option) => String(option) === raw) ? raw : "";
     return (
       <select {...dataKeyProp} data-initial={initial} defaultValue={initial}>
-        <option value="">未设置</option>
+        <option value="">{t("admin.config.unset")}</option>
         {item.options.map((option) => (
           <option key={option} value={option}>
-            {option}
+            {CONFIG_FIELD_OPTION_KEYS[`${item.key}:${option}`]
+              ? t(CONFIG_FIELD_OPTION_KEYS[`${item.key}:${option}`])
+              : option}
           </option>
         ))}
       </select>

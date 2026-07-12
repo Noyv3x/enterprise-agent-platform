@@ -38,6 +38,7 @@ import {
   type AppStore,
 } from "./loaders";
 import { resetSession, runBusy } from "./sessionActions";
+import { t } from "../i18n";
 import type {
   AdminPageId,
   AutoUpdateConfigUpdateRequest,
@@ -76,7 +77,7 @@ export async function createAccount(
     });
     onSuccess?.();
     await loadUsers(store);
-    toast("账户已创建", { type: "ok", title: "完成" });
+    toast(t("admin.toast.accountCreated"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -96,7 +97,7 @@ export async function updateAccount(
     });
     onSuccess?.();
     await loadUsers(store);
-    toast(`已更新 ${username}`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.accountUpdated", { username }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -112,7 +113,7 @@ export async function impersonateAccount(store: AppStore, userId: Id): Promise<v
     store.dispatch({ type: "SET_USER", payload: result.user });
     await loadInitial(store);
     store.dispatch({ type: "SET_ACTIVE_VIEW", payload: store.getState().activeView });
-    toast(`已代入 ${result.user.display_name || result.user.username}`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.impersonated", { name: result.user.display_name || result.user.username }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -199,7 +200,7 @@ export async function deleteChannelMessage(
       { method: "DELETE", body: EMPTY_BODY },
     );
     await reloadAfterChannelAuditChange(store, channelId);
-    toast(`已删除 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.channelDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -217,7 +218,7 @@ export async function deleteChannelMessagesBefore(
       body: JSON.stringify(body),
     });
     await reloadAfterChannelAuditChange(store, channelId);
-    toast(`已删除 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.channelDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -231,7 +232,7 @@ export async function clearChannelMessages(store: AppStore, channelId: Id): Prom
       body: JSON.stringify(body),
     });
     await reloadAfterChannelAuditChange(store, channelId);
-    toast(`已清空 ${result.deleted || 0} 条频道消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.channelCleared", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -250,7 +251,7 @@ export async function deletePrivateMessage(
       { method: "DELETE", body: EMPTY_BODY },
     );
     await reloadAfterPrivateAuditChange(store, userId);
-    toast(`已删除 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.privateDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -268,7 +269,7 @@ export async function deletePrivateMessagesBefore(
       body: JSON.stringify(body),
     });
     await reloadAfterPrivateAuditChange(store, userId);
-    toast(`已删除 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.privateDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -282,7 +283,7 @@ export async function clearPrivateMessages(store: AppStore, userId: Id): Promise
       body: JSON.stringify(body),
     });
     await reloadAfterPrivateAuditChange(store, userId);
-    toast(`已清空 ${result.deleted || 0} 条私人 Agent 消息`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.privateCleared", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -314,11 +315,11 @@ export async function saveSecurityConfig(
     const secretRestart = !!result.session_secret_restart_required;
     toast(
       secretRestart
-        ? "已保存；重启后所有会话会失效"
+        ? t("admin.toast.securitySecretRestart")
         : needsRestart
-          ? "已保存；部分启动项需要重启/重新部署后生效"
-          : "公网安全配置已保存",
-      { type: "ok", title: needsRestart || secretRestart ? "需要重启" : "完成" },
+          ? t("admin.toast.securityRestart")
+          : t("admin.toast.securitySaved"),
+      { type: "ok", title: t(needsRestart || secretRestart ? "admin.toast.restartRequired" : "admin.toast.complete") },
     );
   });
 }
@@ -334,7 +335,7 @@ export async function saveHermesConfig(
     await api(endpoints.updateHermesConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
     await loadSettings(store);
-    toast("Hermes 配置已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.hermesSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -349,7 +350,7 @@ export async function saveTelegramConfig(
     await api(endpoints.updateTelegramConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
     await loadTelegramConfig(store);
-    toast("Telegram 配置已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.telegramSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -367,7 +368,7 @@ export async function saveAutoUpdateConfig(
     });
     onSuccess?.();
     await loadAutoUpdateConfig(store);
-    toast("自动更新配置已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.autoUpdateSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -376,7 +377,7 @@ export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
   await runBusy(store, async () => {
     await api(endpoints.autoUpdateCheck.path(), { method: "POST", body: EMPTY_BODY });
     await loadAutoUpdateConfig(store);
-    toast("已触发自动更新检查", { type: "ok", title: "已发送" });
+    toast(t("admin.toast.autoUpdateCheck"), { type: "ok", title: t("admin.toast.sent") });
   });
 }
 
@@ -396,7 +397,7 @@ export async function saveHermesYamlFields(
       body: JSON.stringify({ yaml_updates: updates }),
     });
     await loadHermesInternalConfig(store);
-    toast("Hermes 内部配置已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.hermesInternalSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -407,7 +408,7 @@ export async function saveHermesYamlText(store: AppStore, yamlText: string): Pro
       body: JSON.stringify({ yaml_text: yamlText }),
     });
     await loadHermesInternalConfig(store);
-    toast("Hermes config.yaml 已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.hermesYamlSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -421,7 +422,7 @@ export async function saveHermesEnv(
       body: JSON.stringify({ env: updates }),
     });
     await loadHermesInternalConfig(store);
-    toast("Hermes .env 已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.hermesEnvSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -438,7 +439,7 @@ export async function saveCogneeEnv(
     });
     await loadCogneeConfig(store);
     await loadRuntime(store);
-    toast("Cognee 内部配置已保存", { type: "ok", title: "完成" });
+    toast(t("admin.toast.cogneeSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -466,7 +467,7 @@ export async function installHermes(store: AppStore): Promise<void> {
       timeoutMs: RUNTIME_INSTALL_TIMEOUT_MS,
     });
     await loadSettings(store);
-    toast("已触发 Hermes 安装", { type: "ok", title: "完成" });
+    toast(t("admin.toast.hermesInstall"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -487,7 +488,7 @@ export async function setSecret(
     await api(endpoints.setSecret.path(key), { method: "PUT", body: JSON.stringify({ value }) });
     onSuccess?.();
     await loadSecrets(store);
-    toast(`已更新 ${key}`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.secretUpdated", { key }), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -572,7 +573,7 @@ export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   await runBusy(store, async () => {
     const payload = await api(endpoints.exportOAuthCredentials.path());
     downloadJson(payload, `ubitech-agent-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
-    toast("OAuth 凭据文件已生成", { type: "ok", title: "完成" });
+    toast(t("admin.toast.oauthExported"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -585,7 +586,7 @@ export async function importOAuthCredentials(store: AppStore, file: File): Promi
     try {
       credentials = JSON.parse(await file.text());
     } catch {
-      throw new Error("OAuth 凭据文件不是有效 JSON");
+      throw new Error(t("admin.toast.oauthInvalidJson"));
     }
     const result = await api<OAuthImportResponse>(endpoints.importOAuthCredentials.path(), {
       method: "POST",
@@ -594,6 +595,6 @@ export async function importOAuthCredentials(store: AppStore, file: File): Promi
     updateOAuthState(store, result.active_provider || "", result);
     await Promise.all([loadSecrets(store), loadHermesConfig(store)]);
     const count = result.imported?.keys?.length || 0;
-    toast(`已导入 ${count} 个 OAuth 凭据`, { type: "ok", title: "完成" });
+    toast(t("admin.toast.oauthImported", { count }), { type: "ok", title: t("admin.toast.complete") });
   });
 }

@@ -10,6 +10,7 @@
 
 import { useRef, type ReactNode } from "react";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
+import { useI18n, type Translator } from "../../i18n";
 import { agentStatusFor, hasPermission, isAgentActive, scopeTypeFor } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { AgentStatus, ChatMode, Message, ScopeType, StreamMsg, TypingUser } from "../../types";
@@ -31,6 +32,7 @@ function agentStreamingMessages(
   mode: ChatMode,
   scopeType: ScopeType,
   scopeId: string,
+  translate: Translator,
 ): Message[] {
   const segments: StreamMsg[] = [];
   for (const stream of status.stream_messages || []) {
@@ -44,7 +46,12 @@ function agentStreamingMessages(
     scope_id: scopeId,
     author_type: "agent",
     user_id: null,
-    username: stream.username || (mode === "private" ? "Private Agent" : "Main Agent"),
+    username:
+      !stream.username || stream.username === "Private Agent" || stream.username === "Main Agent"
+        ? mode === "private"
+          ? translate("chat.privateAgent")
+          : translate("chat.mainAgent")
+        : stream.username,
     content: stream.content || "",
     metadata: { streaming: stream.active !== false, stream_segment: stream.active === false },
     created_at: stream.created_at || status.started_at || Math.floor(Date.now() / 1000),
@@ -62,6 +69,7 @@ export function MessageList({
   noChannel: boolean;
   forceBottomToken: number;
 }) {
+  const { t } = useI18n();
   const ref = useRef<HTMLDivElement>(null);
   const scopeType = scopeTypeFor(mode);
   const scopeKey = `${scopeType}:${scopeId}`;
@@ -77,14 +85,22 @@ export function MessageList({
   let body: ReactNode;
   if (noChannel) {
     body = (
-      <EmptyState icon="hash" title="还没有频道" text="在左侧创建一个频道，开始与团队和 Agent 协作。" />
+      <EmptyState
+        icon="hash"
+        title={t("chat.empty.noChannelTitle")}
+        text={t("chat.empty.noChannelText")}
+      />
     );
   } else if (!messages.length && !isAgentActive(status) && status?.state !== "error") {
     body =
       mode === "private" ? (
-        <EmptyState icon="bot" title="开启你的私人 Agent" text="这是仅你可见的助手。发送第一条消息试试看。" />
+        <EmptyState icon="bot" title={t("chat.empty.privateTitle")} text={t("chat.empty.privateText")} />
       ) : (
-        <EmptyState icon="message" title="暂无消息" text="成为第一个在该频道发言的人。需要时 @agent。" />
+        <EmptyState
+          icon="message"
+          title={t("chat.empty.channelTitle")}
+          text={t("chat.empty.channelText")}
+        />
       );
   } else {
     const items: ReactNode[] = messages.map((message) => (
@@ -108,7 +124,7 @@ export function MessageList({
           />,
         );
       }
-      for (const streamingMessage of agentStreamingMessages(status, mode, scopeType, scopeId)) {
+      for (const streamingMessage of agentStreamingMessages(status, mode, scopeType, scopeId, t)) {
         items.push(<MessageBubble key={String(streamingMessage.id)} message={streamingMessage} />);
       }
     } else if (status && status.state === "error") {
@@ -135,7 +151,7 @@ export function MessageList({
       data-chat-key={scopeKey}
       ref={ref}
       role="log"
-      aria-label={mode === "private" ? "私人 Agent 消息" : "频道消息"}
+      aria-label={mode === "private" ? t("chat.log.privateLabel") : t("chat.log.channelLabel")}
       aria-live="polite"
       aria-relevant="additions text"
       aria-busy={isAgentActive(status)}

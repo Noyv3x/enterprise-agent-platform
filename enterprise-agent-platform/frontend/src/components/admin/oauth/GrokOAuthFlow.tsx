@@ -8,9 +8,16 @@
 import { completeOAuthVerification, setOAuthCallbackUrl } from "../../../data/adminActions";
 import { safeUrl } from "../../../lib/api";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import { oauthStatusLabel } from "../../../utils/oauth";
 import type { OAuthManualCallbackFlow } from "../../../types";
 import { Icon } from "../../common/Icon";
+import { useI18n } from "../../../i18n";
+
+function flowStatus(t: ReturnType<typeof useI18n>["t"], status: string | undefined): string {
+  if (status === "waiting_for_user") return t("admin.oauth.waitingForUser");
+  if (status === "waiting_for_callback") return t("admin.oauth.waitingForCallback");
+  if (status === "complete") return t("admin.oauth.complete");
+  return status || t("admin.oauth.waiting");
+}
 
 export interface GrokOAuthFlowProps {
   providerId: string;
@@ -19,24 +26,25 @@ export interface GrokOAuthFlowProps {
 }
 
 export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlowProps) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
 
   return (
     <div className="oauth-guide">
       <div className="oauth-line">
-        <span>授权页</span>
+        <span>{t("admin.oauth.authorizationPage")}</span>
         <a href={safeUrl(flow.authorize_url)} target="_blank" rel="noreferrer">
-          <span>打开 Grok OAuth</span>
+          <span>{t("admin.oauth.openGrok")}</span>
           <Icon name="external" size={13} />
         </a>
       </div>
       <div className="oauth-line">
-        <span>回调地址</span>
+        <span>{t("admin.oauth.callbackAddress")}</span>
         <code>{flow.redirect_uri}</code>
       </div>
       <textarea
-        placeholder="粘贴浏览器跳转后的完整 callback URL"
+        placeholder={t("admin.oauth.callbackPlaceholder")}
         value={callbackValue}
         onChange={(event) => setOAuthCallbackUrl(store, providerId, event.target.value)}
       />
@@ -47,10 +55,10 @@ export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlow
           onClick={() => void completeOAuthVerification(store, providerId, flow.flow_id)}
         >
           <Icon name="checkCircle" size={14} />
-          <span>完成验证</span>
+          <span>{t("admin.oauth.completeVerification")}</span>
         </button>
         <span className="muted" style={{ fontSize: "12px" }} aria-live="polite">
-          {`状态：${oauthStatusLabel(flow.status)}`}
+          {t("admin.oauth.status", { status: flowStatus(t, flow.status) })}
         </span>
       </div>
     </div>

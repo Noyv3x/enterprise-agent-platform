@@ -4,6 +4,7 @@
    it). No store reads here — callers pass AppState in. */
 
 import { ADMIN_PAGES } from "../lib/constants";
+import { t as defaultTranslate, type Translator } from "../i18n";
 import type {
   AdminPage,
   AgentStatus,
@@ -75,11 +76,16 @@ export function isAgentActive(status: AgentStatus | null | undefined): boolean {
   return !!status && (status.state === "queued" || status.state === "replying" || status.state === "approval");
 }
 
-export function agentStatusText(status: AgentStatus | null | undefined): string {
+export function agentStatusText(
+  status: AgentStatus | null | undefined,
+  translate: Translator = defaultTranslate,
+): string {
   if (!isAgentActive(status)) return "";
-  const target = status?.replying_to?.username || "用户";
-  if (status?.state === "approval") return `等待 ${target} 审批权限`;
-  return status?.state === "queued" ? `Agent 准备回复 ${target}` : `Agent 正在回复 ${target}`;
+  const target = status?.replying_to?.username || translate("chat.userFallback");
+  if (status?.state === "approval") return translate("chat.status.approval", { target });
+  return status?.state === "queued"
+    ? translate("chat.status.queued", { target })
+    : translate("chat.status.replying", { target });
 }
 
 /* ----------------------------------------------------------------- admin */
@@ -94,25 +100,39 @@ export function messageAuditState(state: AppState): MessageAudit {
 
 /* --------------------------------------------------------------- topbar */
 
-export function topbarInfo(state: AppState): TopbarInfo {
+export function topbarInfo(state: AppState, translate: Translator = defaultTranslate): TopbarInfo {
   if (state.activeView === "private") {
-    const active = agentStatusText(agentStatusFor(state, "private"));
-    return { title: "私人 Agent", icon: "bot", sub: active || "仅你可见的私有助手会话" };
+    const active = agentStatusText(agentStatusFor(state, "private"), translate);
+    return {
+      title: translate("nav.privateAgent"),
+      icon: "bot",
+      sub: active || translate("nav.topbar.privateSubtitle"),
+    };
   }
   if (state.activeView === "knowledge") {
-    return { title: "知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
+    return {
+      title: translate("nav.knowledge"),
+      icon: "library",
+      sub: translate("nav.topbar.knowledgeDocuments", { count: state.documents.length }),
+    };
   }
   if (state.activeView === "admin") {
-    return { title: "管理面板", icon: "shield", sub: activeAdminPage(state).description };
+    return { title: translate("nav.admin"), icon: "shield", sub: translate("nav.topbar.adminSubtitle") };
   }
   if (state.activeView === "settings") {
-    return { title: "设置", icon: "settings", sub: "账户资料与密码" };
+    return {
+      title: translate("nav.settings"),
+      icon: "settings",
+      sub: translate("nav.topbar.settingsSubtitle"),
+    };
   }
   const ch = activeChannel(state);
-  const active = agentStatusText(agentStatusFor(state, "channel"));
+  const active = agentStatusText(agentStatusFor(state, "channel"), translate);
   return {
-    title: ch?.name || "频道",
+    title: ch?.name || translate("nav.channel"),
     hash: true,
-    sub: ch ? active || `${state.messages.length} 条消息` : "选择或创建一个频道",
+    sub: ch
+      ? active || translate("nav.topbar.channelMessages", { count: state.messages.length })
+      : translate("nav.topbar.selectChannel"),
   };
 }

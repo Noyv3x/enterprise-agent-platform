@@ -9,8 +9,10 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import { CardHead } from "../../common/CardHead";
 import { Icon } from "../../common/Icon";
 import { OAuthProviderCard } from "./OAuthProviderCard";
+import { useI18n } from "../../../i18n";
 
 export function OAuthSettings() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const oauthProviders = useStore((state) => state.oauthProviders);
@@ -26,9 +28,9 @@ export function OAuthSettings() {
   return (
     <section className="card">
       <CardHead
-        title="API 供应商验证"
+        title={t("admin.oauth.title")}
         icon="shield"
-        desc="通过 OAuth 授权模型供应商，验证后 Hermes 自动切换。"
+        desc={t("admin.oauth.description")}
         extra={
           <div className="oauth-transfer">
             <button
@@ -38,7 +40,7 @@ export function OAuthSettings() {
               onClick={() => void exportOAuthCredentials(store)}
             >
               <Icon name="download" size={14} />
-              <span>导出凭据</span>
+              <span>{t("admin.oauth.exportCredentials")}</span>
             </button>
             <button
               className="btn btn--sm"
@@ -47,7 +49,7 @@ export function OAuthSettings() {
               onClick={() => inputRef.current?.click()}
             >
               <Icon name="upload" size={14} />
-              <span>导入凭据</span>
+              <span>{t("admin.oauth.importCredentials")}</span>
             </button>
             <input
               ref={inputRef}
@@ -66,7 +68,7 @@ export function OAuthSettings() {
           ))}
         </div>
       ) : (
-        <div className="muted">未发现可验证的供应商。</div>
+        <div className="muted">{t("admin.oauth.empty")}</div>
       )}
     </section>
   );

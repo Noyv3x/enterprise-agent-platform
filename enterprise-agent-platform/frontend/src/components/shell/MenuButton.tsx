@@ -4,16 +4,18 @@
    the drawer via the AppShell open/close effect. */
 
 import { useStore, useStoreHandle } from "../../store/useStore";
+import { useI18n } from "../../i18n";
 import { Icon } from "../common/Icon";
 
 export function MenuButton() {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const sidebarOpen = useStore((state) => state.sidebarOpen);
   return (
     <button
       className="icon-btn menu-btn"
-      title="打开菜单"
-      aria-label="打开菜单"
+      title={t("nav.menu.open")}
+      aria-label={t("nav.menu.open")}
       aria-expanded={sidebarOpen}
       aria-controls="app-sidebar"
       onClick={() => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: true })}

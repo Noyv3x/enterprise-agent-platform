@@ -6,6 +6,7 @@
 import { useMemo, useRef } from "react";
 import { clearSearch, openDocument } from "../../data/knowledgeActions";
 import { runBusy } from "../../data/sessionActions";
+import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import type { Id } from "../../types";
 import { CardHead } from "../common/CardHead";
@@ -14,6 +15,7 @@ import { DocumentViewer } from "./DocumentViewer";
 import { KnowledgeSearchForm } from "./KnowledgeSearchForm";
 
 export function KnowledgeLibraryCard() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const documents = useStore((state) => state.documents);
   const search = useStore((state) => state.knowledgeSearch);
@@ -49,16 +51,25 @@ export function KnowledgeLibraryCard() {
   return (
     <section className="card">
       <CardHead
-        title="条目库"
+        title={t("knowledge.library")}
         icon="library"
-        extra={<span className="status">{`${documents.length} docs`}</span>}
+        extra={
+          <span className="status">
+            {t("knowledge.documentCount", { count: documents.length })}
+          </span>
+        }
       />
       <KnowledgeSearchForm />
       {isSearching ? (
         <div className="list__note">
-          <span>{`搜索“${search.query}”：${(results ?? []).length} 条结果`}</span>
+          <span>
+            {t("knowledge.searchResults", {
+              query: search.query,
+              count: (results ?? []).length,
+            })}
+          </span>
           <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
-            <span>显示全部</span>
+            <span>{t("knowledge.showAll")}</span>
           </button>
         </div>
       ) : null}

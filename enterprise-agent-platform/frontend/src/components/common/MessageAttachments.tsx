@@ -5,15 +5,17 @@
    data:/blob: for inline + optimistic previews. */
 
 import { safeUrl } from "../../lib/api";
+import { useI18n } from "../../i18n";
 import { formatFileSize } from "../../utils/format";
 import type { Attachment } from "../../types";
 import { Icon } from "./Icon";
 
 export function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
+  const { t } = useI18n();
   return (
     <div className="msg-attachments">
       {attachments.map((attachment) => {
-        const name = attachment.filename || "attachment";
+        const name = attachment.filename || t("chat.attachment");
         const size = formatFileSize(attachment.size_bytes || 0);
         const href = safeUrl(attachment.download_url || attachment.url);
         if (attachment.is_image) {
@@ -45,7 +47,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
             </span>
             <span className="msg-attachment__meta">
               <strong>{name}</strong>
-              <span>{`${attachment.mime_type || "file"} · ${size}`}</span>
+              <span>{`${attachment.mime_type || t("chat.file")} · ${size}`}</span>
             </span>
             <Icon name="download" size={16} />
           </a>

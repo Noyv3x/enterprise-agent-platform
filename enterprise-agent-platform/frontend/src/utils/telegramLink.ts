@@ -1,3 +1,5 @@
+import { t } from "../i18n";
+
 export interface TelegramChallengeTiming {
   valid: boolean;
   expired: boolean;
@@ -33,8 +35,10 @@ export function telegramChallengeTiming(
 }
 
 export function telegramChallengeRelativeLabel(timing: TelegramChallengeTiming): string {
-  if (!timing.valid) return "有效期未知";
-  if (timing.expired) return "绑定码已过期";
-  if (timing.secondsRemaining < 60) return `${timing.secondsRemaining} 秒后过期`;
-  return `约 ${timing.minutesRemaining} 分钟后过期`;
+  if (!timing.valid) return t("telegram.expiryUnknown");
+  if (timing.expired) return t("telegram.challengeExpired");
+  if (timing.secondsRemaining < 60) {
+    return t("telegram.expiresInSeconds", { count: timing.secondsRemaining });
+  }
+  return t("telegram.expiresInMinutes", { count: timing.minutesRemaining });
 }

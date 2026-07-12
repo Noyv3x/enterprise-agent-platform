@@ -8,6 +8,7 @@ import { formatCompactNumber } from "../../utils/format";
 import { isOAuthSecret } from "../../utils/oauth";
 import { useStore } from "../../store/useStore";
 import type { AdminPageId, AppState } from "../../types";
+import { useI18n } from "../../i18n";
 
 export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): number | string {
   const security = state.securityConfig?.config || {};
@@ -33,10 +34,10 @@ export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): numbe
       return state.oauthProviders?.providers?.length || 0;
     case "telegram":
       return state.telegramConfig?.config?.enabled
-        ? state.telegramConfig?.linked_users?.length || "on"
+        ? state.telegramConfig?.linked_users?.length || "enabled"
         : 0;
     case "updates":
-      return state.autoUpdateConfig?.config?.enabled ? "on" : 0;
+      return state.autoUpdateConfig?.config?.enabled ? "enabled" : 0;
     case "security":
       return securityWarnings;
     case "runtime":
@@ -50,7 +51,12 @@ export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): numbe
 }
 
 export function AdminPageBadge({ pageId }: { pageId: AdminPageId }) {
+  const { t } = useI18n();
   const value = useStore((state) => adminPageBadgeValue(state, pageId));
   if (!value) return null;
-  return <span className="admin-pager__badge">{String(value)}</span>;
+  return (
+    <span className="admin-pager__badge">
+      {value === "enabled" ? t("admin.common.enabledShort") : String(value)}
+    </span>
+  );
 }

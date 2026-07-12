@@ -6,17 +6,19 @@ import { useStore } from "../../../store/useStore";
 import { isOAuthSecret } from "../../../utils/oauth";
 import { CardHead } from "../../common/CardHead";
 import { SecretRow } from "./SecretRow";
+import { useI18n } from "../../../i18n";
 
 export function SecretsSettings() {
+  const { t } = useI18n();
   const secrets = useStore((state) => state.secrets);
   const rows = secrets.filter((secret) => !isOAuthSecret(secret.key));
 
   return (
     <section className="card">
       <CardHead
-        title="平台内部密钥"
+        title={t("admin.secrets.title")}
         icon="key"
-        desc="手动配置的平台级密钥，OAuth 凭据在上方管理。"
+        desc={t("admin.secrets.description")}
       />
       {rows.length ? (
         <div className="list">
@@ -25,7 +27,7 @@ export function SecretsSettings() {
           ))}
         </div>
       ) : (
-        <div className="muted">暂无可手动配置的内部密钥。</div>
+        <div className="muted">{t("admin.secrets.none")}</div>
       )}
     </section>
   );

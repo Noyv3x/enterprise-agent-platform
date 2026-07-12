@@ -3,6 +3,7 @@
    from the per-scope draftFiles store entry. */
 
 import { formatFileSize } from "../../utils/format";
+import { useI18n } from "../../i18n";
 import { Icon } from "../common/Icon";
 
 export function ComposerFiles({
@@ -12,6 +13,7 @@ export function ComposerFiles({
   files: File[];
   onRemove: (index: number) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="composer-files">
       {files.map((file, index) => (
@@ -19,13 +21,13 @@ export function ComposerFiles({
           <span className="composer-file__icon">
             <Icon name={file.type?.startsWith("image/") ? "image" : "doc"} size={15} />
           </span>
-          <span className="composer-file__name">{file.name || "attachment"}</span>
+          <span className="composer-file__name">{file.name || t("chat.attachment")}</span>
           <span className="composer-file__size">{formatFileSize(file.size || 0)}</span>
           <button
             className="icon-btn composer-file__remove"
             type="button"
-            title="移除"
-            aria-label="移除附件"
+            title={t("chat.attach.remove")}
+            aria-label={t("chat.attach.removeAttachment")}
             onClick={() => onRemove(index)}
           >
             <Icon name="close" size={14} />

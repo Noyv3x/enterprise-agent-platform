@@ -9,6 +9,7 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { ConfigFieldDescriptor } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { ConfigForm } from "../../common/ConfigForm";
+import { useI18n } from "../../../i18n";
 
 function fieldsSignature(fields: ConfigFieldDescriptor[]): string {
   return fields
@@ -17,6 +18,7 @@ function fieldsSignature(fields: ConfigFieldDescriptor[]): string {
 }
 
 export function CogneeInternalConfig() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const cogneeConfig = useStore((state) => state.cogneeConfig);
   const internal = cogneeConfig?.internal || {};
@@ -24,12 +26,12 @@ export function CogneeInternalConfig() {
 
   return (
     <section className="card config-software">
-      <CardHead title="Cognee 内部配置" icon="settings" desc={internal.env_path || "Cognee .env"} />
+      <CardHead title={t("admin.config.cogneeInternal.title")} icon="settings" desc={internal.env_path || "Cognee .env"} />
       <ConfigForm
         key={`env:${fieldsSignature(envFields)}`}
         fields={envFields}
         attr="envKey"
-        buttonText="保存 Cognee 环境变量"
+        buttonText={t("admin.config.cogneeInternal.saveEnv")}
         onSubmit={(updates) => saveCogneeEnv(store, updates)}
       />
     </section>

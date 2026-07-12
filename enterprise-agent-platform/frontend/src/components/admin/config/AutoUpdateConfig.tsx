@@ -15,6 +15,18 @@ import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
 import { StatusBadge } from "../../common/StatusBadge";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
+import { useI18n } from "../../../i18n";
+
+function updateTriggerLabel(t: ReturnType<typeof useI18n>["t"], trigger: string | undefined): string {
+  switch (trigger) {
+    case "startup": return t("admin.updates.trigger.startup");
+    case "config": return t("admin.updates.trigger.config");
+    case "manual": return t("admin.updates.trigger.manual");
+    case "webhook": return t("admin.updates.trigger.webhook");
+    case "poll": return t("admin.updates.trigger.poll");
+    default: return trigger || "-";
+  }
+}
 
 interface AutoUpdateFormState {
   enabled: boolean;
@@ -35,19 +47,20 @@ function seedForm(config: AutoUpdateConfigValues): AutoUpdateFormState {
 }
 
 export function AutoUpdateConfig() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const autoUpdateConfig = useStore((state) => state.autoUpdateConfig);
   const config = autoUpdateConfig?.config || {};
   const status = autoUpdateConfig?.status || {};
-  const webhookUrl = config.webhook_url || "启用后自动生成 webhook URL";
+  const webhookUrl = config.webhook_url || t("admin.updates.webhookPlaceholder");
   const updateState = status.in_progress
-    ? "检查中"
+    ? t("admin.updates.checking")
     : status.update_started
-      ? "已触发更新"
+      ? t("admin.updates.triggered")
       : status.update_available
-        ? "发现更新"
-        : "待命";
+        ? t("admin.updates.available")
+        : t("admin.updates.idle");
   const clean = !status.dirty;
 
   const [form, setForm] = useState<AutoUpdateFormState>(() =>
@@ -72,10 +85,10 @@ export function AutoUpdateConfig() {
   return (
     <section className="card config-form">
       <CardHead
-        title="自动更新监听"
+        title={t("admin.updates.title")}
         icon="refresh"
-        desc="常驻监听上游分支；GitHub webhook 可秒级触发，轮询作为兜底。"
-        extra={<StatusBadge ok={!!config.enabled} label={config.enabled ? "已启用" : "未启用"} />}
+        desc={t("admin.updates.description")}
+        extra={<StatusBadge ok={!!config.enabled} label={t(config.enabled ? "admin.common.enabled" : "admin.common.disabled")} />}
       />
       <form onSubmit={handleSubmit}>
         <div className="config-grid">
@@ -86,11 +99,11 @@ export function AutoUpdateConfig() {
               onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))}
             />
             <div className="check-row__text">
-              <strong>启用常驻监听</strong>
-              <span>收到 webhook 或轮询发现上游更新后自动执行 deploy.sh update</span>
+              <strong>{t("admin.updates.enableWatcher")}</strong>
+              <span>{t("admin.updates.enableWatcherHint")}</span>
             </div>
           </label>
-          <Field label="轮询间隔（秒）">
+          <Field label={t("admin.updates.interval")}>
             <input
               type="number"
               min="5"
@@ -100,26 +113,26 @@ export function AutoUpdateConfig() {
               onChange={(event) => setForm((prev) => ({ ...prev, interval: event.target.value }))}
             />
           </Field>
-          <Field label="Git remote">
+          <Field label={t("admin.updates.remote")}>
             <input
               value={form.remote}
-              placeholder="origin"
+              placeholder={t("admin.updates.remotePlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, remote: event.target.value }))}
             />
           </Field>
-          <Field label="分支">
+          <Field label={t("admin.updates.branch")}>
             <input
               value={form.branch}
-              placeholder="留空使用当前分支"
+              placeholder={t("admin.updates.branchPlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, branch: event.target.value }))}
             />
           </Field>
           <div className="field--full">
-            <Field label="Webhook Secret">
+            <Field label={t("admin.updates.webhookSecret")}>
               <input
                 type="password"
                 autoComplete="off"
-                placeholder={config.webhook_secret_configured ? "保持不变" : "至少 16 位 secret"}
+                placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.updates.secretPlaceholder")}
                 value={form.webhookSecret}
                 onChange={(event) =>
                   setForm((prev) => ({ ...prev, webhookSecret: event.target.value }))
@@ -128,13 +141,13 @@ export function AutoUpdateConfig() {
             </Field>
           </div>
           <div className="field--full field-stack">
-            <span className="field-help">GitHub Webhook URL</span>
+            <span className="field-help">{t("admin.updates.webhookUrl")}</span>
             <code className="mono">{webhookUrl}</code>
           </div>
         </div>
         <div className="form-actions">
           <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>保存自动更新配置</span>
+            <span>{t("admin.updates.save")}</span>
           </button>
           <button
             className="btn"
@@ -143,17 +156,17 @@ export function AutoUpdateConfig() {
             onClick={() => void checkAutoUpdateNow(store)}
           >
             <Icon name="refresh" size={15} />
-            <span>立即检查</span>
+            <span>{t("admin.updates.checkNow")}</span>
           </button>
         </div>
       </form>
       <div className="metric-grid metric-grid--compact">
-        <UsageMetricTile label="状态" value={updateState} />
-        <UsageMetricTile label="工作树" value={clean ? "干净" : "有本地改动"} />
-        <UsageMetricTile label="当前版本" value={shortSha(status.current_revision)} />
-        <UsageMetricTile label="远端版本" value={shortSha(status.remote_revision)} />
-        <UsageMetricTile label="最近检查" value={formatTime(Number(status.last_check_at) || undefined) || "-"} />
-        <UsageMetricTile label="最近触发" value={status.last_trigger || "-"} />
+        <UsageMetricTile label={t("admin.updates.status")} value={updateState} />
+        <UsageMetricTile label={t("admin.updates.worktree")} value={t(clean ? "admin.updates.clean" : "admin.updates.dirty")} />
+        <UsageMetricTile label={t("admin.updates.currentRevision")} value={shortSha(status.current_revision)} />
+        <UsageMetricTile label={t("admin.updates.remoteRevision")} value={shortSha(status.remote_revision)} />
+        <UsageMetricTile label={t("admin.updates.lastCheck")} value={formatTime(Number(status.last_check_at) || undefined) || "-"} />
+        <UsageMetricTile label={t("admin.updates.lastTrigger")} value={updateTriggerLabel(t, status.last_trigger)} />
       </div>
       {status.last_error ? <div className="notice notice--warn">{status.last_error}</div> : null}
       {status.dirty_summary ? <pre className="config-preview">{status.dirty_summary}</pre> : null}

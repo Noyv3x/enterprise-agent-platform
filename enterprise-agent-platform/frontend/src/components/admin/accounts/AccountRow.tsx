@@ -15,10 +15,12 @@ import type { PermissionGroup, User } from "../../../types";
 import { Field } from "../../common/Field";
 import { StatusBadge } from "../../common/StatusBadge";
 import { AccountModelSelect } from "./AccountModelSelect";
-import { PermissionGroupSelect } from "./PermissionGroupSelect";
+import { PermissionGroupSelect, permissionGroupLabel } from "./PermissionGroupSelect";
 import { ThinkingDepthSelect } from "./ThinkingDepthSelect";
+import { useI18n } from "../../../i18n";
 
 export function AccountRow({ user, groups }: { user: User; groups: PermissionGroup[] }) {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const busy = useStore((state) => state.busy);
   const currentUserId = useStore((state) => state.user?.id);
@@ -64,40 +66,40 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
           <div className="avatar">{initials(user.display_name || user.username)}</div>
           <div>
             <strong>{user.username}</strong>
-            <span>{user.permission_group_label || user.permission_group || "member"}</span>
+            <span>{permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label)}</span>
           </div>
         </div>
-        <StatusBadge ok={!!user.active} label={user.active ? "active" : "disabled"} />
+        <StatusBadge ok={!!user.active} label={t(user.active ? "admin.common.active" : "admin.common.disabled")} />
       </div>
       <div className="account-row__grid">
-        <Field label="显示名称">
+        <Field label={t("admin.accounts.displayName")}>
           <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
         </Field>
-        <Field label="职位">
+        <Field label={t("admin.accounts.position")}>
           <input
             value={position}
-            placeholder="职位"
+            placeholder={t("admin.accounts.position")}
             onChange={(event) => setPosition(event.target.value)}
           />
         </Field>
-        <Field label="权限组">
+        <Field label={t("admin.accounts.permissionGroup")}>
           <PermissionGroupSelect
             groups={groups}
             value={permissionGroup}
             onChange={setPermissionGroup}
           />
         </Field>
-        <Field label="模型型号">
+        <Field label={t("admin.accounts.model")}>
           <AccountModelSelect value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
         </Field>
-        <Field label="思考深度">
+        <Field label={t("admin.accounts.thinkingDepth")}>
           <ThinkingDepthSelect value={thinkingDepth} onChange={setThinkingDepth} />
         </Field>
-        <Field label="重置密码">
+        <Field label={t("admin.accounts.resetPassword")}>
           <input
             type="password"
             autoComplete="new-password"
-            placeholder="留空不修改"
+            placeholder={t("admin.common.leaveBlank")}
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
@@ -110,8 +112,8 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
             onChange={(event) => setActive(event.target.checked)}
           />
           <div className="check-row__text">
-            <strong>账户启用</strong>
-            <span>停用后无法登录</span>
+            <strong>{t("admin.accounts.enabled")}</strong>
+            <span>{t("admin.accounts.disabledHint")}</span>
           </div>
         </label>
       </div>
@@ -121,12 +123,12 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
           type="button"
           disabled={busy || selfDisabled || !active}
           onClick={handleImpersonate}
-          title={selfDisabled ? "当前已是此账号" : active ? "以此账号登录" : "账号已停用"}
+          title={selfDisabled ? t("admin.accounts.impersonateCurrent") : active ? t("admin.accounts.impersonateTitle") : t("admin.accounts.impersonateDisabled")}
         >
-          <span>管理员代入</span>
+          <span>{t("admin.accounts.impersonate")}</span>
         </button>
         <button className="btn btn--primary btn--sm" type="submit" disabled={busy}>
-          <span>保存账户</span>
+          <span>{t("admin.accounts.save")}</span>
         </button>
       </div>
     </form>

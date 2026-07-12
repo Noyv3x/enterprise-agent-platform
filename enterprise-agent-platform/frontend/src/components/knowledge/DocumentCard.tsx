@@ -4,6 +4,7 @@
    so calling it would 404 — disabling it is the documented improvement (spec §7). */
 
 import { isNumericDocumentId } from "../../data/knowledgeActions";
+import { useI18n } from "../../i18n";
 import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
 import { Icon } from "../common/Icon";
 import { DOC_VIEWER_ID } from "./DocumentViewer";
@@ -16,6 +17,7 @@ export interface DocumentCardProps {
 }
 
 export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
+  const { t } = useI18n();
   const canView = isNumericDocumentId(doc.id);
   return (
     <div className="doc-card">
@@ -34,7 +36,7 @@ export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
           onClick={(event) => onView(doc.id, event.currentTarget)}
         >
           <Icon name="doc" size={14} />
-          <span>查看正文</span>
+          <span>{t("knowledge.viewDocument")}</span>
         </button>
       </div>
     </div>

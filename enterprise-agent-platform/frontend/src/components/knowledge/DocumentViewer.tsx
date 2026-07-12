@@ -6,6 +6,7 @@
    win for this view. The panel is an inline region, not a modal. */
 
 import { useEffect, useRef } from "react";
+import { useI18n } from "../../i18n";
 import type { FullDocument } from "../../types";
 import { Icon } from "../common/Icon";
 
@@ -18,6 +19,7 @@ export interface DocumentViewerProps {
 }
 
 export function DocumentViewer({ document: doc, onClose }: DocumentViewerProps) {
+  const { t } = useI18n();
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
   // Focus handoff on open. The restore-to-trigger on close lives in the parent's
@@ -27,15 +29,20 @@ export function DocumentViewer({ document: doc, onClose }: DocumentViewerProps) 
   }, []);
 
   return (
-    <div className="doc-viewer" id={DOC_VIEWER_ID} role="region" aria-label="文档正文">
+    <div
+      className="doc-viewer"
+      id={DOC_VIEWER_ID}
+      role="region"
+      aria-label={t("knowledge.documentRegion")}
+    >
       <div className="doc-viewer__bar">
-        <span className="eyebrow">{doc.title || "DOCUMENT"}</span>
+        <span className="eyebrow">{doc.title || t("knowledge.untitledDocument")}</span>
         <button
           ref={closeRef}
           className="icon-btn"
           type="button"
-          title="关闭"
-          aria-label="关闭文档"
+          title={t("common.close")}
+          aria-label={t("knowledge.closeDocument")}
           onClick={onClose}
         >
           <Icon name="close" size={16} />

@@ -1,15 +1,17 @@
 /* <AttachButton/> — the composer paperclip that opens the hidden file input
    (legacy composer attach button, :721-728). */
 
+import { useI18n } from "../../i18n";
 import { Icon } from "../common/Icon";
 
 export function AttachButton({ disabled, onClick }: { disabled: boolean; onClick: () => void }) {
+  const { t } = useI18n();
   return (
     <button
       className="icon-btn composer__attach"
       type="button"
-      title="添加文件"
-      aria-label="添加文件"
+      title={t("chat.attach.add")}
+      aria-label={t("chat.attach.add")}
       disabled={disabled}
       onClick={onClick}
     >

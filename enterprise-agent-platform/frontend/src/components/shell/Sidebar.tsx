@@ -5,6 +5,7 @@
    caller's useMediaQuery. */
 
 import { usePermissions } from "../../hooks/usePermissions";
+import { useI18n } from "../../i18n";
 import { useStore } from "../../store/useStore";
 import { Brand } from "../common/Brand";
 import { ChannelCreateForm } from "./ChannelCreateForm";
@@ -13,6 +14,7 @@ import { SidebarFoot } from "./SidebarFoot";
 import { WorkspaceNav } from "./WorkspaceNav";
 
 export function Sidebar({ hidden }: { hidden: boolean }) {
+  const { t } = useI18n();
   const channelCount = useStore((state) => state.channels.length);
   const canManageChannels = usePermissions().has("manage_channels");
 
@@ -28,12 +30,12 @@ export function Sidebar({ hidden }: { hidden: boolean }) {
       </div>
       <div className="sidebar__scroll">
         <div>
-          <div className="section-label">工作区</div>
+          <div className="section-label">{t("nav.workspace")}</div>
           <WorkspaceNav />
         </div>
         <div>
           <div className="section-label">
-            <span>频道</span>
+            <span>{t("nav.channels")}</span>
             <span className="nav__badge">{channelCount}</span>
           </div>
           <ChannelList />

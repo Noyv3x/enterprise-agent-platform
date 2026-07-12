@@ -11,6 +11,7 @@
    those are shell-owned (AppShell) so the stream/poll are not duplicated. */
 
 import { useCallback, useEffect, useState } from "react";
+import { useI18n } from "../../i18n";
 import { activeChannel, hasPermission, scopeIdFor, scopeTypeFor } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { ChatMode } from "../../types";
@@ -18,6 +19,7 @@ import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 
 export function ChatView({ mode }: { mode: ChatMode }) {
+  const { t } = useI18n();
   const scopeId = useStore((state) => scopeIdFor(state, mode));
   const canChat = useStore(
     (state) => hasPermission(state, "chat") && (mode !== "private" || hasPermission(state, "private_agent")),
@@ -40,12 +42,12 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   }, [mode, scopeId, bumpFocus]);
 
   const placeholder = noChannel
-    ? "选择频道后发送消息"
+    ? t("chat.composer.noChannel")
     : canChat
       ? mode === "private"
-        ? "给你的私人 Agent 发消息…"
-        : `在 #${channelName || "频道"} 发消息，@agent 呼叫 Agent…`
-      : "当前权限组只能查看内容";
+        ? t("chat.composer.privatePlaceholder")
+        : t("chat.composer.channelPlaceholder", { channel: channelName || t("nav.channel") })
+      : t("chat.composer.readOnly");
 
   return (
     <div className="chat">

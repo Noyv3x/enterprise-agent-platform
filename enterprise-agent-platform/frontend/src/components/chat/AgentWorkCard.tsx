@@ -13,6 +13,7 @@
    whether a run has process steps without duplicating the logic. */
 
 import type { MouseEvent } from "react";
+import { t as defaultTranslate, useI18n, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
@@ -23,45 +24,79 @@ type Work = AgentWork | AgentStatus;
 
 function isAgentProcessStep(step: ActivityStep): boolean {
   const stage = String(step?.stage || "").toLowerCase();
-  return step?.source === "hermes" || stage === "tool" || stage.startsWith("tool.") || !!step?.tool;
+  const structuredStage = new Set([
+    "complete",
+    "completed",
+    "queued",
+    "replying",
+    "approval",
+    "approval.responded",
+    "error",
+    "failed",
+  ]).has(stage);
+  return (
+    step?.source === "hermes" ||
+    stage === "tool" ||
+    stage.startsWith("tool.") ||
+    structuredStage ||
+    !!step?.tool
+  );
 }
 
-function agentStepLine(step: ActivityStep): string {
+function agentStepLine(step: ActivityStep, translate: Translator): string {
   const stage = String(step?.stage || "").toLowerCase();
-  const label = step?.label || step?.stage || "处理中";
+  const label = step?.label || step?.line || step?.stage || translate("chat.activity.processing");
   const detail = step?.detail || "";
-  if (stage === "tool") return `${step?.emoji || "⚙️"} ${step?.tool || label}${detail ? `: "${detail}"` : "..."}`;
-  if (stage === "complete") return `✅ ${label}`;
-  if (stage === "error") return `⚠️ ${label}${detail ? `: ${detail}` : ""}`;
-  if (stage === "queued") return `⏳ ${label}`;
-  if (stage === "replying") return `💬 ${label}`;
+  if (stage === "tool" || stage.startsWith("tool.")) {
+    const tool = step?.tool || step?.label || translate("chat.activity.toolFallback");
+    const detailSuffix = detail && detail !== tool ? `: "${detail}"` : "";
+    return translate(
+      step?.tool_status === "completed" || stage.endsWith("completed")
+        ? "chat.activity.toolCompleted"
+        : "chat.activity.toolRunning",
+      { emoji: step?.emoji || "⚙️", tool, detail: detailSuffix },
+    );
+  }
+  if (stage === "complete" || stage === "completed") return translate("chat.activity.completed");
+  if (stage === "error" || stage === "failed") {
+    return translate("chat.activity.error", { detail: detail ? `: ${detail}` : "" });
+  }
+  if (stage === "queued") return translate("chat.activity.queued");
+  if (stage === "replying") return translate("chat.activity.replying");
+  if (stage === "approval") {
+    return translate("chat.activity.approval", { detail: detail ? `: ${detail}` : "" });
+  }
+  if (stage === "approval.responded") return translate("chat.activity.approvalResponded");
   return `• ${label}${detail ? `: ${detail}` : ""}`;
 }
 
-export function agentProcessLines(work: Work | null | undefined): string[] {
+export function agentProcessLines(
+  work: Work | null | undefined,
+  translate: Translator = defaultTranslate,
+): string[] {
   const steps = work?.activity || [];
   return steps
     .filter(isAgentProcessStep)
-    .map((step) => step.line || agentStepLine(step))
+    .map((step) => agentStepLine(step, translate))
     .filter(Boolean);
 }
 
 export function hasAgentProcessSteps(work: Work | null | undefined): boolean {
-  return agentProcessLines(work).length > 0;
+  return (work?.activity || []).some(isAgentProcessStep);
 }
 
-function agentWorkTitle(work: Work | null | undefined): string {
-  if (work?.state === "error") return "Agent 工作过程失败";
-  return "查看 Agent 工作过程";
+function agentWorkTitle(work: Work | null | undefined, translate: Translator): string {
+  if (work?.state === "error") return translate("chat.work.failed");
+  return translate("chat.work.view");
 }
 
 export function AgentWorkCard({ work, active }: { work: Work; active: boolean }) {
   const dispatch = useDispatch();
+  const { t } = useI18n();
 
-  const text = active ? agentStatusText(work) || "Agent 正在处理" : agentWorkTitle(work);
+  const text = active ? agentStatusText(work, t) || t("chat.status.processing") : agentWorkTitle(work, t);
   const queuedCount = Number(work?.queued_count || 0);
   const waiting = active ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1)) : 0;
-  const current = work?.current_step || (active ? text : "已完成");
   const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
 
   // undefined = no stored preference → default open iff active (legacy hasStored
@@ -69,10 +104,11 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const stored = useStore((state) => state.expandedAgentRuns[runId]);
   const expanded = stored === undefined ? active : stored;
 
-  const processLines = agentProcessLines(work);
+  const processLines = agentProcessLines(work, t);
+  const current = active ? processLines[processLines.length - 1] || text : t("chat.work.completed");
   const lines = processLines.length
     ? processLines
-    : [active ? "等待 Hermes Agent 运行过程" : "本次没有工具调用记录"];
+    : [active ? t("chat.work.waiting") : t("chat.work.noTools")];
 
   const onToggle = (event: MouseEvent<HTMLElement>) => {
     event.preventDefault();
@@ -95,9 +131,13 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
         )}
         <div className="agent-work__main">
           <span className="agent-work__title">{text}</span>
-          <span className="agent-work__step">{active ? current : `${processLines.length} 条工作记录`}</span>
+          <span className="agent-work__step">
+            {active ? current : t("chat.work.records", { count: processLines.length })}
+          </span>
         </div>
-        {waiting > 0 ? <span className="agent-status__queue">{`另有 ${waiting} 条等待`}</span> : null}
+        {waiting > 0 ? (
+          <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
+        ) : null}
       </summary>
       <div className="agent-work__log">
         {lines.map((line, index) => (

@@ -1,19 +1,20 @@
 import { useState } from "react";
 import { respondAgentApproval } from "../../data/chatActions";
+import { useI18n, type MessageKey } from "../../i18n";
 import { useStoreHandle } from "../../store/useStore";
 import type { AgentApprovalChoice, AgentApprovalRequest, ChatMode } from "../../types";
 import { Icon } from "../common/Icon";
 
 const APPROVAL_ACTIONS: Array<{
   choice: AgentApprovalChoice;
-  label: string;
+  labelKey: MessageKey;
   icon: "checkCircle" | "shield" | "key" | "alert";
   primary?: boolean;
 }> = [
-  { choice: "once", label: "允许一次", icon: "checkCircle", primary: true },
-  { choice: "session", label: "本会话允许", icon: "shield" },
-  { choice: "always", label: "始终允许", icon: "key" },
-  { choice: "deny", label: "拒绝", icon: "alert" },
+  { choice: "once", labelKey: "chat.approval.once", icon: "checkCircle", primary: true },
+  { choice: "session", labelKey: "chat.approval.session", icon: "shield" },
+  { choice: "always", labelKey: "chat.approval.always", icon: "key" },
+  { choice: "deny", labelKey: "chat.approval.deny", icon: "alert" },
 ];
 
 function allowedChoices(approval: AgentApprovalRequest): Set<string> {
@@ -31,9 +32,10 @@ export function AgentApprovalPrompt({
   scopeId: string;
 }) {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const [submitting, setSubmitting] = useState<AgentApprovalChoice | null>(null);
   const choices = allowedChoices(approval);
-  const description = approval.description || "危险操作需要权限审批";
+  const description = approval.description || t("chat.approval.fallbackDescription");
   const command = approval.command || "";
 
   const submit = async (choice: AgentApprovalChoice) => {
@@ -55,7 +57,7 @@ export function AgentApprovalPrompt({
         <div className="agent-approval__head">
           <Icon name="shield" size={16} />
           <div>
-            <strong>权限审批</strong>
+            <strong>{t("chat.approval.title")}</strong>
             <span>{description}</span>
           </div>
         </div>
@@ -70,7 +72,7 @@ export function AgentApprovalPrompt({
               type="button"
             >
               <Icon name={action.icon} size={14} />
-              <span>{submitting === action.choice ? "提交中" : action.label}</span>
+              <span>{submitting === action.choice ? t("chat.approval.submitting") : t(action.labelKey)}</span>
             </button>
           ))}
         </div>

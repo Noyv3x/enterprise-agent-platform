@@ -12,6 +12,7 @@
 import { api, isApiError, isApiRequestCancelled, resetApiSession } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
+import { t } from "../i18n";
 import { hasPermission, isAdmin } from "../store/selectors";
 import { revokeAttachmentUrls } from "../utils/composerFiles";
 import type { ActiveView, AuthMeResponse, LoginResponse } from "../types";
@@ -64,7 +65,7 @@ export function resetSession(
 export function handleSessionExpired(store: AppStore): void {
   if (!store.getState().user) return;
   resetSession(store);
-  toast("会话已过期，请重新登录", { type: "error", title: "需要登录" });
+  toast(t("session.expired"), { type: "error", title: t("session.loginRequired") });
 }
 
 export function logout(store: AppStore): Promise<void> {
@@ -94,7 +95,9 @@ export async function runBusy(store: AppStore, fn: () => Promise<void> | void): 
     if (isApiRequestCancelled(error)) return;
     const message = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: message });
-    if (store.getState().user) toast(message, { type: "error", title: "操作失败" });
+    if (store.getState().user) {
+      toast(message, { type: "error", title: t("toast.operationFailed") });
+    }
   } finally {
     store.dispatch({ type: "END_BUSY", payload: operationId });
   }

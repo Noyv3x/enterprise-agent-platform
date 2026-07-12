@@ -12,10 +12,29 @@ import type { RuntimeRow } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Icon } from "../../common/Icon";
 import { StatusBadge } from "../../common/StatusBadge";
+import { useI18n, type Translator } from "../../../i18n";
+
+function runtimeStateLabel(t: Translator, state: string | undefined, available: boolean): string {
+  switch (String(state || "").toLowerCase()) {
+    case "ready": case "running": return t("admin.runtime.ready");
+    case "down": case "stopped": return t("admin.runtime.down");
+    case "starting": return t("admin.runtime.starting");
+    case "error": case "failed": return t("admin.runtime.error");
+    case "external": return t("admin.runtime.external");
+    case "prepared": return t("admin.runtime.prepared");
+    case "missing": return t("admin.runtime.missing");
+    case "degraded": return t("admin.runtime.degraded");
+    case "installed": return t("admin.runtime.installed");
+    case "install_failed": return t("admin.runtime.installFailed");
+    case "invalid_config": return t("admin.runtime.invalidConfig");
+    default: return state || t(available ? "admin.runtime.ready" : "admin.runtime.down");
+  }
+}
 
 function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean }) {
   const store = useStoreHandle();
-  const restartLabel = runtime.managed && runtime.name !== "cognee" ? "重启" : "刷新";
+  const { t } = useI18n();
+  const restartLabel = t(runtime.managed && runtime.name !== "cognee" ? "admin.runtime.restart" : "admin.common.refresh");
   return (
     <div className="runtime-row">
       <div className="runtime-row__main">
@@ -24,7 +43,7 @@ function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean 
           <span className="runtime-row__name">{runtime.name}</span>
           <StatusBadge
             ok={!!runtime.available}
-            label={runtime.state || (runtime.available ? "ready" : "down")}
+            label={runtimeStateLabel(t, runtime.state, !!runtime.available)}
           />
         </div>
         <div className="runtime-row__detail">
@@ -35,7 +54,7 @@ function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean 
         {runtime.name === "hermes" ? (
           <button className="btn btn--sm" disabled={busy} onClick={() => void installHermes(store)}>
             <Icon name="download" size={14} />
-            <span>安装</span>
+            <span>{t("admin.runtime.install")}</span>
           </button>
         ) : null}
         <button
@@ -52,15 +71,16 @@ function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean 
 }
 
 export function RuntimeSettings() {
+  const { t } = useI18n();
   const busy = useStore((state) => state.busy);
   const runtimes = useStore((state) => state.runtimes);
 
   return (
     <section className="card">
       <CardHead
-        title="底层基座"
+        title={t("admin.runtime.title")}
         icon="server"
-        desc="平台托管的 Hermes / Cognee / Camofox / Firecrawl 运行时健康状态。"
+        desc={t("admin.runtime.description")}
       />
       <div className="list">
         {runtimes ? (
@@ -68,7 +88,7 @@ export function RuntimeSettings() {
             <RuntimeRowItem key={runtime.name} runtime={runtime} busy={busy} />
           ))
         ) : (
-          <div className="muted">正在读取运行时状态…</div>
+          <div className="muted">{t("admin.runtime.loading")}</div>
         )}
       </div>
     </section>

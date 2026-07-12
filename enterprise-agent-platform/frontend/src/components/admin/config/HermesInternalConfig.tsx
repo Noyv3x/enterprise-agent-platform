@@ -20,6 +20,7 @@ import type { ConfigFieldDescriptor } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { ConfigForm } from "../../common/ConfigForm";
 import { RawYamlForm } from "./RawYamlForm";
+import { useI18n } from "../../../i18n";
 
 /** A stable signature that changes whenever a descriptor's value / configured /
  *  defaulted flags change, used to remount <ConfigForm> on a post-save refetch. */
@@ -30,6 +31,7 @@ function fieldsSignature(fields: ConfigFieldDescriptor[]): string {
 }
 
 export function HermesInternalConfig() {
+  const { t } = useI18n();
   const store = useStoreHandle();
   const hermesInternalConfig = useStore((state) => state.hermesInternalConfig);
   const internal = hermesInternalConfig?.internal || {};
@@ -42,7 +44,7 @@ export function HermesInternalConfig() {
 
   return (
     <section className="card config-software">
-      <CardHead title="Hermes 内部配置" icon="settings" desc={internal.config_path || "config.yaml"} />
+      <CardHead title={t("admin.config.hermesInternal.title")} icon="settings" desc={internal.config_path || "config.yaml"} />
       {internal.yaml_error ? <div className="config-warning">{internal.yaml_error}</div> : null}
       {internal.default_error ? <div className="config-warning">{internal.default_error}</div> : null}
       <label className="check-row config-yolo">
@@ -55,8 +57,8 @@ export function HermesInternalConfig() {
           type="checkbox"
         />
         <span className="check-row__text">
-          <strong>YOLO 权限绕过</strong>
-          <span>{yoloEnabled ? "已关闭危险操作审批" : `当前审批模式: ${approvalMode || "manual"}`}</span>
+          <strong>{t("admin.config.hermesInternal.yolo")}</strong>
+          <span>{yoloEnabled ? t("admin.config.hermesInternal.yoloEnabled") : t("admin.config.hermesInternal.approvalMode", { mode: approvalMode || "manual" })}</span>
         </span>
       </label>
       {sections.length ? (
@@ -73,7 +75,7 @@ export function HermesInternalConfig() {
         key={`fields:${fieldsSignature(fields)}`}
         fields={fields}
         attr="yamlKey"
-        buttonText="保存 Hermes 字段"
+        buttonText={t("admin.config.hermesInternal.saveFields")}
         onSubmit={(updates) => saveHermesYamlFields(store, updates)}
       />
       <RawYamlForm
@@ -84,7 +86,7 @@ export function HermesInternalConfig() {
         key={`env:${fieldsSignature(envFields)}`}
         fields={envFields}
         attr="envKey"
-        buttonText="保存 Hermes 环境变量"
+        buttonText={t("admin.config.hermesInternal.saveEnv")}
         onSubmit={(updates) => saveHermesEnv(store, updates)}
       />
     </section>

@@ -11,8 +11,8 @@ export const SSE_RECONNECT_MS = 3000;
 export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   {
     id: "admin",
-    label: "管理员",
-    description: "管理账户、模型配置和平台运行时。",
+    label: "admin",
+    description: "admin",
     permissions: [
       "read_workspace",
       "chat",
@@ -25,8 +25,8 @@ export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   },
   {
     id: "manager",
-    label: "经理",
-    description: "管理频道和知识库，并使用 ubitech agent。",
+    label: "manager",
+    description: "manager",
     permissions: [
       "read_workspace",
       "chat",
@@ -37,37 +37,37 @@ export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   },
   {
     id: "member",
-    label: "成员",
-    description: "使用频道、知识库和私人 Agent。",
+    label: "member",
+    description: "member",
     permissions: ["read_workspace", "chat", "private_agent"],
   },
   {
     id: "viewer",
-    label: "只读",
-    description: "只能查看频道消息和知识库。",
+    label: "viewer",
+    description: "viewer",
     permissions: ["read_workspace"],
   },
 ];
 
 export const THINKING_DEPTH_OPTIONS: ThinkingDepthOption[] = [
-  ["none", "关闭"],
-  ["minimal", "极低"],
-  ["low", "低"],
-  ["medium", "中"],
-  ["high", "高"],
-  ["xhigh", "超高"],
+  ["none", "none"],
+  ["minimal", "minimal"],
+  ["low", "low"],
+  ["medium", "medium"],
+  ["high", "high"],
+  ["xhigh", "xhigh"],
 ];
 
 export const ADMIN_PAGES: AdminPage[] = [
-  { id: "accounts", label: "账户权限", icon: "users", description: "账户、权限组与个人模型策略。" },
-  { id: "tokens", label: "Token 监控", icon: "barChart", description: "按账户、私聊/频道、供应商和模型查看消耗。" },
-  { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
-  { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
-  { id: "telegram", label: "Telegram", icon: "message", description: "Telegram 私聊网关与用户绑定状态。" },
-  { id: "updates", label: "自动更新", icon: "refresh", description: "监听上游代码提交并自动拉取部署。" },
-  { id: "security", label: "公网安全", icon: "key", description: "反向代理、Cookie 与启动安全项。" },
-  { id: "runtime", label: "运行时", icon: "server", description: "底层基座服务健康状态。" },
-  { id: "hermes", label: "Hermes", icon: "settings", description: "Hermes config.yaml 与环境变量。" },
-  { id: "cognee", label: "Cognee", icon: "library", description: "Cognee 环境变量配置。" },
-  { id: "secrets", label: "密钥", icon: "key", description: "平台内部密钥。" },
+  { id: "accounts", label: "accounts", icon: "users", description: "accounts" },
+  { id: "tokens", label: "tokens", icon: "barChart", description: "tokens" },
+  { id: "messages", label: "messages", icon: "message", description: "messages" },
+  { id: "model", label: "model", icon: "shield", description: "model" },
+  { id: "telegram", label: "Telegram", icon: "message", description: "telegram" },
+  { id: "updates", label: "updates", icon: "refresh", description: "updates" },
+  { id: "security", label: "security", icon: "key", description: "security" },
+  { id: "runtime", label: "runtime", icon: "server", description: "runtime" },
+  { id: "hermes", label: "Hermes", icon: "settings", description: "hermes" },
+  { id: "cognee", label: "Cognee", icon: "library", description: "cognee" },
+  { id: "secrets", label: "secrets", icon: "key", description: "secrets" },
 ];

@@ -5,6 +5,7 @@
    §7 flags as a migration opportunity); search keeps the prior list visible. */
 
 import type { ReactNode } from "react";
+import { useI18n } from "../../i18n";
 import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Spinner } from "../common/Spinner";
@@ -27,6 +28,7 @@ export function DocumentList({
   selectedId,
   onView,
 }: DocumentListProps) {
+  const { t } = useI18n();
   let body: ReactNode;
   if (loading) {
     body = (
@@ -34,7 +36,7 @@ export function DocumentList({
         <div className="empty__icon">
           <Spinner size={26} />
         </div>
-        <p>加载中…</p>
+        <p>{t("knowledge.loading")}</p>
       </div>
     );
   } else if (items.length) {
@@ -50,12 +52,18 @@ export function DocumentList({
     body = (
       <EmptyState
         icon="search"
-        title="没有匹配结果"
-        text={`未找到与“${searchQuery}”相关的条目。`}
+        title={t("knowledge.noResults")}
+        text={t("knowledge.noResultsDetail", { query: searchQuery })}
       />
     );
   } else {
-    body = <EmptyState icon="doc" title="知识库为空" text="在左侧表单中录入第一条知识。" />;
+    body = (
+      <EmptyState
+        icon="doc"
+        title={t("knowledge.empty")}
+        text={t("knowledge.emptyDetail")}
+      />
+    );
   }
   return <div className="list">{body}</div>;
 }

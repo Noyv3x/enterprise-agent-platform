@@ -19,6 +19,7 @@
 import { api, isApiRequestCancelled, type ApiOptions } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
+import { t } from "../i18n";
 import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { optimisticAttachments } from "../utils/composerFiles";
 import { chatSnapshot } from "../utils/fingerprint";
@@ -220,7 +221,7 @@ function buildOptimisticMessage(
     scope_id: String(scopeId),
     author_type: "user",
     user_id: state.user?.id ?? null,
-    username: state.user?.display_name || state.user?.username || "你",
+    username: state.user?.display_name || state.user?.username || t("chat.you"),
     content,
     attachments: optimisticAttachments(files, seq),
     metadata: { local_pending: true },
@@ -280,7 +281,7 @@ export async function sendMessage(
     store.dispatch({ type: "REMOVE_OPTIMISTIC_MESSAGE", payload: { mode, scopeId, tempId: message.id } });
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
-    toast(text, { type: "error", title: "发送失败" });
+    toast(text, { type: "error", title: t("chat.sendFailed") });
     return false;
   }
 }
@@ -307,13 +308,13 @@ export async function respondAgentApproval(
       payload: { mode, scopeId, status: result.agent_status ?? null },
     });
     await refreshActiveChat(store);
-    toast("权限审批已提交", { type: "ok", title: "已处理" });
+    toast(t("chat.approvalSubmitted"), { type: "ok", title: t("chat.approvalProcessed") });
     return true;
   } catch (error) {
     if (isApiRequestCancelled(error)) return false;
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
-    toast(text, { type: "error", title: "审批失败" });
+    toast(text, { type: "error", title: t("chat.approvalFailed") });
     return false;
   }
 }

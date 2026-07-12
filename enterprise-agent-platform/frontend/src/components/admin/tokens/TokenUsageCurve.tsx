@@ -8,17 +8,19 @@ import { useMemo } from "react";
 import { formatCompactNumber, formatNumber } from "../../../utils/format";
 import { tokenCurve } from "../../../utils/tokenCurve";
 import type { TokenDailyUsageRow } from "../../../types";
+import { useI18n } from "../../../i18n";
 
 export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
-  const curve = useMemo(() => tokenCurve(rows), [rows]);
+  const { locale, t } = useI18n();
+  const curve = useMemo(() => tokenCurve(rows, locale), [rows, locale]);
   const { width, height, padX, padY, daily, points, linePath, areaPath, total } = curve;
 
   return (
     <div className="token-curve">
       <div className="token-curve__head">
         <div>
-          <strong>近 7 日消耗曲线</strong>
-          <span>{`${formatNumber(total)} tokens`}</span>
+          <strong>{t("admin.tokens.curve.title")}</strong>
+          <span>{t("admin.tokens.tokenCount", { count: formatNumber(total) })}</span>
         </div>
         <span className="muted">
           {daily.length ? `${daily[0].label} - ${daily[daily.length - 1].label}` : ""}
@@ -28,7 +30,7 @@ export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
         className="token-curve__svg"
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label="近 7 日 token 消耗曲线"
+        aria-label={t("admin.tokens.curve.ariaLabel")}
         preserveAspectRatio="none"
       >
         <line
@@ -48,7 +50,7 @@ export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
             cy={point.y.toFixed(1)}
             r={4}
           >
-            <title>{`${point.date}: ${formatNumber(point.total_tokens)} tokens`}</title>
+            <title>{t("admin.tokens.curve.point", { date: point.label, count: formatNumber(point.total_tokens) })}</title>
           </circle>
         ))}
       </svg>
