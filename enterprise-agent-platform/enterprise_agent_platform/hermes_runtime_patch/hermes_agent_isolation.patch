@@ -649,8 +649,8 @@ index a0b6dfd09..3b6b569a2 100644
 -        exact = self.get_session_by_title(title)
 +        clean_session_key = str(session_key or "").strip()
 +
-+        # First try exact match. Scoped enterprise agents resolve inside their
-+        # own durable session_key so a duplicate title in another agent cannot
++        # First try exact match. Scoped agents resolve inside their own
++        # durable session_key so a duplicate title in another agent cannot
 +        # win the lookup before the caller-side visibility check.
 +        if clean_session_key:
 +            with self._lock:
@@ -1412,8 +1412,8 @@ index 08eeaa470..36087cfe7 100644
 +    """Return the profile-scoped memories directory.
 +
 +    Without a scope key this preserves the historical profile-level memory
-+    files. Gateway/API agents pass a stable session key so each enterprise
-+    agent gets its own MEMORY.md and USER.md under ``memories/agents/``.
++    files. Gateway/API agents pass a stable session key so each agent gets its
++    own MEMORY.md and USER.md under ``memories/agents/``.
 +    """
 +    base = get_hermes_home() / "memories"
 +    clean_scope = str(scope_key or "").strip()
@@ -1844,8 +1844,8 @@ index 44ef03af7..7b0640d3f 100644
 -    ``"default"`` here so subagents share the parent's long-lived container
 -    (one bash, one /workspace, one set of installed packages).
 +    Gateway/API sessions that provide ``HERMES_SESSION_KEY`` get a container
-+    key derived from that stable agent scope, so enterprise private/channel
-+    agents do not share live cwd, background processes, or sandbox state.
++    key derived from that stable agent scope, so private/channel agents do not
++    share live cwd, background processes, or sandbox state.
 +    ``delegate_task`` children inherit the same context var and therefore
 +    share their parent agent's workspace, while their own task_id still keeps
 +    file-state tracking and TUI events distinct.

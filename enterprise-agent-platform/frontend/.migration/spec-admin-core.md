@@ -63,7 +63,7 @@ Each item: `{ id, label, icon, description }`.
 
 | id | label | icon | description |
 |----|-------|------|-------------|
-| accounts | 账户权限 | users | 企业账户、权限组与个人模型策略。 |
+| accounts | 账户权限 | users | 账户、权限组与个人模型策略。 |
 | tokens | Token 监控 | barChart | 按账户、私聊/频道、供应商和模型查看消耗。 |
 | messages | 消息审计 | message | 频道消息删除与私人 Agent 会话审计。 |
 | model | 模型接入 | shield | OAuth 供应商验证与 Hermes API 参数。 |
@@ -162,15 +162,15 @@ React: `AdminPanel` renders `<AdminPageContent pageId>` which switches on pageId
 ## 2. Account Management
 
 ### 2.1 `renderAccountManagement()` (line 1425) — `AccountManagement`
-Purpose: create new enterprise account + list/edit existing accounts.
+Purpose: create a new account + list/edit existing accounts.
 
 Markup:
 ```
 section.card.account-admin
-  <cardHead "企业账户" "users">          // div.card__head
+  <cardHead "账户" "users">              // div.card__head
   <CreateAccountForm form.account-create>
   div.account-list
-    [ <AccountRow> per user ]  OR  div.muted text "暂无企业账户。"
+    [ <AccountRow> per user ]  OR  div.muted text "暂无账户。"
 ```
 State read: `state.permissionGroups` (fallback `FALLBACK_PERMISSION_GROUPS` if empty),
 `state.users`, `state.busy`, plus (indirectly) `state.hermesConfig`/`state.oauthProviders`
@@ -205,7 +205,7 @@ body JSON: {
 - Values come from each input's `.value` (model from `accountModel.select.value`).
 - On success: clear `username/display_name/password/position/model_name` to `""`,
   reset `permission_group="member"`, `thinking_depth="medium"`,
-  then `await loadUsers()`, then `toast("企业账户已创建", {type:"ok", title:"完成"})`.
+  then `await loadUsers()`, then `toast("账户已创建", {type:"ok", title:"完成"})`.
 
 ### 2.3 `renderAccountRow(user, groups)` (line 1483) — `AccountRow`
 Purpose: inline edit form for one user.

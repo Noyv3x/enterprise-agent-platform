@@ -1,6 +1,6 @@
-# 企业 Agent 平台
+# ubitech agent
 
-这是本工作区中 `hermes-agent` 和 `cognee` 本地仓库之上的企业平台层。平台负责默认的 Hermes 和 Cognee 运行时设置：准备 Hermes profile、安装并启用企业知识插件、启动 Hermes API server，并让 Cognee 使用平台托管的本地存储。
+这是本工作区中 `hermes-agent` 和 `cognee` 本地仓库之上的 ubitech agent 应用层。平台负责默认的 Hermes 和 Cognee 运行时设置：准备 Hermes profile、安装并启用知识插件、启动 Hermes API server，并让 Cognee 使用平台托管的本地存储。
 
 平台提供：
 
@@ -8,7 +8,7 @@
 - 基于频道的 Web 聊天。每个频道会路由到一个共享的 Hermes 主 Agent 线程。
 - 按用户隔离的私人 Agent，以及按频道隔离的主 Agent。每个 Agent 拥有独立工作区、会话、记忆和浏览器 Profile，并由可信的平台服务账号在宿主机执行。
 - Codex OAuth 和 Grok OAuth 两种模型供应商验证。用户无需在私人 Agent 会话中输入模型密钥。
-- 企业知识库，支持文档写入、搜索、每轮被动建议、可选 Cognee 混合索引，以及 Hermes 工具调用。
+- 知识库，支持文档写入、搜索、每轮被动建议、可选 Cognee 混合索引，以及 Hermes 工具调用。
 - 可在 Web 设置页管理 Hermes 和 Cognee 运行时。
 
 ## 运行
@@ -153,7 +153,7 @@ Agent 终端固定由平台服务账号在宿主机执行，不创建每用户 D
 `data/workspaces/channels/channel-<id>`；工作区、会话、记忆和浏览器 Profile 按稳定的
 Agent scope 分开。
 
-这是面向可信企业成员的逻辑隔离，不是恶意租户安全沙箱。同一服务账号执行的 shell
+这是面向可信内部成员的逻辑隔离，不是恶意租户安全沙箱。同一服务账号执行的 shell
 命令理论上可以通过绝对路径访问该账号可读的其他数据；敏感命令仍需按当前运行审批。
 
 ## 前端开发

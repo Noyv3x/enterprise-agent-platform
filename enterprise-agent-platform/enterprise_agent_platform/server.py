@@ -977,7 +977,7 @@ def make_server(config: PlatformConfig | None = None, service: EnterpriseService
 def run_server(config: PlatformConfig | None = None) -> None:
     server = make_server(config)
     host, port = server.server_address[:2]
-    print(f"Enterprise Agent Platform running at http://{host}:{port}")
+    print(f"ubitech agent running at http://{host}:{port}")
     bootstrap_password_path = server.service.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE
     if bootstrap_password_path.exists():
         print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")

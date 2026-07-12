@@ -24,7 +24,7 @@ export function KnowledgeCreateCard() {
 
   return (
     <section className="card">
-      <CardHead title="新增条目" icon="plus" desc="结构化录入企业知识，供 Agent 检索引用。" />
+      <CardHead title="新增条目" icon="plus" desc="结构化录入知识，供 Agent 检索引用。" />
       <form
         onSubmit={(event) => {
           event.preventDefault();

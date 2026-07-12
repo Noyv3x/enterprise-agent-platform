@@ -12,7 +12,7 @@ from .service import EnterpriseService
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Enterprise Agent Platform")
+    parser = argparse.ArgumentParser(description="ubitech agent")
     sub = parser.add_subparsers(dest="cmd")
 
     serve = sub.add_parser("serve", help="Start the web platform")

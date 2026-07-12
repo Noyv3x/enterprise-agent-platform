@@ -100,7 +100,7 @@ export function topbarInfo(state: AppState): TopbarInfo {
     return { title: "私人 Agent", icon: "bot", sub: active || "仅你可见的私有助手会话" };
   }
   if (state.activeView === "knowledge") {
-    return { title: "企业知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
+    return { title: "知识库", icon: "library", sub: `${state.documents.length} 篇文档` };
   }
   if (state.activeView === "admin") {
     return { title: "管理面板", icon: "shield", sub: activeAdminPage(state).description };

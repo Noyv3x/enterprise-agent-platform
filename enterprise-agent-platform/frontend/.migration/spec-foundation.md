@@ -422,7 +422,7 @@ These are tiny pure builders — straight ports to presentational React componen
 
 | Fn | Output (markup) | Notes |
 |---|---|---|
-| `brand()` | `.brand` > `img.brand__logo[src=/ubitech-logo.png alt=ubitech]` + `span.brand__eyebrow "Agent Platform"` | Static. |
+| `brand()` | `.brand` > `img.brand__logo[src=/ubitech-logo.png alt=ubitech]` + `span.brand__eyebrow "agent"` | Static. |
 | `field(label, control)` | `label.field` > `span{label}` + control | Wrap a labeled control. In React: `<Field label>{control}</Field>`. The `<label>` wraps the control (implicit association) — preserve for a11y. |
 | `cardHead(title, iconName, {desc, extra})` | `.card__head` > `div`( `.card__title`(optional icon + `span{title}`) + optional `.card__desc{desc}` ) + optional `extra` | Reusable card header. |
 | `statusBadge(ok, label)` | `span.status.status--{ok?ok:warn}` > `span.dot[.dot--warn if !ok]` + textNode(label) | Status pill. |

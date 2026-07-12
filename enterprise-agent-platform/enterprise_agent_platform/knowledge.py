@@ -13,7 +13,7 @@ def _resolve_max_content_chars() -> int:
     """Per-document content cap (characters).
 
     Defaults generously (~2M characters, well below the 5MB request-body cap)
-    so legitimate long enterprise documents are accepted while a handful of
+    so legitimate long knowledge documents are accepted while a handful of
     pathologically large docs cannot bloat the FTS index or Cognee ingestion.
     A value <= 0 disables the limit.
     """
@@ -300,7 +300,7 @@ def format_passive_suggestions(hits: list[KnowledgeHit]) -> str:
     if not hits:
         return ""
     lines = [
-        '检测到企业知识库中的以下条目可能对当前工作有帮助。若需要完整内容，请调用工具 enterprise_kb_read；若需要更多条目，请调用 enterprise_kb_search。'
+        '检测到知识库中的以下条目可能对当前工作有帮助。若需要完整内容，请调用工具 enterprise_kb_read；若需要更多条目，请调用 enterprise_kb_search。'
     ]
     for hit in hits:
         lines.append(f"- kb:{hit.id} | {hit.title}: {hit.summary}")

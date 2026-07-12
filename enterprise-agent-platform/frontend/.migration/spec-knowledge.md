@@ -42,7 +42,7 @@ state.knowledgeSearch = { query: "", results: null };   // resets any active sea
 Note: every `loadDocuments` (nav-in AND post-create) **clears the active search**.
 
 ### Topbar (`topbarInfo`, line 566)
-When `activeView === "knowledge"`: `{ title: "企业知识库", icon: "library", sub: \`${state.documents.length} 篇文档\` }`. The doc count is read live from `state.documents.length` (NOT the search result count).
+When `activeView === "knowledge"`: `{ title: "知识库", icon: "library", sub: \`${state.documents.length} 篇文档\` }`. The doc count is read live from `state.documents.length` (NOT the search result count).
 
 ### No polling / no SSE for knowledge
 `loadDocuments` runs only on nav-in and after a successful create. There is no interval, SSE, or `requestAnimationFrame` work tied to knowledge. (Global render plumbing's `afterRender`/`syncScopeStream` runs but does nothing for this view.)
@@ -77,7 +77,7 @@ div.panel
 ### 3a. Create card — `section.card` "新增条目" (lines 1267–1289, gated by `canManage`)
 ```
 section.card
-  cardHead("新增条目","plus",{desc:"结构化录入企业知识，供 Agent 检索引用。"})
+  cardHead("新增条目","plus",{desc:"结构化录入知识，供 Agent 检索引用。"})
     div.card__head > div > (div.card__title[icon(plus)+span] + div.card__desc) + null
   form (onsubmit -> create)
     field("标题",   input  placeholder="标题")
@@ -122,7 +122,7 @@ div.doc-card
 listSource = isSearching ? searchResults : state.documents
 emptyCard  = isSearching
   ? emptyState("search","没有匹配结果",`未找到与“${searchQuery}”相关的条目。`)
-  : emptyState("doc","知识库为空","在左侧表单中录入第一条企业知识。")
+  : emptyState("doc","知识库为空","在左侧表单中录入第一条知识。")
 docCards   = listSource.length ? listSource.map(docCard) : [emptyCard]
 ```
 `emptyState(icon,title,text)` = `div.empty > div.empty__icon[icon(size26)] + h3(title) + p(text)` (line 358).
@@ -209,7 +209,7 @@ div.doc-viewer
 ## 7. Edge cases / gating / states
 
 - **Permission gating**: `canManage = hasPermission("manage_knowledge")` (admin OR has the permission). When false: create card is omitted and the grid switches to `.kb-grid--single`. The library card (read + search + view) is always present (assumes `read_workspace`; non-`read_workspace` users would 401 on load → `handleSessionExpired`/error toast). `hasPermission` returns true for admins regardless of explicit permission.
-- **Empty list (not searching)**: shows `emptyState("doc","知识库为空","在左侧表单中录入第一条企业知识。")`.
+- **Empty list (not searching)**: shows `emptyState("doc","知识库为空","在左侧表单中录入第一条知识。")`.
 - **Empty search results**: shows `emptyState("search","没有匹配结果", …query…)`. The `.list__note` still shows `…：0 条结果` + "显示全部".
 - **Loading state**: there is NO skeleton/spinner in the view. During `withBusy`, only the create submit button is `disabled`. Because `state.documents` starts `[]`, the FIRST nav-in renders the "知识库为空" empty card for one frame before data arrives → visible flash. (Migration opportunity: gate on a loading flag.)
 - **Search-input value flash (existing quirk)**: the search input is uncontrolled with `value=searchQuery` set per render. On submit, `withBusy` re-renders with `busy=true` BEFORE `state.knowledgeSearch.query` is updated, so the input momentarily reverts to the previous query (empty on first search) and then snaps to the new query once the request resolves. Reproduce-or-fix decision belongs to the React port (see §9).

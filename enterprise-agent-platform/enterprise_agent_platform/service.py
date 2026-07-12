@@ -197,7 +197,7 @@ OAUTH_PROVIDER_SECRET_KEYS = {
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     "admin": {
         "label": "管理员",
-        "description": "管理企业账户、模型配置和平台运行时。",
+        "description": "管理账户、模型配置和平台运行时。",
         "permissions": [
             PERMISSION_READ_WORKSPACE,
             PERMISSION_CHAT,
@@ -210,7 +210,7 @@ PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     },
     "manager": {
         "label": "经理",
-        "description": "管理频道和知识库，并使用企业 Agent。",
+        "description": "管理频道和知识库，并使用 ubitech agent。",
         "permissions": [
             PERMISSION_READ_WORKSPACE,
             PERMISSION_CHAT,
@@ -230,7 +230,7 @@ PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     },
     "viewer": {
         "label": "只读",
-        "description": "只能查看频道消息和企业知识。",
+        "description": "只能查看频道消息和知识库。",
         "permissions": [PERMISSION_READ_WORKSPACE],
     },
 }
@@ -430,7 +430,7 @@ class EnterpriseService:
 
         SQLite serializes individual writes but cannot make the platform's
         in-memory workers, lifecycle epochs, and external side effects a
-        multi-process transaction. The supported small-enterprise deployment is
+        multi-process transaction. The supported small trusted deployment is
         therefore explicitly single-instance. ``flock`` is released by the
         kernel on process death, making startup recovery proof that no prior
         owner is still processing Telegram updates or Agent jobs.
@@ -444,7 +444,7 @@ class EnterpriseService:
         except BlockingIOError as exc:
             os.close(fd)
             raise RuntimeError(
-                f"another enterprise platform instance is already using {self.config.data_dir}"
+                f"another ubitech agent instance is already using {self.config.data_dir}"
             ) from exc
         except Exception:
             os.close(fd)
@@ -5882,10 +5882,10 @@ class EnterpriseService:
     def _channel_system_prompt(self, channel: dict[str, Any], suggestions) -> str:
         passive = format_passive_suggestions(suggestions)
         return (
-            "你是 ubitech 的企业级 Agent。对外介绍自己时，只说自己是 ubitech 的企业级 Agent；"
+            "你是 ubitech agent。对外介绍自己时，只说自己是 ubitech agent；"
             "不要提及底层框架、运行时、模型供应商或内部实现。\n"
-            f"当前工作模式: 频道协作。频道: #{channel['name']}。请保留上下文连续性，明确区分用户请求和企业事实。\n"
-            "企业知识库已作为工具暴露给你: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
+            f"当前工作模式: 频道协作。频道: #{channel['name']}。请保留上下文连续性，明确区分用户请求和知识库事实。\n"
+            "知识库已作为工具暴露给你: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
             "当提示中出现 kb:<id> 时，优先用 enterprise_kb_read 读取完整条目再作答。\n"
             f"{passive}"
         )
@@ -5898,13 +5898,13 @@ class EnterpriseService:
     ) -> str:
         passive = format_passive_suggestions(suggestions)
         return (
-            "你是 ubitech 的企业级 Agent。对外介绍自己时，只说自己是 ubitech 的企业级 Agent；"
+            "你是 ubitech agent。对外介绍自己时，只说自己是 ubitech agent；"
             "不要提及底层框架、运行时、模型供应商或内部实现。\n"
-            "当前工作模式: 私人助手。每个用户拥有独立工作区、记忆和会话；命令在受信任的企业宿主机执行。\n"
+            "当前工作模式: 私人助手。每个用户拥有独立工作区、记忆和会话；命令在受信任的宿主机执行。\n"
             f"当前用户: {self._actor_context_label(actor, include_username=True, include_empty_position=True)}。\n"
             f"工作区: {agent_scope.workspace_path}；会话: {agent_scope.session_id}。\n"
             "模型密钥由平台集中配置，不要要求用户再次提供密钥。\n"
-            "企业知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
+            "知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
             f"{passive}"
         )
 

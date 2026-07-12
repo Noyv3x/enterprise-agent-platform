@@ -1,4 +1,4 @@
-"""Hermes plugin exposing Enterprise Agent Platform knowledge tools."""
+"""Hermes plugin exposing ubitech agent knowledge tools."""
 
 from __future__ import annotations
 
@@ -28,13 +28,13 @@ def _get_json(path: str) -> dict[str, Any]:
 
 
 def enterprise_kb_search(query: str, limit: int = 5) -> str:
-    """Search enterprise knowledge-base entries by natural-language query."""
+    """Search knowledge-base entries by natural-language query."""
     qs = urllib.parse.urlencode({"q": query, "limit": max(1, min(int(limit), 10))})
     return json.dumps(_get_json(f"/api/agent/tools/knowledge/search?{qs}"), ensure_ascii=False)
 
 
 def enterprise_kb_read(document_id: int) -> str:
-    """Read the full content of one enterprise knowledge-base document."""
+    """Read the full content of one knowledge-base document."""
     return json.dumps(_get_json(f"/api/agent/tools/knowledge/documents/{int(document_id)}"), ensure_ascii=False)
 
 
@@ -46,7 +46,7 @@ def register(ctx):
             "type": "function",
             "function": {
                 "name": "enterprise_kb_search",
-                "description": "Search the enterprise knowledge base. Use when the platform suggests kb entries or when company context may matter.",
+                "description": "Search the knowledge base. Use when the platform suggests kb entries or when shared context may matter.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -59,7 +59,7 @@ def register(ctx):
         },
         handler=lambda args: enterprise_kb_search(args.get("query", ""), args.get("limit", 5)),
         requires_env=["ENTERPRISE_PLATFORM_URL", "ENTERPRISE_AGENT_TOOL_TOKEN"],
-        description="Search the Enterprise Agent Platform knowledge base.",
+        description="Search the ubitech agent knowledge base.",
         emoji="📚",
     )
     ctx.register_tool(
@@ -69,7 +69,7 @@ def register(ctx):
             "type": "function",
             "function": {
                 "name": "enterprise_kb_read",
-                "description": "Read a full enterprise knowledge-base document by id.",
+                "description": "Read a full knowledge-base document by id.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -81,6 +81,6 @@ def register(ctx):
         },
         handler=lambda args: enterprise_kb_read(args.get("document_id")),
         requires_env=["ENTERPRISE_PLATFORM_URL", "ENTERPRISE_AGENT_TOOL_TOKEN"],
-        description="Read an Enterprise Agent Platform knowledge-base document.",
+        description="Read a ubitech agent knowledge-base document.",
         emoji="📖",
     )

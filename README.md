@@ -1,12 +1,12 @@
-# 企业 Agent 平台工作区
+# ubitech agent 工作区
 
-本仓库用于管理基于本地 Hermes Agent 和 Cognee 代码库构建的企业 Agent 平台。
+本仓库用于管理基于本地 Hermes Agent 和 Cognee 代码库构建的 ubitech agent。
 
 ## 目录结构
 
-- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、宿主机工作区、Codex OAuth/Grok OAuth 供应商验证、企业知识库、测试，以及 Hermes 知识工具插件。
+- `enterprise-agent-platform/`：平台 Web 层，包含账号登录、频道聊天、私人 Agent、宿主机工作区、Codex OAuth/Grok OAuth 供应商验证、知识库、测试，以及 Hermes 知识工具插件。
 - `hermes-agent/`：指向 `NousResearch/hermes-agent` 的 Git submodule，用作 Agent 运行时和 OpenAI 兼容 API 后端。
-- `cognee/`：指向 `topoteretes/cognee` 的 Git submodule，用作可选的企业知识图谱后端。
+- `cognee/`：指向 `topoteretes/cognee` 的 Git submodule，用作可选的知识图谱后端。
 
 ## 快速开始
 

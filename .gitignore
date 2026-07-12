@@ -14,7 +14,7 @@ htmlcov/
 venv/
 env/
 
-# Enterprise platform runtime state
+# Platform runtime state
 /data/
 enterprise-agent-platform/data/
 enterprise-agent-platform/.env

@@ -1,1 +1,1 @@
-"""Bundled Hermes plugins managed by Enterprise Agent Platform."""
+"""Bundled Hermes plugins managed by ubitech agent."""

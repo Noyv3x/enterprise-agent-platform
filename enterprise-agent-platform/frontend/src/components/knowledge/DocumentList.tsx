@@ -55,7 +55,7 @@ export function DocumentList({
       />
     );
   } else {
-    body = <EmptyState icon="doc" title="知识库为空" text="在左侧表单中录入第一条企业知识。" />;
+    body = <EmptyState icon="doc" title="知识库为空" text="在左侧表单中录入第一条知识。" />;
   }
   return <div className="list">{body}</div>;
 }

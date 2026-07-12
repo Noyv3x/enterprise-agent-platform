@@ -1,4 +1,4 @@
-"""Enterprise agent platform package."""
+"""ubitech agent package."""
 
 __all__ = ["__version__"]
 

@@ -123,7 +123,7 @@ export function TokenUsageMonitoring() {
 
       <UsageTable<TokenAccountRow>
         title="按账户汇总"
-        desc="每个企业账户在当前时间范围内触发的 Agent token 消耗。"
+        desc="每个账户在当前时间范围内触发的 Agent token 消耗。"
         icon="users"
         headers={["账户", "调用", "输入", "输出", "总计", "最近使用"]}
         rows={accountRows}

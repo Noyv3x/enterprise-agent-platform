@@ -1,7 +1,7 @@
 """Runtime patches for managed Hermes Agent processes.
 
-This module is loaded by Python's sitecustomize hook when Enterprise Agent
-Platform starts the managed Hermes gateway. Keep it narrow: it patches only
+This module is loaded by Python's sitecustomize hook when ubitech agent starts
+the managed Hermes gateway. Keep it narrow: it patches only
 known integration issues in the embedded Hermes runtime and leaves standalone
 Hermes installs untouched.
 """
@@ -343,7 +343,7 @@ def _install_auxiliary_response_stream_patch() -> None:
         # bump. This silently disables the auxiliary Codex raw-stream/backfill
         # behavior, so make it operator-visible rather than a quiet no-op.
         logger.warning(
-            "Enterprise Hermes patch: auxiliary_client present but "
+            "Managed Hermes patch: auxiliary_client present but "
             "_CodexCompletionsAdapter missing; auxiliary Codex stream patch "
             "not applied (upstream drift?)"
         )
@@ -504,7 +504,7 @@ def _install_api_async_delegation_patch() -> None:
             _init_async_store(self)
         except Exception as exc:
             _record_patch_status("api_async", f"storage_error:{type(exc).__name__}")
-            logger.error("Enterprise Hermes patch: async outbox unavailable: %s", exc)
+            logger.error("Managed Hermes patch: async outbox unavailable: %s", exc)
         self._enterprise_run_scopes = {}
         self._enterprise_cancelled_lifecycles = set()
         self._enterprise_cancelled_lifecycle_order = deque()
@@ -514,12 +514,12 @@ def _install_api_async_delegation_patch() -> None:
         lifecycle_id = str(request.headers.get("X-Enterprise-Agent-Lifecycle", "") or "").strip()
         if lifecycle_id and not re.fullmatch(r"[0-9a-f]{32}", lifecycle_id):
             return api_server_mod.web.json_response(
-                {"error": "invalid Enterprise Agent lifecycle"},
+                {"error": "invalid Agent lifecycle"},
                 status=400,
             )
         if scope_key and lifecycle_id and (scope_key, lifecycle_id) in self._enterprise_cancelled_lifecycles:
             return api_server_mod.web.json_response(
-                {"error": "Enterprise Agent lifecycle was cancelled"},
+                {"error": "Agent lifecycle was cancelled"},
                 status=409,
             )
         response = await original_handle_runs(self, request)
@@ -586,7 +586,7 @@ def _install_api_async_delegation_patch() -> None:
                     return True
                 except Exception as exc:
                     _record_patch_status("api_async", f"storage_error:{type(exc).__name__}")
-                    logger.error("Enterprise Hermes patch: failed to persist async completion: %s", exc)
+                    logger.error("Managed Hermes patch: failed to persist async completion: %s", exc)
                     return False
             if key in self._enterprise_async_delegation_seen:
                 return True
@@ -784,7 +784,7 @@ def _install_api_async_delegation_patch() -> None:
                 task = getattr(self, "_active_run_tasks", {}).get(run_id)
                 if agent is not None:
                     try:
-                        agent.interrupt("Enterprise Agent scope was reset")
+                        agent.interrupt("Agent scope was reset")
                     except Exception:
                         pass
                 if task is not None and not task.done():
@@ -807,7 +807,7 @@ def _install_api_async_delegation_patch() -> None:
                 cleanup_vm(task_id)
             remaining = len(process_registry.list_sessions(task_id=task_id)) if task_id else 0
         except Exception as exc:
-            logger.warning("Enterprise Hermes patch: scope cleanup failed for %s: %s", scope_key, exc)
+            logger.warning("Managed Hermes patch: scope cleanup failed for %s: %s", scope_key, exc)
             return api_server_mod.web.json_response(
                 {"error": "Agent scope cleanup failed", "scope_key": scope_key},
                 status=500,
@@ -871,7 +871,7 @@ def _install_api_async_delegation_patch() -> None:
     async def _inject_watch_notification(self: Any, synth_text: str, evt: dict[str, Any]) -> None:
         if _record_on_api_adapter(self, evt, synth_text):
             logger.info(
-                "Enterprise Hermes patch: queued async delegation completion for API session %s",
+                "Managed Hermes patch: queued async delegation completion for API session %s",
                 evt.get("session_key", ""),
             )
             return
@@ -991,5 +991,5 @@ for _component, _installer in (
     except Exception as exc:
         # Install each component independently: one upstream incompatibility
         # must not silently prevent unrelated safety/integration patches.
-        logger.warning("Enterprise Hermes runtime patch %s did not install: %s", _component, exc)
+        logger.warning("Managed Hermes runtime patch %s did not install: %s", _component, exc)
         _record_patch_status(_component, f"install_error:{type(exc).__name__}:{exc}")

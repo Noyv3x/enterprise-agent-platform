@@ -511,7 +511,7 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
     )
     lines = [
         "[Unit]",
-        "Description=Enterprise Agent Platform",
+        "Description=ubitech agent",
         "After=network-online.target",
         "Wants=network-online.target",
         "",
@@ -667,7 +667,7 @@ def _probe_http_ready(base_url: str) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Bootstrap and manage Enterprise Agent Platform deployment")
+    parser = argparse.ArgumentParser(description="Bootstrap and manage the ubitech agent deployment")
     sub = parser.add_subparsers(dest="cmd")
     bootstrap = sub.add_parser("bootstrap", help="One-command deployment bootstrap")
     add_bootstrap_args(bootstrap)
@@ -698,10 +698,10 @@ def bootstrap_from_args(args: argparse.Namespace) -> DeploymentResult:
         prepare_runtime=not args.skip_runtime_prepare,
     )
     if result.service_started:
-        print(f"Enterprise Agent Platform service started: {result.url}")
+        print(f"ubitech agent service started: {result.url}")
         print(f"Service file: {result.service_path}")
     elif result.mode == "prepare":
-        print(f"Enterprise Agent Platform prepared: {result.url}")
+        print(f"ubitech agent prepared: {result.url}")
     return result
 
 

@@ -281,7 +281,7 @@ All four go through `withBusy` (so they toggle `state.busy` and surface errors a
 | Method | Path | Body | Response | State |
 |---|---|---|---|---|
 | `GET` | `/api/system/oauth/credentials/export` | — | arbitrary JSON `payload` (the credentials bundle) | none (client download only) |
-- Builds `new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" })`, creates an object URL, programmatically clicks an `<a download="enterprise-oauth-credentials-{YYYY-MM-DD}.json">`, removes it, `URL.revokeObjectURL(url)`.
+- Builds `new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" })`, creates an object URL, programmatically clicks an `<a download="ubitech-agent-oauth-credentials-{YYYY-MM-DD}.json">`, removes it, `URL.revokeObjectURL(url)`.
 - Filename date = `new Date().toISOString().slice(0, 10)`.
 - Toast: `"OAuth 凭据文件已生成"` (ok / "完成").
 - React: use a `downloadJson(payload, filename)` helper; the anchor click + revoke pattern stays the same (no React node needed).

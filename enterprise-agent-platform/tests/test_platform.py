@@ -2553,7 +2553,8 @@ class PlatformServiceTests(unittest.TestCase):
                 service.send_private_message(alice, "draft a roadmap")
                 service.wait_for_agent_idle("private", str(alice["id"]))
                 private_prompt = agent.calls[-1]["system_prompt"]
-                self.assertIn("你是 ubitech 的企业级 Agent", private_prompt)
+                identity_prompt = "你是 ubitech agent。对外介绍自己时，只说自己是 ubitech agent；"
+                self.assertIn(identity_prompt, private_prompt)
                 self.assertIn("不要提及底层框架", private_prompt)
                 self.assertIn("当前用户: Alice (@alice)，职位: Product Manager", private_prompt)
                 self.assertNotIn("Hermes", private_prompt)
@@ -2561,6 +2562,7 @@ class PlatformServiceTests(unittest.TestCase):
                 service.send_channel_message(alice, 1, "@agent summarize status")
                 service.wait_for_agent_idle("channel", "1")
                 self.assertEqual(agent.calls[-1]["user_message"], "Alice，职位: Product Manager: summarize status")
+                self.assertIn(identity_prompt, agent.calls[-1]["system_prompt"])
             finally:
                 service.close()
 
@@ -3119,7 +3121,7 @@ class PlatformServiceTests(unittest.TestCase):
             config = make_config(Path(td))
             first = EnterpriseService(config, agent_client=RecordingAgent())
             try:
-                with self.assertRaisesRegex(RuntimeError, "another enterprise platform instance"):
+                with self.assertRaisesRegex(RuntimeError, "another ubitech agent instance"):
                     EnterpriseService(config, agent_client=RecordingAgent())
             finally:
                 first.close()

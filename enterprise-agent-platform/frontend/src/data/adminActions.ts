@@ -61,7 +61,7 @@ const RUNTIME_INSTALL_TIMEOUT_MS = 30 * 60_000;
 
 /* =============================================================== accounts */
 
-/** Create an enterprise account (legacy renderAccountManagement onsubmit,
+/** Create an account (legacy renderAccountManagement onsubmit,
  *  legacy-app.js:1438-1458). POST /api/users. `onSuccess` resets the form
  *  fields and runs inside runBusy so it only fires on a successful POST. */
 export async function createAccount(
@@ -76,11 +76,11 @@ export async function createAccount(
     });
     onSuccess?.();
     await loadUsers(store);
-    toast("企业账户已创建", { type: "ok", title: "完成" });
+    toast("账户已创建", { type: "ok", title: "完成" });
   });
 }
 
-/** Update an enterprise account (legacy renderAccountRow onsubmit,
+/** Update an account (legacy renderAccountRow onsubmit,
  *  legacy-app.js:1496-1514). PUT /api/users/{id} (NOT PATCH). */
 export async function updateAccount(
   store: AppStore,
@@ -571,7 +571,7 @@ export function setOAuthCallbackUrl(store: AppStore, providerId: string, value: 
 export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   await runBusy(store, async () => {
     const payload = await api(endpoints.exportOAuthCredentials.path());
-    downloadJson(payload, `enterprise-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
+    downloadJson(payload, `ubitech-agent-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
     toast("OAuth 凭据文件已生成", { type: "ok", title: "完成" });
   });
 }

@@ -1,4 +1,4 @@
-/* <AccountRow/> — inline edit form for one enterprise account (legacy
+/* <AccountRow/> — inline edit form for one account (legacy
    renderAccountRow, legacy-app.js:1483-1543). PUT /api/users/{id} (NOT PATCH).
    The "account enabled" checkbox is disabled for the current user (no
    self-disable). Password sent as "" when blank (= keep existing). On success the

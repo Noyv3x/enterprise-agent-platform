@@ -15,13 +15,13 @@ export function AccountManagement() {
 
   return (
     <section className="card account-admin">
-      <CardHead title="企业账户" icon="users" />
+      <CardHead title="账户" icon="users" />
       <CreateAccountForm groups={groups} />
       <div className="account-list">
         {users.length ? (
           users.map((user) => <AccountRow key={String(user.id)} user={user} groups={groups} />)
         ) : (
-          <div className="muted">暂无企业账户。</div>
+          <div className="muted">暂无账户。</div>
         )}
       </div>
     </section>

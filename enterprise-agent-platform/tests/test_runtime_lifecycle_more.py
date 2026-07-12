@@ -351,8 +351,8 @@ assert _session_scoped_container_task_id(scope) == expected_task_id
         self.assertIn("approval_session_key = run_id", patch_text)
         self.assertNotIn("approval_session_key = gateway_session_key", patch_text)
 
-        # Profile identity remains an upstream profile concept. Enterprise
-        # agent isolation travels separately as agent_scope_key.
+        # Profile identity remains an upstream profile concept. Platform agent
+        # isolation travels separately as agent_scope_key.
         self.assertNotIn('agent_identity"] = _agent_scope_key', patch_text)
         self.assertIn('agent_scope_key=getattr(agent, "_gateway_session_key", None)', patch_text)
 
@@ -365,7 +365,7 @@ assert _session_scoped_container_task_id(scope) == expected_task_id
         patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
         patch_text = patch_path.read_text(encoding="utf-8")
 
-        # Repeated cleanup of an already-removed enterprise sandbox must be a
+        # Repeated cleanup of an already-removed managed sandbox must be a
         # no-op, not a fallback that tears down Hermes' unscoped `default` env.
         self.assertIn(
             're.fullmatch(r"gateway-.+-[0-9a-f]{12}", str(task_id))',
@@ -385,7 +385,7 @@ assert _session_scoped_container_task_id(scope) == expected_task_id
         self.assertIn("len(requested_session_id) > self._MAX_SESSION_HEADER_LEN", patch_text)
 
         # Scoped session search must not resolve duplicate titles or explicit
-        # profile selectors outside the caller's enterprise Agent namespace.
+        # profile selectors outside the caller's Agent namespace.
         self.assertIn("session_key=current_session_key", patch_text)
         self.assertIn("Cross-profile session access is unavailable", patch_text)
 

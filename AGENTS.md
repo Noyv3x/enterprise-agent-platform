@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This workspace ties together an enterprise platform and three upstream codebases.
+This workspace ties together ubitech agent and three upstream codebases.
 
 - `enterprise-agent-platform/`: primary platform code. Python package lives in `enterprise_agent_platform/`, frontend source lives in `frontend/`, generated browser assets are served from `enterprise_agent_platform/static/`, tests live in `tests/`, and the managed Hermes knowledge plugin lives in `hermes_plugin/`.
 - `hermes-agent/`: Git submodule for the Hermes runtime and OpenAI-compatible API server. Follow `hermes-agent/AGENTS.md` when editing this submodule.
@@ -99,11 +99,11 @@ The platform uses `unittest`; add Python tests in `enterprise-agent-platform/tes
 
 ## Agent Prompt Guidelines
 
-When editing prompts sent to runtime agents, preserve the product-facing identity contract: agents should introduce themselves only as ubitech enterprise-grade Agents and must not mention underlying frameworks, runtimes, model providers, or internal implementation details to end users. Include available user context in agent prompts, including the user's position, for both private-agent and channel speaker context.
+When editing prompts sent to runtime agents, preserve the product-facing identity contract: agents should introduce themselves as ubitech agent and must not mention underlying frameworks, runtimes, model providers, or internal implementation details to end users. Include available user context in agent prompts, including the user's position, for both private-agent and channel speaker context.
 
 ## Commit & Pull Request Guidelines
 
-The current top-level history uses concise imperative commits, e.g. `Initial enterprise agent platform workspace`. Continue with short, action-oriented subjects; add a scope when useful, such as `platform: manage Hermes runtime`.
+The current top-level history uses concise imperative commits. Continue with short, action-oriented subjects; add a scope when useful, such as `platform: manage Hermes runtime`.
 
 PRs should include a summary, affected directories, commands run, linked issues if any, and screenshots for UI changes. Call out configuration or secret-handling changes explicitly.
 

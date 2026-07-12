@@ -62,7 +62,7 @@ export function AppGate() {
               <h1>{bootStatus === "error" ? "暂时无法连接" : "正在启动"}</h1>
               {bootStatus === "error" ? (
                 <>
-                  <p className="muted">无法连接企业平台服务，请检查网络后重试。</p>
+                  <p className="muted">无法连接 ubitech agent 服务，请检查网络后重试。</p>
                   <button
                     className="btn btn--primary btn--lg"
                     type="button"

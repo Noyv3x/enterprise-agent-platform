@@ -631,7 +631,7 @@ class HermesRelayConnector:
         actor_id = str(raw_actor.get("id") or "").strip()
         if actor_id:
             user_id = f"u{_safe_identifier(actor_id)}"
-        user_name = str(raw_actor.get("display_name") or raw_actor.get("username") or user_id or "Enterprise User")
+        user_name = str(raw_actor.get("display_name") or raw_actor.get("username") or user_id or "User")
         return _RelayTurn(
             turn_id=turn_id,
             chat_id=chat_id,
@@ -663,7 +663,7 @@ class HermesRelayConnector:
             safe = _safe_identifier(user_id)
             return f"enterprise-private-u{safe}", "dm", f"Private Agent u{user_id}", f"u{safe}"
         safe = _safe_identifier(session_id or session_key or "default")
-        return f"enterprise-session-{safe}", "dm", "Enterprise Web", f"user-{safe}"
+        return f"enterprise-session-{safe}", "dm", "ubitech agent", f"user-{safe}"
 
     @staticmethod
     def _attachment_media(attachments: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -687,7 +687,7 @@ class HermesRelayConnector:
         return {
             "contract_version": 1,
             "platform": "relay",
-            "label": "Enterprise Web",
+            "label": "ubitech agent",
             "max_message_length": 12000,
             "supports_draft_streaming": False,
             "supports_edit": False,

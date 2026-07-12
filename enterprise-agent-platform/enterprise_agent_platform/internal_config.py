@@ -442,7 +442,7 @@ def get_default_value(mapping: dict[str, Any], path: str) -> tuple[bool, Any]:
     if found:
         return True, value
     # Hermes historically allowed the primary model to be a scalar at
-    # DEFAULT_CONFIG["model"], while enterprise editing exposes the normalized
+    # DEFAULT_CONFIG["model"], while platform editing exposes the normalized
     # config.yaml shape as model.default.
     if path == "model.default":
         found, value = get_nested(mapping, "model")

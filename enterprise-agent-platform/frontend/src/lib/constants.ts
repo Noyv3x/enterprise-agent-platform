@@ -12,7 +12,7 @@ export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   {
     id: "admin",
     label: "管理员",
-    description: "管理企业账户、模型配置和平台运行时。",
+    description: "管理账户、模型配置和平台运行时。",
     permissions: [
       "read_workspace",
       "chat",
@@ -26,7 +26,7 @@ export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   {
     id: "manager",
     label: "经理",
-    description: "管理频道和知识库，并使用企业 Agent。",
+    description: "管理频道和知识库，并使用 ubitech agent。",
     permissions: [
       "read_workspace",
       "chat",
@@ -44,7 +44,7 @@ export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
   {
     id: "viewer",
     label: "只读",
-    description: "只能查看频道消息和企业知识。",
+    description: "只能查看频道消息和知识库。",
     permissions: ["read_workspace"],
   },
 ];
@@ -59,7 +59,7 @@ export const THINKING_DEPTH_OPTIONS: ThinkingDepthOption[] = [
 ];
 
 export const ADMIN_PAGES: AdminPage[] = [
-  { id: "accounts", label: "账户权限", icon: "users", description: "企业账户、权限组与个人模型策略。" },
+  { id: "accounts", label: "账户权限", icon: "users", description: "账户、权限组与个人模型策略。" },
   { id: "tokens", label: "Token 监控", icon: "barChart", description: "按账户、私聊/频道、供应商和模型查看消耗。" },
   { id: "messages", label: "消息审计", icon: "message", description: "频道消息删除与私人 Agent 会话审计。" },
   { id: "model", label: "模型接入", icon: "shield", description: "OAuth 供应商验证与 Hermes API 参数。" },
