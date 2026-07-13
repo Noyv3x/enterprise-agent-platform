@@ -174,6 +174,7 @@ export interface AgentStatus extends AgentWork {
   replying_to?: AgentReplyTarget | null;
   stream_message?: StreamMsg | null;
   stream_messages?: StreamMsg[];
+  last_error?: string;
 }
 
 export interface AgentStatuses {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentProcessLines } from "../components/chat/AgentWorkCard";
+import { agentProcessLines, hasAgentProcessSteps } from "../components/chat/AgentWorkCard";
 import { agentStatusText } from "../store/selectors";
 import type { AgentStatus } from "../types";
 import { translate, type Translator } from ".";
@@ -52,10 +52,24 @@ describe("chat translations", () => {
 
     expect(agentProcessLines(status, english)).toEqual([
       "✅ Completed knowledge_search · VPN access policy",
-      "🛡️ Waiting for access approval: rm -rf /tmp/example",
-      "🛡️ Access approval completed",
-      "✅ Work completed",
     ]);
+  });
+
+  it("does not create work records for lifecycle or approval activity without tools", () => {
+    const status: AgentStatus = {
+      state: "replying",
+      activity: [
+        { source: "platform", stage: "queued" },
+        { source: "platform", stage: "replying" },
+        { source: "agent", stage: "approval", detail: "Run a command" },
+        { source: "agent", stage: "approval", tool: "terminal", detail: "Not a tool event" },
+        { source: "platform", stage: "approval.responded", approval_choice: "once" },
+        { source: "platform", stage: "complete" },
+      ],
+    };
+
+    expect(agentProcessLines(status, english)).toEqual([]);
+    expect(hasAgentProcessSteps(status)).toBe(false);
   });
 
   it("compacts legacy tool noise and preserves distinct real tool calls", () => {
@@ -126,9 +140,7 @@ describe("chat translations", () => {
     };
 
     expect(agentProcessLines(status, english)).toEqual([
-      "💬 Agent is replying",
       "✅ Completed Web search",
-      "🛡️ Access approval completed · Allow once",
       "✅ Completed Command",
       "✅ Completed File search · config · ./src",
       "✅ Completed Web search",

@@ -1,4 +1,4 @@
-/* <AgentWorkCard/> — the collapsible agent process-step card (legacy
+/* <AgentWorkCard/> — the collapsible agent tool-call card (legacy
    renderAgentWorkCard + step formatters, legacy-app.js:968-1029).
 
    Per-run open/closed memory lives in the store (expandedAgentRuns) keyed by runId:
@@ -10,7 +10,7 @@
    preserving keyboard operability.
 
    The step formatters are exported so <MessageList>/<MessageBubble> can decide
-   whether a run has process steps without duplicating the logic. */
+   whether a run has tool-call steps without duplicating the logic. */
 
 import type { MouseEvent } from "react";
 import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
@@ -42,32 +42,9 @@ const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   delegate_task: "chat.activity.toolName.delegate_task",
 };
 
-const APPROVAL_CHOICE_KEYS: Partial<Record<string, MessageKey>> = {
-  once: "chat.approval.once",
-  session: "chat.approval.session",
-  always: "chat.approval.always",
-  deny: "chat.approval.deny",
-};
-
 function isAgentProcessStep(step: ActivityStep): boolean {
   const stage = String(step?.stage || "").toLowerCase();
-  const structuredStage = new Set([
-    "complete",
-    "completed",
-    "queued",
-    "replying",
-    "approval",
-    "approval.responded",
-    "error",
-    "failed",
-  ]).has(stage);
-  return (
-    step?.source === "agent" ||
-    stage === "tool" ||
-    stage.startsWith("tool.") ||
-    structuredStage ||
-    !!step?.tool
-  );
+  return stage === "tool" || stage.startsWith("tool.");
 }
 
 function isAnonymousToolNoise(step: ActivityStep): boolean {
@@ -84,9 +61,6 @@ function mergeIdentity(step: ActivityStep): string {
   const stage = String(step?.stage || "").toLowerCase();
   if ((stage === "tool" || stage.startsWith("tool.")) && step?.tool_call_id) {
     return `tool:${step.tool_call_id}`;
-  }
-  if (stage.startsWith("approval") && step?.approval_id) {
-    return `approval:${stage}:${step.approval_id}`;
   }
   return "";
 }
@@ -145,38 +119,19 @@ function displayToolName(rawTool: string, translate: Translator): string {
 
 function agentStepLine(step: ActivityStep, translate: Translator): string {
   const stage = String(step?.stage || "").toLowerCase();
-  const label = step?.label || step?.line || step?.stage || translate("chat.activity.processing");
   const detail = step?.detail || "";
-  if (stage === "tool" || stage.startsWith("tool.")) {
-    const rawTool = step?.tool || step?.label || translate("chat.activity.toolFallback");
-    const tool = displayToolName(rawTool, translate);
-    const detailSuffix = detail && detail !== rawTool ? ` · ${detail}` : "";
-    if (step?.tool_status === "failed" || stage.endsWith("failed")) {
-      return translate("chat.activity.toolFailed", { tool, detail: detailSuffix });
-    }
-    return translate(
-      step?.tool_status === "completed" || stage.endsWith("completed")
-        ? "chat.activity.toolCompleted"
-        : "chat.activity.toolRunning",
-      { emoji: step?.emoji || "⚙️", tool, detail: detailSuffix },
-    );
+  const rawTool = step?.tool || step?.label || translate("chat.activity.toolFallback");
+  const tool = displayToolName(rawTool, translate);
+  const detailSuffix = detail && detail !== rawTool ? ` · ${detail}` : "";
+  if (step?.tool_status === "failed" || stage.endsWith("failed")) {
+    return translate("chat.activity.toolFailed", { tool, detail: detailSuffix });
   }
-  if (stage === "complete" || stage === "completed") return translate("chat.activity.completed");
-  if (stage === "error" || stage === "failed") {
-    return translate("chat.activity.error", { detail: detail ? `: ${detail}` : "" });
-  }
-  if (stage === "queued") return translate("chat.activity.queued");
-  if (stage === "replying") return translate("chat.activity.replying");
-  if (stage === "approval") {
-    return translate("chat.activity.approval", { detail: detail ? `: ${detail}` : "" });
-  }
-  if (stage === "approval.responded") {
-    const choiceKey = APPROVAL_CHOICE_KEYS[String(step?.approval_choice || "").toLowerCase()];
-    return translate("chat.activity.approvalResponded", {
-      detail: choiceKey ? ` · ${translate(choiceKey)}` : "",
-    });
-  }
-  return `• ${label}${detail ? `: ${detail}` : ""}`;
+  return translate(
+    step?.tool_status === "completed" || stage.endsWith("completed")
+      ? "chat.activity.toolCompleted"
+      : "chat.activity.toolRunning",
+    { emoji: step?.emoji || "⚙️", tool, detail: detailSuffix },
+  );
 }
 
 function agentProcessLineEntries(
@@ -191,9 +146,7 @@ function agentProcessLineEntries(
     const line = agentStepLine(step, translate);
     if (!line) continue;
     const stage = String(step?.stage || "").toLowerCase();
-    const identity =
-      mergeIdentity(step) ||
-      (stage === "replying" || stage.startsWith("approval") ? `phase:${stage}` : "");
+    const identity = mergeIdentity(step);
     if (line === previousLine && identity && identity === previousIdentity) continue;
     previousLine = line;
     previousIdentity = identity;

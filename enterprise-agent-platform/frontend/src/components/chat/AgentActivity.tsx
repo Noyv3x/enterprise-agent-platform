@@ -1,6 +1,5 @@
 /* <AgentActivity/> — the live agent bubble shown while a run is active AND has
-   tool/process steps (legacy renderAgentActivity, :934-939): a bot avatar + the
-   active work card. */
+   tool-call steps: a bot avatar + the active work card. */
 
 import type { AgentStatus } from "../../types";
 import { Icon } from "../common/Icon";

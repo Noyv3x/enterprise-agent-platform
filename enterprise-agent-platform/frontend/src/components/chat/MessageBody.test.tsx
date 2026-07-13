@@ -104,4 +104,32 @@ describe("MessageBody", () => {
 
     expect(writeText).toHaveBeenCalledWith("**formatted** message");
   });
+
+  it("does not attach a work-record card when the Agent used no tools", () => {
+    const message: Message = {
+      id: "message-without-tools",
+      scope_type: "private",
+      scope_id: "1",
+      author_type: "agent",
+      user_id: null,
+      username: "Private Agent",
+      content: "Answered directly.",
+      metadata: {
+        agent_work: {
+          state: "complete",
+          activity: [
+            { source: "platform", stage: "replying" },
+            { source: "agent", stage: "approval", detail: "No tool followed" },
+            { source: "platform", stage: "complete" },
+          ],
+        },
+      },
+      created_at: 1_700_000_001,
+    };
+
+    renderLocalized(<MessageBubble message={message} />);
+
+    expect(screen.getByText("Answered directly.")).toBeTruthy();
+    expect(screen.queryByText("View Agent work")).toBeNull();
+  });
 });

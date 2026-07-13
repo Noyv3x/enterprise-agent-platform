@@ -1,5 +1,5 @@
 /* <AgentTyping/> — the lightweight "Agent 正在处理" line shown while a run is
-   active but has no process steps yet (legacy renderAgentTyping, :941-946). */
+   active but has no tool-call steps yet. */
 
 import { useI18n } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";

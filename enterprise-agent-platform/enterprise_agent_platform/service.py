@@ -5603,12 +5603,25 @@ class EnterpriseService:
     def _agent_work_snapshot(self, task: dict[str, Any], state: str) -> dict[str, Any]:
         key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
         with self._conversation_lock:
-            status = self._copy_status(self._agent_status.get(key) or self._idle_agent_status(str(task["scope_type"]), str(task["scope_id"])))
+            status = self._copy_status(
+                self._agent_status.get(key)
+                or self._idle_agent_status(str(task["scope_type"]), str(task["scope_id"]))
+            )
+        tool_activity = []
+        for item in status.get("activity") or []:
+            tool = str(item.get("tool") or "").strip()
+            if (
+                item.get("source") == "agent"
+                and item.get("stage") == "tool"
+                and tool
+                and tool.lower() != "tool"
+            ):
+                tool_activity.append(item)
         return {
             "run_id": self._run_id_for_task(task),
             "state": state,
             "replying_to": self._reply_target(task),
-            "activity": status.get("activity") or [],
+            "activity": tool_activity,
             "current_step": status.get("current_step") or "",
             "started_at": status.get("started_at"),
             "updated_at": status.get("updated_at"),

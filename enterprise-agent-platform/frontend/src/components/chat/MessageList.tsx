@@ -148,14 +148,34 @@ export function MessageList({
     } else if (status && status.state === "error") {
       // Terminal failure that could not be persisted as a chat message: surface it
       // inline rather than rendering nothing (legacy :703-709).
-      items.push(
-        <article key="agent-error" className="msg msg--agent msg--activity">
-          <div className="msg__avatar">
-            <Icon name="bot" size={18} />
-          </div>
-          <AgentWorkCard work={status} active={false} />
-        </article>,
-      );
+      if (hasAgentProcessSteps(status)) {
+        items.push(
+          <article key="agent-error" className="msg msg--agent msg--activity">
+            <div className="msg__avatar">
+              <Icon name="bot" size={18} />
+            </div>
+            <AgentWorkCard work={status} active={false} />
+          </article>,
+        );
+      } else {
+        const detail =
+          status.last_error ||
+          [...(status.activity || [])].reverse().find((step) => step.stage === "error")?.detail ||
+          "";
+        items.push(
+          <article key="agent-error" className="msg msg--agent">
+            <div className="msg__avatar">
+              <Icon name="bot" size={18} />
+            </div>
+            <div className="msg__bubble" role="alert">
+              <div className="msg__body">
+                <strong>{t("chat.agent.replyFailed")}</strong>
+                {detail ? <p>{detail}</p> : null}
+              </div>
+            </div>
+          </article>,
+        );
+      }
     }
     if (mode === "channel" && typingUsers.length) {
       items.push(<TypingUsers key="typing-users" users={typingUsers} />);

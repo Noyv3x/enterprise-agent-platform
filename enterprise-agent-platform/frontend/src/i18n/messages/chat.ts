@@ -220,6 +220,11 @@ export const chatMessages = defineMessages({
     en: "Agent work failed",
     "zh-TW": "Agent 工作過程失敗",
   },
+  "chat.agent.replyFailed": {
+    "zh-CN": "Agent 回复失败",
+    en: "Agent reply failed",
+    "zh-TW": "Agent 回覆失敗",
+  },
   "chat.work.view": {
     "zh-CN": "查看 Agent 工作过程",
     en: "View Agent work",

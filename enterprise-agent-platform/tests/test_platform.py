@@ -159,6 +159,26 @@ class ProgressAgent:
         if progress_callback:
             progress_callback(
                 {
+                    "event": "tool.arguments.delta",
+                    "delta": '{"query":"VPN access policy"}',
+                }
+            )
+            progress_callback(
+                {
+                    "event": "approval.request",
+                    "approval_id": "approval-1",
+                    "description": "Use the knowledge search tool",
+                }
+            )
+            progress_callback(
+                {
+                    "event": "approval.responded",
+                    "approval_id": "approval-1",
+                    "choice": "once",
+                }
+            )
+            progress_callback(
+                {
                     "event": "tool.started",
                     "tool": "knowledge",
                     "emoji": "🔍",
@@ -1193,8 +1213,8 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(agent_activity[0]["line"], '🔍 knowledge: "VPN access policy"')
             self.assertEqual(agent_activity[0]["tool_status"], "completed")
             self.assertEqual(
-                len([item for item in work["activity"] if item.get("stage") == "replying"]),
-                1,
+                [(item.get("source"), item.get("stage"), item.get("tool")) for item in work["activity"]],
+                [("agent", "tool", "knowledge")],
             )
             service.close()
 
@@ -1991,7 +2011,7 @@ class PlatformServiceTests(unittest.TestCase):
                 final_message = service.list_messages(user, "channel", "1")[-1]
                 self.assertEqual(final_message["content"], "agent response to Alice: second question")
                 self.assertEqual(final_message["metadata"]["agent_work"]["state"], "complete")
-                self.assertTrue(final_message["metadata"]["agent_work"]["activity"][-1]["line"].startswith("✅"))
+                self.assertEqual(final_message["metadata"]["agent_work"]["activity"], [])
             finally:
                 agent.release.set()
                 service.close()
