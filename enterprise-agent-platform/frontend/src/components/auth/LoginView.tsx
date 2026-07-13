@@ -22,10 +22,13 @@ export function LoginView() {
   const [password, setPassword] = useState("");
 
   return (
-    <main className="auth">
-      <div className="auth__locale"><LanguageSelect /></div>
+    <main className="auth auth--login">
+      <aside className="auth__aside">
+        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
+      </aside>
       <div className="auth__main">
         <section className="auth__card">
+          <div className="auth__locale"><LanguageSelect /></div>
           <Brand />
           <h1>{t("auth.login")}</h1>
           <form

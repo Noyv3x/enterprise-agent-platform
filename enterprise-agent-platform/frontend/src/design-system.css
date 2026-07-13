@@ -132,6 +132,84 @@ input, textarea, select { min-height: 40px; border-radius: var(--r-sm); }
 }
 .boot-status { text-align: left; }
 
+/* Preserve the original split-screen sign-in treatment without leaking its
+ * warm editorial tokens into the authenticated application shell. */
+.auth--login {
+  --brand: light-dark(hsl(220 22% 53%), hsl(222 30% 67%));
+  --accent: light-dark(hsl(222 24% 41%), hsl(223 40% 77%));
+  --accent-hover: light-dark(hsl(223 27% 34%), hsl(223 48% 84%));
+  --accent-solid: light-dark(hsl(222 23% 45%), hsl(222 27% 66%));
+  --accent-solid-h: light-dark(hsl(223 26% 38%), hsl(222 32% 72%));
+  --on-accent: light-dark(hsl(44 42% 97%), hsl(35 16% 11%));
+  --accent-soft: light-dark(hsl(220 40% 92%), hsl(223 19% 21%));
+  --accent-line: light-dark(hsl(221 31% 82%), hsl(223 19% 33%));
+  --bg: light-dark(hsl(40 30% 92.5%), hsl(36 9% 9.5%));
+  --surface: light-dark(hsl(44 48% 97.5%), hsl(36 10% 12.5%));
+  --surface-2: light-dark(hsl(42 36% 94.5%), hsl(35 11% 15.5%));
+  --surface-3: light-dark(hsl(40 27% 89%), hsl(36 12% 19%));
+  --line: light-dark(hsl(40 26% 84%), hsl(34 12% 19%));
+  --line-strong: light-dark(hsl(40 21% 76%), hsl(35 12% 27%));
+  --ink: light-dark(hsl(38 9% 13%), hsl(43 28% 89%));
+  --muted: light-dark(hsl(36 9% 39%), hsl(40 12% 62%));
+  --faint: light-dark(hsl(36 10% 39%), hsl(40 11% 72%));
+  --shadow-1: light-dark(0 1px 2px hsl(34 30% 24% / 0.07), 0 1px 2px hsl(0 0% 0% / 0.4));
+  --shadow-2: light-dark(0 6px 18px -6px hsl(34 35% 22% / 0.16), 0 8px 22px -6px hsl(0 0% 0% / 0.55));
+  --ring: 0 0 0 3px color-mix(in srgb, var(--brand) 35%, transparent);
+  --accent-grad: linear-gradient(165deg, var(--accent-solid), var(--accent-solid-h));
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+    Georgia, "Source Serif 4", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", serif;
+  --r-xs: 7px;
+  --r-sm: 9px;
+  --r-md: 13px;
+  --r-lg: 18px;
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 14px;
+}
+.auth--login .auth__aside { display: flex; }
+.auth--login .auth__main {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 28px;
+  background: var(--bg);
+}
+.auth--login .auth__card { width: min(380px, 100%); gap: 16px; }
+.auth--login .auth__card h1 {
+  font-family: var(--font-display);
+  font-size: 29px;
+  line-height: 1.2;
+  font-weight: 500;
+  letter-spacing: -0.012em;
+}
+.auth--login .auth__card form { gap: 13px; }
+.auth--login .auth__card .brand { margin-bottom: 0; }
+.auth--login .auth__card .brand__logo { display: none; }
+.auth--login .auth__card .brand__eyebrow { font-size: 11.5px; letter-spacing: 0.2em; }
+.auth--login .auth__locale {
+  position: static;
+  z-index: auto;
+  inset: auto;
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 4px;
+}
+.auth--login .btn { font-size: 13.5px; }
+.auth--login .btn--lg { font-size: 14.5px; }
+.auth--login .btn--primary,
+.auth--login .btn--primary:hover {
+  background: var(--accent-grad);
+  box-shadow: var(--shadow-1), inset 0 1px 0 hsl(0 0% 100% / 0.2);
+}
+.auth--login .btn--primary:hover {
+  filter: brightness(1.05);
+  transform: translateY(-1px);
+}
+.auth--login .btn--primary:active { filter: brightness(0.97); transform: translateY(0.5px); }
+
 /* Global shell */
 .shell { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
 .sidebar {
@@ -423,6 +501,9 @@ input, textarea, select { min-height: 40px; border-radius: var(--r-sm); }
 }
 
 @media (max-width: 800px) {
+  .auth--login { grid-template-columns: 1fr; }
+  .auth--login .auth__aside { display: none; }
+  .auth--login .auth__card .brand__logo { display: block; height: 24px; }
   .topbar {
     min-height: 60px;
     padding-block: 8px;
@@ -437,6 +518,7 @@ input, textarea, select { min-height: 40px; border-radius: var(--r-sm); }
 }
 
 @media (max-width: 520px) {
+  .auth--login .auth__main { place-items: center; padding: 22px 18px; }
   .auth__main {
     align-items: flex-start;
     padding: max(88px, calc(env(safe-area-inset-top) + 72px)) 20px max(28px, env(safe-area-inset-bottom));
