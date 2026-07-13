@@ -287,7 +287,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.hermes_timeout_seconds + 30,
+                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
             ) or delivery
         result = delivery.payload.get("result")
         response = dict(result) if isinstance(result, dict) else {"ok": True}
@@ -318,7 +318,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.hermes_timeout_seconds + 30,
+                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
             ) or delivery
         return {
             **result,
@@ -355,7 +355,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.hermes_timeout_seconds + 30,
+                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
             ) or delivery
         agent = self.service.agent_message_replying_to("private", scope_id, user_message_id)
         return {

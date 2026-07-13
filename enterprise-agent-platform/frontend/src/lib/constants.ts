@@ -62,12 +62,11 @@ export const ADMIN_PAGES: AdminPage[] = [
   { id: "accounts", label: "accounts", icon: "users", description: "accounts" },
   { id: "tokens", label: "tokens", icon: "barChart", description: "tokens" },
   { id: "messages", label: "messages", icon: "message", description: "messages" },
-  { id: "model", label: "model", icon: "shield", description: "model" },
+  { id: "agent-runtime", label: "agent-runtime", icon: "bot", description: "agent-runtime" },
   { id: "telegram", label: "Telegram", icon: "message", description: "telegram" },
   { id: "updates", label: "updates", icon: "refresh", description: "updates" },
   { id: "security", label: "security", icon: "key", description: "security" },
   { id: "runtime", label: "runtime", icon: "server", description: "runtime" },
-  { id: "hermes", label: "Hermes", icon: "settings", description: "hermes" },
   { id: "cognee", label: "Cognee", icon: "library", description: "cognee" },
   { id: "secrets", label: "secrets", icon: "key", description: "secrets" },
 ];

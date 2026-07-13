@@ -19,12 +19,11 @@ import { toast } from "../context/ToastContext";
 import {
   loadAuditChannelMessages,
   loadAuditPrivateMessages,
+  loadAgentRuntimeConfig,
   loadAutoUpdateConfig,
   loadChannelMessages,
   loadChannels,
   loadCogneeConfig,
-  loadHermesConfig,
-  loadHermesInternalConfig,
   loadInitial,
   loadMessageAudit,
   loadPrivateConversations,
@@ -47,7 +46,7 @@ import type {
   DeleteBeforeRequest,
   DeleteClearAllRequest,
   DeleteResultResponse,
-  HermesConfigUpdateRequest,
+  AgentRuntimeConfigUpdateRequest,
   Id,
   ImpersonateUserResponse,
   OAuthFlowResponse,
@@ -59,7 +58,6 @@ import type {
 } from "../types";
 
 const RUNTIME_RESTART_TIMEOUT_MS = 5 * 60_000;
-const RUNTIME_INSTALL_TIMEOUT_MS = 30 * 60_000;
 
 /* =============================================================== accounts */
 
@@ -324,18 +322,18 @@ export async function saveSecurityConfig(
   });
 }
 
-/** legacy renderHermesConfig onsubmit (legacy-app.js:2227-2248). Reloads ALL
- *  settings (loadSettings). */
-export async function saveHermesConfig(
+/** Save the platform-owned Agent runtime settings, then refresh all dependent
+ * runtime and model state. */
+export async function saveAgentRuntimeConfig(
   store: AppStore,
-  body: HermesConfigUpdateRequest,
+  body: AgentRuntimeConfigUpdateRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, "admin:model:save", async () => {
-    await api(endpoints.updateHermesConfig.path(), { method: "PUT", body: JSON.stringify(body) });
+  await runBusy(store, "admin:agent-runtime:save", async () => {
+    await api(endpoints.updateAgentRuntimeConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
     await loadSettings(store);
-    toast(t("admin.toast.hermesSaved"), { type: "ok", title: t("admin.toast.complete") });
+    toast(t("admin.toast.agentRuntimeSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }
 
@@ -381,51 +379,6 @@ export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
   });
 }
 
-/* ====================================================== config: hermes internal
-
-   Three mutually-exclusive write shapes to the SAME endpoint (spec §9); all then
-   reload ONLY hermes/internal-config. The `updates` diff maps come from
-   <ConfigForm>'s collectConfigUpdates. */
-
-export async function saveHermesYamlFields(
-  store: AppStore,
-  updates: Record<string, string>,
-): Promise<void> {
-  await runBusy(store, "admin:hermes:fields:save", async () => {
-    await api(endpoints.updateHermesInternalConfig.path(), {
-      method: "PUT",
-      body: JSON.stringify({ yaml_updates: updates }),
-    });
-    await loadHermesInternalConfig(store);
-    toast(t("admin.toast.hermesInternalSaved"), { type: "ok", title: t("admin.toast.complete") });
-  });
-}
-
-export async function saveHermesYamlText(store: AppStore, yamlText: string): Promise<void> {
-  await runBusy(store, "admin:hermes:yaml:save", async () => {
-    await api(endpoints.updateHermesInternalConfig.path(), {
-      method: "PUT",
-      body: JSON.stringify({ yaml_text: yamlText }),
-    });
-    await loadHermesInternalConfig(store);
-    toast(t("admin.toast.hermesYamlSaved"), { type: "ok", title: t("admin.toast.complete") });
-  });
-}
-
-export async function saveHermesEnv(
-  store: AppStore,
-  updates: Record<string, string>,
-): Promise<void> {
-  await runBusy(store, "admin:hermes:env:save", async () => {
-    await api(endpoints.updateHermesInternalConfig.path(), {
-      method: "PUT",
-      body: JSON.stringify({ env: updates }),
-    });
-    await loadHermesInternalConfig(store);
-    toast(t("admin.toast.hermesEnvSaved"), { type: "ok", title: t("admin.toast.complete") });
-  });
-}
-
 /** legacy renderCogneeInternalConfig onsubmit (legacy-app.js:2523-2529). Reloads
  *  cognee config AND runtime (env changes can affect Cognee health). */
 export async function saveCogneeEnv(
@@ -458,19 +411,6 @@ export async function restartRuntime(store: AppStore, name: string): Promise<voi
   });
 }
 
-/** legacy runHermesInstall (legacy-app.js:2130-2136). POST "{}", reload ALL. */
-export async function installHermes(store: AppStore): Promise<void> {
-  await runBusy(store, "admin:runtime:install-hermes", async () => {
-    await api(endpoints.installHermes.path(), {
-      method: "POST",
-      body: EMPTY_BODY,
-      timeoutMs: RUNTIME_INSTALL_TIMEOUT_MS,
-    });
-    await loadSettings(store);
-    toast(t("admin.toast.hermesInstall"), { type: "ok", title: t("admin.toast.complete") });
-  });
-}
-
 /* =============================================================== secrets */
 
 /** legacy renderSecretsSettings per-row onsubmit (legacy-app.js:2650-2657). PUT
@@ -496,8 +436,8 @@ export async function setSecret(
 
    The verification state machine (spec-oauth-utils-data §2, legacy-app.js:
    3366-3428). Every action routes through runBusy + updateOAuthState (the
-   SET_OAUTH_STATE reducer case) and reloads hermesConfig (verification switches
-   Hermes). The start/check bodies are the literal "{}" / { flow_id }. No
+   SET_OAUTH_STATE reducer case) and reloads the Agent runtime config. The
+   start/check bodies are the literal "{}" / { flow_id }. No
    auto-poll exists — poll/complete are user-triggered. */
 
 /** Mirror of legacy updateOAuthState (legacy-app.js:3425-3428). */
@@ -524,7 +464,7 @@ export async function startOAuthVerification(store: AppStore, providerId: string
       body: EMPTY_BODY,
     });
     updateOAuthState(store, providerId, result);
-    await loadHermesConfig(store);
+    await loadAgentRuntimeConfig(store);
   });
 }
 
@@ -539,7 +479,7 @@ export async function pollOAuthVerification(
       body: JSON.stringify({ flow_id: flowId }),
     });
     updateOAuthState(store, providerId, result);
-    await loadHermesConfig(store);
+    await loadAgentRuntimeConfig(store);
   });
 }
 
@@ -558,7 +498,7 @@ export async function completeOAuthVerification(
     if (result.flow?.complete) {
       store.dispatch({ type: "SET_OAUTH_CALLBACK_URL", payload: { providerId, value: "" } });
     }
-    await loadHermesConfig(store);
+    await loadAgentRuntimeConfig(store);
   });
 }
 
@@ -577,9 +517,7 @@ export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   });
 }
 
-/** legacy importOAuthCredentials (legacy-app.js:3407-3423). Parse the file JSON
- *  (throw the exact Chinese error on failure), POST { credentials }, then reload
- *  secrets + hermesConfig. */
+/** Import OAuth credentials, then reload secrets and runtime model state. */
 export async function importOAuthCredentials(store: AppStore, file: File): Promise<void> {
   await runBusy(store, "admin:oauth:import", async () => {
     let credentials: unknown;
@@ -593,7 +531,7 @@ export async function importOAuthCredentials(store: AppStore, file: File): Promi
       body: JSON.stringify({ credentials }),
     });
     updateOAuthState(store, result.active_provider || "", result);
-    await Promise.all([loadSecrets(store), loadHermesConfig(store)]);
+    await Promise.all([loadSecrets(store), loadAgentRuntimeConfig(store)]);
     const count = result.imported?.keys?.length || 0;
     toast(t("admin.toast.oauthImported", { count }), { type: "ok", title: t("admin.toast.complete") });
   });

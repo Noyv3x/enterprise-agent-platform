@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,10 +24,8 @@ def main() -> None:
     init_admin.add_argument("--display-name", default="")
     init_admin.add_argument("--data", default=None)
 
-    token = sub.add_parser("print-agent-token", help="Print the Hermes plugin token")
+    token = sub.add_parser("print-agent-token", help="Print the internal Agent tool token")
     token.add_argument("--data", default=None)
-    install_plugin = sub.add_parser("install-hermes-plugin", help="Install the enterprise_kb Hermes plugin into HERMES_HOME")
-    install_plugin.add_argument("--hermes-home", default=None)
     deploy = sub.add_parser("deploy", help="Bootstrap one-command deployment")
     from .deployment import add_bootstrap_args
 
@@ -69,16 +65,6 @@ def main() -> None:
         elif cmd == "print-agent-token":
             row = service.db.query_one("SELECT value FROM settings WHERE key = 'agent_tool_token'")
             print(row["value"] if row else "")
-        elif cmd == "install-hermes-plugin":
-            src = Path(__file__).resolve().parents[1] / "hermes_plugin" / "enterprise_kb"
-            home = Path(args.hermes_home or os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
-            dest = home / "plugins" / "enterprise_kb"
-            if dest.exists():
-                shutil.rmtree(dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src, dest)
-            print(f"installed Hermes plugin: {dest}")
-            print("Enable plugin key 'enterprise-kb' in Hermes config plugins.enabled.")
     finally:
         service.close()
 

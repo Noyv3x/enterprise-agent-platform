@@ -123,6 +123,7 @@ export interface ActivityStep {
 
 export interface AgentApprovalRequest {
   run_id?: string;
+  approval_id?: string;
   command?: string;
   description?: string;
   pattern_key?: string;
@@ -442,12 +443,11 @@ export type AdminPageId =
   | "accounts"
   | "tokens"
   | "messages"
-  | "model"
   | "telegram"
   | "updates"
   | "security"
   | "runtime"
-  | "hermes"
+  | "agent-runtime"
   | "cognee"
   | "secrets";
 
@@ -461,7 +461,7 @@ export interface AdminPage {
 /** [value, label] tuple as in legacy THINKING_DEPTH_OPTIONS. */
 export type ThinkingDepthOption = [value: string, label: string];
 
-/** Descriptor-driven config field (Hermes/Cognee internal editors). */
+/** Descriptor-driven config field used by managed service editors. */
 export interface ConfigFieldDescriptor {
   key: string;
   label?: string;
@@ -473,11 +473,6 @@ export interface ConfigFieldDescriptor {
   defaulted?: boolean;
   secret?: boolean;
   masked?: string;
-}
-
-export interface ConfigSection {
-  key: string;
-  detail?: string;
 }
 
 /* security config */
@@ -504,29 +499,28 @@ export interface SecurityConfigState {
   session_secret_restart_required?: boolean;
 }
 
-/* hermes config */
-export interface HermesModelCatalog {
+/* agent runtime config */
+export interface AgentModelCatalog {
   models?: string[];
   default_model?: string;
   error?: string;
 }
 
-export interface HermesConfigValues {
-  manage_hermes?: boolean;
-  repo_path?: string;
-  api_url?: string;
+export interface AgentRuntimeConfigValues {
+  managed?: boolean;
+  runtime_url?: string;
+  runtime_home?: string;
   provider?: string;
-  provider_base_url?: string;
   model?: string;
-  install_extras?: string;
-  startup_wait_seconds?: number | string;
   timeout_seconds?: number | string;
-  api_key_configured?: boolean;
-  model_catalog?: Record<string, HermesModelCatalog>;
+  max_concurrency?: number | string;
+  compaction_threshold?: number | string;
+  model_catalog?: Record<string, AgentModelCatalog>;
+  oauth?: unknown;
 }
 
-export interface HermesConfigState {
-  config: HermesConfigValues;
+export interface AgentRuntimeConfigState {
+  config: AgentRuntimeConfigValues;
 }
 
 /* telegram admin config */
@@ -578,21 +572,6 @@ export interface AutoUpdateStatus {
 export interface AutoUpdateConfigState {
   config: AutoUpdateConfigValues;
   status: AutoUpdateStatus;
-}
-
-/* hermes internal config */
-export interface HermesInternalValues {
-  fields?: ConfigFieldDescriptor[];
-  env?: ConfigFieldDescriptor[];
-  yaml_text?: string;
-  config_path?: string;
-  yaml_error?: string;
-  default_error?: string;
-  sections?: ConfigSection[];
-}
-
-export interface HermesInternalConfigState {
-  internal: HermesInternalValues;
 }
 
 /* cognee internal config */

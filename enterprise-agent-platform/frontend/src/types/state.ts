@@ -12,6 +12,7 @@
 import type {
   ActiveView,
   AdminPageId,
+  AgentRuntimeConfigState,
   AgentStatus,
   AgentStatuses,
   AutoUpdateConfigState,
@@ -19,8 +20,6 @@ import type {
   ChatMode,
   CogneeConfigState,
   FullDocument,
-  HermesConfigState,
-  HermesInternalConfigState,
   Id,
   KnowledgeDocument,
   KnowledgeSearch,
@@ -78,10 +77,9 @@ export interface AppState {
   tokenUsageDays: number;
   secrets: Secret[];
   runtimes: RuntimeMap | null;
-  hermesConfig: HermesConfigState | null;
+  agentRuntimeConfig: AgentRuntimeConfigState | null;
   telegramConfig: TelegramConfigState | null;
   autoUpdateConfig: AutoUpdateConfigState | null;
-  hermesInternalConfig: HermesInternalConfigState | null;
   cogneeConfig: CogneeConfigState | null;
   securityConfig: SecurityConfigState | null;
   oauthProviders: OAuthProvidersState | null;
@@ -138,10 +136,9 @@ export type AdminSliceState = Pick<
   | "tokenUsageDays"
   | "secrets"
   | "runtimes"
-  | "hermesConfig"
+  | "agentRuntimeConfig"
   | "telegramConfig"
   | "autoUpdateConfig"
-  | "hermesInternalConfig"
   | "cogneeConfig"
   | "securityConfig"
   | "oauthProviders"
@@ -315,9 +312,9 @@ interface SetRuntimesAction {
   type: "SET_RUNTIMES";
   payload: RuntimeMap | null;
 }
-interface SetHermesConfigAction {
-  type: "SET_HERMES_CONFIG";
-  payload: HermesConfigState | null;
+interface SetAgentRuntimeConfigAction {
+  type: "SET_AGENT_RUNTIME_CONFIG";
+  payload: AgentRuntimeConfigState | null;
 }
 interface SetTelegramConfigAction {
   type: "SET_TELEGRAM_CONFIG";
@@ -326,10 +323,6 @@ interface SetTelegramConfigAction {
 interface SetAutoUpdateConfigAction {
   type: "SET_AUTO_UPDATE_CONFIG";
   payload: AutoUpdateConfigState | null;
-}
-interface SetHermesInternalConfigAction {
-  type: "SET_HERMES_INTERNAL_CONFIG";
-  payload: HermesInternalConfigState | null;
 }
 interface SetCogneeConfigAction {
   type: "SET_COGNEE_CONFIG";
@@ -427,10 +420,9 @@ export type Action =
   | SetTokenUsageDaysAction
   | SetSecretsAction
   | SetRuntimesAction
-  | SetHermesConfigAction
+  | SetAgentRuntimeConfigAction
   | SetTelegramConfigAction
   | SetAutoUpdateConfigAction
-  | SetHermesInternalConfigAction
   | SetCogneeConfigAction
   | SetSecurityConfigAction
   | SetOAuthProvidersAction

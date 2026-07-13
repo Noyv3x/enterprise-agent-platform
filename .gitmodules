@@ -1,6 +1,3 @@
-[submodule "hermes-agent"]
-	path = hermes-agent
-	url = https://github.com/NousResearch/hermes-agent.git
 [submodule "cognee"]
 	path = cognee
 	url = https://github.com/topoteretes/cognee.git

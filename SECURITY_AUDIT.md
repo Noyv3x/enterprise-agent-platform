@@ -1,87 +1,73 @@
-# 上线前项目内安全检查
+# 项目内安全检查
 
-日期：2026-05-27
+日期：2026-07-13
 
-## 范围
+## 范围与信任边界
 
-本次检查限定在本仓库项目代码本身：
+本次检查覆盖：
 
 - `enterprise-agent-platform/enterprise_agent_platform/`
-- `enterprise-agent-platform/hermes_plugin/`
-- `enterprise-agent-platform/static/`
-- 顶层与平台 README、`deploy.sh` 及平台部署引导代码
+- `enterprise-agent-platform/agent-runtime/`
+- `enterprise-agent-platform/frontend/` 与生成静态资源
+- 顶层部署、自动更新和回滚路径
 
-未检查 frp、Caddy、服务器系统、网络边界、TLS 证书、DNS、防火墙、Docker daemon 安全基线，以及 `hermes-agent/`、`cognee/`、`firecrawl/` 上游 submodule 的内部实现。
+Cognee、Firecrawl 上游 submodule、反向代理、TLS、DNS、防火墙、Docker daemon 与宿主机基线不在本次代码审查范围内。
 
-## 已完成加固
+平台按可信成员、小规模内部使用设计。Agent 由平台服务账号直接在宿主机执行；工作区、会话、记忆和浏览器 Profile 提供逻辑隔离，但不构成针对恶意租户的操作系统安全边界。部署方必须把 Agent 可访问的宿主机权限控制在可接受范围内。
 
-1. 移除公开部署下的默认 `admin/admin` 引导口令。
-   - 未设置 `ENTERPRISE_ADMIN_PASSWORD` 时，平台生成随机初始密码并保存到数据目录的 `bootstrap-admin-password.txt`。
-   - 仅显式设置 `ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD=1` 时才允许本地开发使用 `admin/admin`。
+## 已有控制
 
-2. 提高账号密码下限并增加登录失败限流。
-   - 新建账号和重置密码最低 8 位。
-   - 同一用户名和客户端连续登录失败达到阈值后返回 `429`。
+### 登录与浏览器入口
 
-3. 加固浏览器会话请求。
-   - 对 `POST`、`PUT`、`PATCH`、`DELETE` API 请求校验 `Origin` / `Referer`。
-   - `ENTERPRISE_PUBLIC_BASE_URL=https://...` 时，登录 Cookie 自动带 `Secure`。
-   - Cookie 保持 `HttpOnly` 与 `SameSite=Lax`。
+- 未设置 `ENTERPRISE_ADMIN_PASSWORD` 时生成随机初始密码，并写入权限受限的 `bootstrap-admin-password.txt`；默认不开放 `admin/admin`。
+- 密码有最低长度要求，登录失败按账号和客户端限流；改密、权限变化、停用和吊销会使既有 session 失效。
+- Cookie 使用 `HttpOnly`、`SameSite=Lax`，公网基准 URL 为 HTTPS 时增加 `Secure`。
+- Cookie 写请求校验 `Origin` / `Referer`，仅显式可信代理模式读取转发头。
+- 响应包含 CSP、拒绝 iframe、MIME sniffing 防护和 referrer 限制；500 响应不向客户端返回 traceback。
+- SVG、HTML、文本、PDF 与 Office 等上传内容强制下载，只有受支持的位图格式可内联展示。
 
-4. 增加 HTTP 安全响应头。
-   - `Content-Security-Policy`
-   - `X-Frame-Options: DENY`
-   - `X-Content-Type-Options: nosniff`
-   - `Referrer-Policy: same-origin`
+### Agent 运行时
 
-5. 限制附件内联展示。
-   - 只有 PNG、JPEG、GIF、WebP、BMP 会以内联图片方式返回。
-   - SVG、HTML、文本、PDF、Office 等其他上传内容强制走 `Content-Disposition: attachment`，降低同源附件 XSS 风险。
+- 托管 sidecar 默认仅监听 `127.0.0.1:8766`。除不含敏感信息的健康检查外，私有 API 使用定时安全比较的 bearer token。
+- 运行时 token 由平台生成并保存为 secret；OAuth refresh token 只保存在平台数据库，不写入 Node.js 运行时目录。
+- HTTP 请求体有大小上限，SSE 与 JSON 响应禁用缓存，运行时目录以受限权限创建。
+- 文件工具先解析真实路径；工作区内读取可直接执行，文件修改及工作区外访问进入审批。搜索遍历跳过软链、`.git` 和 `node_modules`，受保护系统路径的直接文件写入会被拒绝。
+- 每个 run 可取消；退出、scope 清理和取消会终止待审批操作并尽力终止登记的宿主机进程组，清理接口会等待已登记子进程的退出事件。
+- 所有终端命令，以及文件写入、进程控制、记忆修改和敏感浏览器动作，进入 `once/session/always/deny` 审批。针对关机、磁盘格式化、直接删除系统根、fork bomb 和已知云元数据地址的文本规则属于额外防护，不是宿主机安全边界。
+- 等待队列、请求体读取时间、事件日志、命令输出、同时运行进程和已完成进程记录均有硬上限。
+- 崩溃恢复不自动重放已经开始工具副作用的 run，而是标记为 `needs_review`。
 
-6. 隐藏 500 错误细节。
-   - HTTP 响应只返回通用 `internal server error`。
-   - 详细 traceback 仅写入服务端 stderr / 日志。
+### 数据与集成
 
-7. 校验异常 `Content-Length`。
-   - 非数字或负数长度返回 `400`，避免落入通用异常路径。
+- SQLite 使用 WAL 与按线程连接；频道、私人会话、知识库和 Agent scope 均在服务端校验归属与权限。
+- Agent 生成附件只从允许的媒体根目录读取，并解析软链后再次校验。
+- Agent 内部工具接口使用独立 token，与浏览器 session 分离；凭据和 token 不进入 SSE 事件。
+- Firecrawl 生成的环境与 compose override 写入平台数据目录，不修改 submodule 工作树。
+- 自动更新只接受干净工作树上的 fast-forward，并复用 `deploy.sh update` 的失败回滚路径。
 
-## 二次加固（2026-05-28）
+## 部署要求
 
-在上线前复审基础上，进一步修复了运行时集成与部署路径中的问题：
+- 对公网服务设置 `ENTERPRISE_PUBLIC_BASE_URL=https://你的公网域名`，并让反向代理覆盖客户端提供的转发头。
+- 只有可信代理需要真实客户端 IP 时才设置 `ENTERPRISE_TRUSTED_PROXY=1`。
+- 不要在正式环境设置 `ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD=1`；首次登录改密后删除初始密码文件。
+- 保护 `ENTERPRISE_PLATFORM_DATA` 及平台服务账号。数据库内含密码哈希、OAuth token、session secret 和内部 runtime token。
+- 保持 Agent runtime 监听本机地址，不要通过反向代理公开 `8766` 端口。
+- 以最小权限运行平台服务账号；不要让该账号读取不希望 Agent 访问的宿主机凭据或系统目录。
+- 进程清理基于已登记 PID/进程组，无法保证回收主动通过 `setsid` 脱离进程组的程序，也无法覆盖 sidecar 被强制终止后遗失的登记信息；需要更强保证时应在部署层增加 systemd scope/cgroup 或等价控制。
+- 若宿主机上存在云实例元数据或内部管理网络，应在主机/网络层额外阻断；命令文本规则不能替代网络隔离。
 
-1. 会话签名密钥持久化。未设置 `ENTERPRISE_SESSION_SECRET` 时，密钥首次启动生成后写入数据库（secret），重启不再注销所有会话；设置 env 时仍以 env 为准。
-2. 限制 Agent `MEDIA:` 文件读取范围。生成附件只允许读取工作区与系统临时目录（可经 `ENTERPRISE_MEDIA_ROOTS` 扩展），并解析软链后校验，杜绝读取 `data` 目录密钥或 `/etc/passwd` 等任意主机文件。
-3. 约束托管 Hermes 源路径。`repo_path` 必须存在、含 `pyproject.toml` 且位于受信目录（绑定子模块及其父目录，可经 `ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS` 扩展），消除 Web 管理员触发任意 `pip install -e` 的 RCE 面。
-4. 托管 Hermes/Cognee `.env` 以 0600 原子写入，与 `auth.json` 一致，避免 `API_SERVER_KEY` / agent token 组/全局可读。
-5. CSRF 与登录限流的可信代理边界。仅在 `ENTERPRISE_TRUSTED_PROXY=1` 时信任 `X-Forwarded-*`；cookie 写请求缺 `Origin`/`Referer` 时拒绝（bearer 客户端豁免）；新增按账号的全局失败上限。
-6. 会话 token 可吊销。改密、改角色/权限组、停用或显式吊销会递增 `token_version`，使既有 token 立即失效。
-7. 频道与知识库读取授权。频道历史读取需 `read_workspace`、私聊按用户归属隔离；知识库读取端点需 `read_workspace`（agent-tool 边界仍由 agent token 单独鉴权）。
-8. 私人 Agent 容器隔离加固。Docker 后端默认 `--cap-drop ALL`、`--security-opt no-new-privileges`、`--pids-limit`、`--memory`，可配 `--cpus`/`--network`。
-9. 前端纵深防御。锚点 `href` 仅允许 http(s)/相对/mailto/tel；401 自动跳登录；非 JSON 响应不再抛裸异常；移除登录框默认用户名。
-10. 可靠性。SQLite 改为按线程连接 + WAL（去除全局串行锁）；Agent 队列与 OAuth 会话有界化；Cognee 摄取移至后台线程，不再阻塞请求。
-
-## 检查结论
-
-当前项目代码在本次范围内未发现仍需阻断上线的高危问题。已修复的主要风险集中在公开入口会暴露的默认弱口令、CSRF、附件同源脚本执行、错误信息泄露和登录爆破，以及二次加固覆盖的会话密钥稳定性、Agent 任意文件读取、管理员可控 RCE 面、运行时密钥文件权限、频道/知识库读取授权与容器隔离。
-
-## 上线前项目配置要求
-
-- 生产环境设置 `ENTERPRISE_PUBLIC_BASE_URL=https://你的公网域名`。
-- 若平台位于反向代理之后并需按真实客户端 IP 限流，设置 `ENTERPRISE_TRUSTED_PROXY=1`（仅在代理会重写 `X-Forwarded-*` 时）。
-- 生产环境不要设置 `ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD=1`。
-- 首次启动推荐设置 `ENTERPRISE_ADMIN_PASSWORD`；如使用生成文件，首次登录并修改密码后删除 `bootstrap-admin-password.txt`。
-- 可显式设置 `ENTERPRISE_SESSION_SECRET` 由运维统一管理签名密钥；不设置时平台会在数据库中持久化一份。
-- 保持平台服务监听内网或本机地址，默认 `127.0.0.1:8765` 适合放在 Caddy 后面。
-- 保护 `ENTERPRISE_PLATFORM_DATA` 数据目录权限；平台数据库中保存账号哈希、会话相关密钥、OAuth token 和运行时密钥。
-
-## 验证
-
-已执行：
+## 验证命令
 
 ```bash
 cd enterprise-agent-platform
 python3 -m unittest discover -s tests
-python3 -m compileall enterprise_agent_platform hermes_plugin tests
+python3 -m compileall enterprise_agent_platform tests
+
+cd agent-runtime
+npm ci
+npm run check
+npm test
+npm run build
 ```
 
-结果：51 项单元测试通过，编译检查通过。
+前端改动还需在 `frontend/` 执行 `npm ci`、`npm run check`、`npm test` 和 `npm run build`。

@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import PlatformConfig
-from .service import EnterpriseService
+from .db import Database
+from .runtimes import PlatformRuntimeManager
 
 
 DEFAULT_SERVICE_NAME = "enterprise-agent-platform.service"
@@ -24,6 +25,7 @@ DEFAULT_PIP_NETWORK_RETRIES = 8
 DEFAULT_PIP_TIMEOUT_SECONDS = 120
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
+MINIMUM_NODE_VERSION = (22, 19)
 
 
 class DeploymentError(RuntimeError):
@@ -70,7 +72,7 @@ class SubprocessRunner:
 class DeploymentPaths:
     root: Path
     platform_dir: Path
-    hermes_repo: Path
+    agent_runtime_dir: Path
     cognee_repo: Path
     firecrawl_repo: Path
     venv_dir: Path
@@ -84,7 +86,7 @@ class DeploymentPaths:
         return cls(
             root=clean_root,
             platform_dir=clean_root / "enterprise-agent-platform",
-            hermes_repo=clean_root / "hermes-agent",
+            agent_runtime_dir=clean_root / "enterprise-agent-platform" / "agent-runtime",
             cognee_repo=clean_root / "cognee",
             firecrawl_repo=clean_root / "firecrawl",
             venv_dir=clean_root / ".venv",
@@ -130,6 +132,7 @@ class DeploymentManager:
         prepare_runtime: bool = True,
     ) -> DeploymentResult:
         self.ensure_python_version()
+        self.ensure_node_version()
         self.ensure_layout()
         if not skip_submodules:
             self.ensure_submodules()
@@ -143,6 +146,11 @@ class DeploymentManager:
                 self.prepare_platform_runtime(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port))
         if mode == "service":
+            # Publish the sidecar that matches the checked-out source before
+            # restarting the platform. The installer compares its persisted
+            # source signature, so this is cheap when nothing changed and is
+            # also what restores the matching sidecar after an update rollback.
+            self.prepare_platform_runtime(host=host, port=port)
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
         if mode == "foreground":
@@ -153,6 +161,10 @@ class DeploymentManager:
         if mode != "auto":
             raise DeploymentError(f"unknown deploy mode: {mode}")
 
+        # ``auto`` may choose either systemd or foreground execution. Prepare
+        # the managed sidecar first in both cases so a subsequent service
+        # switch can never observe a build from a different source revision.
+        self.prepare_platform_runtime(host=host, port=port)
         if self.user_systemd_available():
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode="service", url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
@@ -163,9 +175,28 @@ class DeploymentManager:
         if sys.version_info < (3, 11):
             raise DeploymentError("Python 3.11 or newer is required")
 
+    def ensure_node_version(self) -> None:
+        node = shutil.which("node")
+        npm = shutil.which("npm")
+        if node is None or npm is None:
+            raise DeploymentError("Node.js 22.19 or newer and npm are required")
+        raw_version = _capture_command_stdout([node, "--version"]).strip()
+        version = _parse_node_version(raw_version)
+        if version is None or version < MINIMUM_NODE_VERSION:
+            found = raw_version or "unknown"
+            raise DeploymentError(
+                f"Node.js 22.19 or newer is required (found {found})"
+            )
+
     def ensure_layout(self) -> None:
         if not (self.paths.platform_dir / "enterprise_agent_platform").is_dir():
             raise DeploymentError(f"platform source not found: {self.paths.platform_dir}")
+        if not (self.paths.agent_runtime_dir / "package.json").is_file() or not (
+            self.paths.agent_runtime_dir / "package-lock.json"
+        ).is_file():
+            raise DeploymentError(
+                f"Agent runtime source not found: {self.paths.agent_runtime_dir}"
+            )
 
     def ensure_submodules(self) -> None:
         if not (self.paths.root / ".git").exists():
@@ -176,8 +207,6 @@ class DeploymentManager:
 
     def ensure_source_repos(self) -> None:
         missing = []
-        if not (self.paths.hermes_repo / "pyproject.toml").exists():
-            missing.append(str(self.paths.hermes_repo))
         if not (self.paths.cognee_repo / "pyproject.toml").exists():
             missing.append(str(self.paths.cognee_repo))
         if not any(
@@ -293,16 +322,47 @@ class DeploymentManager:
             public_base_url=public_base_url,
             trust_forwarded_headers=env_values.get("ENTERPRISE_TRUSTED_PROXY", "").strip().lower() in {"1", "true", "yes", "on"},
             token_ttl_seconds=int(env_values.get("ENTERPRISE_SESSION_TTL_SECONDS") or config.token_ttl_seconds),
-            hermes_repo=self.paths.hermes_repo,
             cognee_repo=self.paths.cognee_repo,
             firecrawl_repo=self.paths.firecrawl_repo,
-            hermes_home=self.paths.data_dir / "runtimes" / "hermes",
+            agent_runtime_home=self.paths.data_dir / "runtimes" / "agent",
         )
-        service = EnterpriseService(config, autostart_runtime=False)
+        # Deployment can run while the currently installed service still owns
+        # the data-directory instance lock. Use only the concurrent SQLite
+        # settings reader plus the runtime manager here: constructing the full
+        # service would contend on that lock and would also run worker/scope
+        # startup and shutdown hooks during an otherwise isolated install.
+        database = Database(config.db_path)
+
+        def setting_provider(key: str) -> str | None:
+            row = database.query_one("SELECT value FROM settings WHERE key = ?", (key,))
+            return str(row["value"]) if row else None
+
+        def secret_provider(key: str) -> str:
+            row = database.query_one(
+                "SELECT value FROM settings WHERE key = ? AND secret = 1",
+                (key,),
+            )
+            return str(row["value"]) if row else os.getenv(key, "")
+
+        runtimes = PlatformRuntimeManager(
+            config,
+            secret_provider,
+            setting_provider=setting_provider,
+        )
         try:
-            return service.runtimes.status(refresh=False)
+            agent_status = runtimes.agent_runtime_status(refresh=False)
+            if runtimes.agent_runtime_config().get("managed"):
+                agent_status = runtimes.install_agent_runtime(force=False)
+                if not agent_status.available:
+                    raise DeploymentError(
+                        agent_status.error or "Agent runtime preparation failed"
+                    )
+            statuses = runtimes.prepare()
+            statuses["agent"] = agent_status.to_dict()
+            return statuses
         finally:
-            service.close()
+            runtimes.close()
+            database.close()
 
     def user_systemd_available(self) -> bool:
         if not shutil.which("systemctl"):
@@ -480,7 +540,7 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         effective_port = port
     values = {
         "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
-        "ENTERPRISE_HERMES_REPO": str(paths.hermes_repo),
+        "ENTERPRISE_AGENT_RUNTIME_HOME": str(paths.data_dir / "runtimes" / "agent"),
         "ENTERPRISE_COGNEE_REPO": str(paths.cognee_repo),
         "ENTERPRISE_FIRECRAWL_REPO": str(paths.firecrawl_repo),
         "ENTERPRISE_PLATFORM_HOST": effective_host,
@@ -523,7 +583,7 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         f"ExecStart={exec_start}",
         "Restart=on-failure",
         "RestartSec=5",
-        # Give the platform room to bring managed runtimes (Hermes/Firecrawl)
+        # Give the platform room to bring managed runtimes (Agent/Firecrawl)
         # up and down; the default 90s stop window can be too short to stop
         # them gracefully, which would otherwise escalate to SIGKILL.
         f"TimeoutStopSec={service_stop_timeout_seconds()}",
@@ -646,6 +706,17 @@ def _capture_command_stdout(cmd: list[str], *, timeout: float = 20.0) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return result.stdout or ""
+
+
+def _parse_node_version(raw: str) -> tuple[int, int] | None:
+    value = raw.strip().removeprefix("v")
+    parts = value.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
 
 
 def _probe_http_ready(base_url: str) -> bool:

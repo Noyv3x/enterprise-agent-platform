@@ -1,25 +1,23 @@
-import ast
+from __future__ import annotations
+
 import os
-import shutil
-import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from enterprise_agent_platform.runtimes import PlatformRuntimeManager
+
 from test_platform import (
+    RecordingCommandRunner,
+    RecordingLauncher,
     make_config,
     make_fake_firecrawl_repo,
-    RecordingLauncher,
-    RecordingCommandRunner,
 )
-
-from enterprise_agent_platform.runtimes import PlatformRuntimeManager
 
 
 class ExitedProcess:
-    """ProcessLike fake whose poll() reports a non-zero exit code."""
+    """Process fake whose ``poll`` reports a non-zero exit code."""
 
     def __init__(self, pid=55001, returncode=7):
         self.pid = pid
@@ -56,9 +54,6 @@ def _make_manager(tmp, *, wait=0, launcher=None, runner=None, settings=None):
 
 class RuntimeStartupWaitTests(unittest.TestCase):
     def test_zero_config_wait_does_not_apply_heavy_floor(self):
-        # REGRESSION GUARD: with runtime_startup_wait_seconds=0 and no env
-        # override, the heavy 300s/120s cold-start floor must NOT be forced on,
-        # so async startup / the test suite never blocks on a long deadline.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             for key in ("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", "ENTERPRISE_CAMOFOX_STARTUP_WAIT_SECONDS"):
@@ -68,8 +63,6 @@ class RuntimeStartupWaitTests(unittest.TestCase):
             self.assertEqual(manager._runtime_startup_wait_seconds("camofox"), 0.0)
 
     def test_positive_config_wait_applies_heavy_floor(self):
-        # When a startup wait is actually requested, the heavier cold-start
-        # floor (Firecrawl 300s, Camofox 120s) is applied as a minimum.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             for key in ("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", "ENTERPRISE_CAMOFOX_STARTUP_WAIT_SECONDS"):
@@ -77,370 +70,41 @@ class RuntimeStartupWaitTests(unittest.TestCase):
             _, manager = _make_manager(tmp, wait=5)
             self.assertEqual(manager._runtime_startup_wait_seconds("firecrawl"), 300.0)
             self.assertEqual(manager._runtime_startup_wait_seconds("camofox"), 120.0)
-            # A wait larger than the floor wins over the default.
             _, manager_big = _make_manager(tmp, wait=500)
             self.assertEqual(manager_big._runtime_startup_wait_seconds("firecrawl"), 500.0)
             self.assertEqual(manager_big._runtime_startup_wait_seconds("camofox"), 500.0)
 
     def test_env_override_takes_precedence_over_floor(self):
-        # The per-runtime env override wins even when a positive config wait
-        # would otherwise apply the heavy floor.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             os.environ["ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS"] = "0"
             try:
                 _, manager = _make_manager(tmp, wait=5)
                 self.assertEqual(manager._runtime_startup_wait_seconds("firecrawl"), 0.0)
-                # camofox env not set -> heavy floor still applies for camofox.
                 os.environ.pop("ENTERPRISE_CAMOFOX_STARTUP_WAIT_SECONDS", None)
                 self.assertEqual(manager._runtime_startup_wait_seconds("camofox"), 120.0)
             finally:
                 os.environ.pop("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", None)
 
 
-class HermesProcessEnvTests(unittest.TestCase):
-    def test_process_env_points_tmpdir_at_managed_scratch(self):
-        # Managed Hermes must write generated MEDIA: attachments into a trusted
-        # media root, so TMPDIR/TEMP/TMP are redirected to <home>/tmp and that
-        # directory is created.
+class AgentRuntimeProcessEnvTests(unittest.TestCase):
+    def test_process_env_is_scoped_to_managed_runtime_and_never_contains_refresh_tokens(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            _, manager = _make_manager(tmp, wait=0)
-            scratch = manager.config.managed_hermes_home / "tmp"
-            self.assertFalse(scratch.exists())
-            env = manager._hermes_process_env()
-            self.assertEqual(env["TMPDIR"], str(scratch))
-            self.assertEqual(env["TEMP"], str(scratch))
-            self.assertEqual(env["TMP"], str(scratch))
-            self.assertTrue(scratch.is_dir())
-            # The managed HERMES_HOME is still threaded through.
-            self.assertEqual(env["HERMES_HOME"], str(manager.config.managed_hermes_home))
+            config, manager = _make_manager(tmp)
+            env = manager._agent_runtime_process_env()
 
-
-class HermesRuntimePatchCompatibilityTests(unittest.TestCase):
-    def test_managed_hermes_patch_applies_to_pinned_submodule(self):
-        if shutil.which("git") is None:
-            self.skipTest("git is required to verify the Hermes runtime patch")
-
-        platform_root = Path(__file__).resolve().parents[1]
-        repo_root = platform_root.parent
-        hermes_repo = repo_root / "hermes-agent"
-        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
-
-        if not (hermes_repo / "gateway" / "platforms" / "api_server.py").exists():
-            self.skipTest("Hermes submodule is not initialized")
-        self.assertTrue(patch_path.exists(), f"managed Hermes patch is missing: {patch_path}")
-
-        before = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=hermes_repo,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        result = subprocess.run(
-            ["git", "apply", "--check", "--whitespace=nowarn", str(patch_path)],
-            cwd=hermes_repo,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        after = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=hermes_repo,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(before.returncode, 0, before.stderr)
-        self.assertEqual(after.returncode, 0, after.stderr)
-        self.assertEqual(before.stdout, after.stdout)
-        if result.returncode != 0:
-            self.fail(
-                "Managed Hermes runtime patch no longer applies to the pinned hermes-agent submodule.\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-
-    def test_applied_patch_propagates_relay_scope_to_runtime_and_cleanup(self):
-        """Exercise the installed patch, not merely its source text.
-
-        The platform scope must survive relay decoding, native session-key
-        construction, detached-delegation routing, and terminal cleanup key
-        derivation as one byte-identical value.
-        """
-        if shutil.which("git") is None:
-            self.skipTest("git is required to materialize the managed Hermes patch")
-
-        platform_root = Path(__file__).resolve().parents[1]
-        hermes_repo = platform_root.parent / "hermes-agent"
-        patch_path = (
-            platform_root
-            / "enterprise_agent_platform"
-            / "hermes_runtime_patch"
-            / "hermes_agent_isolation.patch"
-        )
-        if not (hermes_repo / "gateway" / "run.py").exists():
-            self.skipTest("Hermes submodule is not initialized")
-
-        with tempfile.TemporaryDirectory() as td:
-            patched = Path(td) / "hermes-agent"
-            shutil.copytree(
-                hermes_repo,
-                patched,
-                ignore=shutil.ignore_patterns(
-                    ".git",
-                    ".venv",
-                    "__pycache__",
-                    ".pytest_cache",
-                    "node_modules",
-                    "website",
-                ),
-            )
-            applied = subprocess.run(
-                ["git", "apply", "--whitespace=nowarn", str(patch_path)],
-                cwd=patched,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(applied.returncode, 0, applied.stderr)
-
-            exercise = r'''
-import ast
-import hashlib
-import logging
-import re
-from types import SimpleNamespace
-from pathlib import Path
-from typing import Any, Dict, Optional
-
-from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.relay.ws_transport import _event_from_wire
-from gateway.session import SessionSource, build_session_key
-
-
-def load_function(path, name, extra_globals):
-    tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=str(path))
-    node = None
-    for candidate in ast.walk(tree):
-        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef)) and candidate.name == name:
-            node = candidate
-            break
-    assert node is not None, name
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-            node,
-        ],
-        type_ignores=[],
-    )
-    ast.fix_missing_locations(module)
-    namespace = dict(extra_globals)
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace[name]
-
-
-_async_delegation_routing_metadata = load_function(
-    "tools/delegate_tool.py",
-    "_async_delegation_routing_metadata",
-    {"Any": Any, "Dict": Dict, "Optional": Optional},
-)
-_session_scoped_container_task_id = load_function(
-    "tools/terminal_tool.py",
-    "_session_scoped_container_task_id",
-    {"hashlib": hashlib, "re": re, "Optional": Optional},
-)
-_build_process_event_source = load_function(
-    "gateway/run.py",
-    "_build_process_event_source",
-    {
-        "logger": logging.getLogger("relay-scope-test"),
-        "Platform": Platform,
-        "_BUILTIN_PLATFORM_VALUES": _BUILTIN_PLATFORM_VALUES,
-        "_parse_session_key": lambda _key: None,
-    },
-)
-
-scope = "private:7"
-event = _event_from_wire({
-    "text": "hello",
-    "message_type": "text",
-    "message_id": "turn-7",
-    "enterprise_session_key": scope,
-    "source": {
-        "platform": "relay",
-        "chat_id": "enterprise-private-u7",
-        "chat_type": "dm",
-        "user_id": "u7",
-        "message_id": "turn-7",
-    },
-})
-assert event.source.enterprise_session_key == scope
-assert event.source.delivered_via_upstream_relay is True
-assert build_session_key(event.source) == scope
-
-# The same field on an ordinary/untrusted source must not override native keying.
-untrusted = SessionSource(
-    platform=Platform.RELAY,
-    chat_id="enterprise-private-u7",
-    chat_type="dm",
-    enterprise_session_key=scope,
-)
-assert build_session_key(untrusted) != scope
-
-# Detached delegation captures and later reconstructs the canonical key.
-parent = SimpleNamespace(
-    platform="relay",
-    _chat_type="dm",
-    _chat_id="enterprise-private-u7",
-    _thread_id=None,
-    _user_id="u7",
-    _user_id_alt=None,
-    _user_name="User 7",
-)
-routing = _async_delegation_routing_metadata(parent, scope)
-assert routing["session_key"] == scope
-
-runner = SimpleNamespace(
-    session_store=SimpleNamespace(_entries={}, _ensure_loaded=lambda: None),
-    _get_cached_session_source=lambda _key: None,
-)
-synthetic = _build_process_event_source(runner, {
-    "session_key": routing["session_key"],
-    "platform": routing["platform"],
-    "chat_type": routing["chat_type"],
-    "chat_id": routing["chat_id"],
-    "user_id": routing["user_id"],
-    "message_id": "turn-7",
-})
-assert synthetic is not None
-assert build_session_key(synthetic) == scope
-
-# Scope cleanup calls this exact derivation, so its process key must match the
-# task id used by terminal dispatch for the canonical Agent scope.
-digest = hashlib.sha256(scope.encode()).hexdigest()[:12]
-expected_task_id = f"gateway-private-7-{digest}"
-assert _session_scoped_container_task_id(scope) == expected_task_id
-'''
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(patched)
-            ran = subprocess.run(
-                [sys.executable, "-c", exercise],
-                cwd=patched,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-
-    def test_managed_patch_keeps_upstream_native_contracts(self):
-        platform_root = Path(__file__).resolve().parents[1]
-        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
-        patch_text = patch_path.read_text(encoding="utf-8")
-
-        # Hermes now owns the session-key schema/upsert and per-run approval
-        # namespace. The platform patch may filter by session_key, but must not
-        # fork those native contracts or collapse approvals back to a shared
-        # conversation key.
-        self.assertNotIn("+    session_key TEXT", patch_text)
-        self.assertNotIn("+CREATE INDEX IF NOT EXISTS idx_sessions_session_key", patch_text)
-        self.assertIn("approval_session_key = run_id", patch_text)
-        self.assertNotIn("approval_session_key = gateway_session_key", patch_text)
-
-        # Profile identity remains an upstream profile concept. Platform agent
-        # isolation travels separately as agent_scope_key.
-        self.assertNotIn('agent_identity"] = _agent_scope_key', patch_text)
-        self.assertIn('agent_scope_key=getattr(agent, "_gateway_session_key", None)', patch_text)
-
-        # MiniMax auth timestamp changes were part of an older unrelated patch
-        # and must not hitch a ride on the managed isolation overlay.
-        self.assertNotIn("minimax", patch_text.lower())
-
-    def test_managed_patch_guards_scoped_runtime_boundaries(self):
-        platform_root = Path(__file__).resolve().parents[1]
-        patch_path = platform_root / "enterprise_agent_platform" / "hermes_runtime_patch" / "hermes_agent_isolation.patch"
-        patch_text = patch_path.read_text(encoding="utf-8")
-
-        # Repeated cleanup of an already-removed managed sandbox must be a
-        # no-op, not a fallback that tears down Hermes' unscoped `default` env.
-        self.assertIn(
-            're.fullmatch(r"gateway-.+-[0-9a-f]{12}", str(task_id))',
-            patch_text,
-        )
-        self.assertIn("_shares_parent_terminal_scope", patch_text)
-
-        # Stable agent scope and per-run approval scope intentionally differ:
-        # terminal state is durable per Agent, sudo credentials are not.
-        self.assertIn("approval_session_key = get_current_session_key", patch_text)
-        self.assertIn('return f"approval:{approval_session_key}"', patch_text)
-
-        # /v1/runs accepts a client session ID in JSON rather than a header,
-        # but it must enforce the same type, traversal and length boundary.
-        self.assertIn("not isinstance(requested_session_id, str)", patch_text)
-        self.assertIn("_is_path_unsafe(requested_session_id)", patch_text)
-        self.assertIn("len(requested_session_id) > self._MAX_SESSION_HEADER_LEN", patch_text)
-
-        # Scoped session search must not resolve duplicate titles or explicit
-        # profile selectors outside the caller's Agent namespace.
-        self.assertIn("session_key=current_session_key", patch_text)
-        self.assertIn("Cross-profile session access is unavailable", patch_text)
-
-        # Detached delegation needs the original reply anchor and profile to
-        # route completion events back to the correct gateway conversation.
-        self.assertIn('("HERMES_SESSION_MESSAGE_ID", "message_id")', patch_text)
-        self.assertIn('("HERMES_SESSION_PROFILE", "profile")', patch_text)
-
-    def test_sitecustomize_private_symbols_exist_in_pinned_submodule(self):
-        platform_root = Path(__file__).resolve().parents[1]
-        hermes_repo = platform_root.parent / "hermes-agent"
-        if not (hermes_repo / "gateway" / "platforms" / "api_server.py").exists():
-            self.skipTest("Hermes submodule is not initialized")
-
-        def parsed(relative_path: str) -> ast.Module:
-            path = hermes_repo / relative_path
-            self.assertTrue(path.exists(), f"Hermes private integration module is missing: {path}")
-            return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-        def class_methods(relative_path: str, class_name: str) -> set[str]:
-            tree = parsed(relative_path)
-            for node in tree.body:
-                if isinstance(node, ast.ClassDef) and node.name == class_name:
-                    return {
-                        child.name
-                        for child in node.body
-                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    }
-            self.fail(f"Hermes private integration class disappeared: {relative_path}:{class_name}")
-
-        def top_level_names(relative_path: str) -> set[str]:
-            return {
-                node.name
-                for node in parsed(relative_path).body
-                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            }
-
-        api_methods = class_methods("gateway/platforms/api_server.py", "APIServerAdapter")
-        self.assertTrue({"__init__", "connect"}.issubset(api_methods))
-
-        runner_methods = class_methods("gateway/run.py", "GatewayRunner")
-        self.assertTrue(
-            {"_inject_watch_notification", "_handle_message_with_agent"}.issubset(runner_methods)
-        )
-
-        self.assertIn("_event_from_wire", top_level_names("gateway/relay/ws_transport.py"))
-        self.assertIn("_CodexCompletionsAdapter", top_level_names("agent/auxiliary_client.py"))
-        self.assertTrue((hermes_repo / "agent" / "codex_runtime.py").is_file())
+            self.assertEqual(env["AGENT_RUNTIME_HOME"], str(config.managed_agent_runtime_home))
+            self.assertEqual(env["AGENT_RUNTIME_HOST"], "127.0.0.1")
+            self.assertEqual(env["AGENT_RUNTIME_PORT"], "8766")
+            self.assertEqual(env["AGENT_RUNTIME_RUN_TIMEOUT_MS"], "2000")
+            self.assertEqual(env["AGENT_PLATFORM_INTERNAL_TOKEN"], "")
+            self.assertNotIn("CODEX_OAUTH_REFRESH_TOKEN", env)
+            self.assertNotIn("GROK_OAUTH_REFRESH_TOKEN", env)
 
 
 class FirecrawlEnvLocationTests(unittest.TestCase):
     def test_managed_env_written_under_runtime_dir_not_submodule(self):
-        # The generated Firecrawl .env (carrying a BULL_AUTH_KEY secret) must
-        # live under config.firecrawl_runtime_dir, NOT inside the firecrawl
-        # submodule working tree.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             repo = tmp / "firecrawl"
@@ -449,7 +113,6 @@ class FirecrawlEnvLocationTests(unittest.TestCase):
             env_path = manager._ensure_firecrawl_env()
             self.assertEqual(env_path, config.firecrawl_runtime_dir / ".env")
             self.assertTrue(env_path.exists())
-            # The secret-bearing env must not be planted in the submodule tree.
             self.assertFalse((repo / ".env").exists())
             text = env_path.read_text(encoding="utf-8")
             self.assertIn("BULL_AUTH_KEY=", text)
@@ -469,9 +132,16 @@ class FirecrawlEnvLocationTests(unittest.TestCase):
 
 
 class ProcessCrashDetectionTests(unittest.TestCase):
+    def test_agent_runtime_nonzero_exit_surfaces_stopped_not_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, manager = _make_manager(Path(td), wait=0)
+            manager._agent_process = ExitedProcess(returncode=11)
+            status = manager.agent_runtime_status(refresh=False)
+            self.assertFalse(status.available)
+            self.assertEqual(status.state, "stopped")
+            self.assertIn("exited with code 11", status.error)
+
     def test_firecrawl_nonzero_exit_surfaces_error_not_running(self):
-        # A managed Firecrawl process that has exited non-zero must be reported
-        # as not-available with an error state, never as running/starting.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_firecrawl_repo(tmp / "firecrawl")
@@ -481,8 +151,7 @@ class ProcessCrashDetectionTests(unittest.TestCase):
             self.assertFalse(status.available)
             self.assertEqual(status.state, "error")
             self.assertIn("exited with code 9", status.error)
-            self.assertNotEqual(status.state, "running")
-            self.assertNotEqual(status.state, "starting")
+            self.assertNotIn(status.state, {"running", "starting"})
 
     def test_camofox_nonzero_exit_surfaces_error_not_running(self):
         with tempfile.TemporaryDirectory() as td:
@@ -493,27 +162,23 @@ class ProcessCrashDetectionTests(unittest.TestCase):
             self.assertFalse(status.available)
             self.assertEqual(status.state, "error")
             self.assertIn("exited with code 3", status.error)
-            self.assertNotEqual(status.state, "running")
-            self.assertNotEqual(status.state, "starting")
+            self.assertNotIn(status.state, {"running", "starting"})
 
 
 class FirecrawlComposeTeardownTests(unittest.TestCase):
     def test_stop_runs_compose_down_for_managed_stack(self):
-        # Stopping a managed Firecrawl compose stack must run
-        # `docker compose ... down --remove-orphans` (mirroring the up argv)
-        # rather than orphaning the daemon-owned containers.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_firecrawl_repo(tmp / "firecrawl")
             launcher = RecordingLauncher()
             runner = RecordingCommandRunner()
             os.environ["ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS"] = "0"
+            manager = None
             try:
                 _, manager = _make_manager(tmp, wait=0, launcher=launcher, runner=runner)
                 manager.ensure_firecrawl_ready(wait=False)
                 up_calls = [c for c in launcher.calls if c["cmd"][:2] == ["docker", "compose"] and "up" in c["cmd"]]
                 self.assertTrue(up_calls, "expected a managed docker compose up launch")
-                # Sanity: teardown command recorded for the managed stack.
                 self.assertIsNotNone(manager._firecrawl_compose_teardown)
 
                 manager.stop_firecrawl()
@@ -524,17 +189,14 @@ class FirecrawlComposeTeardownTests(unittest.TestCase):
                 self.assertTrue(down_calls, "stop_firecrawl must run docker compose down")
                 down_cmd = down_calls[-1]["cmd"]
                 self.assertIn("--remove-orphans", down_cmd)
-                # The down argv preserves the --env-file from the up argv.
                 self.assertIn("--env-file", down_cmd)
-                # Teardown state cleared after stop so a second stop is a no-op.
                 self.assertIsNone(manager._firecrawl_compose_teardown)
             finally:
                 os.environ.pop("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", None)
-                manager.close()
+                if manager is not None:
+                    manager.close()
 
     def test_user_command_firecrawl_is_not_compose_torn_down(self):
-        # A user-configured Firecrawl command is left to the operator: no
-        # compose teardown command should be recorded.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_firecrawl_repo(tmp / "firecrawl")

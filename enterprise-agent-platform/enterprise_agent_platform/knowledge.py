@@ -300,7 +300,7 @@ def format_passive_suggestions(hits: list[KnowledgeHit]) -> str:
     if not hits:
         return ""
     lines = [
-        '检测到知识库中的以下条目可能对当前工作有帮助。若需要完整内容，请调用工具 enterprise_kb_read；若需要更多条目，请调用 enterprise_kb_search。'
+        "检测到知识库中的以下条目可能对当前工作有帮助。需要完整内容时请调用 knowledge 工具的 read 操作；需要更多条目时调用 search 操作。"
     ]
     for hit in hits:
         lines.append(f"- kb:{hit.id} | {hit.title}: {hit.summary}")

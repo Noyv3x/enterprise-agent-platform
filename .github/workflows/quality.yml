@@ -36,11 +36,16 @@ jobs:
           cache: pip
           cache-dependency-path: enterprise-agent-platform/pyproject.toml
 
+      - name: Set up Node.js for deployment checks
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
       - name: Install platform
         run: python -m pip install --no-input --editable .
 
       - name: Compile Python sources
-        run: python -m compileall -q enterprise_agent_platform hermes_plugin tests
+        run: python -m compileall -q enterprise_agent_platform tests
 
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
@@ -93,10 +98,13 @@ jobs:
       - name: Audit frontend dependencies
         run: npm audit --audit-level=high
 
-  hermes-patch:
-    name: Hermes runtime patch
+  agent-runtime:
+    name: Agent runtime (Node 24)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: enterprise-agent-platform/agent-runtime
     steps:
       - name: Check out source and submodules
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -104,7 +112,24 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Verify runtime patch applies cleanly
-        run: >-
-          git -C hermes-agent apply --check
-          ../enterprise-agent-platform/enterprise_agent_platform/hermes_runtime_patch/hermes_agent_isolation.patch
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: enterprise-agent-platform/agent-runtime/package-lock.json
+
+      - name: Install runtime dependencies
+        run: npm ci
+
+      - name: Type-check runtime
+        run: npm run check
+
+      - name: Run runtime tests
+        run: npm test
+
+      - name: Build runtime
+        run: npm run build
+
+      - name: Audit runtime dependencies
+        run: npm audit --audit-level=high

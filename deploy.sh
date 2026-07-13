@@ -48,6 +48,21 @@ python_bootstrap_checked() {
   "$PYTHON_BIN" -m enterprise_agent_platform.deployment bootstrap --root "$ROOT" --mode "$mode" "$@"
 }
 
+require_node_runtime() {
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "Node.js 22.19 or newer and npm are required." >&2
+    exit 1
+  fi
+  local version major minor
+  version="$(node -p 'process.versions.node')"
+  IFS=. read -r major minor _ <<<"$version"
+  if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ ]] \
+    || (( major < 22 || (major == 22 && minor < 19) )); then
+    echo "Node.js 22.19 or newer is required (found ${version:-unknown})." >&2
+    exit 1
+  fi
+}
+
 systemctl_user() {
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemctl is not available; run ./deploy.sh foreground instead." >&2
@@ -72,6 +87,17 @@ update_repo() {
   local branch upstream
   branch="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD || true)"
   upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+
+  # Rollback uses a hard reset to restore the previous revision. Refuse to
+  # enter that workflow when any staged, unstaged, or untracked user changes
+  # are present so a failed update can never erase local work.
+  local worktree_status
+  worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"
+  if [[ -n "$worktree_status" ]]; then
+    echo "Cannot update: the repository has staged, unstaged, or untracked changes." >&2
+    echo "Commit, stash, or remove local changes before running ./deploy.sh update." >&2
+    exit 1
+  fi
 
   # Checkpoint the current revision before moving the working tree forward so
   # the update can be reverted if the subsequent redeploy fails.
@@ -117,6 +143,7 @@ case "$cmd" in
     ;;
   update|upgrade)
     shift || true
+    require_node_runtime
     update_repo
     if ! python_bootstrap_checked auto "$@"; then
       rollback_update "$@" || true
@@ -125,18 +152,22 @@ case "$cmd" in
     ;;
   deploy|up)
     shift || true
+    require_node_runtime
     python_bootstrap auto "$@"
     ;;
   service)
     shift || true
+    require_node_runtime
     python_bootstrap service "$@"
     ;;
   foreground|run)
     shift || true
+    require_node_runtime
     python_bootstrap foreground "$@"
     ;;
   prepare)
     shift || true
+    require_node_runtime
     python_bootstrap prepare "$@"
     ;;
   start|stop|restart|status)
@@ -155,9 +186,16 @@ case "$cmd" in
     shift || true
     cd "$PLATFORM_DIR"
     "$PYTHON_BIN" -m unittest discover -s tests "$@"
-    "$PYTHON_BIN" -m compileall enterprise_agent_platform hermes_plugin tests
+    "$PYTHON_BIN" -m compileall enterprise_agent_platform tests
+    require_node_runtime
+    cd "$PLATFORM_DIR/agent-runtime"
+    npm ci
+    npm run check
+    npm test
+    npm run build
     ;;
   *)
+    require_node_runtime
     python_bootstrap auto "$@"
     ;;
 esac

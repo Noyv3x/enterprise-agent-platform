@@ -66,11 +66,12 @@ class MaskSecretTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
                 short_value = "key12"
                 long_value = "sk-confidentialPLAINTEXTtail99"
-                service.set_secret(admin, "API_SERVER_KEY", short_value)
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", short_value)
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", long_value)
                 items = {item["key"]: item for item in service.list_secrets(admin)}
-                short_item = items["API_SERVER_KEY"]
+                short_item = items["CODEX_OAUTH_REFRESH_TOKEN"]
                 long_item = items["CODEX_OAUTH_ACCESS_TOKEN"]
+                self.assertNotIn("API_SERVER_KEY", items)
                 self.assertTrue(short_item["configured"])
                 self.assertEqual(short_item["masked"], "********")
                 self.assertEqual(long_item["masked"], "...il99")

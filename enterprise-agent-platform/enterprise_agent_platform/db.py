@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -162,7 +163,8 @@ class Database:
                     scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
                     scope_id TEXT NOT NULL,
                     uploader_user_id INTEGER REFERENCES users(id),
-                    source TEXT NOT NULL DEFAULT 'upload' CHECK(source IN ('upload', 'hermes')),
+                    source TEXT NOT NULL DEFAULT 'upload'
+                        CHECK(source IN ('upload', 'hermes', 'agent_generated')),
                     filename TEXT NOT NULL,
                     storage_path TEXT NOT NULL UNIQUE,
                     mime_type TEXT NOT NULL,
@@ -237,6 +239,41 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_agent_scope_sessions_lookup
                     ON agent_scope_sessions(scope_key, lifecycle_id, session_id);
 
+                -- Pi-backed runtime state is intentionally stored separately
+                -- from the legacy session columns above.  A code rollback can
+                -- therefore reopen the prior runtime session without the new
+                -- sidecar ever overwriting its identifier or lifecycle.
+                CREATE TABLE IF NOT EXISTS agent_runtime_scopes (
+                    scope_key TEXT PRIMARY KEY REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_runtime_scope_sessions (
+                    scope_key TEXT NOT NULL REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_scope_sessions_lookup
+                    ON agent_runtime_scope_sessions(scope_key, lifecycle_id, session_id);
+
+                CREATE TABLE IF NOT EXISTS agent_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_key TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT 'memory' CHECK(target IN ('memory', 'user')),
+                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_memories_scope
+                    ON agent_memories(scope_key, target, owner_user_id, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -294,6 +331,8 @@ class Database:
             self._ensure_user_columns()
             self._migrate_private_agent_scopes()
             self._ensure_agent_scope_columns()
+            self._ensure_agent_runtime_scopes()
+            self._ensure_attachment_sources()
             self._ensure_telegram_update_columns()
             self._ensure_fts()
             self._conn.commit()
@@ -334,6 +373,35 @@ class Database:
             "UPDATE agent_scopes SET lifecycle_id = lower(hex(randomblob(16))) WHERE lifecycle_id = ''"
         )
 
+    def _ensure_agent_runtime_scopes(self) -> None:
+        """Seed fresh sidecar sessions without mutating rollback state.
+
+        ``agent_scopes.session_id``/``lifecycle_id``, ``private_agents`` and
+        legacy channel settings belong to the retired runtime.  Keeping the new
+        identifiers in their own table makes a database-level rollback safe,
+        while visible messages and workspace paths remain shared.
+        """
+
+        rows = self._conn.execute("SELECT scope_key, scope_type FROM agent_scopes").fetchall()
+        timestamp = now_ts()
+        for row in rows:
+            scope_type = str(row["scope_type"] or "agent")
+            session_id = f"ubitech-{scope_type}-{secrets.token_urlsafe(18)}"
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_runtime_scopes(
+                    scope_key, session_id, lifecycle_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["scope_key"]),
+                    session_id,
+                    secrets.token_hex(16),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
     def _ensure_telegram_update_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(telegram_updates)").fetchall()}
         if "result_json" not in columns:
@@ -341,12 +409,48 @@ class Database:
                 "ALTER TABLE telegram_updates ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
             )
 
-    def _migrate_private_agent_scopes(self) -> None:
-        """Import the legacy private-Agent row without mutating it.
+    def _ensure_attachment_sources(self) -> None:
+        """Add the neutral generated-file source without rewriting new DBs."""
 
-        ``private_agents`` is retained and dual-written for one release so a
-        rollback can still read the current session. ``agent_scopes`` is the
-        authoritative runtime state. Any
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attachments'"
+        ).fetchone()
+        schema = str(row[0] or "") if row else ""
+        if "agent_generated" in schema:
+            return
+        self._conn.executescript(
+            """
+            CREATE TABLE attachments_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                scope_id TEXT NOT NULL,
+                uploader_user_id INTEGER REFERENCES users(id),
+                source TEXT NOT NULL DEFAULT 'upload'
+                    CHECK(source IN ('upload', 'hermes', 'agent_generated')),
+                filename TEXT NOT NULL,
+                storage_path TEXT NOT NULL UNIQUE,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO attachments_new
+            SELECT id, message_id, scope_type, scope_id, uploader_user_id, source,
+                   filename, storage_path, mime_type, size_bytes, sha256, created_at
+            FROM attachments;
+            DROP TABLE attachments;
+            ALTER TABLE attachments_new RENAME TO attachments;
+            CREATE INDEX idx_attachments_message ON attachments(message_id, id);
+            CREATE INDEX idx_attachments_scope ON attachments(scope_type, scope_id, id);
+            """
+        )
+
+    def _migrate_private_agent_scopes(self) -> None:
+        """Import the legacy private-Agent workspace without mutating it.
+
+        ``private_agents`` is retained so a rollback can still read the old
+        session. ``agent_scopes`` is the authoritative runtime state. Any
         historical platform container is copied into explicit cleanup-tracking
         columns so the host-execution manager can remove only known resources
         and retain failures for a later retry.
@@ -387,7 +491,7 @@ class Database:
                 (
                     f"private:{user_id}",
                     str(user_id),
-                    str(row["session_id"] or f"enterprise-private-u{user_id}"),
+                    str(row["session_id"] or f"ubitech-private-u{user_id}"),
                     str(workspace),
                     container_name,
                     str(row["container_id"] or ""),
@@ -421,6 +525,28 @@ class Database:
                 END;
                 """
             )
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts "
+                "USING fts5(content, tags, content='agent_memories', content_rowid='id')"
+            )
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS agent_memory_ai AFTER INSERT ON agent_memories BEGIN
+                    INSERT INTO agent_memory_fts(rowid, content, tags)
+                    VALUES (new.id, new.content, new.tags_json);
+                END;
+                CREATE TRIGGER IF NOT EXISTS agent_memory_ad AFTER DELETE ON agent_memories BEGIN
+                    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, content, tags)
+                    VALUES ('delete', old.id, old.content, old.tags_json);
+                END;
+                CREATE TRIGGER IF NOT EXISTS agent_memory_au AFTER UPDATE ON agent_memories BEGIN
+                    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, content, tags)
+                    VALUES ('delete', old.id, old.content, old.tags_json);
+                    INSERT INTO agent_memory_fts(rowid, content, tags)
+                    VALUES (new.id, new.content, new.tags_json);
+                END;
+                """
+            )
             # The AFTER triggers only sync rows changed after they exist, so an
             # index created on a DB that already has documents (migrated from a
             # build without FTS5, or where FTS5 was unavailable on a prior boot)
@@ -438,6 +564,11 @@ class Database:
                 self._conn.execute(
                     "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
                 )
+            memory_count = self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
+            if memory_count > 0:
+                indexed = self._conn.execute("SELECT count(*) FROM agent_memory_fts_docsize").fetchone()[0]
+                if indexed != memory_count:
+                    self._conn.execute("INSERT INTO agent_memory_fts(agent_memory_fts) VALUES('rebuild')")
             self.fts_available = True
         except sqlite3.OperationalError:
             # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
@@ -517,7 +648,7 @@ class Database:
 
 
 def encode_json(value: dict[str, Any] | list[Any] | None) -> str:
-    return json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps({} if value is None else value, ensure_ascii=False, separators=(",", ":"))
 
 
 def decode_json(value: str | None) -> Any:

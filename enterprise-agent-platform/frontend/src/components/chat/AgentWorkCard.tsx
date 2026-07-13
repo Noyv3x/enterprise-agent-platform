@@ -35,7 +35,7 @@ function isAgentProcessStep(step: ActivityStep): boolean {
     "failed",
   ]).has(stage);
   return (
-    step?.source === "hermes" ||
+    step?.source === "agent" ||
     stage === "tool" ||
     stage.startsWith("tool.") ||
     structuredStage ||

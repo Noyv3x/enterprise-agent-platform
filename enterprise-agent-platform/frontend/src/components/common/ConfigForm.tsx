@@ -1,7 +1,7 @@
 /* <ConfigForm/> — the generic descriptor-driven config editor, ported from
    legacy renderConfigFieldsForm + groupedConfigFields + renderConfigField +
-   collectConfigUpdates (legacy-app.js:2541-2641). Used by the Hermes/Cognee
-   internal config pages (Phase 4d).
+   collectConfigUpdates (legacy-app.js:2541-2641). Used by managed service
+   configuration pages.
 
    The form is uncontrolled (each field carries a data-initial attribute);
    on submit we collect a CHANGED-ONLY diff via the DOM, preserving the legacy

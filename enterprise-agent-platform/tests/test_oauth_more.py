@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -18,10 +19,10 @@ from enterprise_agent_platform.oauth_flows import (
     OAUTH_HTTP_USER_AGENT,
     XAI_OAUTH_DISCOVERY_URL,
 )
-from enterprise_agent_platform.runtimes import HERMES_SETTING_PROVIDER
+from enterprise_agent_platform.runtimes import AGENT_SETTING_PROVIDER
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
 
-from test_platform import make_config, make_fake_hermes_repo, RecordingAgent
+from test_platform import make_config, RecordingAgent
 
 
 class _ScriptedOAuthHTTPClient:
@@ -57,71 +58,6 @@ class _ScriptedOAuthHTTPClient:
     def post_form(self, url, body, *, timeout=20.0):
         self.calls.append(("post_form", url, dict(body)))
         return self._next(url)
-
-
-class _FakeHermesOAuthBridge:
-    def __init__(self):
-        self.calls = []
-
-    def available(self):
-        return True
-
-    def start(self, provider):
-        self.calls.append(("start", provider))
-        if provider == "openai-codex":
-            return {
-                "provider": "openai-codex",
-                "kind": "device_code",
-                "status": "waiting_for_user",
-                "complete": False,
-                "user_code": "HERMES-CODE",
-                "device_auth_id": "hermes-device",
-                "verification_url": "https://auth.openai.com/codex/device",
-                "poll_interval": 3,
-                "expires_in": 900,
-            }
-        return {
-            "provider": "xai-oauth",
-            "kind": "manual_callback",
-            "status": "waiting_for_callback",
-            "complete": False,
-            "authorize_url": "https://auth.x.ai/authorize?state=hermes-state",
-            "redirect_uri": "http://127.0.0.1:56121/callback",
-            "token_endpoint": "https://auth.x.ai/token",
-            "discovery": {"token_endpoint": "https://auth.x.ai/token"},
-            "code_verifier": "hermes-verifier",
-            "code_challenge": "hermes-challenge",
-            "state": "hermes-state",
-        }
-
-    def poll_codex(self, session):
-        self.calls.append(("poll_codex", session["device_auth_id"], session["user_code"]))
-        return {
-            "provider": "openai-codex",
-            "kind": "device_code",
-            "status": "complete",
-            "complete": True,
-            "tokens": {"access_token": "hermes-codex-access", "refresh_token": "hermes-codex-refresh"},
-        }
-
-    def complete_xai(self, session, callback_url):
-        self.calls.append(("complete_xai", session["state"], callback_url))
-        return {
-            "provider": "xai-oauth",
-            "kind": "manual_callback",
-            "status": "complete",
-            "complete": True,
-            "tokens": {
-                "access_token": "hermes-xai-access",
-                "refresh_token": "hermes-xai-refresh",
-                "id_token": "hermes-xai-id",
-            },
-        }
-
-
-class _FakeHermesOAuthBridgeWithoutAuthHelpers(_FakeHermesOAuthBridge):
-    def auth_helpers_available(self):
-        return False
 
 
 def _codex_started_manager(token_responses):
@@ -177,22 +113,7 @@ class OAuthPollTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Content-type"], "application/json")
         self.assertEqual(captured["timeout"], 7.0)
 
-    def test_codex_flow_uses_hermes_bridge_when_available(self):
-        http_client = _ScriptedOAuthHTTPClient()
-        bridge = _FakeHermesOAuthBridge()
-        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
-
-        started = manager.start("openai-codex")
-        self.assertEqual(started["user_code"], "HERMES-CODE")
-        completed = manager.poll("openai-codex", started["flow_id"])
-
-        self.assertTrue(completed["complete"])
-        self.assertEqual(completed["tokens"]["access_token"], "hermes-codex-access")
-        self.assertEqual(http_client.calls, [])
-        self.assertEqual(bridge.calls[0], ("start", "openai-codex"))
-        self.assertEqual(bridge.calls[1], ("poll_codex", "hermes-device", "HERMES-CODE"))
-
-    def test_codex_flow_falls_back_to_http_when_hermes_auth_helpers_missing(self):
+    def test_codex_flow_uses_platform_http_client(self):
         http_client = _ScriptedOAuthHTTPClient(
             {
                 CODEX_DEVICE_USER_CODE_URL: OAuthHTTPResponse(
@@ -201,38 +122,14 @@ class OAuthPollTests(unittest.TestCase):
                 ),
             }
         )
-        bridge = _FakeHermesOAuthBridgeWithoutAuthHelpers()
-        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+        manager = OAuthFlowManager(http_client)
 
         started = manager.start("openai-codex")
 
         self.assertEqual(started["user_code"], "HTTP-CODE")
-        self.assertEqual(bridge.calls, [])
         self.assertEqual(http_client.calls[0][0], "post_json")
 
-    def test_xai_flow_uses_hermes_bridge_when_available(self):
-        http_client = _ScriptedOAuthHTTPClient()
-        bridge = _FakeHermesOAuthBridge()
-        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
-
-        started = manager.start("xai-oauth")
-        self.assertEqual(started["authorize_url"], "https://auth.x.ai/authorize?state=hermes-state")
-        completed = manager.complete(
-            "xai-oauth",
-            started["flow_id"],
-            "http://127.0.0.1:56121/callback?code=ok&state=hermes-state",
-        )
-
-        self.assertTrue(completed["complete"])
-        self.assertEqual(completed["tokens"]["access_token"], "hermes-xai-access")
-        self.assertEqual(http_client.calls, [])
-        self.assertEqual(bridge.calls[0], ("start", "xai-oauth"))
-        self.assertEqual(
-            bridge.calls[1],
-            ("complete_xai", "hermes-state", "http://127.0.0.1:56121/callback?code=ok&state=hermes-state"),
-        )
-
-    def test_xai_flow_falls_back_to_http_when_hermes_auth_helpers_missing(self):
+    def test_xai_flow_uses_platform_http_client(self):
         http_client = _ScriptedOAuthHTTPClient(
             {
                 XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
@@ -244,13 +141,11 @@ class OAuthPollTests(unittest.TestCase):
                 ),
             }
         )
-        bridge = _FakeHermesOAuthBridgeWithoutAuthHelpers()
-        manager = OAuthFlowManager(http_client, hermes_bridge=bridge)
+        manager = OAuthFlowManager(http_client)
 
         started = manager.start("xai-oauth")
 
         self.assertIn("https://xai.example/authorize?", started["authorize_url"])
-        self.assertEqual(bridge.calls, [])
         self.assertEqual(http_client.calls[0], ("get_json", XAI_OAUTH_DISCOVERY_URL))
 
     def test_poll_pending_returns_not_complete_without_dropping_session(self):
@@ -346,6 +241,71 @@ class OAuthGrokCompleteTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "post_form" for call in client.calls))
 
 
+class OAuthCredentialResolutionTests(unittest.TestCase):
+    def test_expired_codex_token_is_refreshed_once_for_concurrent_runtime_requests(self):
+        client = _ScriptedOAuthHTTPClient(
+            {
+                CODEX_TOKEN_URL: OAuthHTTPResponse(
+                    200,
+                    {
+                        "access_token": "rotated-access",
+                        "refresh_token": "rotated-refresh",
+                        "expires_in": 7200,
+                    },
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=client,
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "expired-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "refresh-token")
+                service.set_setting("CODEX_OAUTH_EXPIRES_AT", "1")
+                barrier = threading.Barrier(5)
+                results = []
+                errors = []
+
+                def resolve():
+                    try:
+                        barrier.wait(timeout=3)
+                        results.append(service.resolve_agent_credentials({"provider": "openai-codex"}))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=resolve) for _ in range(4)]
+                for thread in threads:
+                    thread.start()
+                barrier.wait(timeout=3)
+                for thread in threads:
+                    thread.join(timeout=3)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 4)
+                self.assertEqual({result["access_token"] for result in results}, {"rotated-access"})
+                refresh_calls = [call for call in client.calls if call[0] == "post_form"]
+                self.assertEqual(len(refresh_calls), 1)
+                self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "rotated-access")
+                self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "rotated-refresh")
+            finally:
+                service.close()
+
+    def test_runtime_credential_resolution_rejects_unconnected_provider(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                with self.assertRaises(ServiceError) as raised:
+                    service.resolve_agent_credentials({"provider": "xai-oauth"})
+                self.assertEqual(raised.exception.status, 409)
+                self.assertIn("not connected", raised.exception.message)
+            finally:
+                service.close()
+
+
 class OAuthSessionPruningTests(unittest.TestCase):
     def test_prune_evicts_oldest_when_over_cap(self):
         manager = OAuthFlowManager(_ScriptedOAuthHTTPClient())
@@ -382,7 +342,6 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
     def test_start_oauth_verification_does_not_switch_live_provider(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
             client = _ScriptedOAuthHTTPClient(
                 {
                     XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
@@ -401,9 +360,9 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
-                # Default active provider is openai-codex; the persisted setting is
-                # unset until a provider is actually selected.
-                self.assertIsNone(service.get_setting(HERMES_SETTING_PROVIDER))
+                # Bootstrap persists the default provider so the sidecar and UI
+                # resolve the same configuration before the first OAuth flow.
+                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "openai-codex")
                 self.assertEqual(service._active_oauth_provider(), "openai-codex")
 
                 started = service.start_oauth_verification(admin, "xai-oauth")
@@ -413,7 +372,7 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
                 # ...but the live provider must NOT have switched to xai-oauth and
                 # no tokens were stored, so status still reports openai-codex active.
                 self.assertEqual(started["active_provider"], "openai-codex")
-                self.assertIsNone(service.get_setting(HERMES_SETTING_PROVIDER))
+                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "openai-codex")
                 self.assertEqual(service.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "")
                 self.assertFalse(service._oauth_tokens_configured("xai-oauth"))
             finally:
@@ -422,7 +381,6 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
     def test_poll_pending_through_service_keeps_provider_unswitched(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
             client = _ScriptedOAuthHTTPClient(
                 {
                     CODEX_DEVICE_USER_CODE_URL: OAuthHTTPResponse(
@@ -452,7 +410,6 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
     def test_complete_state_mismatch_through_service_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
             client = _ScriptedOAuthHTTPClient(
                 {
                     XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(

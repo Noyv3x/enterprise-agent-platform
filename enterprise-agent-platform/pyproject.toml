@@ -5,24 +5,37 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "enterprise-agent-platform"
 version = "0.1.0"
-description = "Web platform for shared and private ubitech agent instances with Cognee-backed knowledge tools."
+description = "Web platform for shared and private ubitech agent instances with a platform-owned Agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "ubitech agent" }]
 license = { text = "MIT" }
-dependencies = ["PyYAML>=6.0", "websockets>=14,<16"]
+dependencies = []
 
 [project.scripts]
 enterprise-agent-platform = "enterprise_agent_platform.__main__:main"
 
 [tool.setuptools]
-packages = ["enterprise_agent_platform", "hermes_plugin", "hermes_plugin.enterprise_kb"]
+packages = ["enterprise_agent_platform"]
 
 [tool.setuptools.package-data]
 enterprise_agent_platform = [
   "static/*",
-  "hermes_runtime_patch/*.py",
-  "hermes_runtime_patch/*.patch",
-  "hermes_runtime_patch/*.cjs",
 ]
-"hermes_plugin.enterprise_kb" = ["plugin.yaml"]
+
+# The managed Node.js runtime is installed outside site-packages so npm can
+# materialize its locked dependencies and build it in the platform data
+# directory. Keep the source tree intact in both wheels and source archives.
+[tool.setuptools.data-files]
+"share/ubitech-agent/agent-runtime" = [
+  "agent-runtime/README.md",
+  "agent-runtime/package.json",
+  "agent-runtime/package-lock.json",
+  "agent-runtime/tsconfig.json",
+]
+"share/ubitech-agent/agent-runtime/src" = [
+  "agent-runtime/src/*.ts",
+]
+"share/ubitech-agent/agent-runtime/test" = [
+  "agent-runtime/test/*.ts",
+]

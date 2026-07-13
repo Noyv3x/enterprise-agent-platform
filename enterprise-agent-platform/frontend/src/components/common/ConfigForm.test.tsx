@@ -29,7 +29,7 @@ describe("ConfigForm operation state", () => {
             fields={[{ key: "example", label: "Example", value: "initial", configured: true }]}
             attr="yamlKey"
             buttonText="Save fields"
-            operationKey="admin:hermes:fields:save"
+            operationKey="admin:cognee:fields:save"
             onSubmit={onSubmit}
           />
         </I18nProvider>
@@ -46,10 +46,10 @@ describe("ConfigForm operation state", () => {
     act(() => store.dispatch({ type: "BEGIN_BUSY", payload: "unrelated" }));
     expect(save).toBeEnabled();
 
-    act(() => store.dispatch({ type: "BEGIN_BUSY", payload: "admin:hermes:fields:save" }));
+    act(() => store.dispatch({ type: "BEGIN_BUSY", payload: "admin:cognee:fields:save" }));
     expect(screen.getByRole("button", { name: "Saving…" })).toBeDisabled();
 
-    act(() => store.dispatch({ type: "END_BUSY", payload: "admin:hermes:fields:save" }));
+    act(() => store.dispatch({ type: "END_BUSY", payload: "admin:cognee:fields:save" }));
     await user.clear(input);
     await user.type(input, "initial");
     expect(screen.getByRole("button", { name: "Save fields" })).toBeDisabled();

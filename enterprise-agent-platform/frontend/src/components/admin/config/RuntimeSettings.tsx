@@ -1,11 +1,6 @@
-/* <RuntimeSettings/> — managed-runtime health board with per-row restart/refresh
-   and a Hermes-only install action (legacy renderRuntimeSettings, legacy-app.js:
-   2095-2128). Both actions POST the literal "{}" then reload ALL settings. The
-   button label is "重启" only when managed && name!=="cognee", else "刷新" — but
-   the endpoint is the same .../restart regardless. `runtimes === null` is the
-   loading state. */
+/* Managed-runtime health board with per-row restart or refresh actions. */
 
-import { installHermes, restartRuntime } from "../../../data/adminActions";
+import { restartRuntime } from "../../../data/adminActions";
 import { cx } from "../../../lib/cx";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { RuntimeRow } from "../../../types";
@@ -35,9 +30,6 @@ function runtimeStateLabel(t: Translator, state: string | undefined, available: 
 function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
   const store = useStoreHandle();
   const { t } = useI18n();
-  const installing = useStore((state) =>
-    state.pendingOperations.includes("admin:runtime:install-hermes"),
-  );
   const restarting = useStore((state) =>
     state.pendingOperations.includes(`admin:runtime:restart:${runtime.name}`),
   );
@@ -52,7 +44,9 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
       <div className="runtime-row__main">
         <div className="runtime-row__title">
           <span className={cx("dot", runtime.available ? "dot--pulse" : "dot--off")} />
-          <span className="runtime-row__name">{runtime.name}</span>
+          <span className="runtime-row__name">
+            {runtime.name === "agent" ? t("admin.runtime.agentName") : runtime.name}
+          </span>
           <StatusBadge
             ok={!!runtime.available}
             label={runtimeStateLabel(t, runtime.state, !!runtime.available)}
@@ -63,17 +57,6 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
         </div>
       </div>
       <div className="runtime-row__actions">
-        {runtime.name === "hermes" ? (
-          <LoadingButton
-            className="btn--sm"
-            loading={installing}
-            loadingLabel={t("admin.common.installing")}
-            onClick={() => void installHermes(store)}
-          >
-            <Icon name="download" size={14} />
-            <span>{t("admin.runtime.install")}</span>
-          </LoadingButton>
-        ) : null}
         <LoadingButton
           className="btn--sm"
           loading={restarting}

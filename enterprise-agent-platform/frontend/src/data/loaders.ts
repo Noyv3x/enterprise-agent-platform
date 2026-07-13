@@ -14,6 +14,7 @@ import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
 import type {
   Action,
+  AgentRuntimeConfigResponse,
   AgentStatus,
   AppState,
   AuditChannelMessagesResponse,
@@ -23,8 +24,6 @@ import type {
   ChatMode,
   CogneeConfigResponse,
   DocumentsResponse,
-  HermesConfigResponse,
-  HermesInternalConfigResponse,
   Id,
   MentionTargetsResponse,
   Message,
@@ -247,10 +246,10 @@ export async function loadSecurityConfig(store: AppStore): Promise<void> {
   });
 }
 
-export async function loadHermesConfig(store: AppStore): Promise<void> {
+export async function loadAgentRuntimeConfig(store: AppStore): Promise<void> {
   store.dispatch({
-    type: "SET_HERMES_CONFIG",
-    payload: await api<HermesConfigResponse>(endpoints.hermesConfig.path()),
+    type: "SET_AGENT_RUNTIME_CONFIG",
+    payload: await api<AgentRuntimeConfigResponse>(endpoints.agentRuntimeConfig.path()),
   });
 }
 
@@ -265,13 +264,6 @@ export async function loadAutoUpdateConfig(store: AppStore): Promise<void> {
   store.dispatch({
     type: "SET_AUTO_UPDATE_CONFIG",
     payload: await api<AutoUpdateConfigResponse>(endpoints.autoUpdateConfig.path()),
-  });
-}
-
-export async function loadHermesInternalConfig(store: AppStore): Promise<void> {
-  store.dispatch({
-    type: "SET_HERMES_INTERNAL_CONFIG",
-    payload: await api<HermesInternalConfigResponse>(endpoints.hermesInternalConfig.path()),
   });
 }
 
@@ -299,10 +291,9 @@ export async function loadSettings(store: AppStore): Promise<void> {
     loadSecrets(store),
     loadRuntime(store),
     loadSecurityConfig(store),
-    loadHermesConfig(store),
+    loadAgentRuntimeConfig(store),
     loadTelegramConfig(store),
     loadAutoUpdateConfig(store),
-    loadHermesInternalConfig(store),
     loadCogneeConfig(store),
     loadOAuthProviders(store),
   ]);

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import fcntl
+import ipaddress
+import json
 import os
 import re
 import secrets
 import hashlib
 import mimetypes
 import sys
+import socket
 import threading
 import time
 import urllib.error
@@ -24,32 +27,37 @@ from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .db import Database, decode_json, encode_json, now_ts
-from .hermes import AgentClient, AgentResult, AutoAgentClient, is_substantive_tool_start
-from .hermes_oauth_bridge import HermesOAuthBridge
+from .agent_runtime_client import (
+    AgentClient,
+    AgentResult,
+    AgentRuntimeClient,
+    AgentRuntimeRunError,
+)
 from .internal_config import (
-    load_hermes_default_config,
     read_cognee_internal_config,
-    read_hermes_internal_config,
     update_env_file,
-    update_yaml_text,
-    update_yaml_values,
 )
 from .jobs import DurableJob, DurableJobStore
 from .knowledge import KnowledgeBase, format_passive_suggestions
-from .oauth_flows import OAuthFlowError, OAuthFlowManager, SUPPORTED_OAUTH_PROVIDERS, oauth_provider_info
+from .oauth_flows import (
+    CODEX_OAUTH_CLIENT_ID,
+    CODEX_TOKEN_URL,
+    XAI_OAUTH_CLIENT_ID,
+    XAI_OAUTH_DISCOVERY_URL,
+    OAuthFlowError,
+    OAuthFlowManager,
+    SUPPORTED_OAUTH_PROVIDERS,
+    normalize_oauth_provider,
+    oauth_provider_info,
+)
 from .runtimes import (
-    HERMES_SETTING_API_URL,
-    HERMES_SETTING_INSTALL_EXTRAS,
-    HERMES_SETTING_MANAGED,
-    HERMES_SETTING_MODEL,
-    HERMES_SETTING_PROVIDER,
-    HERMES_SETTING_PROVIDER_BASE_URL,
-    HERMES_SETTING_REPO,
-    HERMES_SETTING_STARTUP_WAIT,
-    HERMES_SETTING_TIMEOUT,
+    AGENT_SETTING_COMPACTION_THRESHOLD,
+    AGENT_SETTING_MANAGED,
+    AGENT_SETTING_MAX_CONCURRENCY,
+    AGENT_SETTING_MODEL,
+    AGENT_SETTING_PROVIDER,
+    AGENT_SETTING_TIMEOUT,
     PlatformRuntimeManager,
-    default_base_url_for_provider,
-    normalize_hermes_provider,
 )
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
@@ -87,7 +95,6 @@ MAX_ATTACHMENTS_TOTAL_BYTES = max(
     MAX_ATTACHMENT_BYTES,
     int(os.getenv("ENTERPRISE_MAX_ATTACHMENTS_TOTAL_BYTES", str(100 * 1024 * 1024)) or "0"),
 )
-ASYNC_DELEGATION_POLL_SECONDS = max(1.0, _float_env("ENTERPRISE_HERMES_ASYNC_POLL_SECONDS", 5.0))
 # Cumulative per-uploader storage budget for attachment blobs. Bounds deliberate
 # or accidental disk exhaustion by any authenticated chat/private-agent user.
 # 0 disables the quota.
@@ -120,13 +127,10 @@ MAX_LOGIN_FAILURE_KEYS = 10_000
 # conversations cannot grow memory without limit.
 MAX_AGENT_QUEUE_DEPTH = 64
 MAX_TRACKED_CONVERSATIONS = 1000
-HERMES_CHANNEL_SESSION_SETTING_PREFIX = "hermes_session:channel:"
-MAX_HERMES_SESSION_ID_LENGTH = 512
-# Global ceiling on concurrent in-flight Hermes generations. Each conversation
-# still drains its own queue in FIFO order, but only this many replies hit the
-# Hermes backend (and hold a thread/socket) at once, providing backpressure so a
-# burst of distinct active conversations cannot exhaust threads/sockets or
-# overwhelm Hermes.
+MAX_AGENT_SESSION_ID_LENGTH = 512
+# Global ceiling on concurrent in-flight Agent generations. Each conversation
+# still drains its own queue in FIFO order, while this bound prevents a burst of
+# distinct conversations from exhausting host threads and sockets.
 MAX_CONCURRENT_AGENT_RUNS = max(1, int(os.getenv("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS", "8") or "8"))
 # Cognee ingestion is heavy; it runs on a background worker so document creation
 # never blocks the request thread (and, via the DB, every other request).
@@ -164,6 +168,16 @@ THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING_DEPTH = "medium"
 AGENT_MENTION_RE = re.compile(r"(?<![\w@])@(agent|main-agent|main_agent|main\s+agent)(?![A-Za-z0-9_-])", re.IGNORECASE)
 
+
+def is_substantive_tool_start(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or payload.get("event_type") or payload.get("event") or "").lower()
+    if status not in {"running", "started", "start", "tool.started"}:
+        return False
+    tool = str(payload.get("tool") or payload.get("tool_name") or "").strip()
+    return bool(tool) and not tool.startswith("_")
+
 PERMISSION_READ_WORKSPACE = "read_workspace"
 PERMISSION_CHAT = "chat"
 PERMISSION_PRIVATE_AGENT = "private_agent"
@@ -172,8 +186,9 @@ PERMISSION_MANAGE_KNOWLEDGE = "manage_knowledge"
 PERMISSION_MANAGE_USERS = "manage_users"
 PERMISSION_SYSTEM_SETTINGS = "system_settings"
 
-OAUTH_CREDENTIAL_EXPORT_KIND = "enterprise-agent-platform.oauth-credentials"
+OAUTH_CREDENTIAL_EXPORT_KIND = "ubitech-agent.oauth-credentials"
 OAUTH_CREDENTIAL_EXPORT_VERSION = 1
+LEGACY_GENERATED_ATTACHMENT_SOURCE = "hermes"
 PLATFORM_SETTING_PUBLIC_BASE_URL = "platform_public_base_url"
 PLATFORM_SETTING_TRUSTED_PROXY = "platform_trusted_proxy"
 PLATFORM_SETTING_HOST = "platform_host"
@@ -244,8 +259,7 @@ class EnterpriseService:
         runtime_process_launcher=None,
         runtime_command_runner=None,
         oauth_http_client=None,
-        hermes_bridge=None,
-        container_command_runner=None,
+        legacy_cleanup_runner=None,
         auto_update_runner=None,
         auto_update_launcher=None,
         auto_update_repo_root: Path | None = None,
@@ -281,18 +295,28 @@ class EnterpriseService:
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
-        # ``container_command_runner`` remains as an internal constructor
-        # compatibility hook, but is used only to remove containers recorded by
-        # pre-host-execution installations.  No Agent container is provisioned.
+        # This runner is used only for one-time cleanup of resources recorded by
+        # pre-host-execution installations. No Agent container is provisioned.
         self.agent_scopes = AgentScopeManager(
             config,
             self.db,
-            cleanup_runner=container_command_runner,
+            cleanup_runner=legacy_cleanup_runner,
         )
-        self.agent_client = agent_client or AutoAgentClient(config, self.get_secret, self.runtimes)
-        self.hermes_bridge = hermes_bridge or HermesOAuthBridge(self.runtimes)
-        oauth_flow_bridge = None if oauth_http_client is not None else self.hermes_bridge
-        self.oauth_flows = OAuthFlowManager(oauth_http_client, hermes_bridge=oauth_flow_bridge)
+        if not self.get_setting("agent_tool_token"):
+            self.set_setting(
+                "agent_tool_token",
+                self.config.agent_tool_token or secrets.token_urlsafe(32),
+                secret=True,
+            )
+        if not self.get_setting("agent_runtime_token"):
+            self.set_setting(
+                "agent_runtime_token",
+                self.config.agent_runtime_token or secrets.token_urlsafe(32),
+                secret=True,
+            )
+        self._uses_default_agent_client = agent_client is None
+        self.agent_client = agent_client or self._new_agent_runtime_client()
+        self.oauth_flows = OAuthFlowManager(oauth_http_client)
         self._conversation_lock = threading.RLock()
         # Message rows and their attachment files form one logical unit.  This
         # lock closes the file-written/row-inserted window against concurrent
@@ -305,7 +329,7 @@ class EnterpriseService:
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
-        # Global backpressure on concurrent in-flight Hermes generations.
+        # Global backpressure on concurrent in-flight Agent generations.
         self._agent_run_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_AGENT_RUNS)
         self._auth_lock = threading.RLock()
         self._login_failures: dict[tuple[str, str], Deque[float]] = {}
@@ -324,9 +348,6 @@ class EnterpriseService:
         # Operator-visible counters for documents that exhausted ingest retries.
         self._ingest_failed_count = 0
         self._ingest_last_error = ""
-        self._async_delegation_stop = threading.Event()
-        self._async_delegation_thread: threading.Thread | None = None
-        self._async_delegation_seen: set[str] = set()
         self._telegram_gateway = None
         self._telegram_delivery_lock = threading.Lock()
         self._telegram_delivery_wakeup = threading.Event()
@@ -343,6 +364,11 @@ class EnterpriseService:
         self._resources_closed = False
         self._close_lock = threading.Lock()
         self.ensure_bootstrap()
+        # Bootstrap may copy one-release legacy settings into the neutral Agent
+        # runtime keys. Rebuild the owned client once so its URL and timeouts
+        # agree with the runtime manager from the first actual generation.
+        if self._uses_default_agent_client:
+            self.agent_client = self._new_agent_runtime_client()
         self._cleanup_incomplete_attachment_messages()
         self._cleanup_orphan_attachment_files()
         # One-time compatibility cleanup. Failures stay tracked on the scope row
@@ -353,19 +379,40 @@ class EnterpriseService:
         except Exception as exc:
             print(f"Failed to clean up legacy Agent containers: {exc}", file=sys.stderr)
         self.runtimes.prepare()
-        if autostart_runtime and agent_client is None and self.config.agent_mode != "local":
+        if autostart_runtime and agent_client is None:
             prepare_agent_runtime = getattr(self.agent_client, "prepare_runtime", None)
             if callable(prepare_agent_runtime):
                 try:
                     prepare_agent_runtime()
                 except Exception as exc:
-                    print(f"Failed to start Hermes relay connector: {exc}", file=sys.stderr)
+                    print(f"Failed to prepare Agent runtime client: {exc}", file=sys.stderr)
             self.runtimes.ensure_managed_tooling_ready(wait=False)
-            self.runtimes.ensure_hermes_ready(wait=False)
+            self.runtimes.ensure_agent_runtime_ready(wait=False)
         self._recover_durable_work()
         self._start_telegram_gateway()
         self._start_auto_update_listener()
-        self._start_async_delegation_watcher()
+
+    def _new_agent_runtime_client(self) -> AgentRuntimeClient:
+        runtime = self.runtimes.agent_runtime_config()
+        runtime_token = self.config.agent_runtime_token or self.get_secret("agent_runtime_token")
+        internal_host = str(self.config.host or "").strip()
+        if internal_host in {"0.0.0.0", "::", ""}:
+            internal_host = "127.0.0.1"
+        if ":" in internal_host and not internal_host.startswith("["):
+            internal_host = f"[{internal_host}]"
+        return AgentRuntimeClient(
+            str(runtime.get("runtime_url") or self.config.agent_runtime_url),
+            runtime_token,
+            timeout_seconds=float(
+                runtime.get("timeout_seconds") or self.config.agent_runtime_timeout_seconds
+            ),
+            gateway_base_url=f"http://{internal_host}:{self.config.port}",
+            gateway_token=self.get_secret("agent_tool_token"),
+            default_provider=str(
+                runtime.get("provider") or self.config.agent_runtime_provider
+            ),
+            default_model=str(runtime.get("model") or self.config.agent_runtime_model),
+        )
 
     def close(self) -> None:
         with self._close_lock:
@@ -378,7 +425,6 @@ class EnterpriseService:
             if self._telegram_gateway is not None:
                 self._telegram_gateway.stop()
             self._auto_updater.stop()
-            self._async_delegation_stop.set()
             self._ingest_wakeup.set()
             self._telegram_delivery_wakeup.set()
 
@@ -395,20 +441,19 @@ class EnterpriseService:
                     pass
             self.runtimes.close()
 
-            async_delegation = self._async_delegation_thread
             with self._ingest_lock:
                 ingest = self._ingest_thread
             with self._telegram_delivery_lock:
                 telegram_delivery = self._telegram_delivery_thread
             deadline = time.monotonic() + 15.0
-            for worker in [async_delegation, ingest, telegram_delivery, *workers]:
+            for worker in [ingest, telegram_delivery, *workers]:
                 if worker is None or worker is threading.current_thread():
                     continue
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
             live_workers = [
                 worker
-                for worker in [async_delegation, ingest, telegram_delivery, *workers]
+                for worker in [ingest, telegram_delivery, *workers]
                 if worker is not None and worker is not threading.current_thread() and worker.is_alive()
             ]
             if live_workers:
@@ -473,6 +518,7 @@ class EnterpriseService:
         scope_key: str,
         *,
         lifecycle_id: str | None = None,
+        delete_sessions: bool = False,
         strict: bool = False,
     ) -> None:
         cleanup = getattr(self.agent_client, "cleanup_scope", None)
@@ -480,31 +526,45 @@ class EnterpriseService:
             return
         try:
             try:
-                cleanup(scope_key, lifecycle_id=lifecycle_id)
+                cleanup(
+                    scope_key,
+                    lifecycle_id=lifecycle_id,
+                    delete_sessions=delete_sessions,
+                )
             except TypeError:
-                # Test/local adapters and one-release third-party integrations
-                # may still expose the pre-lifecycle signature.
-                cleanup(scope_key)
+                try:
+                    # Test/local adapters and one-release third-party integrations
+                    # may still expose the pre-delete-sessions signature.
+                    cleanup(scope_key, lifecycle_id=lifecycle_id)
+                except TypeError:
+                    # Older adapters may expose only the original scope signature.
+                    cleanup(scope_key)
         except Exception as exc:
             if not strict:
                 print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
-                return
-            # A successful lifecycle mutation must not leave a known live run
-            # capable of further host-side tool effects. Restarting the managed
-            # runtime is the fail-closed fallback when targeted cancellation
-            # cannot be confirmed.
-            try:
-                status = self.runtimes.restart_hermes()
-            except Exception as restart_exc:
-                raise ServiceError(
-                    503,
-                    f"Agent scope was reset but Hermes cancellation failed: {restart_exc}",
-                ) from restart_exc
-            if not status.available:
-                raise ServiceError(
-                    503,
-                    f"Agent scope was reset but Hermes cancellation could not be confirmed: {status.error or exc}",
-                ) from exc
+            else:
+                # A successful lifecycle mutation must not leave a known live run
+                # capable of further host-side tool effects. Restarting the managed
+                # runtime is the fail-closed fallback when targeted cancellation
+                # cannot be confirmed.
+                try:
+                    status = self.runtimes.restart_agent_runtime()
+                except Exception as restart_exc:
+                    raise ServiceError(
+                        503,
+                        f"Agent scope was reset but runtime cancellation failed: {restart_exc}",
+                    ) from restart_exc
+                if not status.available:
+                    raise ServiceError(
+                        503,
+                        f"Agent scope was reset but runtime cancellation could not be confirmed: {status.error or exc}",
+                    ) from exc
+        try:
+            self._agent_browser_tool(scope_key, "cleanup", {})
+        except Exception as exc:
+            # Browser is optional and may be disabled. Runtime/process cleanup
+            # remains authoritative; tab/session reclamation is best effort.
+            print(f"Failed to clean Agent browser scope {scope_key}: {exc}", file=sys.stderr)
 
     def _cleanup_all_agent_scopes(self) -> None:
         for row in self.db.query("SELECT scope_key FROM agent_scopes ORDER BY scope_key"):
@@ -849,66 +909,12 @@ class EnterpriseService:
         if self.auto_update_enabled():
             self._auto_updater.start()
 
-    def _start_async_delegation_watcher(self) -> None:
-        if self.config.agent_mode == "local":
-            return
-        if not callable(getattr(self.agent_client, "consume_async_delegations", None)):
-            return
-        if self._async_delegation_thread is not None:
-            return
-
-        def _loop() -> None:
-            while not self._closed:
-                try:
-                    self._poll_async_delegation_events()
-                except Exception:
-                    # This watcher is a notification side channel; transient
-                    # Hermes/API failures must not bring down the service.
-                    pass
-                if self._async_delegation_stop.wait(ASYNC_DELEGATION_POLL_SECONDS):
-                    return
-
-        self._async_delegation_thread = threading.Thread(
-            target=_loop,
-            name="hermes-async-delegations",
-            daemon=True,
-        )
-        self._async_delegation_thread.start()
-
-    def _poll_async_delegation_events(self) -> None:
-        consumer = getattr(self.agent_client, "consume_async_delegations", None)
-        if not callable(consumer):
-            return
-        try:
-            events = consumer(session_key_prefixes=["channel:", "private:"])
-        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ValueError):
-            return
-        ack = getattr(self.agent_client, "ack_async_delegations", None)
-        ack_ids: list[str] = []
-        for event in events:
-            if isinstance(event, dict):
-                try:
-                    handled = self._handle_async_delegation_event(event)
-                except Exception:
-                    # Leave the peeked event unacknowledged so a transient DB
-                    # failure is retried on the next poll.
-                    continue
-                event_id = str(event.get("_enterprise_event_id") or "").strip()
-                if handled and event_id:
-                    ack_ids.append(event_id)
-        if ack_ids and callable(ack):
-            try:
-                ack(ack_ids)
-            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ValueError):
-                # Message-level dedupe makes a later peek harmless.
-                pass
-
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
             ts = now_ts()
             self.db.execute(
                 "INSERT INTO channels(name, description, created_at) VALUES (?, ?, ?)",
-                ("general", "Company-wide agent channel", ts),
+                ("general", "ubitech agent shared channel", ts),
             )
         if not self.db.scalar("SELECT COUNT(*) FROM users"):
             password, allow_weak = self._bootstrap_admin_password()
@@ -923,8 +929,24 @@ class EnterpriseService:
         if not self.get_setting("agent_tool_token"):
             token = self.config.agent_tool_token or secrets.token_urlsafe(32)
             self.set_setting("agent_tool_token", token, secret=True)
-        if not self.config.hermes_api_key and not self.get_secret("ENTERPRISE_HERMES_API_KEY") and not self.get_secret("API_SERVER_KEY"):
-            self.set_setting("API_SERVER_KEY", secrets.token_urlsafe(32), secret=True)
+        legacy_settings = {
+            AGENT_SETTING_PROVIDER: "hermes_provider",
+            AGENT_SETTING_MODEL: "hermes_model",
+            AGENT_SETTING_TIMEOUT: "hermes_timeout_seconds",
+        }
+        defaults = {
+            AGENT_SETTING_PROVIDER: self.config.agent_runtime_provider,
+            AGENT_SETTING_MODEL: self.config.agent_runtime_model,
+            AGENT_SETTING_TIMEOUT: str(self.config.agent_runtime_timeout_seconds),
+            AGENT_SETTING_MAX_CONCURRENCY: str(MAX_CONCURRENT_AGENT_RUNS),
+            AGENT_SETTING_COMPACTION_THRESHOLD: "0.8",
+        }
+        for key, default in defaults.items():
+            if self.get_setting(key) is not None:
+                continue
+            legacy_key = legacy_settings.get(key)
+            legacy_value = self.get_setting(legacy_key) if legacy_key else None
+            self.set_setting(key, legacy_value or default)
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
         configured = os.getenv("ENTERPRISE_ADMIN_PASSWORD")
@@ -1469,13 +1491,16 @@ class EnterpriseService:
                     reason="Agent request cancelled because the user account was deactivated",
                     cleanup_runtime=False,
                 )
-        if deactivating:
-            if deactivated_scope is not None:
-                self._cleanup_agent_scope(
-                    deactivated_scope.scope_key,
-                    lifecycle_id=deactivated_scope.lifecycle_id,
-                    strict=True,
-                )
+                if deactivated_scope is not None:
+                    # Keep the lifecycle gate closed until the old sidecar run
+                    # and its processes are confirmed terminal. Otherwise a
+                    # reactivation/new send can race and be killed by stale
+                    # scope cleanup.
+                    self._cleanup_agent_scope(
+                        deactivated_scope.scope_key,
+                        lifecycle_id=deactivated_scope.lifecycle_id,
+                        strict=True,
+                    )
         return self.get_user(user_id) or {}
 
     def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
@@ -2444,8 +2469,8 @@ class EnterpriseService:
                 reason="Agent request cancelled because its source message was deleted",
             )
             result = {"deleted": 1, "message": message}
-        for scope_key in cleanup_scope_keys:
-            self._cleanup_agent_scope(scope_key, strict=True)
+            for scope_key in cleanup_scope_keys:
+                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def delete_channel_messages_before(self, actor: dict[str, Any], channel_id: int, before_created_at: int) -> dict[str, Any]:
@@ -2473,8 +2498,8 @@ class EnterpriseService:
                 reason="Agent request cancelled because its source message was deleted",
             )
             result = {"deleted": deleted, "before_created_at": before_ts}
-        for scope_key in cleanup_scope_keys:
-            self._cleanup_agent_scope(scope_key, strict=True)
+            for scope_key in cleanup_scope_keys:
+                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def clear_channel_messages(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
@@ -2490,10 +2515,10 @@ class EnterpriseService:
                 agent_scope = self._channel_agent_scope(scope_id)
             else:
                 agent_scope = self.agent_scopes.ensure_private_scope(int(scope_id))
-            # Rotate the durable Hermes lifecycle before deleting visible
+            # Rotate the durable Agent lifecycle before deleting visible
             # history. If this persistence step fails, the API fails with all
             # messages intact; it can never report a partially cleared UI that
-            # silently reconnects to the old Hermes memory session.
+            # silently reconnects to the old Agent memory session.
             self.agent_scopes.rotate_session(agent_scope.scope_key)
             self._cancel_agent_scope_work(
                 scope_type,
@@ -2514,11 +2539,12 @@ class EnterpriseService:
                 reason=f"Agent request cancelled because the {scope_type} conversation was cleared",
             )
             result = {"deleted": int(deleted or 0)}
-        self._cleanup_agent_scope(
-            agent_scope.scope_key,
-            lifecycle_id=agent_scope.lifecycle_id,
-            strict=True,
-        )
+            self._cleanup_agent_scope(
+                agent_scope.scope_key,
+                lifecycle_id=agent_scope.lifecycle_id,
+                delete_sessions=True,
+                strict=True,
+            )
         return result
 
     def list_private_conversation_audits(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2614,8 +2640,8 @@ class EnterpriseService:
                 reason="Agent request cancelled because its source message was deleted",
             )
             result = {"deleted": 1, "message": message}
-        for scope_key in cleanup_scope_keys:
-            self._cleanup_agent_scope(scope_key, strict=True)
+            for scope_key in cleanup_scope_keys:
+                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def delete_private_messages_before(self, actor: dict[str, Any], user_id: int, before_created_at: int) -> dict[str, Any]:
@@ -2643,8 +2669,8 @@ class EnterpriseService:
                 reason="Agent request cancelled because its source message was deleted",
             )
             result = {"deleted": deleted, "before_created_at": before_ts}
-        for scope_key in cleanup_scope_keys:
-            self._cleanup_agent_scope(scope_key, strict=True)
+            for scope_key in cleanup_scope_keys:
+                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def clear_private_messages(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
@@ -2930,7 +2956,7 @@ class EnterpriseService:
         usage = extract_token_usage(result.raw)
         if usage is None:
             return None
-        provider = normalize_hermes_provider(str(generation.get("provider") or self._active_oauth_provider()))
+        provider = normalize_oauth_provider(str(generation.get("provider") or self._active_oauth_provider()))
         model = normalize_model_name(str(extract_model_name(result.raw) or generation.get("model") or ""))
         return {
             "provider": provider,
@@ -3077,7 +3103,7 @@ class EnterpriseService:
             )
         )
         system_prompt = self._channel_system_prompt(channel, suggestions)
-        self._record_agent_activity("channel", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
+        self._record_agent_activity("channel", scope_id, "replying", "等待 Agent 运行过程", generation["model"])
         agent_scope = self._channel_agent_scope(scope_id)
         session_id = agent_scope.session_id
         workspace_path = Path(agent_scope.workspace_path)
@@ -3085,11 +3111,13 @@ class EnterpriseService:
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], prompt_content),
-            history=self._hermes_owned_history(),
+            history=self._agent_session_seed_history("channel", scope_id, int(user_msg["id"])),
             session_id=session_id,
             session_key=f"channel:{scope_id}:main-agent",
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
+                "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(task["actor"]),
                 "execution": execution,
                 "workspace": {
@@ -3104,7 +3132,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: (
-                self._record_hermes_progress("channel", scope_id, event)
+                self._record_agent_progress("channel", scope_id, event)
                 if self._task_scope_is_current(task)
                 else None
             ),
@@ -3135,6 +3163,7 @@ class EnterpriseService:
                 "execution": execution,
                 "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "reply_to": self._reply_target(task),
             }
             if task.get("_job_id"):
@@ -3151,7 +3180,7 @@ class EnterpriseService:
                 content=clean_content,
                 metadata=metadata,
                 attachments=generated_attachments,
-                attachment_source="hermes",
+                attachment_source="agent_generated",
                 attachment_uploader_user_id=int(task["actor"]["id"]),
             )
         self._record_token_usage_event(
@@ -3234,7 +3263,6 @@ class EnterpriseService:
             "agent_message": None,
             "agent_status": status,
             "execution": agent_scope.to_execution_dict(),
-            "container": None,
         }
 
     def _fresh_active_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -3286,15 +3314,17 @@ class EnterpriseService:
         execution = agent_scope.to_execution_dict()
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
         system_prompt = self._private_system_prompt(actor, agent_scope, suggestions)
-        self._record_agent_activity("private", scope_id, "replying", "等待 Hermes Agent 运行过程", generation["model"])
+        self._record_agent_activity("private", scope_id, "replying", "等待 Agent 运行过程", generation["model"])
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=prompt_content,
-            history=self._hermes_owned_history(),
+            history=self._agent_session_seed_history("private", scope_id, int(user_msg["id"])),
             session_id=agent_scope.session_id,
             session_key=agent_scope.scope_key,
             metadata={
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
+                "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(actor),
                 "execution": execution,
                 "workspace": {
@@ -3309,7 +3339,7 @@ class EnterpriseService:
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: (
-                self._record_hermes_progress("private", scope_id, event)
+                self._record_agent_progress("private", scope_id, event)
                 if self._task_scope_is_current(task)
                 else None
             ),
@@ -3326,7 +3356,7 @@ class EnterpriseService:
         token_usage = self._token_usage_from_agent_result(result, generation)
         with self._conversation_lock:
             self._ensure_agent_task_can_run(task)
-            if self._valid_hermes_session_id(result.session_id):
+            if self._valid_agent_session_id(result.session_id):
                 self.agent_scopes.update_session_id(agent_scope.scope_key, result.session_id)
                 refreshed_scope = self.agent_scopes.get_scope(agent_scope.scope_key)
                 if refreshed_scope is not None:
@@ -3338,6 +3368,7 @@ class EnterpriseService:
                 "execution": execution,
                 "generation": generation,
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
+                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "reply_to": self._reply_target(task),
             }
             if task.get("_job_id"):
@@ -3354,7 +3385,7 @@ class EnterpriseService:
                 content=clean_content,
                 metadata=metadata,
                 attachments=generated_attachments,
-                attachment_source="hermes",
+                attachment_source="agent_generated",
                 attachment_uploader_user_id=int(task["actor"]["id"]),
             )
         self._telegram_delivery_wakeup.set()
@@ -3371,7 +3402,6 @@ class EnterpriseService:
         agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
         return {
             "execution": agent_scope.to_execution_dict(),
-            "container": None,
             "session_id": agent_scope.session_id,
             "agent_status": self.agent_status(actor, "private", str(actor["id"])),
             "jobs": self.jobs.counts(
@@ -3383,46 +3413,61 @@ class EnterpriseService:
         require_admin(actor)
         return self.runtimes.status(refresh=True)
 
-    def hermes_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+    def agent_runtime_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        config = self.runtimes.hermes_runtime_config()
-        config["api_key_configured"] = bool(
-            self.config.hermes_api_key
-            or self.get_secret("ENTERPRISE_HERMES_API_KEY")
-            or self.get_secret("API_SERVER_KEY")
-        )
+        config = self.runtimes.agent_runtime_config()
         config["model_catalog"] = self._oauth_model_catalogs()
-        return {"config": config, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
+        config["oauth"] = self.oauth_provider_status(actor)
+        return {
+            "config": config,
+            "runtime": self.runtimes.agent_runtime_status(refresh=True).to_dict(),
+        }
 
-    def hermes_internal_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+    def update_agent_runtime_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        self.runtimes.prepare_hermes()
-        config = self.runtimes.hermes_runtime_config()
-        defaults, default_error = load_hermes_default_config(Path(config["repo_path"]))
-        internal = read_hermes_internal_config(
-            Path(config["config_path"]),
-            Path(config["env_path"]),
-            default_config=defaults,
-            default_error=default_error,
-        )
-        return {"config": config, "internal": internal, "runtime": self.runtimes.hermes_status(refresh=True).to_dict()}
-
-    def update_hermes_internal_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
-        require_admin(actor)
-        config = self.runtimes.hermes_runtime_config()
-        try:
-            if "yaml_text" in body:
-                update_yaml_text(Path(config["config_path"]), str(body.get("yaml_text") or ""))
-            yaml_updates = body.get("yaml_updates")
-            if isinstance(yaml_updates, dict):
-                update_yaml_values(Path(config["config_path"]), yaml_updates)
-            env_updates = body.get("env")
-            if isinstance(env_updates, dict):
-                update_env_file(Path(config["env_path"]), env_updates)
-        except ValueError as exc:
-            raise ServiceError(400, str(exc)) from exc
-        self.runtimes.prepare_hermes()
-        return self.hermes_internal_config(actor)
+        if "managed" in body:
+            self.set_setting(AGENT_SETTING_MANAGED, "1" if parse_bool(body.get("managed")) else "0")
+        provider = None
+        if "provider" in body:
+            provider = normalize_oauth_provider(str(body.get("provider") or ""))
+            if provider not in SUPPORTED_OAUTH_PROVIDERS:
+                raise ServiceError(400, "Agent provider must be Codex OAuth or Grok OAuth")
+            self.set_setting(AGENT_SETTING_PROVIDER, provider)
+        active_provider = provider or self._active_oauth_provider()
+        if "model" in body:
+            model = self._resolve_oauth_model_selection(active_provider, str(body.get("model") or ""))
+            self.set_setting(AGENT_SETTING_MODEL, model)
+        elif provider:
+            self.set_setting(AGENT_SETTING_MODEL, self._default_oauth_model(provider))
+        if "timeout_seconds" in body:
+            try:
+                timeout = float(body.get("timeout_seconds"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "timeout_seconds must be a number") from exc
+            if not 1 <= timeout <= 3600:
+                raise ServiceError(400, "timeout_seconds must be between 1 and 3600")
+            self.set_setting(AGENT_SETTING_TIMEOUT, str(timeout))
+        if "max_concurrency" in body:
+            try:
+                concurrency = int(body.get("max_concurrency"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "max_concurrency must be an integer") from exc
+            if not 1 <= concurrency <= 64:
+                raise ServiceError(400, "max_concurrency must be between 1 and 64")
+            self.set_setting(AGENT_SETTING_MAX_CONCURRENCY, str(concurrency))
+        if "compaction_threshold" in body:
+            try:
+                threshold = float(body.get("compaction_threshold"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "compaction_threshold must be a number") from exc
+            if not 0.5 <= threshold <= 0.95:
+                raise ServiceError(400, "compaction_threshold must be between 0.5 and 0.95")
+            self.set_setting(AGENT_SETTING_COMPACTION_THRESHOLD, str(threshold))
+        if self.runtimes._managed_agent_runtime_enabled():
+            self.runtimes.restart_agent_runtime()
+        if self._uses_default_agent_client:
+            self.agent_client = self._new_agent_runtime_client()
+        return self.agent_runtime_config(actor)
 
     def cognee_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -3457,134 +3502,11 @@ class EnterpriseService:
         self.runtimes.ensure_cognee_ready()
         return self.cognee_config(actor)
 
-    def _hermes_repo_allowed_roots(self) -> list[Path]:
-        """Trusted base directories a managed Hermes source path may live under.
-
-        Defaults to ONLY the bundled submodule directory (the parent tree is not
-        trusted, because it contains agent/user-writable storage such as the
-        workspaces). Operators can widen this via
-        ``ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS`` (os.pathsep separated). This is
-        the trust boundary that prevents a (possibly compromised) web admin from
-        pointing the source path at an attacker-influenced directory, which
-        would otherwise run code via ``pip install -e <dir>`` and the gateway.
-        """
-        roots: list[Path] = []
-        for base in (self.config.hermes_repo,):
-            try:
-                roots.append(base.resolve())
-            except OSError:
-                continue
-        for raw in os.getenv("ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS", "").split(os.pathsep):
-            raw = raw.strip()
-            if raw:
-                try:
-                    roots.append(Path(raw).expanduser().resolve())
-                except OSError:
-                    continue
-        return roots
-
-    def _validate_hermes_repo_path(self, repo_path: str) -> str:
-        try:
-            candidate = Path(repo_path).expanduser().resolve()
-        except OSError as exc:
-            raise ServiceError(400, "Hermes source path is invalid") from exc
-        if not candidate.is_dir():
-            raise ServiceError(400, "Hermes source path does not exist")
-        if not (candidate / "pyproject.toml").exists():
-            raise ServiceError(400, "Hermes source path must contain pyproject.toml")
-        # Never install from agent/user-writable storage (the workspace tree)
-        # even if an override root were to cover it.
-        try:
-            workspace_root = self.config.workspace_dir.resolve()
-        except OSError:
-            workspace_root = None
-        if workspace_root is not None and (candidate == workspace_root or candidate.is_relative_to(workspace_root)):
-            raise ServiceError(403, "Hermes source path must not be inside the agent workspace")
-        roots = self._hermes_repo_allowed_roots()
-        if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
-            raise ServiceError(
-                403,
-                "Hermes source path must be located under a trusted directory; set "
-                "ENTERPRISE_HERMES_REPO_ALLOWED_ROOTS to permit additional locations",
-            )
-        return str(candidate)
-
-    def update_hermes_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
-        require_admin(actor)
-        if "manage_hermes" in body:
-            self.set_setting(HERMES_SETTING_MANAGED, "1" if parse_bool(body.get("manage_hermes")) else "0")
-        if "repo_path" in body:
-            repo_path = str(body.get("repo_path", "")).strip()
-            if not repo_path:
-                raise ServiceError(400, "Hermes source path is required")
-            self.set_setting(HERMES_SETTING_REPO, self._validate_hermes_repo_path(repo_path))
-        if "api_url" in body:
-            api_url = str(body.get("api_url", "")).strip()
-            parsed = urllib.parse.urlparse(api_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ServiceError(400, "Hermes API URL must be an http(s) URL")
-            self.set_setting(HERMES_SETTING_API_URL, api_url)
-        previous_provider = self._active_oauth_provider()
-        provider = None
-        if "provider" in body:
-            provider = normalize_hermes_provider(str(body.get("provider", "") or "auto"))
-            if provider not in SUPPORTED_OAUTH_PROVIDERS:
-                raise ServiceError(400, "Hermes provider must be Codex OAuth or Grok OAuth")
-            self.set_setting(HERMES_SETTING_PROVIDER, provider)
-        provider_changed = provider is not None and provider != previous_provider
-        if "provider_base_url" in body or "base_url" in body:
-            raw_base_url = body.get("provider_base_url", body.get("base_url", ""))
-            base_url = str(raw_base_url or "").strip().rstrip("/")
-            if base_url:
-                parsed = urllib.parse.urlparse(base_url)
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    raise ServiceError(400, "Hermes provider base URL must be an http(s) URL")
-            self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, base_url)
-        if "model" in body:
-            model = str(body.get("model", "")).strip()
-            if model or provider_changed:
-                model_provider = provider or previous_provider
-                if model_provider in SUPPORTED_OAUTH_PROVIDERS:
-                    model = self._resolve_oauth_model_selection(model_provider, model)
-                if not model:
-                    raise ServiceError(400, "Hermes model is required")
-                self.set_setting(HERMES_SETTING_MODEL, model)
-        elif provider and provider_changed:
-            self.set_setting(HERMES_SETTING_MODEL, self._default_oauth_model(provider))
-            if not self.get_setting(HERMES_SETTING_PROVIDER_BASE_URL):
-                self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
-        if "install_extras" in body:
-            extras = str(body.get("install_extras", "")).strip()
-            if extras and not re.fullmatch(r"[A-Za-z0-9_,.-]{1,120}", extras):
-                raise ServiceError(400, "Hermes install extras contain unsupported characters")
-            self.set_setting(HERMES_SETTING_INSTALL_EXTRAS, extras)
-        if "startup_wait_seconds" in body:
-            try:
-                wait_seconds = float(body.get("startup_wait_seconds"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "startup wait seconds must be a number") from exc
-            if wait_seconds < 0 or wait_seconds > 120:
-                raise ServiceError(400, "startup wait seconds must be between 0 and 120")
-            self.set_setting(HERMES_SETTING_STARTUP_WAIT, str(wait_seconds))
-        if "timeout_seconds" in body:
-            try:
-                timeout_seconds = float(body.get("timeout_seconds"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "timeout seconds must be a number") from exc
-            if timeout_seconds < 1 or timeout_seconds > 3600:
-                raise ServiceError(400, "timeout seconds must be between 1 and 3600")
-            self.set_setting(HERMES_SETTING_TIMEOUT, str(timeout_seconds))
-        api_key = str(body.get("api_key", "")).strip()
-        if api_key:
-            self.set_setting("API_SERVER_KEY", api_key, secret=True)
-        self.runtimes.prepare_hermes()
-        return self.hermes_config(actor)
-
     def restart_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
         require_admin(actor)
         clean = name.strip().lower()
-        if clean == "hermes":
-            return {"runtime": self.runtimes.restart_hermes().to_dict()}
+        if clean == "agent":
+            return {"runtime": self.runtimes.restart_agent_runtime().to_dict()}
         if clean == "camofox":
             return {"runtime": self.runtimes.restart_camofox().to_dict()}
         if clean == "firecrawl":
@@ -3597,11 +3519,9 @@ class EnterpriseService:
     def install_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
         require_admin(actor)
         clean = name.strip().lower()
-        if clean == "hermes":
-            install_status = self.runtimes.install_hermes(force=True)
-            if install_status.available:
-                self.runtimes.prepare_hermes()
-            return {"runtime": install_status.to_dict(), "config": self.runtimes.hermes_runtime_config()}
+        if clean == "agent":
+            install_status = self.runtimes.install_agent_runtime(force=True)
+            return {"runtime": install_status.to_dict(), "config": self.runtimes.agent_runtime_config()}
         if clean == "camofox":
             return {"runtime": self.runtimes.ensure_camofox_ready(wait=True).to_dict()}
         if clean == "firecrawl":
@@ -3611,7 +3531,7 @@ class EnterpriseService:
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         active_provider = self._active_oauth_provider()
-        runtime_oauth = self.runtimes.hermes_runtime_config().get("oauth", {})
+        runtime_oauth: dict[str, Any] = {}
         providers = []
         for provider in SUPPORTED_OAUTH_PROVIDERS:
             info = oauth_provider_info(provider)
@@ -3630,9 +3550,7 @@ class EnterpriseService:
                     "model_catalog_error": catalog["error"],
                     "configured": (configured or bool(runtime_status.get("configured"))) and not relogin_required,
                     "active": active_provider == provider,
-                    # Hermes owns token refresh and keeps auth.json current, but
-                    # an interactive platform re-login updates settings before
-                    # Hermes necessarily writes a newer auth.json timestamp.
+                    # The platform database is the sole OAuth credential store.
                     "last_refresh": self._oauth_display_last_refresh(
                         provider,
                         runtime_status.get("last_refresh"),
@@ -3668,6 +3586,95 @@ class EnterpriseService:
             "providers": providers,
         }
 
+    def resolve_agent_credentials(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a current OAuth access token for the loopback Agent runtime."""
+
+        provider = normalize_oauth_provider(str(body.get("provider") or self._active_oauth_provider()))
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+        force_refresh = parse_bool(body.get("force_refresh"))
+        access_key, refresh_key, expires_key = {
+            "openai-codex": (
+                "CODEX_OAUTH_ACCESS_TOKEN",
+                "CODEX_OAUTH_REFRESH_TOKEN",
+                "CODEX_OAUTH_EXPIRES_AT",
+            ),
+            "xai-oauth": (
+                "GROK_OAUTH_ACCESS_TOKEN",
+                "GROK_OAUTH_REFRESH_TOKEN",
+                "GROK_OAUTH_EXPIRES_AT",
+            ),
+        }[provider]
+        with self._auth_lock:
+            access_token = self.get_secret(access_key)
+            refresh_token = self.get_secret(refresh_key)
+            try:
+                expires_at = int(self.get_setting(expires_key) or "0")
+            except ValueError:
+                expires_at = 0
+            should_refresh = bool(refresh_token) and (
+                force_refresh or expires_at <= now_ts() + 90
+            )
+            if should_refresh:
+                response = self._refresh_oauth_access_token(provider, refresh_token)
+                access_token = str(response.get("access_token") or "").strip()
+                if not access_token:
+                    raise ServiceError(502, "OAuth refresh response did not contain an access token")
+                rotated_refresh = str(response.get("refresh_token") or refresh_token).strip()
+                self.set_setting(access_key, access_token, secret=True)
+                self.set_setting(refresh_key, rotated_refresh, secret=True)
+                try:
+                    expires_in = max(60, int(response.get("expires_in") or 3600))
+                except (TypeError, ValueError):
+                    expires_in = 3600
+                expires_at = now_ts() + expires_in
+                self.set_setting(expires_key, str(expires_at))
+                id_token = str(response.get("id_token") or "").strip()
+                if provider == "xai-oauth" and id_token:
+                    self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
+            if not access_token:
+                raise ServiceError(409, f"{oauth_provider_info(provider)['label']} is not connected")
+        info = oauth_provider_info(provider)
+        return {
+            "provider": provider,
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_at": expires_at or None,
+            "base_url": info["base_url"],
+            "model": self._oauth_model_catalog(provider)["default_model"],
+        }
+
+    def _refresh_oauth_access_token(self, provider: str, refresh_token: str) -> dict[str, Any]:
+        if provider == "openai-codex":
+            response = self.oauth_flows.http.post_form(
+                CODEX_TOKEN_URL,
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": CODEX_OAUTH_CLIENT_ID,
+                },
+                timeout=30.0,
+            )
+        else:
+            discovery = self.oauth_flows.http.get_json(XAI_OAUTH_DISCOVERY_URL, timeout=20.0)
+            if discovery.status != 200:
+                raise ServiceError(502, f"Grok OAuth discovery failed with HTTP {discovery.status}")
+            token_endpoint = str(discovery.data.get("token_endpoint") or "").strip()
+            if not token_endpoint:
+                raise ServiceError(502, "Grok OAuth discovery did not return a token endpoint")
+            response = self.oauth_flows.http.post_form(
+                token_endpoint,
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": XAI_OAUTH_CLIENT_ID,
+                },
+                timeout=30.0,
+            )
+        if response.status != 200:
+            raise ServiceError(502, f"OAuth token refresh failed with HTTP {response.status}: {response.text}")
+        return dict(response.data)
+
     def import_oauth_credentials(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         payload = body.get("credentials", body)
@@ -3691,11 +3698,11 @@ class EnterpriseService:
             raise ServiceError(400, "no supported OAuth credentials found in import file")
 
         active_raw = payload.get("active_provider")
-        active_provider = normalize_hermes_provider(str(active_raw)) if active_raw else ""
+        active_provider = normalize_oauth_provider(str(active_raw)) if active_raw else ""
         if active_provider in SUPPORTED_OAUTH_PROVIDERS and self._oauth_tokens_configured(active_provider):
             self._select_oauth_provider(active_provider)
         else:
-            self.runtimes.prepare_hermes()
+            self.runtimes.prepare_agent_runtime()
 
         return {
             "imported": {
@@ -3707,10 +3714,10 @@ class EnterpriseService:
 
     def start_oauth_verification(self, actor: dict[str, Any], provider: str) -> dict[str, Any]:
         require_admin(actor)
-        provider = normalize_hermes_provider(provider)
+        provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
-        # Do NOT switch the live Hermes provider here: authentication has not yet
+        # Do not switch the live provider here: authentication has not yet
         # completed and no tokens exist. Switching now would point the running
         # agent at a token-less provider if the admin abandons the flow. The
         # provider only becomes active in _store_oauth_flow_result once tokens are
@@ -3726,7 +3733,7 @@ class EnterpriseService:
 
     def poll_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        provider = normalize_hermes_provider(provider)
+        provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         flow_id = str(body.get("flow_id", "")).strip()
@@ -3739,7 +3746,7 @@ class EnterpriseService:
 
     def complete_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        provider = normalize_hermes_provider(provider)
+        provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         flow_id = str(body.get("flow_id", "")).strip()
@@ -3923,6 +3930,452 @@ class EnterpriseService:
             raise ServiceError(404, "knowledge document not found")
         return doc
 
+    def agent_memory_search(self, body: dict[str, Any]) -> dict[str, Any]:
+        scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
+        target = str(body.get("target") or "memory").strip().lower()
+        if target not in {"memory", "user"}:
+            raise ServiceError(400, "memory target must be memory or user")
+        owner_user_id = self._memory_owner_user_id(target, body.get("owner_user_id"))
+        limit = max(1, min(int(body.get("limit") or 8), 20))
+        query = str(body.get("query") or "").strip()
+        params: list[Any] = [scope_key, target]
+        owner_clause = "owner_user_id IS NULL"
+        if target == "user":
+            owner_clause = "owner_user_id = ?"
+            params.append(owner_user_id)
+        rows: list[dict[str, Any]]
+        terms = [part for part in re.findall(r"[\w\-]{2,}", query, flags=re.UNICODE) if part]
+        if terms and getattr(self.db, "fts_available", False):
+            match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:16])
+            try:
+                rows = self.db.query(
+                    f"""
+                    SELECT m.*, bm25(agent_memory_fts) AS rank
+                    FROM agent_memory_fts
+                    JOIN agent_memories m ON m.id = agent_memory_fts.rowid
+                    WHERE agent_memory_fts MATCH ? AND m.scope_key = ?
+                      AND m.target = ? AND {owner_clause}
+                    ORDER BY rank, m.updated_at DESC LIMIT ?
+                    """,
+                    [match, *params, limit],
+                )
+            except Exception:
+                rows = []
+        else:
+            rows = []
+        if not rows:
+            like_clause = ""
+            fallback_params: list[Any] = list(params)
+            if query:
+                like_clause = " AND (content LIKE ? OR tags_json LIKE ?)"
+                fallback_params.extend([f"%{query}%", f"%{query}%"])
+            rows = self.db.query(
+                f"""
+                SELECT * FROM agent_memories
+                WHERE scope_key = ? AND target = ? AND {owner_clause}{like_clause}
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                [*fallback_params, limit],
+            )
+        return {"memories": [self._public_agent_memory(row) for row in rows]}
+
+    def agent_memory_mutate(self, body: dict[str, Any]) -> dict[str, Any]:
+        scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
+        operations = body.get("operations")
+        if not isinstance(operations, list):
+            operations = [body]
+        if not operations or len(operations) > 50:
+            raise ServiceError(400, "memory operations must contain between 1 and 50 items")
+        changed: list[dict[str, Any]] = []
+        with self.db.transaction() as conn:
+            for raw in operations:
+                if not isinstance(raw, dict):
+                    raise ServiceError(400, "memory operation must be an object")
+                action = str(raw.get("action") or "add").strip().lower()
+                target = str(raw.get("target") or body.get("target") or "memory").strip().lower()
+                if target not in {"memory", "user"}:
+                    raise ServiceError(400, "memory target must be memory or user")
+                owner_user_id = self._memory_owner_user_id(
+                    target, raw.get("owner_user_id", body.get("owner_user_id"))
+                )
+                if action == "add":
+                    content = str(raw.get("content") or "").strip()
+                    if not content or len(content) > 20_000:
+                        raise ServiceError(400, "memory content must contain 1 to 20000 characters")
+                    tags = raw.get("tags") if isinstance(raw.get("tags"), list) else []
+                    tags_json = encode_json([str(tag)[:80] for tag in tags[:20]])
+                    timestamp = now_ts()
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO agent_memories(
+                            scope_key, target, owner_user_id, content, tags_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (scope_key, target, owner_user_id, content, tags_json, timestamp, timestamp),
+                    )
+                    changed.append({"action": "add", "id": int(cursor.lastrowid)})
+                    continue
+                if action == "clear":
+                    if target == "user":
+                        cursor = conn.execute(
+                            "DELETE FROM agent_memories WHERE scope_key = ? AND target = ? AND owner_user_id = ?",
+                            (scope_key, target, owner_user_id),
+                        )
+                    else:
+                        cursor = conn.execute(
+                            "DELETE FROM agent_memories WHERE scope_key = ? AND target = ?",
+                            (scope_key, target),
+                        )
+                    changed.append({"action": "clear", "deleted": max(0, int(cursor.rowcount))})
+                    continue
+                try:
+                    memory_id = int(raw.get("id"))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "memory id is required") from exc
+                row = conn.execute(
+                    "SELECT * FROM agent_memories WHERE id = ? AND scope_key = ? AND target = ?",
+                    (memory_id, scope_key, target),
+                ).fetchone()
+                if row is None or (target == "user" and int(row["owner_user_id"] or 0) != owner_user_id):
+                    raise ServiceError(404, "memory not found")
+                if action == "remove":
+                    conn.execute("DELETE FROM agent_memories WHERE id = ?", (memory_id,))
+                    changed.append({"action": "remove", "id": memory_id})
+                elif action == "replace":
+                    content = str(raw.get("content") or "").strip()
+                    if not content or len(content) > 20_000:
+                        raise ServiceError(400, "memory content must contain 1 to 20000 characters")
+                    decoded_tags = decode_json(str(row["tags_json"] or "[]"))
+                    tags = raw.get("tags") if isinstance(raw.get("tags"), list) else (
+                        decoded_tags if isinstance(decoded_tags, list) else []
+                    )
+                    conn.execute(
+                        "UPDATE agent_memories SET content = ?, tags_json = ?, updated_at = ? WHERE id = ?",
+                        (content, encode_json([str(tag)[:80] for tag in list(tags)[:20]]), now_ts(), memory_id),
+                    )
+                    changed.append({"action": "replace", "id": memory_id})
+                else:
+                    raise ServiceError(400, "memory action must be add, replace, remove or clear")
+        return {"changed": changed, **self.agent_memory_search({
+            "scope_key": scope_key,
+            "target": body.get("target") or "memory",
+            "owner_user_id": body.get("owner_user_id"),
+            "limit": 20,
+        })}
+
+    def agent_session_search(self, body: dict[str, Any]) -> dict[str, Any]:
+        scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
+        scope = self.agent_scopes.get_scope(scope_key)
+        if scope is None:
+            raise ServiceError(404, "Agent scope not found")
+        requested_session = str(body.get("session_id") or "").strip()
+        if requested_session and requested_session != scope.session_id:
+            raise ServiceError(404, "Agent session not found in the current lifecycle")
+        limit = max(1, min(int(body.get("limit") or 50), 200))
+        query = str(body.get("query") or "").strip()
+        params: list[Any] = [scope.scope_type, scope.scope_id]
+        where = "scope_type = ? AND scope_id = ?"
+        if query:
+            where += " AND content LIKE ?"
+            params.append(f"%{query}%")
+        rows = self.db.query(
+            f"SELECT * FROM messages WHERE {where} ORDER BY id DESC LIMIT ?",
+            [*params, limit],
+        )
+        return {
+            "session_id": scope.session_id,
+            "lifecycle_id": scope.lifecycle_id,
+            "messages": [self._message_from_row(row) for row in reversed(rows)],
+        }
+
+    def invoke_agent_runtime_tool(self, body: dict[str, Any]) -> dict[str, Any]:
+        tool = str(body.get("tool") or "").strip().lower()
+        action = str(body.get("action") or "").strip().lower()
+        arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
+        context = body.get("context") if isinstance(body.get("context"), dict) else {}
+        scope_key = str(context.get("scope_key") or "").strip()
+        # Runtime context is authoritative. Tool arguments are model-controlled
+        # and must never be able to redirect a call into another Agent scope.
+        common = {**arguments, "scope_key": scope_key}
+        if tool == "memory":
+            if action in {"search", "read", "list"}:
+                result = self.agent_memory_search(common)
+            else:
+                result = self.agent_memory_mutate({**common, "action": action})
+        elif tool == "session":
+            result = self.agent_session_search({
+                **common,
+                "session_id": context.get("session_id"),
+            })
+        elif tool == "knowledge":
+            if action in {"search", "query"}:
+                query = str(arguments.get("query") or arguments.get("q") or "").strip()
+                result = {"results": self.search_knowledge(query, int(arguments.get("limit") or 5))}
+            elif action in {"read", "get"}:
+                result = {"document": self.get_knowledge_document(int(arguments.get("document_id") or arguments.get("id")))}
+            else:
+                raise ServiceError(400, "knowledge action must be search or read")
+        elif tool == "web":
+            result = self._agent_web_tool(action, arguments)
+        elif tool == "browser":
+            result = self._agent_browser_tool(scope_key, action, arguments)
+        else:
+            raise ServiceError(404, "Agent tool not found")
+        return {
+            "content": json.dumps(result, ensure_ascii=False, indent=2),
+            "data": result,
+            "is_error": False,
+        }
+
+    def _agent_web_tool(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        base_url = self.config.firecrawl_api_url.rstrip("/")
+        headers: dict[str, str] = {}
+        api_key = self.get_secret("FIRECRAWL_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if action in {"search", "query"}:
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                raise ServiceError(400, "web search query is required")
+            limit = max(1, min(int(arguments.get("limit") or 5), 100))
+            payload = self._runtime_json_request(
+                base_url + "/v1/search",
+                {"query": query, "limit": limit, "scrapeOptions": {"formats": []}},
+                headers=headers,
+                timeout=60,
+            )
+            raw_results = payload.get("data") or payload.get("web") or []
+            if isinstance(raw_results, dict):
+                raw_results = raw_results.get("web") or []
+            results = []
+            for index, item in enumerate(raw_results if isinstance(raw_results, list) else []):
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "")
+                if url:
+                    self._validate_external_url(url)
+                results.append({
+                    "title": str(item.get("title") or ""),
+                    "url": url,
+                    "description": str(item.get("description") or item.get("markdown") or "")[:2000],
+                    "position": index + 1,
+                })
+            return {"web": results}
+        if action in {"extract", "scrape", "read"}:
+            raw_urls = arguments.get("urls")
+            if not isinstance(raw_urls, list):
+                raw_urls = [arguments.get("url")]
+            urls = [str(value or "").strip() for value in raw_urls if str(value or "").strip()]
+            if not urls or len(urls) > 5:
+                raise ServiceError(400, "web extract accepts between 1 and 5 URLs")
+            char_limit = max(1000, min(int(arguments.get("char_limit") or 100_000), 500_000))
+            results = []
+            for url in urls:
+                self._validate_external_url(url)
+                payload = self._runtime_json_request(
+                    base_url + "/v1/scrape",
+                    {"url": url, "formats": ["markdown", "html"]},
+                    headers=headers,
+                    timeout=60,
+                )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                final_url = str(metadata.get("sourceURL") or metadata.get("url") or url)
+                self._validate_external_url(final_url)
+                content = str(data.get("markdown") or data.get("html") or "")
+                if len(content) > char_limit:
+                    half = max(1, char_limit // 2)
+                    content = content[:half] + "\n…[truncated]…\n" + content[-half:]
+                results.append({
+                    "url": final_url,
+                    "title": str(metadata.get("title") or ""),
+                    "content": content,
+                    "metadata": metadata,
+                })
+            return {"results": results}
+        raise ServiceError(400, "web action must be search or extract")
+
+    def _agent_browser_tool(
+        self,
+        scope_key: str,
+        action: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._validated_agent_memory_scope(scope_key)
+        base_url = self.config.camofox_url.rstrip("/")
+        user_id = "agent-" + hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+        access_key = self.runtimes._camofox_access_key()
+        headers = {"Authorization": f"Bearer {access_key}"}
+        tab_id = str(arguments.get("tab_id") or arguments.get("tabId") or "").strip()
+        if action in {"cleanup", "close_session"}:
+            return self._runtime_json_request(
+                f"{base_url}/sessions/{urllib.parse.quote(user_id, safe='')}",
+                None,
+                headers=headers,
+                timeout=30,
+                method="DELETE",
+            )
+        if action in {"navigate", "open"} and not tab_id:
+            url = str(arguments.get("url") or "").strip()
+            self._validate_external_url(url)
+            return self._runtime_json_request(
+                base_url + "/tabs",
+                {"userId": user_id, "sessionKey": "agent", "url": url},
+                headers=headers,
+                timeout=60,
+            )
+        if action in {"list", "tabs", "status"}:
+            return self._runtime_json_request(
+                base_url + "/tabs?" + urllib.parse.urlencode({"userId": user_id}),
+                None,
+                headers=headers,
+                timeout=30,
+                method="GET",
+            )
+        if not tab_id:
+            raise ServiceError(400, "browser tab_id is required")
+        encoded_tab_id = urllib.parse.quote(tab_id, safe="")
+        if action in {"snapshot", "screenshot"}:
+            query = {"userId": user_id}
+            if action == "screenshot":
+                # Camofox can include a bounded base64 screenshot in its JSON
+                # snapshot response, which keeps the private gateway JSON-only.
+                query["includeScreenshot"] = "true"
+            return self._runtime_json_request(
+                f"{base_url}/tabs/{encoded_tab_id}/snapshot?{urllib.parse.urlencode(query)}",
+                None,
+                headers=headers,
+                timeout=60,
+                method="GET",
+            )
+        if action == "console":
+            return self._runtime_json_request(
+                f"{base_url}/tabs/{encoded_tab_id}/console?"
+                + urllib.parse.urlencode({"userId": user_id}),
+                None,
+                headers=headers,
+                timeout=30,
+                method="GET",
+            )
+        if action in {"close", "close_tab"}:
+            return self._runtime_json_request(
+                f"{base_url}/tabs/{encoded_tab_id}",
+                {"userId": user_id},
+                headers=headers,
+                timeout=30,
+                method="DELETE",
+            )
+        route_actions = {
+            "navigate": "navigate",
+            "click": "click",
+            "type": "type",
+            "scroll": "scroll",
+            "back": "back",
+            "press": "press",
+            "evaluate": "evaluate",
+        }
+        route = route_actions.get(action)
+        if route is None:
+            raise ServiceError(400, "unsupported browser action")
+        payload = dict(arguments)
+        payload.pop("tab_id", None)
+        payload.pop("tabId", None)
+        # The runtime-derived browser identity is authoritative. Camofox uses
+        # userId when resolving every tab ID, so this also prevents one Agent
+        # from operating another Agent's guessed tab ID.
+        payload["userId"] = user_id
+        if route == "navigate" and payload.get("url"):
+            self._validate_external_url(str(payload["url"]))
+        return self._runtime_json_request(
+            f"{base_url}/tabs/{encoded_tab_id}/{route}",
+            payload,
+            headers=headers,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _runtime_json_request(
+        url: str,
+        body: dict[str, Any] | None,
+        *,
+        headers: dict[str, str],
+        timeout: float,
+        method: str = "POST",
+    ) -> dict[str, Any]:
+        request_headers = {"Accept": "application/json", **headers}
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            request_headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read(10 * 1024 * 1024).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(65536).decode("utf-8", errors="replace")
+            raise ServiceError(502, f"managed tool returned HTTP {exc.code}: {detail[:1000]}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ServiceError(502, f"managed tool request failed: {exc}") from exc
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ServiceError(502, "managed tool returned invalid JSON") from exc
+        return payload if isinstance(payload, dict) else {"data": payload}
+
+    @staticmethod
+    def _validate_external_url(value: str) -> None:
+        try:
+            parsed = urllib.parse.urlparse(str(value or "").strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError
+            if any(key.lower() in {"token", "api_key", "apikey", "password", "secret"} for key, _ in urllib.parse.parse_qsl(parsed.query)):
+                raise ServiceError(400, "URL contains a sensitive query parameter")
+            addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        except ServiceError:
+            raise
+        except (ValueError, OSError) as exc:
+            raise ServiceError(400, "URL must be a resolvable public http(s) URL") from exc
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                raise ServiceError(403, "private, local and metadata network targets are blocked")
+
+    def _validated_agent_memory_scope(self, value: Any) -> str:
+        scope_key = str(value or "").strip()
+        if not scope_key or len(scope_key) > 512:
+            raise ServiceError(400, "valid Agent scope_key is required")
+        parent_key = scope_key.split(":child:", 1)[0].split("/delegate/", 1)[0]
+        if self.agent_scopes.get_scope(parent_key) is None:
+            raise ServiceError(404, "Agent scope not found")
+        return scope_key
+
+    @staticmethod
+    def _memory_owner_user_id(target: str, value: Any) -> int | None:
+        if target != "user":
+            return None
+        try:
+            owner_user_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "owner_user_id is required for user memory") from exc
+        if owner_user_id <= 0:
+            raise ServiceError(400, "owner_user_id is invalid")
+        return owner_user_id
+
+    @staticmethod
+    def _public_agent_memory(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "scope_key": str(row["scope_key"]),
+            "target": str(row["target"]),
+            "owner_user_id": row.get("owner_user_id"),
+            "content": str(row["content"]),
+            "tags": (
+                decoded if isinstance((decoded := decode_json(str(row.get("tags_json") or "[]"))), list) else []
+            ),
+            "created_at": int(row["created_at"]),
+            "updated_at": int(row["updated_at"]),
+        }
+
     # User-facing knowledge reads require read_workspace. The bare
     # search_knowledge/get_knowledge_document methods stay unauthenticated for
     # the agent-tool boundary, which is gated separately by the agent token.
@@ -3985,7 +4438,9 @@ class EnterpriseService:
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         provider = self._active_oauth_provider()
-        runtime_model = normalize_model_name(str(self.runtimes.hermes_runtime_config().get("model") or self.config.hermes_model))
+        runtime_model = normalize_model_name(
+            str(self.runtimes.agent_runtime_config().get("model") or self.config.agent_runtime_model)
+        )
         model = normalize_model_name(str(actor.get("model_name") or "")) or runtime_model
         model = self._validated_generation_model(model, fallback_model=runtime_model)
         thinking_depth = normalize_thinking_depth(str(actor.get("thinking_depth") or DEFAULT_THINKING_DEPTH))
@@ -4001,7 +4456,7 @@ class EnterpriseService:
         rows = self.db.query("SELECT key, value, updated_at FROM settings WHERE secret = 1 ORDER BY key")
         found = {row["key"]: row for row in rows}
         items = []
-        known_keys = set(OAUTH_SECRET_KEYS) | {"API_SERVER_KEY", "agent_tool_token"}
+        known_keys = set(OAUTH_SECRET_KEYS) | {"agent_tool_token"}
         for key in sorted(known_keys):
             value = found.get(key, {}).get("value") or os.getenv(key, "")
             items.append({
@@ -4019,11 +4474,17 @@ class EnterpriseService:
             if not value:
                 raise ServiceError(400, "secret value is required")
             self.set_setting(raw_key, value, secret=True)
+            # Managed runs carry the current tool token in every request. The
+            # sidecar keeps the internal target URL fixed but accepts this
+            # request-level credential, so rotation takes effect for new runs
+            # without exposing the token or requiring a runtime restart.
+            if self._uses_default_agent_client:
+                self.agent_client = self._new_agent_runtime_client()
             return
         clean = raw_key.upper()
         if not re.fullmatch(r"[A-Z0-9_]{2,80}", clean):
             raise ServiceError(400, "invalid secret key")
-        allowed_keys = set(OAUTH_SECRET_KEYS) | {"API_SERVER_KEY"}
+        allowed_keys = set(OAUTH_SECRET_KEYS)
         if clean not in allowed_keys:
             raise ServiceError(400, "unsupported secret key")
         if not value:
@@ -4031,7 +4492,10 @@ class EnterpriseService:
         self.set_setting(clean, value, secret=True)
 
     def _active_oauth_provider(self) -> str:
-        active_provider = normalize_hermes_provider(self.get_setting(HERMES_SETTING_PROVIDER) or self.config.hermes_provider)
+        active_provider = normalize_oauth_provider(
+            self.get_setting(AGENT_SETTING_PROVIDER)
+            or self.config.agent_runtime_provider
+        )
         return active_provider if active_provider in SUPPORTED_OAUTH_PROVIDERS else "openai-codex"
 
     def _extract_oauth_credentials(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -4046,7 +4510,7 @@ class EnterpriseService:
         if not isinstance(providers, dict):
             raise ServiceError(400, "OAuth credential providers must be a JSON object")
         for raw_provider, entry in providers.items():
-            provider = normalize_hermes_provider(str(raw_provider))
+            provider = normalize_oauth_provider(str(raw_provider))
             if provider not in SUPPORTED_OAUTH_PROVIDERS:
                 continue
             if not isinstance(entry, dict):
@@ -4080,43 +4544,36 @@ class EnterpriseService:
                 by_provider[provider][key] = clean
 
     def _select_oauth_provider(self, provider: str) -> None:
-        self.set_setting(HERMES_SETTING_PROVIDER, provider)
-        self.set_setting(HERMES_SETTING_MODEL, self._default_oauth_model(provider))
-        self.set_setting(HERMES_SETTING_PROVIDER_BASE_URL, default_base_url_for_provider(provider))
-        self.runtimes.prepare_hermes()
+        self.set_setting(AGENT_SETTING_PROVIDER, provider)
+        self.set_setting(AGENT_SETTING_MODEL, self._default_oauth_model(provider))
 
     def _oauth_model_catalogs(self) -> dict[str, dict[str, Any]]:
         return {provider: self._oauth_model_catalog(provider) for provider in SUPPORTED_OAUTH_PROVIDERS}
 
     def _oauth_model_catalog(self, provider: str) -> dict[str, Any]:
-        provider = normalize_hermes_provider(provider)
-        result: dict[str, Any] = {
-            "provider": provider,
-            "models": [],
-            "default_model": "",
-            "source": "hermes",
-            "error": "",
+        provider = normalize_oauth_provider(provider)
+        catalogs = {
+            "openai-codex": {
+                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
+                "default_model": "gpt-5.5",
+            },
+            "xai-oauth": {
+                "models": [
+                    "grok-4.3",
+                    "grok-4.20-0309-reasoning",
+                    "grok-4.20-0309-non-reasoning",
+                ],
+                "default_model": "grok-4.3",
+            },
         }
-        bridge = self.hermes_bridge
-        try:
-            if bridge is None or not bridge.available():
-                result["error"] = "Hermes model catalog is not available"
-                return result
-            catalog = bridge.model_catalog(provider)
-        except OAuthFlowError as exc:
-            result["error"] = exc.message
-            return result
-        except Exception as exc:
-            result["error"] = str(exc) or type(exc).__name__
-            return result
-
-        models = _clean_model_ids(catalog.get("models") if isinstance(catalog, dict) else [])
-        default_model = str(catalog.get("default_model") or "").strip() if isinstance(catalog, dict) else ""
-        if default_model not in models:
-            default_model = models[0] if models else ""
-        result["models"] = models
-        result["default_model"] = default_model
-        return result
+        catalog = catalogs.get(provider, {"models": [], "default_model": ""})
+        return {
+            "provider": provider,
+            "models": list(catalog["models"]),
+            "default_model": str(catalog["default_model"]),
+            "source": "agent-runtime",
+            "error": "" if provider in catalogs else "unsupported provider",
+        }
 
     def _default_oauth_model(self, provider: str) -> str:
         catalog = self._oauth_model_catalog(provider)
@@ -4125,7 +4582,7 @@ class EnterpriseService:
             return default_model
         label = oauth_provider_info(provider)["label"]
         detail = f": {catalog['error']}" if catalog.get("error") else ""
-        raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+        raise ServiceError(503, f"Agent model catalog for {label} is unavailable{detail}")
 
     def _resolve_oauth_model_selection(self, provider: str, model: str) -> str:
         catalog = self._oauth_model_catalog(provider)
@@ -4133,18 +4590,18 @@ class EnterpriseService:
         if not models:
             label = oauth_provider_info(provider)["label"]
             detail = f": {catalog['error']}" if catalog.get("error") else ""
-            raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+            raise ServiceError(503, f"Agent model catalog for {label} is unavailable{detail}")
         clean = str(model or "").strip()
-        if clean in {"", "hermes-agent"}:
+        if clean in {"", "agent"}:
             clean = catalog["default_model"] or models[0]
         if clean not in models:
             label = oauth_provider_info(provider)["label"]
-            raise ServiceError(400, f"Hermes model must be selected from the Hermes catalog for {label}")
+            raise ServiceError(400, f"Agent model must be selected from the catalog for {label}")
         return clean
 
     def _validate_account_model_name(self, model: str) -> str:
         clean = normalize_model_name(model)
-        if clean in {"", "hermes-agent"}:
+        if clean in {"", "agent"}:
             return ""
         provider = self._active_oauth_provider()
         catalog = self._oauth_model_catalog(provider)
@@ -4152,9 +4609,9 @@ class EnterpriseService:
         label = oauth_provider_info(provider)["label"]
         if not models:
             detail = f": {catalog['error']}" if catalog.get("error") else ""
-            raise ServiceError(503, f"Hermes model catalog for {label} is unavailable{detail}")
+            raise ServiceError(503, f"Agent model catalog for {label} is unavailable{detail}")
         if clean not in models:
-            raise ServiceError(400, f"Account model must be selected from the Hermes catalog for {label}")
+            raise ServiceError(400, f"Account model must be selected from the Agent catalog for {label}")
         return clean
 
     def _validated_generation_model(self, model: str, *, fallback_model: str = "") -> str:
@@ -4175,17 +4632,25 @@ class EnterpriseService:
         tokens = flow.pop("tokens", None)
         if not tokens:
             return
-        self._select_oauth_provider(provider)
         if provider == "openai-codex":
             self.set_setting("CODEX_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
             self.set_setting("CODEX_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+            expires_key = "CODEX_OAUTH_EXPIRES_AT"
         elif provider == "xai-oauth":
             self.set_setting("GROK_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
             self.set_setting("GROK_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+            expires_key = "GROK_OAUTH_EXPIRES_AT"
             id_token = str(tokens.get("id_token", "") or "").strip()
             if id_token:
                 self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
-        self.runtimes.prepare_hermes()
+        else:
+            return
+        try:
+            expires_in = max(60, int(tokens.get("expires_in") or 3600))
+        except (TypeError, ValueError):
+            expires_in = 3600
+        self.set_setting(expires_key, str(now_ts() + expires_in))
+        self._select_oauth_provider(provider)
 
     def _oauth_tokens_configured(self, provider: str) -> bool:
         if provider == "openai-codex":
@@ -4276,12 +4741,18 @@ class EnterpriseService:
         run_id = str(approval.get("run_id") or "").strip()
         if not run_id:
             raise ServiceError(409, "no pending approval for this conversation")
+        approval_id = str(approval.get("approval_id") or "").strip()
         responder = self._actor_display_name(actor)
         respond = getattr(self.agent_client, "respond_approval", None)
         if not callable(respond):
             raise ServiceError(503, "agent approval response is not supported")
         try:
-            approval_result = respond(run_id=run_id, choice=normalized_choice, resolve_all=bool(resolve_all))
+            approval_result = respond(
+                run_id=run_id,
+                choice=normalized_choice,
+                resolve_all=bool(resolve_all),
+                approval_id=approval_id or None,
+            )
         except ValueError as exc:
             raise ServiceError(400, str(exc)) from exc
         except Exception as exc:
@@ -4457,7 +4928,7 @@ class EnterpriseService:
                 error = ""
                 error_persisted = True
                 try:
-                    # Only N replies hit the Hermes backend (and hold a thread /
+                    # Only N replies hit the Agent runtime (and hold a thread /
                     # socket) at once; each conversation still drains its own
                     # queue in FIFO order while queued runs wait on the semaphore.
                     with self._agent_run_semaphore:
@@ -4481,6 +4952,10 @@ class EnterpriseService:
                         self.jobs.mark_failed(job_id, error, needs_review=exc.needs_review)
                 except Exception as exc:
                     error = str(exc)
+                    runtime_needs_review = (
+                        isinstance(exc, AgentRuntimeRunError)
+                        and exc.state == "needs_review"
+                    )
                     with self._conversation_lock:
                         shutting_down = self._closed
                     if shutting_down:
@@ -4505,7 +4980,11 @@ class EnterpriseService:
                                 file=sys.stderr,
                             )
                         if job_id:
-                            self.jobs.mark_failed(job_id, error)
+                            self.jobs.mark_failed(
+                                job_id,
+                                error,
+                                needs_review=runtime_needs_review,
+                            )
 
                 with self._conversation_lock:
                     self._agent_active_tasks.pop(key, None)
@@ -4543,124 +5022,6 @@ class EnterpriseService:
                     self._agent_workers.pop(key, None)
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
-
-    def _handle_async_delegation_event(self, event: dict[str, Any]) -> bool:
-        scope = self._scope_from_async_delegation_session_key(str(event.get("session_key") or ""))
-        if scope is None:
-            return True
-        event_id = self._async_delegation_event_id(event)
-        scope_type, scope_id = scope
-        with self._conversation_lock:
-            if scope_type == "private":
-                try:
-                    private_user_id = int(scope_id)
-                except (TypeError, ValueError):
-                    return True
-                if private_user_id <= 0:
-                    return True
-                scope_key = self.agent_scopes.private_scope_key(private_user_id)
-            else:
-                private_user_id = None
-                scope_key = self.agent_scopes.channel_scope_key(scope_id)
-            current_scope = self.agent_scopes.get_scope(scope_key)
-            parent_session_id = str(event.get("parent_session_id") or "").strip()
-            # Async completions are delayed external events.  Bind them to the
-            # exact current Hermes session so a completion from before clear /
-            # session rotation cannot repopulate the new conversation. Missing
-            # lineage is rejected rather than guessed from the reusable
-            # session_key.
-            if current_scope is None or not parent_session_id:
-                return True
-            if not self.agent_scopes.session_belongs_to_current_lifecycle(scope_key, parent_session_id):
-                return True
-            if scope_type == "private":
-                user = self.get_user(int(private_user_id))
-                if user is None or not user.get("active"):
-                    return True
-            if event_id in self._async_delegation_seen:
-                return True
-            if self._async_delegation_message_exists(event_id):
-                self._async_delegation_seen.add(event_id)
-                return True
-            failed = self._async_delegation_failed(event)
-            title = "后台子代理任务失败" if failed else "后台子代理任务完成"
-            detail = str(event.get("error") or event.get("summary") or event.get("goal") or "")[:180]
-            self._record_agent_activity(scope_type, scope_id, "error" if failed else "complete", title, detail)
-            content = self._format_async_delegation_message(event, failed=failed)
-            metadata = {
-                "async_delegation_id": event_id,
-                "async_delegation": {
-                    "delegation_id": str(event.get("delegation_id") or ""),
-                    "session_key": str(event.get("session_key") or ""),
-                    "parent_session_id": parent_session_id,
-                    "status": str(event.get("status") or ""),
-                    "goal": str(event.get("goal") or ""),
-                    "model": str(event.get("model") or ""),
-                    "duration_seconds": event.get("duration_seconds"),
-                    "failed": failed,
-                },
-            }
-            self._append_message(
-                scope_type=scope_type,
-                scope_id=scope_id,
-                author_type="agent",
-                user_id=None,
-                username="Main Agent" if scope_type == "channel" else "Private Agent",
-                content=content,
-                metadata=metadata,
-            )
-            self._async_delegation_seen.add(event_id)
-            return True
-    @staticmethod
-    def _scope_from_async_delegation_session_key(session_key: str) -> tuple[str, str] | None:
-        if session_key.startswith("channel:") and session_key.endswith(":main-agent"):
-            scope_id = session_key[len("channel:") : -len(":main-agent")]
-            return ("channel", scope_id) if scope_id else None
-        if session_key.startswith("private:"):
-            scope_id = session_key[len("private:") :]
-            return ("private", scope_id) if scope_id else None
-        return None
-
-    @staticmethod
-    def _async_delegation_event_id(event: dict[str, Any]) -> str:
-        delegation_id = str(event.get("delegation_id") or "").strip()
-        if delegation_id:
-            return delegation_id
-        return hashlib.sha256(encode_json(event).encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _async_delegation_failed(event: dict[str, Any]) -> bool:
-        status = str(event.get("status") or "").strip().lower()
-        return bool(event.get("error")) or status in {"error", "failed", "cancelled", "interrupted"}
-
-    def _async_delegation_message_exists(self, event_id: str) -> bool:
-        needle = f'"async_delegation_id":"{event_id}"'
-        return bool(
-            self.db.scalar(
-                "SELECT id FROM messages WHERE metadata_json LIKE ? LIMIT 1",
-                (f"%{needle}%",),
-            )
-        )
-
-    @staticmethod
-    def _format_async_delegation_message(event: dict[str, Any], *, failed: bool) -> str:
-        goal = str(event.get("goal") or "").strip()
-        summary = str(event.get("summary") or "").strip()
-        error = str(event.get("error") or "").strip()
-        message = str(event.get("message") or "").strip()
-        duration = event.get("duration_seconds")
-        title = "后台子代理任务失败" if failed else "后台子代理任务完成"
-        lines = [f"{title}: {goal}" if goal else title]
-        if summary:
-            lines.extend(["", summary])
-        if error:
-            lines.extend(["", f"错误: {error}"])
-        if not summary and not error and message:
-            lines.extend(["", message])
-        if duration not in {None, ""}:
-            lines.extend(["", f"耗时: {duration} 秒"])
-        content = "\n".join(lines).strip()
-        return content[:8000] + ("\n…[已截断]" if len(content) > 8000 else "")
 
     def _drop_empty_conversation_maps_locked(self, key: str) -> None:
         """Remove empty companion-map entries for a conversation key.
@@ -4880,7 +5241,7 @@ class EnterpriseService:
             status["updated_at"] = timestamp
             self._agent_status[key] = status
 
-    def _record_hermes_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
+    def _record_agent_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):
             return
         event_type = str(event.get("event") or event.get("type") or event.get("event_type") or "").strip().lower()
@@ -4892,9 +5253,11 @@ class EnterpriseService:
                 scope_type,
                 scope_id,
                 str(event.get("choice") or "").strip().lower(),
-                responder="Hermes",
+                responder="Agent runtime",
                 approval_result=event,
             )
+            return
+        if not event_type.startswith("tool."):
             return
         tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
         label = str(event.get("label") or event.get("preview") or tool).strip() or tool
@@ -4905,32 +5268,49 @@ class EnterpriseService:
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             activity = [dict(item) for item in status.get("activity") or []]
-            if tool_status in {"completed", "complete", "done", "tool.completed"}:
+            if tool_status in {
+                "completed",
+                "complete",
+                "done",
+                "tool.completed",
+                "failed",
+                "error",
+                "tool.failed",
+            }:
+                terminal_status = (
+                    "failed"
+                    if tool_status in {"failed", "error", "tool.failed"}
+                    else "completed"
+                )
                 updated = False
                 if tool_call_id:
                     for item in reversed(activity):
-                        if item.get("source") == "hermes" and item.get("tool_call_id") == tool_call_id:
-                            item["tool_status"] = "completed"
+                        if item.get("source") == "agent" and item.get("tool_call_id") == tool_call_id:
+                            item["tool_status"] = terminal_status
                             item["completed_at"] = timestamp
                             updated = True
                             break
                 if updated:
                     status["activity"] = activity[-30:]
-                    status["current_step"] = f"完成 {tool}"
+                    status["current_step"] = (
+                        f"{tool} 执行失败"
+                        if terminal_status == "failed"
+                        else f"完成 {tool}"
+                    )
                     status["updated_at"] = timestamp
                     self._agent_status[key] = status
                 return
 
-            line = hermes_progress_line(event)
+            line = agent_progress_line(event)
             existing = None
             if tool_call_id:
                 for item in reversed(activity):
-                    if item.get("source") == "hermes" and item.get("tool_call_id") == tool_call_id:
+                    if item.get("source") == "agent" and item.get("tool_call_id") == tool_call_id:
                         existing = item
                         break
             item_data = {
                 "stage": "tool",
-                "source": "hermes",
+                "source": "agent",
                 "label": tool,
                 "detail": label,
                 "line": line,
@@ -4965,7 +5345,7 @@ class EnterpriseService:
             activity.append(
                 {
                     "stage": "approval",
-                    "source": "hermes",
+                    "source": "agent",
                     "label": "等待权限审批",
                     "detail": approval["description"],
                     "line": line,
@@ -5028,6 +5408,7 @@ class EnterpriseService:
             pattern_keys = [event.get("pattern_key")] if event.get("pattern_key") else []
         return {
             "run_id": str(event.get("run_id") or "").strip(),
+            "approval_id": str(event.get("approval_id") or event.get("id") or "").strip(),
             "command": str(event.get("command") or "").strip(),
             "description": str(event.get("description") or "危险操作需要权限审批").strip(),
             "pattern_key": str(event.get("pattern_key") or "").strip(),
@@ -5293,7 +5674,7 @@ class EnterpriseService:
             return
         query_one = conn.execute if conn is not None else self.db._conn.execute
         quota_user_id = uploader_user_id
-        if quota_user_id is None and source == "hermes" and scope_type == "private":
+        if quota_user_id is None and source in {LEGACY_GENERATED_ATTACHMENT_SOURCE, "agent_generated"} and scope_type == "private":
             try:
                 quota_user_id = int(scope_id)
             except (TypeError, ValueError):
@@ -5301,8 +5682,9 @@ class EnterpriseService:
         if ATTACHMENT_QUOTA_BYTES > 0 and quota_user_id is not None:
             existing = query_one(
                 "SELECT COALESCE(SUM(size_bytes), 0) FROM attachments "
-                "WHERE uploader_user_id = ? OR (source = 'hermes' AND scope_type = 'private' AND scope_id = ?)",
-                (int(quota_user_id), str(quota_user_id)),
+                "WHERE uploader_user_id = ? OR "
+                "(source IN (?, 'agent_generated') AND scope_type = 'private' AND scope_id = ?)",
+                (int(quota_user_id), LEGACY_GENERATED_ATTACHMENT_SOURCE, str(quota_user_id)),
             ).fetchone()[0]
             if int(existing or 0) + incoming > ATTACHMENT_QUOTA_BYTES:
                 raise ServiceError(413, "attachment storage quota exceeded")
@@ -5376,7 +5758,7 @@ class EnterpriseService:
                 return max(0, int(cursor.rowcount))
 
     def _active_agent_scope_keys_for_message_ids(self, message_ids: list[int]) -> set[str]:
-        """Return Hermes scopes whose currently running source turn is deleted.
+        """Return Agent scopes whose currently running source turn is deleted.
 
         The caller holds ``_conversation_lock`` so the active-task snapshot is
         ordered with both deletion and terminal Agent persistence.
@@ -5560,14 +5942,12 @@ class EnterpriseService:
         return [{key: item[key] for key in keys if key in item} for item in attachments]
 
     def _managed_media_tmp_dir(self) -> Path:
-        """Dedicated scratch dir for managed-Hermes generated media.
+        """Dedicated scratch dir for managed Agent-generated media.
 
         Lives under the platform data dir (not the shared system temp dir) so
-        Hermes can write generated files here without those files being readable
-        across tenants/processes. Managed Hermes should be pointed at this via
-        ``TMPDIR`` in its process environment.
+        runtime-generated files are isolated from shared system temporary data.
         """
-        return self.config.managed_hermes_home / "tmp"
+        return self.config.managed_agent_runtime_home / "tmp"
 
     def _media_safe_data_subtrees(
         self,
@@ -5575,7 +5955,7 @@ class EnterpriseService:
         workspace_path: Path | None = None,
     ) -> list[Path]:
         """Subtrees under the platform data dir that ARE safe to read media from
-        (the agent's own workspace, the managed Hermes generated-media cache, and
+        (the agent's own workspace, the managed Agent generated-media cache, and
         the dedicated managed media scratch dir), used to keep platform secrets
         unreadable even when the data dir overlaps another allowed root."""
         if workspace_path is not None:
@@ -5587,7 +5967,7 @@ class EnterpriseService:
         subtrees: list[Path] = []
         for path in (
             workspace,
-            self.config.managed_hermes_home / "cache",
+            self.config.managed_agent_runtime_home / "cache",
             self._managed_media_tmp_dir(),
         ):
             try:
@@ -5605,15 +5985,15 @@ class EnterpriseService:
 
         For a private conversation only the owning user's workspace is allowed;
         a channel response is restricted to that channel Agent's workspace.
-        Managed Hermes writes
-        generated documents/images/audio under its cache and the dedicated
+        The managed Agent runtime writes generated documents/images/audio under
+        its cache and the dedicated
         managed media scratch dir, so those subtrees are allowed, plus any
         operator-configured ``ENTERPRISE_MEDIA_ROOTS``. The broad system temp dir
         is intentionally NOT allowed: it is shared with other processes/users on
         the host, so allowing it would let a prompt-injected agent exfiltrate
         arbitrary readable temp files via ``MEDIA:`` tags. Platform secrets
-        elsewhere under the data directory (``platform.db``, the managed Hermes
-        ``.env``, the bootstrap admin password) are never readable — see
+        elsewhere under the data directory (``platform.db``, runtime state,
+        the bootstrap admin password) are never readable — see
         ``_resolve_media_path``.
         """
         candidates = list(self._media_safe_data_subtrees(owner_id, workspace_path))
@@ -5738,10 +6118,10 @@ class EnterpriseService:
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         notes: list[str] = []
         if missing:
-            notes.append("Hermes returned file path(s) that the platform could not read: " + ", ".join(missing[:5]))
+            notes.append("Agent returned file path(s) that the platform could not read: " + ", ".join(missing[:5]))
         if refused:
             notes.append(
-                "Hermes returned file path(s) that exceeded attachment limits or were outside the allowed media "
+                "Agent returned file path(s) that exceeded attachment limits or were outside the allowed media "
                 "directories; they were not shared: "
                 + ", ".join(refused[:5])
             )
@@ -5763,20 +6143,39 @@ class EnterpriseService:
             "created_at": row["created_at"],
         }
 
-    @staticmethod
-    def _hermes_owned_history() -> list[dict[str, str]]:
-        """Hermes owns transcript continuity and context compression."""
-        return []
+    def _agent_session_seed_history(
+        self,
+        scope_type: str,
+        scope_id: str,
+        before_message_id: int,
+    ) -> list[dict[str, str]]:
+        """Seed a newly materialized runtime session from visible platform history.
+
+        The sidecar records a durable seed marker and ignores this list after
+        the first run for a scope/lifecycle/session tuple.
+        """
+
+        rows = self.db.query(
+            """
+            SELECT author_type, content FROM messages
+            WHERE scope_type = ? AND scope_id = ? AND id < ?
+              AND author_type IN ('user', 'agent', 'system')
+            ORDER BY id DESC LIMIT 30
+            """,
+            (str(scope_type), str(scope_id), int(before_message_id)),
+        )
+        roles = {"user": "user", "agent": "assistant", "system": "system"}
+        return [
+            {"role": roles[str(row["author_type"])], "content": str(row["content"])}
+            for row in reversed(rows)
+            if str(row.get("content") or "").strip()
+        ]
 
     @staticmethod
-    def _default_channel_agent_session_id(scope_id: str) -> str:
-        return f"enterprise-channel-{scope_id}-main-agent"
-
-    @staticmethod
-    def _valid_hermes_session_id(session_id: str | None) -> bool:
+    def _valid_agent_session_id(session_id: str | None) -> bool:
         if not isinstance(session_id, str):
             return False
-        if not session_id or len(session_id) > MAX_HERMES_SESSION_ID_LENGTH:
+        if not session_id or len(session_id) > MAX_AGENT_SESSION_ID_LENGTH:
             return False
         return not any(ch in session_id for ch in "\r\n\x00")
 
@@ -5784,7 +6183,7 @@ class EnterpriseService:
         return self._channel_agent_scope(scope_id).session_id
 
     def _remember_channel_agent_session_id(self, scope_id: str, session_id: str | None) -> None:
-        if self._valid_hermes_session_id(session_id):
+        if self._valid_agent_session_id(session_id):
             self.agent_scopes.update_session_id(
                 self.agent_scopes.channel_scope_key(scope_id),
                 str(session_id),
@@ -5794,15 +6193,7 @@ class EnterpriseService:
         return Path(self._channel_agent_scope(scope_id).workspace_path)
 
     def _channel_agent_scope(self, scope_id: str) -> AgentExecutionScope:
-        # Read the old setting only when materializing a scope for the first
-        # time. New session state is written exclusively to agent_scopes.
-        legacy_session_id = self.get_setting(
-            f"{HERMES_CHANNEL_SESSION_SETTING_PREFIX}{scope_id}:main-agent"
-        )
-        return self.agent_scopes.ensure_channel_scope(
-            scope_id,
-            legacy_session_id=legacy_session_id,
-        )
+        return self.agent_scopes.ensure_channel_scope(scope_id)
 
     def _recent_context(self, scope_type: str, scope_id: str, content: str) -> str:
         messages = self._messages_for_scope(scope_type, scope_id, limit=12)
@@ -5885,8 +6276,8 @@ class EnterpriseService:
             "你是 ubitech agent。对外介绍自己时，只说自己是 ubitech agent；"
             "不要提及底层框架、运行时、模型供应商或内部实现。\n"
             f"当前工作模式: 频道协作。频道: #{channel['name']}。请保留上下文连续性，明确区分用户请求和知识库事实。\n"
-            "知识库已作为工具暴露给你: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
-            "当提示中出现 kb:<id> 时，优先用 enterprise_kb_read 读取完整条目再作答。\n"
+            "知识库已通过 knowledge 工具提供；使用 search 操作检索，使用 read 操作读取完整条目。\n"
+            "当提示中出现 kb:<id> 时，优先使用 knowledge/read 读取完整条目再作答。\n"
             f"{passive}"
         )
 
@@ -5904,7 +6295,7 @@ class EnterpriseService:
             f"当前用户: {self._actor_context_label(actor, include_username=True, include_empty_position=True)}。\n"
             f"工作区: {agent_scope.workspace_path}；会话: {agent_scope.session_id}。\n"
             "模型密钥由平台集中配置，不要要求用户再次提供密钥。\n"
-            "知识库工具: enterprise_kb_search(query, limit) 与 enterprise_kb_read(document_id)。\n"
+            "知识库通过 knowledge 工具提供；使用 search 操作检索，使用 read 操作读取完整条目。\n"
             f"{passive}"
         )
 
@@ -6214,7 +6605,7 @@ def agent_work_line(stage: str, label: str, detail: str = "") -> str:
     return f"• {label}{(': ' + detail) if detail else ''}"
 
 
-def hermes_progress_line(event: dict[str, Any]) -> str:
+def agent_progress_line(event: dict[str, Any]) -> str:
     tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
     label = str(event.get("label") or event.get("preview") or "").strip()
     emoji = str(event.get("emoji") or "⚙️").strip() or "⚙️"

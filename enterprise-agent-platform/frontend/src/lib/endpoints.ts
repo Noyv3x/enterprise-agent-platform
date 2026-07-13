@@ -9,6 +9,8 @@ import type {
   AuditChannelMessagesResponse,
   AuditPrivateMessagesResponse,
   AuthMeResponse,
+  AgentRuntimeConfigResponse,
+  AgentRuntimeConfigUpdateRequest,
   AutoUpdateConfigResponse,
   AutoUpdateConfigUpdateRequest,
   AgentApprovalSubmitRequest,
@@ -27,10 +29,6 @@ import type {
   DeleteResultResponse,
   DocumentResponse,
   DocumentsResponse,
-  HermesConfigResponse,
-  HermesConfigUpdateRequest,
-  HermesInternalConfigResponse,
-  HermesInternalConfigUpdateRequest,
   ImpersonateUserResponse,
   KnowledgeSearchResponse,
   LoginRequest,
@@ -230,8 +228,6 @@ export const endpoints = {
     "POST",
     (name) => `/api/system/runtime/${name}/restart`,
   ),
-  installHermes: ep<string, unknown>("POST", () => "/api/system/runtime/hermes/install"),
-
   /* system: config */
   securityConfig: ep<void, SecurityConfigResponse>(
     "GET",
@@ -241,10 +237,13 @@ export const endpoints = {
     "PUT",
     () => "/api/system/security/config",
   ),
-  hermesConfig: ep<void, HermesConfigResponse>("GET", () => "/api/system/hermes/config"),
-  updateHermesConfig: ep<HermesConfigUpdateRequest, unknown>(
+  agentRuntimeConfig: ep<void, AgentRuntimeConfigResponse>(
+    "GET",
+    () => "/api/system/agent-runtime/config",
+  ),
+  updateAgentRuntimeConfig: ep<AgentRuntimeConfigUpdateRequest, unknown>(
     "PUT",
-    () => "/api/system/hermes/config",
+    () => "/api/system/agent-runtime/config",
   ),
   telegramConfig: ep<void, TelegramConfigResponse>(
     "GET",
@@ -263,14 +262,6 @@ export const endpoints = {
     () => "/api/system/auto-update/config",
   ),
   autoUpdateCheck: ep<string, unknown>("POST", () => "/api/system/auto-update/check"),
-  hermesInternalConfig: ep<void, HermesInternalConfigResponse>(
-    "GET",
-    () => "/api/system/hermes/internal-config",
-  ),
-  updateHermesInternalConfig: ep<HermesInternalConfigUpdateRequest, unknown>(
-    "PUT",
-    () => "/api/system/hermes/internal-config",
-  ),
   cogneeConfig: ep<void, CogneeConfigResponse>("GET", () => "/api/system/cognee/config"),
   updateCogneeConfig: ep<CogneeConfigUpdateRequest, unknown>(
     "PUT",

@@ -16,7 +16,13 @@ from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
 _LEGACY_CONTAINER_NAME_RE = re.compile(r"enterprise-agent-u[1-9][0-9]*-[0-9a-f]{10}")
 _MAX_SESSION_ID_LENGTH = 512
-_LEGACY_CHANNEL_SESSION_PREFIX = "hermes_session:channel:"
+_SCOPE_SELECT = """
+    SELECT scopes.*,
+           runtime.session_id AS runtime_session_id,
+           runtime.lifecycle_id AS runtime_lifecycle_id
+    FROM agent_scopes AS scopes
+    JOIN agent_runtime_scopes AS runtime ON runtime.scope_key = scopes.scope_key
+"""
 
 
 @dataclass(frozen=True)
@@ -121,19 +127,15 @@ class AgentScopeManager:
             scope_key=self.private_scope_key(uid),
             scope_type="private",
             scope_id=str(uid),
-            default_session_id=f"enterprise-private-u{uid}",
+            default_session_id=f"ubitech-private-u{uid}",
         )
 
     def ensure_channel_scope(
         self,
         channel_id: str | int,
-        *,
-        legacy_session_id: str | None = None,
     ) -> AgentExecutionScope:
         scope_id = str(channel_id)
-        default_session_id = f"enterprise-channel-{self._safe_channel_id(scope_id)}-main-agent"
-        if self._valid_session_id(legacy_session_id):
-            default_session_id = str(legacy_session_id)
+        default_session_id = f"ubitech-channel-{self._safe_channel_id(scope_id)}-main-agent"
         return self._ensure_scope(
             scope_key=self.channel_scope_key(scope_id),
             scope_type="channel",
@@ -151,7 +153,8 @@ class AgentScopeManager:
     ) -> AgentExecutionScope:
         workspace = self._expected_workspace(scope_type, scope_id)
         ts = now_ts()
-        lifecycle_id = secrets.token_hex(16)
+        legacy_lifecycle_id = secrets.token_hex(16)
+        runtime_lifecycle_id = secrets.token_hex(16)
         with self.db.transaction() as conn:
             conn.execute(
                 """
@@ -164,22 +167,41 @@ class AgentScopeManager:
                     execution_backend='host',
                     updated_at=excluded.updated_at
                 """,
-                (scope_key, scope_type, scope_id, default_session_id, lifecycle_id, str(workspace), ts, ts),
+                (
+                    scope_key,
+                    scope_type,
+                    scope_id,
+                    default_session_id,
+                    legacy_lifecycle_id,
+                    str(workspace),
+                    ts,
+                    ts,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_runtime_scopes(
+                    scope_key, session_id, lifecycle_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (scope_key, default_session_id, runtime_lifecycle_id, ts, ts),
             )
             row = conn.execute(
-                "SELECT * FROM agent_scopes WHERE scope_key = ?",
+                _SCOPE_SELECT + " WHERE scopes.scope_key = ?",
                 (scope_key,),
             ).fetchone()
         if row is None:
             raise RuntimeError(f"failed to create Agent scope {scope_key}")
         scope = self._from_row(dict(row))
         self._record_session_alias(scope)
-        self._sync_legacy_session(scope)
         self._write_scope_marker(scope)
         return scope
 
     def get_scope(self, scope_key: str) -> AgentExecutionScope | None:
-        row = self.db.query_one("SELECT * FROM agent_scopes WHERE scope_key = ?", (scope_key,))
+        row = self.db.query_one(
+            _SCOPE_SELECT + " WHERE scopes.scope_key = ?",
+            (scope_key,),
+        )
         return self._from_row(row) if row else None
 
     def get_private_scope(self, user_id: int) -> AgentExecutionScope | None:
@@ -187,57 +209,64 @@ class AgentScopeManager:
 
     def update_session_id(self, scope_key: str, session_id: str) -> None:
         if not self._valid_session_id(session_id):
-            raise ValueError("invalid Hermes session id")
+            raise ValueError("invalid Agent session id")
         ts = now_ts()
         with self.db.transaction() as conn:
             conn.execute(
-                "UPDATE agent_scopes SET session_id = ?, updated_at = ? WHERE scope_key = ?",
+                "UPDATE agent_runtime_scopes SET session_id = ?, updated_at = ? WHERE scope_key = ?",
                 (session_id, ts, scope_key),
             )
-            row = conn.execute("SELECT * FROM agent_scopes WHERE scope_key = ?", (scope_key,)).fetchone()
+            row = conn.execute(
+                _SCOPE_SELECT + " WHERE scopes.scope_key = ?",
+                (scope_key,),
+            ).fetchone()
             if row is not None:
                 scope = self._from_row(dict(row))
                 self._record_session_alias(scope, conn=conn, timestamp=ts)
-                self._sync_legacy_session(scope, conn=conn, timestamp=ts)
 
     def rotate_session(self, scope_key: str) -> AgentExecutionScope:
-        """Start a fresh Hermes conversation while preserving its workspace.
+        """Start a fresh Agent conversation while preserving its workspace.
 
         Administrative chat clearing is a lifecycle boundary, not only a UI
-        row deletion. A random suffix prevents Hermes from reopening the prior
+        row deletion. A random suffix prevents the runtime from reopening the prior
         transcript/memory snapshot if the same logical Agent is used again.
         """
 
-        row = self.db.query_one("SELECT * FROM agent_scopes WHERE scope_key = ?", (str(scope_key),))
+        row = self.db.query_one(
+            _SCOPE_SELECT + " WHERE scopes.scope_key = ?",
+            (str(scope_key),),
+        )
         if row is None:
             raise ValueError(f"Agent scope does not exist: {scope_key}")
         scope = self._from_row(row)
         if scope.scope_type == "private":
-            prefix = f"enterprise-private-u{int(scope.scope_id)}"
+            prefix = f"ubitech-private-u{int(scope.scope_id)}"
         else:
-            prefix = f"enterprise-channel-{self._safe_channel_id(scope.scope_id)}-main-agent"
+            prefix = f"ubitech-channel-{self._safe_channel_id(scope.scope_id)}-main-agent"
         session_id = f"{prefix}-{secrets.token_urlsafe(12)}"
         lifecycle_id = secrets.token_hex(16)
         ts = now_ts()
         with self.db.transaction() as conn:
             conn.execute(
                 """
-                UPDATE agent_scopes
+                UPDATE agent_runtime_scopes
                 SET session_id = ?, lifecycle_id = ?, updated_at = ?
                 WHERE scope_key = ?
                 """,
                 (session_id, lifecycle_id, ts, scope.scope_key),
             )
-            conn.execute("DELETE FROM agent_scope_sessions WHERE scope_key = ?", (scope.scope_key,))
+            conn.execute(
+                "DELETE FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                (scope.scope_key,),
+            )
             row = conn.execute(
-                "SELECT * FROM agent_scopes WHERE scope_key = ?",
+                _SCOPE_SELECT + " WHERE scopes.scope_key = ?",
                 (scope.scope_key,),
             ).fetchone()
             if row is None:
                 raise RuntimeError(f"failed to rotate Agent session {scope.scope_key}")
             rotated = self._from_row(dict(row))
             self._record_session_alias(rotated, conn=conn, timestamp=ts)
-            self._sync_legacy_session(rotated, conn=conn, timestamp=ts)
         refreshed = self.get_scope(scope.scope_key)
         if refreshed is None:
             raise RuntimeError(f"failed to rotate Agent session {scope.scope_key}")
@@ -247,13 +276,13 @@ class AgentScopeManager:
     def deactivate_private_scope(self, user_id: int) -> None:
         """Preserve private state for later account reactivation.
 
-        Hermes owns the scoped process registry.  Account deactivation prevents
+        The runtime owns the scoped process registry. Account deactivation prevents
         new work from being queued; the durable workspace/session record remains
         intact as required by the trusted internal deployment model.
         """
 
         self.db.execute(
-            "UPDATE agent_scopes SET updated_at = ? WHERE scope_key = ?",
+            "UPDATE agent_runtime_scopes SET updated_at = ? WHERE scope_key = ?",
             (now_ts(), self.private_scope_key(int(user_id))),
         )
 
@@ -314,50 +343,6 @@ class AgentScopeManager:
             (status, error, now_ts(), scope_key),
         )
 
-    def _sync_legacy_session(
-        self,
-        scope: AgentExecutionScope,
-        *,
-        conn=None,
-        timestamp: int | None = None,
-    ) -> None:
-        """Dual-write one release of rollback-compatible session state."""
-
-        ts = now_ts() if timestamp is None else int(timestamp)
-
-        def write(connection) -> None:
-            if scope.scope_type == "private":
-                connection.execute(
-                    """
-                    INSERT INTO private_agents(
-                        user_id, session_id, container_name, container_id,
-                        container_status, workspace_path, created_at, updated_at
-                    ) VALUES (?, ?, '', '', 'host-workspace', ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        session_id = excluded.session_id,
-                        workspace_path = excluded.workspace_path,
-                        updated_at = excluded.updated_at
-                    """,
-                    (int(scope.scope_id), scope.session_id, scope.workspace_path, ts, ts),
-                )
-                return
-            key = f"{_LEGACY_CHANNEL_SESSION_PREFIX}{scope.scope_id}:main-agent"
-            connection.execute(
-                """
-                INSERT INTO settings(key, value, secret, updated_at)
-                VALUES (?, ?, 0, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value, secret = 0, updated_at = excluded.updated_at
-                """,
-                (key, scope.session_id, ts),
-            )
-
-        if conn is not None:
-            write(conn)
-            return
-        with self.db.transaction() as transaction:
-            write(transaction)
-
     def session_belongs_to_current_lifecycle(self, scope_key: str, session_id: str) -> bool:
         scope = self.get_scope(str(scope_key))
         if scope is None or not self._valid_session_id(session_id):
@@ -365,7 +350,7 @@ class AgentScopeManager:
         return bool(
             self.db.scalar(
                 """
-                SELECT 1 FROM agent_scope_sessions
+                SELECT 1 FROM agent_runtime_scope_sessions
                 WHERE scope_key = ? AND lifecycle_id = ? AND session_id = ?
                 """,
                 (scope.scope_key, scope.lifecycle_id, str(session_id)),
@@ -378,7 +363,7 @@ class AgentScopeManager:
         def write(connection) -> None:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO agent_scope_sessions(
+                INSERT OR IGNORE INTO agent_runtime_scope_sessions(
                     scope_key, lifecycle_id, session_id, created_at
                 ) VALUES (?, ?, ?, ?)
                 """,
@@ -397,14 +382,14 @@ class AgentScopeManager:
             scope_key=str(row["scope_key"]),
             scope_type=str(row["scope_type"]),
             scope_id=str(row["scope_id"]),
-            session_id=str(row["session_id"]),
-            lifecycle_id=str(row["lifecycle_id"]),
+            session_id=str(row.get("runtime_session_id") or row["session_id"]),
+            lifecycle_id=str(row.get("runtime_lifecycle_id") or row["lifecycle_id"]),
             workspace_path=str(row["workspace_path"]),
         )
 
     @staticmethod
     def _write_scope_marker(scope: AgentExecutionScope) -> None:
-        marker = Path(scope.workspace_path) / ".enterprise-agent-scope.json"
+        marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
         payload = json.dumps(
             {
                 "scope_key": scope.scope_key,

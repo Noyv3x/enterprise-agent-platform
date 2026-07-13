@@ -11,3 +11,12 @@ describe("Telegram link challenge endpoint", () => {
     expect(endpoints.deletePrivateTelegram.path()).toBe("/api/private-agent/telegram");
   });
 });
+
+describe("Agent runtime configuration endpoint", () => {
+  it("uses the neutral runtime resource for reads and writes", () => {
+    expect(endpoints.agentRuntimeConfig).toMatchObject({ method: "GET" });
+    expect(endpoints.updateAgentRuntimeConfig).toMatchObject({ method: "PUT" });
+    expect(endpoints.agentRuntimeConfig.path()).toBe("/api/system/agent-runtime/config");
+    expect(endpoints.updateAgentRuntimeConfig.path()).toBe("/api/system/agent-runtime/config");
+  });
+});

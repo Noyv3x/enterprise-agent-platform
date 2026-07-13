@@ -212,6 +212,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/telegram/webhook/"):
                 self._handle_telegram_webhook(method, path)
                 return
+            if path.startswith("/internal/agent/"):
+                self._handle_agent_internal(method, path)
+                return
             if path.startswith("/api/") and method in UNSAFE_METHODS:
                 self._require_same_origin()
             if path.startswith("/api/agent/tools/"):
@@ -508,11 +511,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/runtime" and method == "GET":
             self._json(service.runtime_status(actor))
             return
-        if path == "/api/system/hermes/config" and method == "GET":
-            self._json(service.hermes_config(actor))
+        if path == "/api/system/agent-runtime/config" and method == "GET":
+            self._json(service.agent_runtime_config(actor))
             return
-        if path == "/api/system/hermes/config" and method == "PUT":
-            self._json(service.update_hermes_config(actor, self._body_json()))
+        if path == "/api/system/agent-runtime/config" and method == "PUT":
+            self._json(service.update_agent_runtime_config(actor, self._body_json()))
             return
         if path == "/api/system/telegram/config" and method == "GET":
             self._json(service.telegram_admin_config(actor))
@@ -528,12 +531,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/system/auto-update/check" and method == "POST":
             self._json(service.trigger_auto_update_check(actor), status=202)
-            return
-        if path == "/api/system/hermes/internal-config" and method == "GET":
-            self._json(service.hermes_internal_config(actor))
-            return
-        if path == "/api/system/hermes/internal-config" and method == "PUT":
-            self._json(service.update_hermes_internal_config(actor, self._body_json()))
             return
         if path == "/api/system/cognee/config" and method == "GET":
             self._json(service.cognee_config(actor))
@@ -575,7 +572,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_agent_tool(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
-        token = self.headers.get("X-Enterprise-Agent-Token") or bearer_token(self.headers.get("Authorization", ""))
+        token = bearer_token(self.headers.get("Authorization", ""))
         if not service.validate_agent_tool_token(token):
             raise ServiceError(401, "invalid agent tool token")
         if path == "/api/agent/tools/knowledge/search" and method == "GET":
@@ -585,7 +582,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "GET":
             self._json({"document": service.get_knowledge_document(int(m.group(1)))})
             return
+        if path == "/api/agent/tools/memory/search" and method == "POST":
+            self._json(service.agent_memory_search(self._body_json()))
+            return
+        if path == "/api/agent/tools/memory" and method == "POST":
+            self._json(service.agent_memory_mutate(self._body_json()))
+            return
+        if path == "/api/agent/tools/session/search" and method == "POST":
+            self._json(service.agent_session_search(self._body_json()))
+            return
+        if path == "/api/agent/tools/credentials/resolve" and method == "POST":
+            self._json(service.resolve_agent_credentials(self._body_json()))
+            return
         raise ServiceError(404, "agent tool endpoint not found")
+
+    def _handle_agent_internal(self, method: str, path: str) -> None:
+        service = self.server.service
+        token = bearer_token(self.headers.get("Authorization", ""))
+        if not service.validate_agent_tool_token(token):
+            raise ServiceError(401, "invalid Agent runtime token")
+        if method != "POST":
+            raise ServiceError(405, "method not allowed")
+        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser)", path):
+            body = self._body_json()
+            body["tool"] = path.rsplit("/", 1)[-1]
+            self._json(service.invoke_agent_runtime_tool(body))
+            return
+        if path == "/internal/agent/auth/token":
+            self._json(service.resolve_agent_credentials(self._body_json()))
+            return
+        raise ServiceError(404, "Agent runtime endpoint not found")
 
     def _require_user(self) -> dict[str, Any]:
         user = self.server.service.user_from_token(self._read_token())

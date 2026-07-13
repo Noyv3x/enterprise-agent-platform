@@ -3,9 +3,8 @@ import type { AdminPageId } from "../types";
 
 const loads = vi.hoisted(() => ({
   updates: vi.fn(async () => undefined),
+  agentRuntime: vi.fn(async () => undefined),
   cognee: vi.fn(async () => undefined),
-  hermes: vi.fn(async () => undefined),
-  hermesInternal: vi.fn(async () => undefined),
   messages: vi.fn(async () => undefined),
   oauth: vi.fn(async () => undefined),
   groups: vi.fn(async () => undefined),
@@ -19,9 +18,8 @@ const loads = vi.hoisted(() => ({
 
 vi.mock("./loaders", () => ({
   loadAutoUpdateConfig: loads.updates,
+  loadAgentRuntimeConfig: loads.agentRuntime,
   loadCogneeConfig: loads.cognee,
-  loadHermesConfig: loads.hermes,
-  loadHermesInternalConfig: loads.hermesInternal,
   loadMessageAudit: loads.messages,
   loadOAuthProviders: loads.oauth,
   loadPermissionGroups: loads.groups,
@@ -36,8 +34,8 @@ vi.mock("./loaders", () => ({
 import { loadAdminPage } from "./adminResources";
 
 const pages: AdminPageId[] = [
-  "accounts", "tokens", "messages", "model", "telegram", "updates",
-  "security", "runtime", "hermes", "cognee", "secrets",
+  "accounts", "tokens", "messages", "agent-runtime", "telegram", "updates",
+  "security", "runtime", "cognee", "secrets",
 ];
 
 describe("administration page resources", () => {
@@ -47,15 +45,14 @@ describe("administration page resources", () => {
 
   it("uses one precise loader set for every page", async () => {
     const expected: Record<AdminPageId, string[]> = {
-      accounts: ["users", "groups"],
+      accounts: ["users", "groups", "oauth", "agentRuntime"],
       tokens: ["tokens"],
       messages: ["messages"],
-      model: ["hermes", "oauth"],
+      "agent-runtime": ["agentRuntime", "oauth"],
       telegram: ["telegram"],
       updates: ["updates"],
       security: ["security"],
       runtime: ["runtime"],
-      hermes: ["hermesInternal"],
       cognee: ["cognee"],
       secrets: ["secrets"],
     };

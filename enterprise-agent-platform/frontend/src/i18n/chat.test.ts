@@ -27,15 +27,15 @@ describe("chat translations", () => {
       state: "replying",
       activity: [
         {
-          source: "hermes",
+          source: "agent",
           stage: "tool",
-          tool: "enterprise_kb_search",
+          tool: "knowledge_search",
           detail: "VPN access policy",
           emoji: "🔍",
           tool_status: "completed",
         },
         {
-          source: "hermes",
+          source: "agent",
           stage: "approval",
           detail: "rm -rf /tmp/example",
         },
@@ -51,7 +51,7 @@ describe("chat translations", () => {
     };
 
     expect(agentProcessLines(status, english)).toEqual([
-      '✅ Completed enterprise_kb_search: "VPN access policy"',
+      '✅ Completed knowledge_search: "VPN access policy"',
       "🛡️ Waiting for access approval: rm -rf /tmp/example",
       "🛡️ Access approval completed",
       "✅ Work completed",

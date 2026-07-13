@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from enterprise_agent_platform.deployment import (
@@ -89,8 +91,16 @@ def make_deploy_root(root: Path) -> None:
     (root / ".git").mkdir()
     (root / "enterprise-agent-platform" / "enterprise_agent_platform").mkdir(parents=True)
     (root / "enterprise-agent-platform" / "pyproject.toml").write_text("[project]\nname='platform'\n", encoding="utf-8")
-    (root / "hermes-agent").mkdir()
-    (root / "hermes-agent" / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
+    runtime = root / "enterprise-agent-platform" / "agent-runtime"
+    runtime.mkdir()
+    (runtime / "package.json").write_text(
+        '{"name":"agent-runtime","private":true,"engines":{"node":">=22.19.0"}}\n',
+        encoding="utf-8",
+    )
+    (runtime / "package-lock.json").write_text(
+        '{"name":"agent-runtime","lockfileVersion":3,"packages":{}}\n',
+        encoding="utf-8",
+    )
     (root / "cognee").mkdir()
     (root / "cognee" / "pyproject.toml").write_text("[project]\nname='cognee'\n", encoding="utf-8")
     (root / "firecrawl").mkdir()
@@ -98,6 +108,35 @@ def make_deploy_root(root: Path) -> None:
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_node_runtime_requires_node_and_npm_at_supported_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = DeploymentManager(DeploymentPaths.from_root(Path(td)), runner=RecordingDeployRunner())
+            with mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=lambda name: None if name == "npm" else f"/tools/{name}",
+            ):
+                with self.assertRaisesRegex(DeploymentError, "Node.js 22.19"):
+                    manager.ensure_node_version()
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=lambda name: f"/tools/{name}",
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._capture_command_stdout",
+                return_value="v22.18.0",
+            ):
+                with self.assertRaisesRegex(DeploymentError, "found v22.18.0"):
+                    manager.ensure_node_version()
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=lambda name: f"/tools/{name}",
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._capture_command_stdout",
+                return_value="v22.19.0",
+            ):
+                manager.ensure_node_version()
+
     def test_bootstrap_prepare_initializes_submodules_and_platform_venv(self):
         if not shutil.which("git"):
             self.skipTest("git is not available")
@@ -107,6 +146,7 @@ class DeploymentTests(unittest.TestCase):
             runner = RecordingDeployRunner()
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
 
@@ -157,6 +197,7 @@ class DeploymentTests(unittest.TestCase):
             runner = TransientPipFailureRunner()
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
 
             with mock.patch.dict(os.environ, {"ENTERPRISE_PIP_INSTALL_ATTEMPTS": "2"}):
                 result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
@@ -175,6 +216,7 @@ class DeploymentTests(unittest.TestCase):
             runner = AutoInstallEnsurepipRunner()
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
 
             def fake_which(name):
                 if name in {"apt-get", "git", "sudo"}:
@@ -205,6 +247,7 @@ class DeploymentTests(unittest.TestCase):
             marker.write_text("old", encoding="utf-8")
             runner = BrokenExistingVenvRunner()
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
 
@@ -221,6 +264,7 @@ class DeploymentTests(unittest.TestCase):
             runner = MissingEnsurepipRunner()
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
 
             with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_APT": "0"}):
                 with self.assertRaises(DeploymentError) as ctx:
@@ -241,8 +285,9 @@ class DeploymentTests(unittest.TestCase):
 
             self.assertIn("Restart=on-failure", unit)
             self.assertIn(f"ENTERPRISE_PLATFORM_DATA={root / 'state'}", unit)
-            self.assertIn(f"ENTERPRISE_HERMES_REPO={root / 'hermes-agent'}", unit)
+            self.assertIn(f"ENTERPRISE_AGENT_RUNTIME_HOME={root / 'state' / 'runtimes' / 'agent'}", unit)
             self.assertIn(f"ENTERPRISE_COGNEE_REPO={root / 'cognee'}", unit)
+            self.assertNotIn("ENTERPRISE_HERMES_REPO", unit)
             self.assertIn(str(paths.platform_cli), unit)
             self.assertIn(f"WorkingDirectory={root / 'enterprise-agent-platform'}", unit)
             self.assertNotIn(f"WorkingDirectory=\"{root / 'enterprise-agent-platform'}\"", unit)
@@ -255,15 +300,99 @@ class DeploymentTests(unittest.TestCase):
             runner = RecordingDeployRunner(systemd_available=True)
             paths = replace(DeploymentPaths.from_root(root), service_dir=root / "systemd-user")
             manager = DeploymentManager(paths, runner=runner)
+            manager.ensure_node_version = mock.Mock()
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="service", prepare_runtime=False)
 
             commands = [call["cmd"] for call in runner.calls]
             self.assertEqual(result.mode, "service")
+            manager.prepare_platform_runtime.assert_called_once_with(host="127.0.0.1", port=8765)
             self.assertIn(["systemctl", "--user", "daemon-reload"], commands)
             self.assertIn(["systemctl", "--user", "enable", paths.service_name], commands)
             self.assertIn(["systemctl", "--user", "restart", paths.service_name], commands)
             self.assertNotIn(["systemctl", "--user", "enable", "--now", paths.service_name], commands)
+
+    def test_service_switches_prepare_matching_agent_runtime_before_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            for mode in ("service", "auto"):
+                with self.subTest(mode=mode):
+                    manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+                    manager.ensure_python_version = mock.Mock()
+                    manager.ensure_node_version = mock.Mock()
+                    manager.ensure_layout = mock.Mock()
+                    manager.ensure_submodules = mock.Mock()
+                    manager.ensure_source_repos = mock.Mock()
+                    manager.ensure_platform_venv = mock.Mock()
+                    manager.user_systemd_available = mock.Mock(return_value=True)
+                    sequence = mock.Mock()
+                    sequence.restart.return_value = paths.service_path
+                    manager.prepare_platform_runtime = sequence.prepare
+                    manager.install_user_service = sequence.restart
+
+                    result = manager.bootstrap(
+                        host="127.0.0.1",
+                        port=8765,
+                        mode=mode,
+                        # Service-changing paths must not allow the signature
+                        # check to be bypassed by this prepare-only test knob.
+                        prepare_runtime=False,
+                    )
+
+                    self.assertEqual(result.mode, "service")
+                    self.assertEqual(
+                        sequence.mock_calls,
+                        [
+                            mock.call.prepare(host="127.0.0.1", port=8765),
+                            mock.call.restart(host="127.0.0.1", port=8765),
+                        ],
+                    )
+
+    def test_runtime_prepare_does_not_contend_with_the_live_service_instance_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            paths.data_dir.mkdir(parents=True)
+            lock_path = paths.data_dir / ".enterprise-platform.lock"
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            runtime = mock.Mock()
+            runtime.agent_runtime_config.return_value = {"managed": True}
+            runtime.agent_runtime_status.return_value = SimpleNamespace(
+                available=False,
+                error="",
+                to_dict=lambda: {"available": False},
+            )
+            installed = SimpleNamespace(
+                available=True,
+                error="",
+                to_dict=lambda: {"available": True, "install_state": "ready"},
+            )
+            runtime.install_agent_runtime.return_value = installed
+            runtime.prepare.return_value = {
+                "agent": {"available": True},
+                "cognee": {"available": True},
+                "camofox": {"available": True},
+                "firecrawl": {"available": True},
+            }
+            try:
+                with mock.patch(
+                    "enterprise_agent_platform.deployment.PlatformRuntimeManager",
+                    return_value=runtime,
+                ):
+                    statuses = DeploymentManager(paths).prepare_platform_runtime(
+                        host="127.0.0.1",
+                        port=8765,
+                    )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+            self.assertTrue(statuses["agent"]["available"])
+            runtime.install_agent_runtime.assert_called_once_with(force=False)
+            runtime.close.assert_called_once_with()
 
     def test_user_service_unit_passes_systemd_verify_when_available(self):
         if not shutil.which("systemd-analyze"):
@@ -295,9 +424,10 @@ class DeploymentTests(unittest.TestCase):
 
             env = runtime_env(paths, host="127.0.0.1", port=9999)
 
-            self.assertEqual(env["ENTERPRISE_HERMES_REPO"], str(root / "hermes-agent"))
+            self.assertEqual(env["ENTERPRISE_AGENT_RUNTIME_HOME"], str(paths.data_dir / "runtimes" / "agent"))
             self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(root / "cognee"))
             self.assertEqual(env["ENTERPRISE_FIRECRAWL_REPO"], str(root / "firecrawl"))
+            self.assertNotIn("ENTERPRISE_HERMES_REPO", env)
             self.assertEqual(env["ENTERPRISE_PLATFORM_PORT"], "9999")
 
     def test_deploy_script_exposes_one_command_entrypoint(self):
@@ -312,12 +442,159 @@ class DeploymentTests(unittest.TestCase):
         syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    def test_deploy_update_rejects_all_dirty_worktree_states_before_pull(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            tools = base / "tools"
+            tools.mkdir()
+            for name, body in (
+                ("node", "#!/bin/sh\nprintf '22.19.0\\n'\n"),
+                ("npm", "#!/bin/sh\nexit 0\n"),
+            ):
+                executable = tools / name
+                executable.write_text(body, encoding="utf-8")
+                executable.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tools}{os.pathsep}{env.get('PATH', '')}"
+            env["PYTHON_BIN"] = str(base / "python-must-not-run")
+
+            for dirty_state in ("unstaged", "staged", "untracked"):
+                with self.subTest(dirty_state=dirty_state):
+                    root = base / dirty_state
+                    root.mkdir()
+                    shutil.copy2(source_script, root / "deploy.sh")
+                    tracked = root / "tracked.txt"
+                    tracked.write_text("original\n", encoding="utf-8")
+                    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+                    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+                    subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=root, check=True)
+                    subprocess.run(["git", "add", "deploy.sh", "tracked.txt"], cwd=root, check=True)
+                    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+                    before = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+
+                    if dirty_state == "untracked":
+                        (root / "untracked.txt").write_text("keep me\n", encoding="utf-8")
+                    else:
+                        tracked.write_text(f"{dirty_state} local work\n", encoding="utf-8")
+                        if dirty_state == "staged":
+                            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+
+                    result = subprocess.run(
+                        ["bash", str(root / "deploy.sh"), "update"],
+                        cwd=root,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("staged, unstaged, or untracked changes", result.stderr)
+                    self.assertNotIn("couldn't find remote ref", result.stderr.lower())
+                    self.assertEqual(
+                        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+                        before,
+                    )
+                    self.assertTrue(
+                        subprocess.check_output(
+                            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                            cwd=root,
+                            text=True,
+                        ).strip()
+                    )
+
+    def test_failed_update_redeploys_previous_revision_after_rollback(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upstream = base / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=upstream, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=upstream, check=True)
+            shutil.copy2(source_script, upstream / "deploy.sh")
+            (upstream / "version.txt").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "deploy.sh", "version.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "old"], cwd=upstream, check=True)
+            old_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=upstream, text=True).strip()
+
+            downstream = base / "downstream"
+            subprocess.run(["git", "clone", "-q", str(upstream), str(downstream)], check=True)
+            (upstream / "version.txt").write_text("new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "new"], cwd=upstream, check=True)
+
+            tools = base / "tools"
+            tools.mkdir()
+            (tools / "node").write_text("#!/bin/sh\nprintf '22.19.0\\n'\n", encoding="utf-8")
+            (tools / "npm").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "python").write_text(
+                """#!/bin/sh
+root=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--root" ]; then
+    root="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+version="$(tr -d '\\n' < "$root/version.txt")"
+printf '%s\\n' "$version" >> "$FAKE_DEPLOY_LOG"
+printf '%s\\n' "$version" > "$FAKE_SIDECAR"
+if [ "$version" = "new" ]; then
+  exit 1
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            for executable in tools.iterdir():
+                executable.chmod(0o755)
+            log = base / "deploy.log"
+            sidecar = base / "managed-sidecar.txt"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{tools}{os.pathsep}{env.get('PATH', '')}",
+                    "PYTHON_BIN": str(tools / "python"),
+                    "FAKE_DEPLOY_LOG": str(log),
+                    "FAKE_SIDECAR": str(sidecar),
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(downstream / "deploy.sh"), "update"],
+                cwd=downstream,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"Rolled back to {old_sha}", result.stderr)
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["new", "old"])
+            self.assertEqual(sidecar.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(
+                subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=downstream, text=True).strip(),
+                old_sha,
+            )
+
     def test_platform_pyproject_supports_editable_install(self):
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         package_data = data["tool"]["setuptools"]["package-data"]
-        self.assertIn("hermes_plugin.enterprise_kb", package_data)
-        self.assertEqual(package_data["hermes_plugin.enterprise_kb"], ["plugin.yaml"])
+        self.assertEqual(package_data["enterprise_agent_platform"], ["static/*"])
+        self.assertFalse(any("hermes" in name.lower() for name in package_data))
 
 
 if __name__ == "__main__":

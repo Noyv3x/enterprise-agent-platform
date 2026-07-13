@@ -5,9 +5,8 @@ import type { AdminPageId, AppState } from "../types";
 import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
 import {
   loadAutoUpdateConfig,
+  loadAgentRuntimeConfig,
   loadCogneeConfig,
-  loadHermesConfig,
-  loadHermesInternalConfig,
   loadMessageAudit,
   loadOAuthProviders,
   loadPermissionGroups,
@@ -23,13 +22,18 @@ import {
 export function loadAdminPage(store: AppStore, pageId: AdminPageId): Promise<void> {
   switch (pageId) {
     case "accounts":
-      return Promise.all([loadUsers(store), loadPermissionGroups(store)]).then(() => undefined);
+      return Promise.all([
+        loadUsers(store),
+        loadPermissionGroups(store),
+        loadOAuthProviders(store),
+        loadAgentRuntimeConfig(store),
+      ]).then(() => undefined);
     case "tokens":
       return loadTokenUsage(store);
     case "messages":
       return loadMessageAudit(store);
-    case "model":
-      return Promise.all([loadOAuthProviders(store), loadHermesConfig(store)]).then(() => undefined);
+    case "agent-runtime":
+      return Promise.all([loadOAuthProviders(store), loadAgentRuntimeConfig(store)]).then(() => undefined);
     case "telegram":
       return loadTelegramConfig(store);
     case "updates":
@@ -38,8 +42,6 @@ export function loadAdminPage(store: AppStore, pageId: AdminPageId): Promise<voi
       return loadSecurityConfig(store);
     case "runtime":
       return loadRuntime(store);
-    case "hermes":
-      return loadHermesInternalConfig(store);
     case "cognee":
       return loadCogneeConfig(store);
     case "secrets":
@@ -69,8 +71,8 @@ export function hasAdminPageData(state: AppState, pageId: AdminPageId): boolean 
         state.messageAudit.privateConversations.length ||
         state.messageAudit.privateMessages.length
       );
-    case "model":
-      return state.oauthProviders !== null || state.hermesConfig !== null;
+    case "agent-runtime":
+      return state.oauthProviders !== null || state.agentRuntimeConfig !== null;
     case "telegram":
       return state.telegramConfig !== null;
     case "updates":
@@ -79,8 +81,6 @@ export function hasAdminPageData(state: AppState, pageId: AdminPageId): boolean 
       return state.securityConfig !== null;
     case "runtime":
       return state.runtimes !== null;
-    case "hermes":
-      return state.hermesInternalConfig !== null;
     case "cognee":
       return state.cogneeConfig !== null;
     case "secrets":

@@ -3,7 +3,6 @@ from __future__ import annotations
 import http.client
 import hashlib
 import hmac
-import importlib.util
 import json
 import os
 import shutil
@@ -13,7 +12,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 import urllib.parse
 from dataclasses import replace
@@ -22,12 +20,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from enterprise_agent_platform import runtimes as runtime_module
+from enterprise_agent_platform.agent_runtime_client import AgentResult, AgentRuntimeRunError
 from enterprise_agent_platform.auto_update import AutoUpdateManager
 from enterprise_agent_platform.config import PlatformConfig
-from enterprise_agent_platform.hermes import AgentResult, AutoAgentClient, HermesAgentClient
-from enterprise_agent_platform.hermes_relay import HermesRelayConnector
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
+from enterprise_agent_platform.runtimes import (
+    AGENT_SETTING_COMPACTION_THRESHOLD,
+    AGENT_SETTING_MAX_CONCURRENCY,
+    AGENT_SETTING_MODEL,
+    AGENT_SETTING_PROVIDER,
+    AGENT_SETTING_TIMEOUT,
+)
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
     BOOTSTRAP_ADMIN_PASSWORD_FILE,
@@ -52,13 +55,34 @@ class RecordingAgent:
         )
 
 
+class NeedsReviewAgent:
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AgentRuntimeRunError(
+            "run-uncertain",
+            "needs_review",
+            "tool side effects may have completed",
+            partial_content="partial output must not be committed",
+            session_id=kwargs["session_id"],
+            raw={"terminal_event": "run.needs_review"},
+        )
+
+
 class ApprovalRecordingAgent(RecordingAgent):
     def __init__(self):
         super().__init__()
         self.approvals = []
 
-    def respond_approval(self, *, run_id, choice, resolve_all=False):
-        payload = {"run_id": run_id, "choice": choice, "resolve_all": resolve_all}
+    def respond_approval(self, *, run_id, choice, resolve_all=False, approval_id=None):
+        payload = {
+            "run_id": run_id,
+            "choice": choice,
+            "resolve_all": resolve_all,
+            "approval_id": approval_id,
+        }
         self.approvals.append(payload)
         return {**payload, "resolved": 1}
 
@@ -134,7 +158,8 @@ class ProgressAgent:
         if progress_callback:
             progress_callback(
                 {
-                    "tool": "enterprise_kb_search",
+                    "event": "tool.started",
+                    "tool": "knowledge",
                     "emoji": "🔍",
                     "label": "VPN access policy",
                     "toolCallId": "call-1",
@@ -143,7 +168,8 @@ class ProgressAgent:
             )
             progress_callback(
                 {
-                    "tool": "enterprise_kb_search",
+                    "event": "tool.completed",
+                    "tool": "knowledge",
                     "toolCallId": "call-1",
                     "status": "completed",
                 }
@@ -217,6 +243,7 @@ class ToolBoundaryStreamingAgent:
         if progress_callback:
             progress_callback(
                 {
+                    "event": "tool.started",
                     "tool": "browser_vision",
                     "toolCallId": "call-1",
                     "status": "running",
@@ -279,47 +306,10 @@ class RecordingCommandRunner:
         return subprocess.CompletedProcess(cmd, 0)
 
 
-class FakeResponsesStream:
-    def __init__(self, events):
-        self.events = events
-        self.kwargs = None
-        self.closed = False
-
-    def create(self, **kwargs):
-        self.kwargs = kwargs
-        return self
-
-    def __iter__(self):
-        return iter(self.events)
-
-    def close(self):
-        self.closed = True
 
 
-class FakeCodexClient:
-    def __init__(self, events):
-        self.responses = FakeResponsesStream(events)
 
 
-class FakeCodexAgent:
-    _interrupt_requested = False
-
-    def __init__(self):
-        self.activity = []
-        self.deltas = []
-        self.reasoning = []
-
-    def _get_transport(self):
-        return SimpleNamespace(preflight_kwargs=lambda kwargs, allow_stream=False: kwargs)
-
-    def _touch_activity(self, message):
-        self.activity.append(message)
-
-    def _fire_stream_delta(self, delta):
-        self.deltas.append(delta)
-
-    def _fire_reasoning_delta(self, delta):
-        self.reasoning.append(delta)
 
 
 class FakeOAuthHTTPClient:
@@ -370,28 +360,6 @@ class FakeOAuthHTTPClient:
         return OAuthHTTPResponse(404, {}, "not found")
 
 
-class FakeHermesBridge:
-    def __init__(self):
-        self.catalog_calls = []
-
-    def available(self):
-        return True
-
-    def model_catalog(self, provider, *, force_refresh=False):
-        self.catalog_calls.append((provider, force_refresh))
-        if provider == "openai-codex":
-            return {
-                "provider": "openai-codex",
-                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
-                "default_model": "gpt-5.5",
-            }
-        if provider == "xai-oauth":
-            return {
-                "provider": "xai-oauth",
-                "models": ["grok-4.3", "grok-4.20-0309-reasoning"],
-                "default_model": "grok-4.3",
-            }
-        return {"provider": provider, "models": [], "default_model": ""}
 
 
 def make_config(tmp: Path) -> PlatformConfig:
@@ -403,43 +371,25 @@ def make_config(tmp: Path) -> PlatformConfig:
         token_secret="test-secret",
         token_ttl_seconds=3600,
         agent_tool_token="agent-token",
-        agent_mode="local",
-        hermes_api_url="http://127.0.0.1:8642/v1/chat/completions",
-        hermes_api_key="",
-        hermes_model="hermes-agent",
-        hermes_timeout_seconds=2,
         knowledge_backend="local",
         cognee_dataset="enterprise_knowledge",
         cognee_ingest_background=True,
         cognee_repo=tmp / "cognee",
-        hermes_repo=tmp / "hermes-agent",
         firecrawl_repo=tmp / "firecrawl",
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
-        hermes_home=tmp / "runtimes" / "hermes",
         runtime_startup_wait_seconds=0,
+        manage_agent_runtime=False,
+        agent_runtime_url="http://127.0.0.1:8766",
+        agent_runtime_token="runtime-token",
+        agent_runtime_home=tmp / "runtimes" / "agent",
+        agent_runtime_model="gpt-5.5",
+        agent_runtime_provider="openai-codex",
+        agent_runtime_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
 
 
-def make_fake_hermes_repo(path: Path) -> None:
-    (path / "hermes_cli").mkdir(parents=True, exist_ok=True)
-    (path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    (path / "hermes_cli" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
-    (path / "hermes_cli" / "secret_prompt.py").write_text("def masked_secret_prompt(*args, **kwargs): return ''\n", encoding="utf-8")
-    (path / "hermes_cli" / "config.py").write_text(
-        "DEFAULT_CONFIG = {\n"
-        "    'agent': {'max_turns': 90, 'api_max_retries': 3},\n"
-        "    'display': {'show_reasoning': False, 'streaming': True},\n"
-        "    'toolsets': ['hermes-cli'],\n"
-        "    'tool_output': {'max_bytes': 60000},\n"
-        "}\n",
-        encoding="utf-8",
-    )
-    (path / "pyproject.toml").write_text(
-        '[project]\nname = "hermes-agent-test"\nversion = "0.0.0"\n',
-        encoding="utf-8",
-    )
 
 
 def make_fake_cognee_repo(path: Path) -> None:
@@ -511,8 +461,6 @@ class FakeAutoUpdater:
         pass
 
 
-def managed_python(home: Path) -> Path:
-    return home / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
 
 
 class PlatformServiceTests(unittest.TestCase):
@@ -586,7 +534,6 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=agent,
-                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -638,7 +585,6 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
-                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -705,12 +651,13 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")
-                service._record_hermes_progress(
+                service._record_agent_progress(
                     "channel",
                     "1",
                     {
                         "event": "approval.request",
                         "run_id": "run_42",
+                        "approval_id": "approval_42",
                         "command": "rm -rf build",
                         "description": "recursive delete",
                         "choices": ["once", "session", "always", "deny"],
@@ -724,7 +671,15 @@ class PlatformServiceTests(unittest.TestCase):
 
                 result = service.respond_agent_approval(admin, "channel", "1", "session")
 
-                self.assertEqual(agent.approvals, [{"run_id": "run_42", "choice": "session", "resolve_all": False}])
+                self.assertEqual(
+                    agent.approvals,
+                    [{
+                        "run_id": "run_42",
+                        "choice": "session",
+                        "resolve_all": False,
+                        "approval_id": "approval_42",
+                    }],
+                )
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["agent_status"]["state"], "replying")
                 self.assertIsNone(result["agent_status"]["approval"])
@@ -732,749 +687,18 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_hermes_client_uses_post_tool_stream_as_final_response(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                events = [
-                    "data: "
-                    + json.dumps({"choices": [{"delta": {"content": "Now browser_vision call.\n\n"}}]})
-                    + "\n\n",
-                    (
-                        "event: hermes.tool.progress\n"
-                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
-                    ),
-                    (
-                        "event: hermes.tool.progress\n"
-                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'completed'})}\n\n"
-                    ),
-                    "data: " + json.dumps({"choices": [{"delta": {"content": "好了，这次成功了。"}}]}) + "\n\n",
-                    "data: [DONE]\n\n",
-                ]
-                for event in events:
-                    self.wfile.write(event.encode("utf-8"))
-                    self.wfile.flush()
 
-            def log_message(self, format, *args):
-                return
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                )
-                chunks = []
-                progress = []
-                client = HermesAgentClient(config, lambda name: "")
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="question",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                    progress_callback=progress.append,
-                    content_callback=chunks.append,
-                )
 
-                self.assertEqual(result.content, "好了，这次成功了。")
-                self.assertEqual(chunks, ["Now browser_vision call.\n\n", None, "好了，这次成功了。"])
-                self.assertEqual([event["status"] for event in progress], ["running", "completed"])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
 
-    def test_hermes_client_keeps_pre_tool_text_when_no_post_tool_response(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                events = [
-                    "data: "
-                    + json.dumps({"choices": [{"delta": {"content": "Here is the summary you asked for."}}]})
-                    + "\n\n",
-                    (
-                        "event: hermes.tool.progress\n"
-                        f"data: {json.dumps({'tool': 'browser_vision', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
-                    ),
-                    "data: [DONE]\n\n",
-                ]
-                for event in events:
-                    self.wfile.write(event.encode("utf-8"))
-                    self.wfile.flush()
 
-            def log_message(self, format, *args):
-                return
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                )
-                client = HermesAgentClient(config, lambda name: "")
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="question",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                    progress_callback=lambda event: None,
-                    content_callback=lambda chunk: None,
-                )
-                # Pre-tool prose is preserved instead of being lost (which used
-                # to raise "no final streaming response").
-                self.assertEqual(result.content, "Here is the summary you asked for.")
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
 
-    def test_hermes_runtime_patch_backfills_codex_stream_output_null(self):
-        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
-        spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_test", patch_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
 
-        terminal = SimpleNamespace(status="completed", output=None)
-        events = [
-            SimpleNamespace(type="response.output_text.delta", delta="O"),
-            SimpleNamespace(type="response.output_text.delta", delta="K"),
-            SimpleNamespace(type="response.completed", response=terminal),
-        ]
-        client = FakeCodexClient(events)
-        agent = FakeCodexAgent()
-        first_delta = []
 
-        result = module._run_raw_responses_stream(
-            agent,
-            {"model": "gpt-5.3-codex", "input": []},
-            client=client,
-            on_first_delta=lambda: first_delta.append(True),
-        )
 
-        self.assertEqual(agent.deltas, ["O", "K"])
-        self.assertEqual(first_delta, [True])
-        self.assertTrue(client.responses.closed)
-        self.assertEqual(client.responses.kwargs["stream"], True)
-        self.assertEqual(len(result.output), 1)
-        self.assertEqual(result.output[0].content[0].text, "OK")
 
-    def test_hermes_async_delegation_outbox_survives_adapter_restart_until_ack(self):
-        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
-        spec = importlib.util.spec_from_file_location("enterprise_async_outbox_patch_test", patch_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
 
-        class FakeAdapter:
-            def __init__(self):
-                pass
-
-            async def connect(self):
-                return None
-
-            async def _handle_runs(self, request):
-                return SimpleNamespace(status=202, body=b'{}')
-
-            def _check_auth(self, request):
-                return None
-
-        class FakeRunner:
-            async def _inject_watch_notification(self, synth_text, event):
-                return None
-
-        fake_api = types.ModuleType("gateway.platforms.api_server")
-        fake_api.APIServerAdapter = FakeAdapter
-        fake_api.web = SimpleNamespace(json_response=lambda payload, status=200: SimpleNamespace(body=payload, status=status))
-        fake_run = types.ModuleType("gateway.run")
-        fake_run.GatewayRunner = FakeRunner
-        fake_gateway = types.ModuleType("gateway")
-        fake_platforms = types.ModuleType("gateway.platforms")
-        fake_platforms.api_server = fake_api
-        fake_gateway.platforms = fake_platforms
-        fake_gateway.run = fake_run
-
-        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
-            sys.modules,
-            {
-                "gateway": fake_gateway,
-                "gateway.platforms": fake_platforms,
-                "gateway.platforms.api_server": fake_api,
-                "gateway.run": fake_run,
-            },
-        ), mock.patch.dict(os.environ, {"HERMES_HOME": td}):
-            module._install_api_async_delegation_patch()
-            first = FakeAdapter()
-            event = {
-                "type": "async_delegation",
-                "delegation_id": "durable-delegation",
-                "platform": "api_server",
-                "session_key": "private:1",
-                "parent_session_id": "session-1",
-                "status": "complete",
-            }
-            self.assertTrue(first.record_async_delegation_event(event))
-
-            restarted = FakeAdapter()
-            persisted = restarted._matching_async_events(prefixes=["private:"])
-            self.assertEqual([item["delegation_id"] for item in persisted], ["durable-delegation"])
-            event_id = persisted[0]["_enterprise_event_id"]
-            self.assertEqual(restarted._ack_async_events([event_id]), 1)
-            self.assertEqual(FakeAdapter()._matching_async_events(prefixes=["private:"]), [])
-
-    def test_hermes_runtime_patch_backfills_auxiliary_codex_stream_output_null(self):
-        patch_path = Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch" / "sitecustomize.py"
-        spec = importlib.util.spec_from_file_location("enterprise_hermes_runtime_patch_aux_test", patch_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        class FakeAuxiliaryResponses(FakeResponsesStream):
-            def stream(self, **kwargs):
-                raise TypeError("'NoneType' object is not iterable")
-
-        class FakeAuxiliaryClient:
-            def __init__(self, events):
-                self.responses = FakeAuxiliaryResponses(events)
-
-        class FakeAuxiliaryAdapter:
-            def __init__(self, client):
-                self._client = client
-
-            def create(self, **kwargs):
-                with self._client.responses.stream(**kwargs) as stream:
-                    for _event in stream:
-                        pass
-                    return stream.get_final_response()
-
-        fake_auxiliary = types.ModuleType("agent.auxiliary_client")
-        fake_auxiliary._CodexCompletionsAdapter = FakeAuxiliaryAdapter
-        fake_agent = types.ModuleType("agent")
-        fake_agent.auxiliary_client = fake_auxiliary
-        old_agent = sys.modules.get("agent")
-        old_auxiliary = sys.modules.get("agent.auxiliary_client")
-        sys.modules["agent"] = fake_agent
-        sys.modules["agent.auxiliary_client"] = fake_auxiliary
-        try:
-            module._install_auxiliary_response_stream_patch()
-
-            terminal = SimpleNamespace(status="completed", output=None)
-            client = FakeAuxiliaryClient([
-                SimpleNamespace(type="response.output_text.delta", delta="O"),
-                SimpleNamespace(type="response.output_text.delta", delta="K"),
-                SimpleNamespace(type="response.completed", response=terminal),
-            ])
-            result = FakeAuxiliaryAdapter(client).create(model="gpt-5.3-codex", input=[])
-        finally:
-            if old_agent is None:
-                sys.modules.pop("agent", None)
-            else:
-                sys.modules["agent"] = old_agent
-            if old_auxiliary is None:
-                sys.modules.pop("agent.auxiliary_client", None)
-            else:
-                sys.modules["agent.auxiliary_client"] = old_auxiliary
-
-        self.assertTrue(client.responses.closed)
-        self.assertEqual(client.responses.kwargs["stream"], True)
-        self.assertEqual(len(result.output), 1)
-        self.assertEqual(result.output[0].content[0].text, "OK")
-        with self.assertRaises(TypeError):
-            client.responses.stream()
-
-    def test_hermes_client_streams_tool_progress_events(self):
-        requests = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
-                requests.append({"headers": dict(self.headers), "body": body})
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("X-Hermes-Session-Id", "stream-session")
-                self.end_headers()
-                events = [
-                    (
-                        "event: hermes.tool.progress\n"
-                        f"data: {json.dumps({'tool': 'enterprise_kb_search', 'emoji': '🔍', 'label': 'VPN policy', 'toolCallId': 'call-1', 'status': 'running'})}\n\n"
-                    ),
-                    f"data: {json.dumps({'choices': [{'delta': {'role': 'assistant'}}]})}\n\n",
-                    f"data: {json.dumps({'choices': [{'delta': {'content': 'Found '}}]})}\n\n",
-                    (
-                        "event: hermes.tool.progress\n"
-                        f"data: {json.dumps({'tool': 'enterprise_kb_search', 'toolCallId': 'call-1', 'status': 'completed'})}\n\n"
-                    ),
-                    f"data: {json.dumps({'choices': [{'delta': {'content': 'policy.'}}]})}\n\n",
-                    "data: [DONE]\n\n",
-                ]
-                for event in events:
-                    self.wfile.write(event.encode("utf-8"))
-                    self.wfile.flush()
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                    hermes_api_key="test-key",
-                )
-                events = []
-                content_chunks = []
-                client = HermesAgentClient(config, lambda name: "")
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="question",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                    progress_callback=events.append,
-                    content_callback=content_chunks.append,
-                )
-
-                self.assertEqual(result.content, "Found policy.")
-                self.assertEqual(content_chunks, ["Found ", "policy."])
-                self.assertEqual(result.session_id, "stream-session")
-                self.assertEqual([event["status"] for event in events], ["running", "completed"])
-                self.assertEqual(events[0]["tool"], "enterprise_kb_search")
-                self.assertTrue(requests[-1]["body"]["stream"])
-                self.assertEqual(requests[-1]["headers"]["Authorization"], "Bearer test-key")
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_hermes_client_reads_run_events_and_posts_approval_response(self):
-        requests = []
-        approvals = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                if self.path == "/v1/runs":
-                    requests.append({"headers": dict(self.headers), "body": body})
-                    self.send_response(202)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"run_id": "run_1", "status": "started"}).encode("utf-8"))
-                    return
-                if self.path == "/v1/runs/run_1/approval":
-                    approvals.append({"headers": dict(self.headers), "body": body})
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(
-                        json.dumps(
-                            {
-                                "object": "hermes.run.approval_response",
-                                "run_id": "run_1",
-                                "choice": body.get("choice"),
-                                "resolved": 1,
-                            }
-                        ).encode("utf-8")
-                    )
-                    return
-                self.send_response(404)
-                self.end_headers()
-
-            def do_GET(self):
-                if self.path != "/v1/runs/run_1/events":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                events = [
-                    {"event": "message.delta", "run_id": "run_1", "delta": "Hello "},
-                    {
-                        "event": "approval.request",
-                        "run_id": "run_1",
-                        "command": "rm -rf build",
-                        "description": "recursive delete",
-                        "choices": ["once", "session", "always", "deny"],
-                    },
-                    {"event": "approval.responded", "run_id": "run_1", "choice": "once"},
-                    {"event": "message.delta", "run_id": "run_1", "delta": "world"},
-                    {
-                        "event": "run.completed",
-                        "run_id": "run_1",
-                        "session_id": "session-rotated",
-                        "output": "Hello world",
-                        "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
-                    },
-                ]
-                for event in events:
-                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                    hermes_api_key="test-key",
-                )
-                progress = []
-                chunks = []
-                class RuntimeManager:
-                    def hermes_runtime_config(self):
-                        return {
-                            "manage_hermes": True,
-                            "model": config.hermes_model,
-                            # Even an explicitly enabled relay must not bypass
-                            # the Runs API's structured approval contract.
-                            "relay": {"enabled": True},
-                        }
-
-                    def ensure_hermes_ready(self, *, wait=True):
-                        return SimpleNamespace(available=True)
-
-                client = AutoAgentClient(config, lambda name: "", runtime_manager=RuntimeManager())
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="question",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                    progress_callback=progress.append,
-                    content_callback=chunks.append,
-                )
-                response = client.respond_approval(run_id="run_1", choice="always", resolve_all=True)
-                unstreamed_result = client.generate(
-                    system_prompt="system",
-                    user_message="question without callbacks",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                )
-
-                self.assertEqual(result.content, "Hello world")
-                self.assertEqual(result.session_id, "session-rotated")
-                self.assertEqual(unstreamed_result.raw["mode"], "runs")
-                self.assertEqual(chunks, ["Hello ", "world"])
-                self.assertEqual([event["event"] for event in progress], ["approval.request", "approval.responded"])
-                self.assertEqual(result.raw["mode"], "runs")
-                self.assertEqual(result.raw["usage"]["total_tokens"], 3)
-                self.assertEqual(requests[0]["body"]["input"][0]["content"], "question")
-                self.assertEqual(requests[0]["body"]["instructions"], "system")
-                self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Id"], "session-1")
-                self.assertEqual(requests[0]["headers"]["X-Hermes-Session-Key"], "channel:1:main-agent")
-                self.assertEqual(requests[1]["body"]["input"][0]["content"], "question without callbacks")
-                self.assertEqual(approvals[0]["body"], {"choice": "always", "all": True})
-                self.assertEqual(response["resolved"], 1)
-                self.assertTrue(client.hermes.require_runs)
-                self.assertFalse(client.relay_connector._started)
-                client.close()
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_hermes_client_consumes_async_delegation_events(self):
-        requests = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                requests.append({"path": self.path, "headers": dict(self.headers)})
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                if query.get("ack_id"):
-                    self.wfile.write(
-                        json.dumps({"object": "hermes.async_delegations", "acked": len(query["ack_id"]), "events": []}).encode("utf-8")
-                    )
-                    return
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "object": "hermes.async_delegations",
-                            "count": 1,
-                            "events": [
-                                {
-                                    "type": "async_delegation",
-                                    "delegation_id": "deleg_1",
-                                    "session_key": "channel:1:main-agent",
-                                    "status": "error",
-                                    "error": "API call failed after 3 retries",
-                                }
-                            ],
-                        }
-                    ).encode("utf-8")
-                )
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                    hermes_api_key="test-key",
-                )
-                client = HermesAgentClient(config, lambda name: "")
-                events = client.consume_async_delegations(session_key_prefixes=["channel:", "private:"])
-                acked = client.ack_async_delegations(["deleg_1"])
-
-                self.assertEqual(events[0]["delegation_id"], "deleg_1")
-                self.assertEqual(acked, 1)
-                self.assertIn("/api/async-delegations?", requests[-2]["path"])
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-2]["path"]).query)
-                self.assertEqual(parsed["consume"], ["0"])
-                self.assertEqual(parsed["session_key_prefix"], ["channel:", "private:"])
-                self.assertEqual(requests[-2]["headers"]["Authorization"], "Bearer test-key")
-                ack_query = urllib.parse.parse_qs(urllib.parse.urlparse(requests[-1]["path"]).query)
-                self.assertEqual(ack_query["ack_id"], ["deleg_1"])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_auto_agent_refuses_degraded_managed_hermes_before_api_call(self):
-        class DegradedRuntime:
-            def hermes_runtime_config(self):
-                return {"manage_hermes": True}
-
-            def ensure_hermes_ready(self, *, wait=True):
-                return SimpleNamespace(
-                    available=False,
-                    state="degraded",
-                    error="required runtime patch failed",
-                )
-
-        with tempfile.TemporaryDirectory() as td:
-            config = replace(make_config(Path(td)), agent_mode="hermes")
-            client = AutoAgentClient(config, lambda name: "", runtime_manager=DegradedRuntime())
-            with mock.patch.object(client.hermes, "generate") as generate:
-                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
-                    client.generate(
-                        system_prompt="system",
-                        user_message="question",
-                        history=[],
-                        session_id="session-1",
-                        session_key="private:1",
-                    )
-                generate.assert_not_called()
-            with mock.patch.object(client.hermes, "respond_approval") as approval:
-                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
-                    client.respond_approval(run_id="run_1", choice="deny")
-                approval.assert_not_called()
-            with mock.patch.object(client.hermes, "consume_async_delegations") as consume:
-                with self.assertRaisesRegex(RuntimeError, "required runtime patch failed"):
-                    client.consume_async_delegations(session_key_prefixes=["private:"])
-                consume.assert_not_called()
-
-    def test_hermes_client_streams_responses_api_output_text_events(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                events = [
-                    f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': '看到了'})}\n\n",
-                    f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': '图片。'})}\n\n",
-                    "data: [DONE]\n\n",
-                ]
-                for event in events:
-                    self.wfile.write(event.encode("utf-8"))
-                    self.wfile.flush()
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                config = replace(
-                    make_config(Path(td)),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                )
-                chunks = []
-                client = HermesAgentClient(config, lambda name: "")
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="question",
-                    history=[],
-                    session_id="session-1",
-                    session_key="channel:1:main-agent",
-                    content_callback=chunks.append,
-                )
-
-                self.assertEqual(result.content, "看到了图片。")
-                self.assertEqual(chunks, ["看到了", "图片。"])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_auto_agent_falls_back_instead_of_saving_empty_hermes_response(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                service = EnterpriseService(
-                    replace(
-                        make_config(Path(td)),
-                        agent_mode="auto",
-                        hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                    )
-                )
-                try:
-                    _, user = service.authenticate("admin", "admin")
-                    service.send_channel_message(user, 1, "@agent hello")
-                    service.wait_for_agent_idle("channel", "1")
-                    messages = service.list_messages(user, "channel", "1")
-
-                    self.assertNotIn("(agent returned an empty response)", messages[-1]["content"])
-                    self.assertIn("Hermes Agent request did not complete", messages[-1]["content"])
-                    self.assertTrue(messages[-1]["metadata"]["degraded"])
-                finally:
-                    service.close()
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_hermes_client_sends_image_attachments_as_multimodal_content(self):
-        requests = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
-                requests.append(body)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps({"choices": [{"message": {"content": "saw image"}}]}).encode("utf-8")
-                )
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                tmp = Path(td)
-                image_path = tmp / "image.png"
-                image_path.write_bytes(b"\x89PNG\r\n\x1a\nimage-bytes")
-                config = replace(
-                    make_config(tmp),
-                    agent_mode="hermes",
-                    hermes_api_url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
-                    hermes_api_key="test-key",
-                )
-                client = HermesAgentClient(config, lambda name: "")
-                result = client.generate(
-                    system_prompt="system",
-                    user_message="look at this\n\n[User attached image: image.png (image/png, 19 B); local path: /tmp/image.png]",
-                    history=[],
-                    session_id="session-1",
-                    session_key="private:1",
-                    attachments=[
-                        {
-                            "filename": "image.png",
-                            "mime_type": "image/png",
-                            "is_image": True,
-                            "local_path": str(image_path),
-                            "size_bytes": image_path.stat().st_size,
-                        }
-                    ],
-                )
-
-                self.assertEqual(result.content, "saw image")
-                content = requests[-1]["messages"][-1]["content"]
-                self.assertIsInstance(content, list)
-                self.assertEqual(content[0]["type"], "text")
-                self.assertEqual(content[1]["type"], "image_url")
-                self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-
-    def test_default_repo_paths_support_whole_checkout_startup(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "hermes-agent").mkdir()
-            (root / "cognee").mkdir()
-            (root / "enterprise-agent-platform").mkdir()
-            old_env = {key: os.environ.get(key) for key in ("ENTERPRISE_HERMES_REPO", "ENTERPRISE_COGNEE_REPO")}
-            for key in old_env:
-                os.environ.pop(key, None)
-            try:
-                root_config = PlatformConfig.from_env(root)
-                platform_config = PlatformConfig.from_env(root / "enterprise-agent-platform")
-                self.assertEqual(root_config.hermes_repo, root / "hermes-agent")
-                self.assertEqual(root_config.cognee_repo, root / "cognee")
-                self.assertEqual(platform_config.hermes_repo, root / "hermes-agent")
-                self.assertEqual(platform_config.cognee_repo, root / "cognee")
-            finally:
-                for key, value in old_env.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
 
     def test_existing_admin_rows_migrate_to_admin_permission_group(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1514,100 +738,8 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_async_delegation_failure_event_is_persisted_once(self):
-        with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
-            try:
-                scope = service._channel_agent_scope("1")
-                event = {
-                    "type": "async_delegation",
-                    "delegation_id": "deleg_failed",
-                    "session_key": "channel:1:main-agent",
-                    "parent_session_id": scope.session_id,
-                    "goal": "整理整轨专辑",
-                    "status": "error",
-                    "error": "API call failed after 3 retries",
-                    "duration_seconds": 448.2,
-                }
-                service._handle_async_delegation_event(event)
-                service._handle_async_delegation_event(dict(event))
 
-                rows = service.db.query(
-                    "SELECT content, metadata_json FROM messages WHERE scope_type = 'channel' AND scope_id = '1' AND author_type = 'agent'"
-                )
-                self.assertEqual(len(rows), 1)
-                self.assertIn("后台子代理任务失败", rows[0]["content"])
-                self.assertIn("API call failed after 3 retries", rows[0]["content"])
-                metadata = json.loads(rows[0]["metadata_json"])
-                self.assertEqual(metadata["async_delegation_id"], "deleg_failed")
-                self.assertTrue(metadata["async_delegation"]["failed"])
-            finally:
-                service.close()
 
-    def test_async_delegation_from_cleared_or_inactive_scope_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                old_channel_scope = service._channel_agent_scope("1")
-                service.clear_channel_messages(admin, 1)
-                service._handle_async_delegation_event(
-                    {
-                        "delegation_id": "stale-channel",
-                        "session_key": "channel:1:main-agent",
-                        "parent_session_id": old_channel_scope.session_id,
-                        "status": "complete",
-                    }
-                )
-
-                user = service.create_user(
-                    username="delegation-user",
-                    password="delegation-pass",
-                    display_name="Delegation User",
-                    permission_group="member",
-                    actor=admin,
-                )
-                private_scope = service.agent_scopes.ensure_private_scope(user["id"])
-                service.deactivate_user(admin, user["id"])
-                service._handle_async_delegation_event(
-                    {
-                        "delegation_id": "inactive-private",
-                        "session_key": f"private:{user['id']}",
-                        "parent_session_id": private_scope.session_id,
-                        "status": "complete",
-                    }
-                )
-
-                self.assertFalse(
-                    service.db.scalar(
-                        "SELECT 1 FROM messages WHERE metadata_json LIKE '%stale-channel%' OR metadata_json LIKE '%inactive-private%'"
-                    )
-                )
-            finally:
-                service.close()
-
-    def test_async_delegation_accepts_parent_session_before_compression_rotation(self):
-        with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
-            try:
-                scope = service._channel_agent_scope("1")
-                service.agent_scopes.update_session_id(scope.scope_key, "compressed-child-session")
-                service._handle_async_delegation_event(
-                    {
-                        "delegation_id": "pre-compression-child",
-                        "session_key": "channel:1:main-agent",
-                        "parent_session_id": scope.session_id,
-                        "status": "complete",
-                        "summary": "background work survived compression",
-                    }
-                )
-                row = service.db.query_one(
-                    "SELECT content FROM messages WHERE metadata_json LIKE '%pre-compression-child%'"
-                )
-                self.assertIsNotNone(row)
-                self.assertIn("survived compression", row["content"])
-            finally:
-                service.close()
 
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1641,11 +773,25 @@ class PlatformServiceTests(unittest.TestCase):
             agent_message = messages[-1]
 
             self.assertEqual(agent_message["username"], "Main Agent")
-            self.assertEqual(agent.calls[-1]["session_id"], "enterprise-channel-1-main-agent")
+            self.assertEqual(agent.calls[-1]["session_id"], "ubitech-channel-1-main-agent")
             self.assertEqual(agent.calls[-1]["session_key"], "channel:1:main-agent")
             self.assertEqual(agent.calls[-1]["user_message"], "Administrator: What is the VPN access policy?")
-            self.assertEqual(agent.calls[-1]["history"], [])
-            self.assertIn("enterprise_kb_search", agent.calls[-1]["system_prompt"])
+            self.assertEqual(
+                agent.calls[-1]["history"],
+                [
+                    {
+                        "role": "user",
+                        "content": "VPN onboarding starts in the general channel.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "I need device posture details before Friday.",
+                    },
+                ],
+            )
+            self.assertIn("知识库已通过 knowledge 工具提供", agent.calls[-1]["system_prompt"])
+            self.assertIn("使用 search 操作检索", agent.calls[-1]["system_prompt"])
+            self.assertIn("使用 read 操作读取完整条目", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
             workspace = Path(agent.calls[-1]["metadata"]["workspace"]["path"])
             self.assertTrue(workspace.is_dir())
@@ -1654,15 +800,15 @@ class PlatformServiceTests(unittest.TestCase):
             work = agent_message["metadata"]["agent_work"]
             self.assertEqual(work["state"], "complete")
             self.assertEqual(work["run_id"], f"channel:1:{result['user_message']['id']}")
-            hermes_activity = [item for item in work["activity"] if item.get("source") == "hermes"]
-            self.assertEqual(len(hermes_activity), 1)
-            self.assertEqual(hermes_activity[0]["line"], '🔍 enterprise_kb_search: "VPN access policy"')
-            self.assertEqual(hermes_activity[0]["tool_status"], "completed")
+            agent_activity = [item for item in work["activity"] if item.get("source") == "agent"]
+            self.assertEqual(len(agent_activity), 1)
+            self.assertEqual(agent_activity[0]["line"], '🔍 knowledge: "VPN access policy"')
+            self.assertEqual(agent_activity[0]["tool_status"], "completed")
             service.close()
 
-    def test_channel_reuses_hermes_returned_session_after_rotation(self):
+    def test_channel_reuses_runtime_returned_session_after_rotation(self):
         with tempfile.TemporaryDirectory() as td:
-            agent = RotatingSessionAgent("compressed-channel-session")
+            agent = RotatingSessionAgent("compacted-channel-session")
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, user = service.authenticate("admin", "admin")
@@ -1671,13 +817,27 @@ class PlatformServiceTests(unittest.TestCase):
                 service.send_channel_message(user, 1, "@agent second")
                 service.wait_for_agent_idle("channel", "1")
 
-                self.assertEqual(agent.calls[0]["session_id"], "enterprise-channel-1-main-agent")
-                self.assertEqual(agent.calls[1]["session_id"], "compressed-channel-session")
+                self.assertEqual(agent.calls[0]["session_id"], "ubitech-channel-1-main-agent")
+                self.assertEqual(agent.calls[1]["session_id"], "compacted-channel-session")
                 self.assertEqual(agent.calls[0]["history"], [])
-                self.assertEqual(agent.calls[1]["history"], [])
+                self.assertEqual(
+                    agent.calls[1]["history"],
+                    [
+                        {"role": "user", "content": "@agent first"},
+                        {
+                            "role": "assistant",
+                            "content": "agent response to Administrator: first",
+                        },
+                    ],
+                )
                 self.assertEqual(agent.calls[1]["session_key"], "channel:1:main-agent")
+                self.assertEqual(
+                    service.agent_scopes.get_scope("channel:1:main-agent").session_id,
+                    "compacted-channel-session",
+                )
             finally:
                 service.close()
+
 
     def test_channel_agent_reply_exposes_streaming_content_while_running(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2412,7 +1572,7 @@ class PlatformServiceTests(unittest.TestCase):
                 status = service.agent_status(user, "channel", "1")
                 self.assertEqual(status["state"], "replying")
                 self.assertEqual(status["replying_to"]["username"], "Administrator")
-                self.assertEqual(status["current_step"], "等待 Hermes Agent 运行过程")
+                self.assertEqual(status["current_step"], "等待 Agent 运行过程")
                 self.assertIn("replying", [item["stage"] for item in status["activity"]])
                 self.assertEqual(service.list_messages(user, "channel", "1")[-1]["content"], "@agent slow question")
 
@@ -2505,11 +1665,39 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(execution["isolation"], "logical")
             self.assertEqual(execution["scope_key"], "private:1")
             self.assertTrue(Path(execution["workspace_path"]).exists())
-            self.assertIsNone(status["container"])
-            self.assertEqual(agent.calls[-1]["session_id"], "enterprise-private-u1")
+            self.assertNotIn("container", status)
+            self.assertEqual(agent.calls[-1]["session_id"], "ubitech-private-u1")
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
             self.assertNotIn("container", agent.calls[-1]["metadata"])
             service.close()
+
+    def test_private_reuses_runtime_returned_session_after_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RotatingSessionAgent("compacted-private-session")
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                service.wait_for_agent_idle("private", str(user["id"]))
+                service.send_private_message(user, "second")
+                service.wait_for_agent_idle("private", str(user["id"]))
+
+                self.assertEqual(agent.calls[0]["session_id"], "ubitech-private-u1")
+                self.assertEqual(agent.calls[1]["session_id"], "compacted-private-session")
+                self.assertEqual(agent.calls[0]["history"], [])
+                self.assertEqual(
+                    agent.calls[1]["history"],
+                    [
+                        {"role": "user", "content": "first"},
+                        {"role": "assistant", "content": "agent response to first"},
+                    ],
+                )
+                self.assertEqual(
+                    service.private_status(user)["execution"]["session_id"],
+                    "compacted-private-session",
+                )
+            finally:
+                service.close()
 
     def test_private_agent_accepts_file_only_message_and_passes_file_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2566,6 +1754,39 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_agent_memory_clear_removes_only_the_disposable_child_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                parent = service.agent_scopes.ensure_private_scope(admin["id"])
+                child_scope = f"{parent.scope_key}/delegate/test-child"
+                service.agent_memory_mutate({
+                    "scope_key": parent.scope_key,
+                    "action": "add",
+                    "content": "keep parent memory",
+                })
+                service.agent_memory_mutate({
+                    "scope_key": child_scope,
+                    "action": "add",
+                    "content": "discard child memory",
+                })
+
+                cleared = service.agent_memory_mutate({
+                    "scope_key": child_scope,
+                    "action": "clear",
+                })
+
+                self.assertEqual(cleared["changed"], [{"action": "clear", "deleted": 1}])
+                self.assertEqual(cleared["memories"], [])
+                parent_memories = service.agent_memory_search({"scope_key": parent.scope_key})
+                self.assertEqual(
+                    [memory["content"] for memory in parent_memories["memories"]],
+                    ["keep parent memory"],
+                )
+            finally:
+                service.close()
+
     def test_agent_media_tags_are_saved_as_returned_attachments(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as media_td:
             tmp = Path(td)
@@ -2574,7 +1795,7 @@ class PlatformServiceTests(unittest.TestCase):
             # exfiltrate arbitrary readable temp files via MEDIA: tags). An
             # operator allow-lists this generated-media directory explicitly via
             # ENTERPRISE_MEDIA_ROOTS, the documented escape hatch alongside the
-            # managed Hermes scratch dirs that are trusted by default.
+            # managed Agent runtime directories that are trusted by default.
             media_path = Path(media_td) / "result.csv"
             media_path.write_text("a,b\n1,2\n", encoding="utf-8")
             agent = MediaReturningAgent(media_path)
@@ -2592,6 +1813,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(agent_message["attachments"][0]["filename"], "result.csv")
                 attachment, stored_path = service.get_attachment_file(user, agent_message["attachments"][0]["id"])
                 self.assertEqual(attachment["mime_type"], "text/csv")
+                source = service.db.query_one(
+                    "SELECT source FROM attachments WHERE id = ?",
+                    (agent_message["attachments"][0]["id"],),
+                )
+                self.assertEqual(source["source"], "agent_generated")
                 self.assertEqual(stored_path.read_text(encoding="utf-8"), "a,b\n1,2\n")
             finally:
                 service.close()
@@ -2698,32 +1924,14 @@ class PlatformServiceTests(unittest.TestCase):
             service.send_channel_message(member, 1, "@agent member asks")
             service.wait_for_agent_idle("channel", "1")
             channel_sessions = [call["session_id"] for call in agent.calls[-2:]]
-            self.assertEqual(channel_sessions, ["enterprise-channel-1-main-agent", "enterprise-channel-1-main-agent"])
+            self.assertEqual(channel_sessions, ["ubitech-channel-1-main-agent", "ubitech-channel-1-main-agent"])
 
             service.send_private_message(member, "private task")
             service.wait_for_agent_idle("private", str(member["id"]))
-            self.assertEqual(service.private_status(member)["execution"]["session_id"], "enterprise-private-u2")
+            self.assertEqual(service.private_status(member)["execution"]["session_id"], "ubitech-private-u2")
             self.assertEqual(service.model_secret_env(), {})
             service.close()
 
-    def test_private_reuses_hermes_returned_session_after_rotation(self):
-        with tempfile.TemporaryDirectory() as td:
-            agent = RotatingSessionAgent("compressed-private-session")
-            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
-            try:
-                _, user = service.authenticate("admin", "admin")
-                service.send_private_message(user, "first")
-                service.wait_for_agent_idle("private", str(user["id"]))
-                service.send_private_message(user, "second")
-                service.wait_for_agent_idle("private", str(user["id"]))
-
-                self.assertEqual(agent.calls[0]["session_id"], "enterprise-private-u1")
-                self.assertEqual(agent.calls[1]["session_id"], "compressed-private-session")
-                self.assertEqual(agent.calls[0]["history"], [])
-                self.assertEqual(agent.calls[1]["history"], [])
-                self.assertEqual(service.private_status(user)["execution"]["session_id"], "compressed-private-session")
-            finally:
-                service.close()
 
     def test_admin_can_delete_channel_messages_by_id_before_time_and_clear(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2880,6 +2088,7 @@ class PlatformServiceTests(unittest.TestCase):
     def test_clear_private_conversation_cancels_inflight_reply_and_rotates_session(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()
+            agent.cleanup_scope = mock.Mock(return_value={"cancelled": 1})
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -2894,6 +2103,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIsNotNone(after)
                 self.assertNotEqual(after.session_id, before.session_id)
                 self.assertEqual(after.workspace_path, before.workspace_path)
+                agent.cleanup_scope.assert_called_once_with(
+                    before.scope_key,
+                    lifecycle_id=before.lifecycle_id,
+                    delete_sessions=True,
+                )
 
                 agent.release.set()
                 service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
@@ -3131,7 +2345,7 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_admin_can_manage_account_permissions_and_model_policy(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 user = service.create_user(
@@ -3172,7 +2386,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(updated["thinking_depth"], "high")
 
                 with self.assertRaises(ServiceError) as model_error:
-                    service.update_user(admin, user["id"], {"model_name": "not-from-hermes"})
+                    service.update_user(admin, user["id"], {"model_name": "not-in-catalog"})
                 self.assertEqual(model_error.exception.status, 400)
 
                 _, member_actor = service.authenticate("alice", "alice-pass")
@@ -3282,7 +2496,7 @@ class PlatformServiceTests(unittest.TestCase):
     def test_account_model_and_thinking_depth_are_used_for_agent_calls(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
-            service = EnterpriseService(make_config(Path(td)), agent_client=agent, hermes_bridge=FakeHermesBridge())
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.create_user(
@@ -3312,10 +2526,10 @@ class PlatformServiceTests(unittest.TestCase):
     def test_generation_falls_back_when_system_model_is_stale(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
-            service = EnterpriseService(make_config(Path(td)), agent_client=agent, hermes_bridge=FakeHermesBridge())
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")
-                service.set_setting(runtime_module.HERMES_SETTING_MODEL, "gpt-5.3-codex")
+                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.3-codex")
 
                 result = service.send_private_message(admin, "draft a plan")
                 self.assertIsNone(result["agent_message"])
@@ -3329,7 +2543,7 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_admin_can_update_own_model_without_invalidating_session(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 token, admin = service.authenticate("admin", "admin")
                 updated = service.update_user(
@@ -3395,6 +2609,40 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_legacy_runtime_settings_are_copied_once_without_overwriting_agent_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                first.set_setting("hermes_provider", "xai-oauth")
+                first.set_setting("hermes_model", "grok-4.3")
+                first.set_setting("hermes_timeout_seconds", "321")
+                first.db.execute(
+                    "DELETE FROM settings WHERE key IN (?, ?, ?)",
+                    (AGENT_SETTING_PROVIDER, AGENT_SETTING_MODEL, AGENT_SETTING_TIMEOUT),
+                )
+            finally:
+                first.close()
+
+            migrated = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                self.assertEqual(migrated.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
+                self.assertEqual(migrated.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
+                self.assertEqual(migrated.get_setting(AGENT_SETTING_TIMEOUT), "321")
+                migrated.set_setting("hermes_model", "stale-legacy-model")
+                migrated.set_setting(AGENT_SETTING_MODEL, "grok-4.20-0309-reasoning")
+            finally:
+                migrated.close()
+
+            reopened = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                self.assertEqual(
+                    reopened.get_setting(AGENT_SETTING_MODEL),
+                    "grok-4.20-0309-reasoning",
+                )
+            finally:
+                reopened.close()
+
     def test_agent_tool_token_protects_knowledge_endpoints(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -3406,108 +2654,17 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(service.get_knowledge_document(doc["id"])["title"], "Runbook")
             service.close()
 
-    def test_platform_prepares_managed_hermes_and_cognee_without_manual_install(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            make_fake_cognee_repo(tmp / "cognee")
-            make_fake_firecrawl_repo(tmp / "firecrawl")
-            runner = RecordingCommandRunner()
-            config = make_config(tmp)
-            service = EnterpriseService(config, agent_client=RecordingAgent(), runtime_command_runner=runner)
-            try:
-                hermes_home = service.config.managed_hermes_home
-                self.assertTrue((hermes_home / "plugins" / "enterprise_kb" / "plugin.yaml").exists())
-                config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
-                env_text = (hermes_home / ".env").read_text(encoding="utf-8")
 
-                self.assertIn("enterprise-kb", config_text)
-                self.assertIn("backend: firecrawl", config_text)
-                self.assertIn("cloud_provider: local", config_text)
-                self.assertIn("managed_persistence: true", config_text)
-                self.assertIn('API_SERVER_ENABLED="true"', env_text)
-                self.assertIn('ENTERPRISE_AGENT_TOOL_TOKEN="agent-token"', env_text)
-                self.assertIn("API_SERVER_KEY=", env_text)
-                self.assertIn(f'CAMOFOX_URL="{config.camofox_url}"', env_text)
-                self.assertIn(f'FIRECRAWL_API_URL="{config.firecrawl_api_url}"', env_text)
-
-                _, admin = service.authenticate("admin", "admin")
-                status = service.runtime_status(admin)
-                self.assertEqual(status["hermes"]["managed"], True)
-                self.assertEqual(status["hermes"]["install_state"], "installed")
-                self.assertEqual(status["cognee"]["managed"], True)
-                self.assertEqual(status["cognee"]["state"], "prepared")
-                self.assertEqual(status["camofox"]["managed"], True)
-                self.assertEqual(status["camofox"]["url"], config.camofox_url)
-                self.assertEqual(status["firecrawl"]["managed"], True)
-                self.assertEqual(status["firecrawl"]["url"], config.firecrawl_api_url)
-                # Managed Firecrawl secrets are written under the platform data
-                # dir (firecrawl_runtime_dir) rather than into the submodule tree,
-                # so runtime secrets never land in the repo working copy.
-                firecrawl_env_text = (config.firecrawl_runtime_dir / ".env").read_text(encoding="utf-8")
-                self.assertIn('PORT="127.0.0.1:13002"', firecrawl_env_text)
-                self.assertIn('HOST="0.0.0.0"', firecrawl_env_text)
-                self.assertIn('USE_DB_AUTHENTICATION="false"', firecrawl_env_text)
-                self.assertIn('BULL_AUTH_KEY=', firecrawl_env_text)
-                install_commands = [call["cmd"] for call in runner.calls]
-                runtime_source = hermes_home / "source" / "hermes-agent"
-                self.assertTrue(runtime_source.exists())
-                self.assertTrue((hermes_home / "source" / "source.json").exists())
-                self.assertFalse((tmp / "hermes-agent" / "source.json").exists())
-                self.assertIn(
-                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
-                    install_commands,
-                )
-            finally:
-                service.close()
-
-    def test_auto_agent_starts_managed_hermes_before_local_fallback(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            config = replace(
-                make_config(tmp),
-                agent_mode="auto",
-                hermes_api_url="http://127.0.0.1:9/v1/chat/completions",
-                hermes_timeout_seconds=0.2,
-                runtime_startup_wait_seconds=0,
-            )
-            launcher = RecordingLauncher()
-            runner = RecordingCommandRunner()
-            service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
-            try:
-                _, user = service.authenticate("admin", "admin")
-                result = service.send_channel_message(user, 1, "@agent hello")
-                self.assertIsNone(result["agent_message"])
-                service.wait_for_agent_idle("channel", "1", timeout=10)
-                agent_message = service.list_messages(user, "channel", "1")[-1]
-
-                self.assertTrue(launcher.calls)
-                launch = next(call for call in launcher.calls if "gateway" in call["cmd"])
-                runtime_source = config.managed_hermes_home / "source" / "hermes-agent"
-                self.assertEqual(launch["cwd"], runtime_source)
-                self.assertEqual(launch["cmd"][0], str(managed_python(config.managed_hermes_home / "venv")))
-                self.assertIn("gateway", launch["cmd"])
-                self.assertEqual(launch["env"]["HERMES_HOME"], str(config.managed_hermes_home))
-                self.assertEqual(launch["env"]["API_SERVER_ENABLED"], "true")
-                self.assertEqual(launch["env"]["ENTERPRISE_AGENT_TOOL_TOKEN"], "agent-token")
-                self.assertEqual(launch["env"]["CAMOFOX_URL"], config.camofox_url)
-                self.assertEqual(launch["env"]["FIRECRAWL_API_URL"], config.firecrawl_api_url)
-                python_path = launch["env"]["PYTHONPATH"].split(os.pathsep)
-                patch_path = str(Path(runtime_module.__file__).resolve().parent / "hermes_runtime_patch")
-                self.assertEqual(python_path[0], patch_path)
-                self.assertEqual(python_path[1], str(runtime_source))
-                self.assertTrue(agent_message["metadata"]["degraded"])
-                self.assertIn("Hermes Agent request did not complete", agent_message["content"])
-            finally:
-                service.close()
 
     def test_platform_manages_browser_and_firecrawl_process_lifecycle(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
             make_fake_firecrawl_repo(tmp / "firecrawl")
-            config = replace(make_config(tmp), agent_mode="auto", runtime_startup_wait_seconds=0)
+            config = replace(
+                make_config(tmp),
+                manage_agent_runtime=False,
+                runtime_startup_wait_seconds=0,
+            )
             launcher = RecordingLauncher()
             runner = RecordingCommandRunner()
             service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
@@ -3520,7 +2677,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(any("@askjo/camofox-browser@1.11.2" in cmd for cmd in commands))
                 self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
                 firecrawl_launch = next(call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"])
-                override_path = config.firecrawl_runtime_dir / "docker-compose.enterprise.yaml"
+                override_path = config.firecrawl_runtime_dir / "docker-compose.ubitech.yaml"
                 self.assertIn("docker-compose.yml", firecrawl_launch["cmd"])
                 self.assertIn(str(override_path), firecrawl_launch["cmd"])
                 self.assertIn("--no-build", firecrawl_launch["cmd"])
@@ -3544,260 +2701,30 @@ class PlatformServiceTests(unittest.TestCase):
 
             self.assertTrue(all(not process.running for process in launcher.processes))
 
-    def test_first_run_installs_hermes_from_managed_patched_source_copy(self):
+    def test_agent_tool_token_rotation_refreshes_owned_runtime_client(self):
         with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            runner = RecordingCommandRunner()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
-            try:
-                hermes_home = service.config.managed_hermes_home
-                runtime_source = hermes_home / "source" / "hermes-agent"
-                self.assertTrue((hermes_home / "install.json").exists())
-                self.assertTrue(runtime_source.exists())
-                self.assertEqual(runner.calls[0]["cmd"][:3], [sys.executable, "-m", "venv"])
-                self.assertEqual(runner.calls[0]["cmd"][3], str(hermes_home / "venv"))
-                self.assertEqual(
-                    runner.calls[1]["cmd"],
-                    [str(managed_python(hermes_home / "venv")), "-m", "pip", "install", "-e", str(runtime_source)],
-                )
-                self.assertEqual(len(runner.calls), 2)
-                self.assertFalse(any("websockets" in " ".join(call["cmd"]) for call in runner.calls))
-                _, admin = service.authenticate("admin", "admin")
-                status = service.runtime_status(admin)["hermes"]
-                self.assertEqual(status["install_state"], "installed")
-                self.assertEqual(status["source"], f"{runtime_source} (patched from {tmp / 'hermes-agent'})")
-            finally:
-                service.close()
-
-    def test_hermes_relay_connector_uses_notify_as_final_reply_marker(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            connector = HermesRelayConnector(make_config(tmp))
-            progress_events = []
-            content_deltas = []
-            turn = connector._build_turn(
-                system_prompt="system",
-                user_message="hello",
-                session_id="enterprise-private-u1",
-                session_key="private:1",
-                metadata={"actor": {"id": 1, "display_name": "Ada"}},
-                attachments=[],
-                model="gpt-5.4",
-                reasoning_config={"enabled": True, "effort": "low"},
-                progress_callback=progress_events.append,
-                content_callback=content_deltas.append,
-            )
-            with connector._turn_lock:
-                connector._turns_by_chat[turn.chat_id] = turn
-                connector._turns_by_id[turn.turn_id] = turn
-            try:
-                progress_result = connector._handle_outbound_action(
-                    {
-                        "op": "send",
-                        "chat_id": turn.chat_id,
-                        "content": "working",
-                        "metadata": {"enterprise_turn_id": turn.turn_id},
-                    }
-                )
-                self.assertTrue(progress_result["success"])
-                self.assertFalse(turn.done.is_set())
-                self.assertEqual(progress_events[-1]["event"], "relay.message")
-                self.assertEqual(content_deltas, [])
-
-                final_result = connector._handle_outbound_action(
-                    {
-                        "op": "send",
-                        "chat_id": turn.chat_id,
-                        "content": "final answer",
-                        "metadata": {"notify": True, "enterprise_turn_id": turn.turn_id},
-                    }
-                )
-                self.assertTrue(final_result["success"])
-                self.assertTrue(turn.done.is_set())
-                self.assertEqual(turn.content, "final answer")
-                self.assertEqual(content_deltas, ["final answer"])
-            finally:
-                with connector._turn_lock:
-                    connector._turns_by_chat.clear()
-                    connector._turns_by_id.clear()
-
-    def test_hermes_relay_connector_normalizes_media_fallbacks(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            media_path = tmp / "runtimes" / "hermes" / "tmp" / "answer.txt"
-            media_path.parent.mkdir(parents=True, exist_ok=True)
-            media_path.write_text("generated", encoding="utf-8")
-            content = f"Created the file.\nFile: {media_path}"
-            self.assertEqual(
-                HermesRelayConnector(make_config(tmp))
-                ._build_turn(
-                    system_prompt="system",
-                    user_message="hello",
-                    session_id="enterprise-private-u1",
-                    session_key="private:1",
-                    metadata={},
-                    attachments=[],
-                    model=None,
-                    reasoning_config=None,
-                    progress_callback=None,
-                    content_callback=None,
-                )
-                ._normalize_final_content(content),
-                f"Created the file.\nMEDIA:{media_path}",
-            )
-
-    def test_hermes_config_can_be_updated_from_platform(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            runner = RecordingCommandRunner()
-            bridge = FakeHermesBridge()
             service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                runtime_command_runner=runner,
-                hermes_bridge=bridge,
+                make_config(Path(td)),
+                autostart_runtime=False,
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
-                result = service.update_hermes_config(
-                    admin,
-                    {
-                        "manage_hermes": True,
-                        "repo_path": str(tmp / "hermes-agent"),
-                        "api_url": "http://127.0.0.1:8766/v1/chat/completions",
-                        "model": "gpt-5.4",
-                        "install_extras": "dev",
-                        "startup_wait_seconds": 3.5,
-                        "api_key": "runtime-key",
-                    },
-                )
+                self.assertEqual(service.agent_client.gateway_token, "agent-token")
 
-                self.assertEqual(result["config"]["api_port"], 8766)
-                self.assertEqual(result["config"]["model"], "gpt-5.4")
-                self.assertEqual(result["config"]["install_extras"], "dev")
-                env_text = (service.config.managed_hermes_home / ".env").read_text(encoding="utf-8")
-                self.assertIn('API_SERVER_PORT="8766"', env_text)
-                self.assertIn('API_SERVER_MODEL_NAME="gpt-5.4"', env_text)
-                self.assertIn('API_SERVER_KEY="runtime-key"', env_text)
-                self.assertNotIn("GATEWAY_RELAY_URL=", env_text)
-                self.assertEqual(
-                    runner.calls[-1]["cmd"],
-                    [
-                        str(managed_python(service.config.managed_hermes_home / "venv")),
-                        "-m",
-                        "pip",
-                        "install",
-                        "-e",
-                        f"{service.config.managed_hermes_home / 'source' / 'hermes-agent'}[dev]",
-                    ],
-                )
-                self.assertFalse(any("websockets" in " ".join(call["cmd"]) for call in runner.calls))
+                service.set_secret(admin, "agent_tool_token", "rotated-agent-token")
+
+                self.assertEqual(service.agent_client.gateway_token, "rotated-agent-token")
+                self.assertFalse(service.validate_agent_tool_token("agent-token"))
+                self.assertTrue(service.validate_agent_tool_token("rotated-agent-token"))
             finally:
                 service.close()
 
-    def test_update_hermes_config_rejects_untrusted_repo_path(self):
-        # A directory containing a pyproject.toml but located outside the
-        # trusted submodule tree must be rejected, so a web admin cannot drive
-        # `pip install -e <attacker dir>` (arbitrary code execution).
-        evil = Path(__file__).resolve().parent / "_evil_hermes_repo"
-        evil.mkdir(exist_ok=True)
-        (evil / "pyproject.toml").write_text("[project]\nname = 'evil'\nversion = '0'\n", encoding="utf-8")
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                tmp = Path(td)
-                if str(evil).startswith(str(tmp)):
-                    self.skipTest("repository tree is under the temp dir; cannot test refusal deterministically")
-                make_fake_hermes_repo(tmp / "hermes-agent")
-                service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-                try:
-                    _, admin = service.authenticate("admin", "admin")
-                    with self.assertRaises(ServiceError) as ctx:
-                        service.update_hermes_config(admin, {"repo_path": str(evil)})
-                    self.assertEqual(ctx.exception.status, 403)
-                    # The trusted bundled path is still accepted.
-                    ok = service.update_hermes_config(admin, {"repo_path": str(tmp / "hermes-agent")})
-                    self.assertIn("repo_path", ok["config"])
-                finally:
-                    service.close()
-        finally:
-            shutil.rmtree(evil, ignore_errors=True)
 
-    def test_update_hermes_config_rejects_workspace_repo_path(self):
-        # An agent-writable workspace directory containing a pyproject.toml must
-        # be rejected so an agent cannot plant a build backend for an admin to
-        # install.
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            planted = tmp / "workspaces" / "user-1"
-            planted.mkdir(parents=True, exist_ok=True)
-            (planted / "pyproject.toml").write_text("[project]\nname = 'x'\nversion = '0'\n", encoding="utf-8")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                with self.assertRaises(ServiceError) as ctx:
-                    service.update_hermes_config(admin, {"repo_path": str(planted)})
-                self.assertEqual(ctx.exception.status, 403)
-            finally:
-                service.close()
 
-    def test_hermes_internal_config_exposes_yaml_and_env_without_leaking_secrets(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            runner = RecordingCommandRunner()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), runtime_command_runner=runner)
-            try:
-                _, admin = service.authenticate("admin", "admin")
 
-                current = service.hermes_internal_config(admin)
-                fields_by_key = {item["key"]: item for item in current["internal"]["fields"]}
-                yaml_keys = set(fields_by_key)
-                env_by_key = {item["key"]: item for item in current["internal"]["env"]}
 
-                self.assertIn("agent.max_turns", yaml_keys)
-                self.assertIn("display.show_reasoning", yaml_keys)
-                self.assertEqual(fields_by_key["agent.max_turns"]["value"], 90)
-                self.assertFalse(fields_by_key["agent.max_turns"]["configured"])
-                self.assertTrue(fields_by_key["agent.max_turns"]["defaulted"])
-                self.assertEqual(fields_by_key["display.show_reasoning"]["value"], False)
-                self.assertFalse(fields_by_key["display.show_reasoning"]["configured"])
-                self.assertTrue(fields_by_key["display.show_reasoning"]["defaulted"])
-                self.assertEqual(fields_by_key["toolsets"]["value"], "[\n  \"hermes-cli\"\n]")
-                self.assertTrue(fields_by_key["toolsets"]["defaulted"])
-                self.assertIn("API_SERVER_KEY", env_by_key)
-                self.assertTrue(env_by_key["API_SERVER_KEY"]["secret"])
-                self.assertEqual(env_by_key["API_SERVER_KEY"]["value"], "")
 
-                updated = service.update_hermes_internal_config(
-                    admin,
-                    {
-                        "yaml_updates": {
-                            "agent.max_turns": "12",
-                            "display.show_reasoning": "true",
-                        },
-                        "env": {
-                            "HERMES_MAX_ITERATIONS": "12",
-                            "OPENROUTER_API_KEY": "openrouter-secret",
-                        },
-                    },
-                )
-                fields = {item["key"]: item for item in updated["internal"]["fields"]}
-                env = {item["key"]: item for item in updated["internal"]["env"]}
 
-                self.assertEqual(fields["agent.max_turns"]["value"], 12)
-                self.assertEqual(fields["display.show_reasoning"]["value"], True)
-                self.assertEqual(env["HERMES_MAX_ITERATIONS"]["value"], "12")
-                self.assertEqual(env["OPENROUTER_API_KEY"]["value"], "")
-                self.assertTrue(env["OPENROUTER_API_KEY"]["masked"])
-
-                with self.assertRaises(ServiceError) as bad_yaml:
-                    service.update_hermes_internal_config(admin, {"yaml_text": "not: [valid"})
-                self.assertEqual(bad_yaml.exception.status, 400)
-            finally:
-                service.close()
 
     def test_cognee_internal_config_exposes_and_updates_managed_env(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3834,145 +2761,8 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_platform_writes_managed_codex_and_grok_oauth_state_for_hermes(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            runner = RecordingCommandRunner()
-            bridge = FakeHermesBridge()
-            service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                runtime_command_runner=runner,
-                hermes_bridge=bridge,
-            )
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
-                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
-                service.set_secret(admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
-                service.set_secret(admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
 
-                codex_config = service.update_hermes_config(
-                    admin,
-                    {
-                        "provider": "codex",
-                        "model": "hermes-agent",
-                    },
-                )["config"]
-                auth_path = service.config.managed_hermes_home / "auth.json"
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
 
-                self.assertEqual(codex_config["provider"], "openai-codex")
-                self.assertEqual(codex_config["model"], "gpt-5.5")
-                self.assertIn(("openai-codex", False), bridge.catalog_calls)
-                self.assertEqual(auth_store["active_provider"], "openai-codex")
-                self.assertEqual(auth_store["providers"]["openai-codex"]["auth_mode"], "chatgpt")
-                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
-                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["refresh_token"], "codex-refresh")
-
-                grok_config = service.update_hermes_config(
-                    admin,
-                    {
-                        "provider": "grok-oauth",
-                        "model": "hermes-agent",
-                    },
-                )["config"]
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
-                config_text = (service.config.managed_hermes_home / "config.yaml").read_text(encoding="utf-8")
-                env_text = (service.config.managed_hermes_home / ".env").read_text(encoding="utf-8")
-
-                self.assertEqual(grok_config["provider"], "xai-oauth")
-                self.assertEqual(grok_config["model"], "grok-4.3")
-                self.assertIn(("xai-oauth", False), bridge.catalog_calls)
-                self.assertEqual(grok_config["provider_base_url"], "https://api.x.ai/v1")
-                self.assertEqual(auth_store["active_provider"], "xai-oauth")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["auth_mode"], "oauth_pkce")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["refresh_token"], "grok-refresh")
-                self.assertIn("provider: xai-oauth", config_text)
-                self.assertIn("default: grok-4.3", config_text)
-                self.assertIn('HERMES_INFERENCE_PROVIDER="xai-oauth"', env_text)
-                self.assertIn('HERMES_XAI_BASE_URL="https://api.x.ai/v1"', env_text)
-            finally:
-                service.close()
-
-    def test_oauth_model_selection_is_validated_against_hermes_catalog(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            bridge = FakeHermesBridge()
-            service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                runtime_command_runner=RecordingCommandRunner(),
-                hermes_bridge=bridge,
-            )
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                config = service.hermes_config(admin)["config"]
-                self.assertEqual(
-                    config["model_catalog"]["openai-codex"]["models"],
-                    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
-                )
-
-                with self.assertRaises(ServiceError) as ctx:
-                    service.update_hermes_config(admin, {"provider": "codex", "model": "not-from-hermes"})
-                self.assertEqual(ctx.exception.status, 400)
-
-                updated = service.update_hermes_config(admin, {"provider": "codex", "model": "gpt-5.4"})
-                self.assertEqual(updated["config"]["model"], "gpt-5.4")
-                self.assertIn(("openai-codex", False), bridge.catalog_calls)
-            finally:
-                service.close()
-
-    def test_platform_does_not_resurrect_relogin_required_codex_oauth_state(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
-                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
-                service.update_hermes_config(admin, {"provider": "codex", "model": "hermes-agent"})
-
-                auth_path = service.config.managed_hermes_home / "auth.json"
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
-                state = auth_store["providers"]["openai-codex"]
-                state["last_auth_error"] = {
-                    "provider": "openai-codex",
-                    "code": "refresh_token_reused",
-                    "message": "Codex refresh token was already consumed by another client.",
-                    "reason": "credential_pool_refresh_failure",
-                    "relogin_required": True,
-                    "at": "2026-06-07T01:37:29Z",
-                }
-                auth_path.write_text(json.dumps(auth_store), encoding="utf-8")
-
-                service.runtimes.prepare_hermes()
-
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
-                state = auth_store["providers"]["openai-codex"]
-                self.assertNotIn("access_token", state["tokens"])
-                self.assertNotIn("refresh_token", state["tokens"])
-                codex_status = next(
-                    item for item in service.oauth_provider_status(admin)["providers"] if item["id"] == "openai-codex"
-                )
-                self.assertFalse(codex_status["configured"])
-                self.assertEqual(codex_status["last_auth_error"]["code"], "refresh_token_reused")
-
-                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access-2")
-                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh-2")
-                service.runtimes.prepare_hermes()
-
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
-                state = auth_store["providers"]["openai-codex"]
-                self.assertEqual(state["tokens"]["access_token"], "codex-access-2")
-                self.assertEqual(state["tokens"]["refresh_token"], "codex-refresh-2")
-                self.assertNotIn("last_auth_error", state)
-            finally:
-                service.close()
 
     def test_api_providers_are_limited_to_codex_and_grok_oauth(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3984,7 +2774,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["active_provider"], "openai-codex")
 
                 with self.assertRaises(ServiceError) as update_error:
-                    service.update_hermes_config(admin, {"provider": "openrouter"})
+                    service.update_agent_runtime_config(admin, {"provider": "openrouter"})
                 self.assertEqual(update_error.exception.status, 400)
 
                 with self.assertRaises(ServiceError) as key_error:
@@ -3993,15 +2783,76 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_codex_guided_oauth_flow_stores_tokens_for_hermes(self):
+    def test_agent_runtime_config_updates_and_validates_runtime_controls(self):
         with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                updated = service.update_agent_runtime_config(
+                    admin,
+                    {
+                        "provider": "grok-oauth",
+                        "model": "grok-4.3",
+                        "timeout_seconds": 321,
+                        "max_concurrency": 4,
+                        "compaction_threshold": 0.75,
+                    },
+                )["config"]
+
+                self.assertEqual(updated["provider"], "xai-oauth")
+                self.assertEqual(updated["model"], "grok-4.3")
+                self.assertEqual(updated["timeout_seconds"], 321)
+                self.assertEqual(updated["max_concurrency"], 4)
+                self.assertEqual(updated["compaction_threshold"], 0.75)
+                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
+                self.assertEqual(service.get_setting(AGENT_SETTING_TIMEOUT), "321.0")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MAX_CONCURRENCY), "4")
+                self.assertEqual(service.get_setting(AGENT_SETTING_COMPACTION_THRESHOLD), "0.75")
+
+                invalid_updates = (
+                    {"provider": "openrouter"},
+                    {"model": "not-in-catalog"},
+                    {"timeout_seconds": 0},
+                    {"timeout_seconds": 3601},
+                    {"max_concurrency": 0},
+                    {"max_concurrency": 65},
+                    {"compaction_threshold": 0.49},
+                    {"compaction_threshold": 0.96},
+                )
+                for body in invalid_updates:
+                    with self.subTest(body=body), self.assertRaises(ServiceError) as ctx:
+                        service.update_agent_runtime_config(admin, body)
+                    self.assertEqual(ctx.exception.status, 400)
+            finally:
+                service.close()
+
+    def test_agent_runtime_model_selection_uses_platform_catalog(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                config = service.agent_runtime_config(admin)["config"]
+                self.assertEqual(
+                    config["model_catalog"]["openai-codex"]["models"],
+                    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
+                )
+
+                with self.assertRaises(ServiceError) as ctx:
+                    service.update_agent_runtime_config(admin, {"model": "not-in-catalog"})
+                self.assertEqual(ctx.exception.status, 400)
+
+                updated = service.update_agent_runtime_config(admin, {"model": "gpt-5.4"})
+                self.assertEqual(updated["config"]["model"], "gpt-5.4")
+            finally:
+                service.close()
+
+    def test_codex_guided_oauth_flow_stores_runtime_credentials(self):
+        with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
-                make_config(tmp),
+                make_config(Path(td)),
                 agent_client=RecordingAgent(),
                 oauth_http_client=FakeOAuthHTTPClient(),
-                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -4012,64 +2863,32 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(flow["user_code"], "CODE-1234")
                 self.assertEqual(started["active_provider"], "openai-codex")
 
-                completed = service.poll_oauth_verification(admin, "openai-codex", {"flow_id": flow["flow_id"]})
+                completed = service.poll_oauth_verification(
+                    admin,
+                    "openai-codex",
+                    {"flow_id": flow["flow_id"]},
+                )
                 self.assertTrue(completed["flow"]["complete"])
                 self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
                 self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
-
-                auth_store = json.loads((service.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
-                self.assertEqual(auth_store["active_provider"], "openai-codex")
-                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
-                self.assertTrue(next(item for item in completed["providers"] if item["id"] == "openai-codex")["configured"])
-            finally:
-                service.close()
-
-    def test_codex_oauth_relogin_refreshes_managed_auth_timestamp(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                auth_path = service.config.managed_hermes_home / "auth.json"
-                auth_path.parent.mkdir(parents=True, exist_ok=True)
-                auth_path.write_text(
-                    json.dumps(
-                        {
-                            "version": 2,
-                            "providers": {
-                                "openai-codex": {
-                                    "auth_mode": "chatgpt",
-                                    "tokens": {
-                                        "access_token": "old-access",
-                                        "refresh_token": "old-refresh",
-                                    },
-                                    "last_refresh": "2000-01-01T00:00:00Z",
-                                    "platform_synced_refresh_token": "old-refresh",
-                                }
-                            },
-                        }
-                    ),
-                    encoding="utf-8",
+                self.assertEqual(service._active_oauth_provider(), "openai-codex")
+                self.assertTrue(
+                    next(
+                        item
+                        for item in completed["providers"]
+                        if item["id"] == "openai-codex"
+                    )["configured"]
                 )
-
-                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "new-access")
-                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "new-refresh")
-                service.runtimes.prepare_hermes()
-
-                auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
-                state = auth_store["providers"]["openai-codex"]
-                self.assertEqual(state["tokens"]["access_token"], "new-access")
-                self.assertEqual(state["tokens"]["refresh_token"], "new-refresh")
-                self.assertNotEqual(state["last_refresh"], "2000-01-01T00:00:00Z")
+                self.assertFalse((service.config.managed_agent_runtime_home / "auth.json").exists())
             finally:
                 service.close()
+
+
 
     def test_oauth_provider_status_uses_newer_settings_timestamp(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent(), hermes_bridge=FakeHermesBridge())
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
@@ -4079,28 +2898,6 @@ class PlatformServiceTests(unittest.TestCase):
                     "UPDATE settings SET updated_at = ? WHERE key = ?",
                     (newer, "CODEX_OAUTH_ACCESS_TOKEN"),
                 )
-                auth_path = service.config.managed_hermes_home / "auth.json"
-                auth_path.parent.mkdir(parents=True, exist_ok=True)
-                auth_path.write_text(
-                    json.dumps(
-                        {
-                            "version": 2,
-                            "providers": {
-                                "openai-codex": {
-                                    "auth_mode": "chatgpt",
-                                    "tokens": {
-                                        "access_token": "codex-access",
-                                        "refresh_token": "codex-refresh",
-                                    },
-                                    "last_refresh": "2000-01-01T00:00:00Z",
-                                    "platform_synced_refresh_token": "codex-refresh",
-                                }
-                            },
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-
                 status = service.oauth_provider_status(admin)
                 codex_status = next(item for item in status["providers"] if item["id"] == "openai-codex")
                 self.assertEqual(codex_status["last_refresh"], newer)
@@ -4110,12 +2907,10 @@ class PlatformServiceTests(unittest.TestCase):
     def test_grok_guided_oauth_flow_accepts_pasted_callback_url(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_hermes_repo(tmp / "hermes-agent")
             service = EnterpriseService(
                 make_config(tmp),
                 agent_client=RecordingAgent(),
                 oauth_http_client=FakeOAuthHTTPClient(),
-                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -4124,7 +2919,7 @@ class PlatformServiceTests(unittest.TestCase):
                 flow = started["flow"]
                 self.assertEqual(flow["kind"], "manual_callback")
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(flow["authorize_url"]).query)
-                self.assertEqual(query["referrer"], ["hermes-agent"])
+                self.assertEqual(query["referrer"], ["ubitech-agent"])
                 callback_url = f"{flow['redirect_uri']}?code=grok-code&state={query['state'][0]}"
 
                 completed = service.complete_oauth_verification(
@@ -4137,9 +2932,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(service.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
                 self.assertEqual(service.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
 
-                auth_store = json.loads((service.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
-                self.assertEqual(auth_store["active_provider"], "xai-oauth")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
+                self.assertEqual(service._active_oauth_provider(), "xai-oauth")
                 self.assertTrue(next(item for item in completed["providers"] if item["id"] == "xai-oauth")["configured"])
             finally:
                 service.close()
@@ -4149,19 +2942,15 @@ class PlatformServiceTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             target_dir = root / "target"
-            make_fake_hermes_repo(source_dir / "hermes-agent")
-            make_fake_hermes_repo(target_dir / "hermes-agent")
             source = EnterpriseService(
                 make_config(source_dir),
                 agent_client=RecordingAgent(),
                 runtime_command_runner=RecordingCommandRunner(),
-                hermes_bridge=FakeHermesBridge(),
             )
             target = EnterpriseService(
                 make_config(target_dir),
                 agent_client=RecordingAgent(),
                 runtime_command_runner=RecordingCommandRunner(),
-                hermes_bridge=FakeHermesBridge(),
             )
             try:
                 _, source_admin = source.authenticate("admin", "admin")
@@ -4170,10 +2959,10 @@ class PlatformServiceTests(unittest.TestCase):
                 source.set_secret(source_admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
                 source.set_secret(source_admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
                 source.set_secret(source_admin, "GROK_OAUTH_ID_TOKEN", "grok-id")
-                source.update_hermes_config(source_admin, {"provider": "grok-oauth"})
+                source.update_agent_runtime_config(source_admin, {"provider": "grok-oauth"})
 
                 exported = source.export_oauth_credentials(source_admin)
-                self.assertEqual(exported["kind"], "enterprise-agent-platform.oauth-credentials")
+                self.assertEqual(exported["kind"], "ubitech-agent.oauth-credentials")
                 self.assertEqual(exported["version"], 1)
                 self.assertEqual(exported["active_provider"], "xai-oauth")
                 self.assertEqual(
@@ -4197,11 +2986,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(target.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
                 self.assertEqual(target.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
 
-                auth_store = json.loads((target.config.managed_hermes_home / "auth.json").read_text(encoding="utf-8"))
-                self.assertEqual(auth_store["active_provider"], "xai-oauth")
-                self.assertEqual(auth_store["providers"]["openai-codex"]["tokens"]["access_token"], "codex-access")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["access_token"], "grok-access")
-                self.assertEqual(auth_store["providers"]["xai-oauth"]["tokens"]["id_token"], "grok-id")
+                self.assertEqual(target._active_oauth_provider(), "xai-oauth")
             finally:
                 source.close()
                 target.close()
@@ -4376,6 +3161,37 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.status, 429)
             finally:
                 agent.release.set()
+                service.close()
+
+    def test_runtime_needs_review_does_not_mark_agent_job_succeeded(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = NeedsReviewAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                sent = service.send_private_message(user, "perform a side-effectful task")
+                service.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+
+                job = service.jobs.get_by_key(
+                    "agent", f"message:{sent['user_message']['id']}"
+                )
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "needs_review")
+                self.assertNotEqual(job.status, "succeeded")
+
+                messages = service.audit_private_messages(user, user["id"])["messages"]
+                agent_messages = [message for message in messages if message["author_type"] == "agent"]
+                self.assertEqual(len(agent_messages), 1)
+                self.assertIn("Agent 回复失败", agent_messages[0]["content"])
+                self.assertIn("needs_review", agent_messages[0]["metadata"]["error"])
+                self.assertNotIn("partial output must not be committed", agent_messages[0]["content"])
+                self.assertEqual(
+                    service.jobs.counts(
+                        kind="agent", scope_type="private", scope_id=str(user["id"])
+                    )["needs_review"],
+                    1,
+                )
+            finally:
                 service.close()
 
     def test_durable_agent_jobs_recover_queued_and_quarantine_interrupted_work(self):
@@ -4712,12 +3528,72 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
-                container_command_runner=fake_run,
+                legacy_cleanup_runner=fake_run,
             )
             try:
                 scope = service.agent_scopes.ensure_private_scope(1)
                 self.assertEqual(scope.to_execution_dict()["backend"], "host")
                 self.assertEqual(runner_calls, [])
+            finally:
+                service.close()
+
+    def test_browser_tool_binds_every_tab_operation_to_the_agent_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            calls: list[dict[str, object]] = []
+
+            def record_request(url, body, *, headers, timeout, method="POST"):
+                calls.append({
+                    "url": url,
+                    "body": body,
+                    "headers": headers,
+                    "timeout": timeout,
+                    "method": method,
+                })
+                return {"ok": True}
+
+            service._runtime_json_request = record_request
+            service._validate_external_url = lambda _value: None
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                expected_user_id = "agent-" + hashlib.sha256(
+                    scope.scope_key.encode("utf-8")
+                ).hexdigest()[:24]
+
+                service._agent_browser_tool(
+                    scope.scope_key,
+                    "navigate",
+                    {"url": "https://example.com"},
+                )
+                self.assertEqual(
+                    calls[-1]["body"],
+                    {
+                        "userId": expected_user_id,
+                        "sessionKey": "agent",
+                        "url": "https://example.com",
+                    },
+                )
+
+                service._agent_browser_tool(
+                    scope.scope_key,
+                    "click",
+                    {"tab_id": "tab/one", "ref": "e1", "userId": "attacker"},
+                )
+                self.assertEqual(calls[-1]["body"]["userId"], expected_user_id)
+                self.assertNotIn("tab_id", calls[-1]["body"])
+                self.assertIn("/tabs/tab%2Fone/click", calls[-1]["url"])
+
+                service._agent_browser_tool(
+                    scope.scope_key,
+                    "snapshot",
+                    {"tab_id": "tab-1"},
+                )
+                self.assertEqual(calls[-1]["method"], "GET")
+                self.assertIsNone(calls[-1]["body"])
+                self.assertIn(
+                    urllib.parse.urlencode({"userId": expected_user_id}),
+                    calls[-1]["url"],
+                )
             finally:
                 service.close()
 
@@ -5379,7 +4255,6 @@ class PlatformHTTPTests(unittest.TestCase):
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
-                hermes_bridge=FakeHermesBridge(),
             )
             server, thread = serve_in_thread(make_config(Path(td)), service)
             host, port = server.server_address
@@ -5408,15 +4283,16 @@ class PlatformHTTPTests(unittest.TestCase):
                 res = conn.getresponse()
                 runtime = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
-                self.assertIn("hermes", runtime)
+                self.assertIn("agent", runtime)
                 self.assertIn("cognee", runtime)
 
-                conn.request("GET", "/api/system/hermes/config", headers={"Cookie": cookie})
+                conn.request("GET", "/api/system/agent-runtime/config", headers={"Cookie": cookie})
                 res = conn.getresponse()
-                hermes_config = json.loads(res.read().decode("utf-8"))
+                agent_config = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
-                self.assertIn("config", hermes_config)
-                self.assertIn("repo_path", hermes_config["config"])
+                self.assertIn("config", agent_config)
+                self.assertIn("runtime_home", agent_config["config"])
+                self.assertEqual(agent_config["config"]["provider"], "openai-codex")
 
                 conn.request("GET", "/api/permission-groups", headers={"Cookie": cookie})
                 res = conn.getresponse()

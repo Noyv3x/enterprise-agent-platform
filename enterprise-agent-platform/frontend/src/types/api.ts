@@ -6,12 +6,11 @@
 import type {
   AgentApprovalChoice,
   AgentStatus,
+  AgentRuntimeConfigState,
   AutoUpdateConfigState,
   Channel,
   CogneeConfigState,
   FullDocument,
-  HermesConfigState,
-  HermesInternalConfigState,
   KnowledgeDocument,
   KnowledgeHit,
   MentionTarget,
@@ -241,19 +240,14 @@ export interface SecurityConfigUpdateRequest {
   session_secret: string;
 }
 
-export type HermesConfigResponse = HermesConfigState;
+export type AgentRuntimeConfigResponse = AgentRuntimeConfigState;
 
-export interface HermesConfigUpdateRequest {
-  manage_hermes: boolean;
-  repo_path: string;
-  api_url: string;
+export interface AgentRuntimeConfigUpdateRequest {
   provider: string;
-  provider_base_url: string;
   model: string;
-  install_extras: string;
-  startup_wait_seconds: string;
   timeout_seconds: string;
-  api_key: string;
+  max_concurrency: string;
+  compaction_threshold: string;
 }
 
 export type TelegramConfigResponse = TelegramConfigState;
@@ -274,15 +268,6 @@ export interface AutoUpdateConfigUpdateRequest {
   remote: string;
   branch: string;
   webhook_secret: string;
-}
-
-export type HermesInternalConfigResponse = HermesInternalConfigState;
-
-/** Three mutually-exclusive write shapes to the same endpoint. */
-export interface HermesInternalConfigUpdateRequest {
-  yaml_updates?: Record<string, string>;
-  yaml_text?: string;
-  env?: Record<string, string>;
 }
 
 export type CogneeConfigResponse = CogneeConfigState;

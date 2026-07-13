@@ -1,6 +1,5 @@
-/* <AccountModelSelect/> — per-account model dropdown driven by the active Hermes
-   provider's catalog + a help line (legacy accountModelControl / hermesModelCatalog
-   / activeHermesProviderId, legacy-app.js:2138-2183).
+/* <AccountModelSelect/> — per-account model dropdown driven by the active Agent
+   runtime provider's catalog and a help line.
 
    The legacy <select>'s effective value is COERCED to "" when the saved model
    isn't in the current catalog, and the submit reads that coerced DOM value. The
@@ -13,27 +12,27 @@
 
 import { useEffect, useMemo, type MutableRefObject } from "react";
 import { useStore } from "../../../store/useStore";
-import type { HermesConfigState, HermesModelCatalog, OAuthProvidersState } from "../../../types";
+import type { AgentModelCatalog, AgentRuntimeConfigState, OAuthProvidersState } from "../../../types";
 import { useI18n } from "../../../i18n";
 
-const HERMES_PROVIDERS = ["openai-codex", "xai-oauth"];
+const AGENT_PROVIDERS = ["openai-codex", "xai-oauth"];
 
-function activeHermesProviderId(
+function activeAgentProviderId(
   oauthProviders: OAuthProvidersState | null,
-  hermesConfig: HermesConfigState | null,
+  runtimeConfig: AgentRuntimeConfigState | null,
 ): string {
   const provider =
-    oauthProviders?.active_provider || hermesConfig?.config?.provider || "openai-codex";
-  return HERMES_PROVIDERS.includes(provider) ? provider : "openai-codex";
+    oauthProviders?.active_provider || runtimeConfig?.config?.provider || "openai-codex";
+  return AGENT_PROVIDERS.includes(provider) ? provider : "openai-codex";
 }
 
-function hermesModelCatalog(
+function agentModelCatalog(
   providerId: string,
-  hermesConfig: HermesConfigState | null,
+  runtimeConfig: AgentRuntimeConfigState | null,
   oauthProviders: OAuthProvidersState | null,
-): HermesModelCatalog {
-  const normalized = HERMES_PROVIDERS.includes(providerId) ? providerId : "openai-codex";
-  const fromConfig = hermesConfig?.config?.model_catalog?.[normalized];
+): AgentModelCatalog {
+  const normalized = AGENT_PROVIDERS.includes(providerId) ? providerId : "openai-codex";
+  const fromConfig = runtimeConfig?.config?.model_catalog?.[normalized];
   if (fromConfig && typeof fromConfig === "object") return fromConfig;
   const fromOAuth = (oauthProviders?.providers || []).find((item) => item.id === normalized);
   if (fromOAuth) {
@@ -55,14 +54,14 @@ export interface AccountModelSelectProps {
 
 export function AccountModelSelect({ value, onChange, coercedRef }: AccountModelSelectProps) {
   const { t } = useI18n();
-  const hermesConfig = useStore((state) => state.hermesConfig);
+  const runtimeConfig = useStore((state) => state.agentRuntimeConfig);
   const oauthProviders = useStore((state) => state.oauthProviders);
 
   const { models, defaultModel, help, selectValue } = useMemo(() => {
-    const providerId = activeHermesProviderId(oauthProviders, hermesConfig);
-    const catalog = hermesModelCatalog(providerId, hermesConfig, oauthProviders);
+    const providerId = activeAgentProviderId(oauthProviders, runtimeConfig);
+    const catalog = agentModelCatalog(providerId, runtimeConfig, oauthProviders);
     const list = Array.isArray(catalog.models) ? catalog.models : [];
-    const fallback = catalog.default_model || hermesConfig?.config?.model || t("admin.model.systemDefault");
+    const fallback = catalog.default_model || runtimeConfig?.config?.model || t("admin.model.systemDefault");
     const clean = String(value || "").trim();
     const coerced = clean && list.includes(clean) ? clean : "";
     let helpText: string;
@@ -76,7 +75,7 @@ export function AccountModelSelect({ value, onChange, coercedRef }: AccountModel
       helpText = t("admin.model.defaultOnly");
     }
     return { models: list, defaultModel: fallback, help: helpText, selectValue: coerced };
-  }, [hermesConfig, oauthProviders, t, value]);
+  }, [runtimeConfig, oauthProviders, t, value]);
 
   // Mirror the effective (coerced) value for the submit path. Re-derived from the
   // ORIGINAL `value` against the CURRENT catalog every render, so a late catalog

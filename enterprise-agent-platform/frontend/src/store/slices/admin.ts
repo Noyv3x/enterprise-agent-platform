@@ -25,10 +25,9 @@ export const adminInitial: AdminSliceState = {
   tokenUsageDays: 30,
   secrets: [],
   runtimes: null,
-  hermesConfig: null,
+  agentRuntimeConfig: null,
   telegramConfig: null,
   autoUpdateConfig: null,
-  hermesInternalConfig: null,
   cogneeConfig: null,
   securityConfig: null,
   oauthProviders: null,
@@ -56,14 +55,12 @@ export function adminReducer(state: AppState, action: Action): AppState {
       return { ...state, secrets: action.payload };
     case "SET_RUNTIMES":
       return { ...state, runtimes: action.payload };
-    case "SET_HERMES_CONFIG":
-      return { ...state, hermesConfig: action.payload };
+    case "SET_AGENT_RUNTIME_CONFIG":
+      return { ...state, agentRuntimeConfig: action.payload };
     case "SET_TELEGRAM_CONFIG":
       return { ...state, telegramConfig: action.payload };
     case "SET_AUTO_UPDATE_CONFIG":
       return { ...state, autoUpdateConfig: action.payload };
-    case "SET_HERMES_INTERNAL_CONFIG":
-      return { ...state, hermesInternalConfig: action.payload };
     case "SET_COGNEE_CONFIG":
       return { ...state, cogneeConfig: action.payload };
     case "SET_SECURITY_CONFIG":

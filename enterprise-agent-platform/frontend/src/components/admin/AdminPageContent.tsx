@@ -2,14 +2,13 @@
    renderAdminPageSections, legacy-app.js:1410-1423). Maps each page id to its
    section component(s).
 
-   Phase 4c owns accounts / tokens / messages; Phase 4d filled in the config,
-   oauth and secrets pages below:
-     model    → <OAuthSettings/> + <HermesConfig/>
+   The Agent runtime page combines provider authorization with neutral runtime
+   settings; managed service and platform settings remain on their own pages:
+     agent-runtime → <OAuthSettings/> + <AgentRuntimeConfig/>
      telegram → <TelegramAdminConfig/>
      updates  → <AutoUpdateConfig/>
      security → <SecuritySettings/>
      runtime  → <RuntimeSettings/>
-     hermes   → <HermesInternalConfig/>
      cognee   → <CogneeInternalConfig/>
      secrets  → <SecretsSettings/> */
 
@@ -19,8 +18,7 @@ import { MessageAuditManagement } from "./audit/MessageAuditManagement";
 import { TokenUsageMonitoring } from "./tokens/TokenUsageMonitoring";
 import { AutoUpdateConfig } from "./config/AutoUpdateConfig";
 import { CogneeInternalConfig } from "./config/CogneeInternalConfig";
-import { HermesConfig } from "./config/HermesConfig";
-import { HermesInternalConfig } from "./config/HermesInternalConfig";
+import { AgentRuntimeConfig } from "./config/AgentRuntimeConfig";
 import { RuntimeSettings } from "./config/RuntimeSettings";
 import { SecuritySettings } from "./config/SecuritySettings";
 import { TelegramAdminConfig } from "./config/TelegramAdminConfig";
@@ -35,11 +33,11 @@ export function AdminPageContent({ pageId }: { pageId: AdminPageId }) {
       return <TokenUsageMonitoring />;
     case "messages":
       return <MessageAuditManagement />;
-    case "model":
+    case "agent-runtime":
       return (
         <>
           <OAuthSettings />
-          <HermesConfig />
+          <AgentRuntimeConfig />
         </>
       );
     case "telegram":
@@ -50,8 +48,6 @@ export function AdminPageContent({ pageId }: { pageId: AdminPageId }) {
       return <SecuritySettings />;
     case "runtime":
       return <RuntimeSettings />;
-    case "hermes":
-      return <HermesInternalConfig />;
     case "cognee":
       return <CogneeInternalConfig />;
     case "secrets":
