@@ -1,39 +1,68 @@
-/* <AdminPager/> — the sticky tab strip over ADMIN_PAGES (legacy renderAdminPager,
-   legacy-app.js:1367-1386). On mobile the active tab is scrolled into view, the
-   React replacement for legacy syncActiveAdminPager (legacy-app.js:299): a
-   useEffect keyed on [activeAdminPage, isMobile] + a ref on the active item. */
+/* Grouped administration navigation. Desktop renders four labelled groups in a
+   secondary sidebar. Mobile renders one compact page selector with optgroups. */
 
-import { useEffect, useRef } from "react";
 import { ADMIN_PAGES } from "../../lib/constants";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { selectAdminPage } from "../../data/adminActions";
 import type { AdminPageId } from "../../types";
+import { useStoreHandle } from "../../store/useStore";
 import { AdminPagerItem } from "./AdminPagerItem";
 import { useI18n } from "../../i18n";
 
+export type AdminGroupId = "people" | "agents" | "system" | "advanced";
+
+export const ADMIN_PAGE_GROUPS: ReadonlyArray<{
+  id: AdminGroupId;
+  pages: readonly AdminPageId[];
+}> = [
+  { id: "people", pages: ["accounts", "tokens", "messages"] },
+  { id: "agents", pages: ["model", "telegram"] },
+  { id: "system", pages: ["updates", "security", "runtime"] },
+  { id: "advanced", pages: ["hermes", "cognee", "secrets"] },
+];
+
 export function AdminPager({ activeId }: { activeId: AdminPageId }) {
   const { t } = useI18n();
-  const isMobile = useMediaQuery("(max-width: 800px)");
-  const activeRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    if (isMobile) {
-      activeRef.current?.scrollIntoView({ block: "nearest", inline: "center" });
-    }
-  }, [activeId, isMobile]);
+  const store = useStoreHandle();
+  const pagesById = new Map(ADMIN_PAGES.map((page) => [page.id, page]));
 
   return (
-    <nav className="admin-pager" aria-label={t("admin.pager.ariaLabel")}>
-      {ADMIN_PAGES.map((page) => {
-        const active = page.id === activeId;
-        return (
-          <AdminPagerItem
-            key={page.id}
-            page={page}
-            active={active}
-            buttonRef={active ? activeRef : undefined}
-          />
-        );
-      })}
-    </nav>
+    <>
+      <nav className="admin-pager admin-pager--desktop" aria-label={t("admin.pager.ariaLabel")}>
+        {ADMIN_PAGE_GROUPS.map((group) => (
+          <div className="admin-pager__group" key={group.id}>
+            <div className="admin-pager__group-label">{t(`admin.group.${group.id}`)}</div>
+            <div className="admin-pager__group-items">
+              {group.pages.map((pageId) => {
+                const page = pagesById.get(pageId);
+                return page ? (
+                  <AdminPagerItem key={page.id} page={page} active={page.id === activeId} />
+                ) : null;
+              })}
+            </div>
+          </div>
+        ))}
+      </nav>
+      <div className="admin-pager-mobile">
+        <label htmlFor="admin-page-select">{t("admin.pager.mobileLabel")}</label>
+        <select
+          id="admin-page-select"
+          value={activeId}
+          onChange={(event) => void selectAdminPage(store, event.target.value as AdminPageId)}
+        >
+          {ADMIN_PAGE_GROUPS.map((group) => (
+            <optgroup key={group.id} label={t(`admin.group.${group.id}`)}>
+              {group.pages.map((pageId) => {
+                const page = pagesById.get(pageId);
+                return page ? (
+                  <option key={page.id} value={page.id}>
+                    {t(`admin.page.${page.id}.label`)}
+                  </option>
+                ) : null;
+              })}
+            </optgroup>
+          ))}
+        </select>
+      </div>
+    </>
   );
 }

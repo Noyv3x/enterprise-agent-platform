@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { activeChannel, hasPermission, scopeIdFor, scopeTypeFor } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { ChatMode } from "../../types";
@@ -25,6 +26,7 @@ export function ChatView({ mode }: { mode: ChatMode }) {
     (state) => hasPermission(state, "chat") && (mode !== "private" || hasPermission(state, "private_agent")),
   );
   const channelName = useStore((state) => activeChannel(state)?.name);
+  const mobile = useMediaQuery("(max-width: 800px)");
 
   const noChannel = mode === "channel" && !scopeId;
   const disabled = noChannel || !canChat;
@@ -35,11 +37,11 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   const bumpFocus = useCallback(() => setFocusToken((token) => token + 1), []);
   const bumpForceBottom = useCallback(() => setForceBottomToken((token) => token + 1), []);
 
-  // Re-focus the composer when the scope (channel id / mode) changes — legacy
-  // selectChannel / nav set _focusComposer (:456, 495).
+  // Keep the desktop shortcut, but never raise the software keyboard merely
+  // because a mobile user switched channel or chat mode.
   useEffect(() => {
-    bumpFocus();
-  }, [mode, scopeId, bumpFocus]);
+    if (!mobile) bumpFocus();
+  }, [mode, scopeId, mobile, bumpFocus]);
 
   const placeholder = noChannel
     ? t("chat.composer.noChannel")

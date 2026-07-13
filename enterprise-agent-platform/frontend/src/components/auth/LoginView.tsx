@@ -15,7 +15,7 @@ import { Spinner } from "../common/Spinner";
 
 export function LoginView() {
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const busy = useStore((state) => state.pendingOperations.includes("auth:login"));
   const error = useStore((state) => state.error);
   const { t } = useI18n();
   const [username, setUsername] = useState("");
@@ -23,25 +23,25 @@ export function LoginView() {
 
   return (
     <main className="auth">
-      <aside className="auth__aside">
-        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
-      </aside>
+      <div className="auth__locale"><LanguageSelect /></div>
       <div className="auth__main">
-        <div className="auth__card">
-          <div className="auth__locale"><LanguageSelect /></div>
+        <section className="auth__card">
           <Brand />
           <h1>{t("auth.login")}</h1>
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              void runBusy(store, () => login(store, username, password));
+              void runBusy(store, "auth:login", () => login(store, username, password));
             }}
           >
             <Field label={t("auth.username")}>
               <input
                 name="username"
                 autoComplete="username"
+                required
                 placeholder={t("auth.username")}
+                aria-invalid={!!error || undefined}
+                aria-describedby={error ? "login-error" : undefined}
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
               />
@@ -51,7 +51,10 @@ export function LoginView() {
                 name="password"
                 type="password"
                 autoComplete="current-password"
+                required
                 placeholder={t("auth.password")}
+                aria-invalid={!!error || undefined}
+                aria-describedby={error ? "login-error" : undefined}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
               />
@@ -60,11 +63,11 @@ export function LoginView() {
               {busy ? <Spinner size={18} /> : null}
               <span>{busy ? t("auth.loggingIn") : t("auth.login")}</span>
             </button>
-            <div className="error" role="alert">
+            <div className="error" id="login-error" role="alert">
               {error}
             </div>
           </form>
-        </div>
+        </section>
       </div>
     </main>
   );

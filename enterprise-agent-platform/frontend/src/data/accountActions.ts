@@ -19,7 +19,7 @@ export async function updateCurrentUser(
   body: UpdateCurrentUserRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "account:profile", async () => {
     const result = await api<UpdateCurrentUserResponse>(endpoints.updateCurrentUser.path(), {
       method: "PUT",
       body: JSON.stringify(body),
@@ -35,7 +35,7 @@ export async function changePassword(
   body: ChangePasswordRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "account:password", async () => {
     const result = await api<ChangePasswordResponse>(endpoints.changePassword.path(), {
       method: "PUT",
       body: JSON.stringify(body),

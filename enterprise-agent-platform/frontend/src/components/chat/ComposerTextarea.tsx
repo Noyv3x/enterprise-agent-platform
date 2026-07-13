@@ -69,9 +69,10 @@ export function ComposerTextarea({
     }
   }, [value, textareaRef, pendingCaretRef]);
 
-  // Focus after send / nav / attach (focusToken bump). Disabled textarea = no-op.
+  // Token 0 is the untouched mobile mount. Positive tokens represent an explicit
+  // desktop navigation shortcut or a user action such as send/attach.
   useLayoutEffect(() => {
-    textareaRef.current?.focus();
+    if (focusToken > 0) textareaRef.current?.focus();
   }, [focusToken, textareaRef]);
 
   return (

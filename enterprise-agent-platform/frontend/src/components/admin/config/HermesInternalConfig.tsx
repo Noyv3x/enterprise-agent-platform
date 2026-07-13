@@ -38,7 +38,9 @@ export function HermesInternalConfig() {
   const fields = internal.fields || [];
   const envFields = internal.env || [];
   const sections = internal.sections || [];
-  const busy = useStore((state) => state.busy);
+  const savingFields = useStore((state) =>
+    state.pendingOperations.includes("admin:hermes:fields:save"),
+  );
   const approvalMode = String(fields.find((field) => field.key === "approvals.mode")?.value || "manual");
   const yoloEnabled = approvalMode === "off";
 
@@ -50,7 +52,8 @@ export function HermesInternalConfig() {
       <label className="check-row config-yolo">
         <input
           checked={yoloEnabled}
-          disabled={busy}
+          disabled={savingFields}
+          aria-busy={savingFields || undefined}
           onChange={(event) =>
             void saveHermesYamlFields(store, { "approvals.mode": event.currentTarget.checked ? "off" : "manual" })
           }
@@ -77,6 +80,8 @@ export function HermesInternalConfig() {
         attr="yamlKey"
         buttonText={t("admin.config.hermesInternal.saveFields")}
         onSubmit={(updates) => saveHermesYamlFields(store, updates)}
+        operationKey="admin:hermes:fields:save"
+        loadingLabel={t("admin.common.saving")}
       />
       <RawYamlForm
         value={internal.yaml_text || ""}
@@ -88,6 +93,8 @@ export function HermesInternalConfig() {
         attr="envKey"
         buttonText={t("admin.config.hermesInternal.saveEnv")}
         onSubmit={(updates) => saveHermesEnv(store, updates)}
+        operationKey="admin:hermes:env:save"
+        loadingLabel={t("admin.common.saving")}
       />
     </section>
   );

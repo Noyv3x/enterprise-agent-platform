@@ -3,24 +3,28 @@
    the doc-view trigger reference so closing the viewer restores focus to the
    exact "查看正文" button that opened it (the focus handoff on close). */
 
-import { useMemo, useRef } from "react";
-import { clearSearch, openDocument } from "../../data/knowledgeActions";
-import { runBusy } from "../../data/sessionActions";
+import { useMemo, useRef, useState } from "react";
+import { clearSearch, loadDocuments, openDocument } from "../../data/knowledgeActions";
+import { resourceKeys, runResourceLoad } from "../../data/resourceState";
 import { useI18n } from "../../i18n";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import type { Id } from "../../types";
-import { CardHead } from "../common/CardHead";
+import { EmptyState } from "../common/EmptyState";
+import { Drawer } from "../common/Drawer";
+import { ResourceStatusView } from "../common/ResourceStatusView";
 import { DocumentList } from "./DocumentList";
 import { DocumentViewer } from "./DocumentViewer";
 import { KnowledgeSearchForm } from "./KnowledgeSearchForm";
 
 export function KnowledgeLibraryCard() {
   const { t } = useI18n();
+  const isMobile = useMediaQuery("(max-width: 800px)");
   const store = useStoreHandle();
   const documents = useStore((state) => state.documents);
   const search = useStore((state) => state.knowledgeSearch);
   const selectedDocument = useStore((state) => state.selectedDocument);
-  const busy = useStore((state) => state.busy);
+  const [requestedId, setRequestedId] = useState<Id | null>(null);
 
   // The button that opened the current viewer, so we can return focus to it on
   // close (an inline panel, not a modal).
@@ -32,58 +36,89 @@ export function KnowledgeLibraryCard() {
   );
   const results = search.results;
   const items = isSearching ? results ?? [] : documents;
-  // Loading only for the very first library load (avoids the legacy empty flash);
-  // a search keeps the prior list visible while it resolves.
-  const loading = busy && !isSearching && documents.length === 0;
-
   const handleView = (id: Id, button: HTMLButtonElement) => {
     triggerRef.current = button;
-    void runBusy(store, () => openDocument(store, id));
+    setRequestedId(id);
+    void runResourceLoad(store, resourceKeys.knowledgeDocument(id), () => openDocument(store, id));
   };
 
   const handleCloseViewer = () => {
     store.dispatch({ type: "SET_SELECTED_DOCUMENT", payload: null });
+    setRequestedId(null);
     // Move focus back to the originating trigger before React commits the
     // viewer unmount, so focus never falls to <body>.
     triggerRef.current?.focus();
   };
 
   return (
-    <section className="card">
-      <CardHead
-        title={t("knowledge.library")}
-        icon="library"
-        extra={
-          <span className="status">
-            {t("knowledge.documentCount", { count: documents.length })}
-          </span>
-        }
-      />
-      <KnowledgeSearchForm />
-      {isSearching ? (
-        <div className="list__note">
-          <span>
-            {t("knowledge.searchResults", {
-              query: search.query,
-              count: (results ?? []).length,
-            })}
-          </span>
-          <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
-            <span>{t("knowledge.showAll")}</span>
-          </button>
-        </div>
-      ) : null}
-      <DocumentList
-        items={items}
-        isSearching={isSearching}
-        searchQuery={search.query}
-        loading={loading}
-        selectedId={selectedDocument?.id}
-        onView={handleView}
-      />
-      {selectedDocument ? (
-        <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} />
-      ) : null}
-    </section>
+    <div className="knowledge-workspace">
+      <section className="card knowledge-browser" aria-label={t("knowledge.library")}>
+        <KnowledgeSearchForm />
+        {isSearching ? (
+          <div className="list__note">
+            <span>
+              {t("knowledge.searchResults", {
+                query: search.query,
+                count: (results ?? []).length,
+              })}
+            </span>
+            <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
+              <span>{t("knowledge.showAll")}</span>
+            </button>
+          </div>
+        ) : null}
+        <ResourceStatusView
+          resourceKey={resourceKeys.knowledgeList}
+          hasData={documents.length > 0}
+          onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store))}
+        >
+          <DocumentList
+            items={items}
+            isSearching={isSearching}
+            searchQuery={search.query}
+            loading={false}
+            selectedId={requestedId ?? selectedDocument?.id}
+            onView={handleView}
+          />
+        </ResourceStatusView>
+      </section>
+      {!isMobile ? <section className="card knowledge-detail" aria-label={t("knowledge.documentRegion")}>
+        {requestedId ? (
+          <ResourceStatusView
+            resourceKey={resourceKeys.knowledgeDocument(requestedId)}
+            hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
+            onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
+          >
+            {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
+              <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} />
+            ) : null}
+          </ResourceStatusView>
+        ) : (
+          <EmptyState
+            icon="doc"
+            title={t("knowledge.selectDocument")}
+            text={t("knowledge.selectDocumentDetail")}
+          />
+        )}
+      </section> : null}
+      <Drawer
+        open={isMobile && requestedId != null}
+        onClose={handleCloseViewer}
+        title={selectedDocument?.title || t("knowledge.documentRegion")}
+        description={selectedDocument?.source || undefined}
+      >
+        {requestedId ? (
+          <ResourceStatusView
+            resourceKey={resourceKeys.knowledgeDocument(requestedId)}
+            hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
+            onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
+          >
+            {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
+              <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} showClose={false} />
+            ) : null}
+          </ResourceStatusView>
+        ) : null}
+      </Drawer>
+    </div>
   );
 }

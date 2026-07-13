@@ -8,12 +8,13 @@ import { endpoints } from "../../lib/endpoints";
 import { loadChannels } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
 import { useI18n } from "../../i18n";
-import { useStoreHandle } from "../../store/useStore";
+import { useStore, useStoreHandle } from "../../store/useStore";
 import { Icon } from "../common/Icon";
 
 export function ChannelCreateForm() {
   const store = useStoreHandle();
   const { t } = useI18n();
+  const creating = useStore((state) => state.pendingOperations.includes("channel:create"));
   const [name, setName] = useState("");
 
   return (
@@ -22,7 +23,7 @@ export function ChannelCreateForm() {
       onSubmit={(event) => {
         event.preventDefault();
         if (!name.trim()) return; // guard trims, payload does not
-        void runBusy(store, async () => {
+        void runBusy(store, "channel:create", async () => {
           await api(endpoints.createChannel.path(), {
             method: "POST",
             body: JSON.stringify({ name }), // UNTRIMMED, verbatim legacy payload
@@ -36,14 +37,15 @@ export function ChannelCreateForm() {
         placeholder={t("nav.channel.createPlaceholder")}
         aria-label={t("nav.channel.createPlaceholder")}
         value={name}
+        disabled={creating}
         onChange={(event) => setName(event.target.value)}
       />
       <button
-        className="icon-btn"
+        className="icon-btn channel-create__submit"
         type="submit"
         title={t("nav.channel.create")}
         aria-label={t("nav.channel.create")}
-        style={{ border: "1px solid var(--line-strong)" }}
+        disabled={creating || !name.trim()}
       >
         <Icon name="plus" size={16} />
       </button>

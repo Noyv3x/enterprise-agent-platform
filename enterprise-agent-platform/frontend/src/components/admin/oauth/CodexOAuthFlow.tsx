@@ -9,6 +9,7 @@ import { safeUrl } from "../../../lib/api";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { OAuthDeviceCodeFlow } from "../../../types";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { useI18n } from "../../../i18n";
 
 function flowStatus(t: ReturnType<typeof useI18n>["t"], status: string | undefined): string {
@@ -26,7 +27,9 @@ export interface CodexOAuthFlowProps {
 export function CodexOAuthFlow({ providerId, flow }: CodexOAuthFlowProps) {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const checking = useStore((state) =>
+    state.pendingOperations.includes(`admin:oauth:poll:${providerId}`),
+  );
 
   return (
     <div className="oauth-guide">
@@ -39,14 +42,15 @@ export function CodexOAuthFlow({ providerId, flow }: CodexOAuthFlowProps) {
       </div>
       <div className="oauth-code">{flow.user_code}</div>
       <div className="oauth-actions">
-        <button
-          className="btn btn--sm"
-          disabled={busy}
+        <LoadingButton
+          className="btn--sm"
+          loading={checking}
+          loadingLabel={t("admin.common.checking")}
           onClick={() => void pollOAuthVerification(store, providerId, flow.flow_id)}
         >
           <Icon name="refresh" size={14} />
           <span>{t("admin.oauth.checkStatus")}</span>
-        </button>
+        </LoadingButton>
         <span className="muted" style={{ fontSize: "12px" }} aria-live="polite">
           {t("admin.oauth.status", { status: flowStatus(t, flow.status) })}
         </span>

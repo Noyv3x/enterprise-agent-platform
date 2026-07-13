@@ -22,6 +22,7 @@ import type {
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { useI18n, type Translator } from "../../../i18n";
 
 const HERMES_PROVIDERS = ["openai-codex", "xai-oauth"];
@@ -114,7 +115,10 @@ function seedForm(hermes: HermesConfigValues): HermesFormState {
 export function HermesConfig() {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const saving = useStore((state) => state.pendingOperations.includes("admin:model:save"));
+  const installing = useStore((state) =>
+    state.pendingOperations.includes("admin:runtime:install-hermes"),
+  );
   const hermesConfig = useStore((state) => state.hermesConfig);
   const oauthProviders = useStore((state) => state.oauthProviders);
   const hermes = hermesConfig?.config || {};
@@ -132,6 +136,7 @@ export function HermesConfig() {
     () => resolveModel(t, form.provider, form.modelPreferred, hermesConfig, oauthProviders),
     [form.provider, form.modelPreferred, hermesConfig, oauthProviders, t],
   );
+  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(hermesConfig?.config || {}));
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -265,18 +270,24 @@ export function HermesConfig() {
           </Field>
         </div>
         <div className="form-actions">
-          <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>{t("admin.hermes.save")}</span>
-          </button>
-          <button
-            className="btn"
+          <LoadingButton
+            variant="primary"
+            type="submit"
+            disabled={!dirty}
+            loading={saving}
+            loadingLabel={t("admin.common.saving")}
+          >
+            {t("admin.hermes.save")}
+          </LoadingButton>
+          <LoadingButton
             type="button"
-            disabled={busy}
+            loading={installing}
+            loadingLabel={t("admin.common.installing")}
             onClick={() => void installHermes(store)}
           >
             <Icon name="download" size={15} />
             <span>{t("admin.hermes.reinstall")}</span>
-          </button>
+          </LoadingButton>
         </div>
       </form>
     </section>

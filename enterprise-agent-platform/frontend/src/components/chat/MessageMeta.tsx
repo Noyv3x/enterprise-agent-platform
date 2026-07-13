@@ -3,6 +3,7 @@
 
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
+import type { ReactNode } from "react";
 
 function formatMessageTime(value: number | null | undefined, locale: string): string {
   if (!value) return "";
@@ -26,11 +27,13 @@ export function MessageMeta({
   isUser,
   pending,
   streaming,
+  action,
 }: {
   message: Message;
   isUser: boolean;
   pending: boolean;
   streaming: boolean;
+  action?: ReactNode;
 }) {
   const { locale, t } = useI18n();
   return (
@@ -39,6 +42,7 @@ export function MessageMeta({
       {pending ? <span className="msg__pending">{t("chat.message.sending")}</span> : null}
       {streaming ? <span className="msg__pending">{t("chat.message.generating")}</span> : null}
       <span className="msg__time">{formatMessageTime(message.created_at, locale)}</span>
+      {action}
     </div>
   );
 }

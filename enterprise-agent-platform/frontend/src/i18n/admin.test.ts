@@ -29,5 +29,13 @@ describe("admin translations", () => {
   it("provides Traditional Chinese management labels", () => {
     expect(translate("zh-TW", "admin.page.security.label")).toBe("公網安全");
     expect(translate("zh-TW", "admin.accounts.permissionGroup")).toBe("權限群組");
+    expect(translate("zh-TW", "admin.group.advanced")).toBe("進階");
+  });
+
+  it("localizes grouped navigation and account confirmations", () => {
+    expect(translate("zh-CN", "admin.group.people")).toBe("成员与数据");
+    expect(translate("en", "admin.group.agents")).toBe("Agents & access");
+    expect(translate("en", "admin.accounts.impersonateConfirm", { name: "Avery" }))
+      .toContain("Avery");
   });
 });

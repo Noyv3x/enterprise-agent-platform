@@ -1,9 +1,7 @@
 /* =====================================================================
-   ubitech agent — design system
-   Aesthetic: warm, editorial, calm — in the spirit of Anthropic / Claude.
-   Warm paper surfaces, hazy slate-blue (#7080A0) brand with light-blue
-   support, serif display type for Latin (clean sans for CJK), monospace
-   reserved for genuine machine data. Dual theme via CSS light-dark().
+   ubitech agent — legacy component rules
+   Shared modern tokens and final component refinements live in
+   design-system.css; this file retains the established feature selectors.
    ===================================================================== */
 
 :root {
@@ -21,7 +19,7 @@
   --accent-line:   light-dark(hsl(221 31% 82%), hsl(223 19% 33%));
   --sky:           light-dark(hsl(208 56% 50%), hsl(206 68% 69%));
 
-  /* ---- Surfaces (warm paper / espresso) ---- */
+  /* ---- Legacy surface defaults (overridden by design-system.css) ---- */
   --bg:        light-dark(hsl(40 30% 92.5%),  hsl(36 9% 9.5%));
   --surface:   light-dark(hsl(44 48% 97.5%),  hsl(36 10% 12.5%));
   --surface-2: light-dark(hsl(42 36% 94.5%),  hsl(35 11% 15.5%));
@@ -62,13 +60,12 @@
   --shadow-3: light-dark(0 20px 50px -14px hsl(34 35% 20% / 0.24), 0 26px 60px -16px hsl(0 0% 0% / 0.66));
   --ring: 0 0 0 3px color-mix(in srgb, var(--brand) 35%, transparent);
 
-  /* ---- Bold refresh: layered depth, tactile highlights, accent gradients ---- */
+  /* ---- Compatibility elevation tokens ---- */
   --elevate-hi: light-dark(inset 0 1px 0 hsl(44 55% 100% / 0.55), inset 0 1px 0 hsl(40 30% 100% / 0.045));
   --shadow-card: light-dark(0 2px 3px hsl(34 30% 24% / 0.05), 0 2px 6px hsl(0 0% 0% / 0.42));
   --shadow-pop:  light-dark(0 16px 40px -12px hsl(34 38% 20% / 0.26), 0 20px 48px -12px hsl(0 0% 0% / 0.62));
   --accent-grad: linear-gradient(165deg, var(--accent-solid), var(--accent-solid-h));
   --brand-grad:  linear-gradient(150deg, var(--brand), color-mix(in srgb, var(--brand) 60%, var(--sky)));
-  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 
   /* ---- Geometry ---- */
   --r-xs: 7px;
@@ -1309,7 +1306,8 @@ select {
 }
 .token-curve__svg {
   width: 100%;
-  height: 190px;
+  height: auto;
+  aspect-ratio: 640 / 170;
   display: block;
   overflow: visible;
 }
@@ -2219,151 +2217,4 @@ select {
     scroll-behavior: auto !important;
   }
 }
-
-/* =====================================================================
-   BOLD EDITORIAL REFRESH (Phase 5a)
-   Layered atop the base above using the same class contract (wins by source
-   order). Keeps the warm-paper + slate-blue identity; adds tactile depth,
-   editorial typography, paper grain and confident motion.
-   ===================================================================== */
-
-/* ---- Paper grain + atmosphere on the canvas (reading surfaces only) ---- */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background-image: var(--grain);
-  background-size: 150px 150px;
-  opacity: light-dark(0.5, 0.55);
-  mix-blend-mode: light-dark(multiply, soft-light);
-}
-@media (prefers-reduced-data: reduce) { body::before { display: none; } }
-.shell, .auth { position: relative; z-index: 1; }
-
-/* ---- Editorial typography: confident serif headings with tight tracking ---- */
-.topbar__title,
-.panel__header h2,
-.card__title,
-.empty h3,
-.auth__card h1,
-.agent-work__title { letter-spacing: -0.012em; }
-.topbar__title { font-size: 18.5px; }
-.panel__header h2 { font-size: 19px; }
-
-/* ---- Editorial eyebrows / section labels ---- */
-.brand__eyebrow { letter-spacing: 0.2em; font-weight: 650; color: var(--muted); }
-.section-label { letter-spacing: 0.13em; }
-
-/* ---- Sidebar as a distinct, slightly recessed paper panel ---- */
-.sidebar {
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--sidebar) 92%, var(--surface)), var(--sidebar));
-  border-right-color: var(--line-strong);
-  box-shadow: inset -1px 0 0 var(--hairline), 3px 0 16px -12px hsl(34 35% 20% / 0.5);
-}
-
-/* ---- Navigation: hover nudge + a bolder, glowing active rail ---- */
-.nav__item, .channel {
-  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast),
-    box-shadow var(--t-fast);
-}
-.nav__item:hover, .channel:hover { transform: translateX(2px); }
-.nav__item.is-active, .channel.is-active {
-  background: linear-gradient(90deg, var(--accent-soft), color-mix(in srgb, var(--accent-soft) 35%, transparent));
-  box-shadow: inset 0 0 0 1px var(--accent-line), var(--elevate-hi);
-}
-.nav__item.is-active::before, .channel.is-active::before {
-  height: 60%;
-  width: 3px;
-  border-radius: var(--r-pill);
-  background: var(--accent-grad);
-  box-shadow: 0 0 10px -1px color-mix(in srgb, var(--accent) 80%, transparent);
-}
-
-/* ---- Brand avatar in the foot: real depth ---- */
-.avatar {
-  background: var(--brand-grad);
-  box-shadow: var(--shadow-1), inset 0 1px 0 hsl(0 0% 100% / 0.22);
-}
-
-/* ---- Topbar: subtle lift off the content ---- */
-.topbar { box-shadow: 0 1px 0 var(--line), 0 10px 22px -20px hsl(34 38% 18% / 0.55); }
-
-/* ---- Cards & panels: tactile elevation + top highlight + hover lift ---- */
-.card { box-shadow: var(--shadow-card), var(--elevate-hi); }
-.doc-card { transition: border-color var(--t-fast), box-shadow var(--t-fast), transform var(--t-fast); }
-.doc-card:hover { box-shadow: var(--shadow-2), var(--elevate-hi); transform: translateY(-2px); }
-.metric-tile {
-  background: var(--surface);
-  box-shadow: var(--shadow-card), var(--elevate-hi);
-}
-.metric-tile strong { color: var(--ink); }
-
-/* ---- Buttons: confident accent moment with gradient + press feedback ---- */
-.btn { transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast),
-    box-shadow var(--t-fast), transform var(--t-fast), filter var(--t-fast); }
-.btn--primary {
-  background: var(--accent-grad);
-  box-shadow: var(--shadow-1), inset 0 1px 0 hsl(0 0% 100% / 0.2);
-}
-.btn--primary:hover {
-  background: var(--accent-grad);
-  filter: brightness(1.05);
-  box-shadow: var(--shadow-2), inset 0 1px 0 hsl(0 0% 100% / 0.24);
-  transform: translateY(-1px);
-}
-.btn--primary:active { transform: translateY(0.5px); filter: brightness(0.97); }
-
-/* ---- Messages: staggered entrance, refined user bubble + branded agent avatar ---- */
-@keyframes msg-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.msg { animation: msg-in 0.3s var(--ease-emph) both; }
-.msg--user .msg__bubble {
-  background: linear-gradient(158deg, var(--accent-soft), color-mix(in srgb, var(--accent-soft) 72%, var(--surface)));
-  border-color: var(--accent-line);
-  box-shadow: var(--shadow-card), var(--elevate-hi);
-  border-top-right-radius: var(--r-xs);
-}
-.msg--agent .msg__avatar {
-  background: var(--brand-grad);
-  color: var(--on-accent);
-  box-shadow: var(--shadow-1), inset 0 1px 0 hsl(0 0% 100% / 0.22);
-}
-.msg--agent .msg__avatar svg { color: var(--on-accent); }
-
-/* ---- Agent work card: a touch more presence ---- */
-.agent-work { box-shadow: var(--shadow-card), var(--elevate-hi); }
-.agent-work--active { box-shadow: var(--shadow-card), 0 0 0 1px var(--accent-line); }
-
-/* ---- Knowledge suggestion chips: branded + interactive ---- */
-.chip { transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast); }
-.chip:hover { transform: translateY(-1px); border-color: var(--accent); }
-
-/* ---- Composer: floats above the page with a focus glow ---- */
-.composer__field { box-shadow: var(--shadow-card), var(--elevate-hi); transition: border-color var(--t), box-shadow var(--t), transform var(--t); }
-.composer__field:focus-within { box-shadow: var(--ring), var(--shadow-2); }
-
-/* ---- Admin pager active tab: gradient pill ---- */
-.admin-pager__item.is-active {
-  background: var(--accent-soft);
-  box-shadow: inset 0 0 0 1px var(--accent-line), var(--elevate-hi);
-}
-
-/* ---- Token curve: bring in the under-used --sky for a second-colour rhythm ---- */
-.token-curve__area { fill: color-mix(in srgb, var(--sky) 14%, transparent); }
-.token-curve__line { stroke: var(--sky); }
-.token-curve__point { fill: var(--sky); }
-
-/* ---- Toasts: pop with depth + emphasized easing ---- */
-.toast { box-shadow: var(--shadow-pop), var(--elevate-hi); }
-
-/* ---- Empty-state icon: branded, recessed badge ---- */
-.empty__icon {
-  background: radial-gradient(120% 120% at 50% 10%, var(--accent-soft), var(--surface-2));
-  box-shadow: var(--elevate-hi), inset 0 0 0 1px var(--accent-line);
-  color: var(--accent);
-}
-
-/* ---- Entrance easing alignment ---- */
-.view-enter { animation: view-in 0.26s var(--ease-emph) both; }
+/* The previous decorative refresh layer moved to design-system.css. */

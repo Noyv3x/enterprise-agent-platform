@@ -17,6 +17,7 @@ import { AgentWorkCard, hasAgentProcessSteps } from "./AgentWorkCard";
 import { KnowledgeSuggestions } from "./KnowledgeSuggestions";
 import { MessageBody } from "./MessageBody";
 import { MessageMeta } from "./MessageMeta";
+import { CopyButton } from "./CopyButton";
 
 function MessageBubbleImpl({ message }: { message: Message }) {
   const { t } = useI18n();
@@ -40,7 +41,13 @@ function MessageBubbleImpl({ message }: { message: Message }) {
         </div>
       )}
       <div className="msg__bubble">
-        <MessageMeta message={message} isUser={isUser} pending={pending} streaming={streaming} />
+        <MessageMeta
+          message={message}
+          isUser={isUser}
+          pending={pending}
+          streaming={streaming}
+          action={message.content ? <CopyButton value={message.content} kind="message" /> : null}
+        />
         {message.content ? <MessageBody content={message.content} /> : null}
         {attachments.length ? <MessageAttachments attachments={attachments} /> : null}
         {suggestions.length ? <KnowledgeSuggestions suggestions={suggestions} /> : null}

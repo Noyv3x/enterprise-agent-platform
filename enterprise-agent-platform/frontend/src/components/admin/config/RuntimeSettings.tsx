@@ -11,6 +11,7 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { RuntimeRow } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { StatusBadge } from "../../common/StatusBadge";
 import { useI18n, type Translator } from "../../../i18n";
 
@@ -31,10 +32,21 @@ function runtimeStateLabel(t: Translator, state: string | undefined, available: 
   }
 }
 
-function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean }) {
+function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
   const store = useStoreHandle();
   const { t } = useI18n();
+  const installing = useStore((state) =>
+    state.pendingOperations.includes("admin:runtime:install-hermes"),
+  );
+  const restarting = useStore((state) =>
+    state.pendingOperations.includes(`admin:runtime:restart:${runtime.name}`),
+  );
   const restartLabel = t(runtime.managed && runtime.name !== "cognee" ? "admin.runtime.restart" : "admin.common.refresh");
+  const restartLoadingLabel = t(
+    runtime.managed && runtime.name !== "cognee"
+      ? "admin.common.restarting"
+      : "resource.refreshing",
+  );
   return (
     <div className="runtime-row">
       <div className="runtime-row__main">
@@ -52,19 +64,25 @@ function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean 
       </div>
       <div className="runtime-row__actions">
         {runtime.name === "hermes" ? (
-          <button className="btn btn--sm" disabled={busy} onClick={() => void installHermes(store)}>
+          <LoadingButton
+            className="btn--sm"
+            loading={installing}
+            loadingLabel={t("admin.common.installing")}
+            onClick={() => void installHermes(store)}
+          >
             <Icon name="download" size={14} />
             <span>{t("admin.runtime.install")}</span>
-          </button>
+          </LoadingButton>
         ) : null}
-        <button
-          className="btn btn--sm"
-          disabled={busy}
+        <LoadingButton
+          className="btn--sm"
+          loading={restarting}
+          loadingLabel={restartLoadingLabel}
           onClick={() => void restartRuntime(store, runtime.name)}
         >
           <Icon name="refresh" size={14} />
           <span>{restartLabel}</span>
-        </button>
+        </LoadingButton>
       </div>
     </div>
   );
@@ -72,7 +90,6 @@ function RuntimeRowItem({ runtime, busy }: { runtime: RuntimeRow; busy: boolean 
 
 export function RuntimeSettings() {
   const { t } = useI18n();
-  const busy = useStore((state) => state.busy);
   const runtimes = useStore((state) => state.runtimes);
 
   return (
@@ -85,7 +102,7 @@ export function RuntimeSettings() {
       <div className="list">
         {runtimes ? (
           Object.values(runtimes).map((runtime) => (
-            <RuntimeRowItem key={runtime.name} runtime={runtime} busy={busy} />
+            <RuntimeRowItem key={runtime.name} runtime={runtime} />
           ))
         ) : (
           <div className="muted">{t("admin.runtime.loading")}</div>

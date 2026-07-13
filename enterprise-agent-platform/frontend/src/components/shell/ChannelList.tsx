@@ -15,15 +15,17 @@ export function ChannelList() {
   const activeChannelId = useStore((state) => state.activeChannelId);
 
   return (
-    <div className="channels">
+    <nav className="channels" aria-label={t("shell.channelsNavigation")}>
       {channels.length ? (
         channels.map((channel) => (
           <button
+            type="button"
             key={String(channel.id)}
             className={cx(
               "channel",
               activeView === "channel" && activeChannelId === channel.id && "is-active",
             )}
+            aria-current={activeView === "channel" && activeChannelId === channel.id ? "page" : undefined}
             onClick={() => void selectChannel(store, channel.id)}
           >
             <span className="channel__hash">#</span>
@@ -31,10 +33,10 @@ export function ChannelList() {
           </button>
         ))
       ) : (
-        <div className="muted" style={{ padding: "4px 10px", fontSize: "12.5px" }}>
+        <div className="channel-empty muted">
           {t("nav.channels.empty")}
         </div>
       )}
-    </div>
+    </nav>
   );
 }

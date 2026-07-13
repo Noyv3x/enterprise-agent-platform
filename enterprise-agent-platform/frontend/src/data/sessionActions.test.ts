@@ -3,7 +3,7 @@ import { resetApiSession } from "../lib/api";
 import { createStore } from "../lib/store";
 import { initialAppState, rootReducer } from "../store/reducer";
 import type { Message, User } from "../types";
-import { logout } from "./sessionActions";
+import { logout, runBusy } from "./sessionActions";
 
 function response(status: number, body: unknown) {
   return {
@@ -51,5 +51,24 @@ describe("logout", () => {
 
     resolveFetch(response(200, {}));
     await expect(completion).resolves.toBeUndefined();
+  });
+});
+
+describe("runBusy semantic operations", () => {
+  it("does not start the same named operation twice", async () => {
+    const store = createStore(rootReducer, initialAppState);
+    let finish!: () => void;
+    const firstFn = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const duplicateFn = vi.fn(async () => undefined);
+
+    const first = runBusy(store, "settings:save", firstFn);
+    await runBusy(store, "settings:save", duplicateFn);
+    expect(firstFn).toHaveBeenCalledOnce();
+    expect(duplicateFn).not.toHaveBeenCalled();
+    expect(store.getState().pendingOperations).toEqual(["settings:save"]);
+
+    finish();
+    await first;
+    expect(store.getState().pendingOperations).toEqual([]);
   });
 });

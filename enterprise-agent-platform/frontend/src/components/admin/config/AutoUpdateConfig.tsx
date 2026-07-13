@@ -13,6 +13,7 @@ import type { AutoUpdateConfigValues } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { StatusBadge } from "../../common/StatusBadge";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
 import { useI18n } from "../../../i18n";
@@ -49,7 +50,8 @@ function seedForm(config: AutoUpdateConfigValues): AutoUpdateFormState {
 export function AutoUpdateConfig() {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const saving = useStore((state) => state.pendingOperations.includes("admin:updates:save"));
+  const checking = useStore((state) => state.pendingOperations.includes("admin:updates:check"));
   const autoUpdateConfig = useStore((state) => state.autoUpdateConfig);
   const config = autoUpdateConfig?.config || {};
   const status = autoUpdateConfig?.status || {};
@@ -70,6 +72,8 @@ export function AutoUpdateConfig() {
   useEffect(() => {
     setForm(seedForm(autoUpdateConfig?.config || {}));
   }, [autoUpdateConfig]);
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(autoUpdateConfig?.config || {}));
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -146,18 +150,25 @@ export function AutoUpdateConfig() {
           </div>
         </div>
         <div className="form-actions">
-          <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>{t("admin.updates.save")}</span>
-          </button>
-          <button
-            className="btn"
+          <LoadingButton
+            variant="primary"
+            type="submit"
+            disabled={!dirty}
+            loading={saving}
+            loadingLabel={t("admin.common.saving")}
+          >
+            {t("admin.updates.save")}
+          </LoadingButton>
+          <LoadingButton
             type="button"
-            disabled={busy || !config.enabled}
+            disabled={!config.enabled}
+            loading={checking}
+            loadingLabel={t("admin.common.checking")}
             onClick={() => void checkAutoUpdateNow(store)}
           >
             <Icon name="refresh" size={15} />
             <span>{t("admin.updates.checkNow")}</span>
-          </button>
+          </LoadingButton>
         </div>
       </form>
       <div className="metric-grid metric-grid--compact">

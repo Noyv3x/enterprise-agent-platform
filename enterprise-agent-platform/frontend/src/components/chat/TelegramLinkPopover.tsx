@@ -17,7 +17,7 @@ import {
   telegramChallengeTiming,
   telegramLinkView,
 } from "../../utils/telegramLink";
-import { Icon } from "../common/Icon";
+import { Dialog } from "../common/Dialog";
 
 const LINK_POLL_INTERVAL_MS = 3_000;
 
@@ -61,7 +61,8 @@ export function TelegramLinkPopover() {
   const toast = useToast();
   const { locale, t } = useI18n();
 
-  const busy = useStore((state) => state.busy);
+  const pendingOperations = useStore((state) => state.pendingOperations);
+  const busy = pendingOperations.includes("telegram:link") || pendingOperations.includes("telegram:unlink");
   const telegram = useStore((state) => state.privateTelegram);
   const gateway = telegram?.gateway || {};
   const link = telegram?.link || {};
@@ -144,7 +145,7 @@ export function TelegramLinkPopover() {
   }, [copied]);
 
   const onGenerate = async () => {
-    await runBusy(store, async () => {
+    await runBusy(store, "telegram:link", async () => {
       const result = await api<PrivateTelegramResponse>(endpoints.updatePrivateTelegram.path(), {
         method: "PUT",
         body: EMPTY_BODY,
@@ -186,7 +187,7 @@ export function TelegramLinkPopover() {
   };
 
   const onUnbind = async () => {
-    await runBusy(store, async () => {
+    await runBusy(store, "telegram:unlink", async () => {
       await api(endpoints.deletePrivateTelegram.path(), { method: "DELETE", body: EMPTY_BODY });
       setLocalChallenge(null);
       await loadPrivateTelegram(store);
@@ -195,31 +196,14 @@ export function TelegramLinkPopover() {
   };
 
   return (
-    <section
-      className="telegram-link"
+    <Dialog
       id="private-telegram-popover"
-      role="dialog"
-      aria-label={t("chat.telegram.settingsLabel")}
+      open
+      onClose={() => dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false })}
+      title={t("chat.telegram.title")}
+      description={status}
+      className="telegram-link-dialog"
     >
-      <div className="telegram-link__header">
-        <div className="telegram-link__meta">
-          <div className="telegram-link__title">
-            <Icon name="message" size={16} />
-            <span>{t("chat.telegram.title")}</span>
-          </div>
-          <div className="telegram-link__sub">{status}</div>
-        </div>
-        <button
-          className="icon-btn telegram-link__close"
-          type="button"
-          title={t("chat.telegram.collapse")}
-          aria-label={t("chat.telegram.collapseLabel")}
-          onClick={() => dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false })}
-        >
-          <Icon name="close" size={16} />
-        </button>
-      </div>
-
       <div className="telegram-link__body">
         {view === "linked" ? (
           <div className="telegram-link__account">
@@ -280,6 +264,6 @@ export function TelegramLinkPopover() {
           </>
         )}
       </div>
-    </section>
+    </Dialog>
   );
 }

@@ -42,7 +42,7 @@ export function UsageTable<T>({
     <section className="card usage-card">
       <CardHead title={title} icon={icon} desc={desc} />
       {rows.length ? (
-        <div className="usage-table-wrap">
+        <div className="usage-table-wrap" role="region" aria-label={title} tabIndex={0}>
           <table className="usage-table" aria-label={title}>
             <thead>
               <tr className="usage-table__row usage-table__head">

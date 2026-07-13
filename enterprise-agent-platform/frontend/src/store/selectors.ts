@@ -35,6 +35,10 @@ export function hasPermission(state: AppState, permission: string): boolean {
   return isAdmin(state) || userPermissions(state).has(permission);
 }
 
+export function isOperationPending(state: AppState, operationKey: string): boolean {
+  return state.pendingOperations.includes(operationKey);
+}
+
 /* --------------------------------------------------------------- scope */
 
 export function activeChannel(state: AppState): Channel | undefined {

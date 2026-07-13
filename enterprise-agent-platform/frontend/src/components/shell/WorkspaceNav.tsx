@@ -1,6 +1,5 @@
-/* <WorkspaceNav/> — the permission-gated workspace nav (legacy navSpecs,
-   legacy-app.js:440-446). Order: 频道, [私人 Agent], 知识库, 设置, [管理面板];
-   private requires the private_agent permission, admin requires isAdmin. */
+/* Primary workspace destinations. Channels are rendered as their own list;
+   settings live in the user menu and admin tools sit at the sidebar bottom. */
 
 import { usePermissions } from "../../hooks/usePermissions";
 import { useI18n } from "../../i18n";
@@ -19,14 +18,12 @@ export function WorkspaceNav() {
   const { t } = useI18n();
   const activeView = useStore((state) => state.activeView);
 
-  const specs: NavSpec[] = [{ view: "channel", label: t("nav.channels"), icon: "hash" }];
+  const specs: NavSpec[] = [];
   if (perms.has("private_agent")) specs.push({ view: "private", label: t("nav.privateAgent"), icon: "bot" });
   specs.push({ view: "knowledge", label: t("nav.knowledge"), icon: "library" });
-  specs.push({ view: "settings", label: t("nav.settings"), icon: "settings" });
-  if (perms.isAdmin) specs.push({ view: "admin", label: t("nav.admin"), icon: "shield" });
 
   return (
-    <nav className="nav">
+    <nav className="nav" aria-label={t("shell.navigation")}>
       {specs.map((spec) => (
         <NavItem
           key={spec.view}

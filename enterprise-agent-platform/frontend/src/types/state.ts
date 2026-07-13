@@ -90,6 +90,15 @@ export interface AppState {
 
   /* ui slice */
   sidebarOpen: boolean;
+  resourceStates: Record<string, ResourceState>;
+}
+
+export type ResourceStatus = "idle" | "loading" | "ready" | "error";
+
+export interface ResourceState {
+  status: ResourceStatus;
+  error: string;
+  updatedAt: number | null;
 }
 
 /* ----------------------------- per-slice state sub-types (for slice files) */
@@ -140,7 +149,7 @@ export type AdminSliceState = Pick<
   | "oauthCallbackUrls"
 >;
 
-export type UiSliceState = Pick<AppState, "sidebarOpen">;
+export type UiSliceState = Pick<AppState, "sidebarOpen" | "resourceStates">;
 
 /* ===================================================================== */
 /* Action discriminated union — the contract every reducer is filled against. */
@@ -369,6 +378,10 @@ interface SetSidebarOpenAction {
 interface ToggleSidebarAction {
   type: "TOGGLE_SIDEBAR";
 }
+interface SetResourceStateAction {
+  type: "SET_RESOURCE_STATE";
+  payload: { key: string; state: ResourceState };
+}
 
 export type Action =
   /* cross-cutting */
@@ -428,7 +441,8 @@ export type Action =
   | SetOAuthCallbackUrlsAction
   /* ui */
   | SetSidebarOpenAction
-  | ToggleSidebarAction;
+  | ToggleSidebarAction
+  | SetResourceStateAction;
 
 /** Discriminated-union helper: the action for a given `type`. */
 export type ActionOf<T extends Action["type"]> = Extract<Action, { type: T }>;

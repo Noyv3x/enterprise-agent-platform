@@ -1,7 +1,16 @@
-/* <MessageBody/> — the message text (legacy renderMessage body, :890). Rendered
-   only when content is truthy (the caller guards) so the streaming caret pseudo-
-   element never attaches to an empty node. white-space:pre-wrap lives in CSS. */
+import { lazy, Suspense } from "react";
 
+const MarkdownContent = lazy(() =>
+  import("./MarkdownContent").then((module) => ({ default: module.MarkdownContent })),
+);
+
+/** Lazy-load the Markdown parser only when chat content is actually rendered. */
 export function MessageBody({ content }: { content: string }) {
-  return <div className="msg__body">{content}</div>;
+  return (
+    <div className="msg__body">
+      <Suspense fallback={<span className="md-plaintext">{content}</span>}>
+        <MarkdownContent content={content} />
+      </Suspense>
+    </div>
+  );
 }

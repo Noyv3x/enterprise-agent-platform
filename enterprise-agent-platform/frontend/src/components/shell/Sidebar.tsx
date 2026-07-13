@@ -10,13 +10,16 @@ import { useStore } from "../../store/useStore";
 import { Brand } from "../common/Brand";
 import { ChannelCreateForm } from "./ChannelCreateForm";
 import { ChannelList } from "./ChannelList";
+import { NavItem } from "./NavItem";
 import { SidebarFoot } from "./SidebarFoot";
 import { WorkspaceNav } from "./WorkspaceNav";
 
 export function Sidebar({ hidden }: { hidden: boolean }) {
   const { t } = useI18n();
   const channelCount = useStore((state) => state.channels.length);
-  const canManageChannels = usePermissions().has("manage_channels");
+  const activeView = useStore((state) => state.activeView);
+  const permissions = usePermissions();
+  const canManageChannels = permissions.has("manage_channels");
 
   return (
     <aside
@@ -30,10 +33,6 @@ export function Sidebar({ hidden }: { hidden: boolean }) {
       </div>
       <div className="sidebar__scroll">
         <div>
-          <div className="section-label">{t("nav.workspace")}</div>
-          <WorkspaceNav />
-        </div>
-        <div>
           <div className="section-label">
             <span>{t("nav.channels")}</span>
             <span className="nav__badge">{channelCount}</span>
@@ -41,6 +40,23 @@ export function Sidebar({ hidden }: { hidden: boolean }) {
           <ChannelList />
           {canManageChannels ? <ChannelCreateForm /> : null}
         </div>
+        <div>
+          <div className="section-label">{t("nav.workspace")}</div>
+          <WorkspaceNav />
+        </div>
+        {permissions.isAdmin ? (
+          <div className="sidebar__tools">
+            <div className="section-label">{t("shell.tools")}</div>
+            <nav className="nav" aria-label={t("shell.tools")}>
+              <NavItem
+                view="admin"
+                label={t("nav.admin")}
+                icon="shield"
+                active={activeView === "admin"}
+              />
+            </nav>
+          </div>
+        ) : null}
       </div>
       <SidebarFoot />
     </aside>

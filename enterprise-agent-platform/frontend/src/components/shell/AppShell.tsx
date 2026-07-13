@@ -26,6 +26,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { usePolling } from "../../hooks/usePolling";
 import { useRealtime } from "../../hooks/useRealtime";
 import { useStore, useStoreHandle } from "../../store/useStore";
+import { useI18n } from "../../i18n";
 import { ContentRouter } from "./ContentRouter";
 import { Scrim } from "./Scrim";
 import { Sidebar } from "./Sidebar";
@@ -33,6 +34,7 @@ import { Topbar } from "./Topbar";
 
 export function AppShell() {
   const store = useStoreHandle();
+  const { t } = useI18n();
   const sidebarOpen = useStore((state) => state.sidebarOpen);
   const isMobile = useMediaQuery("(max-width: 800px)");
 
@@ -72,13 +74,22 @@ export function AppShell() {
   const overlayActive = sidebarOpen && isMobile;
 
   return (
-    <div className={cx("shell", sidebarOpen && "is-open")}>
-      <Sidebar hidden={drawerOffCanvas} />
-      <Scrim open={sidebarOpen} onClose={closeSidebar} />
-      <main className="main" inert={overlayActive} aria-hidden={overlayActive ? "true" : undefined}>
-        <Topbar />
-        <ContentRouter />
-      </main>
-    </div>
+    <>
+      <a className="skip-link" href="#main-content">{t("shell.skipToContent")}</a>
+      <div className={cx("shell", sidebarOpen && "is-open")}>
+        <Sidebar hidden={drawerOffCanvas} />
+        <Scrim open={sidebarOpen} onClose={closeSidebar} />
+        <main
+          className="main"
+          id="main-content"
+          tabIndex={-1}
+          inert={overlayActive}
+          aria-hidden={overlayActive ? "true" : undefined}
+        >
+          <Topbar />
+          <ContentRouter />
+        </main>
+      </div>
+    </>
   );
 }

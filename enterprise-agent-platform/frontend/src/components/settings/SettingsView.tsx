@@ -3,9 +3,12 @@ import { changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
 import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
+import { initials } from "../../utils/format";
 import { CardHead } from "../common/CardHead";
 import { EmptyState } from "../common/EmptyState";
 import { Field } from "../common/Field";
+import { LoadingButton } from "../common/LoadingButton";
+import { PageHeader } from "../common/PageHeader";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -13,7 +16,7 @@ export function SettingsView() {
   const { t } = useI18n();
   const store = useStoreHandle();
   const user = useStore((state) => state.user);
-  const busy = useStore((state) => state.busy);
+  const pendingOperations = useStore((state) => state.pendingOperations);
 
   const [displayName, setDisplayName] = useState("");
   const [position, setPosition] = useState("");
@@ -43,6 +46,12 @@ export function SettingsView() {
 
   const permissionId = user.permission_group || user.role || "member";
   const permissionLabel = permissionGroupLabel(t, permissionId, user.permission_group_label);
+  const profilePending = pendingOperations.includes("account:profile");
+  const passwordPending = pendingOperations.includes("account:password");
+  const profileDirty =
+    displayName !== (user.display_name || user.username || "") ||
+    position !== (user.position || "");
+  const passwordDirty = !!(currentPassword || newPassword || confirmPassword);
 
   const handleProfileSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -80,16 +89,27 @@ export function SettingsView() {
   return (
     <div className="panel">
       <div className="panel__inner settings-panel">
+        <PageHeader
+          title={t("nav.settings")}
+          description={t("account.settingsDescription")}
+        />
+        <section className="account-identity" aria-label={t("account.identitySummary")}>
+          <div className="avatar account-identity__avatar">
+            {initials(user.display_name || user.username)}
+          </div>
+          <div className="account-identity__main">
+            <strong>{user.display_name || user.username}</strong>
+            <span>@{user.username}</span>
+          </div>
+          <div className="account-identity__meta">
+            <span>{permissionLabel}</span>
+            {user.position ? <span>{user.position}</span> : null}
+          </div>
+        </section>
         <section className="card settings-card">
           <CardHead title={t("account.profile")} icon="settings" />
           <form onSubmit={handleProfileSubmit}>
             <div className="settings-form__grid">
-              <Field label={t("account.username")}>
-                <input value={user.username} disabled />
-              </Field>
-              <Field label={t("account.permissionGroup")}>
-                <input value={permissionLabel} disabled />
-              </Field>
               <Field label={t("account.displayName")}>
                 <input
                   autoComplete="name"
@@ -107,9 +127,15 @@ export function SettingsView() {
               </Field>
             </div>
             <div className="form-actions">
-              <button className="btn btn--primary" type="submit" disabled={busy}>
-                <span>{t("account.saveProfile")}</span>
-              </button>
+              <LoadingButton
+                type="submit"
+                variant="primary"
+                loading={profilePending}
+                loadingLabel={t("account.saving")}
+                disabled={!profileDirty}
+              >
+                {t("account.saveProfile")}
+              </LoadingButton>
             </div>
           </form>
         </section>
@@ -151,9 +177,15 @@ export function SettingsView() {
                   : ""}
             </div>
             <div className="form-actions">
-              <button className="btn btn--primary" type="submit" disabled={busy}>
-                <span>{t("account.updatePassword")}</span>
-              </button>
+              <LoadingButton
+                type="submit"
+                variant="primary"
+                loading={passwordPending}
+                loadingLabel={t("account.updatingPassword")}
+                disabled={!passwordDirty}
+              >
+                {t("account.updatePassword")}
+              </LoadingButton>
             </div>
           </form>
         </section>

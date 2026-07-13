@@ -1,10 +1,7 @@
-/* <TopbarActions/> — right-aligned topbar actions (legacy-app.js:521-524, 534).
-   The private-Telegram trigger appears only on the private view; the theme toggle
-   is always last/right. */
+/* Contextual topbar actions only. Persistent language/theme controls live in the
+   user menu to keep this header focused on the active workspace. */
 
 import { useStore } from "../../store/useStore";
-import { ThemeToggle } from "../common/ThemeToggle";
-import { LanguageSelect } from "../common/LanguageSelect";
 import { PrivateTelegramTrigger } from "./PrivateTelegramTrigger";
 
 export function TopbarActions() {
@@ -12,8 +9,6 @@ export function TopbarActions() {
   return (
     <div className="topbar__actions">
       {isPrivate ? <PrivateTelegramTrigger /> : null}
-      <LanguageSelect />
-      <ThemeToggle />
     </div>
   );
 }

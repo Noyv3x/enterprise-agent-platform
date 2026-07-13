@@ -5,43 +5,48 @@
    truth. Submit order matches legacy exactly: POST → clear inputs → reload →
    toast, all inside one runBusy (so inputs clear even if the reload fails). */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "../../context/ToastContext";
 import { createDocument, loadDocuments } from "../../data/knowledgeActions";
+import { resourceKeys, runResourceLoad } from "../../data/resourceState";
 import { runBusy } from "../../data/sessionActions";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import { CardHead } from "../common/CardHead";
 import { Field } from "../common/Field";
 import { Icon } from "../common/Icon";
 
-export function KnowledgeCreateCard() {
+export function KnowledgeCreateCard({
+  onSaved,
+  onDirtyChange,
+}: {
+  onSaved?: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
+}) {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const busy = useStore((state) => state.pendingOperations.includes("knowledge:create"));
   const [title, setTitle] = useState("");
   const [source, setSource] = useState("");
   const [summary, setSummary] = useState("");
   const [content, setContent] = useState("");
+  const dirty = !!(title || source || summary || content);
+
+  useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   return (
-    <section className="card">
-      <CardHead
-        title={t("knowledge.createTitle")}
-        icon="plus"
-        desc={t("knowledge.createDescription")}
-      />
+    <div className="knowledge-create">
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          void runBusy(store, async () => {
+          void runBusy(store, "knowledge:create", async () => {
             await createDocument({ title, source, summary, content });
             setTitle("");
             setSource("");
             setSummary("");
             setContent("");
-            await loadDocuments(store);
+            await runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store));
             toast(t("knowledge.saved"), { type: "ok", title: t("toast.complete") });
+            onSaved?.();
           });
         }}
       >
@@ -73,11 +78,11 @@ export function KnowledgeCreateCard() {
             onChange={(event) => setContent(event.target.value)}
           />
         </Field>
-        <button className="btn btn--primary" type="submit" disabled={busy}>
+        <button className="btn btn--primary" type="submit" disabled={busy || !title.trim() || !content.trim()}>
           <Icon name="plus" size={16} />
           <span>{t("knowledge.save")}</span>
         </button>
       </form>
-    </section>
+    </div>
   );
 }

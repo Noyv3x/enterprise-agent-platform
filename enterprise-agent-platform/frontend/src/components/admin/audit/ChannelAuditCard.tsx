@@ -35,7 +35,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
   const channels = useStore((state) => state.channels);
   const channelMessages = useStore((state) => state.messageAudit.channelMessages);
   const channelTotal = useStore((state) => state.messageAudit.channelTotal);
-  const busy = useStore((state) => state.busy);
+  const busy = useStore((state) => state.pendingOperations.some((key) => key.startsWith("admin:audit:")));
   const channel = channels.find((item) => String(item.id) === channelId);
 
   const [messageId, setMessageId] = useState("");

@@ -12,6 +12,7 @@ import { oauthProviderErrorText } from "../../../utils/oauth";
 import type { OAuthProvider } from "../../../types";
 import { Icon } from "../../common/Icon";
 import { StatusBadge } from "../../common/StatusBadge";
+import { LoadingButton } from "../../common/LoadingButton";
 import { CodexOAuthFlow } from "./CodexOAuthFlow";
 import { GrokOAuthFlow } from "./GrokOAuthFlow";
 import { useI18n, type Translator } from "../../../i18n";
@@ -25,7 +26,9 @@ function providerLabel(t: Translator, id: string, fallback: string | undefined):
 export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const verifying = useStore((state) =>
+    state.pendingOperations.includes(`admin:oauth:start:${provider.id}`),
+  );
   const flow = useStore((state) => state.oauthFlows[provider.id]);
   const callbackValue = useStore((state) => state.oauthCallbackUrls[provider.id] || "");
   const errorText = oauthProviderErrorText(provider);
@@ -78,14 +81,16 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
         </div>
       ) : null}
       <div className="oauth-actions">
-        <button
-          className={provider.configured ? "btn btn--sm" : "btn btn--primary btn--sm"}
-          disabled={busy}
+        <LoadingButton
+          className="btn--sm"
+          variant={provider.configured ? "default" : "primary"}
+          loading={verifying}
+          loadingLabel={t("admin.common.verifying")}
           onClick={() => void startOAuthVerification(store, provider.id)}
         >
           <Icon name="shield" size={14} />
           <span>{t(provider.configured ? "admin.oauth.reverify" : "admin.oauth.startVerification")}</span>
-        </button>
+        </LoadingButton>
       </div>
       {flow?.kind === "device_code" ? <CodexOAuthFlow providerId={provider.id} flow={flow} /> : null}
       {flow?.kind === "manual_callback" ? (

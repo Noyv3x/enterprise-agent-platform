@@ -38,6 +38,7 @@ import {
   type AppStore,
 } from "./loaders";
 import { resetSession, runBusy } from "./sessionActions";
+import { ensureAdminPageResource } from "./adminResources";
 import { t } from "../i18n";
 import type {
   AdminPageId,
@@ -70,7 +71,7 @@ export async function createAccount(
   body: CreateUserRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:accounts:create", async () => {
     await api(endpoints.createUser.path(), {
       method: "POST",
       body: JSON.stringify(body),
@@ -90,7 +91,7 @@ export async function updateAccount(
   body: UpdateUserRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:accounts:update:${userId}`, async () => {
     await api(endpoints.updateUser.path(userId), {
       method: "PUT",
       body: JSON.stringify(body),
@@ -102,7 +103,7 @@ export async function updateAccount(
 }
 
 export async function impersonateAccount(store: AppStore, userId: Id): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:accounts:impersonate:${userId}`, async () => {
     const result = await api<ImpersonateUserResponse>(endpoints.impersonateUser.path(userId), {
       method: "POST",
       body: EMPTY_BODY,
@@ -123,12 +124,12 @@ export async function impersonateAccount(store: AppStore, userId: Id): Promise<v
  *  set tokenUsageDays first, then refetch (loadTokenUsage reads it). */
 export async function changeTokenUsageDays(store: AppStore, days: number): Promise<void> {
   store.dispatch({ type: "SET_TOKEN_USAGE_DAYS", payload: Number(days) || 30 });
-  await runBusy(store, () => loadTokenUsage(store));
+  await runBusy(store, "admin:tokens:range", () => loadTokenUsage(store));
 }
 
 /** Manual refresh button (legacy onclick withBusy(loadTokenUsage)). */
 export async function refreshTokenUsage(store: AppStore): Promise<void> {
-  await runBusy(store, () => loadTokenUsage(store));
+  await runBusy(store, "admin:tokens:refresh", () => loadTokenUsage(store));
 }
 
 /* =============================================================== paging */
@@ -137,8 +138,7 @@ export async function refreshTokenUsage(store: AppStore): Promise<void> {
  *  set the active page, then lazily load messages/tokens on each click. */
 export async function selectAdminPage(store: AppStore, pageId: AdminPageId): Promise<void> {
   store.dispatch({ type: "SET_ACTIVE_ADMIN_PAGE", payload: pageId });
-  if (pageId === "messages") await runBusy(store, () => loadMessageAudit(store));
-  else if (pageId === "tokens") await runBusy(store, () => loadTokenUsage(store));
+  await ensureAdminPageResource(store, pageId);
 }
 
 /* ========================================================== audit: select */
@@ -146,23 +146,23 @@ export async function selectAdminPage(store: AppStore, pageId: AdminPageId): Pro
 /** Channel select change (legacy channelSelect onchange, legacy-app.js:1798-1801). */
 export async function selectAuditChannel(store: AppStore, channelId: string): Promise<void> {
   store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditChannelId: channelId } });
-  await runBusy(store, () => loadAuditChannelMessages(store, channelId));
+  await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
 }
 
 /** Conversation select (legacy renderPrivateConversationItem onclick, :1952-1954). */
 export async function selectAuditConversation(store: AppStore, userId: Id): Promise<void> {
   store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditPrivateUserId: String(userId) } });
-  await runBusy(store, () => loadAuditPrivateMessages(store, userId));
+  await runBusy(store, `admin:audit:private:${userId}`, () => loadAuditPrivateMessages(store, userId));
 }
 
 /** Channel-card refresh button (legacy onclick withBusy(loadAuditChannelMessages)). */
 export async function refreshAuditChannel(store: AppStore, channelId: string): Promise<void> {
-  await runBusy(store, () => loadAuditChannelMessages(store, channelId));
+  await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
 }
 
 /** Private-card refresh button (legacy onclick withBusy(loadMessageAudit)). */
 export async function refreshMessageAudit(store: AppStore): Promise<void> {
-  await runBusy(store, () => loadMessageAudit(store));
+  await runBusy(store, "admin:audit:refresh", () => loadMessageAudit(store));
 }
 
 /* ===================================================== audit: cascade reloads */
@@ -194,7 +194,7 @@ export async function deleteChannelMessage(
   messageId: Id,
 ): Promise<void> {
   if (!channelId || !messageId) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:delete-channel:${messageId}`, async () => {
     const result = await api<DeleteResultResponse>(
       endpoints.deleteChannelMessage.path(channelId, messageId),
       { method: "DELETE", body: EMPTY_BODY },
@@ -211,7 +211,7 @@ export async function deleteChannelMessagesBefore(
   beforeCreatedAt: number,
 ): Promise<void> {
   if (!channelId || !beforeCreatedAt) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:trim-channel:${channelId}`, async () => {
     const body: DeleteBeforeRequest = { before_created_at: beforeCreatedAt };
     const result = await api<DeleteResultResponse>(endpoints.deleteChannelMessages.path(channelId), {
       method: "DELETE",
@@ -225,7 +225,7 @@ export async function deleteChannelMessagesBefore(
 /** legacy clearChannelMessages (legacy-app.js:3088-3099). */
 export async function clearChannelMessages(store: AppStore, channelId: Id): Promise<void> {
   if (!channelId) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:clear-channel:${channelId}`, async () => {
     const body: DeleteClearAllRequest = { clear_all: true };
     const result = await api<DeleteResultResponse>(endpoints.deleteChannelMessages.path(channelId), {
       method: "DELETE",
@@ -245,7 +245,7 @@ export async function deletePrivateMessage(
   messageId: Id,
 ): Promise<void> {
   if (!userId || !messageId) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:delete-private:${messageId}`, async () => {
     const result = await api<DeleteResultResponse>(
       endpoints.deletePrivateMessage.path(userId, messageId),
       { method: "DELETE", body: EMPTY_BODY },
@@ -262,7 +262,7 @@ export async function deletePrivateMessagesBefore(
   beforeCreatedAt: number,
 ): Promise<void> {
   if (!userId || !beforeCreatedAt) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:trim-private:${userId}`, async () => {
     const body: DeleteBeforeRequest = { before_created_at: beforeCreatedAt };
     const result = await api<DeleteResultResponse>(endpoints.deletePrivateMessages.path(userId), {
       method: "DELETE",
@@ -276,7 +276,7 @@ export async function deletePrivateMessagesBefore(
 /** legacy clearPrivateMessages (legacy-app.js:3124-3135). */
 export async function clearPrivateMessages(store: AppStore, userId: Id): Promise<void> {
   if (!userId) return;
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:audit:clear-private:${userId}`, async () => {
     const body: DeleteClearAllRequest = { clear_all: true };
     const result = await api<DeleteResultResponse>(endpoints.deletePrivateMessages.path(userId), {
       method: "DELETE",
@@ -304,7 +304,7 @@ export async function saveSecurityConfig(
   body: SecurityConfigUpdateRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:security:save", async () => {
     const result = await api<SecurityConfigResponse>(endpoints.updateSecurityConfig.path(), {
       method: "PUT",
       body: JSON.stringify(body),
@@ -331,7 +331,7 @@ export async function saveHermesConfig(
   body: HermesConfigUpdateRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:model:save", async () => {
     await api(endpoints.updateHermesConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
     await loadSettings(store);
@@ -346,7 +346,7 @@ export async function saveTelegramConfig(
   body: TelegramConfigUpdateRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:telegram:save", async () => {
     await api(endpoints.updateTelegramConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
     await loadTelegramConfig(store);
@@ -361,7 +361,7 @@ export async function saveAutoUpdateConfig(
   body: AutoUpdateConfigUpdateRequest,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:updates:save", async () => {
     await api(endpoints.updateAutoUpdateConfig.path(), {
       method: "PUT",
       body: JSON.stringify(body),
@@ -374,7 +374,7 @@ export async function saveAutoUpdateConfig(
 
 /** legacy "立即检查" button (legacy-app.js:2435-2440). POST literal "{}". */
 export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:updates:check", async () => {
     await api(endpoints.autoUpdateCheck.path(), { method: "POST", body: EMPTY_BODY });
     await loadAutoUpdateConfig(store);
     toast(t("admin.toast.autoUpdateCheck"), { type: "ok", title: t("admin.toast.sent") });
@@ -391,7 +391,7 @@ export async function saveHermesYamlFields(
   store: AppStore,
   updates: Record<string, string>,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:hermes:fields:save", async () => {
     await api(endpoints.updateHermesInternalConfig.path(), {
       method: "PUT",
       body: JSON.stringify({ yaml_updates: updates }),
@@ -402,7 +402,7 @@ export async function saveHermesYamlFields(
 }
 
 export async function saveHermesYamlText(store: AppStore, yamlText: string): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:hermes:yaml:save", async () => {
     await api(endpoints.updateHermesInternalConfig.path(), {
       method: "PUT",
       body: JSON.stringify({ yaml_text: yamlText }),
@@ -416,7 +416,7 @@ export async function saveHermesEnv(
   store: AppStore,
   updates: Record<string, string>,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:hermes:env:save", async () => {
     await api(endpoints.updateHermesInternalConfig.path(), {
       method: "PUT",
       body: JSON.stringify({ env: updates }),
@@ -432,7 +432,7 @@ export async function saveCogneeEnv(
   store: AppStore,
   updates: Record<string, string>,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:cognee:save", async () => {
     await api(endpoints.updateCogneeConfig.path(), {
       method: "PUT",
       body: JSON.stringify({ env: updates }),
@@ -448,7 +448,7 @@ export async function saveCogneeEnv(
 /** legacy runtime restart/refresh button (legacy-app.js:2114-2118). POST "{}",
  *  then reload ALL settings (same endpoint regardless of the button label). */
 export async function restartRuntime(store: AppStore, name: string): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:runtime:restart:${name}`, async () => {
     await api(endpoints.restartRuntime.path(name), {
       method: "POST",
       body: EMPTY_BODY,
@@ -460,7 +460,7 @@ export async function restartRuntime(store: AppStore, name: string): Promise<voi
 
 /** legacy runHermesInstall (legacy-app.js:2130-2136). POST "{}", reload ALL. */
 export async function installHermes(store: AppStore): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:runtime:install-hermes", async () => {
     await api(endpoints.installHermes.path(), {
       method: "POST",
       body: EMPTY_BODY,
@@ -484,7 +484,7 @@ export async function setSecret(
   value: string,
   onSuccess?: () => void,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:secrets:set:${key}`, async () => {
     await api(endpoints.setSecret.path(key), { method: "PUT", body: JSON.stringify({ value }) });
     onSuccess?.();
     await loadSecrets(store);
@@ -518,7 +518,7 @@ function updateOAuthState(
 }
 
 export async function startOAuthVerification(store: AppStore, providerId: string): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:oauth:start:${providerId}`, async () => {
     const result = await api<OAuthFlowResponse>(endpoints.startOAuth.path(providerId), {
       method: "POST",
       body: EMPTY_BODY,
@@ -533,7 +533,7 @@ export async function pollOAuthVerification(
   providerId: string,
   flowId: string,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:oauth:poll:${providerId}`, async () => {
     const result = await api<OAuthFlowResponse>(endpoints.pollOAuth.path(providerId), {
       method: "POST",
       body: JSON.stringify({ flow_id: flowId }),
@@ -548,7 +548,7 @@ export async function completeOAuthVerification(
   providerId: string,
   flowId: string,
 ): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, `admin:oauth:complete:${providerId}`, async () => {
     const callbackUrl = store.getState().oauthCallbackUrls[providerId] || "";
     const result = await api<OAuthFlowResponse>(endpoints.completeOAuth.path(providerId), {
       method: "POST",
@@ -570,7 +570,7 @@ export function setOAuthCallbackUrl(store: AppStore, providerId: string, value: 
 /** legacy exportOAuthCredentials (legacy-app.js:3391-3405). GET (no body) →
  *  client-side JSON download; no state change. */
 export async function exportOAuthCredentials(store: AppStore): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:oauth:export", async () => {
     const payload = await api(endpoints.exportOAuthCredentials.path());
     downloadJson(payload, `ubitech-agent-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
     toast(t("admin.toast.oauthExported"), { type: "ok", title: t("admin.toast.complete") });
@@ -581,7 +581,7 @@ export async function exportOAuthCredentials(store: AppStore): Promise<void> {
  *  (throw the exact Chinese error on failure), POST { credentials }, then reload
  *  secrets + hermesConfig. */
 export async function importOAuthCredentials(store: AppStore, file: File): Promise<void> {
-  await runBusy(store, async () => {
+  await runBusy(store, "admin:oauth:import", async () => {
     let credentials: unknown;
     try {
       credentials = JSON.parse(await file.text());

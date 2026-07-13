@@ -1,8 +1,8 @@
 /* <TokenUsageCurve/> — the 7-day token consumption SVG curve (legacy
    renderTokenUsageCurve, legacy-app.js:1680-1724). Geometry comes from
    utils/tokenCurve (640×170, padX 26, padY 18, x-step 98, baseline y 152),
-   computed once per data change via useMemo. The viewBox + preserveAspectRatio
-   stretch the curve to the container width with no resize listener. */
+   computed once per data change via useMemo. The SVG keeps the source aspect
+   ratio so the trend is never visually distorted by a narrow container. */
 
 import { useMemo } from "react";
 import { formatCompactNumber, formatNumber } from "../../../utils/format";
@@ -31,7 +31,7 @@ export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
         viewBox={`0 0 ${width} ${height}`}
         role="img"
         aria-label={t("admin.tokens.curve.ariaLabel")}
-        preserveAspectRatio="none"
+        preserveAspectRatio="xMidYMid meet"
       >
         <line
           className="token-curve__axis"

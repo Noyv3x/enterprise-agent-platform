@@ -85,8 +85,23 @@ export function logout(store: AppStore): Promise<void> {
 
 /** The withBusy port: global busy flag + clear error; on throw store the error
  *  and toast it ONLY when logged in (login screen shows .error inline instead). */
-export async function runBusy(store: AppStore, fn: () => Promise<void> | void): Promise<void> {
-  const operationId = `operation-${++busyOperationSequence}`;
+export async function runBusy(
+  store: AppStore,
+  operationKeyOrFn: string | (() => Promise<void> | void),
+  maybeFn?: () => Promise<void> | void,
+): Promise<void> {
+  const operationId =
+    typeof operationKeyOrFn === "string"
+      ? operationKeyOrFn
+      : `operation-${++busyOperationSequence}`;
+  const fn = typeof operationKeyOrFn === "string" ? maybeFn : operationKeyOrFn;
+  if (!fn) throw new Error(`Missing operation callback for ${operationId}`);
+  if (
+    typeof operationKeyOrFn === "string" &&
+    store.getState().pendingOperations.includes(operationId)
+  ) {
+    return;
+  }
   store.dispatch({ type: "BEGIN_BUSY", payload: operationId });
   store.dispatch({ type: "SET_ERROR", payload: "" });
   try {

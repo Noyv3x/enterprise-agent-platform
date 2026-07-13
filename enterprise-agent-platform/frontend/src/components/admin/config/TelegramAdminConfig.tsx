@@ -13,6 +13,7 @@ import type { TelegramConfigValues } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { StatusBadge } from "../../common/StatusBadge";
+import { LoadingButton } from "../../common/LoadingButton";
 import { useI18n } from "../../../i18n";
 
 interface TelegramFormState {
@@ -36,7 +37,7 @@ function seedForm(config: TelegramConfigValues): TelegramFormState {
 export function TelegramAdminConfig() {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const saving = useStore((state) => state.pendingOperations.includes("admin:telegram:save"));
   const telegramConfig = useStore((state) => state.telegramConfig);
   const config = telegramConfig?.config || {};
   const linked = telegramConfig?.linked_users || [];
@@ -47,6 +48,8 @@ export function TelegramAdminConfig() {
   useEffect(() => {
     setForm(seedForm(telegramConfig?.config || {}));
   }, [telegramConfig]);
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(telegramConfig?.config || {}));
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -131,12 +134,23 @@ export function TelegramAdminConfig() {
           </div>
         </div>
         <div className="form-actions">
-          <button className="btn btn--primary" type="submit" disabled={busy}>
-            <span>{t("admin.telegram.save")}</span>
-          </button>
+          <LoadingButton
+            variant="primary"
+            type="submit"
+            disabled={!dirty}
+            loading={saving}
+            loadingLabel={t("admin.common.saving")}
+          >
+            {t("admin.telegram.save")}
+          </LoadingButton>
         </div>
       </form>
-      <div className="usage-table-wrap usage-table-wrap--spaced">
+      <div
+        className="usage-table-wrap usage-table-wrap--spaced"
+        role="region"
+        aria-label={t("admin.telegram.linkedAria")}
+        tabIndex={0}
+      >
         <table className="usage-table" aria-label={t("admin.telegram.linkedAria")}>
           <thead>
             <tr className="usage-table__row usage-table__head">

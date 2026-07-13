@@ -73,13 +73,31 @@ export function MessageList({
   const ref = useRef<HTMLDivElement>(null);
   const scopeType = scopeTypeFor(mode);
   const scopeKey = `${scopeType}:${scopeId}`;
-  useStickyScroll(ref, scopeKey, forceBottomToken);
 
   const messages = useStore((state) => (mode === "private" ? state.privateMessages : state.messages));
   const status = useStore((state) => agentStatusFor(state, mode));
   const typingUsers = useStore((state) => (mode === "channel" ? state.typingUsers : EMPTY_TYPING));
   const canApprove = useStore((state) =>
     mode === "private" ? hasPermission(state, "private_agent") : hasPermission(state, "chat"),
+  );
+  const streamCount = status
+    ? (status.stream_messages || []).filter((stream) => !!stream?.content).length +
+      (status.stream_message?.content ? 1 : 0)
+    : 0;
+  const contentRevision =
+    messages.reduce((total, message) => total + (message.content?.length || 0), 0) +
+    (status?.stream_messages || []).reduce((total, stream) => total + (stream.content?.length || 0), 0) +
+    (status?.stream_message?.content?.length || 0) +
+    (status?.activity || []).reduce(
+      (total, step) => total + (step.label?.length || 0) + (step.detail?.length || 0) + (step.line?.length || 0),
+      0,
+    );
+  const { atBottom, unreadCount, scrollToBottom } = useStickyScroll(
+    ref,
+    scopeKey,
+    forceBottomToken,
+    messages.length + streamCount,
+    contentRevision,
   );
 
   let body: ReactNode;
@@ -146,18 +164,30 @@ export function MessageList({
   }
 
   return (
-    <div
-      className="messages"
-      data-chat-key={scopeKey}
-      ref={ref}
-      role="log"
-      aria-label={mode === "private" ? t("chat.log.privateLabel") : t("chat.log.channelLabel")}
-      aria-live="polite"
-      aria-relevant="additions text"
-      aria-busy={isAgentActive(status)}
-      tabIndex={0}
-    >
-      {body}
+    <div className="message-pane">
+      <div
+        className="messages"
+        data-chat-key={scopeKey}
+        ref={ref}
+        role="log"
+        aria-label={mode === "private" ? t("chat.log.privateLabel") : t("chat.log.channelLabel")}
+        aria-live="polite"
+        aria-relevant="additions text"
+        aria-busy={isAgentActive(status)}
+        tabIndex={0}
+      >
+        {body}
+      </div>
+      {!atBottom ? (
+        <button type="button" className="scroll-latest" onClick={scrollToBottom}>
+          <span aria-hidden="true">↓</span>
+          <span>
+            {unreadCount
+              ? t("chat.scroll.newMessages", { count: unreadCount })
+              : t("chat.scroll.toBottom")}
+          </span>
+        </button>
+      ) : null}
     </div>
   );
 }

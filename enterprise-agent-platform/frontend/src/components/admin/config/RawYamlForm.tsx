@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../../../store/useStore";
 import { useI18n } from "../../../i18n";
+import { LoadingButton } from "../../common/LoadingButton";
 
 export interface RawYamlFormProps {
   value: string;
@@ -16,7 +17,9 @@ export interface RawYamlFormProps {
 
 export function RawYamlForm({ value, onSubmit }: RawYamlFormProps) {
   const { t } = useI18n();
-  const busy = useStore((state) => state.busy);
+  const saving = useStore((state) =>
+    state.pendingOperations.includes("admin:hermes:yaml:save"),
+  );
   const [text, setText] = useState(value);
   const lastSeeded = useRef(value);
 
@@ -26,6 +29,8 @@ export function RawYamlForm({ value, onSubmit }: RawYamlFormProps) {
       setText(value);
     }
   }, [value]);
+
+  const dirty = text !== lastSeeded.current;
 
   return (
     <form
@@ -44,9 +49,15 @@ export function RawYamlForm({ value, onSubmit }: RawYamlFormProps) {
         onChange={(event) => setText(event.target.value)}
       />
       <div className="form-actions">
-        <button className="btn btn--primary" type="submit" disabled={busy}>
-          <span>{t("admin.config.hermesInternal.saveYaml")}</span>
-        </button>
+        <LoadingButton
+          variant="primary"
+          type="submit"
+          disabled={!dirty}
+          loading={saving}
+          loadingLabel={t("admin.common.saving")}
+        >
+          {t("admin.config.hermesInternal.saveYaml")}
+        </LoadingButton>
       </div>
     </form>
   );

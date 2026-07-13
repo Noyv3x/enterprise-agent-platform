@@ -33,6 +33,8 @@ export function CogneeInternalConfig() {
         attr="envKey"
         buttonText={t("admin.config.cogneeInternal.saveEnv")}
         onSubmit={(updates) => saveCogneeEnv(store, updates)}
+        operationKey="admin:cognee:save"
+        loadingLabel={t("admin.common.saving")}
       />
     </section>
   );

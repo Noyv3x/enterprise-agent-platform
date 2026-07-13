@@ -170,6 +170,28 @@ export const chatMessages = defineMessages({
   "chat.log.channelLabel": { "zh-CN": "频道消息", en: "Channel messages", "zh-TW": "頻道訊息" },
   "chat.message.sending": { "zh-CN": "发送中", en: "Sending", "zh-TW": "傳送中" },
   "chat.message.generating": { "zh-CN": "生成中", en: "Generating", "zh-TW": "產生中" },
+  "chat.copy.message": { "zh-CN": "复制消息", en: "Copy message", "zh-TW": "複製訊息" },
+  "chat.copy.code": { "zh-CN": "复制代码", en: "Copy code", "zh-TW": "複製程式碼" },
+  "chat.copy.copied": { "zh-CN": "已复制", en: "Copied", "zh-TW": "已複製" },
+  "chat.copy.failed": { "zh-CN": "复制失败", en: "Copy failed", "zh-TW": "複製失敗" },
+  "chat.markdown.codeLabel": { "zh-CN": "代码", en: "Code", "zh-TW": "程式碼" },
+  "chat.markdown.tableLabel": {
+    "zh-CN": "消息表格，可横向滚动",
+    en: "Message table, scroll horizontally",
+    "zh-TW": "訊息表格，可水平捲動",
+  },
+  "chat.markdown.imageBlocked": {
+    "zh-CN": "已阻止外部图片：{alt}",
+    en: "External image blocked: {alt}",
+    "zh-TW": "已封鎖外部圖片：{alt}",
+  },
+  "chat.markdown.imageFallback": { "zh-CN": "图片", en: "image", "zh-TW": "圖片" },
+  "chat.scroll.toBottom": { "zh-CN": "回到底部", en: "Jump to latest", "zh-TW": "回到底部" },
+  "chat.scroll.newMessages": {
+    "zh-CN": { other: "{count} 条新消息" },
+    en: { one: "{count} new message", other: "{count} new messages" },
+    "zh-TW": { other: "{count} 則新訊息" },
+  },
   "chat.typing.someone": { "zh-CN": "有人正在输入", en: "Someone is typing", "zh-TW": "有人正在輸入" },
   "chat.typing.users": {
     "zh-CN": { other: "{names} 正在输入" },

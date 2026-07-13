@@ -10,6 +10,7 @@ import { safeUrl } from "../../../lib/api";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { OAuthManualCallbackFlow } from "../../../types";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { useI18n } from "../../../i18n";
 
 function flowStatus(t: ReturnType<typeof useI18n>["t"], status: string | undefined): string {
@@ -28,7 +29,9 @@ export interface GrokOAuthFlowProps {
 export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlowProps) {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const busy = useStore((state) => state.busy);
+  const verifying = useStore((state) =>
+    state.pendingOperations.includes(`admin:oauth:complete:${providerId}`),
+  );
 
   return (
     <div className="oauth-guide">
@@ -49,14 +52,17 @@ export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlow
         onChange={(event) => setOAuthCallbackUrl(store, providerId, event.target.value)}
       />
       <div className="oauth-actions">
-        <button
-          className="btn btn--primary btn--sm"
-          disabled={busy}
+        <LoadingButton
+          className="btn--sm"
+          variant="primary"
+          disabled={!callbackValue.trim()}
+          loading={verifying}
+          loadingLabel={t("admin.common.verifying")}
           onClick={() => void completeOAuthVerification(store, providerId, flow.flow_id)}
         >
           <Icon name="checkCircle" size={14} />
           <span>{t("admin.oauth.completeVerification")}</span>
-        </button>
+        </LoadingButton>
         <span className="muted" style={{ fontSize: "12px" }} aria-live="polite">
           {t("admin.oauth.status", { status: flowStatus(t, flow.status) })}
         </span>

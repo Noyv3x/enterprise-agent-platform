@@ -5,6 +5,11 @@ export const workspaceMessages = defineMessages({
   "toast.operationFailed": { "zh-CN": "操作失败", en: "Operation failed", "zh-TW": "操作失敗" },
   "toast.close": { "zh-CN": "关闭通知", en: "Dismiss notification", "zh-TW": "關閉通知" },
 
+  "resource.loading": { "zh-CN": "正在加载", en: "Loading", "zh-TW": "正在載入" },
+  "resource.loadFailed": { "zh-CN": "加载失败", en: "Unable to load", "zh-TW": "載入失敗" },
+  "resource.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
+  "resource.refreshing": { "zh-CN": "正在刷新…", en: "Refreshing…", "zh-TW": "正在重新整理…" },
+
   "session.expired": {
     "zh-CN": "会话已过期，请重新登录",
     en: "Your session has expired. Sign in again.",
@@ -29,12 +34,23 @@ export const workspaceMessages = defineMessages({
     "zh-TW": "請登入後查看帳戶設定。",
   },
   "account.profile": { "zh-CN": "账户资料", en: "Account profile", "zh-TW": "帳戶資料" },
+  "account.settingsDescription": {
+    "zh-CN": "管理个人资料和登录密码。",
+    en: "Manage your profile and sign-in password.",
+    "zh-TW": "管理個人資料和登入密碼。",
+  },
+  "account.identitySummary": {
+    "zh-CN": "当前账户",
+    en: "Current account",
+    "zh-TW": "目前帳戶",
+  },
   "account.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },
   "account.permissionGroup": { "zh-CN": "权限组", en: "Permission group", "zh-TW": "權限群組" },
   "account.member": { "zh-CN": "成员", en: "Member", "zh-TW": "成員" },
   "account.displayName": { "zh-CN": "显示名称", en: "Display name", "zh-TW": "顯示名稱" },
   "account.position": { "zh-CN": "职位", en: "Position", "zh-TW": "職位" },
   "account.saveProfile": { "zh-CN": "保存资料", en: "Save profile", "zh-TW": "儲存資料" },
+  "account.saving": { "zh-CN": "保存中…", en: "Saving…", "zh-TW": "儲存中…" },
   "account.changePassword": { "zh-CN": "修改密码", en: "Change password", "zh-TW": "修改密碼" },
   "account.currentPassword": { "zh-CN": "当前密码", en: "Current password", "zh-TW": "目前密碼" },
   "account.newPassword": { "zh-CN": "新密码", en: "New password", "zh-TW": "新密碼" },
@@ -44,6 +60,11 @@ export const workspaceMessages = defineMessages({
     "zh-TW": "確認新密碼",
   },
   "account.updatePassword": { "zh-CN": "更新密码", en: "Update password", "zh-TW": "更新密碼" },
+  "account.updatingPassword": {
+    "zh-CN": "更新中…",
+    en: "Updating…",
+    "zh-TW": "更新中…",
+  },
   "account.passwordMismatch": {
     "zh-CN": "两次输入的新密码不一致",
     en: "The new passwords do not match",
@@ -88,6 +109,32 @@ export const workspaceMessages = defineMessages({
     en: "Add structured knowledge for Agent search and reference.",
     "zh-TW": "以結構化方式新增知識，供 Agent 搜尋及引用。",
   },
+  "knowledge.pageDescription": {
+    "zh-CN": "搜索、浏览并维护 Agent 可以引用的知识。",
+    en: "Search, browse, and maintain knowledge the Agent can reference.",
+    "zh-TW": "搜尋、瀏覽並維護 Agent 可以引用的知識。",
+  },
+  "knowledge.selectDocument": {
+    "zh-CN": "选择一篇文档",
+    en: "Select a document",
+    "zh-TW": "選擇一篇文件",
+  },
+  "knowledge.selectDocumentDetail": {
+    "zh-CN": "从左侧列表选择文档以查看正文。",
+    en: "Choose a document from the list to read its content.",
+    "zh-TW": "從左側清單選擇文件以檢視正文。",
+  },
+  "knowledge.discardTitle": {
+    "zh-CN": "放弃未保存内容？",
+    en: "Discard unsaved entry?",
+    "zh-TW": "放棄未儲存內容？",
+  },
+  "knowledge.discardMessage": {
+    "zh-CN": "关闭后，当前填写的知识条目不会保留。",
+    en: "The entry you are composing will not be kept after closing.",
+    "zh-TW": "關閉後，目前填寫的知識項目不會保留。",
+  },
+  "knowledge.discardConfirm": { "zh-CN": "放弃", en: "Discard", "zh-TW": "放棄" },
   "knowledge.saved": { "zh-CN": "已保存知识条目", en: "Knowledge entry saved", "zh-TW": "已儲存知識項目" },
   "knowledge.title": { "zh-CN": "标题", en: "Title", "zh-TW": "標題" },
   "knowledge.source": { "zh-CN": "来源", en: "Source", "zh-TW": "來源" },
@@ -123,6 +170,8 @@ export const workspaceMessages = defineMessages({
     "zh-TW": "搜尋標題或正文…",
   },
   "knowledge.searchLabel": { "zh-CN": "搜索知识库", en: "Search knowledge base", "zh-TW": "搜尋知識庫" },
+  "knowledge.search": { "zh-CN": "搜索", en: "Search", "zh-TW": "搜尋" },
+  "knowledge.searching": { "zh-CN": "搜索中…", en: "Searching…", "zh-TW": "搜尋中…" },
   "knowledge.clearSearch": { "zh-CN": "清除搜索", en: "Clear search", "zh-TW": "清除搜尋" },
   "knowledge.clearSearchDetail": {
     "zh-CN": "清除搜索，显示全部条目",

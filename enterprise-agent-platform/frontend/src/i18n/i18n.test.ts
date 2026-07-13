@@ -79,6 +79,19 @@ describe("translation catalogs", () => {
     }
   });
 
+  it("keeps every localized message and plural branch non-empty", () => {
+    for (const [key, definition] of Object.entries(messages)) {
+      for (const locale of ["zh-CN", "en", "zh-TW"] as const) {
+        const value = definition[locale];
+        const templates = typeof value === "string" ? [value] : Object.values(value);
+        expect(templates.length, `${key} ${locale} templates`).toBeGreaterThan(0);
+        for (const template of templates) {
+          expect(template.trim(), `${key} ${locale} empty template`).not.toBe("");
+        }
+      }
+    }
+  });
+
   it("keeps interpolation parameters aligned across locales", () => {
     const parameters = (value: string | Record<string, string>) => {
       const templates = typeof value === "string" ? [value] : Object.values(value);

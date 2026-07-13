@@ -12,17 +12,21 @@
      - values are sent as strings (numbers are NOT coerced — backend parses).
    If the diff is empty the submit is a no-op (onSubmit is not called). */
 
+import { useState } from "react";
 import { useStore } from "../../store/useStore";
 import type { ConfigFieldDescriptor } from "../../types";
 import { ConfigFieldControl, type ConfigAttr } from "./ConfigFieldControl";
 import { useI18n } from "../../i18n";
 import { CONFIG_FIELD_GROUP_KEYS, CONFIG_FIELD_LABEL_KEYS } from "../../i18n/messages/admin";
+import { LoadingButton } from "./LoadingButton";
 
 export interface ConfigFormProps {
   fields: ConfigFieldDescriptor[];
   attr: ConfigAttr;
   buttonText: string;
   onSubmit: (updates: Record<string, string>) => void | Promise<void>;
+  operationKey?: string;
+  loadingLabel?: string;
 }
 
 interface FieldGroup {
@@ -63,9 +67,19 @@ function collectConfigUpdates(form: HTMLFormElement, attr: ConfigAttr): Record<s
   return updates;
 }
 
-export function ConfigForm({ fields, attr, buttonText, onSubmit }: ConfigFormProps) {
+export function ConfigForm({
+  fields,
+  attr,
+  buttonText,
+  onSubmit,
+  operationKey,
+  loadingLabel,
+}: ConfigFormProps) {
   const { t } = useI18n();
-  const busy = useStore((state) => state.busy);
+  const loading = useStore((state) =>
+    operationKey ? state.pendingOperations.includes(operationKey) : state.busy,
+  );
+  const [dirty, setDirty] = useState(false);
 
   if (!fields.length) {
     return <div className="muted">{t("admin.config.loading")}</div>;
@@ -76,6 +90,9 @@ export function ConfigForm({ fields, attr, buttonText, onSubmit }: ConfigFormPro
   return (
     <form
       className="config-fields-form"
+      onChange={(event) => {
+        setDirty(Object.keys(collectConfigUpdates(event.currentTarget, attr)).length > 0);
+      }}
       onSubmit={(event) => {
         event.preventDefault();
         const updates = collectConfigUpdates(event.currentTarget, attr);
@@ -109,9 +126,15 @@ export function ConfigForm({ fields, attr, buttonText, onSubmit }: ConfigFormPro
         ))}
       </div>
       <div className="form-actions">
-        <button className="btn btn--primary" type="submit" disabled={busy}>
-          <span>{buttonText}</span>
-        </button>
+        <LoadingButton
+          variant="primary"
+          type="submit"
+          disabled={!dirty}
+          loading={loading}
+          loadingLabel={loadingLabel || t("admin.common.saving")}
+        >
+          {buttonText}
+        </LoadingButton>
       </div>
     </form>
   );

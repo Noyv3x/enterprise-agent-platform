@@ -47,6 +47,8 @@ interface ToastStore {
   toast: ToastFn;
   dismiss: (id: number) => void;
   remove: (id: number) => void;
+  pause: (id: number) => void;
+  resume: (id: number, type: ToastType) => void;
 }
 
 const ToastContext = createContext<ToastStore | null>(null);
@@ -82,18 +84,31 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.map((item) => (item.id === id ? { ...item, leaving: true } : item)));
   }, []);
 
+  const pause = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timers.current.delete(id);
+    }
+  }, []);
+
+  const resume = useCallback(
+    (id: number, type: ToastType) => {
+      if (timers.current.has(id)) return;
+      const ttl = type === "ok" ? 3200 : 6500;
+      timers.current.set(id, window.setTimeout(() => dismiss(id), ttl));
+    },
+    [dismiss],
+  );
+
   const addToast = useCallback<ToastFn>(
     (message, options) => {
       const id = (seq.current += 1);
       const type: ToastType = options?.type ?? "error";
       setToasts((prev) => [...prev, { id, type, title: options?.title, message, leaving: false }]);
-      const ttl = type === "ok" ? 3200 : 6500;
-      timers.current.set(
-        id,
-        window.setTimeout(() => dismiss(id), ttl),
-      );
+      resume(id, type);
     },
-    [dismiss],
+    [resume],
   );
 
   useEffect(() => {
@@ -111,8 +126,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<ToastStore>(
-    () => ({ toasts, toast: addToast, dismiss, remove }),
-    [toasts, addToast, dismiss, remove],
+    () => ({ toasts, toast: addToast, dismiss, remove, pause, resume }),
+    [toasts, addToast, dismiss, remove, pause, resume],
   );
 
   return <ToastContext.Provider value={value}>{children}</ToastContext.Provider>;
@@ -144,6 +159,8 @@ export function ToastViewport() {
         item={item}
         onDismiss={() => ctx.dismiss(item.id)}
         onRemove={() => ctx.remove(item.id)}
+        onPause={() => ctx.pause(item.id)}
+        onResume={() => ctx.resume(item.id, item.type)}
       />
     )),
     stack,
@@ -154,16 +171,28 @@ function ToastNode({
   item,
   onDismiss,
   onRemove,
+  onPause,
+  onResume,
 }: {
   item: ToastItem;
   onDismiss: () => void;
   onRemove: () => void;
+  onPause: () => void;
+  onResume: () => void;
 }) {
   const { t } = useI18n();
   return (
     <div
       className={cx("toast", `toast--${item.type}`, item.leaving && "is-leaving")}
-      role="status"
+      role={item.type === "error" ? "alert" : "status"}
+      onMouseEnter={onPause}
+      onMouseLeave={() => {
+        if (!item.leaving) onResume();
+      }}
+      onFocusCapture={onPause}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !item.leaving) onResume();
+      }}
       onAnimationEnd={() => {
         // The enter animation (toast-in) also fires animationend; only remove
         // once the leave animation (toast-out, via .is-leaving) has played.

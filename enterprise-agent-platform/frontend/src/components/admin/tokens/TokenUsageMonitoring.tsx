@@ -16,6 +16,7 @@ import type {
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
+import { LoadingButton } from "../../common/LoadingButton";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
 import { TokenUsageCurve } from "./TokenUsageCurve";
 import { UsageTable } from "./UsageTable";
@@ -28,7 +29,12 @@ export function TokenUsageMonitoring() {
   const store = useStoreHandle();
   const report = useStore((state) => state.tokenUsage);
   const tokenUsageDays = useStore((state) => state.tokenUsageDays);
-  const busy = useStore((state) => state.busy);
+  const changingRange = useStore((state) =>
+    state.pendingOperations.includes("admin:tokens:range"),
+  );
+  const refreshing = useStore((state) =>
+    state.pendingOperations.includes("admin:tokens:refresh"),
+  );
   const oauthProviders = useStore((state) => state.oauthProviders);
 
   const summary = report?.summary || {};
@@ -86,6 +92,8 @@ export function TokenUsageMonitoring() {
               <Field label={t("admin.tokens.timeRange")}>
                 <select
                   value={daysValue}
+                  disabled={changingRange}
+                  aria-busy={changingRange || undefined}
                   onChange={(event) =>
                     void changeTokenUsageDays(store, Number(event.target.value) || 30)
                   }
@@ -95,15 +103,16 @@ export function TokenUsageMonitoring() {
                   ))}
                 </select>
               </Field>
-              <button
-                className="btn btn--sm"
+              <LoadingButton
+                className="btn--sm"
                 type="button"
-                disabled={busy}
+                loading={refreshing}
+                loadingLabel={t("resource.refreshing")}
                 onClick={() => void refreshTokenUsage(store)}
               >
                 <Icon name="refresh" size={14} />
                 <span>{t("admin.common.refresh")}</span>
-              </button>
+              </LoadingButton>
             </div>
           }
         />

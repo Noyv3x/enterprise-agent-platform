@@ -1,6 +1,6 @@
 import { SUPPORTED_LOCALES, useI18n, type Locale } from "../../i18n";
 
-const LOCALE_NAMES: Record<Locale, string> = {
+export const LOCALE_NAMES: Record<Locale, string> = {
   "zh-CN": "简体中文",
   en: "English",
   "zh-TW": "繁體中文",

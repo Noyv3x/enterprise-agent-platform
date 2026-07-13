@@ -3,7 +3,6 @@
    legacy h() drops null attributes). Clicking switches the page and lazily loads
    messages/tokens via selectAdminPage. */
 
-import type { Ref } from "react";
 import { cx } from "../../lib/cx";
 import { selectAdminPage } from "../../data/adminActions";
 import { useStoreHandle } from "../../store/useStore";
@@ -15,15 +14,13 @@ import { useI18n } from "../../i18n";
 export interface AdminPagerItemProps {
   page: AdminPage;
   active: boolean;
-  buttonRef?: Ref<HTMLButtonElement>;
 }
 
-export function AdminPagerItem({ page, active, buttonRef }: AdminPagerItemProps) {
+export function AdminPagerItem({ page, active }: AdminPagerItemProps) {
   const store = useStoreHandle();
   const { t } = useI18n();
   return (
     <button
-      ref={buttonRef}
       className={cx("admin-pager__item", active && "is-active")}
       type="button"
       aria-current={active ? "page" : undefined}

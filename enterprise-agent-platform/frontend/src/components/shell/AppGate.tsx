@@ -52,16 +52,13 @@ export function AppGate() {
       <>
         <ToastViewport />
         <main className="auth">
-          <aside className="auth__aside">
-            <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
-          </aside>
+          <div className="auth__locale"><LanguageSelect /></div>
           <div className="auth__main">
             <section
               className="auth__card boot-status"
               role={bootStatus === "error" ? "alert" : "status"}
               aria-live="polite"
             >
-              <div className="auth__locale"><LanguageSelect /></div>
               <Brand />
               <h1>{bootStatus === "error" ? t("boot.failed") : t("boot.connecting")}</h1>
               {bootStatus === "error" ? (

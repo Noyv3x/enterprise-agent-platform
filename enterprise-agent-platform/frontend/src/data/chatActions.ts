@@ -24,8 +24,9 @@ import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { optimisticAttachments } from "../utils/composerFiles";
 import { chatSnapshot } from "../utils/fingerprint";
 import { runBusy } from "./sessionActions";
+import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
+import { ensureAdminPageResource } from "./adminResources";
 import {
-  loadAdminPanel,
   loadChannelMessages,
   loadDocuments,
   loadPrivateMessages,
@@ -184,9 +185,17 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
 export async function navigateToView(store: AppStore, view: ActiveView): Promise<void> {
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: view });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
-  if (view === "private") await runBusy(store, () => loadPrivateMessages(store));
-  else if (view === "knowledge") await runBusy(store, () => loadDocuments(store));
-  else if (view === "admin") await runBusy(store, () => loadAdminPanel(store));
+  if (view !== "private") {
+    store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false });
+  }
+  if (view === "private") {
+    await runResourceLoad(store, resourceKeys.privateChat, () => loadPrivateMessages(store));
+  } else if (view === "knowledge") {
+    await ensureResource(store, resourceKeys.knowledgeList, () => loadDocuments(store));
+  }
+  else if (view === "admin") {
+    await ensureAdminPageResource(store, store.getState().activeAdminPage);
+  }
 }
 
 /** Select a channel + close the drawer, then load its messages (legacy channel
@@ -195,7 +204,8 @@ export async function selectChannel(store: AppStore, channelId: Id): Promise<voi
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
   store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: channelId });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
-  await runBusy(store, () => loadChannelMessages(store));
+  store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false });
+  await runResourceLoad(store, resourceKeys.channelChat(channelId), () => loadChannelMessages(store));
 }
 
 /* ----------------------------------------------------- optimistic send */

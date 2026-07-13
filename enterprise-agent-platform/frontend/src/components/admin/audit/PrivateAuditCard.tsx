@@ -35,7 +35,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
   const privateMessages = useStore((state) => state.messageAudit.privateMessages);
   const privateTotal = useStore((state) => state.messageAudit.privateTotal);
   const auditPrivateUserId = useStore((state) => state.messageAudit.auditPrivateUserId);
-  const busy = useStore((state) => state.busy);
+  const busy = useStore((state) => state.pendingOperations.some((key) => key.startsWith("admin:audit:")));
 
   const selectedPrivateUserId = String(auditPrivateUserId || "");
   const selectedConversation = conversations.find(

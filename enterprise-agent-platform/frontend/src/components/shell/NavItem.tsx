@@ -19,7 +19,9 @@ export function NavItem({ view, label, icon, active }: NavItemProps) {
   const store = useStoreHandle();
   return (
     <button
+      type="button"
       className={cx("nav__item", active && "is-active")}
+      aria-current={active ? "page" : undefined}
       onClick={() => void navigateToView(store, view)}
     >
       <Icon name={icon} />

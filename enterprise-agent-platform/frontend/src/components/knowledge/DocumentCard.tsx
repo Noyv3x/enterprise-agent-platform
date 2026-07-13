@@ -6,6 +6,7 @@
 import { isNumericDocumentId } from "../../data/knowledgeActions";
 import { useI18n } from "../../i18n";
 import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
+import { formatTimestamp } from "../../utils/format";
 import { Icon } from "../common/Icon";
 import { DOC_VIEWER_ID } from "./DocumentViewer";
 
@@ -26,6 +27,10 @@ export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
         <span>{doc.title}</span>
       </div>
       {doc.summary ? <div className="doc-card__summary">{doc.summary}</div> : null}
+      <div className="doc-card__meta">
+        {doc.source ? <span>{doc.source}</span> : null}
+        {"updated_at" in doc && doc.updated_at ? <time>{formatTimestamp(doc.updated_at)}</time> : null}
+      </div>
       <div className="doc-card__actions">
         <button
           className="btn btn--sm"

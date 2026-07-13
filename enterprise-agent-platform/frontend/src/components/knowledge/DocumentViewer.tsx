@@ -16,9 +16,10 @@ export const DOC_VIEWER_ID = "knowledge-doc-viewer";
 export interface DocumentViewerProps {
   document: FullDocument;
   onClose: () => void;
+  showClose?: boolean;
 }
 
-export function DocumentViewer({ document: doc, onClose }: DocumentViewerProps) {
+export function DocumentViewer({ document: doc, onClose, showClose = true }: DocumentViewerProps) {
   const { t } = useI18n();
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
@@ -37,7 +38,7 @@ export function DocumentViewer({ document: doc, onClose }: DocumentViewerProps) 
     >
       <div className="doc-viewer__bar">
         <span className="eyebrow">{doc.title || t("knowledge.untitledDocument")}</span>
-        <button
+        {showClose ? <button
           ref={closeRef}
           className="icon-btn"
           type="button"
@@ -46,7 +47,7 @@ export function DocumentViewer({ document: doc, onClose }: DocumentViewerProps) 
           onClick={onClose}
         >
           <Icon name="close" size={16} />
-        </button>
+        </button> : null}
       </div>
       <pre>{doc.content}</pre>
     </div>
