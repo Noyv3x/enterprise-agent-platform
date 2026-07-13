@@ -55,6 +55,7 @@ export function createRuntimeServer(config: RuntimeConfig, coordinator = new Run
 async function route(config: RuntimeConfig, coordinator: RunCoordinator, request: IncomingMessage, response: ServerResponse): Promise<void> {
   applySecurityHeaders(response);
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  authorize(config, request);
   if (request.method === "GET" && url.pathname === "/health") {
     json(response, 200, {
       status: "ok",
@@ -65,7 +66,6 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     });
     return;
   }
-  authorize(config, request);
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
     const body = await readJson<RunRequest>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);

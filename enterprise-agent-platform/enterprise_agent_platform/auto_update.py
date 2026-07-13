@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -7,6 +8,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol
+
+
+DEFAULT_SERVICE_NAME = "enterprise-agent-platform.service"
 
 
 class AutoUpdateService(Protocol):
@@ -199,28 +203,102 @@ class AutoUpdateManager:
     def _launch_update_command(self, reason: str) -> list[str]:
         if not self.deploy_script.exists():
             raise RuntimeError(f"deploy script not found: {self.deploy_script}")
-        if shutil.which("systemd-run") and shutil.which("systemctl") and _user_systemd_available(self._runner):
-            unit = f"enterprise-agent-platform-auto-update-{int(time.time())}"
+        handoff = self._deployment_handoff()
+        systemd_managed = _running_under_systemd()
+        systemd_tools = bool(shutil.which("systemd-run") and shutil.which("systemctl"))
+        user_systemd = systemd_tools and _user_systemd_available(self._runner)
+        if user_systemd:
+            systemd_managed = systemd_managed or _user_service_active(
+                self._runner,
+                handoff["ENTERPRISE_SERVICE_NAME"],
+            )
+        if user_systemd:
+            unit = f"enterprise-agent-platform-auto-update-{time.time_ns()}-{os.getpid()}"
             command = [
                 "systemd-run",
                 "--user",
                 "--collect",
-                "--unit",
-                unit,
+                "--service-type=exec",
+                f"--unit={unit}",
                 f"--working-directory={self.repo_root}",
+                *[f"--setenv={key}={value}" for key, value in handoff.items()],
                 str(self.deploy_script),
                 "update",
+                "--data",
+                handoff["ENTERPRISE_PLATFORM_DATA"],
+                "--service-name",
+                handoff["ENTERPRISE_SERVICE_NAME"],
+                "--host",
+                handoff["ENTERPRISE_PLATFORM_HOST"],
+                "--port",
+                handoff["ENTERPRISE_PLATFORM_PORT"],
             ]
             result = self._runner(command, cwd=self.repo_root, timeout=30, check=False)
             if result.returncode == 0:
                 return command
-        log_path = self.repo_root / "enterprise-agent-platform" / "data" / "logs" / "auto-update.log"
+            if systemd_managed:
+                detail = str(getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+                raise RuntimeError(
+                    "could not launch auto update in an independent systemd unit"
+                    + (f": {detail}" if detail else "")
+                )
+        elif systemd_managed:
+            raise RuntimeError(
+                "auto update is running under systemd, but an independent user transient unit is unavailable"
+            )
+
+        # A detached child is safe only for a standalone/foreground process.
+        # A child launched from a systemd service remains in the service cgroup
+        # and can be killed by the restart that completes its own update.
+        log_path = Path(handoff["ENTERPRISE_PLATFORM_DATA"]) / "logs" / "auto-update.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        command = [str(self.deploy_script), "update"]
+        command = [
+            str(self.deploy_script),
+            "update",
+            "--data",
+            handoff["ENTERPRISE_PLATFORM_DATA"],
+            "--service-name",
+            handoff["ENTERPRISE_SERVICE_NAME"],
+            "--host",
+            handoff["ENTERPRISE_PLATFORM_HOST"],
+            "--port",
+            handoff["ENTERPRISE_PLATFORM_PORT"],
+        ]
         with log_path.open("ab") as log:
             log.write(f"\n[{int(time.time())}] auto update triggered by {reason}\n".encode("utf-8"))
             subprocess.Popen(command, cwd=str(self.repo_root), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         return command
+
+    def _deployment_handoff(self) -> dict[str, str]:
+        config = getattr(self.service, "config", None)
+        data_dir = Path(
+            getattr(config, "data_dir", self.repo_root / "enterprise-agent-platform" / "data")
+        ).expanduser().resolve()
+        service_name = str(os.getenv("ENTERPRISE_SERVICE_NAME", DEFAULT_SERVICE_NAME)).strip()
+        host = str(getattr(config, "host", os.getenv("ENTERPRISE_PLATFORM_HOST", "127.0.0.1"))).strip()
+        try:
+            port = int(getattr(config, "port", os.getenv("ENTERPRISE_PLATFORM_PORT", "8765")))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("invalid platform port for auto-update handoff") from exc
+        if (
+            len(service_name) > 255
+            or not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", service_name)
+            or service_name.startswith((".", "-"))
+        ):
+            raise RuntimeError(f"invalid systemd service name for auto-update handoff: {service_name!r}")
+        if not host or any(char in host for char in "\x00\r\n"):
+            raise RuntimeError("invalid platform host for auto-update handoff")
+        if not 1 <= port <= 65535:
+            raise RuntimeError("invalid platform port for auto-update handoff")
+        values = {
+            "ENTERPRISE_PLATFORM_DATA": str(data_dir),
+            "ENTERPRISE_SERVICE_NAME": service_name,
+            "ENTERPRISE_PLATFORM_HOST": host,
+            "ENTERPRISE_PLATFORM_PORT": str(port),
+        }
+        if any(any(char in value for char in "\x00\r\n") for value in values.values()):
+            raise RuntimeError("invalid value in auto-update deployment handoff")
+        return values
 
     def _git(self, cmd: list[str], *, timeout: float = 30, check: bool = True) -> subprocess.CompletedProcess:
         return self._runner(cmd, cwd=self.repo_root, timeout=timeout, check=check)
@@ -269,3 +347,17 @@ def _safe_git_name(value: str, label: str) -> str:
 def _user_systemd_available(runner) -> bool:
     result = runner(["systemctl", "--user", "show-environment"], cwd=None, timeout=20, check=False)
     return result.returncode == 0
+
+
+def _user_service_active(runner, service_name: str) -> bool:
+    result = runner(
+        ["systemctl", "--user", "is-active", "--quiet", service_name],
+        cwd=None,
+        timeout=20,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _running_under_systemd() -> bool:
+    return any(os.getenv(name) for name in ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID"))

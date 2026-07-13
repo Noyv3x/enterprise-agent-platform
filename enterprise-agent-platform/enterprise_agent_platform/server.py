@@ -206,6 +206,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            if path == "/healthz":
+                if method != "GET":
+                    self._json({"error": "method not allowed"}, status=405)
+                    return
+                self._json({"status": "ok", "service": "ubitech-agent-platform"})
+                return
             if path.startswith("/api/auto-update/webhook/"):
                 self._handle_auto_update_webhook(method, path)
                 return

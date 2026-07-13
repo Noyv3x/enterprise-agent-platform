@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,13 +15,24 @@ from types import SimpleNamespace
 from unittest import mock
 
 from enterprise_agent_platform.deployment import (
+    ACTIVATED_CLEANUP_PENDING_EXIT_CODE,
+    ActivatedCleanupPending,
     DeploymentError,
     DeploymentManager,
     DeploymentPaths,
+    DeploymentResult,
+    _detect_previous_update_revision,
+    _existing_service_data_dir,
+    _is_hermes_removal_transition,
+    _resolve_existing_service_deployment,
+    _revision_is_valid_update_base,
+    bootstrap_from_args,
+    main as deployment_main,
     python_venv_package_names,
     runtime_env,
     user_service_unit,
 )
+from enterprise_agent_platform.legacy_migration import LegacyMigrationResult
 
 
 class RecordingDeployRunner:
@@ -111,14 +123,14 @@ class DeploymentTests(unittest.TestCase):
     def test_node_runtime_requires_node_and_npm_at_supported_version(self):
         with tempfile.TemporaryDirectory() as td:
             manager = DeploymentManager(DeploymentPaths.from_root(Path(td)), runner=RecordingDeployRunner())
-            with mock.patch(
+            with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_NODE": "0"}), mock.patch(
                 "enterprise_agent_platform.deployment.shutil.which",
                 side_effect=lambda name: None if name == "npm" else f"/tools/{name}",
             ):
                 with self.assertRaisesRegex(DeploymentError, "Node.js 22.19"):
                     manager.ensure_node_version()
 
-            with mock.patch(
+            with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_NODE": "0"}), mock.patch(
                 "enterprise_agent_platform.deployment.shutil.which",
                 side_effect=lambda name: f"/tools/{name}",
             ), mock.patch(
@@ -128,7 +140,7 @@ class DeploymentTests(unittest.TestCase):
                 with self.assertRaisesRegex(DeploymentError, "found v22.18.0"):
                     manager.ensure_node_version()
 
-            with mock.patch(
+            with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_NODE": "0"}), mock.patch(
                 "enterprise_agent_platform.deployment.shutil.which",
                 side_effect=lambda name: f"/tools/{name}",
             ), mock.patch(
@@ -136,6 +148,23 @@ class DeploymentTests(unittest.TestCase):
                 return_value="v22.19.0",
             ):
                 manager.ensure_node_version()
+
+    def test_missing_system_node_is_installed_and_activated_under_data_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            managed_bin = paths.managed_node_root / "node-v22.19.0-linux-x64" / "bin"
+            manager.install_managed_node = mock.Mock(return_value=managed_bin)
+            original_path = os.environ.get("PATH", "")
+
+            with mock.patch.dict(os.environ, {"PATH": original_path}), mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                return_value=None,
+            ), mock.patch.object(manager, "_node_install_is_usable", return_value=False):
+                manager.ensure_node_version()
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(managed_bin))
+
+            manager.install_managed_node.assert_called_once_with()
 
     def test_bootstrap_prepare_initializes_submodules_and_platform_venv(self):
         if not shutil.which("git"):
@@ -286,6 +315,8 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("Restart=on-failure", unit)
             self.assertIn(f"ENTERPRISE_PLATFORM_DATA={root / 'state'}", unit)
             self.assertIn(f"ENTERPRISE_AGENT_RUNTIME_HOME={root / 'state' / 'runtimes' / 'agent'}", unit)
+            self.assertIn(str(paths.managed_node_current / "bin"), unit)
+            self.assertIn(f"ENTERPRISE_SERVICE_NAME={paths.service_name}", unit)
             self.assertIn(f"ENTERPRISE_COGNEE_REPO={root / 'cognee'}", unit)
             self.assertNotIn("ENTERPRISE_HERMES_REPO", unit)
             self.assertIn(str(paths.platform_cli), unit)
@@ -301,13 +332,14 @@ class DeploymentTests(unittest.TestCase):
             paths = replace(DeploymentPaths.from_root(root), service_dir=root / "systemd-user")
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
-            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager.wait_for_service_ready = mock.Mock()
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="service", prepare_runtime=False)
 
             commands = [call["cmd"] for call in runner.calls]
             self.assertEqual(result.mode, "service")
-            manager.prepare_platform_runtime.assert_called_once_with(host="127.0.0.1", port=8765)
+            manager.prepare_agent_runtime_artifact.assert_called_once_with(host="127.0.0.1", port=8765)
             self.assertIn(["systemctl", "--user", "daemon-reload"], commands)
             self.assertIn(["systemctl", "--user", "enable", paths.service_name], commands)
             self.assertIn(["systemctl", "--user", "restart", paths.service_name], commands)
@@ -328,7 +360,7 @@ class DeploymentTests(unittest.TestCase):
                     manager.user_systemd_available = mock.Mock(return_value=True)
                     sequence = mock.Mock()
                     sequence.restart.return_value = paths.service_path
-                    manager.prepare_platform_runtime = sequence.prepare
+                    manager.prepare_agent_runtime_artifact = sequence.prepare
                     manager.install_user_service = sequence.restart
 
                     result = manager.bootstrap(
@@ -349,7 +381,316 @@ class DeploymentTests(unittest.TestCase):
                         ],
                     )
 
-    def test_runtime_prepare_does_not_contend_with_the_live_service_instance_lock(self):
+    def test_legacy_cutover_quarantines_then_removes_hermes_after_activation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = replace(DeploymentPaths.from_root(root, data_dir=root / "state"), service_dir=root / "systemd")
+            paths.legacy_hermes_home.mkdir(parents=True)
+            (paths.legacy_hermes_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner(systemd_available=True))
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._stop_user_service = mock.Mock()
+            manager._migrate_legacy_hermes = mock.Mock(
+                return_value=LegacyMigrationResult(
+                    phase="prepared",
+                    imported=1,
+                    memories_imported=2,
+                )
+            )
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager._retire_legacy_source_checkout = mock.Mock()
+
+            def activate(**kwargs):
+                self.assertFalse(paths.legacy_hermes_home.exists())
+                marker = manager._read_cutover_marker()
+                self.assertEqual(marker["phase"], "quarantined")
+                return paths.service_path
+
+            manager.install_user_service = mock.Mock(side_effect=activate)
+
+            service_path = manager.cutover_legacy_hermes(host="127.0.0.1", port=8765)
+
+            self.assertEqual(service_path, paths.service_path)
+            self.assertFalse(paths.legacy_hermes_home.exists())
+            self.assertEqual(list(paths.legacy_hermes_home.parent.glob(".retired-hermes-*")), [])
+            marker = manager._read_cutover_marker()
+            self.assertEqual(marker["phase"], "finalized")
+            self.assertEqual(marker["imported"], 1)
+            manager.prepare_agent_runtime_artifact.assert_called_once()
+            manager._stop_user_service.assert_called_once()
+            manager.install_user_service.assert_called_once()
+
+    def test_legacy_cutover_restores_hermes_before_reporting_activation_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = replace(DeploymentPaths.from_root(root, data_dir=root / "state"), service_dir=root / "systemd")
+            paths.legacy_hermes_home.mkdir(parents=True)
+            sentinel = paths.legacy_hermes_home / "sentinel"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner(systemd_available=True))
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._stop_user_service = mock.Mock()
+            manager._migrate_legacy_hermes = mock.Mock(
+                return_value=LegacyMigrationResult(phase="prepared")
+            )
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager.install_user_service = mock.Mock(side_effect=DeploymentError("Pi health failed"))
+
+            with self.assertRaisesRegex(DeploymentError, "Pi health failed"):
+                manager.cutover_legacy_hermes(host="127.0.0.1", port=8765)
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+            self.assertEqual(list(paths.legacy_hermes_home.parent.glob(".retired-hermes-*")), [])
+            self.assertEqual(manager._read_cutover_marker()["phase"], "migrated")
+            self.assertEqual(manager._stop_user_service.call_count, 2)
+
+    def test_legacy_cutover_restores_hermes_when_activated_marker_cannot_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = replace(
+                DeploymentPaths.from_root(root, data_dir=root / "state"),
+                service_dir=root / "systemd",
+            )
+            paths.legacy_hermes_home.mkdir(parents=True)
+            sentinel = paths.legacy_hermes_home / "sentinel"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner(systemd_available=True))
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._stop_user_service = mock.Mock()
+            manager._migrate_legacy_hermes = mock.Mock(
+                return_value=LegacyMigrationResult(phase="prepared")
+            )
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager.install_user_service = mock.Mock(return_value=paths.service_path)
+            original_write = manager._write_cutover_marker
+
+            def write_marker(payload):
+                if payload.get("phase") == "activated":
+                    raise OSError("simulated durable marker failure")
+                return original_write(payload)
+
+            manager._write_cutover_marker = mock.Mock(side_effect=write_marker)
+
+            with self.assertRaisesRegex(OSError, "marker failure"):
+                manager.cutover_legacy_hermes(host="127.0.0.1", port=8765)
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+            self.assertEqual(manager._read_cutover_marker()["phase"], "migrated")
+            self.assertEqual(manager._stop_user_service.call_count, 2)
+
+    def test_post_activation_finalization_failure_keeps_quarantine_for_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = replace(
+                DeploymentPaths.from_root(root, data_dir=root / "state"),
+                service_dir=root / "systemd",
+            )
+            paths.legacy_hermes_home.mkdir(parents=True)
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner(systemd_available=True))
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._stop_user_service = mock.Mock()
+            manager._migrate_legacy_hermes = mock.Mock(
+                return_value=LegacyMigrationResult(phase="prepared")
+            )
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager.install_user_service = mock.Mock(return_value=paths.service_path)
+
+            with mock.patch(
+                "enterprise_agent_platform.legacy_migration.finalize_legacy_hermes_migration",
+                side_effect=OSError("simulated finalization failure"),
+            ), self.assertRaises(ActivatedCleanupPending):
+                manager.cutover_legacy_hermes(host="127.0.0.1", port=8765)
+
+            self.assertEqual(manager._read_cutover_marker()["phase"], "activated")
+            self.assertEqual(
+                len(list(paths.legacy_hermes_home.parent.glob(".retired-hermes-*"))),
+                1,
+            )
+            with mock.patch(
+                "enterprise_agent_platform.legacy_migration.finalize_legacy_hermes_migration"
+            ):
+                manager.recover_interrupted_cutover()
+            self.assertEqual(manager._read_cutover_marker()["phase"], "finalized")
+            self.assertEqual(
+                list(paths.legacy_hermes_home.parent.glob(".retired-hermes-*")), []
+            )
+
+    def test_post_activation_cleanup_marker_failure_never_rolls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = replace(
+                DeploymentPaths.from_root(root, data_dir=root / "state"),
+                service_dir=root / "systemd",
+            )
+            paths.legacy_hermes_home.mkdir(parents=True)
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner(systemd_available=True))
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._stop_user_service = mock.Mock()
+            manager._migrate_legacy_hermes = mock.Mock(
+                return_value=LegacyMigrationResult(phase="prepared")
+            )
+            manager.prepare_platform_runtime = mock.Mock(return_value={})
+            manager.install_user_service = mock.Mock(return_value=paths.service_path)
+            manager._retire_legacy_source_checkout = mock.Mock()
+            original_write = manager._write_cutover_marker
+
+            def write_marker(payload):
+                if payload.get("phase") == "finalized":
+                    raise OSError("simulated cleanup marker failure")
+                return original_write(payload)
+
+            manager._write_cutover_marker = mock.Mock(side_effect=write_marker)
+
+            with self.assertRaises(ActivatedCleanupPending):
+                manager.cutover_legacy_hermes(host="127.0.0.1", port=8765)
+
+            self.assertEqual(manager._read_cutover_marker()["phase"], "activated")
+            self.assertFalse(paths.legacy_hermes_home.exists())
+            self.assertEqual(list(paths.legacy_hermes_home.parent.glob(".retired-hermes-*")), [])
+
+            manager._write_cutover_marker = original_write
+            with mock.patch(
+                "enterprise_agent_platform.legacy_migration.finalize_legacy_hermes_migration"
+            ):
+                manager.recover_interrupted_cutover()
+            self.assertEqual(manager._read_cutover_marker()["phase"], "finalized")
+
+    def test_interrupted_quarantine_is_restored_before_a_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
+            paths.legacy_hermes_home.mkdir(parents=True)
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._write_cutover_marker({"version": 1, "phase": "migrated", "updated_at": 1})
+            quarantine = manager._quarantine_legacy_hermes()
+            manager._write_cutover_marker(
+                {
+                    "version": 1,
+                    "phase": "quarantined",
+                    "quarantine_name": quarantine.name,
+                    "updated_at": 2,
+                }
+            )
+            manager._stop_user_service = mock.Mock()
+
+            manager.recover_interrupted_cutover()
+
+            self.assertTrue(paths.legacy_hermes_home.is_dir())
+            self.assertFalse(quarantine.exists())
+            self.assertEqual(manager._read_cutover_marker()["phase"], "migrated")
+            manager._stop_user_service.assert_called_once()
+
+    def test_service_readiness_requires_platform_and_agent_health(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._wait_for_service_http = mock.Mock(return_value=True)
+            manager._wait_for_agent_http = mock.Mock(return_value=False)
+            manager._raise_service_failed = mock.Mock(side_effect=DeploymentError("not ready"))
+
+            with self.assertRaisesRegex(DeploymentError, "not ready"):
+                manager.wait_for_service_ready(host="127.0.0.1", port=8765)
+
+            manager._wait_for_service_http.assert_called_once()
+            manager._wait_for_agent_http.assert_called_once()
+
+    def test_first_hop_discovers_custom_data_directory_from_existing_unit(self):
+        with tempfile.TemporaryDirectory() as td:
+            xdg = Path(td)
+            unit_dir = xdg / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            custom = Path(td) / "custom state"
+            (unit_dir / "custom.service").write_text(
+                '[Service]\nEnvironment="ENTERPRISE_PLATFORM_DATA=' + str(custom) + '"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+                discovered = _existing_service_data_dir("custom.service")
+
+            self.assertEqual(discovered, custom.resolve())
+
+    def test_first_hop_discovers_unique_custom_service_for_this_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "checkout"
+            xdg = base / "config"
+            unit_dir = xdg / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            custom = base / "custom state"
+            (unit_dir / "ubitech-custom.service").write_text(
+                "[Service]\n"
+                f"WorkingDirectory={root / 'enterprise-agent-platform'}\n"
+                f'Environment="ENTERPRISE_PLATFORM_DATA={custom}"\n',
+                encoding="utf-8",
+            )
+            (unit_dir / "unrelated.service").write_text(
+                "[Service]\nWorkingDirectory=/srv/other\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+                discovered = _resolve_existing_service_deployment(
+                    root,
+                    requested_service=None,
+                    requested_data=None,
+                )
+
+            self.assertEqual(discovered.service_name, "ubitech-custom.service")
+            self.assertEqual(discovered.data_dir, custom.resolve())
+
+    def test_first_hop_rejects_ambiguous_matching_services(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "checkout"
+            xdg = base / "config"
+            unit_dir = xdg / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            for name in ("first.service", "second.service"):
+                (unit_dir / name).write_text(
+                    "[Service]\n"
+                    f"WorkingDirectory={root / 'enterprise-agent-platform'}\n",
+                    encoding="utf-8",
+                )
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+                with self.assertRaisesRegex(DeploymentError, "multiple platform user services"):
+                    _resolve_existing_service_deployment(
+                        root,
+                        requested_service=None,
+                        requested_data=None,
+                    )
+
+    def test_first_hop_ignores_symlink_service_units(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "checkout"
+            xdg = base / "config"
+            unit_dir = xdg / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            target = base / "outside.service"
+            target.write_text(
+                "[Service]\n"
+                f"WorkingDirectory={root / 'enterprise-agent-platform'}\n",
+                encoding="utf-8",
+            )
+            (unit_dir / "linked.service").symlink_to(target)
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+                discovered = _resolve_existing_service_deployment(
+                    root,
+                    requested_service=None,
+                    requested_data=None,
+                )
+
+            self.assertEqual(discovered.service_name, "enterprise-agent-platform.service")
+            self.assertIsNone(discovered.data_dir)
+
+    def test_agent_artifact_prepare_does_not_migrate_live_database_or_contend_for_lock(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             make_deploy_root(root)
@@ -359,30 +700,18 @@ class DeploymentTests(unittest.TestCase):
             descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             runtime = mock.Mock()
-            runtime.agent_runtime_config.return_value = {"managed": True}
-            runtime.agent_runtime_status.return_value = SimpleNamespace(
-                available=False,
-                error="",
-                to_dict=lambda: {"available": False},
-            )
             installed = SimpleNamespace(
                 available=True,
                 error="",
                 to_dict=lambda: {"available": True, "install_state": "ready"},
             )
             runtime.install_agent_runtime.return_value = installed
-            runtime.prepare.return_value = {
-                "agent": {"available": True},
-                "cognee": {"available": True},
-                "camofox": {"available": True},
-                "firecrawl": {"available": True},
-            }
             try:
                 with mock.patch(
                     "enterprise_agent_platform.deployment.PlatformRuntimeManager",
                     return_value=runtime,
                 ):
-                    statuses = DeploymentManager(paths).prepare_platform_runtime(
+                    status = DeploymentManager(paths).prepare_agent_runtime_artifact(
                         host="127.0.0.1",
                         port=8765,
                     )
@@ -390,9 +719,655 @@ class DeploymentTests(unittest.TestCase):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
 
-            self.assertTrue(statuses["agent"]["available"])
+            self.assertTrue(status["available"])
             runtime.install_agent_runtime.assert_called_once_with(force=False)
+            runtime.prepare.assert_not_called()
             runtime.close.assert_called_once_with()
+
+    def test_session_migration_rejects_symlink_directory_and_removes_stale_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            runtime_home = paths.data_dir / "runtimes" / "agent"
+            runtime_home.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (runtime_home / "migration").symlink_to(outside, target_is_directory=True)
+            manager = DeploymentManager(paths)
+            manifest = SimpleNamespace(
+                scope_key="private:1",
+                session_id="session-1",
+                lifecycle_id="lifecycle-1",
+                messages=(),
+            )
+
+            with self.assertRaisesRegex(DeploymentError, "must not be a symlink"):
+                manager._import_legacy_sessions(
+                    [manifest],
+                    runtime_home=runtime_home,
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                )
+
+            (runtime_home / "migration").unlink()
+            migration_dir = runtime_home / "migration"
+            migration_dir.mkdir()
+            stale = migration_dir / "legacy-sessions-abandoned.json"
+            stale.write_text("sensitive old content", encoding="utf-8")
+            manager._remove_stale_session_manifests(migration_dir)
+            self.assertFalse(stale.exists())
+
+    def test_retired_source_with_ignored_file_is_preserved(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            checkout = root / "hermes-agent"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=checkout, check=True)
+            (checkout / ".gitignore").write_text(".env\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=checkout, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=checkout, check=True)
+            secret = checkout / ".env"
+            secret.write_text("TOKEN=preserve\n", encoding="utf-8")
+
+            DeploymentManager(DeploymentPaths.from_root(root))._retire_legacy_source_checkout()
+
+            self.assertEqual(secret.read_text(encoding="utf-8"), "TOKEN=preserve\n")
+
+    def test_in_service_first_hop_hands_off_without_stopping_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            paths.legacy_hermes_home.mkdir(parents=True)
+            manager = DeploymentManager(paths, previous_revision="a" * 40)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_submodules",
+                "ensure_source_repos",
+                "ensure_platform_venv",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._running_inside_target_service = mock.Mock(return_value=True)
+            manager._launch_independent_cutover = mock.Mock()
+            manager._stop_user_service = mock.Mock()
+
+            result = manager.bootstrap(host="127.0.0.1", port=8765, mode="auto")
+
+            self.assertEqual(result.mode, "handoff")
+            manager._launch_independent_cutover.assert_called_once_with(
+                host="127.0.0.1", port=8765
+            )
+            manager._stop_user_service.assert_not_called()
+
+    def test_handoff_command_carries_exact_data_service_and_revision(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "deploy.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (root / "deploy.sh").chmod(0o755)
+            paths = replace(
+                DeploymentPaths.from_root(
+                    root,
+                    data_dir=root / "custom state",
+                    service_name="custom-agent.service",
+                ),
+                service_dir=root / "units",
+            )
+            runner = RecordingDeployRunner(systemd_available=True)
+            previous = "b" * 40
+            target = "f" * 40
+            manager = DeploymentManager(paths, runner=runner, previous_revision=previous)
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._canonical_commit",
+                return_value=target,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._git_update_lock_path",
+                return_value=root / ".git" / "ubitech-agent-update.lock",
+            ):
+                manager._launch_independent_cutover(host="10.0.0.4", port=9443)
+
+            units = list(paths.service_dir.glob("ubitech-agent-cutover-*.service"))
+            self.assertEqual(len(units), 1)
+            text = units[0].read_text(encoding="utf-8")
+            self.assertIn("Type=oneshot", text)
+            self.assertIn("Restart=on-failure", text)
+            self.assertIn("WantedBy=default.target", text)
+            self.assertIn(
+                f'Environment="ENTERPRISE_PLATFORM_DATA={paths.data_dir}"', text
+            )
+            self.assertIn(
+                'Environment="ENTERPRISE_SERVICE_NAME=custom-agent.service"', text
+            )
+            self.assertIn(
+                f'Environment="ENTERPRISE_UPDATE_PREV_SHA={previous}"', text
+            )
+            self.assertIn(
+                f'Environment="ENTERPRISE_UPDATE_TARGET_SHA={target}"', text
+            )
+            self.assertIn(
+                'Environment="ENTERPRISE_INTERNAL_FIRST_HOP_OWNER=1"', text
+            )
+            self.assertIn(str(root / "deploy.sh"), text)
+            self.assertNotIn("ExecStartPre=", text)
+            exec_start = next(
+                line.removeprefix("ExecStart=")
+                for line in text.splitlines()
+                if line.startswith("ExecStart=")
+            )
+            exec_start = exec_start.removeprefix(":")
+            owner_command = shlex.split(exec_start)
+            self.assertEqual(owner_command[1], "-c")
+            self.assertIn(target, owner_command[2])
+            self.assertIn("reset --keep", owner_command[2])
+            self.assertIn("submodule update --init --recursive", owner_command[2])
+            self.assertIn(shlex.quote(str(paths.data_dir)), owner_command[2])
+            self.assertIn("--service-name custom-agent.service", owner_command[2])
+            self.assertEqual(
+                [call["cmd"] for call in runner.calls],
+                [
+                    ["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", units[0].name],
+                    ["systemctl", "--user", "start", "--no-block", units[0].name],
+                ],
+            )
+            if shutil.which("systemd-analyze"):
+                verified = subprocess.run(
+                    ["systemd-analyze", "verify", "--user", str(units[0])],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_handoff_prestart_restores_pinned_new_shell_after_source_rollback(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            submodule_source = base / "submodule-source"
+            submodule_source.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=submodule_source, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=submodule_source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Deploy Test"],
+                cwd=submodule_source,
+                check=True,
+            )
+            (submodule_source / "version.txt").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=submodule_source, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "old submodule"],
+                cwd=submodule_source,
+                check=True,
+            )
+            old_submodule = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=submodule_source, text=True
+            ).strip()
+
+            root = base / "checkout"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Deploy Test"],
+                cwd=root,
+                check=True,
+            )
+            script = root / "deploy.sh"
+            script.write_text("#!/bin/sh\n# old shell\n", encoding="utf-8")
+            script.chmod(0o755)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    str(submodule_source),
+                    "vendor/runtime",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "deploy.sh", ".gitmodules"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "old"], cwd=root, check=True)
+            previous = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            (submodule_source / "version.txt").write_text("new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=submodule_source, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "new submodule"],
+                cwd=submodule_source,
+                check=True,
+            )
+            new_submodule = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=submodule_source, text=True
+            ).strip()
+            subprocess.run(
+                ["git", "fetch", str(submodule_source)],
+                cwd=root / "vendor" / "runtime",
+                check=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-q", new_submodule],
+                cwd=root / "vendor" / "runtime",
+                check=True,
+            )
+            script.write_text("#!/bin/sh\n# safe owner shell\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "deploy.sh", "vendor/runtime"], cwd=root, check=True
+            )
+            subprocess.run(["git", "commit", "-q", "-m", "new"], cwd=root, check=True)
+            target = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            paths = replace(
+                DeploymentPaths.from_root(root, data_dir=base / "state"),
+                service_dir=base / "units",
+            )
+            manager = DeploymentManager(
+                paths,
+                runner=RecordingDeployRunner(systemd_available=True),
+                previous_revision=previous,
+            )
+
+            manager._launch_independent_cutover(host="127.0.0.1", port=8765)
+            unit = next(paths.service_dir.glob("ubitech-agent-cutover-*.service"))
+            exec_start = next(
+                line.removeprefix("ExecStart=")
+                for line in unit.read_text(encoding="utf-8").splitlines()
+                if line.startswith("ExecStart=")
+            )
+            exec_start = exec_start.removeprefix(":")
+            subprocess.run(["git", "reset", "--hard", previous], cwd=root, check=True)
+            subprocess.run(
+                ["git", "submodule", "update", "--init", "--recursive"],
+                cwd=root,
+                check=True,
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=root / "vendor" / "runtime",
+                    text=True,
+                ).strip(),
+                old_submodule,
+            )
+
+            subprocess.run(
+                shlex.split(exec_start),
+                cwd=root,
+                env={
+                    **os.environ,
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "ENTERPRISE_INTERNAL_FIRST_HOP_OWNER": "1",
+                    "ENTERPRISE_UPDATE_PREV_SHA": previous,
+                    "ENTERPRISE_UPDATE_TARGET_SHA": target,
+                },
+                check=True,
+            )
+
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=root, text=True
+                ).strip(),
+                target,
+            )
+            self.assertIn("safe owner shell", script.read_text(encoding="utf-8"))
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=root / "vendor" / "runtime",
+                    text=True,
+                ).strip(),
+                new_submodule,
+            )
+
+    def test_first_hop_rollback_redeploys_exact_old_service_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(
+                root,
+                data_dir=root / "custom state",
+                service_name="custom-agent.service",
+            )
+            paths.legacy_hermes_home.mkdir(parents=True)
+            manager = DeploymentManager(paths, previous_revision="c" * 40)
+            commands = []
+
+            def run(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._revision_is_valid_update_base",
+                return_value=True,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.subprocess.run",
+                side_effect=run,
+            ):
+                rolled_back = manager.rollback_first_hop_update(
+                    host="10.0.0.4",
+                    port=9443,
+                    restart_service=True,
+                )
+
+            self.assertTrue(rolled_back)
+            restored = commands[-1]
+            self.assertEqual(restored[:3], [sys.executable, "-m", "enterprise_agent_platform.deployment"])
+            self.assertEqual(restored[restored.index("--data") + 1], str(paths.data_dir))
+            self.assertEqual(
+                restored[restored.index("--service-name") + 1],
+                "custom-agent.service",
+            )
+            self.assertEqual(restored[restored.index("--host") + 1], "10.0.0.4")
+            self.assertEqual(restored[restored.index("--port") + 1], "9443")
+
+    def test_first_hop_rollback_is_incomplete_when_old_service_redeploy_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(root), previous_revision="c" * 40
+            )
+            manager.paths.legacy_hermes_home.mkdir(parents=True)
+
+            def run(command, **kwargs):
+                is_redeploy = command[:3] == [
+                    sys.executable,
+                    "-m",
+                    "enterprise_agent_platform.deployment",
+                ]
+                return subprocess.CompletedProcess(
+                    command, 1 if is_redeploy else 0, stdout="", stderr=""
+                )
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._revision_is_valid_update_base",
+                return_value=True,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.subprocess.run",
+                side_effect=run,
+            ):
+                rolled_back = manager.rollback_first_hop_update(
+                    host="127.0.0.1",
+                    port=8765,
+                    restart_service=True,
+                )
+
+            self.assertFalse(rolled_back)
+
+    def test_first_hop_rollback_is_forbidden_after_activation_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
+            manager = DeploymentManager(paths, previous_revision="c" * 40)
+            manager._write_cutover_marker(
+                {"version": 1, "phase": "finalized", "updated_at": 1}
+            )
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._revision_is_valid_update_base",
+                return_value=True,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.subprocess.run"
+            ) as run:
+                rolled_back = manager.rollback_first_hop_update(
+                    host="127.0.0.1",
+                    port=8765,
+                    restart_service=True,
+                )
+
+            self.assertFalse(rolled_back)
+            run.assert_not_called()
+
+    def test_pre_handoff_failure_inside_target_rolls_back_without_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = mock.Mock()
+            manager.bootstrap.side_effect = DeploymentError("node preparation failed")
+            manager._running_inside_target_service.return_value = True
+            manager.rollback_first_hop_update.return_value = True
+            manager.effective_public_url.return_value = "http://127.0.0.1:8765"
+            args = SimpleNamespace(
+                root=str(root),
+                host="127.0.0.1",
+                port=8765,
+                data=None,
+                service_name=None,
+                mode="auto",
+                skip_submodules=False,
+                skip_runtime_prepare=False,
+                internal_previous_revision="",
+                internal_first_hop_owner=False,
+            )
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._resolve_existing_service_deployment",
+                return_value=SimpleNamespace(
+                    service_name="custom-agent.service",
+                    data_dir=root / "state",
+                ),
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._detect_previous_update_revision",
+                return_value="d" * 40,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.DeploymentManager",
+                return_value=manager,
+            ):
+                result = bootstrap_from_args(args)
+
+            self.assertEqual(result.mode, "rollback")
+            manager.rollback_first_hop_update.assert_called_once_with(
+                host="127.0.0.1",
+                port=8765,
+                restart_service=False,
+            )
+
+    def test_internal_owner_keeps_retrying_when_rollback_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = mock.Mock()
+            manager.bootstrap.side_effect = DeploymentError("activation failed")
+            manager._running_inside_target_service.return_value = False
+            manager.rollback_first_hop_update.return_value = False
+            args = SimpleNamespace(
+                root=str(root),
+                host="127.0.0.1",
+                port=8765,
+                data=None,
+                service_name=None,
+                mode="auto",
+                skip_submodules=False,
+                skip_runtime_prepare=False,
+                internal_previous_revision="",
+                internal_first_hop_owner=True,
+            )
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._resolve_existing_service_deployment",
+                return_value=SimpleNamespace(
+                    service_name="custom-agent.service",
+                    data_dir=root / "state",
+                ),
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._detect_previous_update_revision",
+                return_value="e" * 40,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.DeploymentManager",
+                return_value=manager,
+            ), self.assertRaisesRegex(DeploymentError, "activation failed"):
+                bootstrap_from_args(args)
+
+    def test_ordinary_update_failure_stays_in_the_shell_rollback_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = mock.Mock()
+            manager.bootstrap.side_effect = DeploymentError("ordinary Pi update failed")
+            args = SimpleNamespace(
+                root=str(root),
+                host="127.0.0.1",
+                port=8765,
+                data=None,
+                service_name=None,
+                mode="auto",
+                skip_submodules=False,
+                skip_runtime_prepare=False,
+                internal_previous_revision="",
+                internal_first_hop_owner=False,
+            )
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment._resolve_existing_service_deployment",
+                return_value=SimpleNamespace(
+                    service_name="enterprise-agent-platform.service",
+                    data_dir=root / "state",
+                ),
+            ), mock.patch(
+                "enterprise_agent_platform.deployment._detect_previous_update_revision",
+                return_value=None,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.DeploymentManager",
+                return_value=manager,
+            ), self.assertRaisesRegex(DeploymentError, "ordinary Pi update failed"):
+                bootstrap_from_args(args)
+
+            manager.rollback_first_hop_update.assert_not_called()
+
+    def test_explicit_previous_revision_only_enables_hermes_first_hop_recovery(self):
+        root = Path("/tmp/repository")
+        previous = "a" * 40
+        with mock.patch(
+            "enterprise_agent_platform.deployment._canonical_commit",
+            return_value=previous,
+        ), mock.patch(
+            "enterprise_agent_platform.deployment._revision_is_valid_update_base",
+            return_value=True,
+        ), mock.patch(
+            "enterprise_agent_platform.deployment._is_hermes_removal_transition",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                _detect_previous_update_revision(
+                    root,
+                    explicit=previous,
+                    internal_owner=False,
+                )
+            )
+            with self.assertRaisesRegex(DeploymentError, "Hermes-removal"):
+                _detect_previous_update_revision(
+                    root,
+                    explicit=previous,
+                    internal_owner=True,
+                )
+
+    def test_main_retries_when_handoff_unit_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "enterprise_agent_platform.deployment.bootstrap_from_args",
+            return_value=DeploymentResult(mode="service", url="http://127.0.0.1:8765"),
+        ), mock.patch(
+            "enterprise_agent_platform.deployment._cleanup_handoff_unit",
+            side_effect=DeploymentError("simulated cleanup failure"),
+        ), self.assertRaises(SystemExit) as raised:
+            deployment_main(
+                [
+                    "bootstrap",
+                    "--root",
+                    td,
+                    "--internal-first-hop-owner",
+                    "--internal-handoff-unit",
+                    "ubitech-agent-cutover-test.service",
+                ]
+            )
+
+        self.assertEqual(raised.exception.code, ACTIVATED_CLEANUP_PENDING_EXIT_CODE)
+
+    def test_verified_update_base_requires_hermes_removal_transition(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=root, check=True)
+            blob = subprocess.check_output(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=root,
+                input=b"legacy\n",
+            ).decode().strip()
+            tree = subprocess.check_output(
+                ["git", "mktree"],
+                cwd=root,
+                input=f"100644 blob {blob}\tfile\n".encode(),
+            ).decode().strip()
+            submodule_commit = subprocess.check_output(
+                ["git", "commit-tree", tree, "-m", "submodule"],
+                cwd=root,
+            ).decode().strip()
+            subprocess.run(
+                ["git", "update-index", "--add", "--cacheinfo", f"160000,{submodule_commit},hermes-agent"],
+                cwd=root,
+                check=True,
+            )
+            (root / "tracked.txt").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "old"], cwd=root, check=True)
+            old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            subprocess.run(["git", "rm", "--cached", "-q", "hermes-agent"], cwd=root, check=True)
+            (root / "tracked.txt").write_text("new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "new"], cwd=root, check=True)
+            git_dir = Path(
+                subprocess.check_output(
+                    ["git", "rev-parse", "--git-dir"], cwd=root, text=True
+                ).strip()
+            )
+            if not git_dir.is_absolute():
+                git_dir = root / git_dir
+            (git_dir / "ORIG_HEAD").write_text(old + "\n", encoding="ascii")
+
+            self.assertTrue(_revision_is_valid_update_base(root, old))
+            self.assertTrue(_is_hermes_removal_transition(root, old))
+            with mock.patch(
+                "enterprise_agent_platform.deployment._parent_is_legacy_deploy_update",
+                return_value=True,
+            ):
+                detected = _detect_previous_update_revision(
+                    root,
+                    explicit="",
+                    internal_owner=False,
+                )
+            self.assertEqual(detected, old)
+
+            pi_base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            (root / "tracked.txt").write_text("newer\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "pi update"], cwd=root, check=True)
+            self.assertFalse(_is_hermes_removal_transition(root, pi_base))
+            self.assertIsNone(
+                _detect_previous_update_revision(
+                    root,
+                    explicit=pi_base,
+                    internal_owner=False,
+                )
+            )
 
     def test_user_service_unit_passes_systemd_verify_when_available(self):
         if not shutil.which("systemd-analyze"):
@@ -441,6 +1416,71 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("foreground", result.stdout)
         syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_deploy_script_prefers_managed_node_before_runtime_check(self):
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy2(source_script, root / "deploy.sh")
+            managed_bin = root / "enterprise-agent-platform" / "data" / "runtimes" / "node" / "current" / "bin"
+            managed_bin.mkdir(parents=True)
+            marker = root / "managed-node-used.txt"
+            (managed_bin / "node").write_text(
+                "#!/bin/sh\nprintf 'managed\\n' >> \"$FAKE_NODE_MARKER\"\nprintf '22.19.0\\n'\n",
+                encoding="utf-8",
+            )
+            (managed_bin / "npm").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_python = root / "python"
+            fake_python.write_text("#!/bin/sh\nnode --version >/dev/null\n", encoding="utf-8")
+            for executable in (managed_bin / "node", managed_bin / "npm", fake_python):
+                executable.chmod(0o755)
+            env = os.environ.copy()
+            env.update({"PYTHON_BIN": str(fake_python), "FAKE_NODE_MARKER": str(marker)})
+
+            result = subprocess.run(
+                ["bash", str(root / "deploy.sh"), "prepare"],
+                cwd=root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "managed\n")
+
+    def test_deploy_update_refuses_a_second_concurrent_update(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy2(source_script, root / "deploy.sh")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "deploy.sh"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+            lock_file = root / ".git" / "ubitech-agent-update.lock"
+            lock_fd = lock_file.open("w")
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                result = subprocess.run(
+                    ["bash", str(root / "deploy.sh"), "update"],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("update is already in progress", result.stderr)
 
     def test_deploy_update_rejects_all_dirty_worktree_states_before_pull(self):
         if not shutil.which("git"):
@@ -507,7 +1547,7 @@ class DeploymentTests(unittest.TestCase):
                         ).strip()
                     )
 
-    def test_failed_update_redeploys_previous_revision_after_rollback(self):
+    def test_failed_update_rollback_is_safe_and_internal_owner_never_shell_rolls_back(self):
         if not shutil.which("git"):
             self.skipTest("git is not available")
         source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
@@ -526,15 +1566,63 @@ class DeploymentTests(unittest.TestCase):
             old_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=upstream, text=True).strip()
 
             downstream = base / "downstream"
-            subprocess.run(["git", "clone", "-q", str(upstream), str(downstream)], check=True)
+            late_change = base / "late-change"
+            internal_owner = base / "internal-owner"
+            status_failure = base / "status-failure"
+            concurrent_edit = base / "concurrent-edit"
+            pinned_owner = base / "pinned-owner"
+            for checkout in (
+                downstream,
+                late_change,
+                internal_owner,
+                status_failure,
+                concurrent_edit,
+                pinned_owner,
+            ):
+                subprocess.run(
+                    ["git", "clone", "-q", str(upstream), str(checkout)], check=True
+                )
             (upstream / "version.txt").write_text("new\n", encoding="utf-8")
             subprocess.run(["git", "add", "version.txt"], cwd=upstream, check=True)
             subprocess.run(["git", "commit", "-q", "-m", "new"], cwd=upstream, check=True)
+            new_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
 
             tools = base / "tools"
             tools.mkdir()
             (tools / "node").write_text("#!/bin/sh\nprintf '22.19.0\\n'\n", encoding="utf-8")
             (tools / "npm").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "git").write_text(
+                """#!/bin/sh
+is_status=0
+is_reset=0
+for arg in "$@"; do
+  [ "$arg" = "status" ] && is_status=1
+  [ "$arg" = "reset" ] && is_reset=1
+done
+if { [ "${FAKE_FAIL_SECOND_STATUS:-}" = "1" ] || [ "${FAKE_EDIT_AFTER_SECOND_STATUS:-}" = "1" ]; } && [ "$is_status" = "1" ]; then
+  count=0
+  [ -f "$FAKE_STATUS_COUNTER" ] && count="$(cat "$FAKE_STATUS_COUNTER")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_STATUS_COUNTER"
+  if [ "$count" -ge 2 ] && [ "${FAKE_FAIL_SECOND_STATUS:-}" = "1" ]; then
+    exit 42
+  fi
+  if [ "$count" -ge 2 ] && [ "${FAKE_EDIT_AFTER_SECOND_STATUS:-}" = "1" ]; then
+    "$REAL_GIT" "$@"
+    status=$?
+    printf 'concurrent local edit\n' > "$FAKE_EDIT_PATH"
+    exit "$status"
+  fi
+fi
+if [ "$is_reset" = "1" ] && [ -n "${FAKE_RESET_MARKER:-}" ]; then
+  printf 'reset\n' >> "$FAKE_RESET_MARKER"
+fi
+exec "$REAL_GIT" "$@"
+""",
+                encoding="utf-8",
+            )
             (tools / "python").write_text(
                 """#!/bin/sh
 root=''
@@ -550,6 +1638,12 @@ version="$(tr -d '\\n' < "$root/version.txt")"
 printf '%s\\n' "$version" >> "$FAKE_DEPLOY_LOG"
 printf '%s\\n' "$version" > "$FAKE_SIDECAR"
 if [ "$version" = "new" ]; then
+  if [ "${FAKE_CREATE_LOCAL_CHANGE:-}" = "1" ]; then
+    printf 'preserve\\n' > "$root/local-after-pull.txt"
+  fi
+  if [ "${FAKE_CRASH:-}" = "1" ]; then
+    exit 137
+  fi
   exit 1
 fi
 exit 0
@@ -567,6 +1661,7 @@ exit 0
                     "PYTHON_BIN": str(tools / "python"),
                     "FAKE_DEPLOY_LOG": str(log),
                     "FAKE_SIDECAR": str(sidecar),
+                    "REAL_GIT": str(shutil.which("git")),
                 }
             )
 
@@ -587,6 +1682,174 @@ exit 0
             self.assertEqual(
                 subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=downstream, text=True).strip(),
                 old_sha,
+            )
+
+            late_log = base / "late-deploy.log"
+            late_env = {
+                **env,
+                "FAKE_DEPLOY_LOG": str(late_log),
+                "FAKE_SIDECAR": str(base / "late-sidecar.txt"),
+                "FAKE_CREATE_LOCAL_CHANGE": "1",
+            }
+            late_result = subprocess.run(
+                ["bash", str(late_change / "deploy.sh"), "update"],
+                cwd=late_change,
+                env=late_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(late_result.returncode, 0)
+            self.assertIn("automatic rollback was refused", late_result.stderr)
+            self.assertNotIn("Rolled back to", late_result.stderr)
+            self.assertEqual(
+                (late_change / "local-after-pull.txt").read_text(encoding="utf-8"),
+                "preserve\n",
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=late_change, text=True
+                ).strip(),
+                new_sha,
+            )
+
+            owner_log = base / "owner-deploy.log"
+            owner_env = {
+                **env,
+                "FAKE_DEPLOY_LOG": str(owner_log),
+                "FAKE_SIDECAR": str(base / "owner-sidecar.txt"),
+                "FAKE_CRASH": "1",
+                "ENTERPRISE_INTERNAL_FIRST_HOP_OWNER": "1",
+                "ENTERPRISE_UPDATE_TARGET_SHA": new_sha,
+            }
+            subprocess.run(["git", "fetch", "origin"], cwd=internal_owner, check=True)
+            subprocess.run(
+                ["git", "merge", "--ff-only", new_sha],
+                cwd=internal_owner,
+                check=True,
+            )
+            owner_result = subprocess.run(
+                ["bash", str(internal_owner / "deploy.sh"), "update"],
+                cwd=internal_owner,
+                env=owner_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(owner_result.returncode, 137)
+            self.assertNotIn("rolling back", owner_result.stderr.lower())
+            self.assertEqual(owner_log.read_text(encoding="utf-8").splitlines(), ["new"])
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=internal_owner, text=True
+                ).strip(),
+                new_sha,
+            )
+
+            status_log = base / "status-deploy.log"
+            reset_marker = base / "reset-called.txt"
+            status_env = {
+                **env,
+                "FAKE_DEPLOY_LOG": str(status_log),
+                "FAKE_SIDECAR": str(base / "status-sidecar.txt"),
+                "FAKE_FAIL_SECOND_STATUS": "1",
+                "FAKE_STATUS_COUNTER": str(base / "status-counter.txt"),
+                "FAKE_RESET_MARKER": str(reset_marker),
+            }
+            status_result = subprocess.run(
+                ["bash", str(status_failure / "deploy.sh"), "update"],
+                cwd=status_failure,
+                env=status_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(status_result.returncode, 0)
+            self.assertIn("status could not be verified", status_result.stderr)
+            self.assertFalse(reset_marker.exists())
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=status_failure, text=True
+                ).strip(),
+                new_sha,
+            )
+
+            concurrent_env = {
+                **env,
+                "FAKE_DEPLOY_LOG": str(base / "concurrent-deploy.log"),
+                "FAKE_SIDECAR": str(base / "concurrent-sidecar.txt"),
+                "FAKE_EDIT_AFTER_SECOND_STATUS": "1",
+                "FAKE_STATUS_COUNTER": str(base / "concurrent-status-counter.txt"),
+                "FAKE_EDIT_PATH": str(concurrent_edit / "version.txt"),
+            }
+            concurrent_result = subprocess.run(
+                ["bash", str(concurrent_edit / "deploy.sh"), "update"],
+                cwd=concurrent_edit,
+                env=concurrent_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(concurrent_result.returncode, 0)
+            self.assertIn("concurrent local changes", concurrent_result.stderr)
+            self.assertEqual(
+                (concurrent_edit / "version.txt").read_text(encoding="utf-8"),
+                "concurrent local edit\n",
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=concurrent_edit, text=True
+                ).strip(),
+                new_sha,
+            )
+
+            # A newer remote commit appearing after handoff must not be pulled
+            # into the pinned one-time migration transaction.
+            subprocess.run(["git", "fetch", "origin"], cwd=pinned_owner, check=True)
+            subprocess.run(
+                ["git", "merge", "--ff-only", new_sha], cwd=pinned_owner, check=True
+            )
+            (upstream / "version.txt").write_text("newer\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=upstream, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "newer remote"],
+                cwd=upstream,
+                check=True,
+            )
+            pinned_log = base / "pinned-owner-deploy.log"
+            pinned_env = {
+                **env,
+                "FAKE_DEPLOY_LOG": str(pinned_log),
+                "FAKE_SIDECAR": str(base / "pinned-owner-sidecar.txt"),
+                "FAKE_CRASH": "1",
+                "ENTERPRISE_INTERNAL_FIRST_HOP_OWNER": "1",
+                "ENTERPRISE_UPDATE_TARGET_SHA": new_sha,
+            }
+            pinned_result = subprocess.run(
+                ["bash", str(pinned_owner / "deploy.sh"), "update"],
+                cwd=pinned_owner,
+                env=pinned_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(pinned_result.returncode, 137)
+            self.assertEqual(pinned_log.read_text(encoding="utf-8").splitlines(), ["new"])
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=pinned_owner, text=True
+                ).strip(),
+                new_sha,
             )
 
     def test_platform_pyproject_supports_editable_install(self):

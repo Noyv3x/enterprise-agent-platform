@@ -13,12 +13,28 @@ npm test
 npm start
 ```
 
+An offline migration can import platform-visible legacy user/assistant history
+after the old runtime and this sidecar have both stopped:
+
+```bash
+npm run build
+node dist/src/legacy-session-importer.js --manifest /absolute/path/legacy-sessions.json --home /absolute/path/agent-runtime-home
+```
+
+The manifest must be a non-symlink regular file with mode `0600`. It uses
+`{"version":1,"sessions":[...]}`; every session contains `scope_key`,
+`lifecycle_id`, `session_id`, a product `model` (`provider` and `id`), and
+plain visible `messages` (`role`, `content`, and integer millisecond
+`timestamp`). The importer derives all journal paths from hashed identities and
+prints only JSON counts. It can refresh a journal created by the same migration
+marker, but skips any session that Pi has used.
+
 Environment variables:
 
 - `AGENT_RUNTIME_HOME`: runtime state root; defaults to `data/runtimes/agent`.
 - `AGENT_RUNTIME_HOST`: bind host; defaults to `127.0.0.1`.
 - `AGENT_RUNTIME_PORT`: bind port; defaults to `8766`.
-- `AGENT_RUNTIME_TOKEN` or `AGENT_RUNTIME_TOKEN_FILE`: bearer credential for all endpoints except health.
+- `AGENT_RUNTIME_TOKEN` or `AGENT_RUNTIME_TOKEN_FILE`: bearer credential for every endpoint, including health.
 - `AGENT_PLATFORM_INTERNAL_URL` and `AGENT_PLATFORM_INTERNAL_TOKEN`: default private platform gateway used by auth and managed tools.
 - `AGENT_RUNTIME_RUN_TIMEOUT_MS`: hard top-level and child run lifetime; defaults to 240,000 ms. Timeout aborts the model, approval waits, gateway requests, and process group.
 - `AGENT_RUNTIME_MAX_CONCURRENCY`: fair FIFO top-level run concurrency from 1 to 64; defaults to 8. Delegated child runs share their parent's execution slot.

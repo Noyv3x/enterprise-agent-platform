@@ -38,6 +38,7 @@ from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
     UploadedFile,
+    _ResizableConcurrencyGate,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
 
@@ -459,6 +460,114 @@ class FakeAutoUpdater:
 
     def stop(self):
         pass
+
+
+class AutoUpdateLaunchTests(unittest.TestCase):
+    @staticmethod
+    def _manager(root: Path, runner) -> AutoUpdateManager:
+        deploy = root / "deploy.sh"
+        deploy.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        deploy.chmod(0o755)
+        service = FakeAutoUpdateConfig()
+        service.config = SimpleNamespace(
+            data_dir=root / "custom-state",
+            host="0.0.0.0",
+            port=9123,
+        )
+        return AutoUpdateManager(service, repo_root=root, runner=runner)
+
+    def test_systemd_handoff_uses_independent_unit_and_propagates_deployment_context(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = self._manager(root, runner)
+            with mock.patch(
+                "enterprise_agent_platform.auto_update.shutil.which",
+                side_effect=lambda name: f"/usr/bin/{name}",
+            ), mock.patch.dict(
+                os.environ,
+                {"ENTERPRISE_SERVICE_NAME": "ubitech-custom.service", "INVOCATION_ID": "invocation"},
+                clear=False,
+            ):
+                command = manager._launch_update_command("poll")
+
+            self.assertEqual(command[0:3], ["systemd-run", "--user", "--collect"])
+            self.assertIn("--setenv=ENTERPRISE_PLATFORM_DATA=" + str(root / "custom-state"), command)
+            self.assertIn("--setenv=ENTERPRISE_SERVICE_NAME=ubitech-custom.service", command)
+            self.assertIn("--setenv=ENTERPRISE_PLATFORM_HOST=0.0.0.0", command)
+            self.assertIn("--setenv=ENTERPRISE_PLATFORM_PORT=9123", command)
+            self.assertEqual(command[-10:], [
+                str(root / "deploy.sh"),
+                "update",
+                "--data",
+                str(root / "custom-state"),
+                "--service-name",
+                "ubitech-custom.service",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9123",
+            ])
+            self.assertTrue(any(call[:3] == ["systemctl", "--user", "show-environment"] for call in calls))
+
+    def test_systemd_handoff_failure_never_falls_back_to_service_cgroup_child(self):
+        def runner(command, **kwargs):
+            if command[0] == "systemd-run":
+                return subprocess.CompletedProcess(command, 1, stderr="transient launch failed")
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = self._manager(root, runner)
+            with mock.patch(
+                "enterprise_agent_platform.auto_update.shutil.which",
+                side_effect=lambda name: f"/usr/bin/{name}",
+            ), mock.patch.dict(os.environ, {"INVOCATION_ID": "invocation"}, clear=False), mock.patch(
+                "enterprise_agent_platform.auto_update.subprocess.Popen"
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "independent systemd unit"):
+                    manager._launch_update_command("webhook")
+            popen.assert_not_called()
+
+    def test_systemd_handoff_requires_transient_unit_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = self._manager(root, lambda command, **kwargs: subprocess.CompletedProcess(command, 1))
+            with mock.patch(
+                "enterprise_agent_platform.auto_update.shutil.which",
+                return_value=None,
+            ), mock.patch.dict(os.environ, {"JOURNAL_STREAM": "8:123"}, clear=False), mock.patch(
+                "enterprise_agent_platform.auto_update.subprocess.Popen"
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "transient unit is unavailable"):
+                    manager._launch_update_command("poll")
+            popen.assert_not_called()
+
+    def test_standalone_handoff_may_use_detached_child_with_custom_data_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = self._manager(root, lambda command, **kwargs: subprocess.CompletedProcess(command, 1))
+            clean_env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "ENTERPRISE_SERVICE_NAME"}
+            }
+            with mock.patch(
+                "enterprise_agent_platform.auto_update.shutil.which",
+                return_value=None,
+            ), mock.patch.dict(os.environ, clean_env, clear=True), mock.patch(
+                "enterprise_agent_platform.auto_update.subprocess.Popen"
+            ) as popen:
+                command = manager._launch_update_command("manual")
+
+            self.assertEqual(command[:2], [str(root / "deploy.sh"), "update"])
+            popen.assert_called_once()
+            self.assertTrue((root / "custom-state" / "logs" / "auto-update.log").exists())
 
 
 
@@ -2809,6 +2918,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(service.get_setting(AGENT_SETTING_TIMEOUT), "321.0")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MAX_CONCURRENCY), "4")
                 self.assertEqual(service.get_setting(AGENT_SETTING_COMPACTION_THRESHOLD), "0.75")
+                self.assertEqual(service._agent_run_gate.limit, 4)
 
                 invalid_updates = (
                     {"provider": "openrouter"},
@@ -2824,8 +2934,111 @@ class PlatformServiceTests(unittest.TestCase):
                     with self.subTest(body=body), self.assertRaises(ServiceError) as ctx:
                         service.update_agent_runtime_config(admin, body)
                     self.assertEqual(ctx.exception.status, 400)
+
+                before = {
+                    key: service.get_setting(key)
+                    for key in (
+                        AGENT_SETTING_PROVIDER,
+                        AGENT_SETTING_MODEL,
+                        AGENT_SETTING_MAX_CONCURRENCY,
+                    )
+                }
+                with self.assertRaises(ServiceError):
+                    service.update_agent_runtime_config(
+                        admin,
+                        {
+                            "provider": "openai-codex",
+                            "model": "not-in-catalog",
+                            "max_concurrency": 7,
+                        },
+                    )
+                self.assertEqual(
+                    {
+                        key: service.get_setting(key)
+                        for key in (
+                            AGENT_SETTING_PROVIDER,
+                            AGENT_SETTING_MODEL,
+                            AGENT_SETTING_MAX_CONCURRENCY,
+                        )
+                    },
+                    before,
+                )
+                self.assertEqual(service._agent_run_gate.limit, 4)
             finally:
                 service.close()
+
+    def test_agent_run_gate_resizes_up_and_down_without_interrupting_active_runs(self):
+        gate = _ResizableConcurrencyGate(1)
+        release_up = threading.Event()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+
+        def hold(entered: threading.Event, release: threading.Event) -> None:
+            with gate:
+                entered.set()
+                release.wait(2)
+
+        first = threading.Thread(target=hold, args=(first_entered, release_up))
+        second = threading.Thread(target=hold, args=(second_entered, release_up))
+        first.start()
+        self.assertTrue(first_entered.wait(1))
+        second.start()
+        self.assertFalse(second_entered.wait(0.05))
+        gate.resize(2)
+        self.assertTrue(second_entered.wait(1))
+        release_up.set()
+        first.join(1)
+        second.join(1)
+
+        gate.resize(2)
+        releases = [threading.Event(), threading.Event(), threading.Event()]
+        entered = [threading.Event(), threading.Event(), threading.Event()]
+        workers = [
+            threading.Thread(target=hold, args=(entered[index], releases[index]))
+            for index in range(3)
+        ]
+        workers[0].start()
+        workers[1].start()
+        self.assertTrue(entered[0].wait(1))
+        self.assertTrue(entered[1].wait(1))
+        gate.resize(1)
+        workers[2].start()
+        self.assertFalse(entered[2].wait(0.05))
+        releases[0].set()
+        workers[0].join(1)
+        self.assertFalse(entered[2].wait(0.05))
+        releases[1].set()
+        workers[1].join(1)
+        self.assertTrue(entered[2].wait(1))
+        releases[2].set()
+        workers[2].join(1)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_agent_run_gate_uses_persisted_and_canonical_fallback_limits(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                service.set_setting(AGENT_SETTING_MAX_CONCURRENCY, "12")
+            finally:
+                service.close()
+
+            restarted = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                self.assertEqual(restarted._agent_run_gate.limit, 12)
+                restarted.set_setting(AGENT_SETTING_MAX_CONCURRENCY, "invalid")
+            finally:
+                restarted.close()
+
+            fallback = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                self.assertEqual(
+                    fallback._agent_run_gate.limit,
+                    fallback.runtimes.agent_runtime_config()["max_concurrency"],
+                )
+                self.assertEqual(fallback._agent_run_gate.limit, 8)
+            finally:
+                fallback.close()
 
     def test_agent_runtime_model_selection_uses_platform_catalog(self):
         with tempfile.TemporaryDirectory() as td:

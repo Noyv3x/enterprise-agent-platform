@@ -75,6 +75,41 @@ class _AgentTaskCancelled(Exception):
         self.needs_review = bool(needs_review)
 
 
+class _ResizableConcurrencyGate:
+    """A process-wide run limit that can follow runtime settings live.
+
+    Reducing the limit never interrupts active generations; it only blocks new
+    entrants until the active count falls below the new ceiling.
+    """
+
+    def __init__(self, limit: int):
+        self._condition = threading.Condition()
+        self._limit = max(1, min(64, int(limit)))
+        self._active = 0
+
+    @property
+    def limit(self) -> int:
+        with self._condition:
+            return self._limit
+
+    def resize(self, limit: int) -> None:
+        with self._condition:
+            self._limit = max(1, min(64, int(limit)))
+            self._condition.notify_all()
+
+    def __enter__(self) -> "_ResizableConcurrencyGate":
+        with self._condition:
+            while self._active >= self._limit:
+                self._condition.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+
 @dataclass(frozen=True)
 class UploadedFile:
     filename: str
@@ -131,7 +166,10 @@ MAX_AGENT_SESSION_ID_LENGTH = 512
 # Global ceiling on concurrent in-flight Agent generations. Each conversation
 # still drains its own queue in FIFO order, while this bound prevents a burst of
 # distinct conversations from exhausting host threads and sockets.
-MAX_CONCURRENT_AGENT_RUNS = max(1, int(os.getenv("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS", "8") or "8"))
+MAX_CONCURRENT_AGENT_RUNS = max(
+    1,
+    min(64, int(os.getenv("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS", "8") or "8")),
+)
 # Cognee ingestion is heavy; it runs on a background worker so document creation
 # never blocks the request thread (and, via the DB, every other request).
 MAX_INGEST_QUEUE_DEPTH = 256
@@ -287,6 +325,7 @@ class EnterpriseService:
         )
         self.tokens = TokenSigner(self._resolve_session_secret(), self._effective_session_ttl_seconds())
         self.knowledge = KnowledgeBase(self.db)
+        self._agent_runtime_config_lock = threading.RLock()
         self.runtimes = PlatformRuntimeManager(
             config,
             self.get_secret,
@@ -329,8 +368,6 @@ class EnterpriseService:
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
-        # Global backpressure on concurrent in-flight Agent generations.
-        self._agent_run_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_AGENT_RUNS)
         self._auth_lock = threading.RLock()
         self._login_failures: dict[tuple[str, str], Deque[float]] = {}
         self._login_failures_by_user: dict[str, Deque[float]] = {}
@@ -364,6 +401,12 @@ class EnterpriseService:
         self._resources_closed = False
         self._close_lock = threading.Lock()
         self.ensure_bootstrap()
+        # Use the runtime manager's canonical parser so malformed legacy
+        # values and persisted settings produce the exact same ceiling in both
+        # the Python scheduler and the Node sidecar.
+        self._agent_run_gate = _ResizableConcurrencyGate(
+            self.runtimes._effective_agent_max_concurrency()
+        )
         # Bootstrap may copy one-release legacy settings into the neutral Agent
         # runtime keys. Rebuild the owned client once so its URL and timeouts
         # agree with the runtime manager from the first actual generation.
@@ -3415,59 +3458,86 @@ class EnterpriseService:
 
     def agent_runtime_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        config = self.runtimes.agent_runtime_config()
-        config["model_catalog"] = self._oauth_model_catalogs()
-        config["oauth"] = self.oauth_provider_status(actor)
-        return {
-            "config": config,
-            "runtime": self.runtimes.agent_runtime_status(refresh=True).to_dict(),
-        }
+        with self._agent_runtime_config_lock:
+            config = self.runtimes.agent_runtime_config()
+            config["model_catalog"] = self._oauth_model_catalogs()
+            config["oauth"] = self.oauth_provider_status(actor)
+            return {
+                "config": config,
+                "runtime": self.runtimes.agent_runtime_status(refresh=True).to_dict(),
+            }
 
     def update_agent_runtime_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        if "managed" in body:
-            self.set_setting(AGENT_SETTING_MANAGED, "1" if parse_bool(body.get("managed")) else "0")
-        provider = None
-        if "provider" in body:
-            provider = normalize_oauth_provider(str(body.get("provider") or ""))
-            if provider not in SUPPORTED_OAUTH_PROVIDERS:
-                raise ServiceError(400, "Agent provider must be Codex OAuth or Grok OAuth")
-            self.set_setting(AGENT_SETTING_PROVIDER, provider)
-        active_provider = provider or self._active_oauth_provider()
-        if "model" in body:
-            model = self._resolve_oauth_model_selection(active_provider, str(body.get("model") or ""))
-            self.set_setting(AGENT_SETTING_MODEL, model)
-        elif provider:
-            self.set_setting(AGENT_SETTING_MODEL, self._default_oauth_model(provider))
-        if "timeout_seconds" in body:
-            try:
-                timeout = float(body.get("timeout_seconds"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "timeout_seconds must be a number") from exc
-            if not 1 <= timeout <= 3600:
-                raise ServiceError(400, "timeout_seconds must be between 1 and 3600")
-            self.set_setting(AGENT_SETTING_TIMEOUT, str(timeout))
-        if "max_concurrency" in body:
-            try:
-                concurrency = int(body.get("max_concurrency"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "max_concurrency must be an integer") from exc
-            if not 1 <= concurrency <= 64:
-                raise ServiceError(400, "max_concurrency must be between 1 and 64")
-            self.set_setting(AGENT_SETTING_MAX_CONCURRENCY, str(concurrency))
-        if "compaction_threshold" in body:
-            try:
-                threshold = float(body.get("compaction_threshold"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "compaction_threshold must be a number") from exc
-            if not 0.5 <= threshold <= 0.95:
-                raise ServiceError(400, "compaction_threshold must be between 0.5 and 0.95")
-            self.set_setting(AGENT_SETTING_COMPACTION_THRESHOLD, str(threshold))
-        if self.runtimes._managed_agent_runtime_enabled():
-            self.runtimes.restart_agent_runtime()
-        if self._uses_default_agent_client:
-            self.agent_client = self._new_agent_runtime_client()
-        return self.agent_runtime_config(actor)
+        with self._agent_runtime_config_lock:
+            updates: dict[str, str] = {}
+            if "managed" in body:
+                updates[AGENT_SETTING_MANAGED] = (
+                    "1" if parse_bool(body.get("managed")) else "0"
+                )
+            provider = None
+            if "provider" in body:
+                provider = normalize_oauth_provider(str(body.get("provider") or ""))
+                if provider not in SUPPORTED_OAUTH_PROVIDERS:
+                    raise ServiceError(400, "Agent provider must be Codex OAuth or Grok OAuth")
+                updates[AGENT_SETTING_PROVIDER] = provider
+            active_provider = provider or self._active_oauth_provider()
+            if "model" in body:
+                updates[AGENT_SETTING_MODEL] = self._resolve_oauth_model_selection(
+                    active_provider, str(body.get("model") or "")
+                )
+            elif provider:
+                updates[AGENT_SETTING_MODEL] = self._default_oauth_model(provider)
+            if "timeout_seconds" in body:
+                try:
+                    timeout = float(body.get("timeout_seconds"))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "timeout_seconds must be a number") from exc
+                if not 1 <= timeout <= 3600:
+                    raise ServiceError(400, "timeout_seconds must be between 1 and 3600")
+                updates[AGENT_SETTING_TIMEOUT] = str(timeout)
+            if "max_concurrency" in body:
+                try:
+                    concurrency = int(body.get("max_concurrency"))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "max_concurrency must be an integer") from exc
+                if not 1 <= concurrency <= 64:
+                    raise ServiceError(400, "max_concurrency must be between 1 and 64")
+                updates[AGENT_SETTING_MAX_CONCURRENCY] = str(concurrency)
+            if "compaction_threshold" in body:
+                try:
+                    threshold = float(body.get("compaction_threshold"))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "compaction_threshold must be a number") from exc
+                if not 0.5 <= threshold <= 0.95:
+                    raise ServiceError(400, "compaction_threshold must be between 0.5 and 0.95")
+                updates[AGENT_SETTING_COMPACTION_THRESHOLD] = str(threshold)
+
+            if updates:
+                timestamp = now_ts()
+                with self.db.transaction() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for key, value in updates.items():
+                        connection.execute(
+                            """
+                            INSERT INTO settings(key, value, secret, updated_at)
+                            VALUES (?, ?, 0, ?)
+                            ON CONFLICT(key) DO UPDATE SET
+                                value=excluded.value,
+                                secret=0,
+                                updated_at=excluded.updated_at
+                            """,
+                            (key, value, timestamp),
+                        )
+            if AGENT_SETTING_MAX_CONCURRENCY in updates:
+                self._agent_run_gate.resize(
+                    int(updates[AGENT_SETTING_MAX_CONCURRENCY])
+                )
+            if self.runtimes._managed_agent_runtime_enabled():
+                self.runtimes.restart_agent_runtime()
+            if self._uses_default_agent_client:
+                self.agent_client = self._new_agent_runtime_client()
+            return self.agent_runtime_config(actor)
 
     def cognee_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -4931,7 +5001,7 @@ class EnterpriseService:
                     # Only N replies hit the Agent runtime (and hold a thread /
                     # socket) at once; each conversation still drains its own
                     # queue in FIFO order while queued runs wait on the semaphore.
-                    with self._agent_run_semaphore:
+                    with self._agent_run_gate:
                         self._ensure_agent_task_can_run(task)
                         if task["scope_type"] == "channel":
                             self._send_channel_agent_reply(task)

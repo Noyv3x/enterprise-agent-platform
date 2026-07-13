@@ -18,8 +18,18 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
   try {
     const address = await runtime.listen();
     const base = `http://${address.host}:${address.port}`;
-    const health = await fetch(`${base}/health`);
+    const missingHealth = await fetch(`${base}/health`);
+    assert.equal(missingHealth.status, 401);
+    const wrongHealth = await fetch(`${base}/health`, { headers: { authorization: "Bearer wrong" } });
+    assert.equal(wrongHealth.status, 401);
+    const health = await fetch(`${base}/health`, { headers: { authorization: "Bearer secret" } });
     assert.equal(health.status, 200);
+    const healthBody = await health.json() as Record<string, unknown>;
+    assert.equal(healthBody.status, "ok");
+    assert.equal(healthBody.service, "ubitech-agent-runtime");
+    assert.equal(healthBody.version, "0.1.0");
+    assert.equal(healthBody.pid, process.pid);
+    assert.equal(Number.isInteger(healthBody.uptime_seconds), true);
     const unauthorized = await fetch(`${base}/v1/runs`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(unauthorized.status, 401);
     const unsafeModel = await fetch(`${base}/v1/runs`, {

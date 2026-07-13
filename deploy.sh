@@ -63,6 +63,15 @@ require_node_runtime() {
   fi
 }
 
+activate_managed_node_runtime() {
+  local data_dir managed_bin
+  data_dir="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}"
+  managed_bin="$data_dir/runtimes/node/current/bin"
+  if [[ -x "$managed_bin/node" && -x "$managed_bin/npm" ]]; then
+    export PATH="$managed_bin:$PATH"
+  fi
+}
+
 systemctl_user() {
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemctl is not available; run ./deploy.sh foreground instead." >&2
@@ -71,8 +80,36 @@ systemctl_user() {
   systemctl --user "$@"
 }
 
-# Holds the pre-update HEAD so a failed redeploy can be rolled back.
-PREV_SHA=""
+# Holds the pre-update HEAD so a failed redeploy can be rolled back. An
+# independent first-hop migration unit may inherit the original checkpoint.
+PREV_SHA="${ENTERPRISE_UPDATE_PREV_SHA:-}"
+UPDATE_LOCK_FD=""
+
+acquire_update_lock() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is required to update the repository." >&2
+    exit 1
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is required to serialize repository updates." >&2
+    exit 1
+  fi
+  if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "$ROOT is not a git work tree." >&2
+    exit 1
+  fi
+
+  local lock_path
+  lock_path="$(git -C "$ROOT" rev-parse --git-path ubitech-agent-update.lock)"
+  if [[ "$lock_path" != /* ]]; then
+    lock_path="$ROOT/$lock_path"
+  fi
+  exec {UPDATE_LOCK_FD}>"$lock_path"
+  if ! flock -n "$UPDATE_LOCK_FD"; then
+    echo "Another ubitech agent update is already in progress." >&2
+    exit 1
+  fi
+}
 
 update_repo() {
   if ! command -v git >/dev/null 2>&1; then
@@ -101,7 +138,9 @@ update_repo() {
 
   # Checkpoint the current revision before moving the working tree forward so
   # the update can be reverted if the subsequent redeploy fails.
-  PREV_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -z "$PREV_SHA" ]]; then
+    PREV_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  fi
 
   git -C "$ROOT" fetch --recurse-submodules origin
   if [[ -n "$upstream" ]]; then
@@ -115,6 +154,29 @@ update_repo() {
   git -C "$ROOT" submodule update --init --recursive
 }
 
+verify_internal_owner_checkout() {
+  local target canonical current worktree_status
+  target="${ENTERPRISE_UPDATE_TARGET_SHA:-}"
+  if [[ -z "$target" ]]; then
+    echo "Migration owner is missing its pinned target revision." >&2
+    exit 1
+  fi
+  canonical="$(git -C "$ROOT" rev-parse --verify "${target}^{commit}" 2>/dev/null || true)"
+  current="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -z "$canonical" || "$current" != "$canonical" ]]; then
+    echo "Migration owner checkout does not match its pinned target revision." >&2
+    exit 1
+  fi
+  if ! worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"; then
+    echo "Migration owner could not verify repository status." >&2
+    exit 1
+  fi
+  if [[ -n "$worktree_status" ]]; then
+    echo "Migration owner found local repository changes and will retry without overwriting them." >&2
+    exit 1
+  fi
+}
+
 # Revert the working tree (and submodules) to the pre-update revision and
 # redeploy the known-good code so the service is restored to a working state.
 rollback_update() {
@@ -122,19 +184,43 @@ rollback_update() {
     echo "Update failed and no previous revision was recorded; manual recovery required." >&2
     return 1
   fi
+  # A failed bootstrap can race with local maintenance or a generated file
+  # appearing after the pull. Recheck immediately before the destructive reset
+  # so rollback never erases changes that were not part of the update itself.
+  local worktree_status
+  if ! worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"; then
+    echo "Update failed, but automatic rollback was refused because repository status could not be verified." >&2
+    return 1
+  fi
+  if [[ -n "$worktree_status" ]]; then
+    echo "Update failed, but automatic rollback was refused because the repository gained local changes." >&2
+    echo "Preserve those changes and recover the previous revision manually if needed." >&2
+    return 1
+  fi
   echo "Update failed; rolling back to ${PREV_SHA}." >&2
-  git -C "$ROOT" reset --hard "$PREV_SHA"
-  git -C "$ROOT" submodule update --init --recursive --force
+  # --keep performs its own last-moment local-change check while updating the
+  # index/worktree. Unlike --hard, it aborts instead of overwriting a tracked
+  # edit that races with the status check above.
+  if ! git -C "$ROOT" reset --keep "$PREV_SHA"; then
+    echo "Automatic rollback was refused because concurrent local changes could not be preserved." >&2
+    return 1
+  fi
+  if ! git -C "$ROOT" submodule update --init --recursive; then
+    echo "Previous source was selected, but submodules could not be restored without force." >&2
+    return 1
+  fi
   # Reinstall and restart from the restored revision so the live service runs
   # known-good code again. If even this fails, surface manual recovery steps.
   if python_bootstrap_checked auto "$@"; then
     echo "Rolled back to ${PREV_SHA}." >&2
   else
     echo "Rollback redeploy failed. Recover manually with:" >&2
-    echo "  git -C \"$ROOT\" reset --hard ${PREV_SHA} && git -C \"$ROOT\" submodule update --init --recursive --force && ./deploy.sh" >&2
+    echo "  git -C \"$ROOT\" reset --keep ${PREV_SHA} && git -C \"$ROOT\" submodule update --init --recursive && ./deploy.sh" >&2
   fi
   return 1
 }
+
+activate_managed_node_runtime
 
 cmd="${1:-deploy}"
 case "$cmd" in
@@ -143,31 +229,71 @@ case "$cmd" in
     ;;
   update|upgrade)
     shift || true
-    require_node_runtime
-    update_repo
-    if ! python_bootstrap_checked auto "$@"; then
+    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" \
+      && "${ENTERPRISE_INTERNAL_UPDATE_LOCK_HELD:-}" == "1" ]]; then
+      # The persistent unit opened fd 9 and keeps the same flock across source
+      # pinning and this deploy process. Reassert it before trusting the flag.
+      UPDATE_LOCK_FD=9
+      if ! flock -n "$UPDATE_LOCK_FD"; then
+        echo "Migration owner did not inherit its repository update lock." >&2
+        exit 1
+      fi
+    else
+      acquire_update_lock
+    fi
+    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" ]]; then
+      # The persistent owner restored the exact reviewed target and its submodules.
+      # Do not pull a newer release into the middle of this one-time migration.
+      verify_internal_owner_checkout
+    else
+      update_repo
+    fi
+    current_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "$PREV_SHA" && "$PREV_SHA" != "$current_sha" ]]; then
+      export ENTERPRISE_UPDATE_PREV_SHA="$PREV_SHA"
+    else
+      unset ENTERPRISE_UPDATE_PREV_SHA
+    fi
+    set +e
+    python_bootstrap_checked auto "$@"
+    bootstrap_status=$?
+    set -e
+    # The restartable migration owner is the only process allowed to decide
+    # recovery once handoff has occurred. A killed Python child must make the
+    # unit fail and restart; this shell must never hard-reset underneath it.
+    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" && "$bootstrap_status" -ne 0 ]]; then
+      exit "$bootstrap_status"
+    fi
+    # Exit 75 means the Python migration transaction already restored the
+    # exact old checkout, data directory, and service. Do not roll it back a
+    # second time through this shell.
+    if [[ "$bootstrap_status" -eq 75 ]]; then
+      exit 1
+    fi
+    # Exit 76 means Pi is already active and only post-activation Hermes
+    # cleanup remains. Never source-rollback; a persistent owner will retry.
+    if [[ "$bootstrap_status" -eq 76 ]]; then
+      exit 76
+    fi
+    if [[ "$bootstrap_status" -ne 0 ]]; then
       rollback_update "$@" || true
       exit 1
     fi
     ;;
   deploy|up)
     shift || true
-    require_node_runtime
     python_bootstrap auto "$@"
     ;;
   service)
     shift || true
-    require_node_runtime
     python_bootstrap service "$@"
     ;;
   foreground|run)
     shift || true
-    require_node_runtime
     python_bootstrap foreground "$@"
     ;;
   prepare)
     shift || true
-    require_node_runtime
     python_bootstrap prepare "$@"
     ;;
   start|stop|restart|status)
@@ -195,7 +321,6 @@ case "$cmd" in
     npm run build
     ;;
   *)
-    require_node_runtime
     python_bootstrap auto "$@"
     ;;
 esac

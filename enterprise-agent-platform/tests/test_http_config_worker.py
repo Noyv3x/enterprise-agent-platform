@@ -47,6 +47,29 @@ class FailingThenRecoveringAgent:
 
 
 class HTTPServerBehaviorTests(unittest.TestCase):
+    def test_health_endpoint_is_exact_public_readiness_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/healthz")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    payload,
+                    {"status": "ok", "service": "ubitech-agent-platform"},
+                )
+                self.assertIn("application/json", response.getheader("Content-Type"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_non_numeric_limit_query_returns_400_json_not_500(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

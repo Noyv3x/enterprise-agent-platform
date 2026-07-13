@@ -28,7 +28,7 @@ Cognee、Firecrawl 上游 submodule、反向代理、TLS、DNS、防火墙、Doc
 
 ### Agent 运行时
 
-- 托管 sidecar 默认仅监听 `127.0.0.1:8766`。除不含敏感信息的健康检查外，私有 API 使用定时安全比较的 bearer token。
+- 托管 sidecar 默认仅监听 `127.0.0.1:8766`。所有端点（包括健康检查）均使用定时安全比较的 bearer token。
 - 运行时 token 由平台生成并保存为 secret；OAuth refresh token 只保存在平台数据库，不写入 Node.js 运行时目录。
 - HTTP 请求体有大小上限，SSE 与 JSON 响应禁用缓存，运行时目录以受限权限创建。
 - 文件工具先解析真实路径；工作区内读取可直接执行，文件修改及工作区外访问进入审批。搜索遍历跳过软链、`.git` 和 `node_modules`，受保护系统路径的直接文件写入会被拒绝。
