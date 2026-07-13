@@ -116,9 +116,14 @@ export interface ActivityStep {
   detail?: string;
   line?: string;
   tool?: string;
+  tool_call_id?: string;
   tool_status?: string;
+  approval_id?: string;
+  approval_choice?: string;
+  approval_responder?: string;
   emoji?: string;
   at?: number | string;
+  completed_at?: number | string;
 }
 
 export interface AgentApprovalRequest {

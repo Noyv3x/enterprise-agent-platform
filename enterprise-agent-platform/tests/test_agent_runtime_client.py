@@ -360,19 +360,22 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.runtime.events = [
             _event(1, "run.started", {"status": "running"}),
             _event(2, "message.delta", {"delta": "Done"}),
-            _event(3, "tool.started", {"tool": "read_file", "tool_call_id": "tool-1"}),
-            _event(4, "tool.completed", {"tool": "read_file", "tool_call_id": "tool-1"}),
+            _event(3, "tool.arguments.delta", {"delta": '{"path":', "content_index": 0}),
+            _event(4, "tool.arguments.delta", {"delta": '"README.md"}', "content_index": 0}),
+            _event(5, "tool.started", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
+            _event(6, "tool.updated", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
+            _event(7, "tool.completed", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
             _event(
-                5,
+                8,
                 "approval.requested",
                 {"approval_id": "approval-1", "description": "Allow command"},
             ),
             _event(
-                6,
+                9,
                 "approval.resolved",
                 {"approval_id": "approval-1", "decision": "once"},
             ),
-            _event(7, "run.completed", {"output": "Done", "session_id": "session-2"}),
+            _event(10, "run.completed", {"output": "Done", "session_id": "session-2"}),
         ]
         progress: list[dict[str, Any]] = []
 
@@ -388,12 +391,13 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(result.content, "Done")
         self.assertEqual(
             [item["event"] for item in progress],
-            ["tool.started", "tool.completed", "approval.request", "approval.responded"],
+            ["tool.started", "tool.updated", "tool.completed", "approval.request", "approval.responded"],
         )
         self.assertEqual(
             [item["runtime_event_type"] for item in progress],
-            ["tool.started", "tool.completed", "approval.requested", "approval.resolved"],
+            ["tool.started", "tool.updated", "tool.completed", "approval.requested", "approval.resolved"],
         )
+        self.assertEqual([item.get("tool") for item in progress[:3]], ["read_file"] * 3)
 
     def test_approval_callback_can_respond_using_cached_approval_id(self):
         self.runtime.events = [

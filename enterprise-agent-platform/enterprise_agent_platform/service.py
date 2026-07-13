@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import ipaddress
 import json
+import mimetypes
 import os
 import re
 import secrets
-import hashlib
-import mimetypes
-import sys
+import shlex
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -205,6 +206,9 @@ MEDIA_TAG_RE = re.compile(
 THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING_DEPTH = "medium"
 AGENT_MENTION_RE = re.compile(r"(?<![\w@])@(agent|main-agent|main_agent|main\s+agent)(?![A-Za-z0-9_-])", re.IGNORECASE)
+VISIBLE_TOOL_PROGRESS_EVENTS = frozenset(
+    {"tool.started", "tool.updated", "tool.completed", "tool.failed"}
+)
 
 
 def is_substantive_tool_start(payload: dict[str, Any]) -> bool:
@@ -3146,7 +3150,14 @@ class EnterpriseService:
             )
         )
         system_prompt = self._channel_system_prompt(channel, suggestions)
-        self._record_agent_activity("channel", scope_id, "replying", "等待 Agent 运行过程", generation["model"])
+        self._record_agent_activity(
+            "channel",
+            scope_id,
+            "replying",
+            "等待 Agent 运行过程",
+            generation["model"],
+            coalesce=True,
+        )
         agent_scope = self._channel_agent_scope(scope_id)
         session_id = agent_scope.session_id
         workspace_path = Path(agent_scope.workspace_path)
@@ -3357,7 +3368,14 @@ class EnterpriseService:
         execution = agent_scope.to_execution_dict()
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
         system_prompt = self._private_system_prompt(actor, agent_scope, suggestions)
-        self._record_agent_activity("private", scope_id, "replying", "等待 Agent 运行过程", generation["model"])
+        self._record_agent_activity(
+            "private",
+            scope_id,
+            "replying",
+            "等待 Agent 运行过程",
+            generation["model"],
+            coalesce=True,
+        )
         result = self.agent_client.generate(
             system_prompt=system_prompt,
             user_message=prompt_content,
@@ -5173,7 +5191,7 @@ class EnterpriseService:
         return scope_type, scope_id
 
     def _status_for_task(self, task: dict[str, Any], state: str, queued_count: int) -> dict[str, Any]:
-        label = "等待 Agent 处理" if state == "queued" else "开始处理 Agent 请求"
+        label = "等待 Agent 处理" if state == "queued" else "等待 Agent 运行过程"
         started_at = now_ts()
         return {
             "scope_type": str(task["scope_type"]),
@@ -5243,22 +5261,30 @@ class EnterpriseService:
         *,
         source: str = "platform",
         line: str | None = None,
+        coalesce: bool = False,
     ) -> None:
         key = self._conversation_key(scope_type, str(scope_id))
         timestamp = now_ts()
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             activity = [dict(item) for item in status.get("activity") or []]
-            activity.append(
-                {
-                    "stage": stage,
-                    "source": source,
-                    "label": label,
-                    "detail": detail,
-                    "line": line if line is not None else agent_work_line(stage, label, detail),
-                    "at": timestamp,
-                }
-            )
+            item = {
+                "stage": stage,
+                "source": source,
+                "label": label,
+                "detail": detail,
+                "line": line if line is not None else agent_work_line(stage, label, detail),
+                "at": timestamp,
+            }
+            matched_index = None
+            if coalesce:
+                for index in range(len(activity) - 1, -1, -1):
+                    if activity[index].get("stage") == stage and activity[index].get("source") == source:
+                        matched_index = index
+                        break
+            if matched_index is not None:
+                activity.pop(matched_index)
+            activity.append(item)
             status["activity"] = activity[-30:]
             status["current_step"] = label
             status["updated_at"] = timestamp
@@ -5323,16 +5349,18 @@ class EnterpriseService:
                 scope_type,
                 scope_id,
                 str(event.get("choice") or "").strip().lower(),
-                responder="Agent runtime",
+                responder="",
                 approval_result=event,
             )
             return
-        if not event_type.startswith("tool."):
+        if event_type not in VISIBLE_TOOL_PROGRESS_EVENTS:
             return
-        tool = str(event.get("tool") or event.get("tool_name") or "tool").strip() or "tool"
-        label = str(event.get("label") or event.get("preview") or tool).strip() or tool
+        tool = str(event.get("tool") or event.get("tool_name") or "").strip()
+        if not tool:
+            return
+        detail = agent_tool_detail(event)
         tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or event.get("id") or "").strip()
-        tool_status = str(event.get("status") or event.get("event_type") or event.get("event") or "running").strip().lower()
+        tool_status = str(event.get("status") or event_type).strip().lower()
         timestamp = now_ts()
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
@@ -5352,46 +5380,88 @@ class EnterpriseService:
                     if tool_status in {"failed", "error", "tool.failed"}
                     else "completed"
                 )
-                updated = False
+                matched_index: int | None = None
                 if tool_call_id:
-                    for item in reversed(activity):
+                    for index in range(len(activity) - 1, -1, -1):
+                        item = activity[index]
                         if item.get("source") == "agent" and item.get("tool_call_id") == tool_call_id:
-                            item["tool_status"] = terminal_status
-                            item["completed_at"] = timestamp
-                            updated = True
+                            matched_index = index
                             break
-                if updated:
-                    status["activity"] = activity[-30:]
-                    status["current_step"] = (
-                        f"{tool} 执行失败"
-                        if terminal_status == "failed"
-                        else f"完成 {tool}"
-                    )
-                    status["updated_at"] = timestamp
-                    self._agent_status[key] = status
+                if matched_index is None and not tool_call_id:
+                    for index in range(len(activity) - 1, -1, -1):
+                        item = activity[index]
+                        if (
+                            item.get("source") == "agent"
+                            and item.get("tool") == tool
+                            and item.get("tool_status") == "running"
+                        ):
+                            matched_index = index
+                            break
+                if matched_index is None:
+                    item = {
+                        "stage": "tool",
+                        "source": "agent",
+                        "label": tool,
+                        "detail": detail,
+                        "line": agent_progress_line({**event, "tool": tool, "label": detail}),
+                        "tool": tool,
+                        "tool_call_id": tool_call_id,
+                        "at": timestamp,
+                    }
+                else:
+                    # A tool occupies one row for its entire lifecycle. Move the
+                    # completed row to the end so approval events that happened
+                    # while it was paused remain in chronological order.
+                    item = activity.pop(matched_index)
+                    item["tool"] = tool
+                    item["label"] = tool
+                    if detail:
+                        item["detail"] = detail
+                item["tool_status"] = terminal_status
+                item["completed_at"] = timestamp
+                activity.append(item)
+                status["activity"] = activity[-30:]
+                status["current_step"] = (
+                    f"{tool} 执行失败"
+                    if terminal_status == "failed"
+                    else f"完成 {tool}"
+                )
+                status["updated_at"] = timestamp
+                self._agent_status[key] = status
                 return
 
-            line = agent_progress_line(event)
+            line = agent_progress_line({**event, "tool": tool, "label": detail})
             existing = None
             if tool_call_id:
                 for item in reversed(activity):
                     if item.get("source") == "agent" and item.get("tool_call_id") == tool_call_id:
                         existing = item
                         break
+            elif event_type == "tool.updated":
+                for item in reversed(activity):
+                    if (
+                        item.get("source") == "agent"
+                        and item.get("tool") == tool
+                        and item.get("tool_status") == "running"
+                    ):
+                        existing = item
+                        break
             item_data = {
                 "stage": "tool",
                 "source": "agent",
                 "label": tool,
-                "detail": label,
                 "line": line,
                 "tool": tool,
                 "tool_call_id": tool_call_id,
                 "tool_status": "running",
                 "at": timestamp,
             }
+            if detail:
+                item_data["detail"] = detail
             if existing is not None:
                 existing.update(item_data)
             else:
+                item_data.setdefault("detail", "")
                 activity.append(item_data)
             if is_substantive_tool_start(event):
                 status = self._finalize_stream_message(status, timestamp)
@@ -5412,16 +5482,31 @@ class EnterpriseService:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             status = self._finalize_stream_message(status, timestamp)
             activity = [dict(item) for item in status.get("activity") or []]
-            activity.append(
-                {
-                    "stage": "approval",
-                    "source": "agent",
-                    "label": "等待权限审批",
-                    "detail": approval["description"],
-                    "line": line,
-                    "at": timestamp,
-                }
-            )
+            approval_id = approval["approval_id"]
+            if approval_id and any(
+                item.get("stage") == "approval.responded" and item.get("approval_id") == approval_id
+                for item in activity
+            ):
+                return
+            item_data = {
+                "stage": "approval",
+                "source": "agent",
+                "label": "等待权限审批",
+                "detail": approval["description"],
+                "line": line,
+                "approval_id": approval_id,
+                "at": timestamp,
+            }
+            existing = None
+            if approval_id:
+                for item in reversed(activity):
+                    if item.get("stage") == "approval" and item.get("approval_id") == approval_id:
+                        existing = item
+                        break
+            if existing is None:
+                activity.append(item_data)
+            else:
+                existing.update(item_data)
             status["state"] = "approval"
             status["approval"] = approval
             status["activity"] = activity[-30:]
@@ -5449,21 +5534,49 @@ class EnterpriseService:
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             activity = [dict(item) for item in status.get("activity") or []]
-            activity.append(
-                {
-                    "stage": "approval.responded",
-                    "source": "platform",
-                    "label": "权限审批已处理",
-                    "detail": f"{responder}: {choice_label}",
-                    "line": f"权限审批已处理: {choice_label}",
-                    "at": timestamp,
-                    "approval_result": dict(approval_result or {}),
-                }
-            )
-            status["state"] = "replying" if status.get("state") in {"approval", "replying"} else status.get("state", "replying")
-            status["approval"] = None
+            current_approval = dict(status.get("approval") or {})
+            approval_id = str(
+                (approval_result or {}).get("approval_id")
+                or (approval_result or {}).get("id")
+                or current_approval.get("approval_id")
+                or ""
+            ).strip()
+            existing = None
+            if approval_id:
+                for item in reversed(activity):
+                    if item.get("stage") == "approval.responded" and item.get("approval_id") == approval_id:
+                        existing = item
+                        break
+            detail = f"{responder}: {choice_label}" if responder else choice_label
+            item_data = {
+                "stage": "approval.responded",
+                "source": "platform",
+                "label": "权限审批已处理",
+                "detail": detail,
+                "line": f"权限审批已处理: {choice_label}",
+                "approval_id": approval_id,
+                "approval_choice": choice,
+                "approval_responder": responder,
+                "at": timestamp,
+                "approval_result": dict(approval_result or {}),
+            }
+            if existing is None:
+                activity.append(item_data)
+            elif responder or not existing.get("approval_responder"):
+                # Prefer the user-facing HTTP responder over the anonymous SSE
+                # acknowledgement when the two paths race.
+                existing.update(item_data)
+            current_approval_id = str(current_approval.get("approval_id") or "").strip()
+            resolves_current = not current_approval_id or not approval_id or current_approval_id == approval_id
+            if resolves_current:
+                status["state"] = (
+                    "replying"
+                    if status.get("state") in {"approval", "replying"}
+                    else status.get("state", "replying")
+                )
+                status["approval"] = None
+                status["current_step"] = "权限审批已处理"
             status["activity"] = activity[-30:]
-            status["current_step"] = "权限审批已处理"
             status["updated_at"] = timestamp
             self._agent_status[key] = status
             return self._copy_status(status)
@@ -6682,6 +6795,135 @@ def agent_progress_line(event: dict[str, Any]) -> str:
     if label and label != tool:
         return f"{emoji} {tool}: \"{label}\""
     return f"{emoji} {tool}..."
+
+
+def agent_tool_detail(event: dict[str, Any]) -> str:
+    """Return a bounded, secret-redacted summary for a visible tool row.
+
+    Raw tool arguments are never copied wholesale into message metadata. Only
+    a small allowlist of useful fields is considered, and write/patch bodies are
+    intentionally excluded.
+    """
+
+    tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+    explicit = str(event.get("label") or event.get("preview") or "").strip()
+    if explicit and explicit.lower() not in {tool, "tool"}:
+        return _safe_tool_summary_text(explicit)
+    arguments = event.get("arguments")
+    if not isinstance(arguments, dict):
+        return ""
+
+    if tool == "terminal":
+        return _safe_terminal_command_summary(arguments.get("command"))
+    if tool == "process":
+        return _safe_tool_summary_text(arguments.get("action"))
+    if tool in {"read_file", "write_file", "patch_file"}:
+        return _safe_tool_path(arguments.get("path"))
+    if tool == "search_files":
+        parts = [
+            _safe_tool_summary_text(arguments.get("query")),
+            _safe_tool_path(arguments.get("path")),
+        ]
+        return " · ".join(part for part in parts if part and part != ".")[:160]
+
+    action = _safe_tool_summary_text(arguments.get("action"), limit=40)
+    nested = arguments.get("arguments")
+    nested = nested if isinstance(nested, dict) else {}
+    if tool in {"web", "knowledge", "memory", "session"}:
+        query = _safe_tool_summary_text(nested.get("query") or nested.get("q"))
+        url = _safe_tool_url(nested.get("url"))
+        identifier = _safe_tool_summary_text(nested.get("document_id") or nested.get("id"), limit=40)
+        primary = query or url or identifier
+        if primary:
+            return primary
+    if tool == "browser":
+        url = _safe_tool_url(nested.get("url"))
+        parts = [action, url]
+        return " · ".join(part for part in parts if part)[:160]
+    return action
+
+
+def _safe_tool_path(value: Any) -> str:
+    clean = _safe_tool_summary_text(value, limit=120)
+    if not clean:
+        return ""
+    path = Path(clean)
+    if path.is_absolute():
+        return f"…/{path.name}" if path.name else "…"
+    return clean
+
+
+def _safe_terminal_command_summary(value: Any) -> str:
+    """Expose command actions without persisting their arguments or values."""
+
+    command = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    actions: list[str] = []
+    for segment in re.split(r"\s*(?:&&|\|\||[;|])\s*", command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            tokens = segment.split()
+        while tokens and (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0])
+            or tokens[0] in {"command", "env", "exec", "nohup", "sudo"}
+        ):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        action = Path(tokens[0]).name.strip()
+        if action and action not in actions:
+            actions.append(action)
+        if len(actions) >= 4:
+            break
+    return " · ".join(actions)
+
+
+def _safe_tool_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        hostname = parsed.hostname or ""
+        if not hostname and "://" not in raw and not raw.startswith(("/", "?", "#")):
+            hostname = urllib.parse.urlsplit(f"//{raw}").hostname or ""
+    except ValueError:
+        return ""
+    # Userinfo, path parameters, query strings and fragments may all carry
+    # credentials. The host is enough context for a compact activity row.
+    return _safe_tool_summary_text(hostname)
+
+
+def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
+    clean = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return ""
+    clean = re.sub(
+        r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|signature|session[_-]?(?:id|token|key|secret))[A-Za-z0-9_.-]*)\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
+        lambda match: f"{match.group(1)}=•••",
+        clean,
+    )
+    clean = re.sub(r"(?i)\b(authorization\s*:\s*(?:bearer|basic))\s+\S+", r"\1 •••", clean)
+    clean = re.sub(r"(?i)\b((?:set-)?cookie\s*:)\s*[^\s,;]+", r"\1 •••", clean)
+    clean = re.sub(r"(?i)((?<!\S)(?:-u|--user)\s+)\S+", r"\1•••", clean)
+    clean = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^@/\s]+@", r"\1•••@", clean)
+    clean = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b",
+        "•••",
+        clean,
+    )
+    clean = re.sub(r"\b(?:sk|gh[pousr])[-_][A-Za-z0-9_-]{16,}\b", "•••", clean)
+    clean = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "•••", clean)
+    clean = re.sub(r"\b[A-Za-z0-9_+/=-]{48,}\b", "•••", clean)
+    clean = re.sub(
+        r"(?<![A-Za-z0-9:])/(?:home|root|tmp|var|opt|srv)/(?:[^\s\"';&|]+/)*([^\s\"';&|/]*)",
+        lambda match: f"…/{match.group(1)}" if match.group(1) else "…",
+        clean,
+    )
+    if len(clean) > limit:
+        clean = clean[: max(1, limit - 1)].rstrip() + "…"
+    return clean
 
 
 def parse_bool(value: Any) -> bool:

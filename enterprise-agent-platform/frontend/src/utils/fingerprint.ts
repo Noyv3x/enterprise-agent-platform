@@ -13,7 +13,7 @@ function scopeTypeFor(mode: ChatMode): "private" | "channel" {
 function flattenActivity(activity: AgentStatus["activity"]): string[] {
   return (activity || []).map(
     (item) =>
-      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_status || ""}:${item.emoji || ""}:${item.at}`,
+      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_call_id || ""}:${item.tool_status || ""}:${item.approval_id || ""}:${item.approval_choice || ""}:${item.emoji || ""}:${item.at}:${item.completed_at || ""}`,
   );
 }
 

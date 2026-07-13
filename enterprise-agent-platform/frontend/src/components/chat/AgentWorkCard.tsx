@@ -13,7 +13,7 @@
    whether a run has process steps without duplicating the logic. */
 
 import type { MouseEvent } from "react";
-import { t as defaultTranslate, useI18n, type Translator } from "../../i18n";
+import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
@@ -21,6 +21,33 @@ import type { ActivityStep, AgentStatus, AgentWork } from "../../types";
 import { Icon } from "../common/Icon";
 
 type Work = AgentWork | AgentStatus;
+
+interface ProcessLineEntry {
+  key: string;
+  line: string;
+}
+
+const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
+  terminal: "chat.activity.toolName.terminal",
+  process: "chat.activity.toolName.process",
+  read_file: "chat.activity.toolName.read_file",
+  write_file: "chat.activity.toolName.write_file",
+  patch_file: "chat.activity.toolName.patch_file",
+  search_files: "chat.activity.toolName.search_files",
+  session: "chat.activity.toolName.session",
+  memory: "chat.activity.toolName.memory",
+  knowledge: "chat.activity.toolName.knowledge",
+  web: "chat.activity.toolName.web",
+  browser: "chat.activity.toolName.browser",
+  delegate_task: "chat.activity.toolName.delegate_task",
+};
+
+const APPROVAL_CHOICE_KEYS: Partial<Record<string, MessageKey>> = {
+  once: "chat.approval.once",
+  session: "chat.approval.session",
+  always: "chat.approval.always",
+  deny: "chat.approval.deny",
+};
 
 function isAgentProcessStep(step: ActivityStep): boolean {
   const stage = String(step?.stage || "").toLowerCase();
@@ -43,13 +70,90 @@ function isAgentProcessStep(step: ActivityStep): boolean {
   );
 }
 
+function isAnonymousToolNoise(step: ActivityStep): boolean {
+  const stage = String(step?.stage || "").toLowerCase();
+  if (stage === "tool.arguments.delta") return true;
+  if (stage !== "tool" && !stage.startsWith("tool.")) return false;
+  const tool = String(step?.tool || step?.label || "").trim().toLowerCase();
+  if (tool && tool !== "tool") return false;
+  const detail = String(step?.detail || "").trim().toLowerCase();
+  return !detail || detail === "tool";
+}
+
+function mergeIdentity(step: ActivityStep): string {
+  const stage = String(step?.stage || "").toLowerCase();
+  if ((stage === "tool" || stage.startsWith("tool.")) && step?.tool_call_id) {
+    return `tool:${step.tool_call_id}`;
+  }
+  if (stage.startsWith("approval") && step?.approval_id) {
+    return `approval:${stage}:${step.approval_id}`;
+  }
+  return "";
+}
+
+function isTerminalToolStep(step: ActivityStep): boolean {
+  const stage = String(step?.stage || "").toLowerCase();
+  const status = String(step?.tool_status || "").toLowerCase();
+  return (
+    stage.endsWith("completed") ||
+    stage.endsWith("failed") ||
+    status === "completed" ||
+    status === "failed"
+  );
+}
+
+function compactAgentProcessSteps(work: Work | null | undefined): ActivityStep[] {
+  const compacted: ActivityStep[] = [];
+  const identityIndexes = new Map<string, number>();
+  for (const rawStep of work?.activity || []) {
+    if (!isAgentProcessStep(rawStep) || isAnonymousToolNoise(rawStep)) continue;
+    const step = { ...rawStep };
+    const identity = mergeIdentity(step);
+    const existingIndex = identity ? identityIndexes.get(identity) : undefined;
+    if (existingIndex !== undefined) {
+      const previous = compacted[existingIndex]!;
+      const merged = {
+        ...previous,
+        ...step,
+        label: step.label || previous.label,
+        detail: step.detail || previous.detail,
+        line: step.line || previous.line,
+      };
+      if (identity.startsWith("tool:") && isTerminalToolStep(step)) {
+        compacted.splice(existingIndex, 1);
+        compacted.push(merged);
+        identityIndexes.clear();
+        compacted.forEach((item, index) => {
+          const itemIdentity = mergeIdentity(item);
+          if (itemIdentity) identityIndexes.set(itemIdentity, index);
+        });
+      } else {
+        compacted[existingIndex] = merged;
+      }
+      continue;
+    }
+    if (identity) identityIndexes.set(identity, compacted.length);
+    compacted.push(step);
+  }
+  return compacted;
+}
+
+function displayToolName(rawTool: string, translate: Translator): string {
+  const key = TOOL_MESSAGE_KEYS[rawTool.toLowerCase()];
+  return key ? translate(key) : rawTool;
+}
+
 function agentStepLine(step: ActivityStep, translate: Translator): string {
   const stage = String(step?.stage || "").toLowerCase();
   const label = step?.label || step?.line || step?.stage || translate("chat.activity.processing");
   const detail = step?.detail || "";
   if (stage === "tool" || stage.startsWith("tool.")) {
-    const tool = step?.tool || step?.label || translate("chat.activity.toolFallback");
-    const detailSuffix = detail && detail !== tool ? `: "${detail}"` : "";
+    const rawTool = step?.tool || step?.label || translate("chat.activity.toolFallback");
+    const tool = displayToolName(rawTool, translate);
+    const detailSuffix = detail && detail !== rawTool ? ` · ${detail}` : "";
+    if (step?.tool_status === "failed" || stage.endsWith("failed")) {
+      return translate("chat.activity.toolFailed", { tool, detail: detailSuffix });
+    }
     return translate(
       step?.tool_status === "completed" || stage.endsWith("completed")
         ? "chat.activity.toolCompleted"
@@ -66,23 +170,50 @@ function agentStepLine(step: ActivityStep, translate: Translator): string {
   if (stage === "approval") {
     return translate("chat.activity.approval", { detail: detail ? `: ${detail}` : "" });
   }
-  if (stage === "approval.responded") return translate("chat.activity.approvalResponded");
+  if (stage === "approval.responded") {
+    const choiceKey = APPROVAL_CHOICE_KEYS[String(step?.approval_choice || "").toLowerCase()];
+    return translate("chat.activity.approvalResponded", {
+      detail: choiceKey ? ` · ${translate(choiceKey)}` : "",
+    });
+  }
   return `• ${label}${detail ? `: ${detail}` : ""}`;
+}
+
+function agentProcessLineEntries(
+  work: Work | null | undefined,
+  translate: Translator,
+): ProcessLineEntry[] {
+  const entries: ProcessLineEntry[] = [];
+  const keyCounts = new Map<string, number>();
+  let previousLine = "";
+  let previousIdentity = "";
+  for (const [index, step] of compactAgentProcessSteps(work).entries()) {
+    const line = agentStepLine(step, translate);
+    if (!line) continue;
+    const stage = String(step?.stage || "").toLowerCase();
+    const identity =
+      mergeIdentity(step) ||
+      (stage === "replying" || stage.startsWith("approval") ? `phase:${stage}` : "");
+    if (line === previousLine && identity && identity === previousIdentity) continue;
+    previousLine = line;
+    previousIdentity = identity;
+    const baseKey = identity || `${stage || "step"}:${String(step?.at || index)}:${line}`;
+    const occurrence = keyCounts.get(baseKey) || 0;
+    keyCounts.set(baseKey, occurrence + 1);
+    entries.push({ key: occurrence ? `${baseKey}:${occurrence}` : baseKey, line });
+  }
+  return entries;
 }
 
 export function agentProcessLines(
   work: Work | null | undefined,
   translate: Translator = defaultTranslate,
 ): string[] {
-  const steps = work?.activity || [];
-  return steps
-    .filter(isAgentProcessStep)
-    .map((step) => agentStepLine(step, translate))
-    .filter(Boolean);
+  return agentProcessLineEntries(work, translate).map((entry) => entry.line);
 }
 
 export function hasAgentProcessSteps(work: Work | null | undefined): boolean {
-  return (work?.activity || []).some(isAgentProcessStep);
+  return compactAgentProcessSteps(work).length > 0;
 }
 
 function agentWorkTitle(work: Work | null | undefined, translate: Translator): string {
@@ -104,11 +235,13 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const stored = useStore((state) => state.expandedAgentRuns[runId]);
   const expanded = stored === undefined ? active : stored;
 
-  const processLines = agentProcessLines(work, t);
-  const current = active ? processLines[processLines.length - 1] || text : t("chat.work.completed");
-  const lines = processLines.length
-    ? processLines
-    : [active ? t("chat.work.waiting") : t("chat.work.noTools")];
+  const processEntries = agentProcessLineEntries(work, t);
+  const current = active ? processEntries[processEntries.length - 1]?.line || text : t("chat.work.completed");
+  const logEntries = processEntries.length
+    ? active
+      ? processEntries.slice(0, -1)
+      : processEntries
+    : [{ key: "empty", line: active ? t("chat.work.waiting") : t("chat.work.noTools") }];
 
   const onToggle = (event: MouseEvent<HTMLElement>) => {
     event.preventDefault();
@@ -131,21 +264,23 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
         )}
         <div className="agent-work__main">
           <span className="agent-work__title">{text}</span>
-          <span className="agent-work__step">
-            {active ? current : t("chat.work.records", { count: processLines.length })}
+          <span className="agent-work__step" role="status" aria-live="polite" aria-atomic="true">
+            {active ? current : t("chat.work.records", { count: processEntries.length })}
           </span>
         </div>
         {waiting > 0 ? (
           <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
         ) : null}
       </summary>
-      <div className="agent-work__log">
-        {lines.map((line, index) => (
-          <div className="agent-work__line" key={index}>
-            {line}
-          </div>
-        ))}
-      </div>
+      {logEntries.length ? (
+        <div className="agent-work__log">
+          {logEntries.map((entry) => (
+            <div className="agent-work__line" key={entry.key}>
+              {entry.line}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </details>
   );
 }

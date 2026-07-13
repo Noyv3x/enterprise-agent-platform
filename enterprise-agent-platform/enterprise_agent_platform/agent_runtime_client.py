@@ -123,7 +123,16 @@ _COMPAT_EVENT_NAMES = {
     "approval.requested": "approval.request",
     "approval.resolved": "approval.responded",
 }
-_PROGRESS_EVENT_PREFIXES = ("tool.", "approval.")
+_PROGRESS_EVENT_TYPES = frozenset(
+    {
+        "tool.started",
+        "tool.updated",
+        "tool.completed",
+        "tool.failed",
+        "approval.requested",
+        "approval.resolved",
+    }
+)
 
 
 class AgentRuntimeClient:
@@ -450,6 +459,10 @@ class AgentRuntimeClient:
                 payload.setdefault("timestamp", _callback_timestamp(wire["timestamp"]))
             payload.setdefault("runtime_event_type", event_type)
             payload.setdefault("event", _COMPAT_EVENT_NAMES.get(event_type, event_type))
+            if event_type.startswith("tool."):
+                tool_name = str(payload.get("tool") or payload.get("tool_name") or "").strip()
+                if tool_name:
+                    payload.setdefault("tool", tool_name)
 
             if event_type == "message.delta":
                 delta = _text_from_content(payload.get("delta", payload.get("content")))
@@ -493,7 +506,7 @@ class AgentRuntimeClient:
                 terminal_error = _error_message(payload) or event_type
                 return True
 
-            if event_type.startswith(_PROGRESS_EVENT_PREFIXES):
+            if event_type in _PROGRESS_EVENT_TYPES:
                 self._emit_progress(progress_callback, payload)
             return False
 

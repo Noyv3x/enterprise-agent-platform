@@ -51,10 +51,88 @@ describe("chat translations", () => {
     };
 
     expect(agentProcessLines(status, english)).toEqual([
-      '✅ Completed knowledge_search: "VPN access policy"',
+      "✅ Completed knowledge_search · VPN access policy",
       "🛡️ Waiting for access approval: rm -rf /tmp/example",
       "🛡️ Access approval completed",
       "✅ Work completed",
+    ]);
+  });
+
+  it("compacts legacy tool noise and preserves distinct real tool calls", () => {
+    const status: AgentStatus = {
+      state: "replying",
+      activity: [
+        { source: "platform", stage: "replying" },
+        { source: "platform", stage: "replying" },
+        { source: "agent", stage: "tool", tool: "tool", label: "tool", detail: "tool" },
+        { source: "agent", stage: "tool", tool: "tool", label: "tool", detail: "tool" },
+        { source: "agent", stage: "tool.started", tool: "web", tool_call_id: "web-1" },
+        {
+          source: "agent",
+          stage: "tool.completed",
+          tool: "web",
+          tool_call_id: "web-1",
+          tool_status: "completed",
+        },
+        {
+          source: "agent",
+          stage: "tool.started",
+          tool: "terminal",
+          tool_call_id: "terminal-1",
+        },
+        {
+          source: "platform",
+          stage: "approval.responded",
+          approval_id: "approval-1",
+          approval_choice: "once",
+        },
+        {
+          source: "agent",
+          stage: "tool.completed",
+          tool: "terminal",
+          tool_call_id: "terminal-1",
+          tool_status: "completed",
+        },
+        {
+          source: "platform",
+          stage: "approval.responded",
+          approval_id: "approval-1",
+          approval_choice: "once",
+        },
+        {
+          source: "agent",
+          stage: "tool",
+          tool: "search_files",
+          tool_call_id: "search-1",
+          tool_status: "completed",
+          detail: "config · ./src",
+        },
+        {
+          source: "agent",
+          stage: "tool",
+          tool: "web",
+          tool_call_id: "web-2",
+          tool_status: "completed",
+        },
+        {
+          source: "agent",
+          stage: "tool",
+          tool: "read_file",
+          tool_call_id: "read-1",
+          tool_status: "failed",
+          detail: "missing.txt",
+        },
+      ],
+    };
+
+    expect(agentProcessLines(status, english)).toEqual([
+      "💬 Agent is replying",
+      "✅ Completed Web search",
+      "🛡️ Access approval completed · Allow once",
+      "✅ Completed Command",
+      "✅ Completed File search · config · ./src",
+      "✅ Completed Web search",
+      "⚠️ Read file failed · missing.txt",
     ]);
   });
 });

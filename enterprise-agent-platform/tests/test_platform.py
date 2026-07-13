@@ -793,6 +793,285 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(result["agent_status"]["state"], "replying")
                 self.assertIsNone(result["agent_status"]["approval"])
                 self.assertEqual(result["agent_status"]["current_step"], "权限审批已处理")
+
+                # The HTTP response and the runtime SSE acknowledgement race in
+                # production. Both carry the same approval ID and must converge
+                # on one visible response row.
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.responded",
+                        "approval_id": "approval_42",
+                        "choice": "session",
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                responded = [
+                    item
+                    for item in status["activity"]
+                    if item.get("stage") == "approval.responded"
+                ]
+                self.assertEqual(len(responded), 1)
+                self.assertEqual(responded[0]["approval_id"], "approval_42")
+                self.assertEqual(responded[0]["approval_responder"], "Administrator")
+
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.request",
+                        "run_id": "run_42",
+                        "approval_id": "approval_43",
+                        "description": "second command",
+                    },
+                )
+                service._mark_agent_approval_responded(
+                    "channel",
+                    "1",
+                    "once",
+                    responder="",
+                    approval_result={"approval_id": "approval_43"},
+                )
+                service._mark_agent_approval_responded(
+                    "channel",
+                    "1",
+                    "once",
+                    responder="Administrator",
+                    approval_result={"approval_id": "approval_43"},
+                )
+                status = service.agent_status(admin, "channel", "1")
+                reverse_race = [
+                    item
+                    for item in status["activity"]
+                    if item.get("stage") == "approval.responded"
+                    and item.get("approval_id") == "approval_43"
+                ]
+                self.assertEqual(len(reverse_race), 1)
+                self.assertEqual(reverse_race[0]["approval_responder"], "Administrator")
+
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.request",
+                        "run_id": "run_42",
+                        "approval_id": "approval_44",
+                        "description": "current command",
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.responded",
+                        "approval_id": "approval_43",
+                        "choice": "once",
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                self.assertEqual(status["state"], "approval")
+                self.assertEqual(status["approval"]["approval_id"], "approval_44")
+                self.assertIn("current command", status["current_step"])
+            finally:
+                service.close()
+
+    def test_agent_progress_ignores_argument_deltas_and_upserts_tool_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {"event": "tool.arguments.delta", "delta": '{"command":"pwd"}'},
+                )
+                self.assertEqual(service.agent_status(admin, "channel", "1")["activity"], [])
+
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "terminal",
+                        "tool_call_id": "tool-1",
+                        "arguments": {
+                            "command": (
+                                "pwd && TOKEN=super-secret && "
+                                "cat /home/ubitech/platform/data/workspaces/user-1/secret.txt"
+                            )
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "approval.request",
+                        "run_id": "run-1",
+                        "approval_id": "approval-1",
+                        "description": "Run a command on the host",
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.updated",
+                        "tool_name": "terminal",
+                        "tool_call_id": "tool-1",
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "terminal",
+                        "tool_call_id": "tool-1",
+                    },
+                )
+
+                status = service.agent_status(admin, "channel", "1")
+                tools = [item for item in status["activity"] if item.get("stage") == "tool"]
+                self.assertEqual(len(tools), 1)
+                self.assertEqual(tools[0]["tool"], "terminal")
+                self.assertEqual(tools[0]["tool_status"], "completed")
+                self.assertEqual(status["activity"][-1]["tool_call_id"], "tool-1")
+                self.assertNotIn("super-secret", tools[0]["detail"])
+                self.assertNotIn("/home/ubitech", tools[0]["detail"])
+                self.assertEqual(tools[0]["detail"], "pwd · cat")
+
+                secret_query = (
+                    "AWS_SECRET_ACCESS_KEY=aws-value "
+                    "client_secret=client-value access_token=access-value "
+                    "session_token=session-value X-Amz-Signature=sig-value "
+                    "Cookie: cookie-value Authorization: Basic header-value "
+                    "postgresql://dbuser:dbpass@db.internal/app "
+                    "curl -u basic-user:basic-pass "
+                    "eyJabcdefgh.abcdefghijk.abcdefghijk"
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "web",
+                        "tool_call_id": "tool-secret-query",
+                        "arguments": {
+                            "action": "search",
+                            "arguments": {"query": secret_query},
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "browser",
+                        "tool_call_id": "tool-secret-url",
+                        "arguments": {
+                            "action": "navigate",
+                            "arguments": {
+                                "url": (
+                                    "https://url-user:url-pass@example.com/private"
+                                    "?access_token=url-secret"
+                                )
+                            },
+                        },
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                secret_tool = next(
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-secret-query"
+                )
+                for secret in (
+                    "aws-value",
+                    "client-value",
+                    "access-value",
+                    "session-value",
+                    "sig-value",
+                    "cookie-value",
+                    "header-value",
+                    "dbuser",
+                    "dbpass",
+                    "basic-user",
+                    "basic-pass",
+                    "eyJabcdefgh",
+                ):
+                    self.assertNotIn(secret, secret_tool["detail"])
+                browser_tool = next(
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-secret-url"
+                )
+                self.assertEqual(browser_tool["detail"], "navigate · example.com")
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "browser",
+                        "tool_call_id": "tool-schemeless-url",
+                        "arguments": {
+                            "action": "navigate",
+                            "arguments": {
+                                "url": "example.net/private/path?foo=short-secret"
+                            },
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "browser",
+                        "tool_call_id": "tool-path-only-url",
+                        "arguments": {
+                            "action": "navigate",
+                            "arguments": {"url": "/private/path?foo=path-secret"},
+                        },
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                schemeless = next(
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-schemeless-url"
+                )
+                path_only = next(
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-path-only-url"
+                )
+                self.assertEqual(schemeless["detail"], "navigate · example.net")
+                self.assertEqual(path_only["detail"], "navigate")
+                self.assertNotIn("short-secret", schemeless["detail"])
+                self.assertNotIn("path-secret", path_only["detail"])
+
+                # A terminal event can still be rendered if a previous start
+                # was lost (for example from an old capped activity snapshot).
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.failed",
+                        "tool_name": "read_file",
+                        "tool_call_id": "tool-missing-start",
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                failed = [
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-missing-start"
+                ]
+                self.assertEqual(len(failed), 1)
+                self.assertEqual(failed[0]["tool_status"], "failed")
             finally:
                 service.close()
 
@@ -913,6 +1192,10 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(len(agent_activity), 1)
             self.assertEqual(agent_activity[0]["line"], '🔍 knowledge: "VPN access policy"')
             self.assertEqual(agent_activity[0]["tool_status"], "completed")
+            self.assertEqual(
+                len([item for item in work["activity"] if item.get("stage") == "replying"]),
+                1,
+            )
             service.close()
 
     def test_channel_reuses_runtime_returned_session_after_rotation(self):
