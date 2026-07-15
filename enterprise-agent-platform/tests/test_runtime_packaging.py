@@ -74,6 +74,7 @@ class AgentRuntimePackagingTests(unittest.TestCase):
                     "node_modules", "dist", "coverage", ".cache"
                 ),
             )
+            shutil.copytree(PROJECT_ROOT / "camofox-runtime", source / "camofox-runtime")
 
             result = subprocess.run(
                 [
@@ -101,6 +102,22 @@ class AgentRuntimePackagingTests(unittest.TestCase):
                     if marker in name and not name.endswith("/")
                 }
             self.assertEqual(wheel_files, expected)
+            with zipfile.ZipFile(wheel) as archive:
+                camofox_marker = "/share/ubitech-agent/camofox-runtime/"
+                camofox_files = {
+                    name.split(camofox_marker, 1)[1]
+                    for name in archive.namelist()
+                    if camofox_marker in name and not name.endswith("/")
+                }
+            self.assertEqual(
+                camofox_files,
+                {
+                    "package.json",
+                    "package-lock.json",
+                    "loopback-preload.cjs",
+                    "patch-runtime.cjs",
+                },
+            )
 
             sdist = next((source / "dist").glob("*.tar.gz"))
             with tarfile.open(sdist, "r:gz") as archive:

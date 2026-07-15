@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import ipaddress
@@ -353,6 +354,8 @@ class EnterpriseService:
         self.agent_client = agent_client or self._new_agent_runtime_client()
         self.oauth_flows = OAuthFlowManager(oauth_http_client)
         self._conversation_lock = threading.RLock()
+        self._agent_browser_tabs_lock = threading.RLock()
+        self._agent_browser_current_tabs: dict[str, str] = {}
         # Message rows and their attachment files form one logical unit.  This
         # lock closes the file-written/row-inserted window against concurrent
         # administrative deletion; it is deliberately re-entrant because the
@@ -3587,7 +3590,10 @@ class EnterpriseService:
             install_status = self.runtimes.install_agent_runtime(force=True)
             return {"runtime": install_status.to_dict(), "config": self.runtimes.agent_runtime_config()}
         if clean == "camofox":
-            return {"runtime": self.runtimes.ensure_camofox_ready(wait=True).to_dict()}
+            installed = self.runtimes.install_camofox(force=True)
+            if not installed.available:
+                return {"runtime": installed.to_dict()}
+            return {"runtime": self.runtimes.restart_camofox().to_dict()}
         if clean == "firecrawl":
             return {"runtime": self.runtimes.ensure_firecrawl_ready(wait=True).to_dict()}
         raise ServiceError(404, "runtime not found")
@@ -4185,8 +4191,16 @@ class EnterpriseService:
             result = self._agent_browser_tool(scope_key, action, arguments)
         else:
             raise ServiceError(404, "Agent tool not found")
+        content_result = result
+        if tool == "browser" and isinstance(result.get("screenshot"), dict):
+            # A screenshot is already carried once in ``data`` for the Agent
+            # runtime to turn into native image content. Do not duplicate the
+            # (up to 8 MiB) PNG as base64 in the human-readable content field.
+            screenshot = dict(result["screenshot"])
+            screenshot.pop("data", None)
+            content_result = {**result, "screenshot": screenshot}
         return {
-            "content": json.dumps(result, ensure_ascii=False, indent=2),
+            "content": json.dumps(content_result, ensure_ascii=False, indent=2),
             "data": result,
             "is_error": False,
         }
@@ -4266,77 +4280,257 @@ class EnterpriseService:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         self._validated_agent_memory_scope(scope_key)
-        base_url = self.config.camofox_url.rstrip("/")
+        action = {
+            "tabs": "list",
+            "status": "list",
+            "open": "navigate",
+            "create": "new_tab",
+            "get_images": "images",
+            "reload": "refresh",
+            "close_tab": "close",
+            "close_session": "cleanup",
+        }.get(action, action)
+        if action == "cleanup":
+            status = self.runtimes.camofox_status(refresh=True)
+            if not status.available:
+                self._agent_browser_clear_current_tab(scope_key)
+                return {"ok": True, "skipped": True, "detail": "browser runtime is not running"}
+        ready = self.runtimes.ensure_camofox_ready(wait=True)
+        if not ready.available:
+            raise ServiceError(503, ready.error or "managed Camoufox browser is unavailable")
+        base_url = self.runtimes._effective_camofox_url().rstrip("/")
         user_id = "agent-" + hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
         access_key = self.runtimes._camofox_access_key()
         headers = {"Authorization": f"Bearer {access_key}"}
         tab_id = str(arguments.get("tab_id") or arguments.get("tabId") or "").strip()
-        if action in {"cleanup", "close_session"}:
-            return self._runtime_json_request(
+        if action == "cleanup":
+            result = self._runtime_json_request(
                 f"{base_url}/sessions/{urllib.parse.quote(user_id, safe='')}",
                 None,
                 headers=headers,
                 timeout=30,
                 method="DELETE",
             )
-        if action in {"navigate", "open"} and not tab_id:
-            url = str(arguments.get("url") or "").strip()
-            self._validate_external_url(url)
-            return self._runtime_json_request(
-                base_url + "/tabs",
-                {"userId": user_id, "sessionKey": "agent", "url": url},
-                headers=headers,
-                timeout=60,
-            )
-        if action in {"list", "tabs", "status"}:
-            return self._runtime_json_request(
+            self._agent_browser_clear_current_tab(scope_key)
+            return result
+        if action == "list":
+            listed = self._runtime_json_request(
                 base_url + "/tabs?" + urllib.parse.urlencode({"userId": user_id}),
                 None,
                 headers=headers,
                 timeout=30,
                 method="GET",
             )
-        if not tab_id:
-            raise ServiceError(400, "browser tab_id is required")
-        encoded_tab_id = urllib.parse.quote(tab_id, safe="")
-        if action in {"snapshot", "screenshot"}:
-            query = {"userId": user_id}
-            if action == "screenshot":
-                # Camofox can include a bounded base64 screenshot in its JSON
-                # snapshot response, which keeps the private gateway JSON-only.
-                query["includeScreenshot"] = "true"
-            return self._runtime_json_request(
-                f"{base_url}/tabs/{encoded_tab_id}/snapshot?{urllib.parse.urlencode(query)}",
-                None,
+            tabs = listed.get("tabs") if isinstance(listed.get("tabs"), list) else []
+            for tab in tabs:
+                if not isinstance(tab, dict):
+                    raise ServiceError(502, "managed browser returned invalid tab metadata")
+                self._validate_browser_page_url(str(tab.get("url") or ""))
+            return listed
+
+        url = ""
+        macro = ""
+        query_text = ""
+        if action in {"navigate", "new_tab"}:
+            url = str(arguments.get("url") or "").strip()
+            macro = str(arguments.get("macro") or "").strip()
+            query_text = str(arguments.get("query") or "").strip()
+            if url:
+                self._validate_browser_url(url)
+            if action == "navigate" and not url and not macro:
+                raise ServiceError(400, "browser navigate requires url or macro")
+
+        create_tab = action == "new_tab"
+        if action == "navigate" and not tab_id:
+            try:
+                tab_id = self._agent_browser_current_tab(
+                    scope_key,
+                    base_url,
+                    user_id,
+                    headers,
+                )
+            except ServiceError as exc:
+                if exc.status != 409:
+                    raise
+                create_tab = True
+
+        if create_tab:
+            created = self._runtime_json_request(
+                base_url + "/tabs",
+                {
+                    "userId": user_id,
+                    "sessionKey": "agent",
+                    **({"url": url} if url else {}),
+                },
                 headers=headers,
                 timeout=60,
-                method="GET",
             )
-        if action == "console":
-            return self._runtime_json_request(
-                f"{base_url}/tabs/{encoded_tab_id}/console?"
-                + urllib.parse.urlencode({"userId": user_id}),
-                None,
+            tab_id = str(created.get("tabId") or "")
+            if not tab_id:
+                raise ServiceError(502, "Camoufox created a tab without returning tabId")
+            if macro:
+                created = self._runtime_json_request(
+                    f"{base_url}/tabs/{urllib.parse.quote(tab_id, safe='')}/navigate",
+                    {
+                        "userId": user_id,
+                        "sessionKey": "agent",
+                        "macro": macro,
+                        "query": query_text,
+                    },
+                    headers=headers,
+                    timeout=60,
+                )
+                created.setdefault("tabId", tab_id)
+            created["url"] = self._agent_browser_validate_tab_url(
+                base_url,
+                tab_id,
+                user_id,
+                headers,
+            )
+            if url or macro:
+                snapshot = self._agent_browser_snapshot(base_url, tab_id, user_id, headers)
+                created["snapshot"] = snapshot.get("snapshot", "")
+                created["refsCount"] = snapshot.get("refsCount", 0)
+                created["url"] = snapshot.get("url") or created.get("url")
+                created["url"] = self._agent_browser_validate_tab_url(
+                    base_url,
+                    tab_id,
+                    user_id,
+                    headers,
+                )
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return created
+        if not tab_id:
+            tab_id = self._agent_browser_current_tab(
+                scope_key,
+                base_url,
+                user_id,
+                headers,
+            )
+        encoded_tab_id = urllib.parse.quote(tab_id, safe="")
+        if action != "close":
+            self._agent_browser_validate_tab_url(base_url, tab_id, user_id, headers)
+        if action == "snapshot":
+            result = self._agent_browser_snapshot(
+                base_url,
+                tab_id,
+                user_id,
+                headers,
+                offset=max(0, int(arguments.get("offset") or 0)),
+            )
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return result
+        if action in {"screenshot", "vision"}:
+            query = {
+                "userId": user_id,
+                # Full-page captures can be unbounded on attacker-controlled
+                # pages. The service boundary always requests one viewport,
+                # even if a direct caller supplies either full-page spelling.
+                "fullPage": "false",
+            }
+            image, mime_type = self._runtime_binary_request(
+                f"{base_url}/tabs/{encoded_tab_id}/screenshot?{urllib.parse.urlencode(query)}",
                 headers=headers,
-                timeout=30,
-                method="GET",
+                timeout=60,
+                max_bytes=8 * 1024 * 1024,
+                allowed_content_types={"image/png"},
             )
-        if action in {"close", "close_tab"}:
-            return self._runtime_json_request(
+            result: dict[str, Any] = {
+                "tabId": tab_id,
+                "screenshot": {
+                    "data": base64.b64encode(image).decode("ascii"),
+                    "mimeType": mime_type,
+                    "bytes": len(image),
+                },
+            }
+            if action == "vision":
+                snapshot = self._agent_browser_snapshot(base_url, tab_id, user_id, headers)
+                result.update(
+                    {
+                        "url": snapshot.get("url", ""),
+                        "snapshot": snapshot.get("snapshot", ""),
+                        "question": str(arguments.get("question") or "Describe the current page"),
+                    }
+                )
+            result["url"] = self._agent_browser_validate_tab_url(
+                base_url,
+                tab_id,
+                user_id,
+                headers,
+            )
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return result
+        if action == "console":
+            if str(arguments.get("expression") or "").strip():
+                raise ServiceError(400, "browser console does not evaluate JavaScript")
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return {
+                "messages": [],
+                "supported": False,
+                "detail": "Camoufox does not expose captured console logs; use snapshot or vision to inspect page state.",
+            }
+        if action == "close":
+            result = self._runtime_json_request(
                 f"{base_url}/tabs/{encoded_tab_id}",
                 {"userId": user_id},
                 headers=headers,
                 timeout=30,
                 method="DELETE",
             )
+            self._agent_browser_clear_current_tab(scope_key)
+            return result
+        readonly_routes = {
+            "links": ("links", {"limit": max(1, min(int(arguments.get("limit") or 50), 200)), "offset": max(0, int(arguments.get("offset") or 0))}),
+            "images": ("images", {"includeData": "false", "limit": max(1, min(int(arguments.get("limit") or 8), 20))}),
+            # Listing downloads must never delete the underlying files. A
+            # future save/download action can consume only after it has copied
+            # the bytes into the Agent workspace successfully.
+            "downloads": ("downloads", {"includeData": "false", "consume": "false"}),
+            "stats": ("stats", {}),
+        }
+        if action in readonly_routes:
+            route, extras = readonly_routes[action]
+            query = urllib.parse.urlencode({"userId": user_id, **extras})
+            result = self._runtime_json_request(
+                f"{base_url}/tabs/{encoded_tab_id}/{route}?{query}",
+                None,
+                headers=headers,
+                timeout=60,
+                method="GET",
+            )
+            result.setdefault(
+                "url",
+                self._agent_browser_validate_tab_url(base_url, tab_id, user_id, headers),
+            )
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return result
+        if action == "extract":
+            schema = arguments.get("schema")
+            if not isinstance(schema, dict):
+                raise ServiceError(400, "browser extract requires a JSON schema object")
+            result = self._runtime_json_request(
+                f"{base_url}/tabs/{encoded_tab_id}/extract",
+                {"userId": user_id, "schema": schema},
+                headers=headers,
+                timeout=60,
+            )
+            result.setdefault(
+                "url",
+                self._agent_browser_validate_tab_url(base_url, tab_id, user_id, headers),
+            )
+            self._agent_browser_remember_current_tab(scope_key, tab_id)
+            return result
         route_actions = {
             "navigate": "navigate",
             "click": "click",
             "type": "type",
             "scroll": "scroll",
             "back": "back",
+            "forward": "forward",
+            "refresh": "refresh",
             "press": "press",
-            "evaluate": "evaluate",
+            "wait": "wait",
+            "viewport": "viewport",
         }
         route = route_actions.get(action)
         if route is None:
@@ -4344,18 +4538,131 @@ class EnterpriseService:
         payload = dict(arguments)
         payload.pop("tab_id", None)
         payload.pop("tabId", None)
+        payload.pop("userId", None)
+        payload.pop("user_id", None)
+        payload.pop("sessionKey", None)
+        payload.pop("listItemId", None)
+        for source, target in (
+            ("double_click", "doubleClick"),
+            ("press_enter", "pressEnter"),
+            ("wait_for_network", "waitForNetwork"),
+        ):
+            if source in payload:
+                payload[target] = payload.pop(source)
+        if route in {"click", "type"} and isinstance(payload.get("ref"), str):
+            payload["ref"] = str(payload["ref"]).lstrip("@")
         # The runtime-derived browser identity is authoritative. Camofox uses
         # userId when resolving every tab ID, so this also prevents one Agent
         # from operating another Agent's guessed tab ID.
         payload["userId"] = user_id
-        if route == "navigate" and payload.get("url"):
-            self._validate_external_url(str(payload["url"]))
-        return self._runtime_json_request(
-            f"{base_url}/tabs/{encoded_tab_id}/{route}",
-            payload,
+        if route == "navigate":
+            if not payload.get("url") and not payload.get("macro"):
+                raise ServiceError(400, "browser navigate requires url or macro")
+            payload["sessionKey"] = "agent"
+            if payload.get("url"):
+                self._validate_browser_url(str(payload["url"]))
+        result = self._runtime_json_request(
+            f"{base_url}/tabs/{encoded_tab_id}/{route}", payload, headers=headers, timeout=60
+        )
+        if result.get("url"):
+            self._validate_browser_page_url(str(result["url"]))
+        if route in {"navigate", "back", "forward", "refresh"}:
+            snapshot = self._agent_browser_snapshot(base_url, tab_id, user_id, headers)
+            result["snapshot"] = snapshot.get("snapshot", "")
+            result["refsCount"] = snapshot.get("refsCount", 0)
+            result["url"] = snapshot.get("url") or result.get("url")
+        result["url"] = self._agent_browser_validate_tab_url(
+            base_url,
+            tab_id,
+            user_id,
+            headers,
+        )
+        self._agent_browser_remember_current_tab(scope_key, tab_id)
+        return result
+
+    def _agent_browser_current_tab(
+        self,
+        scope_key: str,
+        base_url: str,
+        user_id: str,
+        headers: dict[str, str],
+    ) -> str:
+        listed = self._runtime_json_request(
+            base_url + "/tabs?" + urllib.parse.urlencode({"userId": user_id}),
+            None,
+            headers=headers,
+            timeout=30,
+            method="GET",
+        )
+        tabs = listed.get("tabs") if isinstance(listed.get("tabs"), list) else []
+        tab_ids: list[str] = []
+        for tab in tabs:
+            if isinstance(tab, dict):
+                tab_id = str(tab.get("tabId") or tab.get("targetId") or "").strip()
+                if tab_id:
+                    tab_ids.append(tab_id)
+        with self._agent_browser_tabs_lock:
+            tracked = self._agent_browser_current_tabs.get(scope_key, "")
+            if tracked and tracked in tab_ids:
+                return tracked
+            if tab_ids:
+                current = tab_ids[-1]
+                self._agent_browser_current_tabs[scope_key] = current
+                return current
+            self._agent_browser_current_tabs.pop(scope_key, None)
+        raise ServiceError(409, "browser has no open tab; call navigate first")
+
+    def _agent_browser_remember_current_tab(self, scope_key: str, tab_id: str) -> None:
+        clean_tab_id = str(tab_id or "").strip()
+        if not clean_tab_id:
+            return
+        with self._agent_browser_tabs_lock:
+            self._agent_browser_current_tabs[scope_key] = clean_tab_id
+
+    def _agent_browser_clear_current_tab(self, scope_key: str) -> None:
+        with self._agent_browser_tabs_lock:
+            self._agent_browser_current_tabs.pop(scope_key, None)
+
+    def _agent_browser_validate_tab_url(
+        self,
+        base_url: str,
+        tab_id: str,
+        user_id: str,
+        headers: dict[str, str],
+    ) -> str:
+        query = urllib.parse.urlencode({"userId": user_id})
+        metadata = self._runtime_json_request(
+            f"{base_url}/tabs/{urllib.parse.quote(tab_id, safe='')}/stats?{query}",
+            None,
+            headers=headers,
+            timeout=30,
+            method="GET",
+        )
+        url = str(metadata.get("url") or "").strip()
+        self._validate_browser_page_url(url)
+        return url
+
+    def _agent_browser_snapshot(
+        self,
+        base_url: str,
+        tab_id: str,
+        user_id: str,
+        headers: dict[str, str],
+        *,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {"userId": user_id}
+        if offset:
+            query["offset"] = offset
+        snapshot = self._runtime_json_request(
+            f"{base_url}/tabs/{urllib.parse.quote(tab_id, safe='')}/snapshot?{urllib.parse.urlencode(query)}",
+            None,
             headers=headers,
             timeout=60,
+            method="GET",
         )
+        self._validate_browser_page_url(str(snapshot.get("url") or ""))
+        return snapshot
 
     @staticmethod
     def _runtime_json_request(
@@ -4374,10 +4681,29 @@ class EnterpriseService:
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read(10 * 1024 * 1024).decode("utf-8", errors="replace")
+                raw_bytes = response.read(10 * 1024 * 1024 + 1)
+                if len(raw_bytes) > 10 * 1024 * 1024:
+                    raise ServiceError(413, "managed tool JSON response exceeds 10 MiB")
+                raw = raw_bytes.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read(65536).decode("utf-8", errors="replace")
-            raise ServiceError(502, f"managed tool returned HTTP {exc.code}: {detail[:1000]}") from exc
+            try:
+                error_payload = json.loads(detail)
+            except json.JSONDecodeError:
+                error_payload = None
+            if isinstance(error_payload, dict):
+                parts = [
+                    str(error_payload.get(key) or "").strip()
+                    for key in ("error", "code", "hint")
+                ]
+                safe_detail = " · ".join(part for part in parts if part)
+            else:
+                safe_detail = re.sub(r"\s+", " ", detail).strip()
+            status = exc.code if 400 <= exc.code < 500 else 502
+            raise ServiceError(
+                status,
+                f"managed tool returned HTTP {exc.code}: {(safe_detail or 'request failed')[:1000]}",
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ServiceError(502, f"managed tool request failed: {exc}") from exc
         try:
@@ -4385,6 +4711,82 @@ class EnterpriseService:
         except json.JSONDecodeError as exc:
             raise ServiceError(502, "managed tool returned invalid JSON") from exc
         return payload if isinstance(payload, dict) else {"data": payload}
+
+    @staticmethod
+    def _runtime_binary_request(
+        url: str,
+        *,
+        headers: dict[str, str],
+        timeout: float,
+        max_bytes: int,
+        allowed_content_types: set[str],
+    ) -> tuple[bytes, str]:
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": ", ".join(sorted(allowed_content_types)), **headers},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                mime_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if mime_type not in allowed_content_types:
+                    raise ServiceError(502, f"managed browser returned unsupported content type: {mime_type or 'missing'}")
+                payload = response.read(max_bytes + 1)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            status = exc.code if 400 <= exc.code < 500 else 502
+            raise ServiceError(status, f"managed browser returned HTTP {exc.code}: {detail[:500]}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ServiceError(502, f"managed browser request failed: {exc}") from exc
+        if len(payload) > max_bytes:
+            raise ServiceError(413, f"managed browser image exceeds {max_bytes // (1024 * 1024)} MiB")
+        return payload, mime_type
+
+    def _validate_browser_page_url(self, value: str) -> None:
+        clean = str(value or "").strip()
+        if clean == "about:blank":
+            return
+        self._validate_browser_url(clean)
+
+    @staticmethod
+    def _validate_browser_url(value: str) -> None:
+        """Allow normal intranet browsing while always blocking metadata targets."""
+
+        metadata_hosts = {
+            "metadata.google.internal",
+            "metadata.google.internal.",
+            "instance-data",
+            "instance-data.",
+        }
+        metadata_ips = {
+            ipaddress.ip_address("169.254.169.254"),
+            ipaddress.ip_address("100.100.100.200"),
+            ipaddress.ip_address("fd00:ec2::254"),
+        }
+        try:
+            parsed = urllib.parse.urlparse(str(value or "").strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError
+            if parsed.hostname.lower() in metadata_hosts:
+                raise ServiceError(403, "cloud metadata targets are blocked")
+            addresses = socket.getaddrinfo(
+                parsed.hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+            )
+        except ServiceError:
+            raise
+        except (ValueError, OSError) as exc:
+            raise ServiceError(400, "URL must be a resolvable http(s) URL") from exc
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if (
+                ip in metadata_ips
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                raise ServiceError(403, "metadata and non-routable network targets are blocked")
 
     @staticmethod
     def _validate_external_url(value: str) -> None:

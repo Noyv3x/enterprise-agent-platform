@@ -5,6 +5,11 @@ import { PlatformGateway } from "./platform-gateway.js";
 
 type ProductProvider = "openai-codex" | "xai";
 
+const AUXILIARY_VISION_MODEL_PREFERENCES: Readonly<Record<ProductProvider, readonly string[]>> = {
+  "openai-codex": ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"],
+  xai: ["grok-4.3", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-reasoning"],
+};
+
 const PROVIDER_ALIASES: Readonly<Record<string, ProductProvider>> = {
   "openai-codex": "openai-codex",
   codex: "openai-codex",
@@ -60,4 +65,36 @@ export function resolveModel(request: RunRequest, gateway: PlatformGateway, sign
       return undefined;
     },
   };
+}
+
+/**
+ * Treat the locked Pi model catalog as the capability boundary. In particular,
+ * do not infer image support from a model name or provider: some Codex models
+ * share an OAuth endpoint while advertising different input modalities.
+ */
+export function modelSupportsImages(model: Model<Api>): boolean {
+  return model.input.includes("image");
+}
+
+/**
+ * Resolve an allowed image-capable companion on the same product/OAuth
+ * provider. The primary model's metadata remains authoritative and unchanged.
+ */
+export function resolveAuxiliaryVisionModel(
+  request: RunRequest,
+  gateway: PlatformGateway,
+  signal?: AbortSignal,
+): ResolvedModel | undefined {
+  const provider = validateProductModelRequest(request.model);
+  const primary = resolveModel(request, gateway, signal);
+  if (modelSupportsImages(primary.model)) return undefined;
+  for (const id of AUXILIARY_VISION_MODEL_PREFERENCES[provider]) {
+    if (!PRODUCT_MODELS[provider].includes(id)) continue;
+    const candidate = resolveModel({
+      ...request,
+      model: { ...request.model, id },
+    }, gateway, signal);
+    if (modelSupportsImages(candidate.model)) return candidate;
+  }
+  return undefined;
 }

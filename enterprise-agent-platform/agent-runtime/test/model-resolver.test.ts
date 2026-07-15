@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PlatformGateway } from "../src/platform-gateway.js";
-import { PRODUCT_MODELS, resolveModel, validateProductModelRequest } from "../src/model-resolver.js";
+import {
+  modelSupportsImages,
+  PRODUCT_MODELS,
+  resolveAuxiliaryVisionModel,
+  resolveModel,
+  validateProductModelRequest,
+} from "../src/model-resolver.js";
 import type { ModelRequest, RunRequest } from "../src/types.js";
 
 test("all seven product models resolve only to fixed OAuth provider endpoints", () => {
@@ -69,6 +75,34 @@ test("OAuth token lookup accepts the product alias without changing the fixed en
   const resolved = resolveModel(run, gateway);
   assert.equal(await resolved.getApiKey(resolved.model.provider), "short-lived-oauth-token");
   assert.equal(resolved.model.baseUrl, "https://api.x.ai/v1");
+});
+
+test("image support follows locked model metadata without overriding Codex OAuth models", () => {
+  const gateway = new PlatformGateway();
+  const spark = resolveModel(request({ provider: "openai-codex", id: "gpt-5.3-codex-spark" }), gateway);
+  const multimodalCodex = resolveModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway);
+
+  assert.equal(modelSupportsImages(spark.model), false);
+  assert.equal(modelSupportsImages(multimodalCodex.model), true);
+  assert.equal(spark.model.api, "openai-codex-responses");
+  assert.equal(spark.model.baseUrl, "https://chatgpt.com/backend-api");
+});
+
+test("text-only Codex selects an allowed image companion on the same OAuth endpoint", () => {
+  const gateway = new PlatformGateway();
+  const sparkRequest = request({ provider: "codex", id: "gpt-5.3-codex-spark" });
+  const companion = resolveAuxiliaryVisionModel(sparkRequest, gateway);
+
+  assert.ok(companion);
+  assert.equal(companion.model.id, "gpt-5.4-mini");
+  assert.equal(companion.model.provider, "openai-codex");
+  assert.equal(companion.model.api, "openai-codex-responses");
+  assert.equal(companion.model.baseUrl, "https://chatgpt.com/backend-api");
+  assert.equal(modelSupportsImages(companion.model), true);
+  assert.equal(
+    resolveAuxiliaryVisionModel(request({ provider: "codex", id: "gpt-5.5" }), gateway),
+    undefined,
+  );
 });
 
 function request(model: ModelRequest): RunRequest {

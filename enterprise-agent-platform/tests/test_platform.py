@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import http.client
 import hashlib
 import hmac
@@ -3039,6 +3040,7 @@ class PlatformServiceTests(unittest.TestCase):
                 make_config(tmp),
                 manage_agent_runtime=False,
                 runtime_startup_wait_seconds=0,
+                camofox_command="managed-camofox-test",
             )
             launcher = RecordingLauncher()
             runner = RecordingCommandRunner()
@@ -3049,7 +3051,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["camofox"]["state"], "starting")
                 self.assertEqual(status["firecrawl"]["state"], "starting")
                 commands = [call["cmd"] for call in launcher.calls]
-                self.assertTrue(any("@askjo/camofox-browser@1.11.2" in cmd for cmd in commands))
+                self.assertTrue(any(cmd == ["managed-camofox-test"] for cmd in commands))
                 self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
                 firecrawl_launch = next(call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"])
                 override_path = config.firecrawl_runtime_dir / "docker-compose.ubitech.yaml"
@@ -3069,7 +3071,7 @@ class PlatformServiceTests(unittest.TestCase):
 
                 service.restart_runtime(admin, "camofox")
                 service.restart_runtime(admin, "firecrawl")
-                self.assertGreaterEqual(len([call for call in launcher.calls if "@askjo/camofox-browser@1.11.2" in call["cmd"]]), 2)
+                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"] == ["managed-camofox-test"]]), 2)
                 self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"]]), 2)
             finally:
                 service.close()
@@ -4021,10 +4023,20 @@ class PlatformServiceTests(unittest.TestCase):
                     "timeout": timeout,
                     "method": method,
                 })
+                if url.endswith("/tabs") and method == "POST":
+                    return {"tabId": "created-tab", "url": body.get("url", "about:blank")}
+                if "/stats?" in url:
+                    return {"ok": True, "url": "https://example.com"}
+                if "/snapshot?" in url:
+                    return {"url": "https://example.com", "snapshot": "- heading Example", "refsCount": 1}
                 return {"ok": True}
 
             service._runtime_json_request = record_request
-            service._validate_external_url = lambda _value: None
+            service._validate_browser_url = lambda _value: None
+            service.runtimes.ensure_camofox_ready = lambda **_kwargs: SimpleNamespace(
+                available=True,
+                error="",
+            )
             try:
                 scope = service.agent_scopes.ensure_private_scope(1)
                 expected_user_id = "agent-" + hashlib.sha256(
@@ -4036,8 +4048,9 @@ class PlatformServiceTests(unittest.TestCase):
                     "navigate",
                     {"url": "https://example.com"},
                 )
+                create_call = next(call for call in calls if call["url"].endswith("/tabs"))
                 self.assertEqual(
-                    calls[-1]["body"],
+                    create_call["body"],
                     {
                         "userId": expected_user_id,
                         "sessionKey": "agent",
@@ -4048,11 +4061,12 @@ class PlatformServiceTests(unittest.TestCase):
                 service._agent_browser_tool(
                     scope.scope_key,
                     "click",
-                    {"tab_id": "tab/one", "ref": "e1", "userId": "attacker"},
+                    {"tab_id": "tab/one", "ref": "@e1", "userId": "attacker"},
                 )
-                self.assertEqual(calls[-1]["body"]["userId"], expected_user_id)
-                self.assertNotIn("tab_id", calls[-1]["body"])
-                self.assertIn("/tabs/tab%2Fone/click", calls[-1]["url"])
+                click_call = next(call for call in calls if "/tabs/tab%2Fone/click" in call["url"])
+                self.assertEqual(click_call["body"]["userId"], expected_user_id)
+                self.assertEqual(click_call["body"]["ref"], "e1")
+                self.assertNotIn("tab_id", click_call["body"])
 
                 service._agent_browser_tool(
                     scope.scope_key,
@@ -4067,6 +4081,327 @@ class PlatformServiceTests(unittest.TestCase):
                 )
             finally:
                 service.close()
+
+    def test_browser_tool_exposes_full_camoufox_actions_and_binary_vision(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            calls: list[dict[str, object]] = []
+            binary_urls: list[str] = []
+
+            def record_request(url, body, *, headers, timeout, method="POST"):
+                calls.append({"url": url, "body": body, "method": method})
+                if url.endswith("/tabs"):
+                    return {"tabId": "created-tab", "url": "about:blank"}
+                if "/snapshot?" in url:
+                    return {"url": "http://127.0.0.1/page", "snapshot": "- heading Page", "refsCount": 1}
+                return {"ok": True, "url": "http://127.0.0.1/page"}
+
+            service._runtime_json_request = record_request
+
+            def record_binary_request(url, **_kwargs):
+                binary_urls.append(url)
+                return b"\x89PNG\r\n\x1a\nfixture", "image/png"
+
+            service._runtime_binary_request = record_binary_request
+            service._validate_browser_url = lambda _value: None
+            service.runtimes.ensure_camofox_ready = lambda **_kwargs: SimpleNamespace(
+                available=True,
+                error="",
+            )
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                tab = {"tab_id": "tab/full"}
+                service._agent_browser_tool(scope.scope_key, "new_tab", {"trace": True})
+                for action, arguments in (
+                    ("wait", {**tab, "timeout": 1000, "wait_for_network": False}),
+                    ("forward", tab),
+                    ("refresh", tab),
+                    ("viewport", {**tab, "width": 1024, "height": 768}),
+                    ("links", {**tab, "limit": 10}),
+                    ("images", {**tab, "limit": 4}),
+                    ("downloads", tab),
+                    ("stats", tab),
+                    ("extract", {**tab, "schema": {"type": "object"}}),
+                ):
+                    service._agent_browser_tool(scope.scope_key, action, arguments)
+
+                vision = service._agent_browser_tool(
+                    scope.scope_key,
+                    "vision",
+                    {
+                        **tab,
+                        "question": "What is visible?",
+                        "full_page": True,
+                        "fullPage": True,
+                    },
+                )
+                console = service._agent_browser_tool(scope.scope_key, "console", tab)
+                with self.assertRaises(ServiceError) as console_evaluate:
+                    service._agent_browser_tool(
+                        scope.scope_key,
+                        "console",
+                        {**tab, "expression": "document.title"},
+                    )
+                with self.assertRaises(ServiceError) as direct_evaluate:
+                    service._agent_browser_tool(
+                        scope.scope_key,
+                        "evaluate",
+                        {**tab, "expression": "document.title"},
+                    )
+
+                urls = [str(call["url"]) for call in calls]
+                for route in (
+                    "/wait", "/forward", "/refresh", "/viewport", "/links?",
+                    "/images?", "/downloads?", "/stats?", "/extract",
+                ):
+                    self.assertTrue(any(route in url for url in urls), route)
+                wait_call = next(call for call in calls if str(call["url"]).endswith("/wait"))
+                self.assertFalse(wait_call["body"]["waitForNetwork"])
+                self.assertNotIn("wait_for_network", wait_call["body"])
+                downloads_call = next(call for call in calls if "/downloads?" in str(call["url"]))
+                self.assertIn("consume=false", str(downloads_call["url"]))
+                self.assertEqual(vision["screenshot"]["mimeType"], "image/png")
+                self.assertEqual(base64.b64decode(vision["screenshot"]["data"]), b"\x89PNG\r\n\x1a\nfixture")
+                self.assertEqual(len(binary_urls), 1)
+                screenshot_query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(binary_urls[0]).query
+                )
+                self.assertEqual(screenshot_query["fullPage"], ["false"])
+                self.assertFalse(console["supported"])
+                self.assertEqual(console_evaluate.exception.status, 400)
+                self.assertEqual(direct_evaluate.exception.status, 400)
+                self.assertFalse(any("trace" in (call.get("body") or {}) for call in calls))
+            finally:
+                service.close()
+
+    def test_browser_navigate_without_tab_id_reuses_the_current_tab(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            calls: list[dict[str, object]] = []
+
+            def record_request(url, body, *, headers, timeout, method="POST"):
+                calls.append({"url": url, "body": body, "method": method})
+                if "/tabs?" in url and method == "GET":
+                    return {
+                        "tabs": [
+                            {"tabId": "existing/tab", "url": "http://127.0.0.1/old"},
+                        ],
+                    }
+                if "/stats?" in url:
+                    return {"url": "http://127.0.0.1/new"}
+                if url.endswith("/navigate"):
+                    return {"ok": True, "url": "http://127.0.0.1/new"}
+                if "/snapshot?" in url:
+                    return {
+                        "url": "http://127.0.0.1/new",
+                        "snapshot": "- heading New",
+                        "refsCount": 1,
+                    }
+                return {"ok": True}
+
+            service._runtime_json_request = record_request
+            service.runtimes.ensure_camofox_ready = lambda **_kwargs: SimpleNamespace(
+                available=True,
+                error="",
+            )
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                result = service._agent_browser_tool(
+                    scope.scope_key,
+                    "navigate",
+                    {"url": "http://127.0.0.1/new"},
+                )
+
+                self.assertFalse(any(call["url"].endswith("/tabs") for call in calls))
+                navigate = next(call for call in calls if str(call["url"]).endswith("/navigate"))
+                self.assertIn("/tabs/existing%2Ftab/navigate", str(navigate["url"]))
+                self.assertEqual(result["snapshot"], "- heading New")
+            finally:
+                service.close()
+
+    def test_browser_current_tab_is_tracked_per_scope_and_falls_back_when_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            calls: list[dict[str, object]] = []
+            live_tabs: dict[str, list[dict[str, str]]] = {}
+
+            def record_request(url, body, *, headers, timeout, method="POST"):
+                calls.append({"url": url, "body": body, "method": method})
+                parsed = urllib.parse.urlparse(url)
+                if parsed.path.endswith("/tabs") and method == "GET":
+                    user_id = urllib.parse.parse_qs(parsed.query)["userId"][0]
+                    return {"tabs": list(live_tabs[user_id])}
+                if "/stats?" in url:
+                    return {"url": "http://127.0.0.1/current"}
+                if "/snapshot?" in url:
+                    return {
+                        "url": "http://127.0.0.1/current",
+                        "snapshot": "- heading Current",
+                        "refsCount": 1,
+                    }
+                return {"ok": True}
+
+            service._runtime_json_request = record_request
+            service.runtimes.ensure_camofox_ready = lambda **_kwargs: SimpleNamespace(
+                available=True,
+                error="",
+            )
+            service.runtimes.camofox_status = lambda **_kwargs: SimpleNamespace(
+                available=True,
+            )
+            try:
+                first_scope = service.agent_scopes.ensure_private_scope(1)
+                second_scope = service.agent_scopes.ensure_channel_scope(1)
+                first_user_id = "agent-" + hashlib.sha256(
+                    first_scope.scope_key.encode("utf-8")
+                ).hexdigest()[:24]
+                second_user_id = "agent-" + hashlib.sha256(
+                    second_scope.scope_key.encode("utf-8")
+                ).hexdigest()[:24]
+                live_tabs[first_user_id] = [
+                    {"tabId": "first-current"},
+                    {"tabId": "first-newest"},
+                ]
+                live_tabs[second_user_id] = [
+                    {"tabId": "second-current"},
+                    {"tabId": "second-newest"},
+                ]
+
+                service._agent_browser_tool(
+                    first_scope.scope_key,
+                    "snapshot",
+                    {"tab_id": "first-current"},
+                )
+                service._agent_browser_tool(
+                    second_scope.scope_key,
+                    "snapshot",
+                    {"tab_id": "second-current"},
+                )
+
+                calls.clear()
+                service._agent_browser_tool(first_scope.scope_key, "snapshot", {})
+                service._agent_browser_tool(second_scope.scope_key, "snapshot", {})
+                snapshot_urls = [
+                    str(call["url"])
+                    for call in calls
+                    if "/snapshot?" in str(call["url"])
+                ]
+                self.assertTrue(any("/tabs/first-current/snapshot?" in url for url in snapshot_urls))
+                self.assertTrue(any("/tabs/second-current/snapshot?" in url for url in snapshot_urls))
+                self.assertFalse(any("newest/snapshot?" in url for url in snapshot_urls))
+
+                live_tabs[first_user_id] = [
+                    {"tabId": "first-older"},
+                    {"tabId": "first-fallback"},
+                ]
+                calls.clear()
+                service._agent_browser_tool(first_scope.scope_key, "snapshot", {})
+                fallback_snapshot = next(
+                    str(call["url"])
+                    for call in calls
+                    if "/snapshot?" in str(call["url"])
+                )
+                self.assertIn("/tabs/first-fallback/snapshot?", fallback_snapshot)
+
+                service._agent_browser_tool(
+                    first_scope.scope_key,
+                    "close",
+                    {"tab_id": "first-fallback"},
+                )
+                self.assertNotIn(
+                    first_scope.scope_key,
+                    service._agent_browser_current_tabs,
+                )
+                service._agent_browser_tool(second_scope.scope_key, "cleanup", {})
+                self.assertNotIn(
+                    second_scope.scope_key,
+                    service._agent_browser_current_tabs,
+                )
+            finally:
+                service.close()
+
+    def test_browser_page_url_guard_runs_before_and_after_actions(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            calls: list[dict[str, object]] = []
+            stats_urls: list[str] = []
+
+            def record_request(url, body, *, headers, timeout, method="POST"):
+                calls.append({"url": url, "body": body, "method": method})
+                if "/stats?" in url:
+                    return {"url": stats_urls.pop(0)}
+                if url.endswith("/click"):
+                    return {"ok": True}
+                if "/snapshot?" in url:
+                    return {
+                        "url": "http://127.0.0.1/safe",
+                        "snapshot": "- heading Safe",
+                        "refsCount": 1,
+                    }
+                return {"ok": True}
+
+            service._runtime_json_request = record_request
+            service.runtimes.ensure_camofox_ready = lambda **_kwargs: SimpleNamespace(
+                available=True,
+                error="",
+            )
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                metadata_url = "http://169.254.169.254/latest/meta-data"
+
+                stats_urls[:] = [metadata_url]
+                with self.assertRaises(ServiceError) as preflight:
+                    service._agent_browser_tool(
+                        scope.scope_key,
+                        "snapshot",
+                        {"tab_id": "guarded"},
+                    )
+                self.assertEqual(preflight.exception.status, 403)
+                self.assertFalse(any("/snapshot?" in str(call["url"]) for call in calls))
+
+                calls.clear()
+                stats_urls[:] = ["http://127.0.0.1/safe", metadata_url]
+                with self.assertRaises(ServiceError) as postflight:
+                    service._agent_browser_tool(
+                        scope.scope_key,
+                        "click",
+                        {"tab_id": "guarded", "ref": "e1"},
+                    )
+                self.assertEqual(postflight.exception.status, 403)
+                self.assertTrue(any(str(call["url"]).endswith("/click") for call in calls))
+                self.assertEqual(len([call for call in calls if "/stats?" in str(call["url"])]), 2)
+            finally:
+                service.close()
+
+    def test_browser_gateway_content_does_not_duplicate_screenshot_base64(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                encoded = base64.b64encode(b"unique browser image bytes").decode("ascii")
+                service._agent_browser_tool = lambda *_args, **_kwargs: {
+                    "url": "http://127.0.0.1/page",
+                    "screenshot": {"data": encoded, "mimeType": "image/png"},
+                }
+                response = service.invoke_agent_runtime_tool({
+                    "tool": "browser",
+                    "action": "screenshot",
+                    "arguments": {},
+                    "context": {"scope_key": scope.scope_key},
+                })
+
+                self.assertEqual(response["data"]["screenshot"]["data"], encoded)
+                self.assertNotIn(encoded, response["content"])
+                self.assertIn("image/png", response["content"])
+            finally:
+                service.close()
+
+    def test_browser_url_allows_signed_and_sso_query_parameters(self):
+        addresses = [(2, 1, 6, "", ("127.0.0.1", 443))]
+        with mock.patch("enterprise_agent_platform.service.socket.getaddrinfo", return_value=addresses):
+            EnterpriseService._validate_browser_url(
+                "https://internal.example/reset?token=signed-value&password=temporary"
+            )
 
     def test_managed_cognee_environment_is_seeded_from_platform(self):
         with tempfile.TemporaryDirectory() as td:

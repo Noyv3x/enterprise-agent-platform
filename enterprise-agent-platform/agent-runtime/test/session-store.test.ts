@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import test from "node:test";
-import type { UserMessage } from "@earendil-works/pi-ai";
+import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { SessionStore } from "../src/session-store.js";
 import { temporaryDirectory } from "./helpers.js";
 
@@ -98,6 +98,122 @@ test("SessionStore atomically replaces compacted history instead of growing fore
     assert.match(raw, /retain-this-message/);
     assert.equal((raw.match(/"type":"header"/g) ?? []).length, 1);
     assert.equal((raw.match(/"type":"compaction"/g) ?? []).length, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore keeps live tool images out of durable journals", async () => {
+  const home = await temporaryDirectory("agent-session-tool-image-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const encoded = Buffer.alloc(2 * 1024 * 1024, 0x5a).toString("base64");
+    const result: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: "browser-call",
+      toolName: "browser",
+      content: [
+        { type: "text", text: "Captured browser screenshot" },
+        { type: "image", data: encoded, mimeType: "image/png" },
+      ],
+      details: {
+        screenshot: { data: encoded, mimeType: "image/png" },
+        nested: [{ type: "image", data: encoded, mimeType: "image/webp", bytes: 2 * 1024 * 1024 }],
+        safe: { data: "ordinary structured data", mimeType: "text/plain" },
+      },
+      isError: false,
+      timestamp: 1,
+    };
+    await store.initialize(identity);
+    await store.appendMessage(identity, result);
+
+    assert.equal(result.content[1]?.type, "image", "persistence must not mutate the live tool result");
+    const loaded = await store.load(identity);
+    assert.equal(loaded.length, 1);
+    const persisted = loaded[0];
+    assert.equal(persisted?.role, "toolResult");
+    assert.equal(persisted?.role === "toolResult" ? persisted.content.some((block) => block.type === "image") : true, false);
+    assert.match(
+      persisted?.role === "toolResult" ? persisted.content.map((block) => block.type === "text" ? block.text : "").join("\n") : "",
+      /omitted from durable session history/,
+    );
+    const persistedDetails = persisted?.role === "toolResult"
+      ? persisted.details as {
+          screenshot: { data?: string; mimeType: string; bytes: number; omitted: boolean };
+          nested: Array<{ data?: string; type: string; mimeType: string; bytes: number; omitted: boolean }>;
+          safe: { data: string; mimeType: string };
+        }
+      : undefined;
+    assert.equal(persistedDetails?.screenshot.data, undefined);
+    assert.equal(persistedDetails?.screenshot.mimeType, "image/png");
+    assert.equal(persistedDetails?.screenshot.bytes, 2 * 1024 * 1024);
+    assert.equal(persistedDetails?.screenshot.omitted, true);
+    assert.equal(persistedDetails?.nested[0]?.data, undefined);
+    assert.equal(persistedDetails?.nested[0]?.type, "image");
+    assert.equal(persistedDetails?.nested[0]?.mimeType, "image/webp");
+    assert.equal(persistedDetails?.nested[0]?.bytes, 2 * 1024 * 1024);
+    assert.equal(persistedDetails?.nested[0]?.omitted, true);
+    assert.equal(persistedDetails?.safe.data, "ordinary structured data");
+    const liveDetails = result.details as {
+      screenshot: { data: string };
+      nested: Array<{ data: string }>;
+    };
+    assert.equal(liveDetails.screenshot.data, encoded, "persistence must not mutate live details");
+    assert.equal(liveDetails.nested[0]?.data, encoded, "nested live details must remain unchanged");
+    const raw = await readFile(store.path(identity), "utf8");
+    assert.doesNotMatch(raw, new RegExp(encoded.slice(0, 100)));
+    assert.ok(Buffer.byteLength(raw) < 10_000, `durable journal unexpectedly used ${Buffer.byteLength(raw)} bytes`);
+
+    await store.rewriteCompacted(identity, [result], {
+      omitted_messages: 0,
+      retained_messages: 1,
+    });
+    const compactedRaw = await readFile(store.path(identity), "utf8");
+    assert.doesNotMatch(compactedRaw, new RegExp(encoded.slice(0, 100)));
+    assert.ok(Buffer.byteLength(compactedRaw) < 10_000);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore replaces user images without mutating the live user message", async () => {
+  const home = await temporaryDirectory("agent-session-user-image-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const encoded = Buffer.alloc(512 * 1024, 0x31).toString("base64");
+    const message: UserMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "Please inspect this image" },
+        { type: "image", data: encoded, mimeType: "image/png" },
+      ],
+      timestamp: 1,
+    };
+
+    await store.initialize(identity);
+    await store.appendMessage(identity, message);
+
+    assert.equal(Array.isArray(message.content) ? message.content[1]?.type : undefined, "image");
+    assert.equal(
+      Array.isArray(message.content) && message.content[1]?.type === "image" ? message.content[1].data : undefined,
+      encoded,
+      "persistence must not mutate the live user image",
+    );
+    const loaded = await store.load(identity);
+    const persisted = loaded[0];
+    assert.equal(persisted?.role, "user");
+    assert.equal(
+      persisted?.role === "user" && Array.isArray(persisted.content)
+        ? persisted.content.some((block) => block.type === "image")
+        : true,
+      false,
+    );
+    assert.match(JSON.stringify(persisted), /User image \(image\/png\).*omitted from durable session history/);
+    const raw = await readFile(store.path(identity), "utf8");
+    assert.doesNotMatch(raw, new RegExp(encoded.slice(0, 100)));
+    assert.ok(Buffer.byteLength(raw) < 10_000);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

@@ -39,3 +39,9 @@ enterprise_agent_platform = [
 "share/ubitech-agent/agent-runtime/test" = [
   "agent-runtime/test/*.ts",
 ]
+"share/ubitech-agent/camofox-runtime" = [
+  "camofox-runtime/package.json",
+  "camofox-runtime/package-lock.json",
+  "camofox-runtime/loopback-preload.cjs",
+  "camofox-runtime/patch-runtime.cjs",
+]

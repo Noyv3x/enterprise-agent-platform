@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { Type, type ImageContent, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { JsonObject, JsonValue, RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
@@ -30,6 +30,34 @@ function objectValue(value: unknown): JsonObject {
 function gatewayResult(result: { content?: string; data?: JsonValue; is_error?: boolean }): AgentToolResult<JsonValue> {
   if (result.is_error) throw new Error(result.content || "Platform tool failed");
   return textResult(result.content || JSON.stringify(result.data ?? null, null, 2), result.data ?? null);
+}
+
+export function browserGatewayResult(result: { content?: string; data?: JsonValue; is_error?: boolean }): AgentToolResult<JsonValue> {
+  if (result.is_error) throw new Error(result.content || "Platform browser tool failed");
+  const data = objectValue(result.data);
+  const rawScreenshot = objectValue(data.screenshot);
+  const encoded = typeof rawScreenshot.data === "string" ? rawScreenshot.data : "";
+  if (!encoded) return textResult(JSON.stringify(data, null, 2), data as JsonValue);
+  const mimeType = typeof rawScreenshot.mimeType === "string" ? rawScreenshot.mimeType.toLowerCase() : "";
+  if (mimeType !== "image/png") throw new Error(`Unsupported browser screenshot type: ${mimeType || "missing"}`);
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) throw new Error("Browser screenshot is not valid base64");
+  const image = Buffer.from(encoded, "base64");
+  if (image.length === 0 || image.length > 8 * 1024 * 1024) throw new Error("Browser screenshot exceeds the 8 MiB limit");
+  if (!image.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    throw new Error("Browser screenshot is not a PNG");
+  }
+  const sanitized: JsonValue = {
+    ...(data as { [key: string]: JsonValue }),
+    screenshot: { mimeType, bytes: image.length },
+  };
+  const summary = typeof data.snapshot === "string"
+    ? truncate(data.snapshot, 40_000)
+    : `Captured browser screenshot (${image.length} bytes).`;
+  const imageContent: ImageContent = { type: "image", data: encoded, mimeType };
+  return {
+    content: [{ type: "text", text: summary }, imageContent],
+    details: sanitized,
+  };
 }
 
 const terminalSchema = Type.Object({
@@ -77,6 +105,63 @@ const gatewaySchema = Type.Object({
   action: Type.String({ minLength: 1 }),
   arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
+
+const browserActionSchema = Type.Union([
+  Type.Literal("navigate"),
+  Type.Literal("new_tab"),
+  Type.Literal("list"),
+  Type.Literal("snapshot"),
+  Type.Literal("screenshot"),
+  Type.Literal("vision"),
+  Type.Literal("click"),
+  Type.Literal("type"),
+  Type.Literal("press"),
+  Type.Literal("scroll"),
+  Type.Literal("wait"),
+  Type.Literal("back"),
+  Type.Literal("forward"),
+  Type.Literal("refresh"),
+  Type.Literal("viewport"),
+  Type.Literal("links"),
+  Type.Literal("images"),
+  Type.Literal("downloads"),
+  Type.Literal("stats"),
+  Type.Literal("extract"),
+  Type.Literal("console"),
+  Type.Literal("close"),
+  Type.Literal("cleanup"),
+]);
+
+const browserArgumentsSchema = Type.Object({
+  tab_id: Type.Optional(Type.String({ minLength: 1 })),
+  url: Type.Optional(Type.String({ minLength: 1 })),
+  macro: Type.Optional(Type.String({ minLength: 1 })),
+  query: Type.Optional(Type.String()),
+  offset: Type.Optional(Type.Integer({ minimum: 0 })),
+  question: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+  ref: Type.Optional(Type.String({ minLength: 1 })),
+  selector: Type.Optional(Type.String({ minLength: 1 })),
+  text: Type.Optional(Type.String()),
+  mode: Type.Optional(Type.Union([Type.Literal("fill"), Type.Literal("keyboard")])),
+  delay: Type.Optional(Type.Integer({ minimum: 0, maximum: 5000 })),
+  submit: Type.Optional(Type.Boolean()),
+  key: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
+  direction: Type.Optional(Type.Union([
+    Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right"),
+  ])),
+  amount: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  timeout: Type.Optional(Type.Integer({ minimum: 0, maximum: 120_000 })),
+  wait_for_network: Type.Optional(Type.Boolean()),
+  width: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000 })),
+  height: Type.Optional(Type.Integer({ minimum: 100, maximum: 4000 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  schema: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+}, { additionalProperties: false });
+
+const browserSchema = Type.Object({
+  action: browserActionSchema,
+  arguments: Type.Optional(browserArgumentsSchema),
+}, { additionalProperties: false });
 
 const delegateSchema = Type.Object({
   prompt: Type.String({ minLength: 1 }),
@@ -283,7 +368,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     },
   };
 
-  const gatewayTools = (["memory", "knowledge", "web", "browser"] as const).map((name): AgentTool<typeof gatewaySchema, JsonValue> => ({
+  const gatewayTools = (["memory", "knowledge", "web"] as const).map((name): AgentTool<typeof gatewaySchema, JsonValue> => ({
     name,
     label: name[0]!.toUpperCase() + name.slice(1),
     description: gatewayDescription(name),
@@ -294,6 +379,28 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       return gatewayResult(await context.gateway.invoke(context.request, context.runId, name, params.action, objectValue(params.arguments), signal));
     },
   }));
+
+  const browserTool: AgentTool<typeof browserSchema, JsonValue> = {
+    name: "browser",
+    label: "Browser",
+    description: gatewayDescription("browser"),
+    parameters: browserSchema,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal) {
+      const browserArguments = objectValue(params.arguments);
+      if (isGatewayMutation("browser", params.action)) context.markSideEffect();
+      return browserGatewayResult(
+        await context.gateway.invoke(
+          context.request,
+          context.runId,
+          "browser",
+          params.action,
+          browserArguments,
+          signal,
+        ),
+      );
+    },
+  };
 
   const sessionTool: AgentTool<typeof gatewaySchema, JsonValue> = {
     name: "session",
@@ -333,6 +440,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     searchTool,
     sessionTool,
     ...gatewayTools,
+    browserTool,
     delegateTool,
   ];
 }
@@ -389,7 +497,6 @@ export async function classifyToolCall(toolName: string, args: unknown, workspac
     "click",
     "type",
     "press",
-    "evaluate",
     "download",
     "close",
     "close_tab",
@@ -561,14 +668,16 @@ function gatewayDescription(name: "memory" | "session" | "knowledge" | "web" | "
     session: "Inspect this Agent's isolated session journal. Actions: search (arguments.query), read (arguments.index), list; arguments.limit bounds results.",
     knowledge: "Use the platform knowledge base. Actions: search, read.",
     web: "Use the managed web gateway. Actions: search, extract.",
-    browser: "Use this Agent's isolated managed browser profile. Actions: navigate, list, snapshot, screenshot, click, type, scroll, back, press, evaluate, console, close.",
+    browser: "Use this Agent's persistent, isolated Camoufox browser. navigate opens or reuses a tab and returns an accessibility snapshot; tab_id is optional after a tab exists. Actions: navigate, new_tab, list, snapshot (offset for pagination), screenshot, vision (question), click (ref/selector), type (ref/selector/text), press, scroll, wait, back, forward, refresh, viewport, links, images, downloads (list metadata only; does not fetch, save, or clear files), stats, extract, console, close, cleanup.",
   };
   return descriptions[name];
 }
 
 function isGatewayMutation(name: string, action: string): boolean {
   if (name === "memory") return !["search", "read", "list"].includes(action);
-  if (name === "browser") return !["snapshot", "screenshot", "status"].includes(action);
+  if (name === "browser") return ![
+    "list", "snapshot", "screenshot", "vision", "links", "images", "downloads", "stats", "extract", "wait", "console",
+  ].includes(action);
   return false;
 }
 

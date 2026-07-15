@@ -4,11 +4,13 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import signal
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -17,10 +19,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import zipfile
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - managed Camoufox currently targets Linux.
+    fcntl = None
 
 from .config import PlatformConfig
 from .db import now_ts
@@ -58,6 +68,33 @@ FIRECRAWL_SETTING_API_URL = "firecrawl_api_url"
 FIRECRAWL_SETTING_COMMAND = "firecrawl_command"
 FIRECRAWL_COMPOSE_OVERRIDE = "docker-compose.ubitech.yaml"
 CAMOFOX_MANAGED_VERSION = "1.11.2"
+CAMOFOX_JS_VERSION = "0.10.2"
+CAMOFOX_PLAYWRIGHT_VERSION = "1.59.1"
+CAMOFOX_RUNTIME_INSTALL_MARKER = "install.json"
+CAMOFOX_BROWSER_RELEASE = "v150.0.2-beta.25"
+CAMOFOX_BROWSER_MAX_ARCHIVE_BYTES = 750 * 1024 * 1024
+CAMOFOX_BROWSER_MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
+CAMOFOX_BROWSER_MAX_ARCHIVE_MEMBERS = 50_000
+CAMOFOX_BROWSER_MAX_COMPRESSION_RATIO = 1_000
+CAMOFOX_BROWSER_DOWNLOAD_DEADLINE_SECONDS = 30 * 60
+CAMOFOX_CAPABILITY_REPROBE_AFTER_SECONDS = 30.0
+CAMOFOX_CAPABILITY_RETRY_SECONDS = 2.0
+CAMOFOX_BROWSER_ASSETS = {
+    ("Linux", "x86_64"): (
+        "camoufox-150.0.2-alpha.26-lin.x86_64.zip",
+        "b146b98b0c2c41023716feef36451f319a534309f72c54584a4b0b88670f510b",
+        661_687_098,
+        "150.0.2",
+        "alpha.26",
+    ),
+    ("Linux", "aarch64"): (
+        "camoufox-150.0.2-alpha.25-lin.arm64.zip",
+        "b2870af8cd99721d41bd48f0cce0f949449ab75364b80ee3d389bd35953ea213",
+        652_036_669,
+        "150.0.2",
+        "alpha.25",
+    ),
+}
 FIRECRAWL_IMAGE = "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c"
 FIRECRAWL_PLAYWRIGHT_IMAGE = "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2"
 FIRECRAWL_POSTGRES_IMAGE = "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"
@@ -207,6 +244,11 @@ class PlatformRuntimeManager:
         self._cognee_last_error = ""
         self._camofox_last_error = ""
         self._firecrawl_last_error = ""
+        self._camofox_capability_verified = False
+        self._camofox_capability_verified_at = 0.0
+        self._camofox_capability_next_probe_at = 0.0
+        self._camofox_capability_probe_lock = threading.Lock()
+        self._camofox_process_generation = 0
 
     def prepare(self) -> dict[str, Any]:
         with self._lock:
@@ -711,6 +753,14 @@ class PlatformRuntimeManager:
             )
         command, _cwd, detail = self._camofox_command()
         available = bool(command)
+        if not self._effective_camofox_command():
+            source = self._camofox_source_dir()
+            if not source.joinpath("package.json").is_file() or not source.joinpath("package-lock.json").is_file():
+                available = False
+                detail = f"Camofox runtime source is missing: {source}"
+            elif not self._camofox_install_is_current(source):
+                available = False
+                detail = "Camofox runtime is not installed from the current lockfile"
         self._camofox_last_error = "" if available else detail
         return RuntimeStatus(
             "camofox",
@@ -723,13 +773,155 @@ class PlatformRuntimeManager:
             error="" if available else detail,
             last_started_at=self._camofox_last_started_at,
             source=detail,
+            install_state="ready" if available else "missing",
         )
+
+    def install_camofox(self, *, force: bool = False) -> RuntimeStatus:
+        """Install the fully locked Camoufox service and browser cache."""
+
+        with self._lock:
+            if not self._managed_camofox_enabled():
+                # An external/disabled browser is an explicit operator choice.
+                # Deployment must neither download the ~GiB managed bundle nor
+                # turn that choice into an update failure.
+                return self.prepare_camofox()
+            runtime_dir = self.config.runtime_dir / "camofox"
+            for directory in (runtime_dir, runtime_dir / "logs", runtime_dir / "cache"):
+                ensure_private_directory(directory)
+            if self._effective_camofox_command():
+                return self.prepare_camofox()
+            source = self._camofox_source_dir()
+            required = (
+                "package.json",
+                "package-lock.json",
+                "loopback-preload.cjs",
+                "patch-runtime.cjs",
+            )
+            if any(not source.joinpath(name).is_file() for name in required):
+                return RuntimeStatus(
+                    "camofox",
+                    True,
+                    False,
+                    "missing",
+                    path=str(source),
+                    error="Camofox runtime package.json/package-lock.json/preload is missing",
+                    install_state="missing",
+                )
+            if shutil.which("node") is None or shutil.which("npm") is None:
+                return RuntimeStatus(
+                    "camofox",
+                    True,
+                    False,
+                    "missing",
+                    path=str(source),
+                    error="Node.js >=22.19 and npm are required",
+                    install_state="missing",
+                )
+            app = self._camofox_app_dir()
+            staging: Path | None = None
+            try:
+                # The deployment preparer and the still-running platform are
+                # separate processes during an update. Serialize only the
+                # install/publish transaction; health probes never take this
+                # file lock.
+                with self._camofox_install_lock():
+                    if not force and self._camofox_install_is_current(source):
+                        return self.prepare_camofox()
+                    signature = self._agent_runtime_source_signature(source)
+                    staging = runtime_dir / f"app.staging-{uuid.uuid4().hex}"
+                    shutil.copytree(
+                        source,
+                        staging,
+                        ignore=shutil.ignore_patterns("node_modules", ".cache", "coverage"),
+                    )
+                    log_path = runtime_dir / "logs" / "install.log"
+                    env = _scrubbed_process_env()
+                    env.update(
+                        {
+                            "NPM_CONFIG_FUND": "false",
+                            "NPM_CONFIG_AUDIT": "false",
+                            # Isolate both the downloaded Camoufox binary and its
+                            # version marker from unrelated host-level npm tools.
+                            "XDG_CACHE_HOME": str(runtime_dir / "cache"),
+                            "CAMOFOX_CRASH_REPORT_ENABLED": "false",
+                            "CAMOFOX_SKIP_DOWNLOAD": "1",
+                        }
+                    )
+                    commands = (
+                        ["npm", "ci", "--omit=dev"],
+                        [shutil.which("node") or "node", "patch-runtime.cjs"],
+                    )
+                    for command in commands:
+                        result = self.command_runner.run(
+                            command,
+                            cwd=staging,
+                            env=env,
+                            log_path=log_path,
+                            timeout=900,
+                        )
+                        if result.returncode != 0:
+                            raise RuntimeError(
+                                f"{' '.join(command)} exited with {result.returncode}; see {log_path}"
+                            )
+                    self._validate_camofox_install(staging)
+                    self._install_camofox_browser(force=False, install_lock_held=True)
+                    _write_json_secure(
+                        staging / CAMOFOX_RUNTIME_INSTALL_MARKER,
+                        {
+                            "source_signature": signature,
+                            "installed_at": _iso_now(),
+                            "camofox_browser": CAMOFOX_MANAGED_VERSION,
+                            "camoufox_js": CAMOFOX_JS_VERSION,
+                            "playwright_core": CAMOFOX_PLAYWRIGHT_VERSION,
+                        },
+                    )
+                    previous = runtime_dir / "app.previous"
+                    shutil.rmtree(previous, ignore_errors=True)
+                    if app.exists():
+                        app.rename(previous)
+                    try:
+                        staging.rename(app)
+                    except Exception:
+                        if previous.exists() and not app.exists():
+                            previous.rename(app)
+                        raise
+                    shutil.rmtree(previous, ignore_errors=True)
+                    staging = None
+            except Exception as exc:
+                if staging is not None:
+                    shutil.rmtree(staging, ignore_errors=True)
+                self._camofox_last_error = str(exc)
+                return RuntimeStatus(
+                    "camofox",
+                    True,
+                    False,
+                    "error",
+                    path=str(app),
+                    error=str(exc),
+                    install_state="failed",
+                )
+            self._camofox_last_error = ""
+            return self.prepare_camofox()
 
     def ensure_camofox_ready(self, *, wait: bool = True) -> RuntimeStatus:
         with self._lock:
             if not self._managed_camofox_enabled():
                 return self.camofox_status(refresh=False)
+            # During auto-update the live process still serves requests while a
+            # separate deployment process publishes the next locked app. Keep
+            # using that known-owned healthy process instead of making the old
+            # service contend for the installer lock after git fast-forwards.
+            if self._camofox_process is not None and self._camofox_process.poll() is None:
+                current = self.camofox_status(refresh=True)
+                if current.available:
+                    return current
             prepared = self.prepare_camofox()
+            if (
+                not prepared.available
+                and not self._effective_camofox_command()
+                and prepared.state != "invalid_config"
+            ):
+                prepared = self.install_camofox(force=False)
             if not prepared.available:
                 return prepared
             current = self.camofox_status(refresh=True)
@@ -755,6 +947,7 @@ class PlatformRuntimeManager:
 
     def stop_camofox(self) -> RuntimeStatus:
         with self._lock:
+            self._reset_camofox_capability_state()
             self._stop_process("_camofox_process")
             return self.camofox_status(refresh=False)
 
@@ -776,6 +969,7 @@ class PlatformRuntimeManager:
                 path=str(runtime_dir),
                 last_started_at=self._camofox_last_started_at,
                 source=self._camofox_source_label(),
+                install_state="ready",
             )
         if process_running:
             return RuntimeStatus(
@@ -783,14 +977,14 @@ class PlatformRuntimeManager:
                 True,
                 False,
                 "starting",
-                "Camofox process is running; health check is not ready yet "
-                "(first launch downloads the browser package and may take a few minutes)",
+                "Camofox process is running; browser capability check is not ready yet",
                 pid=pid,
                 url=self._effective_camofox_url(),
                 path=str(runtime_dir),
                 error=self._camofox_last_error,
                 last_started_at=self._camofox_last_started_at,
                 source=self._camofox_source_label(),
+                install_state="ready",
             )
         command, _cwd, detail = self._camofox_command()
         exited = self._process_exit_error("Camofox", returncode, runtime_dir / "logs" / "managed-camofox.log")
@@ -989,7 +1183,7 @@ class PlatformRuntimeManager:
         if not command:
             self._camofox_last_error = detail
             return
-        env = os.environ.copy()
+        env = _scrubbed_process_env()
         env["CAMOFOX_PORT"] = str(urllib.parse.urlparse(self._effective_camofox_url()).port or 9377)
         runtime_dir = self.config.runtime_dir / "camofox"
         access_key = self._camofox_access_key()
@@ -1005,12 +1199,26 @@ class PlatformRuntimeManager:
                 "CAMOFOX_COOKIES_DIR": str(runtime_dir / "cookies"),
                 "CAMOFOX_TRACES_DIR": str(runtime_dir / "traces"),
                 "CAMOFOX_CRASH_REPORT_ENABLED": "false",
+                "NODE_ENV": "production",
                 "HOST": "127.0.0.1",
                 "CAMOFOX_HOST": "127.0.0.1",
+                "UBITECH_CAMOFOX_BIND_HOST": urllib.parse.urlparse(
+                    self._effective_camofox_url()
+                ).hostname
+                or "127.0.0.1",
+                "XDG_CACHE_HOME": str(runtime_dir / "cache"),
             }
         )
+        if not self._effective_camofox_command():
+            browser_executable = self._camofox_browser_executable()
+            if browser_executable is None:
+                self._camofox_last_error = "managed Camoufox browser executable is missing"
+                return
+            env["CAMOUFOX_EXECUTABLE_PATH"] = str(browser_executable)
+            env["CAMOFOX_EXECUTABLE_PATH"] = str(browser_executable)
         log_path = runtime_dir / "logs" / "managed-camofox.log"
         try:
+            self._reset_camofox_capability_state()
             self._camofox_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
             self._camofox_last_started_at = now_ts()
             self._camofox_last_error = ""
@@ -1152,15 +1360,329 @@ class PlatformRuntimeManager:
         configured = self._effective_camofox_command()
         if configured:
             return (shlex.split(configured), None, configured)
+        app = self._camofox_app_dir()
+        entrypoint = app / "node_modules" / "@askjo" / "camofox-browser" / "server.js"
+        preload = app / "loopback-preload.cjs"
+        node = shutil.which("node")
+        detail = (
+            "locked npm runtime: "
+            f"@askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}, "
+            f"camoufox-js@{CAMOFOX_JS_VERSION}, "
+            f"playwright-core@{CAMOFOX_PLAYWRIGHT_VERSION}"
+        )
+        if node is None:
+            return ([], app, "Node.js >=22.19 is required for Camofox")
+        if not entrypoint.is_file() or not preload.is_file():
+            return ([], app, "locked Camofox runtime is not installed; run deployment preparation")
         return (
             [
-                "npx",
-                "-y",
-                f"@askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}",
+                node,
+                "--require",
+                str(preload),
+                str(entrypoint),
             ],
-            None,
-            f"npm package: @askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}",
+            app,
+            detail,
         )
+
+    def _camofox_source_dir(self) -> Path:
+        candidates = (
+            Path(__file__).resolve().parents[1] / "camofox-runtime",
+            Path(sysconfig.get_path("data"))
+            / "share"
+            / "ubitech-agent"
+            / "camofox-runtime",
+        )
+        for candidate in candidates:
+            if all(
+                candidate.joinpath(name).is_file()
+                for name in (
+                    "package.json",
+                    "package-lock.json",
+                    "loopback-preload.cjs",
+                    "patch-runtime.cjs",
+                )
+            ):
+                return candidate
+        return candidates[0]
+
+    def _camofox_app_dir(self) -> Path:
+        return self.config.runtime_dir / "camofox" / "app"
+
+    @contextmanager
+    def _camofox_install_lock(self):
+        runtime_dir = self.config.runtime_dir / "camofox"
+        ensure_private_directory(runtime_dir)
+        path = runtime_dir / ".install.lock"
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(str(path), flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"Camofox install lock is not a regular file: {path}")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise RuntimeError(f"Camofox install lock is not owned by the service user: {path}")
+            os.fchmod(descriptor, 0o600)
+            if fcntl is None:
+                raise RuntimeError("managed Camofox installation requires POSIX file locking")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def _camofox_install_is_current(self, source: Path | None = None) -> bool:
+        source = source or self._camofox_source_dir()
+        app = self._camofox_app_dir()
+        marker = _read_json_mapping(app / CAMOFOX_RUNTIME_INSTALL_MARKER)
+        if marker.get("source_signature") != self._agent_runtime_source_signature(source):
+            return False
+        try:
+            self._validate_camofox_install(app)
+        except RuntimeError:
+            return False
+        return self._camofox_browser_executable() is not None
+
+    @staticmethod
+    def _validate_camofox_install(app: Path) -> None:
+        packages = (
+            (
+                app / "node_modules" / "@askjo" / "camofox-browser" / "package.json",
+                CAMOFOX_MANAGED_VERSION,
+                "@askjo/camofox-browser",
+            ),
+            (app / "node_modules" / "camoufox-js" / "package.json", CAMOFOX_JS_VERSION, "camoufox-js"),
+            (
+                app / "node_modules" / "playwright-core" / "package.json",
+                CAMOFOX_PLAYWRIGHT_VERSION,
+                "playwright-core",
+            ),
+        )
+        for path, expected, name in packages:
+            actual = str(_read_json_mapping(path).get("version") or "")
+            if actual != expected:
+                raise RuntimeError(f"locked {name} version mismatch: expected {expected}, found {actual or 'missing'}")
+        required_files = (
+            app / "loopback-preload.cjs",
+            app / "patch-runtime.cjs",
+            app / "node_modules" / "@askjo" / "camofox-browser" / "server.js",
+            app / "node_modules" / "@askjo" / "camofox-browser" / "lib" / "config.js",
+            app / "node_modules" / "camoufox-js" / "dist" / "index.js",
+            app / "node_modules" / "playwright-core" / "index.js",
+        )
+        missing = [str(path.relative_to(app)) for path in required_files if not path.is_file()]
+        if missing:
+            raise RuntimeError("Camofox runtime files are missing: " + ", ".join(missing))
+        server = required_files[2].read_text(encoding="utf-8")
+        if "reporter.resetNativeMemBaseline?.();" not in server:
+            raise RuntimeError("Camofox graceful-shutdown runtime patch is missing")
+        if "function sanitizeLogUrl(value)" not in server or "...sanitizeLogFields(fields)" not in server:
+            raise RuntimeError("Camofox structured-log URL redaction patch is missing")
+
+    def _camofox_browser_asset(self) -> tuple[str, str, int, str, str]:
+        machine = platform.machine().lower()
+        if machine in {"amd64", "x64"}:
+            machine = "x86_64"
+        elif machine in {"arm64"}:
+            machine = "aarch64"
+        asset = CAMOFOX_BROWSER_ASSETS.get((platform.system(), machine))
+        if asset is None:
+            raise RuntimeError(
+                f"managed Camoufox browser is unavailable for {platform.system()} {platform.machine()}"
+            )
+        return asset
+
+    def _install_camofox_browser(
+        self,
+        *,
+        force: bool,
+        install_lock_held: bool = False,
+    ) -> Path:
+        lock = nullcontext() if install_lock_held else self._camofox_install_lock()
+        with lock:
+            return self._install_camofox_browser_locked(force=force)
+
+    def _install_camofox_browser_locked(self, *, force: bool) -> Path:
+        current = self._camofox_browser_executable()
+        if current is not None and not force:
+            filename, _sha256, _size, version, release = self._camofox_browser_asset()
+            version_path = current.parent / "version.json"
+            if not version_path.is_file():
+                _write_json_secure(version_path, {"version": version, "release": release})
+            return current
+        runtime_dir = self.config.runtime_dir / "camofox"
+        browser_dir = runtime_dir / "browser"
+        filename, expected_sha256, expected_size, version, release = self._camofox_browser_asset()
+        url = (
+            "https://github.com/daijro/camoufox/releases/download/"
+            f"{CAMOFOX_BROWSER_RELEASE}/{filename}"
+        )
+        unique = uuid.uuid4().hex
+        archive = runtime_dir / f"browser-download-{unique}.zip"
+        staging = runtime_dir / f"browser.staging-{unique}"
+        digest = hashlib.sha256()
+        downloaded = 0
+        started_at = time.monotonic()
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "ubitech-agent-runtime"})
+            with urllib.request.urlopen(request, timeout=120) as response, archive.open("wb") as output:
+                raw_length = str(response.headers.get("Content-Length") or "").strip()
+                if raw_length:
+                    try:
+                        declared_length = int(raw_length)
+                    except ValueError as exc:
+                        raise RuntimeError("managed Camoufox browser response has an invalid Content-Length") from exc
+                    if declared_length != expected_size:
+                        raise RuntimeError(
+                            "managed Camoufox browser Content-Length mismatch: "
+                            f"expected {expected_size}, found {declared_length}"
+                        )
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > expected_size or downloaded > CAMOFOX_BROWSER_MAX_ARCHIVE_BYTES:
+                        raise RuntimeError("managed Camoufox browser download exceeds the pinned asset size")
+                    if time.monotonic() - started_at > CAMOFOX_BROWSER_DOWNLOAD_DEADLINE_SECONDS:
+                        raise RuntimeError("managed Camoufox browser download exceeded its time limit")
+                    digest.update(chunk)
+                    output.write(chunk)
+            if downloaded != expected_size:
+                raise RuntimeError(
+                    f"managed Camoufox browser size mismatch: expected {expected_size}, found {downloaded}"
+                )
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "managed Camoufox browser checksum mismatch: "
+                    f"expected {expected_sha256}, found {actual_sha256}"
+                )
+            staging.mkdir(mode=0o700, parents=True)
+            staging_root = staging.resolve()
+            with zipfile.ZipFile(archive) as bundle:
+                members = self._validated_camofox_archive_members(bundle, staging_root)
+                bundle.extractall(staging, members)
+            for path in staging.rglob("*"):
+                try:
+                    path.chmod(0o755 if path.is_dir() or path.is_file() else 0o700)
+                except OSError:
+                    pass
+            executable = next(
+                (
+                    path
+                    for path in staging.rglob("camoufox")
+                    if path.is_file() and path.name == "camoufox"
+                ),
+                None,
+            )
+            if executable is None:
+                raise RuntimeError("managed Camoufox browser archive has no executable")
+            relative_executable = executable.relative_to(staging).as_posix()
+            _write_json_secure(executable.parent / "version.json", {"version": version, "release": release})
+            _write_json_secure(
+                staging / CAMOFOX_RUNTIME_INSTALL_MARKER,
+                {
+                    "release": CAMOFOX_BROWSER_RELEASE,
+                    "asset": filename,
+                    "sha256": expected_sha256,
+                    "executable": relative_executable,
+                    "installed_at": _iso_now(),
+                },
+            )
+            previous = runtime_dir / "browser.previous"
+            shutil.rmtree(previous, ignore_errors=True)
+            if browser_dir.exists():
+                browser_dir.rename(previous)
+            try:
+                staging.rename(browser_dir)
+            except Exception:
+                if previous.exists() and not browser_dir.exists():
+                    previous.rename(browser_dir)
+                raise
+            shutil.rmtree(previous, ignore_errors=True)
+            installed = browser_dir / relative_executable
+            installed.chmod(0o755)
+            return installed
+        finally:
+            archive.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _validated_camofox_archive_members(
+        bundle: zipfile.ZipFile,
+        staging_root: Path,
+    ) -> list[zipfile.ZipInfo]:
+        members = bundle.infolist()
+        if len(members) > CAMOFOX_BROWSER_MAX_ARCHIVE_MEMBERS:
+            raise RuntimeError("managed Camoufox browser archive contains too many entries")
+        extracted_bytes = 0
+        targets: set[Path] = set()
+        for member in members:
+            member_mode = (member.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(member_mode):
+                raise RuntimeError("managed Camoufox browser archive contains a symbolic link")
+            file_type = stat.S_IFMT(member_mode)
+            if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise RuntimeError("managed Camoufox browser archive contains a special file")
+            target = (staging_root / member.filename).resolve()
+            if target != staging_root and staging_root not in target.parents:
+                raise RuntimeError("managed Camoufox browser archive contains an unsafe path")
+            if target in targets:
+                raise RuntimeError("managed Camoufox browser archive contains a duplicate target")
+            targets.add(target)
+            extracted_bytes += int(member.file_size)
+            if extracted_bytes > CAMOFOX_BROWSER_MAX_EXTRACTED_BYTES:
+                raise RuntimeError("managed Camoufox browser archive exceeds the extraction limit")
+            if member.file_size > 0:
+                if member.compress_size <= 0:
+                    raise RuntimeError("managed Camoufox browser archive has an invalid compression ratio")
+                if member.file_size / member.compress_size > CAMOFOX_BROWSER_MAX_COMPRESSION_RATIO:
+                    raise RuntimeError("managed Camoufox browser archive has an unsafe compression ratio")
+        return members
+
+    def _camofox_browser_executable(self) -> Path | None:
+        browser_dir = self.config.runtime_dir / "camofox" / "browser"
+        marker = _read_json_mapping(browser_dir / CAMOFOX_RUNTIME_INSTALL_MARKER)
+        try:
+            filename, expected_sha256, _size, _version, _release = self._camofox_browser_asset()
+        except RuntimeError:
+            return None
+        if (
+            marker.get("release") != CAMOFOX_BROWSER_RELEASE
+            or marker.get("asset") != filename
+            or marker.get("sha256") != expected_sha256
+        ):
+            return None
+        relative = str(marker.get("executable") or "")
+        if not relative:
+            return None
+        executable = (browser_dir / relative).resolve()
+        try:
+            executable.relative_to(browser_dir.resolve())
+        except ValueError:
+            return None
+        bundle_dir = executable.parent
+        browser_binary = bundle_dir / "camoufox-bin"
+        required_files = (
+            bundle_dir / "properties.json",
+            bundle_dir / "version.json",
+            bundle_dir / "libxul.so",
+            bundle_dir / "fontconfig" / "linux" / "fonts.conf",
+        )
+        if (
+            not executable.is_file()
+            or not os.access(executable, os.X_OK)
+            or not browser_binary.is_file()
+            or not os.access(browser_binary, os.X_OK)
+            or any(not path.is_file() for path in required_files)
+        ):
+            return None
+        return executable
 
     def _firecrawl_command(self) -> tuple[list[str], Path | None, str]:
         configured = self._effective_firecrawl_command()
@@ -1294,11 +1816,171 @@ class PlatformRuntimeManager:
         return ""
 
     def _probe_camofox_health(self) -> bool:
-        return self._probe_json_health(
-            self._effective_camofox_url(),
-            ("/health",),
-            lambda payload: payload.get("ok") is True and payload.get("engine") == "camoufox",
+        payload = self._camofox_json_request("/health", method="GET", authenticated=False)
+        if not (
+            isinstance(payload, dict)
+            and payload.get("ok") is True
+            and payload.get("engine") == "camoufox"
+        ):
+            return False
+        # The upstream API reports ok=true even when the browser failed to
+        # launch. A recently verified browser gets a short disconnect grace
+        # period for normal idle shutdown; a persistent disconnect triggers a
+        # fresh tab/snapshot/screenshot cycle instead of becoming a permanent
+        # false-green status.
+        if self._camofox_capability_verified:
+            if payload.get("browserConnected") is True and payload.get("browserRunning") is True:
+                return True
+            if (
+                time.monotonic() - self._camofox_capability_verified_at
+                < CAMOFOX_CAPABILITY_REPROBE_AFTER_SECONDS
+            ):
+                return True
+        return self._probe_camofox_capability()
+
+    def _probe_camofox_capability(self) -> bool:
+        now = time.monotonic()
+        if now < self._camofox_capability_next_probe_at:
+            return False
+        generation = self._camofox_process_generation
+        with self._camofox_capability_probe_lock:
+            now = time.monotonic()
+            if now < self._camofox_capability_next_probe_at:
+                return False
+            # Another status caller may have completed the expensive probe
+            # while this caller waited for the per-process probe lock.
+            if (
+                self._camofox_capability_verified
+                and now - self._camofox_capability_verified_at
+                < CAMOFOX_CAPABILITY_REPROBE_AFTER_SECONDS
+            ):
+                return True
+            return self._probe_camofox_capability_unlocked(generation)
+
+    def _probe_camofox_capability_unlocked(self, generation: int) -> bool:
+        url_scope = hashlib.sha256(self._effective_camofox_url().encode("utf-8")).hexdigest()[:24]
+        probe_user = f"ubitech-runtime-health-{url_scope}"
+        tab_id = ""
+        try:
+            created = self._camofox_json_request(
+                "/tabs",
+                body={"userId": probe_user, "sessionKey": "health"},
+                method="POST",
+                authenticated=True,
+                timeout=8.0,
+            )
+            tab_id = str((created or {}).get("tabId") or "")
+            if not tab_id:
+                raise RuntimeError("tab creation returned no tabId")
+            encoded = urllib.parse.quote(tab_id, safe="")
+            query = urllib.parse.urlencode({"userId": probe_user})
+            snapshot = self._camofox_json_request(
+                f"/tabs/{encoded}/snapshot?{query}",
+                method="GET",
+                authenticated=True,
+                timeout=8.0,
+            )
+            if not isinstance((snapshot or {}).get("snapshot"), str):
+                raise RuntimeError("snapshot capability is unavailable")
+            screenshot = self._camofox_binary_request(
+                f"/tabs/{encoded}/screenshot?{query}", timeout=8.0
+            )
+            if not screenshot.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise RuntimeError("screenshot capability did not return a PNG")
+        except Exception as exc:
+            if generation == self._camofox_process_generation:
+                self._camofox_capability_verified = False
+                self._camofox_capability_verified_at = 0.0
+                self._camofox_capability_next_probe_at = (
+                    time.monotonic() + CAMOFOX_CAPABILITY_RETRY_SECONDS
+                )
+                self._camofox_last_error = f"Camofox browser capability probe failed: {exc}"
+            return False
+        finally:
+            encoded_user = urllib.parse.quote(probe_user, safe="")
+            try:
+                self._camofox_json_request(
+                    f"/sessions/{encoded_user}",
+                    method="DELETE",
+                    authenticated=True,
+                    timeout=3.0,
+                )
+            except Exception:
+                # Cleanup is best-effort, but it is always attempted even when
+                # tab creation failed after the upstream session was allocated.
+                pass
+        if generation != self._camofox_process_generation:
+            return False
+        self._camofox_capability_verified = True
+        self._camofox_capability_verified_at = time.monotonic()
+        self._camofox_capability_next_probe_at = 0.0
+        self._camofox_last_error = ""
+        return True
+
+    def _reset_camofox_capability_state(self) -> None:
+        # Do not acquire the potentially long-running probe lock during
+        # shutdown. The generation check prevents a racing old probe from
+        # publishing success for the replacement process.
+        self._camofox_process_generation += 1
+        self._camofox_capability_verified = False
+        self._camofox_capability_verified_at = 0.0
+        self._camofox_capability_next_probe_at = 0.0
+
+    def _camofox_json_request(
+        self,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        method: str,
+        authenticated: bool,
+        timeout: float = 1.0,
+    ) -> dict[str, Any] | None:
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self._camofox_access_key()}"
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        try:
+            request = urllib.request.Request(
+                self._effective_camofox_url().rstrip("/") + path,
+                data=data,
+                headers=headers,
+                method=method,
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if not 200 <= response.status < 300:
+                    return None
+                raw = response.read(512 * 1024)
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            return payload if isinstance(payload, dict) else None
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def _camofox_binary_request(self, path: str, *, timeout: float) -> bytes:
+        request = urllib.request.Request(
+            self._effective_camofox_url().rstrip("/") + path,
+            headers={"Authorization": f"Bearer {self._camofox_access_key()}"},
+            method="GET",
         )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"HTTP {response.status}")
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "image/png" not in content_type:
+                raise RuntimeError(f"unexpected screenshot content type: {content_type or 'missing'}")
+            payload = response.read(2 * 1024 * 1024 + 1)
+        if len(payload) > 2 * 1024 * 1024:
+            raise RuntimeError("health screenshot exceeded 2 MiB")
+        return payload
 
     def _probe_firecrawl_health(self) -> bool:
         return self._probe_json_health(

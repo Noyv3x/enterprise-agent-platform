@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import io
+import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform.runtimes import (
+    CAMOFOX_JS_VERSION,
     CAMOFOX_MANAGED_VERSION,
+    CAMOFOX_PLAYWRIGHT_VERSION,
     FIRECRAWL_FOUNDATIONDB_IMAGE,
     FIRECRAWL_IMAGE,
     FIRECRAWL_PLAYWRIGHT_IMAGE,
@@ -22,6 +29,7 @@ from enterprise_agent_platform.runtimes import (
     FIRECRAWL_SERVICE_IMAGES,
     PlatformRuntimeManager,
 )
+import enterprise_agent_platform.runtimes as runtime_module
 
 from test_platform import (
     RecordingCommandRunner,
@@ -152,15 +160,24 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             launcher = RecordingLauncher()
-            manager = self._manager(tmp, launcher=launcher)
-            command, _, _ = manager._camofox_command()
-            self.assertEqual(command[-1], f"@askjo/camofox-browser@{CAMOFOX_MANAGED_VERSION}")
+            manager = self._manager(
+                tmp,
+                launcher=launcher,
+                config=replace(make_config(tmp), camofox_command="camofox-test"),
+            )
+            lock = json.loads(manager._camofox_source_dir().joinpath("package-lock.json").read_text(encoding="utf-8"))
+            packages = lock["packages"]
+            self.assertEqual(packages["node_modules/@askjo/camofox-browser"]["version"], CAMOFOX_MANAGED_VERSION)
+            self.assertEqual(packages["node_modules/camoufox-js"]["version"], CAMOFOX_JS_VERSION)
+            self.assertEqual(packages["node_modules/playwright-core"]["version"], CAMOFOX_PLAYWRIGHT_VERSION)
+            self.assertTrue(packages["node_modules/@askjo/camofox-browser"]["integrity"].startswith("sha512-"))
             manager._start_camofox()
             env = launcher.calls[-1]["env"]
             self.assertEqual(env["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_API_KEY"])
             self.assertGreaterEqual(len(env["CAMOFOX_ACCESS_KEY"]), 32)
             self.assertEqual(env["HOST"], "127.0.0.1")
             self.assertEqual(env["CAMOFOX_CRASH_REPORT_ENABLED"], "false")
+            self.assertEqual(env["NODE_ENV"], "production")
             self.assertNotIn("NODE_OPTIONS", env)
             for name in ("profiles", "cookies", "traces"):
                 key = f"CAMOFOX_{name.upper() if name != 'profiles' else 'PROFILE'}_DIR"
@@ -169,6 +186,506 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
                 stat.S_IMODE((tmp / "runtimes" / "camofox" / "access-key").stat().st_mode),
                 0o600,
             )
+
+    def test_disabled_camofox_skips_managed_install(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = RecordingCommandRunner()
+            manager = PlatformRuntimeManager(
+                replace(make_config(Path(td)), manage_camofox=False),
+                _no_secret,
+                process_launcher=RecordingLauncher(),
+                command_runner=runner,
+            )
+
+            status = manager.install_camofox(force=True)
+
+            self.assertFalse(status.managed)
+            self.assertEqual(status.state, "external")
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((Path(td) / "runtimes" / "camofox").exists())
+
+    def test_camofox_install_validation_rejects_missing_entrypoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = Path(td)
+            versions = (
+                ("@askjo/camofox-browser", CAMOFOX_MANAGED_VERSION),
+                ("camoufox-js", CAMOFOX_JS_VERSION),
+                ("playwright-core", CAMOFOX_PLAYWRIGHT_VERSION),
+            )
+            for package, version in versions:
+                package_dir = app / "node_modules" / package
+                package_dir.mkdir(parents=True)
+                (package_dir / "package.json").write_text(
+                    json.dumps({"version": version}), encoding="utf-8"
+                )
+            (app / "loopback-preload.cjs").write_text("// preload\n", encoding="utf-8")
+            (app / "patch-runtime.cjs").write_text("// patch\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "server.js"):
+                PlatformRuntimeManager._validate_camofox_install(app)
+
+    @unittest.skipIf(runtime_module.fcntl is None, "POSIX flock is required")
+    def test_camofox_install_lock_serializes_other_manager_instances(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            first = self._manager(tmp)
+            second = self._manager(tmp)
+            acquired = threading.Event()
+
+            with first._camofox_install_lock():
+                def take_lock() -> None:
+                    with second._camofox_install_lock():
+                        acquired.set()
+
+                worker = threading.Thread(target=take_lock, daemon=True)
+                worker.start()
+                self.assertFalse(acquired.wait(0.15))
+            self.assertTrue(acquired.wait(2.0))
+            worker.join(timeout=2.0)
+
+    def test_camofox_archive_validation_rejects_symlink_and_duplicate_targets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            symlink_data = io.BytesIO()
+            with zipfile.ZipFile(symlink_data, "w") as archive:
+                item = zipfile.ZipInfo("linked")
+                item.create_system = 3
+                item.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(item, "target")
+            symlink_data.seek(0)
+            with zipfile.ZipFile(symlink_data) as archive, self.assertRaisesRegex(
+                RuntimeError, "symbolic link"
+            ):
+                PlatformRuntimeManager._validated_camofox_archive_members(archive, root)
+
+            duplicate_data = io.BytesIO()
+            with zipfile.ZipFile(duplicate_data, "w") as archive:
+                archive.writestr("same", "one")
+                with self.assertWarns(UserWarning):
+                    archive.writestr("same", "two")
+            duplicate_data.seek(0)
+            with zipfile.ZipFile(duplicate_data) as archive, self.assertRaisesRegex(
+                RuntimeError, "duplicate target"
+            ):
+                PlatformRuntimeManager._validated_camofox_archive_members(archive, root)
+
+    def test_camofox_health_requires_a_real_browser_capability_probe_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            responses = [
+                {"ok": True, "engine": "camoufox", "browserConnected": False, "browserRunning": False},
+                {"tabId": "health-tab", "url": "about:blank"},
+                {"snapshot": "", "url": "about:blank"},
+                {"ok": True},
+                {"ok": True, "engine": "camoufox", "browserConnected": True, "browserRunning": True},
+            ]
+            with (
+                mock.patch.object(manager, "_camofox_json_request", side_effect=responses) as request,
+                mock.patch.object(manager, "_camofox_binary_request", return_value=b"\x89PNG\r\n\x1a\n"),
+            ):
+                self.assertTrue(manager._probe_camofox_health())
+                self.assertTrue(manager._probe_camofox_health())
+
+            self.assertTrue(manager._camofox_capability_verified)
+            self.assertEqual(request.call_count, 5)
+            self.assertEqual(request.call_args_list[1].args[0], "/tabs")
+            expected_scope = hashlib.sha256(
+                manager._effective_camofox_url().encode("utf-8")
+            ).hexdigest()[:24]
+            self.assertEqual(
+                request.call_args_list[1].kwargs["body"]["userId"],
+                f"ubitech-runtime-health-{expected_scope}",
+            )
+            self.assertIn("/snapshot?", request.call_args_list[2].args[0])
+            self.assertIn("/sessions/", request.call_args_list[3].args[0])
+
+    def test_camofox_health_rejects_api_shell_when_browser_probe_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            with mock.patch.object(
+                manager,
+                "_camofox_json_request",
+                side_effect=[
+                    {"ok": True, "engine": "camoufox", "browserConnected": False},
+                    None,
+                    {"ok": True},
+                ],
+            ) as request:
+                self.assertFalse(manager._probe_camofox_health())
+
+            self.assertFalse(manager._camofox_capability_verified)
+            self.assertIn("capability probe failed", manager._camofox_last_error)
+            self.assertEqual(request.call_count, 3)
+            self.assertTrue(request.call_args_list[-1].args[0].startswith("/sessions/"))
+
+    def test_camofox_health_reprobes_a_persistently_disconnected_browser(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            manager._camofox_capability_verified = True
+            manager._camofox_capability_verified_at = time.monotonic() - 60
+            responses = [
+                {"ok": True, "engine": "camoufox", "browserConnected": False, "browserRunning": False},
+                {"tabId": "health-tab", "url": "about:blank"},
+                {"snapshot": "", "url": "about:blank"},
+                {"ok": True},
+            ]
+            with (
+                mock.patch.object(manager, "_camofox_json_request", side_effect=responses) as request,
+                mock.patch.object(manager, "_camofox_binary_request", return_value=b"\x89PNG\r\n\x1a\n"),
+            ):
+                self.assertTrue(manager._probe_camofox_health())
+
+            self.assertEqual(request.call_count, 4)
+            self.assertGreater(manager._camofox_capability_verified_at, 0)
+
+    def test_camofox_capability_probe_is_serialized_for_status_callers(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+
+            def complete_probe(_generation: int) -> bool:
+                time.sleep(0.1)
+                manager._camofox_capability_verified = True
+                manager._camofox_capability_verified_at = time.monotonic()
+                return True
+
+            results: list[bool] = []
+            with mock.patch.object(
+                manager,
+                "_probe_camofox_capability_unlocked",
+                side_effect=complete_probe,
+            ) as probe:
+                threads = [
+                    threading.Thread(
+                        target=lambda: results.append(manager._probe_camofox_capability())
+                    )
+                    for _ in range(3)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2.0)
+
+            self.assertEqual(results, [True, True, True])
+            probe.assert_called_once_with(manager._camofox_process_generation)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to exercise the loopback preload")
+    def test_camofox_preload_forces_real_tcp_listener_to_loopback(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            preload = manager._camofox_source_dir() / "loopback-preload.cjs"
+            script = (
+                "const http=require('node:http');"
+                "const s=http.createServer((_q,r)=>r.end('ok'));"
+                "s.listen(0,()=>{console.log(JSON.stringify(s.address()));s.close();});"
+            )
+            result = subprocess.run(
+                [shutil.which("node") or "node", "--require", str(preload), "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            address = json.loads(result.stdout.strip())
+            self.assertEqual(address["address"], "127.0.0.1")
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to exercise the preload")
+    def test_camofox_preload_blocks_metadata_link_local_and_dns_rebinding_targets(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            preload = manager._camofox_source_dir() / "loopback-preload.cjs"
+            script = r"""
+const guard = require(process.argv[1]);
+(async () => {
+  const direct = guard.isBlockedNetworkAddress('169.254.169.254');
+  const ipv6 = guard.isBlockedNetworkAddress('fe80::1');
+  const mapped = guard.isBlockedNetworkAddress('::ffff:169.254.170.2');
+  const mappedAlibaba = guard.isBlockedNetworkAddress('::ffff:100.100.100.200');
+  const expandedAws = guard.isBlockedNetworkAddress('fd00:0ec2:0:0:0:0:0:254');
+  const hostname = await guard.inspectNetworkTarget('http://metadata.google.internal/latest');
+  const rebound = await guard.inspectNetworkTarget(
+    'https://public.example/resource',
+    async () => [{ address: '169.254.1.20', family: 4 }],
+  );
+  const publicTarget = await guard.inspectNetworkTarget(
+    'https://public.example/resource',
+    async () => [{ address: '93.184.216.34', family: 4 }],
+  );
+  const dnsFailure = await guard.inspectNetworkTarget(
+    'https://unresolved.example/resource',
+    async () => { throw new Error('NXDOMAIN'); },
+  );
+  const dualStack = await guard.resolvePinnedNetworkTarget(
+    'dual.example',
+    async () => [
+      { address: '2001:4860:4860::8888', family: 6 },
+      { address: '93.184.216.34', family: 4 },
+    ],
+  );
+  console.log(JSON.stringify({
+    direct, ipv6, mapped, mappedAlibaba, expandedAws, hostname, rebound,
+    publicTarget, dnsFailure, dualStack,
+  }));
+})();
+"""
+            result = subprocess.run(
+                [shutil.which("node") or "node", "-e", script, str(preload)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["direct"])
+            self.assertTrue(payload["ipv6"])
+            self.assertTrue(payload["mapped"])
+            self.assertTrue(payload["mappedAlibaba"])
+            self.assertTrue(payload["expandedAws"])
+            self.assertTrue(payload["hostname"]["blocked"])
+            self.assertTrue(payload["rebound"]["blocked"])
+            self.assertFalse(payload["publicTarget"]["blocked"])
+            self.assertTrue(payload["dnsFailure"]["blocked"])
+            self.assertEqual(payload["dnsFailure"]["reason"], "dns-resolution-failed")
+            self.assertEqual(payload["dualStack"]["family"], 4)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to exercise the pinning proxy")
+    def test_camofox_pinning_proxy_covers_http_connect_websocket_and_fail_closed_dns(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            preload = manager._camofox_source_dir() / "loopback-preload.cjs"
+            script = r"""
+const http = require('node:http');
+const net = require('node:net');
+const guard = require(process.argv[1]);
+
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+  });
+}
+function close(server) {
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+function proxyHttp(port, target) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1', port, method: 'GET', path: target,
+      headers: { Host: new URL(target).host },
+    }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, body }));
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+function proxyConnect(port, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    let response = '';
+    let sent = false;
+    const timeout = setTimeout(() => reject(new Error('CONNECT test timed out')), 5000);
+    socket.setEncoding('utf8');
+    socket.once('error', reject);
+    socket.on('data', (chunk) => {
+      response += chunk;
+      if (!sent && response.includes('\r\n\r\n')) {
+        sent = true;
+        socket.write('GET /connect HTTP/1.1\r\nHost: safe.test\r\nConnection: close\r\n\r\n');
+      }
+      if (response.includes('http-ok:/connect')) {
+        clearTimeout(timeout);
+        socket.destroy();
+        resolve(response);
+      }
+    });
+    socket.once('connect', () => {
+      socket.write(`CONNECT safe.test:${targetPort} HTTP/1.1\r\nHost: safe.test:${targetPort}\r\n\r\n`);
+    });
+  });
+}
+function proxyWebSocket(port, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    let response = '';
+    const timeout = setTimeout(() => reject(new Error('WebSocket test timed out')), 5000);
+    socket.setEncoding('utf8');
+    socket.once('error', reject);
+    socket.on('data', (chunk) => {
+      response += chunk;
+      if (response.includes('ws-ok')) {
+        clearTimeout(timeout);
+        socket.destroy();
+        resolve(response);
+      }
+    });
+    socket.once('connect', () => socket.write(
+      `GET ws://safe.test:${targetPort}/socket HTTP/1.1\r\n`
+      + `Host: safe.test:${targetPort}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n`
+      + 'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1rZXktMTIzNA==\r\n\r\n',
+    ));
+  });
+}
+
+(async () => {
+  const origin = http.createServer((request, response) => response.end(`http-ok:${request.url}`));
+  origin.on('upgrade', (_request, socket) => {
+    socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nws-ok');
+  });
+  const originPort = await listen(origin);
+  const lookup = async (hostname) => {
+    if (hostname === 'blocked.test') return [{ address: '169.254.10.20', family: 4 }];
+    if (hostname === 'mapped.test') return [{ address: '::ffff:100.100.100.200', family: 6 }];
+    if (hostname === 'missing.test') throw new Error('NXDOMAIN');
+    return [{ address: '127.0.0.1', family: 4 }];
+  };
+  const proxy = guard.createPinningProxy({ lookup });
+  const proxyUrl = new URL(await proxy.listen());
+  const proxyPort = Number(proxyUrl.port);
+  try {
+    const normal = await proxyHttp(proxyPort, `http://safe.test:${originPort}/http`);
+    const blocked = await proxyHttp(proxyPort, `http://blocked.test:${originPort}/secret`);
+    const mapped = await proxyHttp(proxyPort, `http://mapped.test:${originPort}/secret`);
+    const missing = await proxyHttp(proxyPort, `http://missing.test:${originPort}/missing`);
+    const connect = await proxyConnect(proxyPort, originPort);
+    const websocket = await proxyWebSocket(proxyPort, originPort);
+    console.log(JSON.stringify({ normal, blocked, mapped, missing, connect, websocket }));
+  } finally {
+    await proxy.close();
+    await close(origin);
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+            result = subprocess.run(
+                [shutil.which("node") or "node", "-e", script, str(preload)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["normal"], {"status": 200, "body": "http-ok:/http"})
+            self.assertEqual(payload["blocked"]["status"], 403)
+            self.assertEqual(payload["mapped"]["status"], 403)
+            self.assertEqual(payload["missing"]["status"], 502)
+            self.assertIn("http-ok:/connect", payload["connect"])
+            self.assertIn("101 Switching Protocols", payload["websocket"])
+            self.assertIn("ws-ok", payload["websocket"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to exercise proxy policy")
+    def test_camofox_preload_preserves_explicit_upstream_proxy(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            preload = manager._camofox_source_dir() / "loopback-preload.cjs"
+            script = r"""
+const guard = require(process.argv[1]);
+let captured = null;
+const context = {
+  async route() {},
+  async routeWebSocket() {},
+  async close() {},
+};
+const browser = {
+  async newContext(options) { captured = options; return context; },
+  contexts() { return []; },
+};
+(async () => {
+  guard.patchBrowser(browser, { upstreamProxy: false, source: 'test' });
+  await browser.newContext({ proxy: { server: 'http://proxy.example:8080' } });
+  console.log(JSON.stringify(captured));
+})();
+"""
+            result = subprocess.run(
+                [shutil.which("node") or "node", "-e", script, str(preload)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["proxy"], {"server": "http://proxy.example:8080"})
+            self.assertEqual(payload["serviceWorkers"], "block")
+            self.assertIn("upstream proxy preserved", result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to apply the runtime patch")
+    def test_camofox_runtime_patch_is_exact_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            server = root / "node_modules" / "@askjo" / "camofox-browser" / "server.js"
+            server.parent.mkdir(parents=True)
+            server.write_text(
+                """function log(level, msg, fields = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    ...fields,
+  };
+  const line = JSON.stringify(entry);
+  if (level === 'error') {
+    process.stderr.write(line + '\\n');
+  } else {
+    process.stdout.write(line + '\\n');
+  }
+}
+before();
+reporter.resetNativeMemBaseline();
+after();
+""",
+                encoding="utf-8",
+            )
+            patch = Path(__file__).resolve().parents[1] / "camofox-runtime" / "patch-runtime.cjs"
+            for _ in range(2):
+                result = subprocess.run(
+                    [shutil.which("node") or "node", str(patch)],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            patched = server.read_text(encoding="utf-8")
+            self.assertIn("reporter.resetNativeMemBaseline?.();", patched)
+            self.assertNotIn("reporter.resetNativeMemBaseline();", patched)
+            self.assertIn("function sanitizeLogUrl(value)", patched)
+            self.assertIn("...sanitizeLogFields(fields)", patched)
+            self.assertIn("[invalid-url-redacted]", patched)
+            helper_start = patched.index("function sanitizeLogUrl(value)")
+            helper_end = patched.index("function log(level", helper_start)
+            helper_source = patched[helper_start:helper_end]
+            redaction_probe = helper_source + r"""
+const payload = sanitizeLogFields({
+  url: 'https://alice:password@example.test/path?q=secret#fragment',
+  nested: {
+    error: 'page.goto failed at https://bob:token@example.test/deep/page?api_key=hidden#frag\u001b[22m.',
+    urls: ['ws://user:pass@example.test/socket?credential=gone#tail'],
+  },
+});
+console.log(JSON.stringify(payload));
+"""
+            result = subprocess.run(
+                [shutil.which("node") or "node", "-e", redaction_probe],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            redacted = json.loads(result.stdout)
+            serialized = json.dumps(redacted)
+            for secret in ("alice", "password", "secret", "bob", "token", "hidden", "credential", "gone"):
+                self.assertNotIn(secret, serialized)
+            self.assertEqual(redacted["url"], "https://example.test/path")
+            self.assertIn("https://example.test/deep/page", redacted["nested"]["error"])
+            self.assertIn("\u001b[22m.", redacted["nested"]["error"])
+            self.assertEqual(redacted["nested"]["urls"], ["ws://example.test/socket"])
 
     @unittest.skipUnless(shutil.which("node"), "Node is required to exercise the loopback preload")
 

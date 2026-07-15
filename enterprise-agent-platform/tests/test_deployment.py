@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from dataclasses import replace
@@ -423,6 +424,36 @@ class DeploymentTests(unittest.TestCase):
                         ],
                     )
 
+    def test_explicit_foreground_prepares_matching_runtimes_before_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager.ensure_python_version = mock.Mock()
+            manager.ensure_node_version = mock.Mock()
+            manager.ensure_layout = mock.Mock()
+            manager.ensure_submodules = mock.Mock()
+            manager.ensure_source_repos = mock.Mock()
+            manager.ensure_platform_venv = mock.Mock()
+            sequence = mock.Mock()
+            manager.prepare_agent_runtime_artifact = sequence.prepare
+            manager.run_foreground = sequence.start
+
+            result = manager.bootstrap(
+                host="127.0.0.1",
+                port=8765,
+                mode="foreground",
+                prepare_runtime=False,
+            )
+
+            self.assertEqual(result.mode, "foreground")
+            self.assertEqual(
+                sequence.mock_calls,
+                [
+                    mock.call.prepare(host="127.0.0.1", port=8765),
+                    mock.call.start(host="127.0.0.1", port=8765),
+                ],
+            )
+
     def test_service_readiness_requires_platform_and_agent_health(self):
         with tempfile.TemporaryDirectory() as td:
             paths = DeploymentPaths.from_root(Path(td))
@@ -436,6 +467,66 @@ class DeploymentTests(unittest.TestCase):
 
             manager._wait_for_service_http.assert_called_once()
             manager._wait_for_agent_http.assert_called_once()
+
+    def test_service_readiness_requires_managed_camofox_capability(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._wait_for_service_http = mock.Mock(return_value=True)
+            manager._wait_for_agent_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_http = mock.Mock(return_value=False)
+            manager._raise_service_failed = mock.Mock(side_effect=DeploymentError("not ready"))
+
+            with self.assertRaisesRegex(DeploymentError, "not ready"):
+                manager.wait_for_service_ready(host="127.0.0.1", port=8765)
+
+            manager._wait_for_camofox_http.assert_called_once()
+            self.assertIn(
+                "Camoufox browser capability",
+                manager._raise_service_failed.call_args.args[0],
+            )
+
+    def test_camofox_readiness_uses_runtime_capability_probe_and_skips_when_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
+            paths.data_dir.mkdir(parents=True)
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            runtime = mock.Mock()
+            runtime._managed_camofox_enabled.return_value = True
+            runtime._probe_camofox_capability.side_effect = [False, True]
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment.PlatformRuntimeManager",
+                    return_value=runtime,
+                ),
+                mock.patch("enterprise_agent_platform.deployment.time.sleep"),
+            ):
+                ready = manager._wait_for_camofox_http(
+                    host="127.0.0.1",
+                    port=8765,
+                    deadline=time.monotonic() + 30,
+                )
+
+            self.assertTrue(ready)
+            self.assertEqual(runtime._probe_camofox_capability.call_count, 2)
+            runtime.close.assert_called_once_with()
+
+            disabled = mock.Mock()
+            disabled._managed_camofox_enabled.return_value = False
+            with mock.patch(
+                "enterprise_agent_platform.deployment.PlatformRuntimeManager",
+                return_value=disabled,
+            ):
+                self.assertTrue(
+                    manager._wait_for_camofox_http(
+                        host="127.0.0.1",
+                        port=8765,
+                        deadline=time.monotonic(),
+                    )
+                )
+            disabled._probe_camofox_capability.assert_not_called()
+            disabled.close.assert_called_once_with()
 
     def test_existing_service_data_directory_is_discovered_from_unit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -541,10 +632,14 @@ class DeploymentTests(unittest.TestCase):
             runtime = mock.Mock()
             installed = SimpleNamespace(
                 available=True,
+                managed=True,
                 error="",
                 to_dict=lambda: {"available": True, "install_state": "ready"},
             )
             runtime.install_agent_runtime.return_value = installed
+            runtime.install_camofox.return_value = installed
+            runtime._managed_camofox_enabled.return_value = True
+            runtime._effective_camofox_command.return_value = "custom-camofox"
             try:
                 with mock.patch(
                     "enterprise_agent_platform.deployment.PlatformRuntimeManager",
@@ -560,8 +655,100 @@ class DeploymentTests(unittest.TestCase):
 
             self.assertTrue(status["available"])
             runtime.install_agent_runtime.assert_called_once_with(force=False)
+            runtime.install_camofox.assert_called_once_with(force=False)
             runtime.prepare.assert_not_called()
             runtime.close.assert_called_once_with()
+
+    def test_artifact_prepare_skips_camofox_dependencies_when_management_is_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            make_deploy_root(root)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            paths.data_dir.mkdir(parents=True)
+            runtime = mock.Mock()
+            agent = SimpleNamespace(
+                available=True,
+                managed=True,
+                error="",
+                to_dict=lambda: {"available": True},
+            )
+            external_camofox = SimpleNamespace(
+                available=False,
+                managed=False,
+                error="",
+                to_dict=lambda: {"available": False, "managed": False, "state": "external"},
+            )
+            runtime.install_agent_runtime.return_value = agent
+            runtime.install_camofox.return_value = external_camofox
+            runtime._managed_camofox_enabled.return_value = False
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment.PlatformRuntimeManager",
+                    return_value=runtime,
+                ),
+                mock.patch.object(manager, "ensure_camofox_system_dependencies") as dependencies,
+            ):
+                status = manager.prepare_agent_runtime_artifact(host="127.0.0.1", port=8765)
+
+            self.assertFalse(status["camofox"]["managed"])
+            dependencies.assert_not_called()
+            runtime.install_camofox.assert_called_once_with(force=False)
+
+    def test_camofox_system_dependencies_do_not_run_apt_when_preflight_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner()
+            manager = DeploymentManager(DeploymentPaths.from_root(root), runner=runner)
+            with mock.patch(
+                "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                return_value=[],
+            ):
+                manager.ensure_camofox_system_dependencies()
+            self.assertEqual(runner.calls, [])
+
+    def test_camofox_system_dependencies_install_only_after_failed_preflight(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner()
+            manager = DeploymentManager(DeploymentPaths.from_root(root), runner=runner)
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                    side_effect=[["Xvfb executable"], []],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.apt_get_command_base",
+                    return_value=["/usr/bin/apt-get"],
+                ),
+            ):
+                manager.ensure_camofox_system_dependencies()
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(commands[0], ["/usr/bin/apt-get", "update"])
+            self.assertEqual(commands[1][:4], ["/usr/bin/apt-get", "install", "-y", "--no-install-recommends"])
+            self.assertIn("xvfb", commands[1])
+            self.assertIn("fontconfig", commands[1])
+
+    def test_camofox_system_dependency_error_is_actionable_without_apt(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=RecordingDeployRunner(),
+            )
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                    return_value=["Xvfb executable", "fontconfig (fc-match)"],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.apt_get_command_base",
+                    return_value=None,
+                ),
+                self.assertRaisesRegex(DeploymentError, "sudo apt update"),
+            ):
+                manager.ensure_camofox_system_dependencies()
 
     def test_user_service_unit_passes_systemd_verify_when_available(self):
         if not shutil.which("systemd-analyze"):

@@ -57,6 +57,36 @@ MANAGED_NODE_RELEASES = {
         "0b2d9f564b6594222a62c82e1df2efe119dd4a4aff29644f4dd325bf360b6bcc",
     ),
 }
+CAMOFOX_APT_PACKAGES = (
+    "xvfb",
+    "fontconfig",
+    "fonts-liberation",
+    "fonts-noto-color-emoji",
+    "libgtk-3-0",
+    "libdbus-glib-1-2",
+    "libxt6",
+    "libasound2",
+    "libx11-xcb1",
+    "libxcomposite1",
+    "libxcursor1",
+    "libxdamage1",
+    "libxfixes3",
+    "libxi6",
+    "libxrandr2",
+    "libxrender1",
+    "libxss1",
+    "libxtst6",
+    "libegl1-mesa",
+    "libgl1-mesa-dri",
+    "libgbm1",
+    "ca-certificates",
+)
+CAMOFOX_APT_PACKAGES_T64 = tuple(
+    "libgtk-3-0t64" if name == "libgtk-3-0" else
+    "libasound2t64" if name == "libasound2" else
+    name
+    for name in CAMOFOX_APT_PACKAGES
+)
 
 
 class DeploymentError(RuntimeError):
@@ -202,8 +232,12 @@ class DeploymentManager:
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
         if mode == "foreground":
-            # The foreground server prepares the runtime on startup in its own
-            # single process, so no separate prepare step is needed here.
+            # Foreground is a supported deployment path, not a development
+            # shortcut. Publish the locked sidecars and preflight/install the
+            # native Camoufox dependencies before starting the platform. The
+            # preparation is signature/idempotency guarded, so a healthy
+            # installation does not repeat downloads or apt mutations.
+            self.prepare_agent_runtime_artifact(host=host, port=port)
             self.run_foreground(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), foreground_started=True)
         if mode != "auto":
@@ -484,9 +518,8 @@ class DeploymentManager:
         )
         return result.returncode == 0
 
-
     def prepare_agent_runtime_artifact(self, *, host: str, port: int) -> dict[str, object]:
-        """Build and publish the Agent runtime without opening the live database."""
+        """Publish the locked Agent and Camoufox runtimes without opening the live database."""
 
         config = self._platform_config(host=host, port=port)
         snapshot = _read_settings_snapshot(config.db_path)
@@ -507,12 +540,70 @@ class DeploymentManager:
             setting_provider=setting_provider,
         )
         try:
+            managed_camofox = runtimes._managed_camofox_enabled()
+            platform_camofox = managed_camofox and not runtimes._effective_camofox_command()
+            if platform_camofox:
+                self.ensure_camofox_system_dependencies()
             status = runtimes.install_agent_runtime(force=False)
             if not status.available:
                 raise DeploymentError(status.error or "Agent runtime preparation failed")
-            return status.to_dict()
+            camofox = runtimes.install_camofox(force=False)
+            if camofox.managed and not camofox.available:
+                raise DeploymentError(camofox.error or "Camofox runtime preparation failed")
+            if platform_camofox:
+                self.ensure_camofox_system_dependencies(
+                    browser_executable=runtimes._camofox_browser_executable()
+                )
+            result = status.to_dict()
+            result["camofox"] = camofox.to_dict()
+            return result
         finally:
             runtimes.close()
+
+    def ensure_camofox_system_dependencies(
+        self,
+        *,
+        browser_executable: Path | None = None,
+    ) -> None:
+        """Prepare native dependencies only when the managed browser needs them."""
+
+        missing = _camofox_system_dependency_problems(browser_executable)
+        if not missing:
+            return
+        command_base = apt_get_command_base()
+        if command_base is None:
+            raise DeploymentError(_camofox_dependency_hint(missing))
+
+        print(
+            "Managed Camofox system dependencies are missing; attempting Debian/Ubuntu installation.",
+            flush=True,
+        )
+        update = self.runner.run(
+            [*command_base, "update"],
+            cwd=self.paths.root,
+            timeout=1800,
+            check=False,
+        )
+        if update.returncode != 0:
+            raise DeploymentError(_camofox_dependency_hint(missing, apt_failed=True))
+
+        installed = False
+        for packages in (CAMOFOX_APT_PACKAGES, CAMOFOX_APT_PACKAGES_T64):
+            result = self.runner.run(
+                [*command_base, "install", "-y", "--no-install-recommends", *packages],
+                cwd=self.paths.root,
+                timeout=1800,
+                check=False,
+            )
+            if result.returncode == 0:
+                installed = True
+                break
+        if not installed:
+            raise DeploymentError(_camofox_dependency_hint(missing, apt_failed=True))
+
+        remaining = _camofox_system_dependency_problems(browser_executable)
+        if remaining:
+            raise DeploymentError(_camofox_dependency_hint(remaining, apt_failed=True))
 
     def _ensure_private_runtime_directories(self, target: Path) -> None:
         """Validate every managed directory component without following links."""
@@ -610,7 +701,7 @@ class DeploymentManager:
         )
 
     def wait_for_service_ready(self, *, host: str, port: int) -> None:
-        """Require systemd, platform HTTP, and Pi runtime readiness.
+        """Require systemd, platform HTTP, Pi, and managed browser readiness.
 
         ``Type=simple`` units are reported active as soon as the main process is
         forked, so ``systemctl restart`` succeeds even for a crash-looping
@@ -645,6 +736,8 @@ class DeploymentManager:
             self._raise_service_failed("the platform health endpoint did not become ready")
         if not self._wait_for_agent_http(host=host, port=port, deadline=deadline):
             self._raise_service_failed("the Pi Agent runtime health endpoint did not become ready")
+        if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
+            self._raise_service_failed("the managed Camoufox browser capability did not become ready")
 
     def _wait_for_service_http(self, *, host: str, port: int, deadline: float) -> bool:
         env = runtime_env(self.paths, host=host, port=port)
@@ -680,6 +773,42 @@ class DeploymentManager:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.5)
+
+    def _wait_for_camofox_http(self, *, host: str, port: int, deadline: float) -> bool:
+        """Probe a real authenticated tab/snapshot/screenshot capability chain."""
+
+        config = self._platform_config(host=host, port=port)
+        snapshot = _read_settings_snapshot(config.db_path)
+
+        def setting_provider(key: str) -> str | None:
+            found = snapshot.get(key)
+            return str(found[0]) if found else None
+
+        def secret_provider(key: str) -> str:
+            found = snapshot.get(key)
+            if found and found[1]:
+                return str(found[0])
+            return os.getenv(key, "")
+
+        runtimes = PlatformRuntimeManager(
+            config,
+            secret_provider,
+            setting_provider=setting_provider,
+        )
+        try:
+            if not runtimes._managed_camofox_enabled():
+                return True
+            while True:
+                # This uses the same authenticated capability probe as runtime
+                # status: create a scoped tab, take an accessibility snapshot
+                # and PNG screenshot, then always delete the probe session.
+                if runtimes._probe_camofox_capability():
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.5)
+        finally:
+            runtimes.close()
 
     def _raise_service_failed(self, reason: str) -> None:
         tail = self._service_log_tail()
@@ -877,6 +1006,112 @@ def python_venv_package_names() -> list[str]:
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     names = [f"python{version}-venv", "python3-venv"]
     return list(dict.fromkeys(names))
+
+
+def _camofox_system_dependency_problems(browser_executable: Path | None) -> list[str]:
+    problems: list[str] = []
+    xvfb = shutil.which("Xvfb")
+    fontconfig = shutil.which("fc-match")
+    if xvfb is None:
+        problems.append("Xvfb executable")
+    if fontconfig is None:
+        problems.append("fontconfig (fc-match)")
+    elif not _command_succeeds([fontconfig, "--version"]):
+        problems.append("working fontconfig runtime")
+
+    if browser_executable is None:
+        return problems
+    executable = browser_executable.expanduser().resolve()
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        problems.append(f"executable managed browser at {executable}")
+        return problems
+    bundle = executable.parent
+    env = os.environ.copy()
+    existing_library_path = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = str(bundle) + (
+        os.pathsep + existing_library_path if existing_library_path else ""
+    )
+    if not _command_succeeds([str(executable), "--version"], env=env, cwd=bundle):
+        problems.append("managed browser loader/runtime libraries")
+
+    ldd = shutil.which("ldd")
+    if ldd is None:
+        problems.append("ldd dependency checker")
+        return problems
+    targets = (
+        executable,
+        bundle / "libxul.so",
+        bundle / "libmozgtk.so",
+        bundle / "libmozwayland.so",
+    )
+    for target in targets:
+        if not target.is_file():
+            problems.append(f"managed browser component {target.name}")
+            continue
+        try:
+            result = subprocess.run(
+                [ldd, str(target)],
+                cwd=str(bundle),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            problems.append(f"dependency preflight for {target.name}")
+            continue
+        output = result.stdout or ""
+        unresolved = sorted(
+            {
+                line.strip()
+                for line in output.splitlines()
+                if "not found" in line.lower()
+            }
+        )
+        if result.returncode != 0 or unresolved:
+            detail = "; ".join(unresolved[:3]) or f"ldd exited {result.returncode}"
+            problems.append(f"{target.name}: {detail}")
+    return list(dict.fromkeys(problems))
+
+
+def _command_succeeds(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> bool:
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _camofox_dependency_hint(missing: list[str], *, apt_failed: bool = False) -> str:
+    package_text = " ".join(CAMOFOX_APT_PACKAGES)
+    reason = "Automatic apt installation did not complete." if apt_failed else (
+        "Automatic apt installation is unavailable, disabled, or this host is not Debian/Ubuntu."
+    )
+    return "\n".join(
+        [
+            "Managed Camofox cannot start because native browser dependencies are missing:",
+            *(f"  - {item}" for item in missing),
+            "",
+            reason,
+            "On Debian/Ubuntu install the runtime packages, then rerun deploy:",
+            f"  sudo apt update && sudo apt install -y --no-install-recommends {package_text}",
+        ]
+    )
 
 
 def apt_get_command_base() -> list[str] | None:

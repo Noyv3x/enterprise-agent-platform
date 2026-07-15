@@ -102,7 +102,7 @@ export class SessionStore {
   }
 
   async appendMessage(identity: SessionIdentity, message: AgentMessage): Promise<void> {
-    await this.append(identity, "message", message);
+    await this.append(identity, "message", durableSessionMessage(message));
   }
 
   async appendRun(identity: SessionIdentity, payload: JsonValue): Promise<void> {
@@ -124,7 +124,7 @@ export class SessionStore {
         lifecycle_id: identity.lifecycle_id,
         session_id: identity.session_id,
       }),
-      ...messages.map((message) => this.entry(identity, "message", message)),
+      ...messages.map((message) => this.entry(identity, "message", durableSessionMessage(message))),
       this.entry(identity, "compaction", payload),
     ];
     await this.replaceRaw(file, entries);
@@ -328,6 +328,57 @@ export class SessionStore {
       if (queues.get(key) === current) queues.delete(key);
     }
   }
+}
+
+function durableSessionMessage(message: AgentMessage): AgentMessage {
+  if (message.role === "user") {
+    if (typeof message.content === "string" || !message.content.some((block) => block.type === "image")) {
+      return message;
+    }
+    return {
+      ...message,
+      content: message.content.map((block) => block.type === "image"
+        ? {
+            type: "text" as const,
+            text: `[User image (${block.mimeType}) was available to the live Agent and omitted from durable session history.]`,
+          }
+        : block),
+    };
+  }
+  if (message.role !== "toolResult") return message;
+  return {
+    ...message,
+    content: message.content.map((block) => block.type === "image"
+      ? {
+          type: "text" as const,
+          text: `[Tool result image (${block.mimeType}) was available to the live Agent and omitted from durable session history.]`,
+        }
+      : block),
+    details: durableToolDetails(message.details),
+  };
+}
+
+function durableToolDetails(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => durableToolDetails(item));
+  if (!value || typeof value !== "object") return value;
+  const source = value as Record<string, unknown>;
+  const imageLike = (typeof source.type === "string" && source.type.toLowerCase() === "image")
+    || (typeof source.mimeType === "string" && source.mimeType.toLowerCase().startsWith("image/"));
+  const hasData = imageLike && Object.hasOwn(source, "data");
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(source)) {
+    if (hasData && key === "data") continue;
+    sanitized[key] = durableToolDetails(item);
+  }
+  if (hasData) {
+    if (!(typeof sanitized.bytes === "number" && Number.isFinite(sanitized.bytes))) {
+      sanitized.bytes = typeof source.data === "string"
+        ? Buffer.byteLength(source.data, "base64")
+        : 0;
+    }
+    sanitized.omitted = true;
+  }
+  return sanitized;
 }
 
 function parseJsonLines<T>(text: string, label: string): T[] {

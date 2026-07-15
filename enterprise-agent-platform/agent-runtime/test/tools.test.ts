@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { open, rm, symlink } from "node:fs/promises";
 import test from "node:test";
-import { assertReadableTargetAllowed, assertWritableTargetAllowed, classifyToolCall, readRegularFileRange } from "../src/tools.js";
+import { assertReadableTargetAllowed, assertWritableTargetAllowed, browserGatewayResult, classifyToolCall, createTools, readRegularFileRange } from "../src/tools.js";
 import { resolveWorkspacePath } from "../src/utils.js";
 import { temporaryDirectory } from "./helpers.js";
 
@@ -27,6 +27,78 @@ test("tool policy requires approval for host commands and mutations", async () =
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("browser screenshots become native image content without base64 in details", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+  const encoded = png.toString("base64");
+  const result = browserGatewayResult({
+    data: {
+      tabId: "tab-1",
+      snapshot: "- heading Example",
+      screenshot: { data: encoded, mimeType: "image/png" },
+    },
+  });
+
+  assert.equal(result.content[0]?.type, "text");
+  assert.equal(result.content[1]?.type, "image");
+  assert.equal(result.content[1]?.type === "image" ? result.content[1].data : "", encoded);
+  assert.deepEqual((result.details as Record<string, unknown>).screenshot, {
+    mimeType: "image/png",
+    bytes: png.length,
+  });
+  assert.doesNotMatch(JSON.stringify(result.details), new RegExp(encoded));
+});
+
+test("browser policy distinguishes read-only actions from sensitive actions", async () => {
+  for (const action of ["list", "snapshot", "screenshot", "vision", "links", "images", "downloads", "stats", "extract", "wait", "console"]) {
+    assert.deepEqual(await classifyToolCall("browser", { action, arguments: {} }), {});
+  }
+  assert.ok((await classifyToolCall("browser", { action: "click", arguments: { ref: "e1" } })).approvalReason);
+});
+
+test("browser schema omits unsupported interactions and download deletion", () => {
+  const tools = createTools({
+    runId: "run",
+    request: {} as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const browser = tools.find((tool) => tool.name === "browser");
+  assert.ok(browser);
+  assert.equal((browser.parameters as { additionalProperties?: boolean }).additionalProperties, false);
+  const schema = JSON.stringify(browser.parameters);
+  assert.match(schema, /"additionalProperties":false/);
+  for (const unsupported of ["annotate", "coordinates", "double_click", "consume", "evaluate", "expression", "trace", "full_page"]) {
+    assert.doesNotMatch(schema, new RegExp(`\\b${unsupported}\\b`));
+  }
+  assert.match(browser.description, /downloads \(list metadata only/);
+});
+
+test("read-only browser operations do not mark the run as side-effecting", async () => {
+  let sideEffects = 0;
+  const tools = createTools({
+    runId: "run",
+    request: {} as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async () => ({ data: { ok: true } }),
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => { sideEffects += 1; },
+  });
+  const browser = tools.find((tool) => tool.name === "browser");
+  assert.ok(browser);
+  for (const action of ["downloads", "extract", "wait"]) {
+    await browser.execute("call", { action, arguments: {} }, undefined);
+  }
+  assert.equal(sideEffects, 0);
+  await browser.execute("call", { action: "click", arguments: { ref: "e1" } }, undefined);
+  assert.equal(sideEffects, 1);
 });
 
 test("tool policy blocks writes to protected host paths", async () => {
