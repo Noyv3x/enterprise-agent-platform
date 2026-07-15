@@ -164,7 +164,7 @@ class Database:
                     scope_id TEXT NOT NULL,
                     uploader_user_id INTEGER REFERENCES users(id),
                     source TEXT NOT NULL DEFAULT 'upload'
-                        CHECK(source IN ('upload', 'hermes', 'agent_generated')),
+                        CHECK(source IN ('upload', 'agent_generated')),
                     filename TEXT NOT NULL,
                     storage_path TEXT NOT NULL UNIQUE,
                     mime_type TEXT NOT NULL,
@@ -198,17 +198,6 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_token_usage_scope_time ON token_usage_events(scope_type, scope_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_token_usage_model_time ON token_usage_events(provider, model, created_at);
 
-                CREATE TABLE IF NOT EXISTS private_agents (
-                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                    session_id TEXT NOT NULL,
-                    container_name TEXT NOT NULL DEFAULT '',
-                    container_id TEXT NOT NULL DEFAULT '',
-                    container_status TEXT NOT NULL DEFAULT 'unknown',
-                    workspace_path TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS agent_scopes (
                     scope_key TEXT PRIMARY KEY,
                     scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
@@ -217,11 +206,6 @@ class Database:
                     lifecycle_id TEXT NOT NULL DEFAULT '',
                     workspace_path TEXT NOT NULL,
                     execution_backend TEXT NOT NULL DEFAULT 'host' CHECK(execution_backend = 'host'),
-                    legacy_container_name TEXT NOT NULL DEFAULT '',
-                    legacy_container_id TEXT NOT NULL DEFAULT '',
-                    legacy_cleanup_status TEXT NOT NULL DEFAULT 'not_needed'
-                        CHECK(legacy_cleanup_status IN ('not_needed', 'pending', 'removed', 'failed', 'skipped')),
-                    legacy_cleanup_error TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE(scope_type, scope_id)
@@ -229,20 +213,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_agent_scopes_type_id
                     ON agent_scopes(scope_type, scope_id);
 
-                CREATE TABLE IF NOT EXISTS agent_scope_sessions (
-                    scope_key TEXT NOT NULL REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
-                    lifecycle_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_agent_scope_sessions_lookup
-                    ON agent_scope_sessions(scope_key, lifecycle_id, session_id);
-
-                -- Pi-backed runtime state is intentionally stored separately
-                -- from the legacy session columns above.  A code rollback can
-                -- therefore reopen the prior runtime session without the new
-                -- sidecar ever overwriting its identifier or lifecycle.
+                -- Runtime session state is separate from logical scope metadata:
+                -- workspaces remain stable while a conversation lifecycle can be
+                -- rotated independently.
                 CREATE TABLE IF NOT EXISTS agent_runtime_scopes (
                     scope_key TEXT PRIMARY KEY REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
                     session_id TEXT NOT NULL,
@@ -329,10 +302,9 @@ class Database:
                 """
             )
             self._ensure_user_columns()
-            self._migrate_private_agent_scopes()
             self._ensure_agent_scope_columns()
             self._ensure_agent_runtime_scopes()
-            self._ensure_attachment_sources()
+            self._normalize_attachment_sources()
             self._ensure_telegram_update_columns()
             self._ensure_fts()
             self._conn.commit()
@@ -374,13 +346,7 @@ class Database:
         )
 
     def _ensure_agent_runtime_scopes(self) -> None:
-        """Seed fresh sidecar sessions without mutating rollback state.
-
-        ``agent_scopes.session_id``/``lifecycle_id``, ``private_agents`` and
-        legacy channel settings belong to the retired runtime.  Keeping the new
-        identifiers in their own table makes a database-level rollback safe,
-        while visible messages and workspace paths remain shared.
-        """
+        """Ensure every logical Agent scope has authoritative runtime state."""
 
         rows = self._conn.execute("SELECT scope_key, scope_type FROM agent_scopes").fetchall()
         timestamp = now_ts()
@@ -409,97 +375,64 @@ class Database:
                 "ALTER TABLE telegram_updates ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
             )
 
-    def _ensure_attachment_sources(self) -> None:
-        """Add the neutral generated-file source without rewriting new DBs."""
+    def _normalize_attachment_sources(self) -> None:
+        """Collapse non-upload attachment origins into the current schema."""
 
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attachments'"
         ).fetchone()
         schema = str(row[0] or "") if row else ""
-        if "agent_generated" in schema:
+        normalized_schema = "".join(schema.lower().split())
+        if "check(sourcein('upload','agent_generated'))" in normalized_schema:
             return
-        self._conn.executescript(
-            """
-            CREATE TABLE attachments_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
-                scope_id TEXT NOT NULL,
-                uploader_user_id INTEGER REFERENCES users(id),
-                source TEXT NOT NULL DEFAULT 'upload'
-                    CHECK(source IN ('upload', 'hermes', 'agent_generated')),
-                filename TEXT NOT NULL,
-                storage_path TEXT NOT NULL UNIQUE,
-                mime_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                sha256 TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            INSERT INTO attachments_new
-            SELECT id, message_id, scope_type, scope_id, uploader_user_id, source,
-                   filename, storage_path, mime_type, size_bytes, sha256, created_at
-            FROM attachments;
-            DROP TABLE attachments;
-            ALTER TABLE attachments_new RENAME TO attachments;
-            CREATE INDEX idx_attachments_message ON attachments(message_id, id);
-            CREATE INDEX idx_attachments_scope ON attachments(scope_type, scope_id, id);
-            """
-        )
 
-    def _migrate_private_agent_scopes(self) -> None:
-        """Import the legacy private-Agent workspace without mutating it.
-
-        ``private_agents`` is retained so a rollback can still read the old
-        session. ``agent_scopes`` is the authoritative runtime state. Any
-        historical platform container is copied into explicit cleanup-tracking
-        columns so the host-execution manager can remove only known resources
-        and retain failures for a later retry.
-        """
-
-        rows = self._conn.execute("SELECT * FROM private_agents").fetchall()
-        workspace_root = self.path.parent / "workspaces"
-        for row in rows:
-            user_id = int(row["user_id"])
-            container_name = str(row["container_name"] or "")
-            cleanup_status = "pending" if container_name else "not_needed"
-            workspace = workspace_root / f"user-{user_id}"
+        self._conn.execute("SAVEPOINT normalize_attachment_sources")
+        try:
+            self._conn.execute("DROP TABLE IF EXISTS attachments_new")
             self._conn.execute(
                 """
-                INSERT INTO agent_scopes(
-                    scope_key, scope_type, scope_id, session_id, workspace_path,
-                    execution_backend, legacy_container_name, legacy_container_id,
-                    legacy_cleanup_status, created_at, updated_at
-                ) VALUES (?, 'private', ?, ?, ?, 'host', ?, ?, ?, ?, ?)
-                ON CONFLICT(scope_key) DO UPDATE SET
-                    legacy_container_name = CASE
-                        WHEN agent_scopes.legacy_container_name = ''
-                        THEN excluded.legacy_container_name
-                        ELSE agent_scopes.legacy_container_name
-                    END,
-                    legacy_container_id = CASE
-                        WHEN agent_scopes.legacy_container_id = ''
-                        THEN excluded.legacy_container_id
-                        ELSE agent_scopes.legacy_container_id
-                    END,
-                    legacy_cleanup_status = CASE
-                        WHEN agent_scopes.legacy_cleanup_status = 'not_needed'
-                             AND excluded.legacy_container_name != ''
-                        THEN 'pending'
-                        ELSE agent_scopes.legacy_cleanup_status
-                    END
-                """,
-                (
-                    f"private:{user_id}",
-                    str(user_id),
-                    str(row["session_id"] or f"ubitech-private-u{user_id}"),
-                    str(workspace),
-                    container_name,
-                    str(row["container_id"] or ""),
-                    cleanup_status,
-                    int(row["created_at"]),
-                    int(row["updated_at"]),
-                ),
+                CREATE TABLE attachments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    uploader_user_id INTEGER REFERENCES users(id),
+                    source TEXT NOT NULL DEFAULT 'upload'
+                        CHECK(source IN ('upload', 'agent_generated')),
+                    filename TEXT NOT NULL,
+                    storage_path TEXT NOT NULL UNIQUE,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
             )
+            self._conn.execute(
+                """
+                INSERT INTO attachments_new(
+                    id, message_id, scope_type, scope_id, uploader_user_id, source,
+                    filename, storage_path, mime_type, size_bytes, sha256, created_at
+                )
+                SELECT id, message_id, scope_type, scope_id, uploader_user_id,
+                       CASE WHEN source = 'upload' THEN 'upload' ELSE 'agent_generated' END,
+                       filename, storage_path, mime_type, size_bytes, sha256, created_at
+                FROM attachments
+                """
+            )
+            self._conn.execute("DROP TABLE attachments")
+            self._conn.execute("ALTER TABLE attachments_new RENAME TO attachments")
+            self._conn.execute(
+                "CREATE INDEX idx_attachments_message ON attachments(message_id, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX idx_attachments_scope ON attachments(scope_type, scope_id, id)"
+            )
+            self._conn.execute("RELEASE SAVEPOINT normalize_attachment_sources")
+        except Exception:
+            self._conn.execute("ROLLBACK TO SAVEPOINT normalize_attachment_sources")
+            self._conn.execute("RELEASE SAVEPOINT normalize_attachment_sources")
+            raise
 
     def _ensure_fts(self) -> None:
         try:

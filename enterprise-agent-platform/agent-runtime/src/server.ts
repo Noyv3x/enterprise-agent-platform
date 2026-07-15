@@ -91,15 +91,24 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       return;
     }
     if (request.method === "POST" && action === "approval") {
-      const body = await readJson<{ approval_id?: string; decision?: ApprovalDecision; choice?: ApprovalDecision; resolve_all?: boolean }>(
+      const body = await readJson<Record<string, unknown>>(
         request,
         config.maxBodyBytes,
         config.requestBodyTimeoutMs,
       );
-      const decision = body.decision ?? body.choice;
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "Invalid approval request");
+      const allowedKeys = new Set(["approval_id", "decision"]);
+      if (Object.keys(body).some((key) => !allowedKeys.has(key))) {
+        throw httpError(400, "Approval request accepts only approval_id and decision");
+      }
+      if (body.approval_id !== undefined && (typeof body.approval_id !== "string" || !body.approval_id.trim())) {
+        throw httpError(400, "approval_id must be a non-empty string when provided");
+      }
+      const decision = body.decision as ApprovalDecision | undefined;
       if (!decision || !["once", "session", "always", "deny"].includes(decision)) throw httpError(400, "Invalid approval decision");
-      await coordinator.respondApproval(runId, body.approval_id, decision);
-      json(response, 200, { run_id: runId, approval_id: body.approval_id ?? null, decision, resolved: true });
+      const approvalId = body.approval_id as string | undefined;
+      await coordinator.respondApproval(runId, approvalId, decision);
+      json(response, 200, { run_id: runId, approval_id: approvalId ?? null, decision, resolved: true });
       return;
     }
     if (request.method === "POST" && action === "cancel") {

@@ -51,7 +51,7 @@ rm -rf .venv
 ./deploy.sh test
 ```
 
-`update` 只接受干净工作树上的 fast-forward 更新，并在重新部署失败时回滚到更新前的提交和 submodule 版本。从旧 Hermes 运行时首次更新时，部署流程会在停止旧服务后离线迁移会话、记忆和 OAuth 状态，验证新平台与 Pi 运行时健康后再清理旧运行时；切换失败会先恢复 Hermes 数据再触发版本回滚。
+`update` 只接受干净工作树上的 fast-forward 更新，并在重新部署失败时回滚到更新前的提交和 submodule 版本。
 
 ## 运行方式
 

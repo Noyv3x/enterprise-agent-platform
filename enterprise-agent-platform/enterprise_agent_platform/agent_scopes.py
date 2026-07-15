@@ -4,7 +4,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,6 @@ from .db import Database, now_ts
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
 
-_LEGACY_CONTAINER_NAME_RE = re.compile(r"enterprise-agent-u[1-9][0-9]*-[0-9a-f]{10}")
 _MAX_SESSION_ID_LENGTH = 512
 _SCOPE_SELECT = """
     SELECT scopes.*,
@@ -54,18 +52,11 @@ class AgentExecutionScope:
 
 
 class AgentScopeManager:
-    """Own stable Agent workspaces and sessions without provisioning Docker.
+    """Own stable host-executed Agent workspaces and runtime sessions."""
 
-    The only Docker operation retained here is a one-time, tightly constrained
-    cleanup of containers recorded by installations that predate host
-    execution.  Cleanup progress is stored in ``agent_scopes`` and is never
-    performed by a background reaper.
-    """
-
-    def __init__(self, config: PlatformConfig, db: Database, *, cleanup_runner=None):
+    def __init__(self, config: PlatformConfig, db: Database):
         self.config = config
         self.db = db
-        self._cleanup_runner = cleanup_runner or subprocess.run
         self._workspace_root = self.config.workspace_dir.expanduser()
         ensure_private_directory(self._workspace_root)
         self._workspace_root = self._workspace_root.resolve()
@@ -153,7 +144,7 @@ class AgentScopeManager:
     ) -> AgentExecutionScope:
         workspace = self._expected_workspace(scope_type, scope_id)
         ts = now_ts()
-        legacy_lifecycle_id = secrets.token_hex(16)
+        scope_lifecycle_id = secrets.token_hex(16)
         runtime_lifecycle_id = secrets.token_hex(16)
         with self.db.transaction() as conn:
             conn.execute(
@@ -172,7 +163,7 @@ class AgentScopeManager:
                     scope_type,
                     scope_id,
                     default_session_id,
-                    legacy_lifecycle_id,
+                    scope_lifecycle_id,
                     str(workspace),
                     ts,
                     ts,
@@ -278,69 +269,12 @@ class AgentScopeManager:
 
         The runtime owns the scoped process registry. Account deactivation prevents
         new work from being queued; the durable workspace/session record remains
-        intact as required by the trusted internal deployment model.
+        intact for later use.
         """
 
         self.db.execute(
             "UPDATE agent_runtime_scopes SET updated_at = ? WHERE scope_key = ?",
             (now_ts(), self.private_scope_key(int(user_id))),
-        )
-
-    def cleanup_legacy_containers(self) -> dict[str, int]:
-        """Best-effort cleanup for containers recorded before this migration.
-
-        Only the platform's exact historical generated-name format is accepted;
-        arbitrary database values can never become Docker CLI arguments.
-        Failed cleanup remains pending as operator-visible database state and is
-        retried on a later service start.  No new containers are inspected,
-        created or started.
-        """
-
-        rows = self.db.query(
-            """
-            SELECT scope_key, legacy_container_name
-            FROM agent_scopes
-            WHERE legacy_cleanup_status IN ('pending', 'failed')
-              AND legacy_container_name != ''
-            """
-        )
-        result = {"removed": 0, "failed": 0, "skipped": 0}
-        for row in rows:
-            scope_key = str(row["scope_key"])
-            name = str(row["legacy_container_name"])
-            if not _LEGACY_CONTAINER_NAME_RE.fullmatch(name):
-                self._set_cleanup_status(scope_key, "skipped", "legacy container name is not platform-generated")
-                result["skipped"] += 1
-                continue
-            try:
-                completed = self._cleanup_runner(
-                    ["docker", "rm", "-f", name],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=30,
-                )
-                if int(getattr(completed, "returncode", 1)) == 0:
-                    self._set_cleanup_status(scope_key, "removed", "")
-                    result["removed"] += 1
-                else:
-                    error = str(getattr(completed, "stderr", "") or "docker rm failed").strip()[:500]
-                    self._set_cleanup_status(scope_key, "failed", error)
-                    result["failed"] += 1
-            except Exception as exc:
-                self._set_cleanup_status(scope_key, "failed", str(exc)[:500])
-                result["failed"] += 1
-        return result
-
-    def _set_cleanup_status(self, scope_key: str, status: str, error: str) -> None:
-        self.db.execute(
-            """
-            UPDATE agent_scopes
-            SET legacy_cleanup_status = ?, legacy_cleanup_error = ?, updated_at = ?
-            WHERE scope_key = ?
-            """,
-            (status, error, now_ts(), scope_key),
         )
 
     def session_belongs_to_current_lifecycle(self, scope_key: str, session_id: str) -> bool:
@@ -382,8 +316,8 @@ class AgentScopeManager:
             scope_key=str(row["scope_key"]),
             scope_type=str(row["scope_type"]),
             scope_id=str(row["scope_id"]),
-            session_id=str(row.get("runtime_session_id") or row["session_id"]),
-            lifecycle_id=str(row.get("runtime_lifecycle_id") or row["lifecycle_id"]),
+            session_id=str(row["runtime_session_id"]),
+            lifecycle_id=str(row["runtime_lifecycle_id"]),
             workspace_path=str(row["workspace_path"]),
         )
 

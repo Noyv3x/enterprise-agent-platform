@@ -290,7 +290,7 @@ export async function clearPrivateMessages(store: AppStore, userId: Id): Promise
    Phase 4d additions. Each mirrors the legacy form onsubmit handler byte-for-
    byte: identical endpoint/method/body, numbers carried as STRINGS, empty
    secrets dropped (callers send "" which the backend treats as "keep"), and the
-   exact per-page refetch scope + toast (spec-admin-config §12.5). `onSuccess`
+   exact per-page refetch scope + toast. `onSuccess`
    runs only after a successful PUT (inside runBusy) and is used by the form to
    clear secret inputs. */
 
@@ -434,8 +434,8 @@ export async function setSecret(
 
 /* =============================================================== oauth flows
 
-   The verification state machine (spec-oauth-utils-data §2, legacy-app.js:
-   3366-3428). Every action routes through runBusy + updateOAuthState (the
+   The verification state machine (legacy-app.js:3366-3428). Every action
+   routes through runBusy + updateOAuthState (the
    SET_OAUTH_STATE reducer case) and reloads the Agent runtime config. The
    start/check bodies are the literal "{}" / { flow_id }. No
    auto-poll exists — poll/complete are user-triggered. */

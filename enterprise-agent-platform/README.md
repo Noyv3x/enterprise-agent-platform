@@ -106,8 +106,6 @@ export ENTERPRISE_TELEGRAM_POLLING=1
 
 管理员可通过 GitHub webhook 和轮询监听目标分支。自动更新只在工作树干净且远端可 fast-forward 时运行，并复用 `./deploy.sh update` 的 submodule 同步、重新部署和失败回滚路径。
 
-从旧 Hermes 版本首次更新时，更新任务会先准备 Pi 运行时，再停止旧服务并离线迁移可见会话、分 scope 记忆和 OAuth 状态。Hermes 目录会先原子隔离，只有平台与 Pi 健康检查都通过后才永久清理；失败时会在版本回滚前恢复该目录。
-
 ```bash
 export ENTERPRISE_AUTO_UPDATE_ENABLED=1
 export ENTERPRISE_AUTO_UPDATE_INTERVAL_SECONDS=30

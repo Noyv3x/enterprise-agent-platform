@@ -399,7 +399,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         )
         self.assertEqual([item.get("tool") for item in progress[:3]], ["read_file"] * 3)
 
-    def test_approval_callback_can_respond_using_cached_approval_id(self):
+    def test_approval_callback_maps_platform_choice_to_runtime_decision(self):
         self.runtime.events = [
             _event(
                 1,

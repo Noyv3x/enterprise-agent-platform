@@ -77,11 +77,10 @@ class ApprovalRecordingAgent(RecordingAgent):
         super().__init__()
         self.approvals = []
 
-    def respond_approval(self, *, run_id, choice, resolve_all=False, approval_id=None):
+    def respond_approval(self, *, run_id, choice, approval_id=None):
         payload = {
             "run_id": run_id,
             "choice": choice,
-            "resolve_all": resolve_all,
             "approval_id": approval_id,
         }
         self.approvals.append(payload)
@@ -805,7 +804,6 @@ class PlatformServiceTests(unittest.TestCase):
                     [{
                         "run_id": "run_42",
                         "choice": "session",
-                        "resolve_all": False,
                         "approval_id": "approval_42",
                     }],
                 )
@@ -2157,7 +2155,6 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn(identity_prompt, private_prompt)
                 self.assertIn("不要提及底层框架", private_prompt)
                 self.assertIn("当前用户: Alice (@alice)，职位: Product Manager", private_prompt)
-                self.assertNotIn("Hermes", private_prompt)
 
                 service.send_channel_message(alice, 1, "@agent summarize status")
                 service.wait_for_agent_idle("channel", "1")
@@ -3020,40 +3017,6 @@ class PlatformServiceTests(unittest.TestCase):
                     service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
             finally:
                 service.close()
-
-    def test_legacy_runtime_settings_are_copied_once_without_overwriting_agent_config(self):
-        with tempfile.TemporaryDirectory() as td:
-            config = make_config(Path(td))
-            first = EnterpriseService(config, agent_client=RecordingAgent())
-            try:
-                first.set_setting("hermes_provider", "xai-oauth")
-                first.set_setting("hermes_model", "grok-4.3")
-                first.set_setting("hermes_timeout_seconds", "321")
-                first.db.execute(
-                    "DELETE FROM settings WHERE key IN (?, ?, ?)",
-                    (AGENT_SETTING_PROVIDER, AGENT_SETTING_MODEL, AGENT_SETTING_TIMEOUT),
-                )
-            finally:
-                first.close()
-
-            migrated = EnterpriseService(config, agent_client=RecordingAgent())
-            try:
-                self.assertEqual(migrated.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
-                self.assertEqual(migrated.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
-                self.assertEqual(migrated.get_setting(AGENT_SETTING_TIMEOUT), "321")
-                migrated.set_setting("hermes_model", "stale-legacy-model")
-                migrated.set_setting(AGENT_SETTING_MODEL, "grok-4.20-0309-reasoning")
-            finally:
-                migrated.close()
-
-            reopened = EnterpriseService(config, agent_client=RecordingAgent())
-            try:
-                self.assertEqual(
-                    reopened.get_setting(AGENT_SETTING_MODEL),
-                    "grok-4.20-0309-reasoning",
-                )
-            finally:
-                reopened.close()
 
     def test_agent_tool_token_protects_knowledge_endpoints(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4035,21 +3998,13 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_host_backend_never_provisions_agent_container(self):
         with tempfile.TemporaryDirectory() as td:
-            runner_calls: list[list[str]] = []
-
-            def fake_run(cmd, **kwargs):
-                runner_calls.append(cmd)
-                return SimpleNamespace(returncode=0, stdout="")
-
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
-                legacy_cleanup_runner=fake_run,
             )
             try:
                 scope = service.agent_scopes.ensure_private_scope(1)
                 self.assertEqual(scope.to_execution_dict()["backend"], "host")
-                self.assertEqual(runner_calls, [])
             finally:
                 service.close()
 
@@ -4141,6 +4096,55 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_agent_approval_http_body_maps_choice_to_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            agent = ApprovalRecordingAgent()
+            service = EnterpriseService(config, agent_client=agent)
+            token, admin = service.authenticate("admin", "admin")
+            scope_id = str(admin["id"])
+            service._record_agent_progress(
+                "private",
+                scope_id,
+                {
+                    "event": "approval.request",
+                    "run_id": "run-http-approval",
+                    "approval_id": "approval-http-1",
+                    "description": "Run a command on the host",
+                },
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/private-agent/agent-approval",
+                    body=json.dumps({"choice": "session"}),
+                    headers=headers,
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(
+                    agent.approvals,
+                    [{
+                        "run_id": "run-http-approval",
+                        "choice": "session",
+                        "approval_id": "approval-http-1",
+                    }],
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_telegram_webhook_uses_gateway_secret_instead_of_cookie_csrf(self):
         with tempfile.TemporaryDirectory() as td:
             config = replace(

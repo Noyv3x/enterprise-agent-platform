@@ -382,7 +382,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "channel",
                     m.group(1),
                     str(body.get("choice", "")),
-                    bool(body.get("all") or body.get("resolve_all")),
                 )
             )
             return
@@ -418,7 +417,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "private",
                     str(actor["id"]),
                     str(body.get("choice", "")),
-                    bool(body.get("all") or body.get("resolve_all")),
                 )
             )
             return

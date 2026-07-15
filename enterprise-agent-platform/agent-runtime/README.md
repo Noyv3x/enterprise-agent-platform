@@ -13,22 +13,6 @@ npm test
 npm start
 ```
 
-An offline migration can import platform-visible legacy user/assistant history
-after the old runtime and this sidecar have both stopped:
-
-```bash
-npm run build
-node dist/src/legacy-session-importer.js --manifest /absolute/path/legacy-sessions.json --home /absolute/path/agent-runtime-home
-```
-
-The manifest must be a non-symlink regular file with mode `0600`. It uses
-`{"version":1,"sessions":[...]}`; every session contains `scope_key`,
-`lifecycle_id`, `session_id`, a product `model` (`provider` and `id`), and
-plain visible `messages` (`role`, `content`, and integer millisecond
-`timestamp`). The importer derives all journal paths from hashed identities and
-prints only JSON counts. It can refresh a journal created by the same migration
-marker, but skips any session that Pi has used.
-
 Environment variables:
 
 - `AGENT_RUNTIME_HOME`: runtime state root; defaults to `data/runtimes/agent`.
@@ -93,7 +77,7 @@ Model selection is restricted to product OAuth providers and fixed runtime endpo
 
 A non-empty `metadata.idempotency_key` is scoped by `scope_key`. Its status and terminal result are stored atomically under `AGENT_RUNTIME_HOME/idempotency/`, so repeated creation returns the original run and a synthesized replayable terminal journal even after sidecar restart. A run interrupted by restart is returned as `needs_review` and is never executed again automatically.
 
-Approval responses accept `{ "approval_id": "approval_...", "decision": "once" }`, where decision is `once`, `session`, `always`, or `deny`. `approval_id` may be omitted to resolve the newest pending approval for the run. The legacy `choice` and `resolve_all` fields are accepted for adapter compatibility.
+Approval responses accept `{ "approval_id": "approval_...", "decision": "once" }`, where decision is `once`, `session`, `always`, or `deny`. `approval_id` may be omitted to resolve the newest pending approval for the run. Unknown fields are rejected.
 
 `always` grants are atomically persisted under `AGENT_RUNTIME_HOME/approvals/`. `session` grants use a permission-`0600` lifecycle journal beside the session JSONL files; scope cleanup atomically resets that journal. Neither store contains OAuth credentials.
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { appendFile, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import test from "node:test";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { SessionStore } from "../src/session-store.js";
@@ -29,6 +30,48 @@ test("SessionStore ignores an incomplete final JSONL record", async () => {
     await store.initialize(identity, [message]);
     await appendFile(store.path(identity), "{\"incomplete\":");
     assert.deepEqual(await store.load(identity), [message]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore reads an existing journal with unknown header metadata without rewriting it", async () => {
+  const home = await temporaryDirectory("agent-session-header-metadata-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const message: UserMessage = { role: "user", content: "existing history", timestamp: 1 };
+    const entries = [
+      {
+        id: "existing-header",
+        type: "header",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        ...identity,
+        payload: {
+          version: 1,
+          unknown_extension: {
+            owner: "retired-importer",
+            version: 7,
+            digest: "opaque-metadata",
+          },
+        },
+      },
+      {
+        id: "existing-message",
+        type: "message",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        ...identity,
+        payload: message,
+      },
+    ];
+    const journal = store.path(identity);
+    await mkdir(dirname(journal), { recursive: true, mode: 0o700 });
+    const original = `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+    await writeFile(journal, original, { mode: 0o600 });
+
+    const replacementSeed: UserMessage = { role: "user", content: "must-not-reseed", timestamp: 2 };
+    assert.deepEqual(await store.initialize(identity, [replacementSeed]), [message]);
+    assert.equal(await readFile(journal, "utf8"), original);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

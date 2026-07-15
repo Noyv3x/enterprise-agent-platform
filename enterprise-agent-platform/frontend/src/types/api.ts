@@ -97,8 +97,6 @@ export interface PostMessageResponse {
 
 export interface AgentApprovalSubmitRequest {
   choice: AgentApprovalChoice;
-  all?: boolean;
-  resolve_all?: boolean;
 }
 
 export interface AgentApprovalSubmitResponse {

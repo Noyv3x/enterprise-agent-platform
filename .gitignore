@@ -44,6 +44,3 @@ build/
 tmp/
 temp/
 *.log
-
-# Retired upstream checkout may remain adjacent for local rollback/reference.
-/hermes-agent/

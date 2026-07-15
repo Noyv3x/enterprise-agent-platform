@@ -80,9 +80,8 @@ systemctl_user() {
   systemctl --user "$@"
 }
 
-# Holds the pre-update HEAD so a failed redeploy can be rolled back. An
-# independent first-hop migration unit may inherit the original checkpoint.
-PREV_SHA="${ENTERPRISE_UPDATE_PREV_SHA:-}"
+# Holds the pre-update HEAD so a failed redeploy can be rolled back.
+PREV_SHA=""
 UPDATE_LOCK_FD=""
 
 acquire_update_lock() {
@@ -154,29 +153,6 @@ update_repo() {
   git -C "$ROOT" submodule update --init --recursive
 }
 
-verify_internal_owner_checkout() {
-  local target canonical current worktree_status
-  target="${ENTERPRISE_UPDATE_TARGET_SHA:-}"
-  if [[ -z "$target" ]]; then
-    echo "Migration owner is missing its pinned target revision." >&2
-    exit 1
-  fi
-  canonical="$(git -C "$ROOT" rev-parse --verify "${target}^{commit}" 2>/dev/null || true)"
-  current="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
-  if [[ -z "$canonical" || "$current" != "$canonical" ]]; then
-    echo "Migration owner checkout does not match its pinned target revision." >&2
-    exit 1
-  fi
-  if ! worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"; then
-    echo "Migration owner could not verify repository status." >&2
-    exit 1
-  fi
-  if [[ -n "$worktree_status" ]]; then
-    echo "Migration owner found local repository changes and will retry without overwriting them." >&2
-    exit 1
-  fi
-}
-
 # Revert the working tree (and submodules) to the pre-update revision and
 # redeploy the known-good code so the service is restored to a working state.
 rollback_update() {
@@ -229,53 +205,9 @@ case "$cmd" in
     ;;
   update|upgrade)
     shift || true
-    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" \
-      && "${ENTERPRISE_INTERNAL_UPDATE_LOCK_HELD:-}" == "1" ]]; then
-      # The persistent unit opened fd 9 and keeps the same flock across source
-      # pinning and this deploy process. Reassert it before trusting the flag.
-      UPDATE_LOCK_FD=9
-      if ! flock -n "$UPDATE_LOCK_FD"; then
-        echo "Migration owner did not inherit its repository update lock." >&2
-        exit 1
-      fi
-    else
-      acquire_update_lock
-    fi
-    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" ]]; then
-      # The persistent owner restored the exact reviewed target and its submodules.
-      # Do not pull a newer release into the middle of this one-time migration.
-      verify_internal_owner_checkout
-    else
-      update_repo
-    fi
-    current_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
-    if [[ -n "$PREV_SHA" && "$PREV_SHA" != "$current_sha" ]]; then
-      export ENTERPRISE_UPDATE_PREV_SHA="$PREV_SHA"
-    else
-      unset ENTERPRISE_UPDATE_PREV_SHA
-    fi
-    set +e
-    python_bootstrap_checked auto "$@"
-    bootstrap_status=$?
-    set -e
-    # The restartable migration owner is the only process allowed to decide
-    # recovery once handoff has occurred. A killed Python child must make the
-    # unit fail and restart; this shell must never hard-reset underneath it.
-    if [[ "${ENTERPRISE_INTERNAL_FIRST_HOP_OWNER:-}" == "1" && "$bootstrap_status" -ne 0 ]]; then
-      exit "$bootstrap_status"
-    fi
-    # Exit 75 means the Python migration transaction already restored the
-    # exact old checkout, data directory, and service. Do not roll it back a
-    # second time through this shell.
-    if [[ "$bootstrap_status" -eq 75 ]]; then
-      exit 1
-    fi
-    # Exit 76 means Pi is already active and only post-activation Hermes
-    # cleanup remains. Never source-rollback; a persistent owner will retry.
-    if [[ "$bootstrap_status" -eq 76 ]]; then
-      exit 76
-    fi
-    if [[ "$bootstrap_status" -ne 0 ]]; then
+    acquire_update_lock
+    update_repo
+    if ! python_bootstrap_checked auto "$@"; then
       rollback_update "$@" || true
       exit 1
     fi

@@ -17,11 +17,7 @@ AgentContentCallback = Callable[[str | None], None]
 
 @dataclass(frozen=True)
 class AgentResult:
-    """Result returned by an Agent run.
-
-    The shape intentionally matches the platform's previous Agent result so
-    callers can migrate without changing message or token-usage handling.
-    """
+    """Completed Agent run returned to the platform."""
 
     content: str
     session_id: str
@@ -53,7 +49,6 @@ class AgentClient(Protocol):
         *,
         run_id: str,
         choice: str,
-        resolve_all: bool = False,
         approval_id: str | None = None,
     ) -> dict[str, Any]:
         ...
@@ -119,7 +114,7 @@ class AgentRuntimeRunError(AgentRuntimeError):
 
 _APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
 _TERMINAL_EVENTS = frozenset({"run.completed", "run.failed", "run.cancelled", "run.needs_review"})
-_COMPAT_EVENT_NAMES = {
+_PLATFORM_EVENT_NAMES = {
     "approval.requested": "approval.request",
     "approval.resolved": "approval.responded",
 }
@@ -316,7 +311,6 @@ class AgentRuntimeClient:
         *,
         run_id: str,
         choice: str,
-        resolve_all: bool = False,
         approval_id: str | None = None,
     ) -> dict[str, Any]:
         clean_run_id = self._required_id("run_id", run_id)
@@ -338,11 +332,6 @@ class AgentRuntimeClient:
         with self._approval_lock:
             if self._pending_approvals.get(clean_run_id) == clean_approval_id:
                 self._pending_approvals.pop(clean_run_id, None)
-        if resolve_all:
-            # The neutral runtime resolves one explicit approval ID at a time.
-            # Keep the legacy flag visible to callers without weakening that
-            # unambiguous wire contract.
-            result.setdefault("resolve_all", False)
         return result
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
@@ -458,7 +447,7 @@ class AgentRuntimeClient:
                 payload.setdefault("runtime_timestamp", wire["timestamp"])
                 payload.setdefault("timestamp", _callback_timestamp(wire["timestamp"]))
             payload.setdefault("runtime_event_type", event_type)
-            payload.setdefault("event", _COMPAT_EVENT_NAMES.get(event_type, event_type))
+            payload.setdefault("event", _PLATFORM_EVENT_NAMES.get(event_type, event_type))
             if event_type.startswith("tool."):
                 tool_name = str(payload.get("tool") or payload.get("tool_name") or "").strip()
                 if tool_name:
@@ -823,7 +812,7 @@ def _http_error_message(response_body: str, fallback: str) -> str:
 
 
 def _callback_timestamp(value: Any) -> Any:
-    """Return epoch seconds for legacy callbacks while retaining wire time separately."""
+    """Return epoch seconds for platform callbacks while retaining wire time separately."""
 
     if isinstance(value, (int, float)):
         return value

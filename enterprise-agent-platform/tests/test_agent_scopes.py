@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,136 +60,197 @@ class AgentScopeSessionTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_runtime_session_migration_and_rotation_preserve_legacy_rollback_state(self):
+    def test_runtime_session_state_persists_across_database_reopen(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                table_names = {
+                    row["name"]
+                    for row in db.query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }
+                self.assertNotIn("private_agents", table_names)
+                self.assertNotIn("agent_scope_sessions", table_names)
+                scope_columns = {
+                    row["name"] for row in db.query("PRAGMA table_info(agent_scopes)")
+                }
+                self.assertFalse(any(name.startswith("legacy_container") for name in scope_columns))
+
+                db.execute(
+                    """
+                    INSERT INTO users(
+                        id, username, display_name, password_hash, role,
+                        permission_group, created_at
+                    ) VALUES (1, 'one', 'One', 'hash', 'member', 'member', 1)
+                    """
+                )
+                manager = AgentScopeManager(config, db)
+                initial = manager.ensure_private_scope(1)
+                manager.update_session_id(initial.scope_key, "runtime-compacted-session")
+                db.execute(
+                    """
+                    INSERT INTO agent_memories(
+                        scope_key, target, owner_user_id, content, tags_json,
+                        created_at, updated_at
+                    ) VALUES (?, 'memory', 1, 'persistent memory', '[]', 1, 1)
+                    """,
+                    (initial.scope_key,),
+                )
+                db.execute(
+                    """
+                    UPDATE agent_scopes
+                    SET session_id = 'metadata-session', lifecycle_id = 'metadata-lifecycle'
+                    WHERE scope_key = ?
+                    """,
+                    (initial.scope_key,),
+                )
+                expected_lifecycle_id = initial.lifecycle_id
+            finally:
+                db.close()
+
+            reopened = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, reopened)
+                persisted = manager.ensure_private_scope(1)
+                self.assertEqual(persisted.session_id, "runtime-compacted-session")
+                self.assertEqual(persisted.lifecycle_id, expected_lifecycle_id)
+                self.assertTrue(
+                    manager.session_belongs_to_current_lifecycle(
+                        persisted.scope_key,
+                        persisted.session_id,
+                    )
+                )
+                self.assertEqual(
+                    reopened.scalar(
+                        "SELECT content FROM agent_memories WHERE scope_key = ?",
+                        (persisted.scope_key,),
+                    ),
+                    "persistent memory",
+                )
+
+                rotated = manager.rotate_session(persisted.scope_key)
+                self.assertNotEqual(rotated.session_id, persisted.session_id)
+                self.assertNotEqual(rotated.lifecycle_id, persisted.lifecycle_id)
+            finally:
+                reopened.close()
+
+            verified = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, verified)
+                persisted = manager.get_private_scope(1)
+                self.assertIsNotNone(persisted)
+                self.assertEqual(persisted.session_id, rotated.session_id)
+                self.assertEqual(persisted.lifecycle_id, rotated.lifecycle_id)
+                self.assertTrue(
+                    manager.session_belongs_to_current_lifecycle(
+                        persisted.scope_key,
+                        persisted.session_id,
+                    )
+                )
+            finally:
+                verified.close()
+
+    def test_attachment_sources_are_normalized_without_losing_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             db = Database(config.db_path)
             try:
                 db.execute(
                     """
-                    INSERT INTO users(
-                        id, username, display_name, password_hash, role,
-                        permission_group, created_at
-                    ) VALUES (1, 'legacy', 'Legacy User', 'hash', 'member', 'member', 1)
+                    INSERT INTO messages(
+                        id, scope_type, scope_id, author_type, content, created_at
+                    ) VALUES (7, 'private', '1', 'agent', 'generated file', 10)
                     """
-                )
-                db.execute(
-                    """
-                    INSERT INTO private_agents(
-                        user_id, session_id, workspace_path, created_at, updated_at
-                    ) VALUES (1, 'legacy-private-session', ?, 1, 2)
-                    """,
-                    (str(config.workspace_dir / "user-1"),),
-                )
-                db.execute(
-                    """
-                    INSERT INTO agent_scopes(
-                        scope_key, scope_type, scope_id, session_id, lifecycle_id,
-                        workspace_path, execution_backend, created_at, updated_at
-                    ) VALUES (
-                        'private:1', 'private', '1', 'legacy-scope-session',
-                        'legacy-lifecycle', ?, 'host', 1, 2
-                    )
-                    """,
-                    (str(config.workspace_dir / "user-1"),),
-                )
-                db.execute(
-                    """
-                    INSERT INTO agent_scope_sessions(
-                        scope_key, lifecycle_id, session_id, created_at
-                    ) VALUES ('private:1', 'legacy-lifecycle', 'legacy-history-session', 1)
-                    """
-                )
-                legacy_scope = db.query_one(
-                    "SELECT session_id, lifecycle_id FROM agent_scopes WHERE scope_key = 'private:1'"
-                )
-                legacy_history = db.query(
-                    """
-                    SELECT lifecycle_id, session_id, created_at
-                    FROM agent_scope_sessions WHERE scope_key = 'private:1'
-                    ORDER BY created_at, session_id
-                    """
-                )
-                legacy_private = db.query_one(
-                    "SELECT session_id FROM private_agents WHERE user_id = 1"
                 )
             finally:
                 db.close()
 
-            migrated = Database(config.db_path)
+            raw = sqlite3.connect(config.db_path)
+            try:
+                raw.executescript(
+                    """
+                    DROP INDEX idx_attachments_message;
+                    DROP INDEX idx_attachments_scope;
+                    DROP TABLE attachments;
+                    CREATE TABLE attachments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                        scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                        scope_id TEXT NOT NULL,
+                        uploader_user_id INTEGER REFERENCES users(id),
+                        source TEXT NOT NULL DEFAULT 'upload'
+                            CHECK(source IN ('upload', 'runtime_output')),
+                        filename TEXT NOT NULL,
+                        storage_path TEXT NOT NULL UNIQUE,
+                        mime_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    );
+                    CREATE INDEX idx_attachments_message ON attachments(message_id, id);
+                    CREATE INDEX idx_attachments_scope ON attachments(scope_type, scope_id, id);
+                    INSERT INTO attachments(
+                        id, message_id, scope_type, scope_id, uploader_user_id, source,
+                        filename, storage_path, mime_type, size_bytes, sha256, created_at
+                    ) VALUES (
+                        11, 7, 'private', '1', NULL, 'runtime_output',
+                        'report.txt', '/managed/report.txt', 'text/plain', 12,
+                        'abc123', 20
+                    );
+                    """
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+            normalized = Database(config.db_path)
             try:
                 self.assertEqual(
-                    migrated.query_one(
-                        "SELECT session_id, lifecycle_id FROM agent_scopes WHERE scope_key = 'private:1'"
-                    ),
-                    legacy_scope,
-                )
-                self.assertEqual(
-                    migrated.query(
+                    normalized.query_one(
                         """
-                        SELECT lifecycle_id, session_id, created_at
-                        FROM agent_scope_sessions WHERE scope_key = 'private:1'
-                        ORDER BY created_at, session_id
+                        SELECT id, message_id, scope_type, scope_id, uploader_user_id,
+                               source, filename, storage_path, mime_type, size_bytes,
+                               sha256, created_at
+                        FROM attachments WHERE id = 11
                         """
                     ),
-                    legacy_history,
+                    {
+                        "id": 11,
+                        "message_id": 7,
+                        "scope_type": "private",
+                        "scope_id": "1",
+                        "uploader_user_id": None,
+                        "source": "agent_generated",
+                        "filename": "report.txt",
+                        "storage_path": "/managed/report.txt",
+                        "mime_type": "text/plain",
+                        "size_bytes": 12,
+                        "sha256": "abc123",
+                        "created_at": 20,
+                    },
                 )
-                self.assertEqual(
-                    migrated.query_one("SELECT session_id FROM private_agents WHERE user_id = 1"),
-                    legacy_private,
+                schema = normalized.scalar(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attachments'"
                 )
-
-                manager = AgentScopeManager(config, migrated)
-                initial = manager.ensure_private_scope(1)
-                self.assertNotEqual(initial.session_id, legacy_scope["session_id"])
-                self.assertNotEqual(initial.lifecycle_id, legacy_scope["lifecycle_id"])
-                self.assertEqual(
-                    migrated.query_one(
-                        "SELECT session_id, lifecycle_id FROM agent_runtime_scopes WHERE scope_key = 'private:1'"
-                    ),
-                    {"session_id": initial.session_id, "lifecycle_id": initial.lifecycle_id},
+                compact_schema = "".join(str(schema).lower().split())
+                self.assertIn(
+                    "check(sourcein('upload','agent_generated'))",
+                    compact_schema,
                 )
-
-                manager.update_session_id("private:1", "runtime-compacted-session")
-                compacted = manager.get_scope("private:1")
-                self.assertEqual(compacted.session_id, "runtime-compacted-session")
-                self.assertEqual(compacted.lifecycle_id, initial.lifecycle_id)
-
-                rotated = manager.rotate_session("private:1")
-                self.assertNotEqual(rotated.session_id, compacted.session_id)
-                self.assertNotEqual(rotated.lifecycle_id, compacted.lifecycle_id)
-                self.assertEqual(
-                    migrated.query(
+                self.assertNotIn("runtime_output", compact_schema)
+                self.assertEqual(normalized.query("PRAGMA foreign_key_check"), [])
+                with self.assertRaises(sqlite3.IntegrityError):
+                    normalized.execute(
                         """
-                        SELECT lifecycle_id, session_id
-                        FROM agent_runtime_scope_sessions WHERE scope_key = 'private:1'
+                        INSERT INTO attachments(
+                            message_id, scope_type, scope_id, source, filename,
+                            storage_path, mime_type, size_bytes, sha256, created_at
+                        ) VALUES (7, 'private', '1', 'runtime_output', 'bad.txt',
+                                  '/managed/bad.txt', 'text/plain', 1, 'bad', 21)
                         """
-                    ),
-                    [{"lifecycle_id": rotated.lifecycle_id, "session_id": rotated.session_id}],
-                )
-
-                self.assertEqual(
-                    migrated.query_one(
-                        "SELECT session_id, lifecycle_id FROM agent_scopes WHERE scope_key = 'private:1'"
-                    ),
-                    legacy_scope,
-                )
-                self.assertEqual(
-                    migrated.query(
-                        """
-                        SELECT lifecycle_id, session_id, created_at
-                        FROM agent_scope_sessions WHERE scope_key = 'private:1'
-                        ORDER BY created_at, session_id
-                        """
-                    ),
-                    legacy_history,
-                )
-                self.assertEqual(
-                    migrated.query_one("SELECT session_id FROM private_agents WHERE user_id = 1"),
-                    legacy_private,
-                )
+                    )
             finally:
-                migrated.close()
+                normalized.close()
 
 
 if __name__ == "__main__":

@@ -230,7 +230,6 @@ PERMISSION_SYSTEM_SETTINGS = "system_settings"
 
 OAUTH_CREDENTIAL_EXPORT_KIND = "ubitech-agent.oauth-credentials"
 OAUTH_CREDENTIAL_EXPORT_VERSION = 1
-LEGACY_GENERATED_ATTACHMENT_SOURCE = "hermes"
 PLATFORM_SETTING_PUBLIC_BASE_URL = "platform_public_base_url"
 PLATFORM_SETTING_TRUSTED_PROXY = "platform_trusted_proxy"
 PLATFORM_SETTING_HOST = "platform_host"
@@ -301,7 +300,6 @@ class EnterpriseService:
         runtime_process_launcher=None,
         runtime_command_runner=None,
         oauth_http_client=None,
-        legacy_cleanup_runner=None,
         auto_update_runner=None,
         auto_update_launcher=None,
         auto_update_repo_root: Path | None = None,
@@ -338,13 +336,7 @@ class EnterpriseService:
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
-        # This runner is used only for one-time cleanup of resources recorded by
-        # pre-host-execution installations. No Agent container is provisioned.
-        self.agent_scopes = AgentScopeManager(
-            config,
-            self.db,
-            cleanup_runner=legacy_cleanup_runner,
-        )
+        self.agent_scopes = AgentScopeManager(config, self.db)
         if not self.get_setting("agent_tool_token"):
             self.set_setting(
                 "agent_tool_token",
@@ -405,26 +397,17 @@ class EnterpriseService:
         self._resources_closed = False
         self._close_lock = threading.Lock()
         self.ensure_bootstrap()
-        # Use the runtime manager's canonical parser so malformed legacy
-        # values and persisted settings produce the exact same ceiling in both
-        # the Python scheduler and the Node sidecar.
+        # Use the runtime manager's canonical parser so persisted settings
+        # produce the same ceiling in the Python scheduler and Node runtime.
         self._agent_run_gate = _ResizableConcurrencyGate(
             self.runtimes._effective_agent_max_concurrency()
         )
-        # Bootstrap may copy one-release legacy settings into the neutral Agent
-        # runtime keys. Rebuild the owned client once so its URL and timeouts
-        # agree with the runtime manager from the first actual generation.
+        # Bootstrap resolves the Agent runtime defaults before the owned client
+        # is rebuilt, so its URL and timeouts agree from the first generation.
         if self._uses_default_agent_client:
             self.agent_client = self._new_agent_runtime_client()
         self._cleanup_incomplete_attachment_messages()
         self._cleanup_orphan_attachment_files()
-        # One-time compatibility cleanup. Failures stay tracked on the scope row
-        # and are retried at a later start; they never prevent the host backend
-        # from serving requests.
-        try:
-            self.agent_scopes.cleanup_legacy_containers()
-        except Exception as exc:
-            print(f"Failed to clean up legacy Agent containers: {exc}", file=sys.stderr)
         self.runtimes.prepare()
         if autostart_runtime and agent_client is None:
             prepare_agent_runtime = getattr(self.agent_client, "prepare_runtime", None)
@@ -976,11 +959,6 @@ class EnterpriseService:
         if not self.get_setting("agent_tool_token"):
             token = self.config.agent_tool_token or secrets.token_urlsafe(32)
             self.set_setting("agent_tool_token", token, secret=True)
-        legacy_settings = {
-            AGENT_SETTING_PROVIDER: "hermes_provider",
-            AGENT_SETTING_MODEL: "hermes_model",
-            AGENT_SETTING_TIMEOUT: "hermes_timeout_seconds",
-        }
         defaults = {
             AGENT_SETTING_PROVIDER: self.config.agent_runtime_provider,
             AGENT_SETTING_MODEL: self.config.agent_runtime_model,
@@ -991,9 +969,7 @@ class EnterpriseService:
         for key, default in defaults.items():
             if self.get_setting(key) is not None:
                 continue
-            legacy_key = legacy_settings.get(key)
-            legacy_value = self.get_setting(legacy_key) if legacy_key else None
-            self.set_setting(key, legacy_value or default)
+            self.set_setting(key, default)
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
         configured = os.getenv("ENTERPRISE_ADMIN_PASSWORD")
@@ -4813,7 +4789,6 @@ class EnterpriseService:
         scope_type: str,
         scope_id: str,
         choice: str,
-        resolve_all: bool = False,
     ) -> dict[str, Any]:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         if scope_type == "channel":
@@ -4838,7 +4813,6 @@ class EnterpriseService:
             approval_result = respond(
                 run_id=run_id,
                 choice=normalized_choice,
-                resolve_all=bool(resolve_all),
                 approval_id=approval_id or None,
             )
         except ValueError as exc:
@@ -5870,7 +5844,7 @@ class EnterpriseService:
             return
         query_one = conn.execute if conn is not None else self.db._conn.execute
         quota_user_id = uploader_user_id
-        if quota_user_id is None and source in {LEGACY_GENERATED_ATTACHMENT_SOURCE, "agent_generated"} and scope_type == "private":
+        if quota_user_id is None and source == "agent_generated" and scope_type == "private":
             try:
                 quota_user_id = int(scope_id)
             except (TypeError, ValueError):
@@ -5879,8 +5853,8 @@ class EnterpriseService:
             existing = query_one(
                 "SELECT COALESCE(SUM(size_bytes), 0) FROM attachments "
                 "WHERE uploader_user_id = ? OR "
-                "(source IN (?, 'agent_generated') AND scope_type = 'private' AND scope_id = ?)",
-                (int(quota_user_id), LEGACY_GENERATED_ATTACHMENT_SOURCE, str(quota_user_id)),
+                "(source = 'agent_generated' AND scope_type = 'private' AND scope_id = ?)",
+                (int(quota_user_id), str(quota_user_id)),
             ).fetchone()[0]
             if int(existing or 0) + incoming > ATTACHMENT_QUOTA_BYTES:
                 raise ServiceError(413, "attachment storage quota exceeded")

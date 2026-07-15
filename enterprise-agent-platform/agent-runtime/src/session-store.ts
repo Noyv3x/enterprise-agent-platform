@@ -1,4 +1,4 @@
-import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { JsonValue, SessionEntry } from "./types.js";
@@ -10,8 +10,6 @@ export interface SessionIdentity {
   session_id: string;
 }
 
-export type LegacySessionImportResult = "created" | "replaced" | "skipped";
-
 interface SessionApprovalEntry {
   id: string;
   type: "grant" | "clear";
@@ -21,8 +19,6 @@ interface SessionApprovalEntry {
 }
 
 const MAX_SESSION_JOURNAL_BYTES = 64 * 1024 * 1024;
-const LEGACY_MIGRATION_OWNER = "ubitech-agent-runtime/legacy-session-import";
-const LEGACY_MIGRATION_VERSION = 1;
 
 export class SessionStore {
   private readonly sessionsRoot: string;
@@ -50,29 +46,7 @@ export class SessionStore {
     return await this.withQueue(this.initializeQueues, file, async () => {
       const entries = await this.readEntries(identity);
       if (entries.some((entry) => entry.type === "header")) {
-        const messages = entries.filter((entry) => entry.type === "message").map((entry) => entry.payload as AgentMessage);
-        if (this.isOwnedUnusedLegacyImport(entries, identity)) {
-          // Consuming the imported seed is itself durable evidence of Pi use.
-          // Remove the replaceable marker before model/tool execution begins,
-          // so even an abrupt process exit cannot make this journal eligible
-          // for a later migration refresh.
-          await this.replaceRaw(file, [
-            this.entry(identity, "header", {
-              version: 1,
-              scope_key: identity.scope_key,
-              lifecycle_id: identity.lifecycle_id,
-              session_id: identity.session_id,
-              legacy_migration_consumed: {
-                owner: LEGACY_MIGRATION_OWNER,
-                version: LEGACY_MIGRATION_VERSION,
-                consumed_at: nowIso(),
-              },
-            }),
-            ...entries.slice(1),
-          ]);
-          await this.writeManifest(identity);
-        }
-        return messages;
+        return entries.filter((entry) => entry.type === "message").map((entry) => entry.payload as AgentMessage);
       }
       await mkdir(dirname(file), { recursive: true, mode: 0o700 });
       await this.writeScopeManifest(identity.scope_key);
@@ -133,48 +107,6 @@ export class SessionStore {
 
   async appendRun(identity: SessionIdentity, payload: JsonValue): Promise<void> {
     await this.append(identity, "run", payload);
-  }
-
-  /**
-   * Atomically imports visible legacy history into a journal that has never
-   * been used by Pi. A prior import can be refreshed, but only while its
-   * marker still exactly describes every entry in the journal. Any message,
-   * run, compaction, or header written by the normal runtime makes the file
-   * ineligible and therefore preserves it unchanged.
-   */
-  async importLegacyHistory(
-    identity: SessionIdentity,
-    messages: AgentMessage[],
-  ): Promise<LegacySessionImportResult> {
-    return await this.withSessionLock(identity, async () => {
-      const file = this.path(identity);
-      await this.ensureLegacyImportDirectory(identity);
-      const existing = await this.readExistingImportCandidate(identity);
-      if (existing.exists && !this.isOwnedUnusedLegacyImport(existing.entries, identity)) return "skipped";
-
-      const messageDigest = stableHash(JSON.stringify(messages));
-      const entries: SessionEntry[] = [
-        this.entry(identity, "header", {
-          version: 1,
-          scope_key: identity.scope_key,
-          lifecycle_id: identity.lifecycle_id,
-          session_id: identity.session_id,
-          legacy_migration: {
-            owner: LEGACY_MIGRATION_OWNER,
-            version: LEGACY_MIGRATION_VERSION,
-            message_count: messages.length,
-            message_digest: messageDigest,
-          },
-        }),
-        ...messages.map((message) => this.entry(identity, "message", message)),
-      ];
-
-      await this.writeScopeManifest(identity.scope_key);
-      if (existing.exists) await this.replaceRaw(file, entries);
-      else await this.createRaw(file, entries);
-      await this.writeManifest(identity);
-      return existing.exists ? "replaced" : "created";
-    });
   }
 
   async rewriteCompacted(
@@ -345,36 +277,6 @@ export class SessionStore {
     }
   }
 
-  private async createRaw(file: string, entries: object[]): Promise<void> {
-    const previous = this.writeQueues.get(file) ?? Promise.resolve();
-    const next = previous.then(async () => {
-      const temporary = `${file}.${id("legacy_import")}.tmp`;
-      let handle: Awaited<ReturnType<typeof open>> | undefined;
-      try {
-        handle = await open(temporary, "wx", 0o600);
-        await handle.writeFile(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        // link(2) fails with EEXIST instead of replacing a journal that may
-        // have appeared after the eligibility check.
-        await link(temporary, file);
-        await chmod(file, 0o600);
-        await this.syncDirectory(dirname(file));
-      } finally {
-        await handle?.close().catch(() => undefined);
-        await rm(temporary, { force: true }).catch(() => undefined);
-      }
-    });
-    const tracked = next.catch(() => undefined);
-    this.writeQueues.set(file, tracked);
-    try {
-      await next;
-    } finally {
-      if (this.writeQueues.get(file) === tracked) this.writeQueues.delete(file);
-    }
-  }
-
   private async replaceText(file: string, text: string): Promise<void> {
     const temporary = `${file}.${id("manifest")}.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -397,49 +299,6 @@ export class SessionStore {
     const directory = join(this.sessionsRoot, stableHash(scopeKey));
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await this.replaceText(join(directory, "scope.json"), `${JSON.stringify({ scope_key: scopeKey }, null, 2)}\n`);
-  }
-
-  private async readExistingImportCandidate(identity: SessionIdentity): Promise<{ exists: boolean; entries: SessionEntry[] }> {
-    try {
-      const info = await lstat(this.path(identity));
-      if (!info.isFile() || info.isSymbolicLink()) return { exists: true, entries: [] };
-      if (info.size > MAX_SESSION_JOURNAL_BYTES) return { exists: true, entries: [] };
-      const text = await readFile(this.path(identity), "utf8");
-      // The ordinary reader intentionally tolerates a torn final write for
-      // runtime recovery. Migration must be stricter: a torn tail may be the
-      // first evidence that Pi already used this imported journal.
-      const entries = parseStrictSessionJournal(text);
-      return { exists: true, entries: entries ?? [] };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false, entries: [] };
-      throw error;
-    }
-  }
-
-  private isOwnedUnusedLegacyImport(entries: SessionEntry[], identity: SessionIdentity): boolean {
-    if (entries.length === 0) return false;
-    const [header, ...tail] = entries;
-    if (!header || header.type !== "header" || !sameIdentity(header, identity)) return false;
-    const payload = asRecord(header.payload);
-    const marker = asRecord(payload?.legacy_migration);
-    if (
-      marker?.owner !== LEGACY_MIGRATION_OWNER
-      || marker.version !== LEGACY_MIGRATION_VERSION
-      || !Number.isSafeInteger(marker.message_count)
-      || typeof marker.message_digest !== "string"
-    ) return false;
-    if (tail.length !== marker.message_count || tail.some((entry) => entry.type !== "message" || !sameIdentity(entry, identity))) {
-      return false;
-    }
-    const messages = tail.map((entry) => entry.payload as AgentMessage);
-    return stableHash(JSON.stringify(messages)) === marker.message_digest;
-  }
-
-  private async ensureLegacyImportDirectory(identity: SessionIdentity): Promise<void> {
-    await ensurePrivateDirectory(this.sessionsRoot);
-    const scopeDirectory = join(this.sessionsRoot, stableHash(identity.scope_key));
-    await ensurePrivateDirectory(scopeDirectory);
-    await ensurePrivateDirectory(join(scopeDirectory, stableHash(identity.lifecycle_id)));
   }
 
   private async syncDirectory(directoryPath: string): Promise<void> {
@@ -471,29 +330,6 @@ export class SessionStore {
   }
 }
 
-async function ensurePrivateDirectory(path: string): Promise<void> {
-  try {
-    await mkdir(path, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-  const info = await lstat(path);
-  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Legacy import directory must be a real directory");
-  await chmod(path, 0o700);
-}
-
-function sameIdentity(entry: SessionEntry, identity: SessionIdentity): boolean {
-  return entry.scope_key === identity.scope_key
-    && entry.lifecycle_id === identity.lifecycle_id
-    && entry.session_id === identity.session_id;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
 function parseJsonLines<T>(text: string, label: string): T[] {
   const entries: T[] = [];
   const lines = text.split("\n");
@@ -505,23 +341,6 @@ function parseJsonLines<T>(text: string, label: string): T[] {
     } catch {
       const hasLaterContent = lines.slice(index + 1).some((candidate) => candidate.trim() !== "");
       if (hasLaterContent) throw new Error(`Corrupt ${label} entry at line ${index + 1}`);
-    }
-  }
-  return entries;
-}
-
-function parseStrictSessionJournal(text: string): SessionEntry[] | undefined {
-  if (!text.endsWith("\n")) return undefined;
-  const entries: SessionEntry[] = [];
-  for (const rawLine of text.split("\n")) {
-    if (rawLine === "") continue;
-    try {
-      const candidate = JSON.parse(rawLine) as unknown;
-      const record = asRecord(candidate);
-      if (!record || typeof record.id !== "string" || typeof record.type !== "string") return undefined;
-      entries.push(candidate as SessionEntry);
-    } catch {
-      return undefined;
     }
   }
   return entries;

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import test from "node:test";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { RunCoordinator } from "../src/run-coordinator.js";
 import { createRuntimeServer } from "../src/server.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
@@ -86,6 +86,73 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     assert.match(events, /event: message\.delta/);
     assert.match(events, /event: run\.completed/);
     assert.match(events, /"output":"hello from pi"/);
+  } finally {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runtime approval endpoint accepts decision and rejects retired compatibility fields", async () => {
+  const home = await temporaryDirectory("agent-server-approval-");
+  const workspace = await temporaryDirectory("agent-server-approval-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("approved"),
+  ]);
+  const config = testConfig(home, { bearerToken: "secret", approvalTimeoutMs: 5_000 });
+  const coordinator = new RunCoordinator({ config, streamFn: faux.provider.streamSimple });
+  const runtime = createRuntimeServer(config, coordinator);
+  try {
+    const address = await runtime.listen();
+    const base = `http://${address.host}:${address.port}`;
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "run it",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const deadline = Date.now() + 2_000;
+    let approval = coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested");
+    while (!approval && Date.now() < deadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      approval = coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested");
+    }
+    assert.ok(approval);
+    const approvalId = String(approval.data.approval_id);
+    const headers = { authorization: "Bearer secret", "content-type": "application/json" };
+
+    const choiceAlias = await fetch(`${base}/v1/runs/${run.id}/approval`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ approval_id: approvalId, choice: "once" }),
+    });
+    assert.equal(choiceAlias.status, 400);
+
+    const resolveAll = await fetch(`${base}/v1/runs/${run.id}/approval`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ approval_id: approvalId, decision: "once", resolve_all: true }),
+    });
+    assert.equal(resolveAll.status, 400);
+
+    const accepted = await fetch(`${base}/v1/runs/${run.id}/approval`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ approval_id: approvalId, decision: "once" }),
+    });
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), {
+      run_id: run.id,
+      approval_id: approvalId,
+      decision: "once",
+      resolved: true,
+    });
+    assert.equal((await coordinator.wait(run.id)).status, "completed");
   } finally {
     await runtime.close();
     await rm(home, { recursive: true, force: true });

@@ -2,8 +2,8 @@
    Data layer — every legacy load* reborn as a typed thunk over the store
    handle. Each calls api() then dispatches SET_* actions; loaders themselves
    never trigger a render (the store notifies subscribers). Endpoint → state
-   mapping is verbatim from spec-oauth-utils-data §5, including the ordering and
-   guards (loadInitial fan-out, channel-switch race guard, mergePendingMessages,
+   mapping preserves the established ordering and guards (loadInitial fan-out,
+   channel-switch race guard, mergePendingMessages,
    mention-error swallow, token-usage day re-sync, audit ordering, Promise.all
    batches).
    ===================================================================== */
