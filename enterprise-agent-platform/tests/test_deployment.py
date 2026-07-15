@@ -18,8 +18,10 @@ from enterprise_agent_platform.deployment import (
     DeploymentError,
     DeploymentManager,
     DeploymentPaths,
+    _camofox_system_dependency_problems,
     _existing_service_data_dir,
     _resolve_existing_service_deployment,
+    apt_get_command_base,
     python_venv_package_names,
     runtime_env,
     user_service_unit,
@@ -298,13 +300,23 @@ class DeploymentTests(unittest.TestCase):
 
             with mock.patch("enterprise_agent_platform.deployment.shutil.which", side_effect=fake_which):
                 with mock.patch("enterprise_agent_platform.deployment.os.geteuid", return_value=1000):
-                    result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
+                    with mock.patch(
+                        "enterprise_agent_platform.deployment.sys.stdin",
+                        SimpleNamespace(isatty=lambda: True),
+                    ):
+                        result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
 
             commands = [call["cmd"] for call in runner.calls]
             self.assertEqual(result.mode, "prepare")
             self.assertIn(["/usr/bin/sudo", "/usr/bin/apt-get", "update"], commands)
             self.assertIn(
-                ["/usr/bin/sudo", "/usr/bin/apt-get", "install", "-y", python_venv_package_names()[0]],
+                [
+                    "/usr/bin/sudo",
+                    "/usr/bin/apt-get",
+                    "install",
+                    "-y",
+                    python_venv_package_names()[0],
+                ],
                 commands,
             )
             self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
@@ -708,6 +720,31 @@ class DeploymentTests(unittest.TestCase):
                 manager.ensure_camofox_system_dependencies()
             self.assertEqual(runner.calls, [])
 
+    def test_camofox_system_dependency_preflight_executes_xvfb(self):
+        def fake_which(name):
+            return {
+                "Xvfb": "/usr/bin/Xvfb",
+                "fc-match": "/usr/bin/fc-match",
+            }.get(name)
+
+        def fake_command_succeeds(cmd, **_kwargs):
+            return cmd != ["/usr/bin/Xvfb", "-help"]
+
+        with (
+            mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=fake_which,
+            ),
+            mock.patch(
+                "enterprise_agent_platform.deployment._command_succeeds",
+                side_effect=fake_command_succeeds,
+            ) as command,
+        ):
+            problems = _camofox_system_dependency_problems(None)
+
+        self.assertEqual(problems, ["working Xvfb runtime"])
+        self.assertIn(mock.call(["/usr/bin/Xvfb", "-help"]), command.call_args_list)
+
     def test_camofox_system_dependencies_install_only_after_failed_preflight(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -731,12 +768,174 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("xvfb", commands[1])
             self.assertIn("fontconfig", commands[1])
 
+    def test_camofox_system_dependencies_use_noninteractive_sudo_without_a_tty(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = RecordingDeployRunner()
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=runner,
+            )
+
+            def fake_which(name):
+                if name in {"apt-get", "sudo"}:
+                    return f"/usr/bin/{name}"
+                return None
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                    side_effect=[["Xvfb executable"], []],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.shutil.which",
+                    side_effect=fake_which,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.os.geteuid",
+                    return_value=1000,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.sys.stdin",
+                    SimpleNamespace(isatty=lambda: False),
+                ),
+            ):
+                manager.ensure_camofox_system_dependencies()
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(
+                commands[0],
+                ["/usr/bin/sudo", "-n", "/usr/bin/apt-get", "update"],
+            )
+            self.assertEqual(
+                commands[1][:6],
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "/usr/bin/apt-get",
+                    "install",
+                    "-y",
+                    "--no-install-recommends",
+                ],
+            )
+
+    def test_apt_uses_interactive_sudo_when_a_tty_is_available(self):
+        def fake_which(name):
+            if name in {"apt-get", "sudo"}:
+                return f"/usr/bin/{name}"
+            return None
+
+        with (
+            mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_APT": "1"}),
+            mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=fake_which,
+            ),
+            mock.patch(
+                "enterprise_agent_platform.deployment.os.geteuid",
+                return_value=1000,
+            ),
+            mock.patch(
+                "enterprise_agent_platform.deployment.sys.stdin",
+                SimpleNamespace(isatty=lambda: True),
+            ),
+        ):
+            command = apt_get_command_base()
+
+        self.assertEqual(command, ["/usr/bin/sudo", "/usr/bin/apt-get"])
+
+    def test_apt_uses_noninteractive_sudo_when_no_tty_is_available(self):
+        def fake_which(name):
+            if name in {"apt-get", "sudo"}:
+                return f"/usr/bin/{name}"
+            return None
+
+        with (
+            mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_APT": "1"}),
+            mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=fake_which,
+            ),
+            mock.patch(
+                "enterprise_agent_platform.deployment.os.geteuid",
+                return_value=1000,
+            ),
+            mock.patch(
+                "enterprise_agent_platform.deployment.sys.stdin",
+                SimpleNamespace(isatty=lambda: False),
+            ),
+        ):
+            command = apt_get_command_base()
+
+        self.assertEqual(command, ["/usr/bin/sudo", "-n", "/usr/bin/apt-get"])
+
+    def test_camofox_system_dependencies_fall_back_to_ubuntu_t64_packages(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = mock.Mock()
+            runner.run.side_effect = [
+                subprocess.CompletedProcess(["apt-get", "update"], 0),
+                subprocess.CompletedProcess(["apt-get", "install"], 100),
+                subprocess.CompletedProcess(["apt-get", "install"], 0),
+            ]
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=runner,
+            )
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                    side_effect=[["managed browser loader/runtime libraries"], []],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.apt_get_command_base",
+                    return_value=["/usr/bin/apt-get"],
+                ),
+            ):
+                manager.ensure_camofox_system_dependencies()
+
+            commands = [call.args[0] for call in runner.run.call_args_list]
+            self.assertIn("libgtk-3-0", commands[1])
+            self.assertIn("libasound2", commands[1])
+            self.assertNotIn("libgtk-3-0t64", commands[1])
+            self.assertIn("libgtk-3-0t64", commands[2])
+            self.assertIn("libasound2t64", commands[2])
+            self.assertNotIn("libgtk-3-0", commands[2])
+
+    def test_camofox_system_dependencies_fail_when_postinstall_preflight_still_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            browser = Path(td) / "camoufox"
+            runner = RecordingDeployRunner()
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=runner,
+            )
+            preflight = mock.Mock(
+                side_effect=[
+                    ["managed browser loader/runtime libraries"],
+                    ["libxul.so: libgtk-3.so.0 => not found"],
+                ]
+            )
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
+                    preflight,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.apt_get_command_base",
+                    return_value=["/usr/bin/apt-get"],
+                ),
+                self.assertRaisesRegex(DeploymentError, "libgtk-3.so.0 => not found"),
+            ):
+                manager.ensure_camofox_system_dependencies(browser_executable=browser)
+
+            self.assertEqual(preflight.call_args_list, [mock.call(browser), mock.call(browser)])
+
     def test_camofox_system_dependency_error_is_actionable_without_apt(self):
         with tempfile.TemporaryDirectory() as td:
             manager = DeploymentManager(
                 DeploymentPaths.from_root(Path(td)),
                 runner=RecordingDeployRunner(),
             )
+            raised = self.assertRaisesRegex(DeploymentError, "sudo apt update")
             with (
                 mock.patch(
                     "enterprise_agent_platform.deployment._camofox_system_dependency_problems",
@@ -746,9 +945,12 @@ class DeploymentTests(unittest.TestCase):
                     "enterprise_agent_platform.deployment.apt_get_command_base",
                     return_value=None,
                 ),
-                self.assertRaisesRegex(DeploymentError, "sudo apt update"),
+                raised,
             ):
                 manager.ensure_camofox_system_dependencies()
+
+            self.assertIn("libgtk-3-0t64", str(raised.exception))
+            self.assertIn("libasound2t64", str(raised.exception))
 
     def test_user_service_unit_passes_systemd_verify_when_available(self):
         if not shutil.which("systemd-analyze"):

@@ -92,6 +92,189 @@ function log(level, msg, fields = {}) {
     process.stdout.write(line + '\\n');
   }
 }`;
+const displayBefore = `    try {
+      if (os.platform() === 'linux') {
+        localVirtualDisplay = pluginCtx.createVirtualDisplay();
+        vdDisplay = localVirtualDisplay.get();
+        log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
+      }
+    } catch (err) {
+      log('warn', 'xvfb not available, falling back to headless', { error: err.message, attempt });
+      localVirtualDisplay = null;
+    }`;
+const cleanupBefore = `function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
+  const origClose = candidateBrowser.close.bind(candidateBrowser);
+  candidateBrowser.close = async (...args) => {
+    await origClose(...args);
+    browserLaunchProxy = null;
+    if (localVirtualDisplay) {
+      localVirtualDisplay.kill();
+      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+    }
+  };
+}`;
+const cleanupAfter = `async function stopVirtualDisplay(display) {
+  if (!display) return;
+  const proc = display.proc;
+  try { display.kill(); } catch { /* already stopped */ }
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+
+  const waitForExit = (timeoutMs) => new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.removeListener('exit', done);
+      proc.removeListener('error', done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    proc.once('exit', done);
+    proc.once('error', done);
+    if (proc.exitCode !== null || proc.signalCode !== null) done();
+  });
+
+  await waitForExit(1000);
+  if (proc.exitCode === null && proc.signalCode === null) {
+    try { proc.kill('SIGKILL'); } catch { /* already stopped */ }
+    await waitForExit(500);
+  }
+}
+
+function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
+  const origClose = candidateBrowser.close.bind(candidateBrowser);
+  const launchProxyToClose = browserLaunchProxy;
+  candidateBrowser.close = async (...args) => {
+    try {
+      return await origClose(...args);
+    } finally {
+      await stopVirtualDisplay(localVirtualDisplay);
+      if (virtualDisplay === localVirtualDisplay) {
+        virtualDisplay = null;
+        if (browserLaunchProxy === launchProxyToClose) browserLaunchProxy = null;
+      }
+    }
+  };
+}`;
+const proxyRetryCleanupBefore = `            await candidateBrowser.close().catch(() => {});
+            if (localVirtualDisplay) localVirtualDisplay.kill();
+            continue;`;
+const proxyRetryCleanupAfter = `            await candidateBrowser.close().catch(() => {});
+            await stopVirtualDisplay(localVirtualDisplay);
+            continue;`;
+const launchFailureCleanupBefore = `      await candidateBrowser?.close().catch(() => {});
+      if (localVirtualDisplay) localVirtualDisplay.kill();`;
+const launchFailureCleanupAfter = `      await candidateBrowser?.close().catch(() => {});
+      await stopVirtualDisplay(localVirtualDisplay);`;
+const closeDisplayCaptureBefore = `  const b = browser;
+  if (!b) return;
+  clearBrowserIdleTimer();`;
+const closeDisplayCaptureAfter = `  const b = browser;
+  if (!b) return;
+  const displayToClose = virtualDisplay;
+  const launchProxyToClose = browserLaunchProxy;
+  clearBrowserIdleTimer();`;
+const closeTimeoutCleanupBefore = `  } finally {
+    clearTimeout(closeTimer);
+  }
+
+  // Force-kill browser survivors.`;
+const closeTimeoutCleanupAfter = `  } finally {
+    clearTimeout(closeTimer);
+    await stopVirtualDisplay(displayToClose);
+    if (virtualDisplay === displayToClose) {
+      virtualDisplay = null;
+      if (browserLaunchProxy === launchProxyToClose) browserLaunchProxy = null;
+    }
+  }
+
+  // Force-kill browser survivors.`;
+const survivorScanBefore = `if (/camoufox-bin|\\/usr\\/bin\\/Xvfb\\b/.test(cmdline))`;
+const survivorScanAfter = `if (/camoufox-bin/.test(cmdline))`;
+const displayAfter = `    let displayStartupError = null;
+    try {
+      if (os.platform() === 'linux') {
+        const { default: net } = await import('node:net');
+        const canConnectDisplay = (socketPath) => new Promise((resolve) => {
+          let settled = false;
+          const socket = net.createConnection({ path: socketPath });
+          const finish = (connected) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            resolve(connected);
+          };
+          socket.once('connect', () => finish(true));
+          socket.once('error', () => finish(false));
+          socket.setTimeout(150, () => finish(false));
+        });
+
+        for (let displayAttempt = 1; displayAttempt <= 2; displayAttempt++) {
+          let xvfbSpawnError = null;
+          try {
+            localVirtualDisplay = pluginCtx.createVirtualDisplay();
+            vdDisplay = localVirtualDisplay.get();
+            if (typeof vdDisplay !== 'string' || !/^:\\d+$/.test(vdDisplay)) {
+              throw new Error('Xvfb returned an invalid display');
+            }
+            const xvfbProcess = localVirtualDisplay.proc;
+            if (!xvfbProcess || typeof xvfbProcess.once !== 'function') {
+              throw new Error('Xvfb process handle is unavailable');
+            }
+            xvfbProcess.once('error', (error) => { xvfbSpawnError = error; });
+            const socketPath = \`/tmp/.X11-unix/X\${vdDisplay.slice(1)}\`;
+            const readyDeadline = Date.now() + 3000;
+            while (!(await canConnectDisplay(socketPath))) {
+              if (xvfbSpawnError) throw xvfbSpawnError;
+              if (xvfbProcess.exitCode !== null || xvfbProcess.signalCode !== null) {
+                throw new Error('Xvfb exited before its display was ready');
+              }
+              if (Date.now() >= readyDeadline) {
+                throw new Error('Xvfb display readiness timed out');
+              }
+              await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+
+            // A socket can briefly belong to a stale/racing display. Require a
+            // second connection after a short stability window and confirm the
+            // child that we started is still the live owner.
+            await new Promise((resolve) => setTimeout(resolve, 75));
+            if (xvfbSpawnError) throw xvfbSpawnError;
+            if (xvfbProcess.exitCode !== null || xvfbProcess.signalCode !== null) {
+              throw new Error('Xvfb exited during display stability check');
+            }
+            if (!(await canConnectDisplay(socketPath))) {
+              throw new Error('Xvfb display failed its stability check');
+            }
+            if (xvfbSpawnError || xvfbProcess.exitCode !== null || xvfbProcess.signalCode !== null) {
+              throw new Error('Xvfb stopped after display stability check');
+            }
+            displayStartupError = null;
+            break;
+          } catch (error) {
+            displayStartupError = error;
+            await stopVirtualDisplay(localVirtualDisplay);
+            localVirtualDisplay = null;
+            vdDisplay = undefined;
+            if (displayAttempt < 2) {
+              log('warn', 'xvfb display attempt failed; retrying', {
+                error: error.message,
+                attempt,
+                displayAttempt,
+              });
+            }
+          }
+        }
+        if (displayStartupError) throw displayStartupError;
+        log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
+      }
+    } catch (err) {
+      log('warn', 'xvfb not available, falling back to headless', { error: err.message, attempt });
+      await stopVirtualDisplay(localVirtualDisplay);
+      localVirtualDisplay = null;
+      vdDisplay = undefined;
+    }`;
 
 let patched = fs.readFileSync(target, "utf8");
 
@@ -106,6 +289,13 @@ function applyExactPatch(label, before, after) {
 
 applyExactPatch("graceful-shutdown", gracefulBefore, gracefulAfter);
 applyExactPatch("structured-log-redaction", loggingBefore, loggingAfter);
+applyExactPatch("owned-virtual-display-cleanup", cleanupBefore, cleanupAfter);
+applyExactPatch("proxy-retry-display-cleanup", proxyRetryCleanupBefore, proxyRetryCleanupAfter);
+applyExactPatch("launch-failure-display-cleanup", launchFailureCleanupBefore, launchFailureCleanupAfter);
+applyExactPatch("browser-close-display-capture", closeDisplayCaptureBefore, closeDisplayCaptureAfter);
+applyExactPatch("browser-close-timeout-display-cleanup", closeTimeoutCleanupBefore, closeTimeoutCleanupAfter);
+applyExactPatch("scoped-browser-survivor-scan", survivorScanBefore, survivorScanAfter);
+applyExactPatch("platform-managed-display", displayBefore, displayAfter);
 
 const source = fs.readFileSync(target, "utf8");
 if (patched === source) process.exit(0);

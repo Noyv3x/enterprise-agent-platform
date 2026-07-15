@@ -1210,6 +1210,12 @@ class PlatformRuntimeManager:
             }
         )
         if not self._effective_camofox_command():
+            # A user-level systemd manager can retain GUI variables long after
+            # that login's display has disappeared. Managed Camoufox owns its
+            # Xvfb/headless choice, so never let a stale host display make
+            # Firefox attempt headed mode against an unrelated X server.
+            for key in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"):
+                env.pop(key, None)
             browser_executable = self._camofox_browser_executable()
             if browser_executable is None:
                 self._camofox_last_error = "managed Camoufox browser executable is missing"
@@ -1482,6 +1488,13 @@ class PlatformRuntimeManager:
             raise RuntimeError("Camofox graceful-shutdown runtime patch is missing")
         if "function sanitizeLogUrl(value)" not in server or "...sanitizeLogFields(fields)" not in server:
             raise RuntimeError("Camofox structured-log URL redaction patch is missing")
+        if (
+            "Xvfb display readiness timed out" not in server
+            or "net.createConnection({ path: socketPath })" not in server
+            or "async function stopVirtualDisplay(display)" not in server
+            or "await stopVirtualDisplay(displayToClose)" not in server
+        ):
+            raise RuntimeError("Camofox virtual-display runtime patch is missing")
 
     def _camofox_browser_asset(self) -> tuple[str, str, int, str, str]:
         machine = platform.machine().lower()

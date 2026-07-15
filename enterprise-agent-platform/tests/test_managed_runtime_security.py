@@ -187,6 +187,44 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
                 0o600,
             )
 
+    def test_managed_camofox_does_not_inherit_host_display_variables(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            launcher = RecordingLauncher()
+            manager = self._manager(tmp, launcher=launcher)
+            browser = tmp / "camoufox-bin"
+            browser.write_text("", encoding="utf-8")
+            browser.chmod(0o700)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "DISPLAY": ":broken",
+                        "WAYLAND_DISPLAY": "wayland-stale",
+                        "XAUTHORITY": "/tmp/missing-xauthority",
+                    },
+                ),
+                mock.patch.object(
+                    manager,
+                    "_camofox_command",
+                    return_value=(["managed-camofox-test"], tmp, "test"),
+                ),
+                mock.patch.object(
+                    manager,
+                    "_camofox_browser_executable",
+                    return_value=browser,
+                ),
+            ):
+                manager._start_camofox()
+
+            env = launcher.calls[-1]["env"]
+            self.assertNotIn("DISPLAY", env)
+            self.assertNotIn("WAYLAND_DISPLAY", env)
+            self.assertNotIn("XAUTHORITY", env)
+            self.assertEqual(env["HOST"], "127.0.0.1")
+            self.assertEqual(env["CAMOFOX_HOST"], "127.0.0.1")
+            self.assertEqual(env["UBITECH_CAMOFOX_BIND_HOST"], "127.0.0.1")
+
     def test_disabled_camofox_skips_managed_install(self):
         with tempfile.TemporaryDirectory() as td:
             runner = RecordingCommandRunner()
@@ -222,6 +260,30 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
             (app / "patch-runtime.cjs").write_text("// patch\n", encoding="utf-8")
 
             with self.assertRaisesRegex(RuntimeError, "server.js"):
+                PlatformRuntimeManager._validate_camofox_install(app)
+
+            server = (
+                app
+                / "node_modules"
+                / "@askjo"
+                / "camofox-browser"
+                / "server.js"
+            )
+            server.write_text(
+                "reporter.resetNativeMemBaseline?.();\n"
+                "function sanitizeLogUrl(value) {}\n"
+                "const fields = {...sanitizeLogFields(fields)};\n",
+                encoding="utf-8",
+            )
+            for required in (
+                server.parent / "lib" / "config.js",
+                app / "node_modules" / "camoufox-js" / "dist" / "index.js",
+                app / "node_modules" / "playwright-core" / "index.js",
+            ):
+                required.parent.mkdir(parents=True, exist_ok=True)
+                required.write_text("// required\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "virtual-display runtime patch"):
                 PlatformRuntimeManager._validate_camofox_install(app)
 
     @unittest.skipIf(runtime_module.fcntl is None, "POSIX flock is required")
@@ -620,7 +682,78 @@ const browser = {
             server = root / "node_modules" / "@askjo" / "camofox-browser" / "server.js"
             server.parent.mkdir(parents=True)
             server.write_text(
-                """function log(level, msg, fields = {}) {
+                """const mode = process.argv[2] || 'ready';
+const fs = require('node:fs');
+const net = require('node:net');
+const os = { platform: () => 'linux' };
+const before = () => {};
+const after = () => {};
+const reporter = { resetNativeMemBaseline: () => {} };
+const displayNumber = String(20000 + (process.pid % 10000));
+const displayName = `:${displayNumber}`;
+const displaySocket = `/tmp/.X11-unix/X${displayNumber}`;
+let socketServer = null;
+let delayedSocketTimer = null;
+function removeDisplaySocket() {
+  try { fs.unlinkSync(displaySocket); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+function listenDisplaySocket() {
+  return new Promise((resolve, reject) => {
+    socketServer = net.createServer((socket) => socket.end());
+    socketServer.once('error', reject);
+    socketServer.listen(displaySocket, resolve);
+  });
+}
+async function prepareDisplaySocket() {
+  fs.mkdirSync('/tmp/.X11-unix', { recursive: true });
+  removeDisplaySocket();
+  if (mode === 'ready' || mode === 'unstable-exit') {
+    await listenDisplaySocket();
+  } else if (mode === 'delayed') {
+    delayedSocketTimer = setTimeout(() => {
+      listenDisplaySocket().catch((error) => {
+        process.stderr.write(`delayed socket failed: ${error.message}\\n`);
+      });
+    }, 60);
+  } else if (mode === 'stale-socket') {
+    fs.writeFileSync(displaySocket, 'not a unix listener');
+  }
+}
+async function cleanupDisplaySocket() {
+  clearTimeout(delayedSocketTimer);
+  if (socketServer) {
+    await new Promise((resolve) => socketServer.close(resolve));
+  }
+  removeDisplaySocket();
+}
+let killed = false;
+const pluginCtx = {
+  createVirtualDisplay: () => {
+    const proc = mode === 'missing-process' ? null : {
+      exitCode: mode === 'exited' ? 1 : null,
+      signalCode: null,
+      once: (_event, callback) => { if (mode === 'spawn-error') callback(new Error('spawn failed')); },
+      removeListener: () => {},
+      kill: () => { proc.exitCode = 137; },
+    };
+    if (mode === 'unstable-exit' && proc) {
+      setTimeout(() => { proc.exitCode = 1; }, 30);
+    } else if (mode === 'stale-socket' && proc) {
+      setTimeout(() => { proc.exitCode = 1; }, 100);
+    }
+    return {
+      get: () => mode === 'object' ? {} : mode === 'empty' ? '' : displayName,
+      proc,
+      kill: () => {
+        killed = true;
+        if (proc && proc.exitCode === null) proc.exitCode = 0;
+      },
+    };
+  },
+};
+function log(level, msg, fields = {}) {
   const entry = {
     ts: new Date().toISOString(),
     level,
@@ -634,9 +767,134 @@ const browser = {
     process.stdout.write(line + '\\n');
   }
 }
+let browserLaunchProxy = null;
+let virtualDisplay = null;
+function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
+  const origClose = candidateBrowser.close.bind(candidateBrowser);
+  candidateBrowser.close = async (...args) => {
+    await origClose(...args);
+    browserLaunchProxy = null;
+    if (localVirtualDisplay) {
+      localVirtualDisplay.kill();
+      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+    }
+  };
+}
+async function proxyRetryCleanup(candidateBrowser, localVirtualDisplay) {
+  for (;;) {
+            await candidateBrowser.close().catch(() => {});
+            if (localVirtualDisplay) localVirtualDisplay.kill();
+            continue;
+  }
+}
+async function launchFailureCleanup(candidateBrowser, localVirtualDisplay) {
+      await candidateBrowser?.close().catch(() => {});
+      if (localVirtualDisplay) localVirtualDisplay.kill();
+}
+function isBrowserSurvivor(cmdline) {
+  if (/camoufox-bin|\/usr\/bin\/Xvfb\\b/.test(cmdline)) return true;
+  return false;
+}
+let browser = null;
+function clearBrowserIdleTimer() {}
+async function closeFixture() {
+  const b = browser;
+  if (!b) return;
+  clearBrowserIdleTimer();
+  let closeTimer;
+  try {
+    await Promise.race([
+      b.close(),
+      new Promise((_, reject) => { closeTimer = setTimeout(() => reject(new Error('browser.close() timeout')), 10000); }),
+    ]);
+  } catch (err) {
+    log('warn', 'browser.close() failed or timed out', { error: err.message });
+  } finally {
+    clearTimeout(closeTimer);
+  }
+
+  // Force-kill browser survivors.
+}
+async function probeLateClose() {
+  const oldDisplay = pluginCtx.createVirtualDisplay();
+  const oldProxy = { name: 'old' };
+  const newDisplay = { name: 'new' };
+  const newProxy = { name: 'new' };
+  virtualDisplay = oldDisplay;
+  browserLaunchProxy = oldProxy;
+  let releaseClose;
+  const candidate = { close: () => new Promise((resolve) => { releaseClose = resolve; }) };
+  attachBrowserCleanup(candidate, oldDisplay);
+  const closing = candidate.close();
+  virtualDisplay = newDisplay;
+  browserLaunchProxy = newProxy;
+  releaseClose();
+  await closing;
+  return {
+    lateCloseSafe: virtualDisplay === newDisplay && browserLaunchProxy === newProxy,
+    killed,
+  };
+}
+async function probeCloseHang() {
+  const display = pluginCtx.createVirtualDisplay();
+  virtualDisplay = display;
+  browserLaunchProxy = { name: 'closing' };
+  browser = { close: () => new Promise(() => {}) };
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(callback, Math.min(delay, 10), ...args);
+  try {
+    await closeFixture();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  return {
+    closeHangCleaned: killed && virtualDisplay === null && browserLaunchProxy === null,
+  };
+}
+async function probeDisplay() {
+  let localVirtualDisplay = null;
+  let vdDisplay = undefined;
+  const attempt = 1;
+    try {
+      if (os.platform() === 'linux') {
+        localVirtualDisplay = pluginCtx.createVirtualDisplay();
+        vdDisplay = localVirtualDisplay.get();
+        log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
+      }
+    } catch (err) {
+      log('warn', 'xvfb not available, falling back to headless', { error: err.message, attempt });
+      localVirtualDisplay = null;
+    }
+  return {
+    virtual: !!vdDisplay,
+    killed,
+    xvfbMatched: isBrowserSurvivor('/usr/bin/Xvfb :99'),
+    camoufoxMatched: isBrowserSurvivor('/tmp/camoufox-bin'),
+  };
+}
 before();
 reporter.resetNativeMemBaseline();
 after();
+(async () => {
+  if (mode === 'late-close') {
+    process.stdout.write(JSON.stringify({ probe: await probeLateClose() }) + '\\n');
+    return;
+  }
+  if (mode === 'close-hang') {
+    process.stdout.write(JSON.stringify({ probe: await probeCloseHang() }) + '\\n');
+    return;
+  }
+  await prepareDisplaySocket();
+  try {
+    const result = await probeDisplay();
+    process.stdout.write(JSON.stringify({ probe: result }) + '\\n');
+  } finally {
+    await cleanupDisplaySocket();
+  }
+})().catch((error) => {
+  process.stderr.write(error.stack + '\\n');
+  process.exitCode = 1;
+});
 """,
                 encoding="utf-8",
             )
@@ -657,6 +915,70 @@ after();
             self.assertIn("function sanitizeLogUrl(value)", patched)
             self.assertIn("...sanitizeLogFields(fields)", patched)
             self.assertIn("[invalid-url-redacted]", patched)
+            self.assertIn("Xvfb returned an invalid display", patched)
+            self.assertIn("Xvfb display readiness timed out", patched)
+            self.assertIn("async function stopVirtualDisplay(display)", patched)
+            self.assertIn("net.createConnection({ path: socketPath })", patched)
+            self.assertNotIn("fs.existsSync(socketPath)", patched)
+            self.assertIn("const displayToClose = virtualDisplay", patched)
+            self.assertIn("await stopVirtualDisplay(displayToClose)", patched)
+            self.assertIn("const launchProxyToClose = browserLaunchProxy", patched)
+            self.assertNotIn("camoufox-bin|\\/usr\\/bin\\/Xvfb", patched)
+            fallback = {
+                "virtual": False,
+                "killed": True,
+                "xvfbMatched": False,
+                "camoufoxMatched": True,
+            }
+            virtual = {
+                "virtual": True,
+                "killed": False,
+                "xvfbMatched": False,
+                "camoufoxMatched": True,
+            }
+            for mode, expected in (
+                ("object", fallback),
+                ("empty", fallback),
+                ("missing-process", fallback),
+                ("exited", fallback),
+                ("spawn-error", fallback),
+                ("stale-socket", fallback),
+                ("unstable-exit", fallback),
+                ("ready", virtual),
+                ("delayed", virtual),
+            ):
+                result = subprocess.run(
+                    [shutil.which("node") or "node", str(server), mode],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                probe_lines = [
+                    json.loads(line)["probe"]
+                    for line in result.stdout.splitlines()
+                    if '"probe"' in line
+                ]
+                self.assertEqual(probe_lines, [expected])
+            for mode, expected in (
+                ("late-close", {"lateCloseSafe": True, "killed": True}),
+                ("close-hang", {"closeHangCleaned": True}),
+            ):
+                result = subprocess.run(
+                    [shutil.which("node") or "node", str(server), mode],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                probes = [
+                    json.loads(line)["probe"]
+                    for line in result.stdout.splitlines()
+                    if '"probe"' in line
+                ]
+                self.assertEqual(probes, [expected])
             helper_start = patched.index("function sanitizeLogUrl(value)")
             helper_end = patched.index("function log(level", helper_start)
             helper_source = patched[helper_start:helper_end]

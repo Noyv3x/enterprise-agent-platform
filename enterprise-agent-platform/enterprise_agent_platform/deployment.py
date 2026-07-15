@@ -1014,6 +1014,8 @@ def _camofox_system_dependency_problems(browser_executable: Path | None) -> list
     fontconfig = shutil.which("fc-match")
     if xvfb is None:
         problems.append("Xvfb executable")
+    elif not _command_succeeds([xvfb, "-help"]):
+        problems.append("working Xvfb runtime")
     if fontconfig is None:
         problems.append("fontconfig (fc-match)")
     elif not _command_succeeds([fontconfig, "--version"]):
@@ -1099,6 +1101,7 @@ def _command_succeeds(
 
 def _camofox_dependency_hint(missing: list[str], *, apt_failed: bool = False) -> str:
     package_text = " ".join(CAMOFOX_APT_PACKAGES)
+    package_text_t64 = " ".join(CAMOFOX_APT_PACKAGES_T64)
     reason = "Automatic apt installation did not complete." if apt_failed else (
         "Automatic apt installation is unavailable, disabled, or this host is not Debian/Ubuntu."
     )
@@ -1110,6 +1113,8 @@ def _camofox_dependency_hint(missing: list[str], *, apt_failed: bool = False) ->
             reason,
             "On Debian/Ubuntu install the runtime packages, then rerun deploy:",
             f"  sudo apt update && sudo apt install -y --no-install-recommends {package_text}",
+            "On Ubuntu 24.04 or another t64-based release, use:",
+            f"  sudo apt update && sudo apt install -y --no-install-recommends {package_text_t64}",
         ]
     )
 
@@ -1124,7 +1129,14 @@ def apt_get_command_base() -> list[str] | None:
         return [apt_get]
     sudo = shutil.which("sudo")
     if sudo:
-        return [sudo, apt_get]
+        try:
+            interactive_tty = bool(sys.stdin and sys.stdin.isatty())
+        except (AttributeError, OSError, ValueError):
+            interactive_tty = False
+        # The user-level systemd auto-updater has no controlling terminal.
+        # Fail fast there instead of hanging on an invisible password prompt,
+        # while preserving the normal sudo prompt for an interactive deploy.
+        return [sudo, apt_get] if interactive_tty else [sudo, "-n", apt_get]
     return None
 
 
