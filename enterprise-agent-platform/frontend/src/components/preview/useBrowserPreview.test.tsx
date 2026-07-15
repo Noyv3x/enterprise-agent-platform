@@ -84,6 +84,7 @@ describe("useBrowserPreview", () => {
     act(() => document.dispatchEvent(new Event("visibilitychange")));
 
     expect(result.current.state.frameUrl).toBe("");
+    expect(result.current.state.activity).toBe("loading");
     expect(result.current.state.title).toBe("");
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:frame-1");
   });

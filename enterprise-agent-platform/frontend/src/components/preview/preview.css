@@ -279,6 +279,10 @@
 
 .browser-preview__screen .empty p { color: hsl(220 8% 66%); }
 .browser-preview__screen .empty__icon { color: hsl(220 10% 76%); background: hsl(220 11% 17%); }
+.browser-preview__loading .empty__icon {
+  border-color: hsl(220 10% 30%);
+  color: hsl(210 28% 82%);
+}
 
 .browser-preview__readonly-shield {
   position: absolute;

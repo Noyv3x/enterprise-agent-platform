@@ -55,12 +55,25 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
               alt={t("browserPreview.frameAlt")}
               draggable={false}
             />
-          ) : (
+          ) : state.activity === "idle" ? (
             <EmptyState
               icon="browser"
               title={t("browserPreview.noBrowser")}
               text={t("browserPreview.noBrowserDetail")}
             />
+          ) : (
+            <div
+              className="empty browser-preview__loading"
+              role="status"
+              aria-live="polite"
+              aria-busy="true"
+            >
+              <div className="empty__icon">
+                <Icon name="refresh" size={26} cls="spin" />
+              </div>
+              <h3>{t("browserPreview.loadingFrame")}</h3>
+              <p>{t("browserPreview.loadingFrameDetail")}</p>
+            </div>
           )}
           <div className="browser-preview__readonly-shield" aria-hidden="true" />
         </div>

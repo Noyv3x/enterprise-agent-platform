@@ -35,6 +35,16 @@ export const previewMessages = defineMessages({
     "zh-TW": "以低幀率檢視 Agent 目前的瀏覽器畫面；預覽無法點擊或輸入。",
   },
   "browserPreview.frameAlt": { "zh-CN": "Agent 浏览器的最新画面", en: "Latest Agent browser frame", "zh-TW": "Agent 瀏覽器的最新畫面" },
+  "browserPreview.loadingFrame": {
+    "zh-CN": "正在加载浏览器画面",
+    en: "Loading browser view",
+    "zh-TW": "正在載入瀏覽器畫面",
+  },
+  "browserPreview.loadingFrameDetail": {
+    "zh-CN": "正在获取最新画面，加载完成后会自动显示。",
+    en: "Fetching the latest view. It will appear here automatically when ready.",
+    "zh-TW": "正在取得最新畫面，載入完成後會自動顯示。",
+  },
   "browserPreview.noBrowser": { "zh-CN": "浏览器尚未运行", en: "Browser is not running", "zh-TW": "瀏覽器尚未執行" },
   "browserPreview.noBrowserDetail": {
     "zh-CN": "Agent 打开浏览器后，画面会自动出现在这里。",
