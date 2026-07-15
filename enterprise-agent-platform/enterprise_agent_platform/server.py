@@ -296,6 +296,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         actor = self._require_user()
+        if path == "/api/agent-previews/status":
+            if method != "GET":
+                raise ServiceError(405, "method not allowed")
+            if set(query) - {"scope_type", "scope_id"}:
+                raise ServiceError(400, "preview status accepts only scope_type and scope_id")
+            if len(query.get("scope_type", [])) != 1 or len(query.get("scope_id", [])) != 1:
+                raise ServiceError(400, "scope_type and scope_id are required exactly once")
+            payload = service.agent_preview_status(
+                actor,
+                first(query, "scope_type", ""),
+                first(query, "scope_id", ""),
+            )
+            self._preview_json(payload)
+            return
         if path == "/api/agent-previews/browser":
             if method != "GET":
                 raise ServiceError(405, "method not allowed")

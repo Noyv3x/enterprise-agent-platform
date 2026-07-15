@@ -4,7 +4,6 @@ import type { Action, AppState, UiSliceState } from "../../types";
 
 export const uiInitial: UiSliceState = {
   sidebarOpen: false,
-  previewScope: null,
   resourceStates: {},
 };
 
@@ -14,8 +13,6 @@ export function uiReducer(state: AppState, action: Action): AppState {
       return { ...state, sidebarOpen: action.payload };
     case "TOGGLE_SIDEBAR":
       return { ...state, sidebarOpen: !state.sidebarOpen };
-    case "SET_PREVIEW_SCOPE":
-      return { ...state, previewScope: action.payload };
     case "SET_RESOURCE_STATE":
       return {
         ...state,

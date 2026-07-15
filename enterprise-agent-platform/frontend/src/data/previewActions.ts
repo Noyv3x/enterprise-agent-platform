@@ -1,10 +1,30 @@
 import { _invokeSessionExpired, ApiError } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { t } from "../i18n";
-import type { AgentPreviewScope, TerminalPreviewProcess } from "../types";
+import type {
+  AgentPreviewScope,
+  AgentPreviewStatusResponse,
+  TerminalPreviewProcess,
+} from "../types";
 
 const MAX_BROWSER_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_TERMINAL_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+const MAX_PREVIEW_STATUS_BYTES = 64 * 1024;
+
+export interface PreviewAvailabilitySnapshot {
+  kind: "snapshot";
+  etag: string;
+  browserActive: boolean;
+  runningTerminalCount: number;
+}
+
+export interface PreviewAvailabilityUnchanged {
+  kind: "unchanged";
+}
+
+export type PreviewAvailabilityResult =
+  | PreviewAvailabilitySnapshot
+  | PreviewAvailabilityUnchanged;
 
 export interface BrowserPreviewFrame {
   kind: "frame";
@@ -68,6 +88,42 @@ async function previewError(response: Response): Promise<Error> {
 function assertBoundedResponse(response: Response, maxBytes: number, message: string): void {
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error(message);
+}
+
+export async function fetchPreviewAvailability(
+  scope: AgentPreviewScope,
+  etag: string,
+  signal: AbortSignal,
+): Promise<PreviewAvailabilityResult> {
+  const response = await fetch(
+    endpoints.previewStatus.path(scope.scope_type, scope.scope_id),
+    {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: etag ? { "If-None-Match": etag } : undefined,
+      signal,
+    },
+  );
+  if (response.status === 304) return { kind: "unchanged" };
+  if (!response.ok) throw await previewError(response);
+  assertBoundedResponse(response, MAX_PREVIEW_STATUS_BYTES, t("preview.loadFailed"));
+
+  const body = (await response.json()) as Partial<AgentPreviewStatusResponse>;
+  if (
+    typeof body.browser_active !== "boolean" ||
+    typeof body.running_terminal_count !== "number" ||
+    !Number.isInteger(body.running_terminal_count) ||
+    body.running_terminal_count < 0
+  ) {
+    throw new Error(t("preview.loadFailed"));
+  }
+  return {
+    kind: "snapshot",
+    etag: response.headers.get("etag") || "",
+    browserActive: body.browser_active,
+    runningTerminalCount: body.running_terminal_count,
+  };
 }
 
 export async function fetchBrowserPreview(

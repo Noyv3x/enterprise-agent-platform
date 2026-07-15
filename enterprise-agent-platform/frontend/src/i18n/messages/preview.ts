@@ -1,20 +1,14 @@
 import { defineMessages } from "../types";
 
 export const previewMessages = defineMessages({
-  "nav.browserPreview": { "zh-CN": "浏览器预览", en: "Browser preview", "zh-TW": "瀏覽器預覽" },
-  "nav.terminalPreview": { "zh-CN": "终端预览", en: "Terminal preview", "zh-TW": "終端預覽" },
-  "nav.topbar.browserPreviewSubtitle": {
-    "zh-CN": "只读查看 Agent 的浏览器画面",
-    en: "Read-only view of the Agent browser",
-    "zh-TW": "唯讀檢視 Agent 的瀏覽器畫面",
+  "preview.sidebarLabel": { "zh-CN": "实时预览", en: "Live previews", "zh-TW": "即時預覽" },
+  "preview.openBrowser": { "zh-CN": "展开浏览器预览", en: "Open browser preview", "zh-TW": "展開瀏覽器預覽" },
+  "preview.openTerminals": {
+    "zh-CN": "展开终端预览（{count}）",
+    en: { one: "Open terminal preview ({count})", other: "Open terminal previews ({count})" },
+    "zh-TW": "展開終端預覽（{count}）",
   },
-  "nav.topbar.terminalPreviewSubtitle": {
-    "zh-CN": "只读查看 Agent 的终端",
-    en: "Read-only view of Agent terminals",
-    "zh-TW": "唯讀檢視 Agent 的終端",
-  },
-  "preview.scope": { "zh-CN": "Agent 范围", en: "Agent scope", "zh-TW": "Agent 範圍" },
-  "preview.channelScope": { "zh-CN": "频道 · {name}", en: "Channel · {name}", "zh-TW": "頻道 · {name}" },
+  "preview.close": { "zh-CN": "关闭预览", en: "Close preview", "zh-TW": "關閉預覽" },
   "preview.readOnly": { "zh-CN": "只读", en: "Read only", "zh-TW": "唯讀" },
   "preview.live": { "zh-CN": "实时", en: "Live", "zh-TW": "即時" },
   "preview.connecting": { "zh-CN": "正在连接", en: "Connecting", "zh-TW": "正在連線" },
@@ -23,12 +17,6 @@ export const previewMessages = defineMessages({
   "preview.waiting": { "zh-CN": "空闲", en: "Idle", "zh-TW": "閒置" },
   "preview.refresh": { "zh-CN": "立即刷新", en: "Refresh now", "zh-TW": "立即重新整理" },
   "preview.updatedAt": { "zh-CN": "更新于 {time}", en: "Updated {time}", "zh-TW": "更新於 {time}" },
-  "preview.noScope": { "zh-CN": "没有可预览的 Agent", en: "No Agent available", "zh-TW": "沒有可預覽的 Agent" },
-  "preview.noScopeDetail": {
-    "zh-CN": "加入一个频道，或启用私人 Agent 权限后即可查看。",
-    en: "Join a channel or enable private Agent access to use previews.",
-    "zh-TW": "加入一個頻道，或啟用私人 Agent 權限後即可檢視。",
-  },
   "preview.loadFailed": {
     "zh-CN": "暂时无法获取预览，界面会继续重试。",
     en: "The preview is unavailable. This view will keep retrying.",
@@ -73,7 +61,6 @@ export const previewMessages = defineMessages({
   },
   "terminalPreview.terminal": { "zh-CN": "终端 {number}", en: "Terminal {number}", "zh-TW": "終端 {number}" },
   "terminalPreview.running": { "zh-CN": "运行中", en: "Running", "zh-TW": "執行中" },
-  "terminalPreview.finished": { "zh-CN": "已结束", en: "Finished", "zh-TW": "已結束" },
   "terminalPreview.cwd": { "zh-CN": "工作目录", en: "Working directory", "zh-TW": "工作目錄" },
   "terminalPreview.command": { "zh-CN": "命令", en: "Command", "zh-TW": "命令" },
   "terminalPreview.output": { "zh-CN": "只读终端输出", en: "Read-only terminal output", "zh-TW": "唯讀終端輸出" },

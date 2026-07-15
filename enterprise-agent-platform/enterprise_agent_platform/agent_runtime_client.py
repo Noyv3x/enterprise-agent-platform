@@ -72,6 +72,13 @@ class AgentClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def terminal_preview_summary(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+    ) -> dict[str, Any]:
+        ...
+
 
 class AgentRuntimeError(RuntimeError):
     """Base error for the platform-owned Agent runtime client."""
@@ -410,6 +417,35 @@ class AgentRuntimeClient:
         if not isinstance(result.get("processes"), list):
             raise AgentRuntimeProtocolError("Agent runtime process preview has no processes list")
         return result
+
+    def terminal_preview_summary(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+    ) -> dict[str, Any]:
+        """Fetch the live process count without transferring terminal output."""
+
+        clean_scope_key = self._required_id("scope_key", scope_key)
+        clean_lifecycle_id = self._required_id("lifecycle_id", lifecycle_id)
+        query = urllib.parse.urlencode(
+            {
+                "scope_key": clean_scope_key,
+                "lifecycle_id": clean_lifecycle_id,
+            }
+        )
+        result, _ = self._json_request(
+            "GET",
+            f"/v1/scopes/process-summary?{query}",
+            None,
+            timeout=min(self.timeout_seconds, 5.0),
+            max_response_bytes=64 * 1024,
+        )
+        count = result.get("running_terminal_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise AgentRuntimeProtocolError(
+                "Agent runtime process summary has an invalid running terminal count"
+            )
+        return {"running_terminal_count": count}
 
     def _cancel_after_stream_failure(self, run_id: str) -> None:
         """Fail closed when the client can no longer observe a live run."""

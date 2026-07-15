@@ -262,3 +262,82 @@ test("runtime exposes only bounded read-only processes owned by a root scope", a
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("runtime exposes a lightweight live-process summary without terminal output", async () => {
+  const home = await temporaryDirectory("agent-server-preview-summary-");
+  const workspace = await temporaryDirectory("agent-server-preview-summary-workspace-");
+  const config = testConfig(home, { bearerToken: "secret" });
+  const coordinator = new RunCoordinator({ config });
+  const runtime = createRuntimeServer(config, coordinator);
+  try {
+    await coordinator.processes.run({
+      runId: "completed-run",
+      scopeKey: "private:9",
+      lifecycleId: "life-9",
+      command: "printf completed-summary-secret",
+      cwd: workspace,
+    });
+    await coordinator.processes.run({
+      runId: "root-live-run",
+      scopeKey: "private:9",
+      lifecycleId: "life-9",
+      command: "printf root-summary-secret; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    await coordinator.processes.run({
+      runId: "child-live-run",
+      scopeKey: "private:9/delegate/child",
+      lifecycleId: "life-9",
+      command: "printf child-summary-secret; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    await coordinator.processes.run({
+      runId: "sibling-live-run",
+      scopeKey: "private:90",
+      lifecycleId: "life-9",
+      command: "printf sibling-summary-secret; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    await coordinator.processes.run({
+      runId: "old-life-live-run",
+      scopeKey: "private:9",
+      lifecycleId: "old-life",
+      command: "printf old-life-summary-secret; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+
+    const address = await runtime.listen();
+    const base = `http://${address.host}:${address.port}`;
+    const query = "scope_key=private%3A9&lifecycle_id=life-9";
+    assert.equal((await fetch(`${base}/v1/scopes/process-summary?${query}`)).status, 401);
+    assert.equal((await fetch(`${base}/v1/scopes/process-summary?scope_key=private%3A9`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+    assert.equal((await fetch(`${base}/v1/scopes/process-summary?${query}&extra=1`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+    assert.equal((await fetch(`${base}/v1/scopes/process-summary?${query}&scope_key=private%3A9`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+
+    const response = await fetch(`${base}/v1/scopes/process-summary?${query}`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    assert.equal(response.status, 200);
+    const raw = await response.text();
+    assert.deepEqual(JSON.parse(raw), { running_terminal_count: 2 });
+    assert.doesNotMatch(raw, /summary-secret|command|stdout|stderr|output|processes/);
+  } finally {
+    coordinator.processes.killScope("private:9");
+    coordinator.processes.killScope("private:90");
+    await coordinator.processes.waitForScopeExit("private:9", undefined, 5_000);
+    await coordinator.processes.waitForScopeExit("private:90", undefined, 5_000);
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});

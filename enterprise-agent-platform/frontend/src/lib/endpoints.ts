@@ -15,6 +15,7 @@ import type {
   AutoUpdateConfigUpdateRequest,
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
+  AgentPreviewStatusResponse,
   ChangePasswordRequest,
   ChangePasswordResponse,
   ChannelCreateRequest,
@@ -146,6 +147,13 @@ export const endpoints = {
   deletePrivateTelegram: ep<string, unknown>("DELETE", () => "/api/private-agent/telegram"),
 
   /* read-only Agent previews */
+  previewStatus: ep<void, AgentPreviewStatusResponse, [ScopeType, Id]>(
+    "GET",
+    (scopeType, scopeId) => {
+      const params = new URLSearchParams({ scope_type: scopeType, scope_id: String(scopeId) });
+      return `/api/agent-previews/status?${params.toString()}`;
+    },
+  ),
   browserPreview: ep<void, Response, [ScopeType, Id, string?]>(
     "GET",
     (scopeType, scopeId, tabId) => {

@@ -133,6 +133,9 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
 
     const preview = registry.preview("private:7", "life-7");
     assert.equal(preview.length, 3);
+    assert.deepEqual(registry.previewSummary("private:7", "life-7"), {
+      running_terminal_count: 1,
+    });
     assert.equal(preview[0]?.id, running.id);
     assert.deepEqual(new Set(preview.map((process) => process.id)), new Set([root.id, delegate.id, running.id]));
     for (const process of preview) {

@@ -120,20 +120,6 @@ export function topbarInfo(state: AppState, translate: Translator = defaultTrans
       sub: translate("nav.topbar.knowledgeDocuments", { count: state.documents.length }),
     };
   }
-  if (state.activeView === "browserPreview") {
-    return {
-      title: translate("nav.browserPreview"),
-      icon: "browser",
-      sub: translate("nav.topbar.browserPreviewSubtitle"),
-    };
-  }
-  if (state.activeView === "terminalPreview") {
-    return {
-      title: translate("nav.terminalPreview"),
-      icon: "terminal",
-      sub: translate("nav.topbar.terminalPreviewSubtitle"),
-    };
-  }
   if (state.activeView === "admin") {
     return { title: translate("nav.admin"), icon: "shield", sub: translate("nav.topbar.adminSubtitle") };
   }

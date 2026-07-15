@@ -35,6 +35,10 @@ export interface ProcessPreview {
   truncated: boolean;
 }
 
+export interface ProcessPreviewSummary {
+  running_terminal_count: number;
+}
+
 interface ManagedProcess extends ProcessSnapshot {
   child: ChildProcessWithoutNullStreams;
   outputBytes: number;
@@ -216,6 +220,21 @@ export class ProcessRegistry {
       })
       .slice(0, PREVIEW_PROCESS_LIMIT)
       .map((process, index) => this.previewSnapshot(process, index));
+  }
+
+  /**
+   * Return only the live-process count needed by the platform's collapsed
+   * preview controls.  Keeping this separate from preview() ensures a status
+   * poll never serializes terminal commands or captured output.
+   */
+  previewSummary(scopeKey: string, lifecycleId: string): ProcessPreviewSummary {
+    this.pruneCompleted();
+    const runningTerminalCount = [...this.processes.values()].filter(
+      (process) => scopeOwns(scopeKey, process.scope_key)
+        && process.lifecycle_id === lifecycleId
+        && process.status === "running",
+    ).length;
+    return { running_terminal_count: runningTerminalCount };
   }
 
   get(scopeKey: string, processId: string, lifecycleId?: string): ProcessSnapshot {

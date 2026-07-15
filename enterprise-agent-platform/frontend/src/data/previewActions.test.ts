@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchBrowserPreview,
+  fetchPreviewAvailability,
   fetchTerminalPreviews,
 } from "./previewActions";
 
@@ -68,6 +69,53 @@ describe("browser preview transport", () => {
       etag: '"idle-1"',
       status: "idle",
     });
+  });
+});
+
+describe("preview availability transport", () => {
+  it("maps the status payload and sends the current validator", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      browser_active: true,
+      running_terminal_count: 2,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ETag: '"status-2"' },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      fetchPreviewAvailability(scope, '"status-1"', new AbortController().signal),
+    ).resolves.toEqual({
+      kind: "snapshot",
+      etag: '"status-2"',
+      browserActive: true,
+      runningTerminalCount: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/agent-previews/status?scope_type=private&scope_id=7",
+      expect.objectContaining({
+        cache: "no-store",
+        credentials: "include",
+        headers: { "If-None-Match": '"status-1"' },
+      }),
+    );
+  });
+
+  it("returns unchanged for a 304 status response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 304 })));
+    await expect(
+      fetchPreviewAvailability(scope, '"status-2"', new AbortController().signal),
+    ).resolves.toEqual({ kind: "unchanged" });
+  });
+
+  it("rejects malformed availability counts", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      browser_active: false,
+      running_terminal_count: -1,
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+    await expect(
+      fetchPreviewAvailability(scope, "", new AbortController().signal),
+    ).rejects.toThrow();
   });
 });
 

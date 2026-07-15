@@ -48,8 +48,6 @@ export type ActiveView =
   | "channel"
   | "private"
   | "knowledge"
-  | "browserPreview"
-  | "terminalPreview"
   | "settings"
   | "admin";
 

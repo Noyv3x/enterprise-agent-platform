@@ -183,20 +183,6 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
  *  (legacy navItem onclick, legacy-app.js:489-501). Channel view loads via
  *  selectChannel / existing state, so it has no loader here. */
 export async function navigateToView(store: AppStore, view: ActiveView): Promise<void> {
-  const current = store.getState();
-  if (view === "browserPreview" || view === "terminalPreview") {
-    if (current.activeView === "private" && current.user) {
-      store.dispatch({
-        type: "SET_PREVIEW_SCOPE",
-        payload: { scope_type: "private", scope_id: String(current.user.id) },
-      });
-    } else if (current.activeView === "channel" && current.activeChannelId != null) {
-      store.dispatch({
-        type: "SET_PREVIEW_SCOPE",
-        payload: { scope_type: "channel", scope_id: String(current.activeChannelId) },
-      });
-    }
-  }
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: view });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
   if (view !== "private") {

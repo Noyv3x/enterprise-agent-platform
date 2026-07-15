@@ -15,6 +15,7 @@ from enterprise_agent_platform.service import EnterpriseService, ServiceError
 class PreviewAgent:
     def __init__(self) -> None:
         self.preview_calls: list[tuple[str, str]] = []
+        self.summary_calls: list[tuple[str, str]] = []
         self.processes: list[dict] = []
 
     def generate(self, **kwargs):
@@ -27,6 +28,16 @@ class PreviewAgent:
     def terminal_previews(self, scope_key: str, lifecycle_id: str) -> dict:
         self.preview_calls.append((scope_key, lifecycle_id))
         return {"processes": list(self.processes)}
+
+    def terminal_preview_summary(self, scope_key: str, lifecycle_id: str) -> dict:
+        self.summary_calls.append((scope_key, lifecycle_id))
+        return {
+            "running_terminal_count": sum(
+                1
+                for process in self.processes
+                if process.get("status") == "running" or process.get("running") is True
+            )
+        }
 
 
 def make_config(root: Path) -> PlatformConfig:
@@ -156,7 +167,7 @@ class TerminalPreviewTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_http_preview_supports_etag_without_exposing_a_write_contract(self):
+    def test_http_preview_excludes_completed_processes_and_supports_etag(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             agent = PreviewAgent()
@@ -165,7 +176,7 @@ class TerminalPreviewTests(unittest.TestCase):
             service.agent_scopes.ensure_private_scope(int(admin["id"]))
             agent.processes = [
                 {
-                    "id": "process-http",
+                    "id": "process-completed",
                     "title": "Terminal 1",
                     "command": "printf hello",
                     "cwd": "/workspace",
@@ -177,6 +188,20 @@ class TerminalPreviewTests(unittest.TestCase):
                     "started_at": "2026-07-15T00:00:00Z",
                     "updated_at": "2026-07-15T00:00:01Z",
                     "exit_code": 0,
+                    "truncated": False,
+                },
+                {
+                    "id": "process-running",
+                    "title": "Terminal 2",
+                    "command": "sleep 30",
+                    "cwd": "/workspace",
+                    "stdout": "live",
+                    "stderr": "",
+                    "output": "live",
+                    "status": "running",
+                    "running": True,
+                    "started_at": "2026-07-15T00:00:02Z",
+                    "updated_at": "2026-07-15T00:00:03Z",
                     "truncated": False,
                 }
             ]
@@ -199,7 +224,11 @@ class TerminalPreviewTests(unittest.TestCase):
                 body = json.loads(response.read().decode("utf-8"))
                 etag = response.getheader("ETag")
                 self.assertEqual(response.status, 200)
-                self.assertEqual(body["processes"][0]["output"], "hello")
+                self.assertEqual(
+                    [process["id"] for process in body["processes"]],
+                    ["process-running"],
+                )
+                self.assertEqual(body["processes"][0]["output"], "live")
                 self.assertTrue(etag)
                 self.assertEqual(response.getheader("Cache-Control"), "private, no-cache, max-age=0")
                 self.assertEqual(response.getheader("Cross-Origin-Resource-Policy"), "same-origin")

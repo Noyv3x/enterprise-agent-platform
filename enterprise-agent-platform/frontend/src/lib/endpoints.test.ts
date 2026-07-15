@@ -23,6 +23,9 @@ describe("Agent runtime configuration endpoint", () => {
 
 describe("read-only Agent preview endpoints", () => {
   it("encodes scope and optional browser tab without exposing path fragments", () => {
+    expect(endpoints.previewStatus.path("private", "user 7")).toBe(
+      "/api/agent-previews/status?scope_type=private&scope_id=user+7",
+    );
     expect(endpoints.browserPreview.path("private", "user 7", "tab/1")).toBe(
       "/api/agent-previews/browser?scope_type=private&scope_id=user+7&tab_id=tab%2F1",
     );

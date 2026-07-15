@@ -72,6 +72,9 @@ class _FakeRuntime:
                         },
                     )
                     return
+                if self.path == "/v1/scopes/process-summary?scope_key=private%3A7&lifecycle_id=life-7":
+                    self._json(200, {"running_terminal_count": 2})
+                    return
                 if self.path == "/v1/runs/run-1/events":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -497,6 +500,17 @@ class AgentRuntimeClientTests(unittest.TestCase):
         request = self.runtime.request(
             "GET",
             "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7",
+        )
+        self.assertEqual(request["authorization"], "Bearer runtime-secret")
+        self.assertEqual(request["accept"], "application/json")
+
+    def test_terminal_preview_summary_uses_the_lightweight_scope_endpoint(self):
+        result = self.client.terminal_preview_summary("private:7", "life-7")
+
+        self.assertEqual(result, {"running_terminal_count": 2})
+        request = self.runtime.request(
+            "GET",
+            "/v1/scopes/process-summary?scope_key=private%3A7&lifecycle_id=life-7",
         )
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
         self.assertEqual(request["accept"], "application/json")

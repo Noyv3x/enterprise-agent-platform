@@ -3515,15 +3515,20 @@ class EnterpriseService:
             return {"processes": []}
 
         processes: list[dict[str, Any]] = []
-        for raw in raw_processes[:16]:
+        for raw in raw_processes[:256]:
             if not isinstance(raw, dict):
-                continue
-            process_id = _preview_text_head(raw.get("id"), 256)
-            if not process_id:
                 continue
             status = str(raw.get("status") or "").strip().lower()
             if status not in {"running", "completed", "failed", "cancelled"}:
                 status = "running" if raw.get("running") is True else "completed"
+            # Completed process records remain in the runtime briefly so the
+            # Agent can inspect them, but they are no longer live terminals and
+            # must not keep the chat preview control visible.
+            if status != "running":
+                continue
+            process_id = _preview_text_head(raw.get("id"), 256)
+            if not process_id:
+                continue
             stdout = _preview_text_tail(raw.get("stdout"), 8 * 1024)
             stderr = _preview_text_tail(raw.get("stderr"), 8 * 1024)
             output = _preview_text_tail(raw.get("output"), 16 * 1024)
@@ -3564,7 +3569,59 @@ class EnterpriseService:
             elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 process["exit_code"] = max(-255, min(255, exit_code))
             processes.append(process)
+            if len(processes) >= 16:
+                break
         return {"processes": processes}
+
+    def agent_preview_status(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any]:
+        """Return lightweight live-preview availability for one chat scope.
+
+        This is an observation-only path: it never ensures an Agent scope,
+        starts either managed runtime, creates a browser credential, captures a
+        screenshot, or serializes terminal output.
+        """
+
+        browser = self.browser_preview(
+            actor,
+            scope_type,
+            scope_id,
+            metadata_only=True,
+        )
+        normalized_type, normalized_id = self._normalize_conversation(
+            actor,
+            scope_type,
+            scope_id,
+        )
+        scope_key = (
+            self.agent_scopes.private_scope_key(int(normalized_id))
+            if normalized_type == "private"
+            else self.agent_scopes.channel_scope_key(normalized_id)
+        )
+        scope = self.agent_scopes.get_scope(scope_key)
+        running_terminal_count = 0
+        summary = getattr(self.agent_client, "terminal_preview_summary", None)
+        if scope is not None and callable(summary):
+            try:
+                payload = summary(scope.scope_key, scope.lifecycle_id)
+            except AgentRuntimeError:
+                payload = None
+            if isinstance(payload, dict):
+                raw_count = payload.get("running_terminal_count")
+                if (
+                    isinstance(raw_count, int)
+                    and not isinstance(raw_count, bool)
+                    and raw_count >= 0
+                ):
+                    running_terminal_count = raw_count
+        return {
+            "browser_active": browser.get("active") is True,
+            "running_terminal_count": running_terminal_count,
+        }
 
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -4397,6 +4454,7 @@ class EnterpriseService:
         scope_id: str,
         *,
         tab_id: str = "",
+        metadata_only: bool = False,
     ) -> dict[str, Any]:
         """Return one low-rate, read-only Camofox frame for an authorized scope.
 
@@ -4517,6 +4575,32 @@ class EnterpriseService:
 
         selected_scope_key, user_id, tabs, selected_tab = selected
         selected_tab_id = str(selected_tab["tabId"])
+        if metadata_only:
+            session = (
+                "main"
+                if selected_scope_key == root_scope_key
+                else "delegate-"
+                + hashlib.sha256(selected_scope_key.encode("utf-8")).hexdigest()[:12]
+            )
+            digest = hashlib.sha256(
+                (
+                    selected_scope_key
+                    + "\x00"
+                    + selected_tab_id
+                    + "\x00"
+                    + str(len(tabs))
+                ).encode("utf-8")
+            ).hexdigest()
+            return {
+                "active": True,
+                "status": "live",
+                "state": "live",
+                "tab_id": selected_tab_id,
+                "tab_count": len(tabs),
+                "session": session,
+                "refresh_interval_ms": BROWSER_PREVIEW_REFRESH_MS,
+                "etag": f'"metadata-{digest[:32]}"',
+            }
         return self._capture_browser_preview_frame(
             root_scope_key=root_scope_key,
             selected_scope_key=selected_scope_key,

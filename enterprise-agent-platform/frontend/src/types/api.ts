@@ -303,6 +303,11 @@ export interface OAuthImportResponse extends OAuthFlowResponse {
 
 /* --------------------------------------------------------- live previews */
 
+export interface AgentPreviewStatusResponse {
+  browser_active: boolean;
+  running_terminal_count: number;
+}
+
 export interface TerminalPreviewProcess {
   id: string;
   title?: string;

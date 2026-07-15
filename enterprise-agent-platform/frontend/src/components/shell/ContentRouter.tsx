@@ -21,8 +21,6 @@ import { TelegramLinkPopover } from "../chat/TelegramLinkPopover";
 import { KnowledgeView } from "../knowledge/KnowledgeView";
 import { AdminPanel } from "../admin/AdminPanel";
 import { SettingsView } from "../settings/SettingsView";
-import { BrowserPreviewView } from "../preview/BrowserPreviewView";
-import { TerminalPreviewView } from "../preview/TerminalPreviewView";
 
 /* ------------------------------------------------------------- router */
 
@@ -47,8 +45,6 @@ export function ContentRouter() {
   let body: React.ReactNode;
   if (effective === "private") body = <ChatView mode="private" />;
   else if (effective === "knowledge") body = <KnowledgeView />;
-  else if (effective === "browserPreview") body = <BrowserPreviewView />;
-  else if (effective === "terminalPreview") body = <TerminalPreviewView />;
   else if (effective === "settings") body = <SettingsView />;
   else if (effective === "admin") body = <AdminPanel />;
   else body = <ChatView mode="channel" />;

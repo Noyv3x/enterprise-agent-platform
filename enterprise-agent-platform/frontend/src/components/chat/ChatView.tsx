@@ -18,6 +18,7 @@ import { useStore } from "../../store/useStore";
 import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
+import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";
 
 export function ChatView({ mode }: { mode: ChatMode }) {
   const { t } = useI18n();
@@ -31,6 +32,9 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   const noChannel = mode === "channel" && !scopeId;
   const disabled = noChannel || !canChat;
   const draftKey = `${scopeTypeFor(mode)}:${scopeId}`;
+  const previewScope = scopeId
+    ? { scope_type: scopeTypeFor(mode), scope_id: scopeId }
+    : null;
 
   const [focusToken, setFocusToken] = useState(0);
   const [forceBottomToken, setForceBottomToken] = useState(0);
@@ -52,7 +56,7 @@ export function ChatView({ mode }: { mode: ChatMode }) {
       : t("chat.composer.readOnly");
 
   return (
-    <div className="chat">
+    <ChatPreviewSidebar scope={previewScope}>
       <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken} />
       <Composer
         mode={mode}
@@ -64,6 +68,6 @@ export function ChatView({ mode }: { mode: ChatMode }) {
         onBumpFocus={bumpFocus}
         onBumpForceBottom={bumpForceBottom}
       />
-    </div>
+    </ChatPreviewSidebar>
   );
 }
