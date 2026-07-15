@@ -65,6 +65,13 @@ class AgentClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def terminal_previews(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+    ) -> dict[str, Any]:
+        ...
+
 
 class AgentRuntimeError(RuntimeError):
     """Base error for the platform-owned Agent runtime client."""
@@ -378,6 +385,32 @@ class AgentRuntimeClient:
         )
         return result
 
+    def terminal_previews(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+    ) -> dict[str, Any]:
+        """Fetch the bounded read-only process view for one root Agent scope."""
+
+        clean_scope_key = self._required_id("scope_key", scope_key)
+        clean_lifecycle_id = self._required_id("lifecycle_id", lifecycle_id)
+        query = urllib.parse.urlencode(
+            {
+                "scope_key": clean_scope_key,
+                "lifecycle_id": clean_lifecycle_id,
+            }
+        )
+        result, _ = self._json_request(
+            "GET",
+            f"/v1/scopes/processes?{query}",
+            None,
+            timeout=min(self.timeout_seconds, 5.0),
+            max_response_bytes=2 * 1024 * 1024,
+        )
+        if not isinstance(result.get("processes"), list):
+            raise AgentRuntimeProtocolError("Agent runtime process preview has no processes list")
+        return result
+
     def _cancel_after_stream_failure(self, run_id: str) -> None:
         """Fail closed when the client can no longer observe a live run."""
 
@@ -573,6 +606,7 @@ class AgentRuntimeClient:
         body: dict[str, Any] | None,
         *,
         timeout: float,
+        max_response_bytes: int | None = None,
     ) -> tuple[dict[str, Any], Any]:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
@@ -583,7 +617,13 @@ class AgentRuntimeClient:
         )
         response = self._open(request, timeout=timeout)
         try:
-            raw_bytes = response.read()
+            raw_bytes = response.read(
+                max_response_bytes + 1 if max_response_bytes is not None else -1
+            )
+            if max_response_bytes is not None and len(raw_bytes) > max_response_bytes:
+                raise AgentRuntimeProtocolError(
+                    f"Agent runtime {method} {path} response exceeded {max_response_bytes} bytes"
+                )
             headers = response.headers
         except (socket.timeout, TimeoutError) as exc:
             raise AgentRuntimeTimeoutError(

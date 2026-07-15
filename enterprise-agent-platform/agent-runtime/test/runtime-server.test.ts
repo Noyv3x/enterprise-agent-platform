@@ -204,3 +204,61 @@ test("runtime rejects a slow JSON request body at the configured deadline", asyn
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("runtime exposes only bounded read-only processes owned by a root scope", async () => {
+  const home = await temporaryDirectory("agent-server-preview-");
+  const workspace = await temporaryDirectory("agent-server-preview-workspace-");
+  const config = testConfig(home, { bearerToken: "secret" });
+  const coordinator = new RunCoordinator({ config });
+  const runtime = createRuntimeServer(config, coordinator);
+  try {
+    const root = await coordinator.processes.run({
+      runId: "root-run",
+      scopeKey: "private:9",
+      lifecycleId: "life-9",
+      command: "printf root",
+      cwd: workspace,
+    });
+    const child = await coordinator.processes.run({
+      runId: "child-run",
+      scopeKey: "private:9/delegate/child",
+      lifecycleId: "life-9",
+      command: "printf child",
+      cwd: workspace,
+    });
+    await coordinator.processes.run({
+      runId: "sibling-run",
+      scopeKey: "private:90",
+      lifecycleId: "life-9",
+      command: "printf sibling",
+      cwd: workspace,
+    });
+    const address = await runtime.listen();
+    const base = `http://${address.host}:${address.port}`;
+    const query = "scope_key=private%3A9&lifecycle_id=life-9";
+
+    assert.equal((await fetch(`${base}/v1/scopes/processes?${query}`)).status, 401);
+    assert.equal((await fetch(`${base}/v1/scopes/processes?scope_key=private%3A9`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+    const response = await fetch(`${base}/v1/scopes/processes?${query}`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { processes: Array<Record<string, unknown>> };
+    assert.deepEqual(new Set(body.processes.map((process) => process.id)), new Set([root.id, child.id]));
+    for (const process of body.processes) {
+      for (const internal of ["pid", "run_id", "scope_key", "lifecycle_id"]) {
+        assert.equal(internal in process, false);
+      }
+    }
+    assert.equal((await fetch(`${base}/v1/scopes/processes?${query}`, {
+      method: "POST",
+      headers: { authorization: "Bearer secret" },
+    })).status, 404);
+  } finally {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});

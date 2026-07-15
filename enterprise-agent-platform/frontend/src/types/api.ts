@@ -300,3 +300,33 @@ export interface OAuthImportRequest {
 export interface OAuthImportResponse extends OAuthFlowResponse {
   imported?: { keys?: string[] };
 }
+
+/* --------------------------------------------------------- live previews */
+
+export interface TerminalPreviewProcess {
+  id: string;
+  title?: string;
+  command?: string;
+  cwd?: string;
+  /** Bounded, plain-text terminal screen returned by the platform. */
+  content?: string;
+  output?: string;
+  screen?: string;
+  stdout?: string;
+  stderr?: string;
+  status?: string;
+  running?: boolean;
+  rows?: number;
+  columns?: number;
+  updated_at?: number | string;
+  started_at?: number | string;
+  finished_at?: number | string;
+  exit_code?: number | null;
+  truncated?: boolean;
+}
+
+export interface TerminalPreviewsResponse {
+  processes: TerminalPreviewProcess[];
+  captured_at?: number | string;
+  revision?: string;
+}

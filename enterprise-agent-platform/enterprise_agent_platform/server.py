@@ -296,6 +296,37 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         actor = self._require_user()
+        if path == "/api/agent-previews/browser":
+            if method != "GET":
+                raise ServiceError(405, "method not allowed")
+            try:
+                pairs = urllib.parse.parse_qsl(
+                    urllib.parse.urlparse(self.path).query,
+                    keep_blank_values=True,
+                    max_num_fields=8,
+                )
+            except ValueError as exc:
+                raise ServiceError(400, "invalid browser preview query") from exc
+            allowed = {"scope_type", "scope_id", "tab_id"}
+            if any(key not in allowed for key, _value in pairs):
+                raise ServiceError(400, "unsupported browser preview query parameter")
+            values: dict[str, list[str]] = {}
+            for key, value in pairs:
+                values.setdefault(key, []).append(value)
+            if (
+                len(values.get("scope_type", [])) != 1
+                or len(values.get("scope_id", [])) != 1
+                or len(values.get("tab_id", [])) > 1
+            ):
+                raise ServiceError(400, "browser preview parameters must not be repeated")
+            preview = service.browser_preview(
+                actor,
+                values["scope_type"][0],
+                values["scope_id"][0],
+                tab_id=(values.get("tab_id") or [""])[0],
+            )
+            self._serve_browser_preview(preview)
+            return
         if path == "/api/auth/me" and method == "GET":
             self._json({"user": actor})
             return
@@ -345,6 +376,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if m and method == "DELETE":
             self._json({"user": service.deactivate_user(actor, int(m.group(1)))})
+            return
+        if path == "/api/agent-previews/terminals" and method == "GET":
+            if set(query) - {"scope_type", "scope_id"}:
+                raise ServiceError(400, "terminal preview accepts only scope_type and scope_id")
+            if len(query.get("scope_type", [])) != 1 or len(query.get("scope_id", [])) != 1:
+                raise ServiceError(400, "scope_type and scope_id are required exactly once")
+            payload = service.agent_terminal_previews(
+                actor,
+                first(query, "scope_type", ""),
+                first(query, "scope_id", ""),
+            )
+            self._preview_json(payload)
             return
         if path == "/api/channels" and method == "GET":
             self._json({"channels": service.list_channels(actor)})
@@ -698,6 +741,134 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self._send_security_headers()
         for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_browser_preview(self, preview: dict[str, Any]) -> None:
+        """Serve a conditional, same-origin-only read-only browser frame."""
+
+        etag = str(preview.get("etag") or "")
+        if not re.fullmatch(r'"[A-Za-z0-9._:-]{1,128}"', etag):
+            etag = '"invalid-preview"'
+        if not preview.get("active"):
+            public = {
+                "active": False,
+                "status": str(preview.get("status") or "idle"),
+                "state": str(preview.get("state") or "idle"),
+                "reason": str(preview.get("reason") or "browser_unavailable"),
+                "refresh_interval_ms": int(preview.get("refresh_interval_ms") or 2000),
+            }
+            body = json.dumps(public, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            response_headers = {
+                "ETag": etag,
+                "Cache-Control": "private, no-cache, max-age=0",
+                "Vary": "Cookie, Authorization",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            }
+            if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("Content-Length", "0")
+                self._send_security_headers()
+                for key, value in response_headers.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
+            for key, value in response_headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        image = preview.get("image")
+        if not isinstance(image, bytes) or len(image) > 8 * 1024 * 1024:
+            raise ServiceError(502, "invalid browser preview frame")
+        metadata_headers = {
+            "ETag": etag,
+            "Cache-Control": "private, no-cache, max-age=0",
+            "Vary": "Cookie, Authorization",
+            "Content-Disposition": "inline",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "X-Preview-State": "live",
+            "X-Preview-Tab-Id": self._preview_header_value(preview.get("tab_id"), 512),
+            "X-Preview-Session": self._preview_header_value(preview.get("session"), 128),
+            "X-Preview-URL": self._preview_header_value(preview.get("url"), 2048),
+            "X-Preview-Title": self._preview_header_value(preview.get("title"), 1000),
+            "X-Preview-Captured-At": str(int(preview.get("captured_at") or 0)),
+            "X-Preview-Refresh-Ms": str(int(preview.get("refresh_interval_ms") or 2000)),
+            "X-Preview-Width": str(max(0, int(preview.get("width") or 0))),
+            "X-Preview-Height": str(max(0, int(preview.get("height") or 0))),
+            "X-Preview-Tab-Count": str(max(0, int(preview.get("tab_count") or 0))),
+        }
+        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Content-Length", "0")
+            self._send_security_headers()
+            for key, value in metadata_headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(image)))
+        self._send_security_headers()
+        for key, value in metadata_headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        try:
+            self.wfile.write(image)
+        except (BrokenPipeError, ConnectionError):
+            return
+
+    @staticmethod
+    def _preview_header_value(value: Any, max_characters: int) -> str:
+        # Percent-encoding yields an ASCII-only header and eliminates CR/LF
+        # injection.  The service has already removed query/userinfo/fragment
+        # from URLs before they reach this response boundary.
+        clean = str(value or "")[:max_characters]
+        return urllib.parse.quote(clean, safe="")
+
+    @staticmethod
+    def _preview_etag_matches(value: str, etag: str) -> bool:
+        for candidate in str(value or "").split(","):
+            clean = candidate.strip()
+            if clean == "*":
+                return True
+            if clean.startswith("W/"):
+                clean = clean[2:].strip()
+            if hmac.compare_digest(clean, etag):
+                return True
+        return False
+
+    def _preview_json(self, payload: Any) -> None:
+        """Send a private, conditionally cacheable read-only preview."""
+
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        etag = f'"{hashlib.sha256(body).hexdigest()}"'
+        response_headers = {
+            "ETag": etag,
+            "Cache-Control": "private, no-cache, max-age=0",
+            "Vary": "Cookie, Authorization",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        }
+        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Content-Length", "0")
+            self._send_security_headers()
+            for key, value in response_headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
+        for key, value in response_headers.items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)

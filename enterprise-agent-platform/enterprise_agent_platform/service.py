@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +33,7 @@ from .agent_runtime_client import (
     AgentClient,
     AgentResult,
     AgentRuntimeClient,
+    AgentRuntimeError,
     AgentRuntimeRunError,
 )
 from .internal_config import (
@@ -165,6 +166,17 @@ MAX_LOGIN_FAILURE_KEYS = 10_000
 MAX_AGENT_QUEUE_DEPTH = 64
 MAX_TRACKED_CONVERSATIONS = 1000
 MAX_AGENT_SESSION_ID_LENGTH = 512
+# Browser preview is deliberately a low-frame-rate polling surface.  A short
+# per-tab cache prevents several open dashboards from taking duplicate
+# screenshots, while the hard entry cap keeps abandoned delegate scopes from
+# becoming an unbounded in-memory registry.
+BROWSER_PREVIEW_REFRESH_MS = 2000
+BROWSER_PREVIEW_MIN_CAPTURE_SECONDS = 1.5
+MAX_BROWSER_PREVIEW_CACHE_ENTRIES = 128
+MAX_BROWSER_PREVIEW_CACHE_BYTES = 32 * 1024 * 1024
+MAX_BROWSER_PREVIEW_FAMILY_SCOPES = 64
+MAX_BROWSER_PREVIEW_DIMENSION = 16_384
+MAX_BROWSER_PREVIEW_PIXELS = 50_000_000
 # Global ceiling on concurrent in-flight Agent generations. Each conversation
 # still drains its own queue in FIFO order, while this bound prevents a burst of
 # distinct conversations from exhausting host threads and sockets.
@@ -356,6 +368,12 @@ class EnterpriseService:
         self._conversation_lock = threading.RLock()
         self._agent_browser_tabs_lock = threading.RLock()
         self._agent_browser_current_tabs: dict[str, str] = {}
+        self._agent_browser_activity: dict[str, float] = {}
+        self._browser_preview_cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._browser_preview_cache_bytes = 0
+        # Fixed lock stripes deduplicate simultaneous captures of the same tab
+        # without retaining one lock object per short-lived delegate.
+        self._browser_preview_capture_locks = tuple(threading.Lock() for _ in range(16))
         # Message rows and their attachment files form one logical unit.  This
         # lock closes the file-written/row-inserted window against concurrent
         # administrative deletion; it is deliberately re-entrant because the
@@ -555,49 +573,60 @@ class EnterpriseService:
         strict: bool = False,
     ) -> None:
         cleanup = getattr(self.agent_client, "cleanup_scope", None)
-        if not callable(cleanup):
-            return
-        try:
+        if callable(cleanup):
             try:
-                cleanup(
-                    scope_key,
-                    lifecycle_id=lifecycle_id,
-                    delete_sessions=delete_sessions,
-                )
-            except TypeError:
                 try:
-                    # Test/local adapters and one-release third-party integrations
-                    # may still expose the pre-delete-sessions signature.
-                    cleanup(scope_key, lifecycle_id=lifecycle_id)
+                    cleanup(
+                        scope_key,
+                        lifecycle_id=lifecycle_id,
+                        delete_sessions=delete_sessions,
+                    )
                 except TypeError:
-                    # Older adapters may expose only the original scope signature.
-                    cleanup(scope_key)
-        except Exception as exc:
-            if not strict:
-                print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
-            else:
-                # A successful lifecycle mutation must not leave a known live run
-                # capable of further host-side tool effects. Restarting the managed
-                # runtime is the fail-closed fallback when targeted cancellation
-                # cannot be confirmed.
-                try:
-                    status = self.runtimes.restart_agent_runtime()
-                except Exception as restart_exc:
-                    raise ServiceError(
-                        503,
-                        f"Agent scope was reset but runtime cancellation failed: {restart_exc}",
-                    ) from restart_exc
-                if not status.available:
-                    raise ServiceError(
-                        503,
-                        f"Agent scope was reset but runtime cancellation could not be confirmed: {status.error or exc}",
-                    ) from exc
-        try:
-            self._agent_browser_tool(scope_key, "cleanup", {})
-        except Exception as exc:
-            # Browser is optional and may be disabled. Runtime/process cleanup
-            # remains authoritative; tab/session reclamation is best effort.
-            print(f"Failed to clean Agent browser scope {scope_key}: {exc}", file=sys.stderr)
+                    try:
+                        # Test/local adapters and one-release third-party integrations
+                        # may still expose the pre-delete-sessions signature.
+                        cleanup(scope_key, lifecycle_id=lifecycle_id)
+                    except TypeError:
+                        # Older adapters may expose only the original scope signature.
+                        cleanup(scope_key)
+            except Exception as exc:
+                if not strict:
+                    print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
+                else:
+                    # A successful lifecycle mutation must not leave a known live run
+                    # capable of further host-side tool effects. Restarting the managed
+                    # runtime is the fail-closed fallback when targeted cancellation
+                    # cannot be confirmed.
+                    try:
+                        status = self.runtimes.restart_agent_runtime()
+                    except Exception as restart_exc:
+                        raise ServiceError(
+                            503,
+                            f"Agent scope was reset but runtime cancellation failed: {restart_exc}",
+                        ) from restart_exc
+                    if not status.available:
+                        raise ServiceError(
+                            503,
+                            f"Agent scope was reset but runtime cancellation could not be confirmed: {status.error or exc}",
+                        ) from exc
+
+        # Delegated Agents derive their own Camofox user identity from their
+        # child scope.  Cleaning only the root leaves those browser profiles
+        # live after a lifecycle reset.  Reclaim every tracked member of the
+        # exact root/delegate family (the slash boundary avoids matching a
+        # sibling such as ``private:1-other``), then clear preview metadata.
+        browser_scope_keys = self._agent_browser_family_scope_keys(scope_key)
+        for browser_scope_key in browser_scope_keys:
+            try:
+                self._agent_browser_tool(browser_scope_key, "cleanup", {})
+            except Exception as exc:
+                # Browser is optional and may be disabled. Runtime/process cleanup
+                # remains authoritative; tab/session reclamation is best effort.
+                print(
+                    f"Failed to clean Agent browser scope {browser_scope_key}: {exc}",
+                    file=sys.stderr,
+                )
+        self._agent_browser_clear_family(scope_key)
 
     def _cleanup_all_agent_scopes(self) -> None:
         for row in self.db.query("SELECT scope_key FROM agent_scopes ORDER BY scope_key"):
@@ -3449,6 +3478,94 @@ class EnterpriseService:
             ),
         }
 
+    def agent_terminal_previews(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any]:
+        """Return a bounded read-only terminal view for an authorized scope.
+
+        Merely opening the preview must not create a workspace/scope or start a
+        runtime. The Node sidecar applies the root/delegate ownership filter;
+        this boundary independently selects only presentation fields.
+        """
+
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        scope_key = (
+            self.agent_scopes.private_scope_key(int(scope_id))
+            if scope_type == "private"
+            else self.agent_scopes.channel_scope_key(scope_id)
+        )
+        scope = self.agent_scopes.get_scope(scope_key)
+        if scope is None:
+            return {"processes": []}
+        preview = getattr(self.agent_client, "terminal_previews", None)
+        if not callable(preview):
+            return {"processes": []}
+        try:
+            payload = preview(scope.scope_key, scope.lifecycle_id)
+        except AgentRuntimeError:
+            # Preview availability is not an execution trigger. A stopped or
+            # rolling-upgrade runtime therefore appears as an empty read-only
+            # view instead of being started by an observation request.
+            return {"processes": []}
+        raw_processes = payload.get("processes") if isinstance(payload, dict) else None
+        if not isinstance(raw_processes, list):
+            return {"processes": []}
+
+        processes: list[dict[str, Any]] = []
+        for raw in raw_processes[:16]:
+            if not isinstance(raw, dict):
+                continue
+            process_id = _preview_text_head(raw.get("id"), 256)
+            if not process_id:
+                continue
+            status = str(raw.get("status") or "").strip().lower()
+            if status not in {"running", "completed", "failed", "cancelled"}:
+                status = "running" if raw.get("running") is True else "completed"
+            stdout = _preview_text_tail(raw.get("stdout"), 8 * 1024)
+            stderr = _preview_text_tail(raw.get("stderr"), 8 * 1024)
+            output = _preview_text_tail(raw.get("output"), 16 * 1024)
+            platform_output_truncated = (
+                len(_preview_plain_text(raw.get("stdout")).encode("utf-8")) > 8 * 1024
+                or len(_preview_plain_text(raw.get("stderr")).encode("utf-8")) > 8 * 1024
+                or len(_preview_plain_text(raw.get("output")).encode("utf-8")) > 16 * 1024
+            )
+            if not output:
+                output = _preview_text_tail(
+                    f"{stdout}\n[stderr]\n{stderr}" if stdout and stderr else stdout or stderr,
+                    16 * 1024,
+                )
+            process: dict[str, Any] = {
+                "id": process_id,
+                "title": _preview_text_head(raw.get("title"), 200),
+                "command": _preview_text_head(
+                    _safe_tool_summary_text(raw.get("command"), limit=4 * 1024),
+                    4 * 1024,
+                ),
+                "cwd": _preview_text_head(raw.get("cwd"), 2 * 1024),
+                "stdout": stdout,
+                "stderr": stderr,
+                "output": output,
+                "status": status,
+                "running": status == "running",
+                "started_at": _preview_text_head(raw.get("started_at"), 64),
+                "updated_at": _preview_text_head(raw.get("updated_at"), 64),
+                "truncated": raw.get("truncated") is True or platform_output_truncated,
+            }
+            finished_at = _preview_text_head(raw.get("finished_at"), 64)
+            if finished_at:
+                process["finished_at"] = finished_at
+            exit_code = raw.get("exit_code")
+            if exit_code is None:
+                if "exit_code" in raw:
+                    process["exit_code"] = None
+            elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                process["exit_code"] = max(-255, min(255, exit_code))
+            processes.append(process)
+        return {"processes": processes}
+
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         return self.runtimes.status(refresh=True)
@@ -4273,6 +4390,353 @@ class EnterpriseService:
             return {"results": results}
         raise ServiceError(400, "web action must be search or extract")
 
+    def browser_preview(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        *,
+        tab_id: str = "",
+    ) -> dict[str, Any]:
+        """Return one low-rate, read-only Camofox frame for an authorized scope.
+
+        This method intentionally does not call ``ensure_*`` for either the
+        Agent scope or managed runtime.  Merely opening the preview therefore
+        cannot create an Agent workspace, start Camofox, open a tab, navigate,
+        or change which tab the Agent considers current.
+        """
+
+        clean_scope_type = str(scope_type or "").strip().lower()
+        clean_scope_id = str(scope_id or "").strip()
+        if clean_scope_type not in {"private", "channel"}:
+            raise ServiceError(400, "unsupported Agent preview scope")
+        try:
+            numeric_scope_id = int(clean_scope_id)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "invalid Agent preview scope id") from exc
+        if numeric_scope_id <= 0 or clean_scope_id != str(numeric_scope_id):
+            raise ServiceError(400, "invalid Agent preview scope id")
+
+        normalized_type, normalized_id = self._normalize_conversation(
+            actor,
+            clean_scope_type,
+            clean_scope_id,
+        )
+        if normalized_type == "private":
+            root_scope_key = self.agent_scopes.private_scope_key(int(normalized_id))
+        else:
+            root_scope_key = self.agent_scopes.channel_scope_key(normalized_id)
+        if self.agent_scopes.get_scope(root_scope_key) is None:
+            return self._browser_preview_idle("scope_not_initialized")
+
+        requested_tab_id = str(tab_id or "").strip()
+        if (
+            len(requested_tab_id) > 512
+            or any(character in requested_tab_id for character in "\r\n\x00")
+        ):
+            raise ServiceError(400, "invalid browser preview tab id")
+
+        with self._agent_browser_tabs_lock:
+            activity = dict(self._agent_browser_activity)
+            tracked_tabs = dict(self._agent_browser_current_tabs)
+        candidate_scope_keys = self._agent_browser_family_scope_keys(root_scope_key)
+        candidate_scope_keys.sort(
+            key=lambda value: (activity.get(value, 0.0), value == root_scope_key),
+            reverse=True,
+        )
+        candidate_scope_keys = candidate_scope_keys[:MAX_BROWSER_PREVIEW_FAMILY_SCOPES]
+
+        try:
+            base_url = self.runtimes._effective_camofox_url().rstrip("/")
+            access_key = self._browser_preview_existing_access_key()
+            if not access_key:
+                return self._browser_preview_idle("browser_unavailable")
+        except Exception:
+            return self._browser_preview_idle("browser_unavailable")
+        headers = {"Authorization": f"Bearer {access_key}"}
+
+        selected: tuple[str, str, list[dict[str, Any]], dict[str, Any]] | None = None
+        successful_lists = 0
+        family_list_deadline = time.monotonic() + 5.0
+        for candidate_scope_key in candidate_scope_keys:
+            remaining = family_list_deadline - time.monotonic()
+            if remaining <= 0:
+                return self._browser_preview_idle("browser_unavailable")
+            user_id = self._agent_browser_user_id(candidate_scope_key)
+            try:
+                listed = self._runtime_json_request(
+                    base_url + "/tabs?" + urllib.parse.urlencode({"userId": user_id}),
+                    None,
+                    headers=headers,
+                    timeout=max(0.25, min(2.0, remaining)),
+                    method="GET",
+                )
+            except ServiceError:
+                # Every family identity is served by the same loopback runtime
+                # and bearer key. A transport/auth failure will affect every
+                # subsequent identity too, so fail once instead of multiplying
+                # the timeout by the delegate count.
+                return self._browser_preview_idle("browser_unavailable")
+            successful_lists += 1
+            raw_tabs = listed.get("tabs") if isinstance(listed.get("tabs"), list) else []
+            tabs: list[dict[str, Any]] = []
+            for item in raw_tabs:
+                if not isinstance(item, dict):
+                    continue
+                live_tab_id = str(item.get("tabId") or item.get("targetId") or "").strip()
+                if (
+                    not live_tab_id
+                    or len(live_tab_id) > 512
+                    or any(character in live_tab_id for character in "\r\n\x00")
+                ):
+                    continue
+                tabs.append({**item, "tabId": live_tab_id})
+            if requested_tab_id:
+                chosen = next(
+                    (item for item in tabs if item["tabId"] == requested_tab_id),
+                    None,
+                )
+                if chosen is not None:
+                    selected = (candidate_scope_key, user_id, tabs, chosen)
+                    break
+                continue
+            tracked_tab_id = tracked_tabs.get(candidate_scope_key, "")
+            chosen = next(
+                (item for item in tabs if item["tabId"] == tracked_tab_id),
+                None,
+            )
+            if chosen is None and tabs:
+                chosen = tabs[-1]
+            if chosen is not None:
+                selected = (candidate_scope_key, user_id, tabs, chosen)
+                break
+
+        if selected is None:
+            reason = "no_open_tab" if successful_lists else "browser_unavailable"
+            return self._browser_preview_idle(reason)
+
+        selected_scope_key, user_id, tabs, selected_tab = selected
+        selected_tab_id = str(selected_tab["tabId"])
+        return self._capture_browser_preview_frame(
+            root_scope_key=root_scope_key,
+            selected_scope_key=selected_scope_key,
+            selected_tab_id=selected_tab_id,
+            selected_tab=selected_tab,
+            tab_count=len(tabs),
+            user_id=user_id,
+            base_url=base_url,
+            headers=headers,
+        )
+
+    def _capture_browser_preview_frame(
+        self,
+        *,
+        root_scope_key: str,
+        selected_scope_key: str,
+        selected_tab_id: str,
+        selected_tab: dict[str, Any],
+        tab_count: int,
+        user_id: str,
+        base_url: str,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        cache_key = (selected_scope_key, selected_tab_id)
+
+        def cache_idle(reason: str) -> dict[str, Any]:
+            # A failing local browser can otherwise make every dashboard waiter
+            # repeat the same slow screenshot attempt after acquiring this tab's
+            # capture stripe. Cache the bounded idle result for the same short
+            # interval as a successful frame so concurrent observers collapse to
+            # one failure without hiding recovery for more than 1.5 seconds.
+            frame = self._browser_preview_idle(reason)
+            with self._agent_browser_tabs_lock:
+                self._browser_preview_cache_put_unlocked(
+                    cache_key,
+                    {
+                        "captured_monotonic": time.monotonic(),
+                        "frame": frame,
+                    },
+                )
+            return dict(frame)
+
+        stripe_digest = hashlib.sha256(
+            f"{selected_scope_key}\x00{selected_tab_id}".encode("utf-8")
+        ).digest()
+        capture_lock = self._browser_preview_capture_locks[stripe_digest[0] % len(self._browser_preview_capture_locks)]
+        with capture_lock:
+            monotonic_now = time.monotonic()
+            with self._agent_browser_tabs_lock:
+                cached = self._browser_preview_cache.get(cache_key)
+                if cached is not None and (
+                    monotonic_now - float(cached.get("captured_monotonic") or 0.0)
+                    < BROWSER_PREVIEW_MIN_CAPTURE_SECONDS
+                ):
+                    self._browser_preview_cache.move_to_end(cache_key)
+                    return dict(cached["frame"])
+
+            encoded_tab_id = urllib.parse.quote(selected_tab_id, safe="")
+            query = urllib.parse.urlencode({"userId": user_id, "fullPage": "false"})
+            try:
+                # Validate immediately before and after capture.  Besides keeping
+                # metadata fresh, this preserves the browser URL policy even when a
+                # page redirects while the PNG is being produced.
+                before = self._runtime_json_request(
+                    f"{base_url}/tabs/{encoded_tab_id}/stats?"
+                    + urllib.parse.urlencode({"userId": user_id}),
+                    None,
+                    headers=headers,
+                    timeout=3,
+                    method="GET",
+                )
+                self._validate_browser_page_url(str(before.get("url") or ""))
+                image, mime_type = self._runtime_binary_request(
+                    f"{base_url}/tabs/{encoded_tab_id}/screenshot?{query}",
+                    headers=headers,
+                    timeout=8,
+                    max_bytes=8 * 1024 * 1024,
+                    allowed_content_types={"image/png"},
+                )
+                after = self._runtime_json_request(
+                    f"{base_url}/tabs/{encoded_tab_id}/stats?"
+                    + urllib.parse.urlencode({"userId": user_id}),
+                    None,
+                    headers=headers,
+                    timeout=3,
+                    method="GET",
+                )
+                current_url = str(after.get("url") or before.get("url") or "")
+                self._validate_browser_page_url(current_url)
+            except ServiceError:
+                return cache_idle("browser_unavailable")
+
+            if (
+                mime_type != "image/png"
+                or len(image) < 24
+                or not image.startswith(b"\x89PNG\r\n\x1a\n")
+                or image[12:16] != b"IHDR"
+            ):
+                return cache_idle("browser_unavailable")
+            width = int.from_bytes(image[16:20], "big")
+            height = int.from_bytes(image[20:24], "big")
+            if (
+                width <= 0
+                or height <= 0
+                or width > MAX_BROWSER_PREVIEW_DIMENSION
+                or height > MAX_BROWSER_PREVIEW_DIMENSION
+                or width * height > MAX_BROWSER_PREVIEW_PIXELS
+            ):
+                return cache_idle("browser_unavailable")
+
+            captured_at = int(time.time() * 1000)
+            title = str(
+                after.get("title")
+                or selected_tab.get("title")
+                or before.get("title")
+                or ""
+            )[:1000]
+            session = (
+                "main"
+                if selected_scope_key == root_scope_key
+                else "delegate-"
+                + hashlib.sha256(selected_scope_key.encode("utf-8")).hexdigest()[:12]
+            )
+            public_url = self._browser_preview_public_url(current_url)
+            etag_digest = hashlib.sha256()
+            for part in (
+                image,
+                public_url.encode("utf-8"),
+                title.encode("utf-8"),
+                selected_tab_id.encode("utf-8"),
+                session.encode("ascii"),
+            ):
+                etag_digest.update(part)
+                etag_digest.update(b"\x00")
+            frame = {
+                "active": True,
+                "status": "live",
+                "state": "live",
+                "image": image,
+                "mime_type": "image/png",
+                "etag": f'"{etag_digest.hexdigest()}"',
+                "captured_at": captured_at,
+                "tab_id": selected_tab_id,
+                "tab_count": tab_count,
+                "session": session,
+                "url": public_url,
+                "title": title,
+                "width": width,
+                "height": height,
+                "refresh_interval_ms": BROWSER_PREVIEW_REFRESH_MS,
+            }
+            with self._agent_browser_tabs_lock:
+                self._browser_preview_cache_put_unlocked(
+                    cache_key,
+                    {
+                        # Record freshness only after the potentially slow
+                        # screenshot completes, so a new frame cannot be born
+                        # already expired.
+                        "captured_monotonic": time.monotonic(),
+                        "frame": frame,
+                    },
+                )
+            return dict(frame)
+
+    @staticmethod
+    def _browser_preview_idle(reason: str) -> dict[str, Any]:
+        clean_reason = str(reason or "browser_unavailable")
+        return {
+            "active": False,
+            "status": "idle",
+            "state": "idle",
+            "reason": clean_reason,
+            "refresh_interval_ms": BROWSER_PREVIEW_REFRESH_MS,
+            "etag": f'"idle-{hashlib.sha256(clean_reason.encode("utf-8")).hexdigest()[:24]}"',
+        }
+
+    @staticmethod
+    def _browser_preview_public_url(value: str) -> str:
+        clean = str(value or "").strip()
+        if clean == "about:blank":
+            return clean
+        try:
+            parsed = urllib.parse.urlparse(clean)
+            hostname = (parsed.hostname or "").encode("idna").decode("ascii")
+            if not hostname or parsed.scheme not in {"http", "https"}:
+                return ""
+            display_host = f"[{hostname}]" if ":" in hostname else hostname
+            port = parsed.port
+            default_port = 443 if parsed.scheme == "https" else 80
+            netloc = display_host if port in {None, default_port} else f"{display_host}:{port}"
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, netloc, parsed.path or "/", "", "")
+            )
+        except (UnicodeError, ValueError):
+            return ""
+
+    def _browser_preview_existing_access_key(self) -> str:
+        # Unlike the Agent tool path, preview must not create runtime state. Do
+        # not call _camofox_access_key(), which generates the key file when it is
+        # absent; only consume a configured or already-materialized credential.
+        try:
+            value = self.runtimes._first_secret(
+                "CAMOFOX_ACCESS_KEY",
+                "CAMOFOX_API_KEY",
+            )
+        except Exception:
+            value = ""
+        if value:
+            return str(value)
+        path = self.config.runtime_dir / "camofox" / "access-key"
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        return existing if len(existing) >= 32 else ""
+
+    @staticmethod
+    def _agent_browser_user_id(scope_key: str) -> str:
+        return "agent-" + hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+
     def _agent_browser_tool(
         self,
         scope_key: str,
@@ -4293,13 +4757,13 @@ class EnterpriseService:
         if action == "cleanup":
             status = self.runtimes.camofox_status(refresh=True)
             if not status.available:
-                self._agent_browser_clear_current_tab(scope_key)
+                self._agent_browser_forget_scope(scope_key)
                 return {"ok": True, "skipped": True, "detail": "browser runtime is not running"}
         ready = self.runtimes.ensure_camofox_ready(wait=True)
         if not ready.available:
             raise ServiceError(503, ready.error or "managed Camoufox browser is unavailable")
         base_url = self.runtimes._effective_camofox_url().rstrip("/")
-        user_id = "agent-" + hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+        user_id = self._agent_browser_user_id(scope_key)
         access_key = self.runtimes._camofox_access_key()
         headers = {"Authorization": f"Bearer {access_key}"}
         tab_id = str(arguments.get("tab_id") or arguments.get("tabId") or "").strip()
@@ -4311,7 +4775,7 @@ class EnterpriseService:
                 timeout=30,
                 method="DELETE",
             )
-            self._agent_browser_clear_current_tab(scope_key)
+            self._agent_browser_forget_scope(scope_key)
             return result
         if action == "list":
             listed = self._runtime_json_request(
@@ -4618,10 +5082,98 @@ class EnterpriseService:
             return
         with self._agent_browser_tabs_lock:
             self._agent_browser_current_tabs[scope_key] = clean_tab_id
+            self._agent_browser_activity[scope_key] = time.monotonic()
+            self._agent_browser_drop_preview_cache_unlocked(scope_key)
 
     def _agent_browser_clear_current_tab(self, scope_key: str) -> None:
         with self._agent_browser_tabs_lock:
             self._agent_browser_current_tabs.pop(scope_key, None)
+            self._agent_browser_drop_preview_cache_unlocked(scope_key)
+
+    def _agent_browser_forget_scope(self, scope_key: str) -> None:
+        with self._agent_browser_tabs_lock:
+            self._agent_browser_current_tabs.pop(scope_key, None)
+            self._agent_browser_activity.pop(scope_key, None)
+            self._agent_browser_drop_preview_cache_unlocked(scope_key)
+
+    def _agent_browser_family_scope_keys(self, root_scope_key: str) -> list[str]:
+        root = str(root_scope_key)
+        delegate_prefix = root + "/delegate/"
+        with self._agent_browser_tabs_lock:
+            candidates = set(self._agent_browser_current_tabs) | set(self._agent_browser_activity)
+        # Always include the root.  This also lets a service restarted after a
+        # previous browser session discover the root profile without creating
+        # any state. Delegate identities are intentionally ephemeral and are
+        # included only when this process observed them.
+        children = sorted(
+            candidate
+            for candidate in candidates
+            if candidate.startswith(delegate_prefix)
+        )
+        return [root, *children]
+
+    def _agent_browser_clear_family(self, root_scope_key: str) -> None:
+        root = str(root_scope_key)
+        delegate_prefix = root + "/delegate/"
+        with self._agent_browser_tabs_lock:
+            family = {
+                candidate
+                for candidate in (
+                    set(self._agent_browser_current_tabs) | set(self._agent_browser_activity)
+                )
+                if candidate == root or candidate.startswith(delegate_prefix)
+            }
+            family.add(root)
+            for candidate in family:
+                self._agent_browser_current_tabs.pop(candidate, None)
+                self._agent_browser_activity.pop(candidate, None)
+                self._agent_browser_drop_preview_cache_unlocked(candidate)
+
+    def _agent_browser_drop_preview_cache_unlocked(self, scope_key: str) -> None:
+        for cache_key in tuple(self._browser_preview_cache):
+            if cache_key[0] == scope_key:
+                removed = self._browser_preview_cache.pop(cache_key, None)
+                if removed is not None:
+                    frame = removed.get("frame") if isinstance(removed, dict) else None
+                    image = frame.get("image") if isinstance(frame, dict) else None
+                    if isinstance(image, bytes):
+                        self._browser_preview_cache_bytes = max(
+                            0,
+                            self._browser_preview_cache_bytes - len(image),
+                        )
+
+    def _browser_preview_cache_put_unlocked(
+        self,
+        cache_key: tuple[str, str],
+        entry: dict[str, Any],
+    ) -> None:
+        previous = self._browser_preview_cache.pop(cache_key, None)
+        if previous is not None:
+            previous_frame = previous.get("frame") if isinstance(previous, dict) else None
+            previous_image = previous_frame.get("image") if isinstance(previous_frame, dict) else None
+            if isinstance(previous_image, bytes):
+                self._browser_preview_cache_bytes = max(
+                    0,
+                    self._browser_preview_cache_bytes - len(previous_image),
+                )
+        frame = entry.get("frame") if isinstance(entry, dict) else None
+        image = frame.get("image") if isinstance(frame, dict) else None
+        image_bytes = len(image) if isinstance(image, bytes) else 0
+        self._browser_preview_cache[cache_key] = entry
+        self._browser_preview_cache_bytes += image_bytes
+        self._browser_preview_cache.move_to_end(cache_key)
+        while self._browser_preview_cache and (
+            len(self._browser_preview_cache) > MAX_BROWSER_PREVIEW_CACHE_ENTRIES
+            or self._browser_preview_cache_bytes > MAX_BROWSER_PREVIEW_CACHE_BYTES
+        ):
+            _old_key, removed = self._browser_preview_cache.popitem(last=False)
+            removed_frame = removed.get("frame") if isinstance(removed, dict) else None
+            removed_image = removed_frame.get("image") if isinstance(removed_frame, dict) else None
+            if isinstance(removed_image, bytes):
+                self._browser_preview_cache_bytes = max(
+                    0,
+                    self._browser_preview_cache_bytes - len(removed_image),
+                )
 
     def _agent_browser_validate_tab_url(
         self,
@@ -7289,20 +7841,42 @@ def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
     if not clean:
         return ""
     clean = re.sub(
-        r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|signature|session[_-]?(?:id|token|key|secret))[A-Za-z0-9_.-]*)\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
+        r"(?i)([\"'])((?:authorization|(?:set-)?cookie)\s*:).*?\1",
+        lambda match: f"{match.group(1)}{match.group(2)} •••{match.group(1)}",
+        clean,
+    )
+    # Handle multi-token authentication headers before the generic named-secret
+    # matcher. Otherwise the generic rule consumes only ``Bearer``/``Basic`` as
+    # the value of ``Authorization`` and leaves the actual credential behind.
+    clean = re.sub(r"(?i)\b(authorization\s*:\s*(?:bearer|basic))\s+\S+", r"\1 •••", clean)
+    clean = re.sub(
+        r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|signature|auth(?:orization)?|pat|session(?:[_-]?(?:id|token|key|secret))?)[A-Za-z0-9_.-]*)\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
         lambda match: f"{match.group(1)}=•••",
         clean,
     )
-    clean = re.sub(r"(?i)\b(authorization\s*:\s*(?:bearer|basic))\s+\S+", r"\1 •••", clean)
+    clean = re.sub(
+        r"(?i)([?&][A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|auth(?:orization)?|pat|session)[A-Za-z0-9_.-]*=)[^&#\s\"';|]+",
+        r"\1•••",
+        clean,
+    )
     clean = re.sub(r"(?i)\b((?:set-)?cookie\s*:)\s*[^\s,;]+", r"\1 •••", clean)
-    clean = re.sub(r"(?i)((?<!\S)(?:-u|--user)\s+)\S+", r"\1•••", clean)
+    clean = re.sub(
+        r"(?i)((?<!\S)(?:-u|--user|-b|--cookie)(?:\s*=\s*|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
+        r"\1•••",
+        clean,
+    )
     clean = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^@/\s]+@", r"\1•••@", clean)
     clean = re.sub(
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b",
         "•••",
         clean,
     )
-    clean = re.sub(r"\b(?:sk|gh[pousr])[-_][A-Za-z0-9_-]{16,}\b", "•••", clean)
+    clean = re.sub(
+        r"\b(?:github_pat_|gh[pousr]_|glpat-|sk-)[A-Za-z0-9_-]{16,}\b",
+        "•••",
+        clean,
+        flags=re.IGNORECASE,
+    )
     clean = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "•••", clean)
     clean = re.sub(r"\b[A-Za-z0-9_+/=-]{48,}\b", "•••", clean)
     clean = re.sub(
@@ -7313,6 +7887,30 @@ def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
     if len(clean) > limit:
         clean = clean[: max(1, limit - 1)].rstrip() + "…"
     return clean
+
+
+def _preview_plain_text(value: Any) -> str:
+    clean = str(value or "")
+    clean = re.sub(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)", "", clean)
+    clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
+    clean = re.sub(r"\x1b[@-_]", "", clean)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", clean)
+
+
+def _preview_text_head(value: Any, max_bytes: int) -> str:
+    clean = _preview_plain_text(value)
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return clean
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _preview_text_tail(value: Any, max_bytes: int) -> str:
+    clean = _preview_plain_text(value)
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return clean
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
 
 def parse_bool(value: Any) -> bool:

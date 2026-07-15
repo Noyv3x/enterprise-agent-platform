@@ -174,4 +174,15 @@ export const ICONS: Record<IconName, readonly IconPrimitive[]> = {
     ["path", { d: "M22 21v-2a4 4 0 0 0-3-3.9" }],
     ["path", { d: "M16 3.1a4 4 0 0 1 0 7.8" }],
   ],
+  browser: [
+    ["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }],
+    ["path", { d: "M3 9h18" }],
+    ["path", { d: "M7 6.5h.01" }],
+    ["path", { d: "M10 6.5h.01" }],
+  ],
+  terminal: [
+    ["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }],
+    ["path", { d: "m7 9 3 3-3 3" }],
+    ["path", { d: "M13 15h4" }],
+  ],
 };

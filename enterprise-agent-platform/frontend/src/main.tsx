@@ -6,6 +6,7 @@ import "./design-system.css";
 import "./components/chat/chat.css";
 import "./components/admin/admin.css";
 import "./styles/workspace-modern.css";
+import "./components/preview/preview.css";
 
 const root = document.getElementById("react-root");
 if (!root) {

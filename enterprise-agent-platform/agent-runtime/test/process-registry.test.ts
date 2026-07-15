@@ -96,6 +96,116 @@ test("ProcessRegistry confirms scope cleanup only after the child close event", 
   }
 });
 
+test("ProcessRegistry exposes a bounded control-free root and delegate preview without internal identifiers", async () => {
+  const workspace = await temporaryDirectory("agent-process-preview-");
+  const registry = new ProcessRegistry();
+  try {
+    const root = await registry.run({
+      runId: "internal-root-run",
+      scopeKey: "private:7",
+      lifecycleId: "life-7",
+      command: "TOKEN=root-secret printf '\\033]0;host-title\\007\\033[31mroot-output\\033[0m\\001' # https://example.test/?token=url-secret&api_key=query-secret&session_id=session-url-secret&auth_token=auth-url-secret&cookie=cookie-url-secret curl -u user:pass --cookie session=cookie-secret -H 'Authorization: Bearer bearer-secret' -H 'Cookie: sid=first-cookie-secret; theme=second-cookie-secret' github_pat_abcdefghijklmnopqrstuvwxyz glpat-abcdefghijklmnopqrstuvwxyz",
+      cwd: workspace,
+    });
+    const delegate = await registry.run({
+      runId: "internal-child-run",
+      scopeKey: "private:7/delegate/child-1",
+      lifecycleId: "life-7",
+      command: "SESSION_TOKEN=delegate-secret printf delegate-output",
+      cwd: workspace,
+    });
+    await registry.run({
+      runId: "internal-sibling-run",
+      scopeKey: "private:70",
+      lifecycleId: "life-7",
+      command: "printf sibling-output",
+      cwd: workspace,
+    });
+    const running = await registry.run({
+      runId: "internal-running-run",
+      scopeKey: "private:7",
+      lifecycleId: "life-7",
+      command: "printf running-output; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    await waitUntil(() => registry.get("private:7", running.id, "life-7").stdout.includes("running-output"));
+
+    const preview = registry.preview("private:7", "life-7");
+    assert.equal(preview.length, 3);
+    assert.equal(preview[0]?.id, running.id);
+    assert.deepEqual(new Set(preview.map((process) => process.id)), new Set([root.id, delegate.id, running.id]));
+    for (const process of preview) {
+      assert.equal(process.running, process.status === "running");
+      for (const internal of ["pid", "run_id", "scope_key", "lifecycle_id"]) {
+        assert.equal(internal in process, false);
+      }
+    }
+    const rootPreview = preview.find((process) => process.id === root.id)!;
+    assert.equal(rootPreview.stdout, "root-output");
+    assert.equal(rootPreview.output, "root-output");
+    assert.doesNotMatch(rootPreview.stdout, /\u001b|\u0001|host-title/);
+    for (const secret of [
+      "root-secret",
+      "url-secret",
+      "query-secret",
+      "session-url-secret",
+      "auth-url-secret",
+      "cookie-url-secret",
+      "user:pass",
+      "cookie-secret",
+      "bearer-secret",
+      "first-cookie-secret",
+      "second-cookie-secret",
+      "github_pat_abcdefghijklmnopqrstuvwxyz",
+      "glpat-abcdefghijklmnopqrstuvwxyz",
+    ]) {
+      assert.doesNotMatch(rootPreview.command, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+    assert.match(rootPreview.command, /\[redacted\]/);
+    assert.doesNotMatch(preview.find((process) => process.id === delegate.id)!.command, /delegate-secret/);
+  } finally {
+    registry.killScope("private:7", "life-7");
+    registry.killScope("private:70", "life-7");
+    await registry.waitForScopeExit("private:7", "life-7", 5_000);
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("ProcessRegistry caps preview process count and returns only a bounded output tail", async () => {
+  const workspace = await temporaryDirectory("agent-process-preview-bounds-");
+  const registry = new ProcessRegistry();
+  try {
+    for (let index = 0; index < 18; index += 1) {
+      await registry.run({
+        runId: `run-${index}`,
+        scopeKey: "scope",
+        lifecycleId: "life",
+        command: `printf process-${index}`,
+        cwd: workspace,
+      });
+    }
+    const large = await registry.run({
+      runId: "large-run",
+      scopeKey: "scope",
+      lifecycleId: "life",
+      command: "printf '%020000d' 7",
+      cwd: workspace,
+    });
+
+    const preview = registry.preview("scope", "life");
+    assert.equal(preview.length, 16);
+    const largePreview = preview.find((process) => process.id === large.id)!;
+    assert.ok(largePreview);
+    assert.ok(Buffer.byteLength(largePreview.stdout, "utf8") <= 8 * 1024);
+    assert.ok(Buffer.byteLength(largePreview.output, "utf8") <= 16 * 1024);
+    assert.equal(largePreview.stdout.endsWith("7"), true);
+    assert.equal(largePreview.truncated, true);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 async function waitUntil(read: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

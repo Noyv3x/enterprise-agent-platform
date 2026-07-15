@@ -139,6 +139,25 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/scopes/processes") {
+    const allowedQuery = new Set(["scope_key", "lifecycle_id"]);
+    if ([...url.searchParams.keys()].some((key) => !allowedQuery.has(key))) {
+      throw httpError(400, "Process preview accepts only scope_key and lifecycle_id");
+    }
+    const scopeKeys = url.searchParams.getAll("scope_key");
+    const lifecycleIds = url.searchParams.getAll("lifecycle_id");
+    const scopeKey = scopeKeys.length === 1 ? scopeKeys[0]!.trim() : "";
+    const lifecycleId = lifecycleIds.length === 1 ? lifecycleIds[0]!.trim() : "";
+    if (!scopeKey || scopeKey.length > 512) {
+      throw httpError(400, "scope_key must be a non-empty string of at most 512 characters");
+    }
+    if (!lifecycleId || lifecycleId.length > 512) {
+      throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
+    }
+    json(response, 200, { processes: coordinator.processes.preview(scopeKey, lifecycleId) });
+    return;
+  }
+
   throw httpError(404, "Not found");
 }
 

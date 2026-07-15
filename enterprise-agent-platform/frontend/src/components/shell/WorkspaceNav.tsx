@@ -21,6 +21,8 @@ export function WorkspaceNav() {
   const specs: NavSpec[] = [];
   if (perms.has("private_agent")) specs.push({ view: "private", label: t("nav.privateAgent"), icon: "bot" });
   specs.push({ view: "knowledge", label: t("nav.knowledge"), icon: "library" });
+  specs.push({ view: "browserPreview", label: t("nav.browserPreview"), icon: "browser" });
+  specs.push({ view: "terminalPreview", label: t("nav.terminalPreview"), icon: "terminal" });
 
   return (
     <nav className="nav" aria-label={t("shell.navigation")}>

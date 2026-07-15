@@ -4,7 +4,7 @@
    from the specs (plan §2.2). Keep paths/methods byte-for-byte.
    ===================================================================== */
 
-import type { Id } from "../types";
+import type { Id, ScopeType } from "../types";
 import type {
   AuditChannelMessagesResponse,
   AuditPrivateMessagesResponse,
@@ -55,6 +55,7 @@ import type {
   TelegramConfigResponse,
   TelegramConfigUpdateRequest,
   TokenUsageResponse,
+  TerminalPreviewsResponse,
   TypingRequest,
   UpdateCurrentUserRequest,
   UpdateCurrentUserResponse,
@@ -143,6 +144,23 @@ export const endpoints = {
     () => "/api/private-agent/telegram",
   ),
   deletePrivateTelegram: ep<string, unknown>("DELETE", () => "/api/private-agent/telegram"),
+
+  /* read-only Agent previews */
+  browserPreview: ep<void, Response, [ScopeType, Id, string?]>(
+    "GET",
+    (scopeType, scopeId, tabId) => {
+      const params = new URLSearchParams({ scope_type: scopeType, scope_id: String(scopeId) });
+      if (tabId) params.set("tab_id", tabId);
+      return `/api/agent-previews/browser?${params.toString()}`;
+    },
+  ),
+  terminalPreviews: ep<void, TerminalPreviewsResponse, [ScopeType, Id]>(
+    "GET",
+    (scopeType, scopeId) => {
+      const params = new URLSearchParams({ scope_type: scopeType, scope_id: String(scopeId) });
+      return `/api/agent-previews/terminals?${params.toString()}`;
+    },
+  ),
 
   /* mentions */
   mentionTargets: ep<void, MentionTargetsResponse>("GET", () => "/api/mention-targets"),

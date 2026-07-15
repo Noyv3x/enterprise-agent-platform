@@ -11,6 +11,7 @@
 
 import type {
   ActiveView,
+  AgentPreviewScope,
   AdminPageId,
   AgentRuntimeConfigState,
   AgentStatus,
@@ -88,6 +89,7 @@ export interface AppState {
 
   /* ui slice */
   sidebarOpen: boolean;
+  previewScope: AgentPreviewScope | null;
   resourceStates: Record<string, ResourceState>;
 }
 
@@ -146,7 +148,7 @@ export type AdminSliceState = Pick<
   | "oauthCallbackUrls"
 >;
 
-export type UiSliceState = Pick<AppState, "sidebarOpen" | "resourceStates">;
+export type UiSliceState = Pick<AppState, "sidebarOpen" | "previewScope" | "resourceStates">;
 
 /* ===================================================================== */
 /* Action discriminated union — the contract every reducer is filled against. */
@@ -371,6 +373,10 @@ interface SetSidebarOpenAction {
 interface ToggleSidebarAction {
   type: "TOGGLE_SIDEBAR";
 }
+interface SetPreviewScopeAction {
+  type: "SET_PREVIEW_SCOPE";
+  payload: AgentPreviewScope | null;
+}
 interface SetResourceStateAction {
   type: "SET_RESOURCE_STATE";
   payload: { key: string; state: ResourceState };
@@ -434,6 +440,7 @@ export type Action =
   /* ui */
   | SetSidebarOpenAction
   | ToggleSidebarAction
+  | SetPreviewScopeAction
   | SetResourceStateAction;
 
 /** Discriminated-union helper: the action for a given `type`. */

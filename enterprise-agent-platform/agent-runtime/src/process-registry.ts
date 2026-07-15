@@ -18,13 +18,44 @@ export interface ProcessSnapshot {
   finished_at?: string;
 }
 
+export interface ProcessPreview {
+  id: string;
+  title: string;
+  command: string;
+  cwd: string;
+  stdout: string;
+  stderr: string;
+  output: string;
+  status: ProcessSnapshot["status"];
+  running: boolean;
+  exit_code?: number | null;
+  started_at: string;
+  updated_at: string;
+  finished_at?: string;
+  truncated: boolean;
+}
+
 interface ManagedProcess extends ProcessSnapshot {
   child: ChildProcessWithoutNullStreams;
   outputBytes: number;
   streamedBytes: number;
   outputLimitExceeded: boolean;
   exitConfirmed: boolean;
+  previewStdout: string;
+  previewStderr: string;
+  previewStdoutTruncated: boolean;
+  previewStderrTruncated: boolean;
+  previewUpdatedAt: string;
 }
+
+const PREVIEW_PROCESS_LIMIT = 16;
+const PREVIEW_CAPTURE_BYTES = 64 * 1024;
+// stdout + stderr + the combined output field remain below roughly 1 MiB for
+// the maximum 16-process response, even when JSON escaping doubles newlines.
+const PREVIEW_STREAM_BYTES = 8 * 1024;
+const PREVIEW_COMBINED_BYTES = 16 * 1024;
+const PREVIEW_COMMAND_BYTES = 4 * 1024;
+const PREVIEW_CWD_BYTES = 2 * 1024;
 
 export interface RunCommandOptions {
   runId: string;
@@ -108,6 +139,11 @@ export class ProcessRegistry {
       streamedBytes: 0,
       outputLimitExceeded: false,
       exitConfirmed: false,
+      previewStdout: "",
+      previewStderr: "",
+      previewStdoutTruncated: false,
+      previewStderrTruncated: false,
+      previewUpdatedAt: new Date().toISOString(),
     };
     this.processes.set(processId, managed);
     child.stdout.setEncoding("utf8");
@@ -123,6 +159,7 @@ export class ProcessRegistry {
         managed.status = "failed";
         managed.stderr = truncate(`${managed.stderr}\n${errorMessage(error)}`.trim(), this.maxCapturedBytes);
         managed.finished_at = new Date().toISOString();
+        managed.previewUpdatedAt = managed.finished_at;
         reject(error);
       });
       child.once("close", (code, signal) => {
@@ -131,6 +168,7 @@ export class ProcessRegistry {
         if (managed.status === "cancelled" || signal) managed.status = "cancelled";
         else managed.status = code === 0 ? "completed" : "failed";
         managed.exitConfirmed = true;
+        managed.previewUpdatedAt = managed.finished_at;
         this.rememberCompleted(managed);
         resolve(this.snapshot(managed));
       });
@@ -160,6 +198,24 @@ export class ProcessRegistry {
     return [...this.processes.values()]
       .filter((process) => process.scope_key === scopeKey && (!lifecycleId || process.lifecycle_id === lifecycleId))
       .map((process) => this.snapshot(process));
+  }
+
+  /**
+   * Return a bounded, presentation-safe view of a root Agent scope and its
+   * delegates. This intentionally has no companion write/kill operation.
+   */
+  preview(scopeKey: string, lifecycleId: string): ProcessPreview[] {
+    this.pruneCompleted();
+    return [...this.processes.values()]
+      .filter((process) => scopeOwns(scopeKey, process.scope_key) && process.lifecycle_id === lifecycleId)
+      .sort((left, right) => {
+        const running = Number(right.status === "running") - Number(left.status === "running");
+        if (running !== 0) return running;
+        const recency = Date.parse(right.started_at) - Date.parse(left.started_at);
+        return recency || right.id.localeCompare(left.id);
+      })
+      .slice(0, PREVIEW_PROCESS_LIMIT)
+      .map((process, index) => this.previewSnapshot(process, index));
   }
 
   get(scopeKey: string, processId: string, lifecycleId?: string): ProcessSnapshot {
@@ -262,6 +318,12 @@ export class ProcessRegistry {
     const bytes = Buffer.byteLength(chunk);
     process.outputBytes += bytes;
     process[channel] = truncate(process[channel] + chunk, this.maxCapturedBytes);
+    const previewKey = channel === "stdout" ? "previewStdout" : "previewStderr";
+    const truncatedKey = channel === "stdout" ? "previewStdoutTruncated" : "previewStderrTruncated";
+    const preview = utf8Tail(process[previewKey] + chunk, PREVIEW_CAPTURE_BYTES);
+    process[previewKey] = preview.value;
+    process[truncatedKey] ||= preview.truncated;
+    process.previewUpdatedAt = new Date().toISOString();
     if (process.streamedBytes < this.maxStreamedBytes) {
       const remaining = this.maxStreamedBytes - process.streamedBytes;
       const selected = Buffer.from(chunk).subarray(0, remaining).toString("utf8");
@@ -281,6 +343,7 @@ export class ProcessRegistry {
   private killManaged(process: ManagedProcess): void {
     if (process.status !== "running") return;
     process.status = "cancelled";
+    process.previewUpdatedAt = new Date().toISOString();
     const pid = process.child.pid;
     try {
       if (pid && globalThis.process.platform !== "win32") globalThis.process.kill(-pid, "SIGTERM");
@@ -307,10 +370,106 @@ export class ProcessRegistry {
       streamedBytes: _streamedBytes,
       outputLimitExceeded: _outputLimitExceeded,
       exitConfirmed: _exitConfirmed,
+      previewStdout: _previewStdout,
+      previewStderr: _previewStderr,
+      previewStdoutTruncated: _previewStdoutTruncated,
+      previewStderrTruncated: _previewStderrTruncated,
+      previewUpdatedAt: _previewUpdatedAt,
       ...snapshot
     } = process;
     return { ...snapshot };
   }
+
+  private previewSnapshot(process: ManagedProcess, index: number): ProcessPreview {
+    const stdout = boundedPlainText(process.previewStdout, PREVIEW_STREAM_BYTES);
+    const stderr = boundedPlainText(process.previewStderr, PREVIEW_STREAM_BYTES);
+    const combined = stdout.value && stderr.value
+      ? `${stdout.value}\n[stderr]\n${stderr.value}`
+      : stdout.value || stderr.value;
+    const output = utf8Tail(combined, PREVIEW_COMBINED_BYTES);
+    const result: ProcessPreview = {
+      id: process.id,
+      title: `Terminal ${index + 1}`,
+      command: redactPreviewCommand(process.command),
+      cwd: boundedPlainText(process.cwd, PREVIEW_CWD_BYTES).value,
+      stdout: stdout.value,
+      stderr: stderr.value,
+      output: output.value,
+      status: process.status,
+      running: process.status === "running",
+      started_at: process.started_at,
+      updated_at: process.previewUpdatedAt,
+      truncated: process.previewStdoutTruncated
+        || process.previewStderrTruncated
+        || stdout.truncated
+        || stderr.truncated
+        || output.truncated,
+    };
+    if (process.exit_code !== undefined) result.exit_code = process.exit_code;
+    if (process.finished_at !== undefined) result.finished_at = process.finished_at;
+    return result;
+  }
+}
+
+function redactPreviewCommand(value: string): string {
+  const sensitiveName = "[A-Za-z0-9_.-]*(?:token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|auth|pat|session(?:[_-]?(?:id|key|token|secret))?)[A-Za-z0-9_.-]*";
+  let command = stripTerminalControls(value);
+  // Header values commonly contain semicolon-separated cookies. Redact the
+  // complete quoted header before token-oriented rules can expose a later
+  // cookie whose name itself does not look sensitive.
+  command = command.replace(
+    /(["'])((?:authorization|(?:set-)?cookie)\s*:)[\s\S]*?\1/gi,
+    "$1$2 [redacted]$1",
+  );
+  command = command.replace(
+    new RegExp(`\\b(${sensitiveName})\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s;|&]+)`, "gi"),
+    "$1=[redacted]",
+  );
+  command = command.replace(
+    /(--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|private[-_]?key|credential|cookie|auth|pat|session))(?:\s*=\s*|\s+)(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
+    "$1 [redacted]",
+  );
+  command = command.replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^\s'";|&]+/gi, "$1[redacted]");
+  command = command.replace(/((?:set-)?cookie\s*:\s*)[^\s'";|&]+/gi, "$1[redacted]");
+  command = command.replace(
+    /((?:^|\s)(?:-u|--user)(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
+    "$1[redacted]",
+  );
+  command = command.replace(
+    /((?:^|\s)(?:-b|--cookie)(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
+    "$1[redacted]",
+  );
+  command = command.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, "$1[redacted]@");
+  command = command.replace(
+    new RegExp(`([?&](?:${sensitiveName})=)[^&#\\s'";|]+`, "gi"),
+    "$1[redacted]",
+  );
+  command = command.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g, "[redacted]");
+  command = command.replace(/\b(?:github_pat_|gh[pousr]_|glpat-|sk-)[A-Za-z0-9_-]{16,}\b/gi, "[redacted]");
+  return utf8Tail(command, PREVIEW_COMMAND_BYTES).value;
+}
+
+function boundedPlainText(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  return utf8Tail(stripTerminalControls(value), maxBytes);
+}
+
+function stripTerminalControls(value: string): string {
+  return value
+    // Operating-system commands (including terminal-title changes).
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    // Control Sequence Introducer and remaining two-byte escape sequences.
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[@-_]/g, "")
+    // Preserve ordinary terminal layout characters only.
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+}
+
+function utf8Tail(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= maxBytes) return { value, truncated: false };
+  let start = buffer.length - maxBytes;
+  while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
+  return { value: buffer.subarray(start).toString("utf8"), truncated: true };
 }
 
 export function scrubEnvironment(source: NodeJS.ProcessEnv | Record<string, string | undefined>): NodeJS.ProcessEnv {

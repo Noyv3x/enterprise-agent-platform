@@ -58,6 +58,20 @@ class _FakeRuntime:
                 if self.path == "/health":
                     self._json(200, {"ok": True, "status": "ready"})
                     return
+                if self.path == "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7":
+                    self._json(
+                        200,
+                        {
+                            "processes": [
+                                {
+                                    "id": "process-1",
+                                    "status": "running",
+                                    "stdout": "hello",
+                                }
+                            ]
+                        },
+                    )
+                    return
                 if self.path == "/v1/runs/run-1/events":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -475,6 +489,17 @@ class AgentRuntimeClientTests(unittest.TestCase):
                 "delete_sessions": True,
             },
         )
+
+    def test_terminal_previews_use_the_bounded_read_only_scope_endpoint(self):
+        result = self.client.terminal_previews("private:7", "life-7")
+
+        self.assertEqual(result["processes"][0]["id"], "process-1")
+        request = self.runtime.request(
+            "GET",
+            "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7",
+        )
+        self.assertEqual(request["authorization"], "Bearer runtime-secret")
+        self.assertEqual(request["accept"], "application/json")
 
     def test_http_error_exposes_status_and_runtime_message(self):
         self.runtime.errors["/health"] = (503, {"error": {"message": "runtime is warming up"}})

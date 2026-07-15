@@ -39,14 +39,28 @@ export type IconName =
   | "barChart"
   | "trash"
   | "link"
-  | "users";
+  | "users"
+  | "browser"
+  | "terminal";
 
 /** Top-level workspace view. */
-export type ActiveView = "channel" | "private" | "knowledge" | "settings" | "admin";
+export type ActiveView =
+  | "channel"
+  | "private"
+  | "knowledge"
+  | "browserPreview"
+  | "terminalPreview"
+  | "settings"
+  | "admin";
 
 /** Chat scope. Both names are used in the legacy code interchangeably. */
 export type ScopeType = "channel" | "private";
 export type ChatMode = ScopeType;
+
+export interface AgentPreviewScope {
+  scope_type: ScopeType;
+  scope_id: string;
+}
 
 /** Message author. Open union — keep literal hints while allowing any string. */
 export type AuthorType = "user" | "agent" | (string & {});
