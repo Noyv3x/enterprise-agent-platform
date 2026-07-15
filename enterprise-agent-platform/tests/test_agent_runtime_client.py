@@ -31,6 +31,7 @@ class _FakeRuntime:
         self.events: list[dict[str, Any] | bytes] = []
         self.requests: list[dict[str, Any]] = []
         self.errors: dict[str, tuple[int, dict[str, Any]]] = {}
+        self.chunked_paths: set[str] = set()
         self.lock = threading.Lock()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -137,9 +138,23 @@ class _FakeRuntime:
                 raw = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
+                chunked = self.path in fake.chunked_paths
+                if chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                else:
+                    self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
-                self.wfile.write(raw)
+                if not chunked:
+                    self.wfile.write(raw)
+                    return
+                midpoint = max(1, len(raw) // 2)
+                for chunk in (raw[:midpoint], raw[midpoint:]):
+                    if not chunk:
+                        continue
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    self.wfile.write(chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
 
             def log_message(self, format, *args):
                 return
@@ -233,6 +248,64 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertIs(request["body"]["model"]["reasoning"], True)
         self.assertEqual(request["body"]["thinking_level"], "high")
         self.assertEqual(request["body"]["attachments"][0]["name"], "input.txt")
+
+    def test_generate_decodes_a_chunked_run_creation_response(self):
+        self.runtime.chunked_paths.add("/v1/runs")
+        self.runtime.events = [
+            _event(
+                1,
+                "run.completed",
+                {"output": "Chunked response accepted", "session_id": "session-2"},
+            )
+        ]
+
+        result = self.client.generate(
+            system_prompt="system",
+            user_message="question",
+            history=[],
+            session_id="session-1",
+            session_key="private:7",
+        )
+
+        self.assertEqual(result.content, "Chunked response accepted")
+        self.assertEqual(result.session_id, "session-2")
+
+    def test_unbounded_json_response_uses_an_argumentless_read(self):
+        response = mock.Mock()
+        response.read.return_value = b'{"ok":true}'
+        response.headers = {}
+
+        with mock.patch.object(self.client, "_open", return_value=response):
+            payload, _headers = self.client._json_request(
+                "GET",
+                "/health",
+                None,
+                timeout=1,
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        response.read.assert_called_once_with()
+        response.close.assert_called_once_with()
+
+    def test_bounded_json_response_reads_one_extra_byte(self):
+        response = mock.Mock()
+        response.read.return_value = b"1234"
+        response.headers = {}
+
+        with (
+            mock.patch.object(self.client, "_open", return_value=response),
+            self.assertRaisesRegex(AgentRuntimeProtocolError, "exceeded 3 bytes"),
+        ):
+            self.client._json_request(
+                "GET",
+                "/health",
+                None,
+                timeout=1,
+                max_response_bytes=3,
+            )
+
+        response.read.assert_called_once_with(4)
+        response.close.assert_called_once_with()
 
     def test_failed_run_raises_explicit_error(self):
         self.runtime.events = [

@@ -653,8 +653,14 @@ class AgentRuntimeClient:
         )
         response = self._open(request, timeout=timeout)
         try:
-            raw_bytes = response.read(
-                max_response_bytes + 1 if max_response_bytes is not None else -1
+            # HTTPResponse.read(-1) is not equivalent to read() for chunked
+            # responses on Python 3.11: the former can bypass chunk decoding
+            # and leave the terminating ``0\r\n\r\n`` in the JSON body.
+            # Pass an explicit size only when enforcing a response limit.
+            raw_bytes = (
+                response.read()
+                if max_response_bytes is None
+                else response.read(max_response_bytes + 1)
             )
             if max_response_bytes is not None and len(raw_bytes) > max_response_bytes:
                 raise AgentRuntimeProtocolError(
