@@ -34,3 +34,20 @@ describe("read-only Agent preview endpoints", () => {
     );
   });
 });
+
+describe("private Agent schedule endpoints", () => {
+  it("uses owner-scoped resources and bounded run-history queries", () => {
+    expect(endpoints.privateSchedules.path()).toBe("/api/private-agent/schedules");
+    expect(endpoints.privateSchedule.path(9)).toBe("/api/private-agent/schedules/9");
+    expect(endpoints.privateScheduleRuns.path(9, 20)).toBe(
+      "/api/private-agent/schedules/9/runs?limit=20",
+    );
+    expect(endpoints.privateScheduleRuns.path(9, 20, 31)).toBe(
+      "/api/private-agent/schedules/9/runs?limit=20&before_id=31",
+    );
+    expect(endpoints.pausePrivateSchedule.path(9)).toBe("/api/private-agent/schedules/9/pause");
+    expect(endpoints.resumePrivateSchedule.path(9)).toBe("/api/private-agent/schedules/9/resume");
+    expect(endpoints.runPrivateScheduleNow.path(9)).toBe("/api/private-agent/schedules/9/run-now");
+    expect(endpoints.deletePrivateSchedule.path(9)).toBe("/api/private-agent/schedules/9");
+  });
+});

@@ -1,13 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { AgentPreviewScope } from "../../types";
 import { Icon } from "../common/Icon";
+import { Spinner } from "../common/Spinner";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 import { TerminalPreviewView } from "./TerminalPreviewView";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 
-type PreviewKind = "browser" | "terminal";
+const ScheduledTasksPanel = lazy(() =>
+  import("../scheduled-tasks/ScheduledTasksPanel").then((module) => ({
+    default: module.ScheduledTasksPanel,
+  })),
+);
+
+type SidePanelKind = "tasks" | "browser" | "terminal";
 
 interface ChatPreviewSidebarProps {
   scope: AgentPreviewScope | null;
@@ -17,17 +24,20 @@ interface ChatPreviewSidebarProps {
 export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps) {
   const { t } = useI18n();
   const { state } = usePreviewAvailability(scope);
-  const [openPreview, setOpenPreview] = useState<PreviewKind | null>(null);
+  const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
+  const tasksButton = useRef<HTMLButtonElement>(null);
   const browserButton = useRef<HTMLButtonElement>(null);
   const terminalButton = useRef<HTMLButtonElement>(null);
-  const previousOpen = useRef<PreviewKind | null>(null);
+  const previousOpen = useRef<SidePanelKind | null>(null);
   const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
   const browserActive = !!scope && state.browserActive;
   const terminalCount = scope ? state.runningTerminalCount : 0;
   const terminalActive = terminalCount > 0;
-  const hasPreviews = browserActive || terminalActive;
+  const tasksActive = scope?.scope_type === "private";
+  const hasPreviews = tasksActive || browserActive || terminalActive;
   const visiblePreview = (
-    (openPreview === "browser" && browserActive)
+    (openPreview === "tasks" && tasksActive)
+    || (openPreview === "browser" && browserActive)
     || (openPreview === "terminal" && terminalActive)
   ) ? openPreview : null;
 
@@ -38,13 +48,18 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
   useEffect(() => {
     if (openPreview === "browser" && !browserActive) setOpenPreview(null);
     if (openPreview === "terminal" && !terminalActive) setOpenPreview(null);
-  }, [browserActive, openPreview, terminalActive]);
+    if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
+  }, [browserActive, openPreview, tasksActive, terminalActive]);
 
   useEffect(() => {
     const wasOpen = previousOpen.current;
     previousOpen.current = openPreview;
     if (!wasOpen || openPreview) return;
-    const trigger = wasOpen === "browser" ? browserButton.current : terminalButton.current;
+    const trigger = wasOpen === "tasks"
+      ? tasksButton.current
+      : wasOpen === "browser"
+        ? browserButton.current
+        : terminalButton.current;
     requestAnimationFrame(() => {
       if (trigger?.isConnected) trigger.focus();
       else document.querySelector<HTMLElement>(".composer textarea")?.focus();
@@ -64,32 +79,62 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [closePreview, openPreview]);
 
-  const drawerTitle = visiblePreview === "browser"
-    ? t("browserPreview.title")
-    : t("terminalPreview.title");
-  const drawerDescription = visiblePreview === "browser"
-    ? t("browserPreview.description")
-    : t("terminalPreview.description");
-  const drawerIcon = visiblePreview === "browser" ? "browser" : "terminal";
+  const drawerTitle = visiblePreview === "tasks"
+    ? t("scheduledTasks.title")
+    : visiblePreview === "browser"
+      ? t("browserPreview.title")
+      : t("terminalPreview.title");
+  const drawerDescription = visiblePreview === "tasks"
+    ? t("scheduledTasks.description")
+    : visiblePreview === "browser"
+      ? t("browserPreview.description")
+      : t("terminalPreview.description");
+  const drawerIcon = visiblePreview === "tasks" ? "calendar" : visiblePreview === "browser" ? "browser" : "terminal";
   const drawer = useMemo(() => {
     if (!scope || !visiblePreview) return null;
-    return visiblePreview === "browser"
-      ? <BrowserPreviewView scope={scope} />
-      : <TerminalPreviewView scope={scope} />;
-  }, [scope, visiblePreview]);
+    if (visiblePreview === "tasks") {
+      return (
+        <Suspense
+          fallback={(
+            <div className="schedule-panel__loading" role="status">
+              <Spinner size={20} />
+              <span>{t("scheduledTasks.loading")}</span>
+            </div>
+          )}
+        >
+          <ScheduledTasksPanel />
+        </Suspense>
+      );
+    }
+    return visiblePreview === "browser" ? <BrowserPreviewView scope={scope} /> : <TerminalPreviewView scope={scope} />;
+  }, [scope, t, visiblePreview]);
 
   return (
     <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
       <div className="chat">{children}</div>
       {hasPreviews ? (
         <nav className="chat-preview__rail" aria-label={t("preview.sidebarLabel")}>
+          {tasksActive ? (
+            <button
+              ref={tasksButton}
+              className={cx("chat-preview__toggle", visiblePreview === "tasks" && "is-active")}
+              type="button"
+              aria-label={t("scheduledTasks.open")}
+              aria-controls="chat-side-panel"
+              aria-expanded={visiblePreview === "tasks"}
+              title={t("scheduledTasks.open")}
+              onClick={() => setOpenPreview((current) => current === "tasks" ? null : "tasks")}
+            >
+              <Icon name="calendar" size={19} />
+            </button>
+          ) : null}
           {browserActive ? (
             <button
               ref={browserButton}
               className={cx("chat-preview__toggle", visiblePreview === "browser" && "is-active")}
               type="button"
               aria-label={t("preview.openBrowser")}
-              aria-controls="chat-preview-drawer"
+              aria-controls="chat-side-panel"
               aria-expanded={visiblePreview === "browser"}
               title={t("preview.openBrowser")}
               onClick={() => setOpenPreview((current) => current === "browser" ? null : "browser")}
@@ -104,7 +149,7 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
               className={cx("chat-preview__toggle", visiblePreview === "terminal" && "is-active")}
               type="button"
               aria-label={t("preview.openTerminals", { count: terminalCount })}
-              aria-controls="chat-preview-drawer"
+              aria-controls="chat-side-panel"
               aria-expanded={visiblePreview === "terminal"}
               title={t("preview.openTerminals", { count: terminalCount })}
               onClick={() => setOpenPreview((current) => current === "terminal" ? null : "terminal")}
@@ -118,7 +163,7 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
       {visiblePreview && drawer ? (
         <aside
           className="chat-preview__drawer"
-          id="chat-preview-drawer"
+          id="chat-side-panel"
           aria-label={drawerTitle}
         >
           <header className="chat-preview__header">

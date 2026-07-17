@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import inspect
 import ipaddress
 import json
 import mimetypes
@@ -61,6 +62,15 @@ from .runtimes import (
     AGENT_SETTING_PROVIDER,
     AGENT_SETTING_TIMEOUT,
     PlatformRuntimeManager,
+)
+from .schedules import (
+    AgentScheduleStore,
+    MAX_SCHEDULE_NAME_LENGTH,
+    MAX_SCHEDULE_PROMPT_LENGTH,
+    next_occurrence,
+    normalize_schedule,
+    normalize_timezone,
+    rfc3339_utc,
 )
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
@@ -203,6 +213,10 @@ TELEGRAM_DELIVERY_LEASE_SECONDS = max(
 TELEGRAM_DELIVERY_POLL_SECONDS = max(
     0.05, min(_float_env("ENTERPRISE_TELEGRAM_DELIVERY_POLL_SECONDS", 0.2), 2.0)
 )
+SCHEDULE_POLL_MAX_SECONDS = max(
+    0.2, min(_float_env("ENTERPRISE_SCHEDULE_POLL_MAX_SECONDS", 30.0), 60.0)
+)
+SCHEDULE_DISPATCH_RETRY_SECONDS = 60
 _DURABLE_AGENT_START_MESSAGE_SETTING = "durable_agent_jobs_start_message_id"
 TELEGRAM_LINK_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
@@ -325,6 +339,7 @@ class EnterpriseService:
         self._acquire_instance_lock()
         self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
+        self.schedules = AgentScheduleStore(self.db)
         # Agent runs and Telegram sends can have external side effects. An
         # interrupted running record is quarantined rather than blindly
         # repeated; queued work remains recoverable and is claimed at least
@@ -366,6 +381,9 @@ class EnterpriseService:
         self.agent_client = agent_client or self._new_agent_runtime_client()
         self.oauth_flows = OAuthFlowManager(oauth_http_client)
         self._conversation_lock = threading.RLock()
+        # Fixed stripes close the final permission-check -> runtime-submission
+        # window without retaining one lock per short-lived delegate scope.
+        self._agent_run_start_locks = tuple(threading.Lock() for _ in range(64))
         self._agent_browser_tabs_lock = threading.RLock()
         self._agent_browser_current_tabs: dict[str, str] = {}
         self._agent_browser_activity: dict[str, float] = {}
@@ -404,10 +422,14 @@ class EnterpriseService:
         self._ingest_last_error = ""
         self._telegram_gateway = None
         self._telegram_delivery_lock = threading.Lock()
+        self._telegram_identity_delivery_locks = tuple(threading.Lock() for _ in range(64))
         self._telegram_delivery_wakeup = threading.Event()
         self._telegram_delivery_thread: threading.Thread | None = None
         self._telegram_delivery_handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None
         self._telegram_delivery_generation = 0
+        self._schedule_wakeup = threading.Event()
+        self._schedule_dispatch_lock = threading.Lock()
+        self._schedule_thread: threading.Thread | None = None
         self._auto_updater = AutoUpdateManager(
             self,
             repo_root=auto_update_repo_root,
@@ -440,6 +462,7 @@ class EnterpriseService:
             self.runtimes.ensure_managed_tooling_ready(wait=False)
             self.runtimes.ensure_agent_runtime_ready(wait=False)
         self._recover_durable_work()
+        self._start_schedule_worker()
         self._start_telegram_gateway()
         self._start_auto_update_listener()
 
@@ -478,6 +501,7 @@ class EnterpriseService:
             self._auto_updater.stop()
             self._ingest_wakeup.set()
             self._telegram_delivery_wakeup.set()
+            self._schedule_wakeup.set()
 
             # First terminate scope-owned processes and the managed runtimes so
             # blocked HTTP/Cognee calls return. The database deliberately stays
@@ -496,15 +520,16 @@ class EnterpriseService:
                 ingest = self._ingest_thread
             with self._telegram_delivery_lock:
                 telegram_delivery = self._telegram_delivery_thread
+            schedule_worker = self._schedule_thread
             deadline = time.monotonic() + 15.0
-            for worker in [ingest, telegram_delivery, *workers]:
+            for worker in [ingest, telegram_delivery, schedule_worker, *workers]:
                 if worker is None or worker is threading.current_thread():
                     continue
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
             live_workers = [
                 worker
-                for worker in [ingest, telegram_delivery, *workers]
+                for worker in [ingest, telegram_delivery, schedule_worker, *workers]
                 if worker is not None and worker is not threading.current_thread() and worker.is_alive()
             ]
             if live_workers:
@@ -564,7 +589,36 @@ class EnterpriseService:
         finally:
             os.close(fd)
 
+    def _agent_run_start_lock(self, scope_key: str) -> threading.Lock:
+        digest = hashlib.sha256(str(scope_key).encode("utf-8")).digest()
+        return self._agent_run_start_locks[int.from_bytes(digest[:4], "big") % len(self._agent_run_start_locks)]
+
     def _cleanup_agent_scope(
+        self,
+        scope_key: str,
+        *,
+        lifecycle_id: str | None = None,
+        delete_sessions: bool = False,
+        strict: bool = False,
+    ) -> None:
+        # Acquire in conversation -> start-lock order, matching submission.
+        # Once held, no checked-but-not-yet-submitted run can appear after this
+        # cleanup finishes: it either registered first and is cancelled here,
+        # or rechecks lifecycle/permission after the barrier is released.
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            self._cleanup_agent_scope_after_start_barrier(
+                scope_key,
+                lifecycle_id=lifecycle_id,
+                delete_sessions=delete_sessions,
+                strict=strict,
+            )
+        finally:
+            start_lock.release()
+
+    def _cleanup_agent_scope_after_start_barrier(
         self,
         scope_key: str,
         *,
@@ -647,6 +701,61 @@ class EnterpriseService:
             job = self.jobs.get(job_id)
             return job is not None and job.status == "running"
 
+    def _runtime_submission_barrier(
+        self,
+        task: dict[str, Any],
+        scope_key: str,
+    ) -> tuple[Callable[[str], None], bool]:
+        """Reserve the check-to-POST boundary against lifecycle cleanup."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+            try:
+                self._ensure_agent_task_can_run(task)
+            except BaseException:
+                start_lock.release()
+                raise
+
+        guard = threading.Lock()
+        released = False
+
+        def release(_run_id: str = "") -> None:
+            nonlocal released
+            with guard:
+                if released:
+                    return
+                released = True
+                start_lock.release()
+
+        try:
+            signature = inspect.signature(self.agent_client.generate)
+            parameters = signature.parameters
+            supports_callback = "run_started_callback" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_callback = False
+        return release, supports_callback
+
+    def _generate_with_submission_barrier(
+        self,
+        task: dict[str, Any],
+        scope_key: str,
+        **kwargs: Any,
+    ) -> AgentResult:
+        release, supports_callback = self._runtime_submission_barrier(task, scope_key)
+        if supports_callback:
+            kwargs["run_started_callback"] = release
+        try:
+            # Clients without the optional callback remain behind the barrier
+            # for the whole call. This is conservative but preserves safety for
+            # injected/local adapters that cannot expose the POST boundary.
+            return self.agent_client.generate(**kwargs)
+        finally:
+            release()
+
     def _ensure_agent_task_can_run(self, task: dict[str, Any]) -> None:
         if not self._task_scope_is_current(task):
             with self._conversation_lock:
@@ -660,6 +769,17 @@ class EnterpriseService:
         current = self.get_user(int(user_id)) if user_id is not None else None
         if not current or not current.get("active"):
             raise _AgentTaskCancelled("Agent request cancelled because the user account is inactive")
+        if (
+            str(task.get("scope_type")) == "private"
+            and PERMISSION_PRIVATE_AGENT not in set(current.get("permissions") or [])
+        ):
+            raise _AgentTaskCancelled(
+                "Agent request cancelled because private Agent permission was revoked"
+            )
+        # Queued work may have waited while the account profile changed. Use
+        # the authoritative current actor for prompts and runtime metadata,
+        # especially the user's timezone, rather than the enqueue-time copy.
+        task["actor"] = current
 
     def _cancel_agent_scope_work(
         self,
@@ -686,15 +806,37 @@ class EnterpriseService:
         }
         timestamp = now_ts()
         with self.db.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE durable_jobs
-                SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
-                WHERE kind = 'agent' AND scope_type = ? AND scope_id = ?
-                  AND status IN ('queued', 'running')
-                """,
-                (str(reason)[:2000], timestamp, scope_type, scope_id),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            cancellable_job_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM durable_jobs
+                    WHERE kind = 'agent' AND scope_type = ? AND scope_id = ?
+                      AND status IN ('queued', 'running')
+                    """,
+                    (scope_type, scope_id),
+                ).fetchall()
+            ]
+            if cancellable_job_ids:
+                placeholders = ",".join("?" for _ in cancellable_job_ids)
+                conn.execute(
+                    f"""
+                    UPDATE durable_jobs
+                    SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                    WHERE id IN ({placeholders}) AND status IN ('queued', 'running')
+                    """,
+                    (str(reason)[:2000], timestamp, *cancellable_job_ids),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE agent_schedule_runs
+                    SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?
+                    WHERE status IN ('queued', 'running')
+                      AND durable_job_id IN ({placeholders})
+                    """,
+                    (str(reason)[:2000], timestamp, timestamp, *cancellable_job_ids),
+                )
             if scope_type == "private":
                 conn.execute(
                     """
@@ -727,8 +869,10 @@ class EnterpriseService:
     def _recover_durable_work(self) -> None:
         """Rebuild disposable wake-up queues from the SQLite work ledger."""
 
+        self._repair_schedule_run_job_gaps()
         self._surface_interrupted_agent_jobs()
         self._surface_failed_agent_jobs_without_message()
+        self._sync_schedule_runs_from_jobs()
         self._recover_agent_message_job_gaps()
 
         # Recovery is the only producer for these disposable in-memory queues;
@@ -804,7 +948,15 @@ class EnterpriseService:
             current = self.get_user(int(actor.get("id") or 0))
             if current is None or not current.get("active"):
                 # Deactivation is an intentional lifecycle cancellation, not a
-                # failed reply that should repopulate a private conversation.
+                # failed reply that should repopulate a conversation.
+                continue
+            if (
+                str(task.get("scope_type")) == "private"
+                and PERMISSION_PRIVATE_AGENT not in set(current.get("permissions") or [])
+            ):
+                # A permission downgrade owns this failed ledger transition in
+                # the same way as deactivation. Never recreate a private reply
+                # after the user has lost access to the private Agent.
                 continue
             task["_job_id"] = job.id
             try:
@@ -1180,6 +1332,15 @@ class EnterpriseService:
             raise ServiceError(400, "session TTL must be between 60 and 2592000 seconds")
         return ttl
 
+    @staticmethod
+    def _normalize_user_timezone(value: Any) -> str:
+        if not str(value or "").strip():
+            return ""
+        try:
+            return normalize_timezone(value)
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+
     def create_user(
         self,
         *,
@@ -1191,6 +1352,7 @@ class EnterpriseService:
         permission_group: str | None = None,
         model_name: str = "",
         thinking_depth: str = DEFAULT_THINKING_DEPTH,
+        timezone_name: str = "",
         actor: dict[str, Any] | None,
         _allow_weak_password: bool = False,
     ) -> dict[str, Any]:
@@ -1206,17 +1368,29 @@ class EnterpriseService:
         position = normalize_position(position)
         model_name = self._validate_account_model_name(model_name)
         thinking_depth = normalize_thinking_depth(thinking_depth)
+        timezone_name = self._normalize_user_timezone(timezone_name)
         ts = now_ts()
         try:
             user_id = self.db.insert(
                 """
                 INSERT INTO users(
                     username, display_name, password_hash, role, position,
-                    permission_group, model_name, thinking_depth, created_at
+                    permission_group, model_name, thinking_depth, timezone, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (username, display, hash_password(password), role, position, group, model_name, thinking_depth, ts),
+                (
+                    username,
+                    display,
+                    hash_password(password),
+                    role,
+                    position,
+                    group,
+                    model_name,
+                    thinking_depth,
+                    timezone_name,
+                    ts,
+                ),
             )
         except Exception as exc:
             raise ServiceError(409, f"user already exists: {username}") from exc
@@ -1379,6 +1553,8 @@ class EnterpriseService:
             updates["display_name"] = display_name or current["username"]
         if "position" in body:
             updates["position"] = normalize_position(str(body.get("position", "")))
+        if "timezone" in body:
+            updates["timezone"] = self._normalize_user_timezone(body.get("timezone"))
 
         updates = _changed_user_updates(current, updates)
         if not updates:
@@ -1494,6 +1670,8 @@ class EnterpriseService:
             )
         if "thinking_depth" in body:
             updates["thinking_depth"] = normalize_thinking_depth(str(body.get("thinking_depth", "")))
+        if "timezone" in body:
+            updates["timezone"] = self._normalize_user_timezone(body.get("timezone"))
         if "active" in body:
             updates["active"] = 1 if parse_bool(body.get("active")) else 0
         password = str(body.get("password", "") or "")
@@ -1518,44 +1696,67 @@ class EnterpriseService:
         if bump_sessions:
             assignments += ", token_version = token_version + 1"
         deactivating = updates.get("active") == 0
-        deactivated_scope: AgentExecutionScope | None = None
+        current_group = public_permission_group(current)
+        next_group = str(updates.get("permission_group") or current_group)
+        revoking_private_agent = (
+            PERMISSION_PRIVATE_AGENT in PERMISSION_GROUPS[current_group]["permissions"]
+            and PERMISSION_PRIVATE_AGENT not in PERMISSION_GROUPS[next_group]["permissions"]
+        )
+        cancelling_private_scope = deactivating or revoking_private_agent
+        cancelled_scope: AgentExecutionScope | None = None
+        telegram_identity_lock = (
+            self._telegram_identity_delivery_lock(int(user_id))
+            if cancelling_private_scope
+            else None
+        )
         with self._conversation_lock:
-            if deactivating:
-                deactivated_scope = self.agent_scopes.get_scope(
-                    self.agent_scopes.private_scope_key(int(user_id))
-                )
-            with self.db.transaction() as conn:
-                # Serialize the invariant check with the mutation so two
-                # administrators cannot both demote/deactivate themselves as
-                # the other's presumed remaining administrator. The outer
-                # lifecycle lock also orders stale authenticated writes after
-                # this privilege/account change.
-                conn.execute("BEGIN IMMEDIATE")
-                locked = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-                if locked is None:
-                    raise ServiceError(404, "user not found")
-                self._guard_admin_update(actor, dict(locked), updates, conn=conn)
-                conn.execute(
-                    f"UPDATE users SET {assignments} WHERE id = ?",
-                    [*updates.values(), user_id],
-                )
-            if deactivating:
-                self._cancel_agent_scope_work(
-                    "private",
-                    str(int(user_id)),
-                    reason="Agent request cancelled because the user account was deactivated",
-                    cleanup_runtime=False,
-                )
-                if deactivated_scope is not None:
-                    # Keep the lifecycle gate closed until the old sidecar run
-                    # and its processes are confirmed terminal. Otherwise a
-                    # reactivation/new send can race and be killed by stale
-                    # scope cleanup.
-                    self._cleanup_agent_scope(
-                        deactivated_scope.scope_key,
-                        lifecycle_id=deactivated_scope.lifecycle_id,
-                        strict=True,
+            if telegram_identity_lock is not None:
+                telegram_identity_lock.acquire()
+            try:
+                if cancelling_private_scope:
+                    cancelled_scope = self.agent_scopes.get_scope(
+                        self.agent_scopes.private_scope_key(int(user_id))
                     )
+                with self.db.transaction() as conn:
+                    # Serialize the invariant check with the mutation so two
+                    # administrators cannot both demote/deactivate themselves as
+                    # the other's presumed remaining administrator. The outer
+                    # lifecycle lock also orders stale authenticated writes after
+                    # this privilege/account change.
+                    conn.execute("BEGIN IMMEDIATE")
+                    locked = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                    if locked is None:
+                        raise ServiceError(404, "user not found")
+                    self._guard_admin_update(actor, dict(locked), updates, conn=conn)
+                    conn.execute(
+                        f"UPDATE users SET {assignments} WHERE id = ?",
+                        [*updates.values(), user_id],
+                    )
+                if cancelling_private_scope:
+                    cancellation_reason = (
+                        "Agent request cancelled because the user account was deactivated"
+                        if deactivating
+                        else "Agent request cancelled because private Agent permission was revoked"
+                    )
+                    self._cancel_agent_scope_work(
+                        "private",
+                        str(int(user_id)),
+                        reason=cancellation_reason,
+                        cleanup_runtime=False,
+                    )
+                    if cancelled_scope is not None:
+                        # Keep the lifecycle gate closed until the old sidecar run
+                        # and its processes are confirmed terminal. Otherwise a
+                        # reactivation/new send can race and be killed by stale
+                        # scope cleanup.
+                        self._cleanup_agent_scope(
+                            cancelled_scope.scope_key,
+                            lifecycle_id=cancelled_scope.lifecycle_id,
+                            strict=True,
+                        )
+            finally:
+                if telegram_identity_lock is not None:
+                    telegram_identity_lock.release()
         return self.get_user(user_id) or {}
 
     def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
@@ -1585,6 +1786,7 @@ class EnterpriseService:
             "permissions": list(PERMISSION_GROUPS[group]["permissions"]),
             "model_name": row.get("model_name", "") or "",
             "thinking_depth": thinking_depth,
+            "timezone": str(row.get("timezone") or ""),
             "active": bool(row["active"]),
             "created_at": row["created_at"],
             "last_login_at": row.get("last_login_at"),
@@ -1627,6 +1829,7 @@ class EnterpriseService:
             SELECT c.*, (
                 SELECT COUNT(*) FROM messages m
                 WHERE m.scope_type = 'channel' AND m.scope_id = CAST(c.id AS TEXT)
+                  AND m.hidden_at IS NULL
             ) AS message_count
             FROM channels c
             WHERE archived = 0
@@ -1666,7 +1869,7 @@ class EnterpriseService:
         rows = self.db.query(
             """
             SELECT * FROM messages
-            WHERE scope_type = ? AND scope_id = ?
+            WHERE scope_type = ? AND scope_id = ? AND hidden_at IS NULL
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -1676,7 +1879,8 @@ class EnterpriseService:
 
     def latest_message_id(self, scope_type: str, scope_id: str) -> int:
         row = self.db.query_one(
-            "SELECT MAX(id) AS mid FROM messages WHERE scope_type = ? AND scope_id = ?",
+            "SELECT MAX(id) AS mid FROM messages "
+            "WHERE scope_type = ? AND scope_id = ? AND hidden_at IS NULL",
             (scope_type, str(scope_id)),
         )
         return int(row["mid"]) if row and row["mid"] is not None else 0
@@ -1882,6 +2086,9 @@ class EnterpriseService:
                 return job
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
+    def _telegram_identity_delivery_lock(self, user_id: int) -> threading.Lock:
+        return self._telegram_identity_delivery_locks[int(user_id) % len(self._telegram_identity_delivery_locks)]
+
     def _telegram_delivery_worker(self) -> None:
         """Match exact replies, claim once, and deliver through one fixed worker."""
 
@@ -1977,7 +2184,59 @@ class EnterpriseService:
         if not text_delivery and not actor.get("active"):
             self.jobs.mark_failed(job.id, "Telegram delivery user is missing or inactive")
             return
+        identity_lock: threading.Lock | None = None
+        if payload.get("scheduled_delivery"):
+            identity_lock = self._telegram_identity_delivery_lock(int(payload.get("user_id") or 0))
+            identity_lock.acquire()
         try:
+            if payload.get("scheduled_delivery"):
+                actor = self.get_user(int(payload.get("user_id") or 0)) or {}
+                if (
+                    not actor.get("active")
+                    or PERMISSION_PRIVATE_AGENT not in set(actor.get("permissions") or [])
+                ):
+                    warning = "Telegram delivery skipped because private Agent access is unavailable."
+                    self.jobs.mark_failed(job.id, warning)
+                    try:
+                        run_id = int(payload.get("schedule_run_id") or 0)
+                    except (TypeError, ValueError):
+                        run_id = 0
+                    if run_id > 0:
+                        self.db.execute(
+                            "UPDATE agent_schedule_runs SET delivery_warning = ?, updated_at = ? WHERE id = ?",
+                            (warning, now_ts(), run_id),
+                        )
+                    return
+                # Final link/chat validation is serialized with unlink and chat
+                # refresh, and remains reserved through the transport call. An
+                # old verified chat can therefore never be used after unlink or
+                # relink has completed.
+                identity = self.db.query_one(
+                    """
+                    SELECT metadata_json FROM external_identities
+                    WHERE provider = 'telegram' AND user_id = ?
+                    """,
+                    (int(payload.get("user_id") or 0),),
+                )
+                identity_metadata = decode_json(identity.get("metadata_json")) if identity else {}
+                verified_chat_id = (
+                    identity_metadata.get("verified_chat_id")
+                    if isinstance(identity_metadata, dict)
+                    else None
+                )
+                if verified_chat_id is None or str(verified_chat_id) != str(payload.get("chat_id")):
+                    warning = "Telegram delivery skipped because the verified private chat changed or was unlinked."
+                    self.jobs.mark_failed(job.id, warning)
+                    try:
+                        run_id = int(payload.get("schedule_run_id") or 0)
+                    except (TypeError, ValueError):
+                        run_id = 0
+                    if run_id > 0:
+                        self.db.execute(
+                            "UPDATE agent_schedule_runs SET delivery_warning = ?, updated_at = ? WHERE id = ?",
+                            (warning, now_ts(), run_id),
+                        )
+                    return
             # Reserve the current registration immediately before transport,
             # but never hold the configuration lock across network I/O. A send
             # already reserved before revocation may finish as an in-flight
@@ -2002,6 +2261,9 @@ class EnterpriseService:
             print(f"Telegram delivery {job.id} needs review: {exc}", file=sys.stderr)
         else:
             self.jobs.mark_succeeded(job.id)
+        finally:
+            if identity_lock is not None:
+                identity_lock.release()
 
     def claim_telegram_update(self, update_id: int) -> bool:
         """Atomically claim a Telegram update across webhook/poller workers."""
@@ -2055,7 +2317,12 @@ class EnterpriseService:
             (status, now_ts(), str(error)[:2000], int(update_id)),
         )
 
-    def telegram_actor_for_user(self, telegram_user: dict[str, Any]) -> dict[str, Any]:
+    def telegram_actor_for_user(
+        self,
+        telegram_user: dict[str, Any],
+        *,
+        chat_id: int | str | None = None,
+    ) -> dict[str, Any]:
         external_id = str(telegram_user.get("id") or "").strip()
         if not external_id:
             raise ServiceError(400, "Telegram user id is required")
@@ -2066,8 +2333,10 @@ class EnterpriseService:
         if row:
             user = self.get_user(int(row["user_id"]))
             if user and user.get("active"):
-                self._refresh_telegram_identity(int(user["id"]), external_id, telegram_user)
-                return user
+                if self._refresh_telegram_identity(
+                    int(user["id"]), external_id, telegram_user, chat_id=chat_id
+                ):
+                    return user
         raise ServiceError(403, "Telegram user is not linked to a platform account")
 
     def telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -2140,15 +2409,16 @@ class EnterpriseService:
 
     def unlink_telegram_private_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
-        with self.db.transaction() as conn:
-            conn.execute(
-                "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
-                (int(actor["id"]),),
-            )
-            conn.execute(
-                "DELETE FROM telegram_link_challenges WHERE user_id = ?",
-                (int(actor["id"]),),
-            )
+        with self._telegram_identity_delivery_lock(int(actor["id"])):
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "DELETE FROM external_identities WHERE provider = 'telegram' AND user_id = ?",
+                    (int(actor["id"]),),
+                )
+                conn.execute(
+                    "DELETE FROM telegram_link_challenges WHERE user_id = ?",
+                    (int(actor["id"]),),
+                )
         return self.telegram_private_config(actor)
 
     def complete_telegram_link(
@@ -2156,6 +2426,7 @@ class EnterpriseService:
         code: str,
         telegram_user: dict[str, Any],
         *,
+        chat_id: int | str | None = None,
         update_id: int | None = None,
     ) -> dict[str, Any]:
         """Consume a one-time challenge and bind the speaking Telegram user."""
@@ -2164,9 +2435,16 @@ class EnterpriseService:
         if not normalized:
             raise ServiceError(400, "Telegram binding code is invalid")
         external_id = self._validate_telegram_user_id(telegram_user.get("id"))
+        verified_chat_id = self._validated_telegram_chat_id(chat_id) if chat_id is not None else None
         code_hash = hashlib.sha256(normalized.encode("ascii")).hexdigest()
         ts = now_ts()
-        with self.db.transaction() as conn:
+        candidate = self.db.query_one(
+            "SELECT user_id FROM telegram_link_challenges WHERE code_hash = ?",
+            (code_hash,),
+        )
+        if candidate is None:
+            raise ServiceError(400, "Telegram binding code is invalid or expired")
+        with self._telegram_identity_delivery_lock(int(candidate["user_id"])), self.db.transaction() as conn:
             # Consume the one-time proof under an immediate write lock so two
             # simultaneous bot updates cannot both validate the same code.
             conn.execute("BEGIN IMMEDIATE")
@@ -2218,7 +2496,17 @@ class EnterpriseService:
                     user_id,
                     str(telegram_user.get("username") or "").strip().lstrip("@")[:80],
                     self._telegram_display_name(telegram_user)[:120],
-                    encode_json({"configured_by": "telegram_challenge", "user": telegram_user}),
+                    encode_json(
+                        {
+                            "configured_by": "telegram_challenge",
+                            "user": telegram_user,
+                            **(
+                                {"verified_chat_id": verified_chat_id}
+                                if verified_chat_id is not None
+                                else {}
+                            ),
+                        }
+                    ),
                     int(existing["created_at"]) if existing else ts,
                     ts,
                 ),
@@ -2448,30 +2736,56 @@ class EnterpriseService:
             raise ServiceError(400, "Telegram user id must be a numeric id")
         return clean
 
-    def _refresh_telegram_identity(self, user_id: int, external_id: str, telegram_user: dict[str, Any]) -> None:
+    @staticmethod
+    def _validated_telegram_chat_id(value: Any) -> int:
+        clean = str(value or "").strip()
+        if not re.fullmatch(r"-?[1-9][0-9]{0,20}", clean):
+            raise ServiceError(400, "Telegram chat id is invalid")
+        return int(clean)
+
+    def _refresh_telegram_identity(
+        self,
+        user_id: int,
+        external_id: str,
+        telegram_user: dict[str, Any],
+        *,
+        chat_id: int | str | None = None,
+    ) -> bool:
         ts = now_ts()
-        self.db.execute(
-            """
-            INSERT OR REPLACE INTO external_identities(
-                provider, external_id, user_id, username, display_name, metadata_json, created_at, updated_at
-            )
-            VALUES (
-                'telegram', ?, ?, ?, ?, ?,
-                COALESCE((SELECT created_at FROM external_identities WHERE provider = 'telegram' AND external_id = ?), ?),
-                ?
-            )
-            """,
-            (
-                external_id,
-                int(user_id),
-                str(telegram_user.get("username") or ""),
-                self._telegram_display_name(telegram_user),
-                encode_json({"user": telegram_user}),
-                external_id,
-                ts,
-                ts,
-            ),
-        )
+        verified_chat_id = self._validated_telegram_chat_id(chat_id) if chat_id is not None else None
+        with self._telegram_identity_delivery_lock(int(user_id)):
+            with self.db.transaction() as conn:
+                existing = conn.execute(
+                    """
+                    SELECT metadata_json FROM external_identities
+                    WHERE provider = 'telegram' AND external_id = ? AND user_id = ?
+                    """,
+                    (external_id, int(user_id)),
+                ).fetchone()
+                if existing is None:
+                    return False
+                metadata = decode_json(existing["metadata_json"])
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["user"] = telegram_user
+                if verified_chat_id is not None:
+                    metadata["verified_chat_id"] = verified_chat_id
+                cursor = conn.execute(
+                    """
+                    UPDATE external_identities
+                    SET username = ?, display_name = ?, metadata_json = ?, updated_at = ?
+                    WHERE provider = 'telegram' AND external_id = ? AND user_id = ?
+                    """,
+                    (
+                        str(telegram_user.get("username") or ""),
+                        self._telegram_display_name(telegram_user),
+                        encode_json(metadata),
+                        ts,
+                        external_id,
+                        int(user_id),
+                    ),
+                )
+                return cursor.rowcount == 1
 
     @staticmethod
     def _telegram_display_name(telegram_user: dict[str, Any]) -> str:
@@ -2486,13 +2800,14 @@ class EnterpriseService:
         limit = max(1, min(int(limit), 500))
         scope_id = str(channel_id)
         total = self.db.scalar(
-            "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = ?",
+            "SELECT COUNT(*) FROM messages "
+            "WHERE scope_type = 'channel' AND scope_id = ? AND hidden_at IS NULL",
             (scope_id,),
         )
         rows = self.db.query(
             """
             SELECT * FROM messages
-            WHERE scope_type = 'channel' AND scope_id = ?
+            WHERE scope_type = 'channel' AND scope_id = ? AND hidden_at IS NULL
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -2511,21 +2826,15 @@ class EnterpriseService:
             row = self.db.query_one(
                 """
                 SELECT * FROM messages
-                WHERE id = ? AND scope_type = 'channel' AND scope_id = ?
+                WHERE id = ? AND scope_type = 'channel' AND scope_id = ? AND hidden_at IS NULL
                 """,
                 (int(message_id), str(channel_id)),
             )
             if not row:
                 raise ServiceError(404, "channel message not found")
             message = self._message_from_row(row)
-            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids([int(message_id)])
-            self._delete_message_ids(
-                [int(message_id)],
-                reason="Agent request cancelled because its source message was deleted",
-            )
+            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]))
             result = {"deleted": 1, "message": message}
-            for scope_key in cleanup_scope_keys:
-                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def delete_channel_messages_before(self, actor: dict[str, Any], channel_id: int, before_created_at: int) -> dict[str, Any]:
@@ -2543,64 +2852,39 @@ class EnterpriseService:
                 """
                 SELECT id FROM messages
                 WHERE scope_type = 'channel' AND scope_id = ? AND created_at < ?
+                  AND hidden_at IS NULL
                 """,
                 (scope_id, before_ts),
             )
             message_ids = [int(row["id"]) for row in rows]
-            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids(message_ids)
-            deleted = self._delete_message_ids(
-                message_ids,
-                reason="Agent request cancelled because its source message was deleted",
-            )
+            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]))
             result = {"deleted": deleted, "before_created_at": before_ts}
-            for scope_key in cleanup_scope_keys:
-                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def clear_channel_messages(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
         require_admin(actor)
         self.get_channel(actor, channel_id)
-        return self._clear_agent_conversation("channel", str(channel_id))
+        return self._clear_agent_conversation("channel", str(channel_id), actor_id=int(actor["id"]))
 
-    def _clear_agent_conversation(self, scope_type: str, scope_id: str) -> dict[str, Any]:
-        """Atomically order clear against new sends and terminal Agent writes."""
-
+    def _clear_agent_conversation(
+        self,
+        scope_type: str,
+        scope_id: str,
+        *,
+        actor_id: int,
+    ) -> dict[str, Any]:
+        """Hide current history without changing durable Agent/runtime state."""
         with self._conversation_lock:
-            if scope_type == "channel":
-                agent_scope = self._channel_agent_scope(scope_id)
-            else:
-                agent_scope = self.agent_scopes.ensure_private_scope(int(scope_id))
-            # Rotate the durable Agent lifecycle before deleting visible
-            # history. If this persistence step fails, the API fails with all
-            # messages intact; it can never report a partially cleared UI that
-            # silently reconnects to the old Agent memory session.
-            self.agent_scopes.rotate_session(agent_scope.scope_key)
-            self._cancel_agent_scope_work(
-                scope_type,
-                scope_id,
-                reason=f"Agent request cancelled because the {scope_type} conversation was cleared",
-                cleanup_runtime=False,
-            )
-            deleted = self.db.scalar(
-                "SELECT COUNT(*) FROM messages WHERE scope_type = ? AND scope_id = ?",
-                (scope_type, scope_id),
-            )
             rows = self.db.query(
-                "SELECT id FROM messages WHERE scope_type = ? AND scope_id = ?",
+                "SELECT id FROM messages "
+                "WHERE scope_type = ? AND scope_id = ? AND hidden_at IS NULL",
                 (scope_type, scope_id),
             )
-            self._delete_message_ids(
+            hidden = self._hide_message_ids(
                 [int(row["id"]) for row in rows],
-                reason=f"Agent request cancelled because the {scope_type} conversation was cleared",
+                actor_id=int(actor_id),
             )
-            result = {"deleted": int(deleted or 0)}
-            self._cleanup_agent_scope(
-                agent_scope.scope_key,
-                lifecycle_id=agent_scope.lifecycle_id,
-                delete_sessions=True,
-                strict=True,
-            )
-        return result
+        return {"deleted": hidden}
 
     def list_private_conversation_audits(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
@@ -2623,7 +2907,7 @@ class EnterpriseService:
                     MIN(created_at) AS first_message_at,
                     MAX(created_at) AS last_message_at
                 FROM messages
-                WHERE scope_type = 'private'
+                WHERE scope_type = 'private' AND hidden_at IS NULL
                 GROUP BY scope_id
             ) stats ON stats.scope_id = CAST(u.id AS TEXT)
             ORDER BY
@@ -2657,13 +2941,14 @@ class EnterpriseService:
         limit = max(1, min(int(limit), 500))
         scope_id = str(int(subject["id"]))
         total = self.db.scalar(
-            "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+            "SELECT COUNT(*) FROM messages "
+            "WHERE scope_type = 'private' AND scope_id = ? AND hidden_at IS NULL",
             (scope_id,),
         )
         rows = self.db.query(
             """
             SELECT * FROM messages
-            WHERE scope_type = 'private' AND scope_id = ?
+            WHERE scope_type = 'private' AND scope_id = ? AND hidden_at IS NULL
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -2682,21 +2967,15 @@ class EnterpriseService:
             row = self.db.query_one(
                 """
                 SELECT * FROM messages
-                WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+                WHERE id = ? AND scope_type = 'private' AND scope_id = ? AND hidden_at IS NULL
                 """,
                 (int(message_id), str(int(subject["id"]))),
             )
             if not row:
                 raise ServiceError(404, "private message not found")
             message = self._message_from_row(row)
-            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids([int(message_id)])
-            self._delete_message_ids(
-                [int(message_id)],
-                reason="Agent request cancelled because its source message was deleted",
-            )
+            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]))
             result = {"deleted": 1, "message": message}
-            for scope_key in cleanup_scope_keys:
-                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def delete_private_messages_before(self, actor: dict[str, Any], user_id: int, before_created_at: int) -> dict[str, Any]:
@@ -2714,25 +2993,20 @@ class EnterpriseService:
                 """
                 SELECT id FROM messages
                 WHERE scope_type = 'private' AND scope_id = ? AND created_at < ?
+                  AND hidden_at IS NULL
                 """,
                 (scope_id, before_ts),
             )
             message_ids = [int(row["id"]) for row in rows]
-            cleanup_scope_keys = self._active_agent_scope_keys_for_message_ids(message_ids)
-            deleted = self._delete_message_ids(
-                message_ids,
-                reason="Agent request cancelled because its source message was deleted",
-            )
+            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]))
             result = {"deleted": deleted, "before_created_at": before_ts}
-            for scope_key in cleanup_scope_keys:
-                self._cleanup_agent_scope(scope_key, strict=True)
         return result
 
     def clear_private_messages(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
         require_admin(actor)
         subject = self._private_audit_subject(user_id)
         scope_id = str(int(subject["id"]))
-        return self._clear_agent_conversation("private", scope_id)
+        return self._clear_agent_conversation("private", scope_id, actor_id=int(actor["id"]))
 
     def _private_audit_subject(self, user_id: int) -> dict[str, Any]:
         subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
@@ -3170,7 +3444,9 @@ class EnterpriseService:
         session_id = agent_scope.session_id
         workspace_path = Path(agent_scope.workspace_path)
         execution = agent_scope.to_execution_dict()
-        result = self.agent_client.generate(
+        result = self._generate_with_submission_barrier(
+            task,
+            agent_scope.scope_key,
             system_prompt=system_prompt,
             user_message=self._channel_speaker_line(task["actor"], prompt_content),
             history=self._agent_session_seed_history("channel", scope_id, int(user_msg["id"])),
@@ -3384,7 +3660,9 @@ class EnterpriseService:
             generation["model"],
             coalesce=True,
         )
-        result = self.agent_client.generate(
+        result = self._generate_with_submission_barrier(
+            task,
+            agent_scope.scope_key,
             system_prompt=system_prompt,
             user_message=prompt_content,
             history=self._agent_session_seed_history("private", scope_id, int(user_msg["id"])),
@@ -3402,13 +3680,18 @@ class EnterpriseService:
                     "user_id": actor["id"],
                 },
                 "attachments": self._attachment_metadata_for_agent(attachments),
+                **(
+                    task.get("runtime_metadata")
+                    if isinstance(task.get("runtime_metadata"), dict)
+                    else {}
+                ),
             },
             attachments=attachments,
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
             progress_callback=lambda event: (
-                self._record_agent_progress("private", scope_id, event)
+                self._record_agent_task_progress(task, "private", scope_id, event)
                 if self._task_scope_is_current(task)
                 else None
             ),
@@ -3442,6 +3725,12 @@ class EnterpriseService:
             }
             if task.get("_job_id"):
                 metadata["durable_job_id"] = int(task["_job_id"])
+            if task.get("schedule_run_id") and task.get("_unattended_authorization_required"):
+                metadata["scheduled_run_status"] = "blocked"
+                metadata["scheduled_run_error"] = str(
+                    task.get("_unattended_authorization_reason")
+                    or "unattended authorization required"
+                )[:2000]
             if token_usage:
                 metadata["token_usage"] = self._public_token_usage(token_usage)
             metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
@@ -3477,6 +3766,931 @@ class EnterpriseService:
                 kind="agent", scope_type="private", scope_id=str(actor["id"])
             ),
         }
+
+    # Scheduled tasks are intentionally user-scoped to the canonical private
+    # Agent. Browser REST may inspect/control existing definitions; only the
+    # authenticated runtime tool may create or edit them.
+    def list_private_schedules(self, actor: dict[str, Any]) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        return {
+            "schedules": [
+                self._public_schedule(row)
+                for row in self.schedules.list(int(actor["id"]))
+            ]
+        }
+
+    def get_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        return {"schedule": self._public_schedule(row)}
+
+    def private_schedule_runs(
+        self,
+        actor: dict[str, Any],
+        schedule_id: int,
+        *,
+        limit: int = 20,
+        before_id: int | None = None,
+    ) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        if self.schedules.get(int(actor["id"]), int(schedule_id)) is None:
+            raise ServiceError(404, "schedule not found")
+        clean_limit = max(1, min(int(limit), 100))
+        if before_id is not None and int(before_id) <= 0:
+            raise ServiceError(400, "before_id must be a positive integer")
+        page = self.schedules.runs(
+            int(actor["id"]),
+            int(schedule_id),
+            limit=clean_limit + 1,
+            before_id=before_id,
+        )
+        has_more = len(page) > clean_limit
+        rows = page[:clean_limit]
+        return {
+            "runs": [self._public_schedule_run(row) for row in rows],
+            "next_before_id": int(rows[-1]["id"]) if has_more and rows else None,
+        }
+
+    def pause_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        if str(row["state"]) == "active":
+            row = self.schedules.update(
+                owner_user_id=int(actor["id"]),
+                schedule_id=int(schedule_id),
+                fields={"state": "paused", "enabled": 0, "revision": int(row.get("revision") or 1) + 1},
+                expected_revision=int(row.get("revision") or 1),
+            )
+            if row is None:
+                raise ServiceError(409, "schedule changed concurrently")
+        self._schedule_wakeup.set()
+        return {"schedule": self._public_schedule(row)}
+
+    def resume_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        definition = self.schedules.decoded_schedule(row)
+        if str(row.get("state")) == "active" or (
+            str(row.get("state")) == "completed" and str(definition.get("type")) == "once"
+        ):
+            return {"schedule": self._public_schedule(row)}
+        try:
+            next_at = next_occurrence(
+                definition,
+                timezone_name=str(row.get("timezone") or actor.get("timezone") or "UTC"),
+                after=now_ts(),
+            )
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        fields: dict[str, Any] = {
+            "revision": int(row.get("revision") or 1) + 1,
+            "last_error": "",
+            "retry_after": 0,
+        }
+        if next_at is None:
+            fields.update({"state": "completed", "enabled": 0, "next_run_at": None})
+        else:
+            fields.update({"state": "active", "enabled": 1, "next_run_at": int(next_at)})
+        row = self.schedules.update(
+            owner_user_id=int(actor["id"]),
+            schedule_id=int(schedule_id),
+            fields=fields,
+            expected_revision=int(row.get("revision") or 1),
+        )
+        if row is None:
+            raise ServiceError(409, "schedule changed concurrently")
+        self._schedule_wakeup.set()
+        return {"schedule": self._public_schedule(row)}
+
+    def run_private_schedule_now(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        materialized = self._materialize_schedule_occurrence(
+            int(schedule_id),
+            scheduled_for=now_ts(),
+            trigger="manual",
+            expected_revision=int(row.get("revision") or 1),
+        )
+        return {
+            "schedule": self._public_schedule(materialized["schedule"]),
+            "run": self._public_schedule_run(materialized["run"]),
+        }
+
+    def delete_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        ts = now_ts()
+        updated = self.schedules.update(
+            owner_user_id=int(actor["id"]),
+            schedule_id=int(schedule_id),
+            fields={
+                "deleted_at": ts,
+                "enabled": 0,
+                "revision": int(row.get("revision") or 1) + 1,
+            },
+            expected_revision=int(row.get("revision") or 1),
+        )
+        if updated is None:
+            raise ServiceError(409, "schedule changed concurrently")
+        self._schedule_wakeup.set()
+        return {"deleted": True, "id": int(schedule_id)}
+
+    def _create_private_schedule(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        name = self._validated_schedule_name(body.get("name"))
+        prompt = self._validated_schedule_prompt(body.get("prompt"))
+        timezone_name = self._validated_schedule_timezone(
+            body.get("timezone") if "timezone" in body else (actor.get("timezone") or "UTC")
+        )
+        delivery = self._validated_schedule_delivery(body.get("delivery", "chat"))
+        try:
+            definition, next_at = normalize_schedule(
+                body.get("schedule"),
+                timezone_name=timezone_name,
+            )
+            row = self.schedules.create(
+                owner_user_id=int(actor["id"]),
+                name=name,
+                prompt=prompt,
+                schedule=definition,
+                timezone_name=timezone_name,
+                delivery=delivery,
+                next_run_at=next_at,
+            )
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        self._schedule_wakeup.set()
+        return {"schedule": self._public_schedule(row)}
+
+    def _update_private_schedule(
+        self,
+        actor: dict[str, Any],
+        schedule_id: int,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        actor = self._schedule_actor(actor)
+        current = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if current is None:
+            raise ServiceError(404, "schedule not found")
+        fields: dict[str, Any] = {}
+        if "name" in body:
+            fields["name"] = self._validated_schedule_name(body.get("name"))
+        if "prompt" in body:
+            fields["prompt"] = self._validated_schedule_prompt(body.get("prompt"))
+        if "delivery" in body:
+            fields["delivery"] = self._validated_schedule_delivery(body.get("delivery"))
+        timezone_name = str(current.get("timezone") or actor.get("timezone") or "UTC")
+        if "timezone" in body:
+            timezone_name = self._validated_schedule_timezone(body.get("timezone"))
+            fields["timezone"] = timezone_name
+
+        definition = self.schedules.decoded_schedule(current)
+        timing_changed = "schedule" in body or "timezone" in body
+        if "schedule" in body:
+            try:
+                definition, _ = normalize_schedule(
+                    body.get("schedule"),
+                    timezone_name=timezone_name,
+                )
+            except ValueError as exc:
+                raise ServiceError(400, str(exc)) from exc
+            fields["schedule_json"] = json.dumps(
+                definition, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            )
+        if timing_changed:
+            try:
+                next_at = next_occurrence(
+                    definition,
+                    timezone_name=timezone_name,
+                    after=now_ts(),
+                )
+            except ValueError as exc:
+                raise ServiceError(400, str(exc)) from exc
+            if next_at is None:
+                fields.update({"next_run_at": None, "state": "completed", "enabled": 0})
+            else:
+                fields["next_run_at"] = int(next_at)
+                if str(current.get("state")) == "completed":
+                    fields["state"] = "active"
+                fields["enabled"] = 0 if fields.get("state", current.get("state")) == "paused" else 1
+        changed = {
+            key: value
+            for key, value in fields.items()
+            if current.get(key) != value
+        }
+        if changed:
+            changed["revision"] = int(current.get("revision") or 1) + 1
+            changed["last_error"] = ""
+            changed["retry_after"] = 0
+            row = self.schedules.update(
+                owner_user_id=int(actor["id"]),
+                schedule_id=int(schedule_id),
+                fields=changed,
+                expected_revision=int(current.get("revision") or 1),
+            )
+            if row is None:
+                raise ServiceError(409, "schedule changed concurrently")
+        else:
+            row = current
+        self._schedule_wakeup.set()
+        return {"schedule": self._public_schedule(row)}
+
+    def _schedule_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        actor = self._fresh_active_actor(actor)
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        return actor
+
+    @staticmethod
+    def _validated_schedule_name(value: Any) -> str:
+        name = str(value or "").strip()
+        if not name or len(name) > MAX_SCHEDULE_NAME_LENGTH:
+            raise ServiceError(
+                400, f"schedule name must contain 1 to {MAX_SCHEDULE_NAME_LENGTH} characters"
+            )
+        return name
+
+    @staticmethod
+    def _validated_schedule_prompt(value: Any) -> str:
+        prompt = str(value or "").strip()
+        if not prompt or len(prompt) > MAX_SCHEDULE_PROMPT_LENGTH:
+            raise ServiceError(
+                400, f"schedule prompt must contain 1 to {MAX_SCHEDULE_PROMPT_LENGTH} characters"
+            )
+        return prompt
+
+    def _validated_schedule_timezone(self, value: Any) -> str:
+        try:
+            return normalize_timezone(value, default="UTC")
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+
+    @staticmethod
+    def _validated_schedule_delivery(value: Any) -> str:
+        delivery = str(value or "chat").strip().lower()
+        if delivery not in {"chat", "chat_and_telegram"}:
+            raise ServiceError(400, "schedule delivery must be chat or chat_and_telegram")
+        return delivery
+
+    def _public_schedule(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "name": str(row["name"]),
+            "prompt": str(row["prompt"]),
+            "schedule": self.schedules.decoded_schedule(row),
+            "timezone": str(row.get("timezone") or "UTC"),
+            "delivery": str(row.get("delivery") or "chat"),
+            "state": str(row.get("state") or "paused"),
+            "enabled": bool(row.get("enabled")),
+            "next_run_at": rfc3339_utc(row.get("next_run_at")),
+            "last_run": (
+                self._public_schedule_run(latest)
+                if (latest := self.schedules.latest_run(int(row["id"]))) is not None
+                else None
+            ),
+            "created_at": rfc3339_utc(row.get("created_at")),
+            "updated_at": rfc3339_utc(row.get("updated_at")),
+        }
+
+    @staticmethod
+    def _public_schedule_run(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "schedule_id": int(row["schedule_id"]),
+            "scheduled_for": rfc3339_utc(row.get("scheduled_for")),
+            "status": str(row.get("status") or "queued"),
+            "source_message_id": (
+                int(row["source_message_id"]) if row.get("source_message_id") is not None else None
+            ),
+            "response_message_id": (
+                int(row["response_message_id"]) if row.get("response_message_id") is not None else None
+            ),
+            "started_at": rfc3339_utc(row.get("started_at")),
+            "finished_at": rfc3339_utc(row.get("finished_at")),
+            "error": str(row.get("error") or ""),
+        }
+
+    def _start_schedule_worker(self) -> None:
+        if self._closed:
+            return
+        if self._schedule_thread is None or not self._schedule_thread.is_alive():
+            self._schedule_thread = threading.Thread(
+                target=self._schedule_worker,
+                name="agent-schedules",
+                daemon=True,
+            )
+            self._schedule_thread.start()
+
+    def _schedule_worker(self) -> None:
+        while True:
+            with self._conversation_lock:
+                if self._closed:
+                    return
+            try:
+                self._dispatch_due_schedules()
+            except Exception as exc:
+                print(f"Scheduled task dispatcher failed: {exc}", file=sys.stderr)
+            next_due = self.schedules.next_due_at()
+            wait_seconds = SCHEDULE_POLL_MAX_SECONDS
+            if next_due is not None:
+                wait_seconds = min(wait_seconds, max(0.05, float(next_due - now_ts())))
+            self._schedule_wakeup.wait(wait_seconds)
+            self._schedule_wakeup.clear()
+
+    def _dispatch_due_schedules(self, *, timestamp: int | None = None) -> int:
+        current = now_ts() if timestamp is None else int(timestamp)
+        dispatched = 0
+        for row in self.schedules.due(current, limit=100):
+            try:
+                self._materialize_schedule_occurrence(
+                    int(row["id"]),
+                    scheduled_for=int(row["next_run_at"]),
+                    trigger="scheduled",
+                    expected_revision=int(row.get("revision") or 1),
+                )
+                dispatched += 1
+            except ServiceError as exc:
+                if exc.status in {401, 403, 404}:
+                    self._skip_unavailable_schedule_occurrence(
+                        row,
+                        reason=exc.message,
+                    )
+                    dispatched += 1
+                elif exc.status != 409:
+                    self.schedules.record_dispatch_error(
+                        int(row["id"]),
+                        exc.message,
+                        retry_at=current + SCHEDULE_DISPATCH_RETRY_SECONDS,
+                        expected_revision=int(row.get("revision") or 1),
+                    )
+            except Exception as exc:
+                self.schedules.record_dispatch_error(
+                    int(row["id"]),
+                    str(exc),
+                    retry_at=current + SCHEDULE_DISPATCH_RETRY_SECONDS,
+                    expected_revision=int(row.get("revision") or 1),
+                )
+        return dispatched
+
+    def _materialize_schedule_occurrence(
+        self,
+        schedule_id: int,
+        *,
+        scheduled_for: int,
+        trigger: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        with self._schedule_dispatch_lock:
+            return self._materialize_schedule_occurrence_locked(
+                schedule_id,
+                scheduled_for=scheduled_for,
+                trigger=trigger,
+                expected_revision=expected_revision,
+            )
+
+    def _materialize_schedule_occurrence_locked(
+        self,
+        schedule_id: int,
+        *,
+        scheduled_for: int,
+        trigger: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        if trigger not in {"scheduled", "manual"}:
+            raise ServiceError(400, "invalid schedule trigger")
+        schedule = self.schedules.get_any(int(schedule_id))
+        if schedule is None:
+            raise ServiceError(404, "schedule not found")
+        scheduled_text = rfc3339_utc(int(scheduled_for)) or ""
+        occurrence_key = (
+            f"scheduled:{int(scheduled_for)}"
+            if trigger == "scheduled"
+            else f"manual:{secrets.token_urlsafe(18)}"
+        )
+        job_id = 0
+        with self._conversation_lock:
+            if self._closed:
+                raise ServiceError(503, "service is shutting down")
+            # Permission/profile state must be read inside the same lifecycle
+            # boundary used by revocation. Otherwise a completed downgrade can
+            # race an earlier actor snapshot and still materialize new work.
+            actor = self.get_user(int(schedule["owner_user_id"]))
+            if actor is None or not actor.get("active"):
+                raise ServiceError(401, "schedule owner is inactive")
+            actor = self._schedule_actor(actor)
+            generation = self.account_generation_config(actor)
+            telegram_enabled = self.telegram_enabled() and bool(self.telegram_bot_token())
+            with self.db.transaction() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                locked = conn.execute(
+                    "SELECT * FROM agent_schedules WHERE id = ? AND deleted_at IS NULL",
+                    (int(schedule_id),),
+                ).fetchone()
+                if locked is None:
+                    raise ServiceError(404, "schedule not found")
+                locked_schedule = dict(locked)
+                revision = int(locked_schedule.get("revision") or 1)
+                if revision != int(expected_revision):
+                    raise ServiceError(409, "schedule changed before this occurrence was dispatched")
+                if trigger == "scheduled" and (
+                    str(locked_schedule["state"]) != "active"
+                    or not bool(locked_schedule["enabled"])
+                    or int(locked_schedule.get("next_run_at") or 0) != int(scheduled_for)
+                ):
+                    raise ServiceError(409, "schedule occurrence is no longer due")
+                overlapping = conn.execute(
+                    """
+                    SELECT id FROM agent_schedule_runs
+                    WHERE schedule_id = ? AND status IN ('queued', 'running')
+                    ORDER BY id LIMIT 1
+                    """,
+                    (int(schedule_id),),
+                ).fetchone()
+                if overlapping is not None:
+                    if trigger == "manual":
+                        raise ServiceError(409, "schedule already has a queued or running occurrence")
+                    return self._skip_schedule_occurrence_locked(
+                        conn,
+                        locked_schedule,
+                        scheduled_for=int(scheduled_for),
+                        reason="previous occurrence is still queued or running",
+                    )
+
+                cursor = conn.execute(
+                    """
+                    INSERT INTO agent_schedule_runs(
+                        schedule_id, schedule_revision, occurrence_key, scheduled_for, trigger,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                    ON CONFLICT(schedule_id, schedule_revision, occurrence_key) DO NOTHING
+                    """,
+                    (
+                        int(schedule_id),
+                        revision,
+                        occurrence_key,
+                        int(scheduled_for),
+                        trigger,
+                        now_ts(),
+                        now_ts(),
+                    ),
+                )
+                run_row = conn.execute(
+                    """
+                    SELECT * FROM agent_schedule_runs
+                    WHERE schedule_id = ? AND schedule_revision = ? AND occurrence_key = ?
+                    """,
+                    (int(schedule_id), revision, occurrence_key),
+                ).fetchone()
+                if run_row is None:
+                    raise RuntimeError("schedule run insert did not produce a row")
+                run = dict(run_row)
+                run_id = int(run["id"])
+                source_message_id = int(run.get("source_message_id") or 0)
+                if source_message_id <= 0:
+                    source_metadata = {
+                        "generation": generation,
+                        "scheduled_task": {
+                            "schedule_id": int(schedule_id),
+                            "schedule_run_id": run_id,
+                            "name": str(locked_schedule["name"]),
+                            "scheduled_for": scheduled_text,
+                        },
+                    }
+                    source_cursor = conn.execute(
+                        """
+                        INSERT INTO messages(
+                            scope_type, scope_id, author_type, user_id, username,
+                            content, metadata_json, created_at
+                        ) VALUES ('private', ?, 'system', ?, 'Scheduled Task', ?, ?, ?)
+                        """,
+                        (
+                            str(actor["id"]),
+                            int(actor["id"]),
+                            str(locked_schedule["prompt"]),
+                            encode_json(source_metadata),
+                            now_ts(),
+                        ),
+                    )
+                    source_message_id = int(source_cursor.lastrowid)
+                    conn.execute(
+                        "UPDATE agent_schedule_runs SET source_message_id = ?, updated_at = ? WHERE id = ?",
+                        (source_message_id, now_ts(), run_id),
+                    )
+                source_row = conn.execute(
+                    "SELECT * FROM messages WHERE id = ?",
+                    (source_message_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise RuntimeError("scheduled source message is missing")
+                source = dict(source_row)
+                source_message = {
+                    "id": source_message_id,
+                    "scope_type": "private",
+                    "scope_id": str(actor["id"]),
+                    "author_type": "system",
+                    "user_id": int(actor["id"]),
+                    "username": str(source["username"]),
+                    "content": str(source["content"]),
+                    "metadata": decode_json(source["metadata_json"]),
+                    "attachments": [],
+                    "created_at": int(source["created_at"]),
+                }
+                runtime_metadata = {
+                    "trigger": "scheduled",
+                    "unattended": True,
+                    "schedule_id": str(schedule_id),
+                    "schedule_run_id": str(run_id),
+                    "scheduled_for": scheduled_text,
+                }
+                task = {
+                    "scope_type": "private",
+                    "scope_id": str(actor["id"]),
+                    "actor": dict(actor),
+                    "content": str(source["content"]),
+                    "attachments": [],
+                    "generation": generation,
+                    "user_message": source_message,
+                    "schedule_run_id": run_id,
+                    "runtime_metadata": runtime_metadata,
+                }
+                encoded_task = json.dumps(
+                    task, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+                job_cursor = conn.execute(
+                    """
+                    INSERT INTO durable_jobs(
+                        kind, scope_type, scope_id, dedupe_key, payload_json,
+                        status, available_at, created_at, updated_at
+                    ) VALUES ('agent', 'private', ?, ?, ?, 'queued', ?, ?, ?)
+                    ON CONFLICT(kind, dedupe_key) DO NOTHING
+                    """,
+                    (
+                        str(actor["id"]),
+                        f"message:{source_message_id}",
+                        encoded_task,
+                        now_ts(),
+                        now_ts(),
+                        now_ts(),
+                    ),
+                )
+                job_row = conn.execute(
+                    "SELECT * FROM durable_jobs WHERE kind = 'agent' AND dedupe_key = ?",
+                    (f"message:{source_message_id}",),
+                ).fetchone()
+                if job_row is None:
+                    raise RuntimeError("scheduled Agent job insert did not produce a row")
+                job_id = int(job_row["id"])
+                delivery_warning = str(run.get("delivery_warning") or "")
+                if str(locked_schedule.get("delivery")) == "chat_and_telegram" and cursor.rowcount > 0:
+                    identity = conn.execute(
+                        """
+                        SELECT metadata_json FROM external_identities
+                        WHERE provider = 'telegram' AND user_id = ?
+                        """,
+                        (int(actor["id"]),),
+                    ).fetchone()
+                    identity_metadata = decode_json(identity["metadata_json"]) if identity else {}
+                    verified_chat_id = (
+                        identity_metadata.get("verified_chat_id")
+                        if isinstance(identity_metadata, dict)
+                        else None
+                    )
+                    if verified_chat_id is None:
+                        delivery_warning = (
+                            "Telegram delivery skipped until the linked user sends the bot a private message."
+                        )
+                    elif not telegram_enabled:
+                        delivery_warning = "Telegram delivery skipped because the gateway is disabled."
+                    else:
+                        delivery_payload = {
+                            "update_id": None,
+                            "user_id": int(actor["id"]),
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "user_message_id": source_message_id,
+                            "chat_id": verified_chat_id,
+                            "reply_to_message_id": None,
+                            "message_thread_id": None,
+                            "scheduled_delivery": True,
+                            "schedule_run_id": run_id,
+                        }
+                        conn.execute(
+                            """
+                            INSERT INTO durable_jobs(
+                                kind, scope_type, scope_id, dedupe_key, payload_json,
+                                status, available_at, created_at, updated_at
+                            ) VALUES (?, 'private', ?, ?, ?, 'queued', ?, ?, ?)
+                            ON CONFLICT(kind, dedupe_key) DO NOTHING
+                            """,
+                            (
+                                TELEGRAM_DELIVERY_JOB_KIND,
+                                str(actor["id"]),
+                                f"message:{source_message_id}",
+                                json.dumps(
+                                    delivery_payload,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                ),
+                                now_ts(),
+                                now_ts(),
+                                now_ts(),
+                            ),
+                        )
+                conn.execute(
+                    """
+                    UPDATE agent_schedule_runs
+                    SET durable_job_id = ?, delivery_warning = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (job_id, delivery_warning, now_ts(), run_id),
+                )
+
+                schedule_fields: dict[str, Any] = {
+                    "last_run_id": run_id,
+                    "last_error": "",
+                    "retry_after": 0,
+                    "updated_at": now_ts(),
+                }
+                if trigger == "scheduled":
+                    # Advancing/completing an automatic occurrence is a
+                    # schedule mutation. Increment the CAS revision so a user
+                    # update based on the pre-dispatch snapshot cannot overwrite
+                    # this state transition with an inconsistent hybrid.
+                    schedule_fields["revision"] = revision + 1
+                    definition = self.schedules.decoded_schedule(locked_schedule)
+                    if str(definition.get("type")) == "once":
+                        schedule_fields.update(
+                            {"state": "completed", "enabled": 0, "next_run_at": None}
+                        )
+                    else:
+                        following = next_occurrence(
+                            definition,
+                            timezone_name=str(locked_schedule.get("timezone") or "UTC"),
+                            after=max(now_ts(), int(scheduled_for)),
+                        )
+                        schedule_fields["next_run_at"] = following
+                assignments = ", ".join(f"{key} = ?" for key in schedule_fields)
+                conn.execute(
+                    f"UPDATE agent_schedules SET {assignments} WHERE id = ?",
+                    (*schedule_fields.values(), int(schedule_id)),
+                )
+                final_schedule = conn.execute(
+                    "SELECT * FROM agent_schedules WHERE id = ?",
+                    (int(schedule_id),),
+                ).fetchone()
+                final_run = conn.execute(
+                    "SELECT * FROM agent_schedule_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+        try:
+            job = self.jobs.get(job_id)
+            if job is None:
+                print(
+                    f"Scheduled Agent job {job_id} could not be reloaded after commit; restart recovery will reconcile it",
+                    file=sys.stderr,
+                )
+            else:
+                scheduled_task = dict(job.payload)
+                key = self._conversation_key("private", str(actor["id"]))
+                scheduled_task["_scope_epoch"] = int(self._agent_scope_epochs.get(key, 0))
+                scheduled_task["_job_id"] = job.id
+                if job.status == "queued":
+                    self._schedule_agent_task(scheduled_task, enforce_limit=False)
+        except Exception as exc:
+            # The message/run/job transaction is already committed. Reloading
+            # the durable row and waking its disposable queue are both strictly
+            # best effort; startup recovery reconstructs the queue from SQLite.
+            print(
+                f"Failed to wake scheduled Agent job {job_id}; restart recovery will retry: {exc}",
+                file=sys.stderr,
+            )
+        try:
+            self._telegram_delivery_wakeup.set()
+        except Exception as exc:
+            print(f"Failed to wake scheduled Telegram delivery: {exc}", file=sys.stderr)
+        try:
+            self._schedule_wakeup.set()
+        except Exception as exc:
+            print(f"Failed to wake scheduled task dispatcher: {exc}", file=sys.stderr)
+        return {"schedule": dict(final_schedule), "run": dict(final_run)}
+
+    def _skip_unavailable_schedule_occurrence(
+        self,
+        schedule: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        with self._schedule_dispatch_lock:
+            with self.db.transaction() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                locked = conn.execute(
+                    "SELECT * FROM agent_schedules WHERE id = ? AND deleted_at IS NULL",
+                    (int(schedule["id"]),),
+                ).fetchone()
+                if locked is None:
+                    return None
+                locked_schedule = dict(locked)
+                if (
+                    int(locked_schedule.get("revision") or 1)
+                    != int(schedule.get("revision") or 1)
+                    or str(locked_schedule.get("state")) != "active"
+                    or not bool(locked_schedule.get("enabled"))
+                    or int(locked_schedule.get("next_run_at") or 0)
+                    != int(schedule.get("next_run_at") or 0)
+                ):
+                    return None
+                return self._skip_schedule_occurrence_locked(
+                    conn,
+                    locked_schedule,
+                    scheduled_for=int(schedule["next_run_at"]),
+                    reason=reason,
+                )
+
+    def _skip_schedule_occurrence_locked(
+        self,
+        conn,
+        schedule: dict[str, Any],
+        *,
+        scheduled_for: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        revision = int(schedule.get("revision") or 1)
+        timestamp = now_ts()
+        conn.execute(
+            """
+            INSERT INTO agent_schedule_runs(
+                schedule_id, schedule_revision, occurrence_key, scheduled_for, trigger,
+                status, error, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'scheduled', 'skipped', ?, ?, ?, ?)
+            ON CONFLICT(schedule_id, schedule_revision, occurrence_key) DO NOTHING
+            """,
+            (
+                int(schedule["id"]),
+                revision,
+                f"scheduled:{int(scheduled_for)}",
+                int(scheduled_for),
+                str(reason)[:2000],
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        run = conn.execute(
+            """
+            SELECT * FROM agent_schedule_runs
+            WHERE schedule_id = ? AND schedule_revision = ? AND occurrence_key = ?
+            """,
+            (int(schedule["id"]), revision, f"scheduled:{int(scheduled_for)}"),
+        ).fetchone()
+        if run is None:
+            raise RuntimeError("skipped schedule run insert did not produce a row")
+        definition = self.schedules.decoded_schedule(schedule)
+        if str(definition.get("type")) == "once":
+            # A one-shot occurrence cannot be replayed at its original instant.
+            # Record the missed attempt explicitly and make it a clear terminal
+            # definition; recurring schedules alone coalesce forward and resume.
+            state = "completed"
+            enabled = 0
+            following = None
+        else:
+            state = "active"
+            enabled = 1
+            following = next_occurrence(
+                definition,
+                timezone_name=str(schedule.get("timezone") or "UTC"),
+                after=max(timestamp, int(scheduled_for)),
+            )
+        conn.execute(
+            """
+            UPDATE agent_schedules
+            SET state = ?, enabled = ?, next_run_at = ?, last_run_id = ?,
+                last_error = ?, retry_after = 0, revision = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                state,
+                enabled,
+                following,
+                int(run["id"]),
+                str(reason)[:2000],
+                revision + 1,
+                timestamp,
+                int(schedule["id"]),
+            ),
+        )
+        final_schedule = conn.execute(
+            "SELECT * FROM agent_schedules WHERE id = ?",
+            (int(schedule["id"]),),
+        ).fetchone()
+        return {"schedule": dict(final_schedule), "run": dict(run)}
+
+    def _repair_schedule_run_job_gaps(self) -> None:
+        """Idempotently close a committed system-message/job crash window."""
+
+        for run in self.schedules.missing_job_runs():
+            source = self.db.query_one(
+                "SELECT * FROM messages WHERE id = ?",
+                (int(run["source_message_id"]),),
+            )
+            if source is None:
+                self.schedules.update_run_status(
+                    int(run["id"]), "cancelled", error="scheduled source message is missing"
+                )
+                continue
+            metadata = decode_json(source.get("metadata_json"))
+            task = self._recovered_agent_task_from_message(source, metadata)
+            if task is None:
+                self.schedules.update_run_status(
+                    int(run["id"]), "cancelled", error="schedule owner is missing or inactive"
+                )
+                continue
+            scheduled_task = metadata.get("scheduled_task") if isinstance(metadata, dict) else {}
+            scheduled_for = str((scheduled_task or {}).get("scheduled_for") or rfc3339_utc(run["scheduled_for"]) or "")
+            task["schedule_run_id"] = int(run["id"])
+            task["runtime_metadata"] = {
+                "trigger": "scheduled",
+                "unattended": True,
+                "schedule_id": str(run["schedule_id"]),
+                "schedule_run_id": str(run["id"]),
+                "scheduled_for": scheduled_for,
+            }
+            job, _ = self.jobs.enqueue(
+                kind="agent",
+                dedupe_key=f"message:{int(source['id'])}",
+                payload=task,
+                scope_type="private",
+                scope_id=str(run["owner_user_id"]),
+            )
+            self.db.execute(
+                "UPDATE agent_schedule_runs SET durable_job_id = ?, updated_at = ? WHERE id = ?",
+                (job.id, now_ts(), int(run["id"])),
+            )
+
+    def _sync_schedule_runs_from_jobs(self) -> None:
+        rows = self.db.query(
+            """
+            SELECT r.id AS run_id, r.source_message_id, r.status AS run_status,
+                   j.status AS job_status, j.last_error
+            FROM agent_schedule_runs r
+            JOIN durable_jobs j ON j.id = r.durable_job_id
+            WHERE r.status IN ('queued', 'running')
+            """
+        )
+        status_map = {
+            "queued": "queued",
+            "running": "running",
+            "succeeded": "succeeded",
+            "failed": "failed",
+            "needs_review": "needs_review",
+        }
+        for row in rows:
+            status = status_map.get(str(row["job_status"]))
+            if status is None:
+                continue
+            response = None
+            if row.get("source_message_id") is not None:
+                source = self.db.query_one(
+                    "SELECT scope_type, scope_id FROM messages WHERE id = ?",
+                    (int(row["source_message_id"]),),
+                )
+                if source:
+                    response = self.agent_message_replying_to(
+                        str(source["scope_type"]),
+                        str(source["scope_id"]),
+                        int(row["source_message_id"]),
+                    )
+            restored_error = str(row.get("last_error") or "")
+            response_metadata = response.get("metadata") if isinstance(response, dict) else {}
+            persisted_schedule_status = (
+                str(response_metadata.get("scheduled_run_status") or "")
+                if isinstance(response_metadata, dict)
+                else ""
+            )
+            if status != "needs_review" and persisted_schedule_status == "blocked":
+                status = "blocked"
+                restored_error = str(
+                    response_metadata.get("scheduled_run_error")
+                    or "unattended authorization required"
+                )
+            if status == str(row["run_status"]):
+                continue
+            self.schedules.update_run_status(
+                int(row["run_id"]),
+                status,
+                response_message_id=int(response["id"]) if response else None,
+                error=restored_error,
+            )
 
     def agent_terminal_previews(
         self,
@@ -4363,6 +5577,8 @@ class EnterpriseService:
             result = self._agent_web_tool(action, arguments)
         elif tool == "browser":
             result = self._agent_browser_tool(scope_key, action, arguments)
+        elif tool == "schedule":
+            result = self._agent_schedule_tool(action, arguments, context)
         else:
             raise ServiceError(404, "Agent tool not found")
         content_result = result
@@ -4378,6 +5594,81 @@ class EnterpriseService:
             "data": result,
             "is_error": False,
         }
+
+    def _agent_schedule_tool(
+        self,
+        action: str,
+        arguments: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        forbidden = {
+            "owner",
+            "owner_id",
+            "owner_user_id",
+            "user_id",
+            "scope",
+            "scope_id",
+            "scope_key",
+        }
+        if forbidden.intersection(arguments):
+            raise ServiceError(400, "schedule owner and scope come from the Agent run context")
+        scope_key = str(context.get("scope_key") or "").strip()
+        scope = self.agent_scopes.get_scope(scope_key)
+        if (
+            scope is None
+            or scope.scope_type != "private"
+            or scope_key != self.agent_scopes.private_scope_key(int(scope.scope_id))
+        ):
+            raise ServiceError(403, "schedules are available only to the canonical private Agent")
+        actor = self.get_user(int(scope.scope_id))
+        if actor is None:
+            raise ServiceError(403, "schedule owner is unavailable")
+
+        def schedule_id() -> int:
+            try:
+                value = int(arguments.get("schedule_id"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "schedule_id must be a positive integer") from exc
+            if value <= 0:
+                raise ServiceError(400, "schedule_id must be a positive integer")
+            return value
+
+        if action == "list":
+            return self.list_private_schedules(actor)
+        if action == "get":
+            return self.get_private_schedule(actor, schedule_id())
+        if action == "history":
+            try:
+                limit = int(arguments.get("limit") or 20)
+                before_id = (
+                    int(arguments["before_id"])
+                    if arguments.get("before_id") not in {None, ""}
+                    else None
+                )
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "schedule history pagination is invalid") from exc
+            return self.private_schedule_runs(
+                actor,
+                schedule_id(),
+                limit=limit,
+                before_id=before_id,
+            )
+        if action == "create":
+            return self._create_private_schedule(actor, arguments)
+        if action == "update":
+            return self._update_private_schedule(actor, schedule_id(), arguments)
+        if action == "pause":
+            return self.pause_private_schedule(actor, schedule_id())
+        if action == "resume":
+            return self.resume_private_schedule(actor, schedule_id())
+        if action == "delete":
+            return self.delete_private_schedule(actor, schedule_id())
+        if action == "run_now":
+            return self.run_private_schedule_now(actor, schedule_id())
+        raise ServiceError(
+            400,
+            "schedule action must be list, get, history, create, update, pause, resume, delete or run_now",
+        )
 
     def _agent_web_tool(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
         base_url = self.config.firecrawl_api_url.rstrip("/")
@@ -6022,11 +7313,13 @@ class EnterpriseService:
                         # this ledger entry. Never execute a side-effectful Agent
                         # run unless this worker atomically claimed it.
                         continue
+                    self._update_schedule_run_for_task(task, "running")
                     self._agent_active_tasks[key] = task
                     self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
 
                 error = ""
                 error_persisted = True
+                response_message: dict[str, Any] | None = None
                 try:
                     # Only N replies hit the Agent runtime (and hold a thread /
                     # socket) at once; each conversation still drains its own
@@ -6034,9 +7327,9 @@ class EnterpriseService:
                     with self._agent_run_gate:
                         self._ensure_agent_task_can_run(task)
                         if task["scope_type"] == "channel":
-                            self._send_channel_agent_reply(task)
+                            response_message = self._send_channel_agent_reply(task)
                         else:
-                            self._send_private_agent_reply(task)
+                            response_message = self._send_private_agent_reply(task)
                     # The reply insertion itself is lifecycle-serialized by
                     # ``_send_*_agent_reply``.  A reset that wins after that
                     # insertion moves the ledger to ``failed`` and removes the
@@ -6044,23 +7337,57 @@ class EnterpriseService:
                     # shutdown that begins after a committed reply must not
                     # quarantine already-successful work merely because the
                     # in-memory epoch changed between commit and this update.
-                    if job_id:
-                        self.jobs.mark_succeeded(job_id)
+                    ledger_succeeded = self.jobs.mark_succeeded(job_id) if job_id else True
+                    if ledger_succeeded:
+                        self._update_schedule_run_for_task(
+                            task,
+                            "blocked" if task.get("_unattended_authorization_required") else "succeeded",
+                            response_message_id=(
+                                int(response_message["id"]) if response_message is not None else None
+                            ),
+                            error=(
+                                str(
+                                    task.get("_unattended_authorization_reason")
+                                    or "unattended authorization required"
+                                )
+                                if task.get("_unattended_authorization_required")
+                                else ""
+                            ),
+                        )
                 except _AgentTaskCancelled as exc:
                     error = str(exc)
-                    if job_id:
+                    ledger_failed = (
                         self.jobs.mark_failed(job_id, error, needs_review=exc.needs_review)
+                        if job_id
+                        else True
+                    )
+                    if ledger_failed:
+                        self._update_schedule_run_for_task(
+                            task,
+                            "needs_review" if exc.needs_review else "cancelled",
+                            error=error,
+                        )
                 except Exception as exc:
                     error = str(exc)
                     runtime_needs_review = (
                         isinstance(exc, AgentRuntimeRunError)
                         and exc.state == "needs_review"
                     )
+                    if task.get("schedule_run_id"):
+                        if runtime_needs_review:
+                            task["_scheduled_terminal_status"] = "needs_review"
+                        elif task.get("_unattended_authorization_required"):
+                            task["_scheduled_terminal_status"] = "blocked"
                     with self._conversation_lock:
                         shutting_down = self._closed
                     if shutting_down:
-                        if job_id:
+                        ledger_failed = (
                             self.jobs.mark_failed(job_id, error, needs_review=True)
+                            if job_id
+                            else True
+                        )
+                        if ledger_failed:
+                            self._update_schedule_run_for_task(task, "needs_review", error=error)
                         error_persisted = True
                     else:
                         try:
@@ -6079,11 +7406,38 @@ class EnterpriseService:
                                 f"Failed to persist agent error for {key}: {persist_exc}",
                                 file=sys.stderr,
                             )
-                        if job_id:
+                        ledger_failed = (
                             self.jobs.mark_failed(
                                 job_id,
                                 error,
                                 needs_review=runtime_needs_review,
+                            )
+                            if job_id
+                            else True
+                        )
+                        linked_response = self.agent_message_replying_to(
+                            str(task["scope_type"]),
+                            str(task["scope_id"]),
+                            int(task["user_message"]["id"]),
+                        )
+                        if ledger_failed:
+                            self._update_schedule_run_for_task(
+                                task,
+                                "needs_review"
+                                if runtime_needs_review
+                                else (
+                                    "blocked"
+                                    if task.get("_unattended_authorization_required")
+                                    else "failed"
+                                ),
+                                response_message_id=(
+                                    int(linked_response["id"]) if linked_response is not None else None
+                                ),
+                                error=(
+                                    str(task.get("_unattended_authorization_reason") or error)
+                                    if task.get("_unattended_authorization_required")
+                                    else error
+                                ),
                             )
 
                 with self._conversation_lock:
@@ -6123,6 +7477,30 @@ class EnterpriseService:
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
 
+    def _update_schedule_run_for_task(
+        self,
+        task: dict[str, Any],
+        status: str,
+        *,
+        response_message_id: int | None = None,
+        error: str = "",
+    ) -> None:
+        try:
+            run_id = int(task.get("schedule_run_id") or 0)
+        except (TypeError, ValueError):
+            return
+        if run_id <= 0:
+            return
+        try:
+            self.schedules.update_run_status(
+                run_id,
+                status,
+                response_message_id=response_message_id,
+                error=error,
+            )
+        except Exception as exc:
+            print(f"Failed to update scheduled run {run_id}: {exc}", file=sys.stderr)
+
     def _drop_empty_conversation_maps_locked(self, key: str) -> None:
         """Remove empty companion-map entries for a conversation key.
 
@@ -6146,6 +7524,12 @@ class EnterpriseService:
         metadata = {"error": error, "reply_to": self._reply_target(task)}
         if task.get("_job_id"):
             metadata["durable_job_id"] = int(task["_job_id"])
+        scheduled_terminal_status = str(task.get("_scheduled_terminal_status") or "")
+        if task.get("schedule_run_id") and scheduled_terminal_status in {"blocked", "needs_review"}:
+            metadata["scheduled_run_status"] = scheduled_terminal_status
+            metadata["scheduled_run_error"] = str(
+                task.get("_unattended_authorization_reason") or error
+            )[:2000]
         metadata["agent_work"] = self._agent_work_snapshot(task, state="error")
         kwargs = {
             "scope_type": str(task["scope_type"]),
@@ -6348,6 +7732,37 @@ class EnterpriseService:
             status["stream_message"] = stream
             status["updated_at"] = timestamp
             self._agent_status[key] = status
+
+    def _record_agent_task_progress(
+        self,
+        task: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        if task.get("schedule_run_id"):
+            event_type = str(
+                event.get("event") or event.get("event_type") or event.get("status") or ""
+            ).strip().lower()
+            reason = str(
+                event.get("reason")
+                or event.get("error")
+                or event.get("message")
+                or event.get("detail")
+                or ""
+            ).strip().lower()
+            explicitly_blocked = event.get("unattended_authorization_required") is True
+            compatibility_prefix = reason.startswith(
+                ("unattended authorization required", "unattended_authorization_required")
+            )
+            if event_type in {"tool.failed", "failed", "failure"} and (
+                explicitly_blocked or compatibility_prefix
+            ):
+                task["_unattended_authorization_required"] = True
+                task["_unattended_authorization_reason"] = (
+                    reason or "unattended authorization required"
+                )[:2000]
+        self._record_agent_progress(scope_type, scope_id, event)
 
     def _record_agent_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):
@@ -6922,6 +8337,23 @@ class EnterpriseService:
         )
         return [self._attachment_from_row(row, include_local_path=include_local_path) for row in rows]
 
+    def _hide_message_ids(self, message_ids: list[int], *, actor_id: int) -> int:
+        """Hide messages from UI reads while preserving all durable execution state."""
+
+        ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cursor = self.db.execute(
+            f"""
+            UPDATE messages
+            SET hidden_at = ?, hidden_by_user_id = ?
+            WHERE id IN ({placeholders}) AND hidden_at IS NULL
+            """,
+            (now_ts(), int(actor_id), *ids),
+        )
+        return max(0, int(cursor.rowcount))
+
     def _delete_message_ids(self, message_ids: list[int], *, reason: str) -> int:
         """Delete exact message ids and cancel work derived from those rows.
 
@@ -7357,15 +8789,16 @@ class EnterpriseService:
         scope_id: str,
         before_message_id: int,
     ) -> list[dict[str, str]]:
-        """Seed a newly materialized runtime session from visible platform history.
+        """Seed a newly materialized runtime session from durable platform history.
 
         The sidecar records a durable seed marker and ignores this list after
-        the first run for a scope/lifecycle/session tuple.
+        the first run for a scope/lifecycle/session tuple. Administratively
+        hidden rows deliberately remain part of this continuity.
         """
 
         rows = self.db.query(
             """
-            SELECT author_type, content FROM messages
+            SELECT author_type, content, metadata_json FROM messages
             WHERE scope_type = ? AND scope_id = ? AND id < ?
               AND author_type IN ('user', 'agent', 'system')
             ORDER BY id DESC LIMIT 30
@@ -7373,11 +8806,22 @@ class EnterpriseService:
             (str(scope_type), str(scope_id), int(before_message_id)),
         )
         roles = {"user": "user", "agent": "assistant", "system": "system"}
-        return [
-            {"role": roles[str(row["author_type"])], "content": str(row["content"])}
-            for row in reversed(rows)
-            if str(row.get("content") or "").strip()
-        ]
+        history: list[dict[str, str]] = []
+        for row in reversed(rows):
+            content = str(row.get("content") or "")
+            if not content.strip():
+                continue
+            role = roles[str(row["author_type"])]
+            metadata = decode_json(row.get("metadata_json"))
+            # Scheduled source rows use author_type=system solely so the UI can
+            # render a task marker. Their prompt is user-authored and must never
+            # gain system-prompt authority when seeding a new runtime lifecycle.
+            if role == "system" and isinstance(metadata, dict) and isinstance(
+                metadata.get("scheduled_task"), dict
+            ):
+                role = "user"
+            history.append({"role": role, "content": content})
+        return history
 
     @staticmethod
     def _valid_agent_session_id(session_id: str | None) -> bool:
@@ -7439,6 +8883,7 @@ class EnterpriseService:
             "username": actor.get("username"),
             "display_name": actor.get("display_name") or actor.get("username") or "User",
             "position": actor.get("position") or "",
+            "timezone": actor.get("timezone") or "UTC",
         }
 
     def _channel_speaker_line(self, actor: dict[str, Any], content: str) -> str:
@@ -7501,6 +8946,8 @@ class EnterpriseService:
             "不要提及底层框架、运行时、模型供应商或内部实现。\n"
             "当前工作模式: 私人助手。每个用户拥有独立工作区、记忆和会话；命令在受信任的宿主机执行。\n"
             f"当前用户: {self._actor_context_label(actor, include_username=True, include_empty_position=True)}。\n"
+            f"当前 UTC 时间: {rfc3339_utc(now_ts())}；当前用户时区: {actor.get('timezone') or 'UTC'}；"
+            "涉及今天、明天、几点或日程时以此时间基准和用户时区解释。\n"
             f"工作区: {agent_scope.workspace_path}；会话: {agent_scope.session_id}。\n"
             "模型密钥由平台集中配置，不要要求用户再次提供密钥。\n"
             "知识库通过 knowledge 工具提供；使用 search 操作检索，使用 read 操作读取完整条目。\n"

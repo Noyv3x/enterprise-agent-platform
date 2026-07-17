@@ -39,6 +39,14 @@ export function messageFingerprint(message: Message): unknown {
     pending: !!message.metadata?.local_pending,
     streaming: !!message.metadata?.streaming,
     stream_segment: !!message.metadata?.stream_segment,
+    scheduled_task: message.metadata?.scheduled_task
+      ? {
+          schedule_id: message.metadata.scheduled_task.schedule_id,
+          schedule_run_id: message.metadata.scheduled_task.schedule_run_id,
+          name: message.metadata.scheduled_task.name,
+          scheduled_for: message.metadata.scheduled_task.scheduled_for,
+        }
+      : null,
     knowledge_suggestions: (message.metadata?.knowledge_suggestions || []).map((item) => ({
       id: item.id,
       title: item.title,

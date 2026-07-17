@@ -46,6 +46,7 @@ test("always and session approvals survive broker restart and cleanup clears ses
     const alwaysPending = first.request(context);
     await first.respond("run-one", (await waitForRequest(alwaysRequests)).id, "always");
     assert.equal(await alwaysPending, true);
+    assert.equal(first.hasPersistentAlways("scope", "terminal"), true);
     const alwaysFile = await stat(`${home}/approvals/always.json`);
     assert.equal(alwaysFile.mode & 0o777, 0o600);
 
@@ -60,6 +61,7 @@ test("always and session approvals survive broker restart and cleanup clears ses
     const sessionPending = sessionBroker.request(sessionContext);
     await sessionBroker.respond(sessionContext.runId, (await waitForRequest(sessionRequests)).id, "session");
     assert.equal(await sessionPending, true);
+    assert.equal(sessionBroker.hasPersistentAlways("scope", "process"), false);
     const sessionFile = await stat(`${home}/sessions/${hash("scope")}/${hash("life")}/approvals.jsonl`);
     assert.equal(sessionFile.mode & 0o777, 0o600);
 

@@ -18,6 +18,7 @@ import { KnowledgeSuggestions } from "./KnowledgeSuggestions";
 import { MessageBody } from "./MessageBody";
 import { MessageMeta } from "./MessageMeta";
 import { CopyButton } from "./CopyButton";
+import { ScheduledTaskMarker } from "./ScheduledTaskMarker";
 
 function MessageBubbleImpl({ message }: { message: Message }) {
   const { t } = useI18n();
@@ -28,6 +29,11 @@ function MessageBubbleImpl({ message }: { message: Message }) {
   const pending = !!message.metadata?.local_pending;
   const attachments = message.attachments || [];
   const showWorkCard = !!agentWork && hasAgentProcessSteps(agentWork);
+  const scheduledTask = message.metadata?.scheduled_task;
+
+  if (scheduledTask && message.author_type === "system") {
+    return <ScheduledTaskMarker marker={scheduledTask} message={message} />;
+  }
 
   return (
     <article

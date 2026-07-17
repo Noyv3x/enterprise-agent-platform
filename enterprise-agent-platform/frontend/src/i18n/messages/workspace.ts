@@ -49,6 +49,12 @@ export const workspaceMessages = defineMessages({
   "account.member": { "zh-CN": "成员", en: "Member", "zh-TW": "成員" },
   "account.displayName": { "zh-CN": "显示名称", en: "Display name", "zh-TW": "顯示名稱" },
   "account.position": { "zh-CN": "职位", en: "Position", "zh-TW": "職位" },
+  "account.timezone": { "zh-CN": "时区", en: "Time zone", "zh-TW": "時區" },
+  "account.timezoneHint": {
+    "zh-CN": "使用 IANA 时区名称，例如 Asia/Shanghai。定时任务按此时区显示。",
+    en: "Use an IANA time-zone name, such as Asia/Shanghai. Scheduled tasks use this time zone.",
+    "zh-TW": "使用 IANA 時區名稱，例如 Asia/Taipei。排程任務會依此時區顯示。",
+  },
   "account.saveProfile": { "zh-CN": "保存资料", en: "Save profile", "zh-TW": "儲存資料" },
   "account.saving": { "zh-CN": "保存中…", en: "Saving…", "zh-TW": "儲存中…" },
   "account.changePassword": { "zh-CN": "修改密码", en: "Change password", "zh-TW": "修改密碼" },

@@ -234,6 +234,7 @@ class TelegramGateway:
                 actor = self.service.complete_telegram_link(
                     str(command.group(2)),
                     sender,
+                    chat_id=chat.get("id"),
                     update_id=update_id,
                 )
             except ServiceError as exc:
@@ -268,7 +269,7 @@ class TelegramGateway:
         if not text and not attachments:
             return {"ok": True, "ignored": "empty message"}
         try:
-            actor = self.service.telegram_actor_for_user(sender)
+            actor = self.service.telegram_actor_for_user(sender, chat_id=chat.get("id"))
         except ServiceError:
             result = {"ok": True, "ignored": "unlinked telegram user"}
             return self._queue_text_reply(update_id, message, self._unlinked_text(sender), result)

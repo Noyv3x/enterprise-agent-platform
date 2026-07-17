@@ -8,6 +8,7 @@ import {
   RunCoordinator,
   sanitizeToolResultForJournal,
 } from "../src/run-coordinator.js";
+import { AlwaysApprovalStore } from "../src/persistence.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
 test("RunCoordinator pauses a sensitive tool until approval", async () => {
@@ -37,6 +38,271 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "finished");
     assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "tool.completed"));
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("unattended scheduled runs reject sensitive tools immediately without requesting approval", async () => {
+  const home = await temporaryDirectory("agent-scheduled-no-approval-");
+  const workspace = await temporaryDirectory("agent-scheduled-no-approval-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch should-not-exist.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The command requires a persistent authorization."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "scheduled-session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "run the scheduled task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "42",
+        scheduled_for: "2026-07-16T08:00:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    const failed = events.find((event) => event.type === "tool.failed");
+    assert.ok(failed);
+    assert.equal(failed.data.unattended_authorization_required, true);
+    assert.match(String(failed.data.reason), /persistent always authorization/);
+    await assert.rejects(readFile(`${workspace}/should-not-exist.txt`, "utf8"), { code: "ENOENT" });
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("unattended scheduled runs accept only a persistent always authorization", async () => {
+  const home = await temporaryDirectory("agent-scheduled-always-");
+  const workspace = await temporaryDirectory("agent-scheduled-always-workspace-");
+  new AlwaysApprovalStore(home).grant("scope", "terminal");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch allowed.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "scheduled-always",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "run the scheduled task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "43",
+        scheduled_for: "2026-07-16T08:05:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(await readFile(`${workspace}/allowed.txt`, "utf8"), "");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.ok(events.some((event) => event.type === "tool.completed"));
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("persisted session approval does not authorize an unattended scheduled run", async () => {
+  const home = await temporaryDirectory("agent-scheduled-session-grant-");
+  const workspace = await temporaryDirectory("agent-scheduled-session-grant-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch session-not-allowed.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The session grant was insufficient."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const identity = { scope_key: "scope", lifecycle_id: "life", session_id: "scheduled-session-grant" };
+  try {
+    await coordinator.sessions.appendSessionApproval(identity, "terminal");
+    const run = coordinator.createRun({
+      ...identity,
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "run the scheduled task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "44",
+        scheduled_for: "2026-07-16T08:10:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.equal(events.find((event) => event.type === "tool.failed")?.data.unattended_authorization_required, true);
+    await assert.rejects(readFile(`${workspace}/session-not-allowed.txt`, "utf8"), { code: "ENOENT" });
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("unattended scheduled runs cannot mutate schedules even with an always authorization", async () => {
+  const home = await temporaryDirectory("agent-scheduled-mutation-");
+  const workspace = await temporaryDirectory("agent-scheduled-mutation-workspace-");
+  new AlwaysApprovalStore(home).grant("private:1", "schedule");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("schedule", { action: "pause", arguments: { schedule_id: 7 } }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("Scheduled runs cannot alter schedules."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  coordinator.gateway.invoke = async () => assert.fail("blocked schedule mutation must not reach the platform gateway");
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      session_id: "scheduled-mutation",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "pause the schedule",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "45",
+        scheduled_for: "2026-07-16T08:15:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    const failed = events.find((event) => event.type === "tool.failed");
+    assert.equal(failed?.data.unattended_authorization_required, true);
+    assert.match(String(failed?.data.reason), /cannot mutate schedules/);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("nested delegated unattended blocks reach the scheduled parent journal", async () => {
+  const home = await temporaryDirectory("agent-scheduled-delegate-block-");
+  const workspace = await temporaryDirectory("agent-scheduled-delegate-block-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("delegate_task", { prompt: "delegate the sensitive command again" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("delegate_task", { prompt: "run the sensitive command" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: "touch delegated-should-not-exist.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The delegated command requires persistent authorization."),
+    fauxAssistantMessage("The nested delegate could not run the command."),
+    fauxAssistantMessage("The scheduled parent is done."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      session_id: "scheduled-delegate",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "run the scheduled delegated task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "46",
+        scheduled_for: "2026-07-16T08:20:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "The scheduled parent is done.");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    const failed = events.find(
+      (event) => event.type === "tool.failed" && event.data.unattended_authorization_required === true,
+    );
+    assert.ok(failed);
+    assert.equal(failed.data.tool_name, "terminal");
+    assert.equal(typeof failed.data.child_run_id, "string");
+    assert.match(String(failed.data.reason), /persistent always authorization/);
+    assert.equal("result" in failed.data, false, "delegated forwarding must keep only stable fields");
+    await assert.rejects(readFile(`${workspace}/delegated-should-not-exist.txt`, "utf8"), { code: "ENOENT" });
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("interactive schedule mutations use the normal approval flow", async () => {
+  const home = await temporaryDirectory("agent-interactive-schedule-");
+  const workspace = await temporaryDirectory("agent-interactive-schedule-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("schedule", { action: "delete", arguments: { schedule_id: 7 } }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The schedule was not deleted."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  coordinator.gateway.invoke = async () => assert.fail("denied schedule mutation must not reach the platform gateway");
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      session_id: "interactive-schedule",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "delete the schedule",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
+      (event) => event.type === "approval.requested",
+    ));
+    assert.equal(approval.data.tool_name, "schedule");
+    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "deny");
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const failed = coordinator.getJournal(run.id)?.list().find((event) => event.type === "tool.failed");
+    assert.equal(failed?.data.unattended_authorization_required, undefined);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

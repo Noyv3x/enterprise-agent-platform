@@ -1,5 +1,5 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { changePassword, updateCurrentUser } from "../../data/accountActions";
+import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
+import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
 import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
@@ -12,6 +12,17 @@ import { PageHeader } from "../common/PageHeader";
 
 const MIN_PASSWORD_LENGTH = 8;
 
+function timezoneOptions(current: string): string[] {
+  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] };
+  let values: string[] = [];
+  try {
+    values = intl.supportedValuesOf?.("timeZone") || [];
+  } catch {
+    values = [];
+  }
+  return [...new Set([current, "UTC", ...values].filter(Boolean))];
+}
+
 export function SettingsView() {
   const { t } = useI18n();
   const store = useStoreHandle();
@@ -20,15 +31,23 @@ export function SettingsView() {
 
   const [displayName, setDisplayName] = useState("");
   const [position, setPosition] = useState("");
+  const [timezone, setTimezone] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordError, setPasswordError] = useState<"mismatch" | "too-short" | "">("");
+  const timezoneListId = useId();
+  const timezoneHintId = useId();
+  const timezones = useMemo(() => timezoneOptions(timezone), [timezone]);
 
   useEffect(() => {
     setDisplayName(user?.display_name || user?.username || "");
     setPosition(user?.position || "");
   }, [user?.display_name, user?.id, user?.position, user?.username]);
+
+  useEffect(() => {
+    setTimezone(user?.timezone || browserTimezone() || "UTC");
+  }, [user?.id, user?.timezone]);
 
   if (!user) {
     return (
@@ -50,7 +69,8 @@ export function SettingsView() {
   const passwordPending = pendingOperations.includes("account:password");
   const profileDirty =
     displayName !== (user.display_name || user.username || "") ||
-    position !== (user.position || "");
+    position !== (user.position || "") ||
+    timezone !== (user.timezone || "");
   const passwordDirty = !!(currentPassword || newPassword || confirmPassword);
 
   const handleProfileSubmit = (event: FormEvent) => {
@@ -58,6 +78,7 @@ export function SettingsView() {
     void updateCurrentUser(store, {
       display_name: displayName,
       position,
+      timezone: timezone.trim(),
     });
   };
 
@@ -125,6 +146,21 @@ export function SettingsView() {
                   onChange={(event) => setPosition(event.target.value)}
                 />
               </Field>
+              <Field label={t("account.timezone")}>
+                <div className="field-stack">
+                  <input
+                    required
+                    list={timezoneListId}
+                    value={timezone}
+                    aria-describedby={timezoneHintId}
+                    onChange={(event) => setTimezone(event.target.value)}
+                  />
+                  <datalist id={timezoneListId}>
+                    {timezones.map((item) => <option key={item} value={item} />)}
+                  </datalist>
+                  <div className="field-help" id={timezoneHintId}>{t("account.timezoneHint")}</div>
+                </div>
+              </Field>
             </div>
             <div className="form-actions">
               <LoadingButton
@@ -132,7 +168,7 @@ export function SettingsView() {
                 variant="primary"
                 loading={profilePending}
                 loadingLabel={t("account.saving")}
-                disabled={!profileDirty}
+                disabled={!profileDirty || !timezone.trim()}
               >
                 {t("account.saveProfile")}
               </LoadingButton>

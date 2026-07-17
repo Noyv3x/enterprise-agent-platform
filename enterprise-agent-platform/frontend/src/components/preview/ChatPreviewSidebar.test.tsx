@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   },
   browserRender: vi.fn(),
   terminalRender: vi.fn(),
+  schedulesRender: vi.fn(),
 }));
 
 vi.mock("./usePreviewAvailability", () => ({
@@ -42,6 +43,13 @@ vi.mock("./TerminalPreviewView", () => ({
   },
 }));
 
+vi.mock("../scheduled-tasks/ScheduledTasksPanel", () => ({
+  ScheduledTasksPanel: () => {
+    mocks.schedulesRender();
+    return <div data-testid="scheduled-tasks-fixture" />;
+  },
+}));
+
 const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" };
 
 function renderSidebar(scope: AgentPreviewScope | null = privateScope) {
@@ -61,6 +69,7 @@ describe("ChatPreviewSidebar", () => {
     mocks.availability.runningTerminalCount = 0;
     mocks.browserRender.mockClear();
     mocks.terminalRender.mockClear();
+    mocks.schedulesRender.mockClear();
   });
 
   afterEach(() => {
@@ -68,13 +77,33 @@ describe("ChatPreviewSidebar", () => {
     localStorage.clear();
   });
 
-  it("keeps the chat visible without rendering preview controls when resources are idle", () => {
+  it("keeps a private task entry visible while live preview resources are idle", () => {
     renderSidebar();
 
     expect(screen.getByText("Chat content")).toBeVisible();
-    expect(screen.queryByRole("navigation", { name: "Live previews" })).not.toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Agent side tools" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open scheduled tasks" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Open browser preview" })).not.toBeInTheDocument();
     expect(mocks.browserRender).not.toHaveBeenCalled();
     expect(mocks.terminalRender).not.toHaveBeenCalled();
+    expect(mocks.schedulesRender).not.toHaveBeenCalled();
+  });
+
+  it("opens scheduled tasks on demand only for a private Agent", async () => {
+    const view = renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
+    expect(screen.getByRole("complementary", { name: "Scheduled tasks" })).toBeVisible();
+    expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
+
+    view.rerender(
+      <I18nProvider>
+        <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+          <div>Channel chat</div>
+        </ChatPreviewSidebar>
+      </I18nProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Open scheduled tasks" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
   });
 
   it("shows only the active browser control and mounts the full preview on demand", async () => {
@@ -83,6 +112,7 @@ describe("ChatPreviewSidebar", () => {
 
     const browserButton = screen.getByRole("button", { name: "Open browser preview" });
     expect(screen.queryByRole("button", { name: /Open terminal preview/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open scheduled tasks" })).toBeVisible();
     expect(mocks.browserRender).not.toHaveBeenCalled();
 
     await userEvent.click(browserButton);
@@ -91,6 +121,19 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.getByRole("complementary", { name: "Live browser preview" })).toBeVisible();
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
     expect(mocks.browserRender).toHaveBeenCalled();
+  });
+
+  it("keeps scheduled tasks and live previews mutually exclusive", async () => {
+    mocks.availability.browserActive = true;
+    renderSidebar();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
+    expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
+    expect(screen.queryByTestId("browser-preview-fixture")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open browser preview" }));
+    expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
+    expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
   });
 
   it("shows the running terminal count and closes the drawer as soon as terminals finish", async () => {

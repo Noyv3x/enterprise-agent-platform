@@ -1,13 +1,14 @@
 {
   "version": 1,
   "current_assets": [
+    "app-B8IyZZB7.js",
+    "chunk-MarkdownContent-Ct5Ug7zw.js",
+    "chunk-ScheduledTasksPanel-DtAYGxtz.js",
+    "styles-B-3UtLy3.css"
+  ],
+  "previous_assets": [
     "app-_Y-C5JPB.js",
     "chunk-MarkdownContent-OHhJrkX4.js",
     "styles-DKd8zkob.css"
-  ],
-  "previous_assets": [
-    "app-CcddhcNd.js",
-    "chunk-MarkdownContent-CICk-kxC.js",
-    "styles-BOqvNKRo.css"
   ]
 }

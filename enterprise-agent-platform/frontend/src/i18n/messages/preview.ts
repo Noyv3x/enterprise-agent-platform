@@ -1,7 +1,7 @@
 import { defineMessages } from "../types";
 
 export const previewMessages = defineMessages({
-  "preview.sidebarLabel": { "zh-CN": "实时预览", en: "Live previews", "zh-TW": "即時預覽" },
+  "preview.sidebarLabel": { "zh-CN": "Agent 侧边工具", en: "Agent side tools", "zh-TW": "Agent 側邊工具" },
   "preview.openBrowser": { "zh-CN": "展开浏览器预览", en: "Open browser preview", "zh-TW": "展開瀏覽器預覽" },
   "preview.openTerminals": {
     "zh-CN": "展开终端预览（{count}）",

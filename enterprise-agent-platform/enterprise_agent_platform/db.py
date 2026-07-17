@@ -129,6 +129,7 @@ class Database:
                     permission_group TEXT NOT NULL DEFAULT 'member',
                     model_name TEXT NOT NULL DEFAULT '',
                     thinking_depth TEXT NOT NULL DEFAULT 'medium',
+                    timezone TEXT NOT NULL DEFAULT '',
                     active INTEGER NOT NULL DEFAULT 1,
                     token_version INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
@@ -153,6 +154,8 @@ class Database:
                     username TEXT NOT NULL DEFAULT '',
                     content TEXT NOT NULL,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    hidden_at INTEGER,
+                    hidden_by_user_id INTEGER REFERENCES users(id),
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope_type, scope_id, id);
@@ -302,6 +305,7 @@ class Database:
                 """
             )
             self._ensure_user_columns()
+            self._ensure_message_columns()
             self._ensure_agent_scope_columns()
             self._ensure_agent_runtime_scopes()
             self._normalize_attachment_sources()
@@ -316,6 +320,7 @@ class Database:
             "permission_group": "ALTER TABLE users ADD COLUMN permission_group TEXT NOT NULL DEFAULT 'member'",
             "model_name": "ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
             "thinking_depth": "ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'",
+            "timezone": "ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''",
             "token_version": "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1",
         }
         for name, sql in additions.items():
@@ -333,6 +338,19 @@ class Database:
         )
         self._conn.execute(
             "UPDATE users SET thinking_depth = 'medium' WHERE thinking_depth IS NULL OR thinking_depth = ''"
+        )
+
+    def _ensure_message_columns(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "hidden_at" not in columns:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN hidden_at INTEGER")
+        if "hidden_by_user_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE messages ADD COLUMN hidden_by_user_id INTEGER REFERENCES users(id)"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_visible_scope "
+            "ON messages(scope_type, scope_id, hidden_at, id)"
         )
 
     def _ensure_agent_scope_columns(self) -> None:

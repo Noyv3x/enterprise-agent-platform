@@ -16,6 +16,10 @@ import type {
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
   AgentPreviewStatusResponse,
+  AgentScheduleResponse,
+  AgentScheduleRunsResponse,
+  AgentScheduleRunNowResponse,
+  AgentSchedulesResponse,
   ChangePasswordRequest,
   ChangePasswordResponse,
   ChannelCreateRequest,
@@ -28,6 +32,7 @@ import type {
   DeleteBeforeRequest,
   DeleteClearAllRequest,
   DeleteResultResponse,
+  DeleteAgentScheduleResponse,
   DocumentResponse,
   DocumentsResponse,
   ImpersonateUserResponse,
@@ -145,6 +150,40 @@ export const endpoints = {
     () => "/api/private-agent/telegram",
   ),
   deletePrivateTelegram: ep<string, unknown>("DELETE", () => "/api/private-agent/telegram"),
+
+  /* private Agent schedules */
+  privateSchedules: ep<void, AgentSchedulesResponse>(
+    "GET",
+    () => "/api/private-agent/schedules",
+  ),
+  privateSchedule: ep<void, AgentScheduleResponse, [Id]>(
+    "GET",
+    (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}`,
+  ),
+  privateScheduleRuns: ep<void, AgentScheduleRunsResponse, [Id, number, Id?]>(
+    "GET",
+    (id, limit, beforeId) => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (beforeId != null && String(beforeId)) params.set("before_id", String(beforeId));
+      return `/api/private-agent/schedules/${encodeURIComponent(String(id))}/runs?${params.toString()}`;
+    },
+  ),
+  pausePrivateSchedule: ep<void, AgentScheduleResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}/pause`,
+  ),
+  resumePrivateSchedule: ep<void, AgentScheduleResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}/resume`,
+  ),
+  runPrivateScheduleNow: ep<void, AgentScheduleRunNowResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}/run-now`,
+  ),
+  deletePrivateSchedule: ep<void, DeleteAgentScheduleResponse, [Id]>(
+    "DELETE",
+    (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}`,
+  ),
 
   /* read-only Agent previews */
   previewStatus: ep<void, AgentPreviewStatusResponse, [ScopeType, Id]>(

@@ -208,6 +208,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         ]
         progress: list[dict[str, Any]] = []
         content: list[str | None] = []
+        started: list[str] = []
 
         result = self.client.generate(
             system_prompt="You are ubitech agent.",
@@ -228,6 +229,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             reasoning_config={"enabled": True},
             progress_callback=progress.append,
             content_callback=content.append,
+            run_started_callback=started.append,
         )
 
         self.assertEqual(result.content, "Hello world")
@@ -237,6 +239,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(content, ["Hello ", "world"])
         self.assertEqual([item["event"] for item in progress], ["tool.started"])
         self.assertEqual(progress[0]["tool"], "read_file")
+        self.assertEqual(started, ["run-1"])
 
         request = self.runtime.request("POST", "/v1/runs")
         self.assertEqual(request["authorization"], "Bearer runtime-secret")

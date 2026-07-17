@@ -13,6 +13,7 @@ from typing import Any, Callable, Protocol
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
 AgentContentCallback = Callable[[str | None], None]
+AgentRunStartedCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class AgentClient(Protocol):
         reasoning_config: dict[str, Any] | None = None,
         progress_callback: AgentProgressCallback | None = None,
         content_callback: AgentContentCallback | None = None,
+        run_started_callback: AgentRunStartedCallback | None = None,
     ) -> AgentResult:
         ...
 
@@ -203,6 +205,7 @@ class AgentRuntimeClient:
         reasoning_config: dict[str, Any] | None = None,
         progress_callback: AgentProgressCallback | None = None,
         content_callback: AgentContentCallback | None = None,
+        run_started_callback: AgentRunStartedCallback | None = None,
     ) -> AgentResult:
         clean_session_id = str(session_id or "").strip()
         clean_scope_key = str(session_key or "").strip()
@@ -267,6 +270,11 @@ class AgentRuntimeClient:
                 "POST /v1/runs returned without a run_id after accepting the request",
                 raw={"start": start},
             )
+        if run_started_callback is not None:
+            # This is the exact submission boundary used by the platform's
+            # lifecycle barrier: the runtime has returned a durable run id, so
+            # a concurrent scope cleanup can now discover and cancel the run.
+            run_started_callback(run_id)
         response_session = str(start.get("session_id") or headers.get("X-Agent-Session-Id") or clean_session_id)
         events_path = self._events_path(start.get("events_url"), run_id)
         request = urllib.request.Request(

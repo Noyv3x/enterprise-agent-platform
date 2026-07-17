@@ -119,6 +119,10 @@ export class ApprovalBroker {
     return [...this.pending.values()].map((item) => item.request).filter((request) => request.run_id === runId).at(-1);
   }
 
+  hasPersistentAlways(scopeKey: string, toolName: string): boolean {
+    return this.persistence?.always.has(scopeKey, toolName) === true;
+  }
+
   cancelRun(runId: string): void {
     for (const [approvalId, item] of this.pending) {
       if (item.request.run_id !== runId) continue;

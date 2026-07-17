@@ -140,6 +140,8 @@ class BlockingAgent:
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
+        if kwargs.get("run_started_callback"):
+            kwargs["run_started_callback"]("fake-run")
         self.started.set()
         self.release.wait(timeout=5)
         return AgentResult(
@@ -1364,6 +1366,84 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_stale_telegram_update_cannot_restore_identity_after_unlink_and_relink(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            entered = threading.Event()
+            release = threading.Event()
+            worker: threading.Thread | None = None
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                self._complete_telegram_link(service, admin, "12345", "old_tg")
+                old_update = {
+                    "update_id": 2,
+                    "message": {
+                        "message_id": 20,
+                        "chat": {"id": 12345, "type": "private"},
+                        "from": {"id": 12345, "username": "old_tg", "first_name": "Old"},
+                        "text": "stale private request",
+                    },
+                }
+                results: list[dict] = []
+                errors: list[BaseException] = []
+                original_refresh = service._refresh_telegram_identity
+
+                def delayed_refresh(*args, **kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(timeout=3))
+                    return original_refresh(*args, **kwargs)
+
+                def process_old_update():
+                    try:
+                        results.append(gateway.process_update(old_update))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with mock.patch.object(
+                    service,
+                    "_refresh_telegram_identity",
+                    side_effect=delayed_refresh,
+                ):
+                    worker = threading.Thread(
+                        target=process_old_update,
+                        name="stale-telegram-update",
+                    )
+                    worker.start()
+                    self.assertTrue(entered.wait(timeout=2))
+
+                    service.unlink_telegram_private_config(admin)
+                    challenge = service.update_telegram_private_config(admin, {})
+                    service.complete_telegram_link(
+                        challenge["pending"]["code"],
+                        {"id": "54321", "username": "new_tg", "first_name": "New"},
+                        chat_id=54321,
+                    )
+                    release.set()
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+
+                self.assertEqual(errors, [])
+                self.assertEqual(results[0]["ignored"], "unlinked telegram user")
+                self.assertEqual(agent.calls, [])
+                identities = service.db.query(
+                    """
+                    SELECT external_id, user_id FROM external_identities
+                    WHERE provider = 'telegram' ORDER BY external_id
+                    """
+                )
+                self.assertEqual(
+                    identities,
+                    [{"external_id": "54321", "user_id": int(admin["id"])}],
+                )
+            finally:
+                release.set()
+                if worker is not None:
+                    worker.join(timeout=5)
+                service.close()
+
     def test_telegram_link_command_is_one_time_and_updates_are_deduplicated(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -2375,6 +2455,9 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(deleted["deleted"], 1)
                 self.assertEqual(deleted["message"]["content"], "second")
                 self.assertEqual([message["content"] for message in service.audit_channel_messages(admin, 1)["messages"]], ["first", "third"])
+                self.assertIsNotNone(
+                    service.db.scalar("SELECT hidden_at FROM messages WHERE id = ?", (second["id"],))
+                )
 
                 before = service.delete_channel_messages_before(admin, 1, 2500)
                 self.assertEqual(before["deleted"], 1)
@@ -2383,6 +2466,12 @@ class PlatformServiceTests(unittest.TestCase):
                 cleared = service.clear_channel_messages(admin, 1)
                 self.assertEqual(cleared["deleted"], 1)
                 self.assertEqual(service.audit_channel_messages(admin, 1)["total"], 0)
+                self.assertEqual(
+                    service.db.scalar(
+                        "SELECT COUNT(*) FROM messages WHERE scope_type = 'channel' AND scope_id = '1'"
+                    ),
+                    3,
+                )
             finally:
                 service.close()
 
@@ -2492,10 +2581,17 @@ class PlatformServiceTests(unittest.TestCase):
                 cleared = service.clear_private_messages(admin, alice["id"])
                 self.assertEqual(cleared["deleted"], 2)
                 self.assertEqual(service.audit_private_messages(admin, alice["id"])["total"], 0)
+                self.assertEqual(
+                    service.db.scalar(
+                        "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+                        (str(alice["id"]),),
+                    ),
+                    6,
+                )
             finally:
                 service.close()
 
-    def test_clear_private_conversation_cancels_inflight_reply_and_rotates_session(self):
+    def test_clear_private_conversation_only_hides_current_rows(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()
             agent.cleanup_scope = mock.Mock(return_value={"cancelled": 1})
@@ -2511,25 +2607,34 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(cleared["deleted"], 1)
                 after = service.agent_scopes.get_private_scope(admin["id"])
                 self.assertIsNotNone(after)
-                self.assertNotEqual(after.session_id, before.session_id)
+                self.assertEqual(after.session_id, before.session_id)
                 self.assertEqual(after.workspace_path, before.workspace_path)
-                agent.cleanup_scope.assert_called_once_with(
-                    before.scope_key,
-                    lifecycle_id=before.lifecycle_id,
-                    delete_sessions=True,
-                )
+                agent.cleanup_scope.assert_not_called()
 
                 agent.release.set()
                 service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
-                self.assertEqual(service.audit_private_messages(admin, admin["id"])["messages"], [])
+                visible = service.audit_private_messages(admin, admin["id"])["messages"]
+                self.assertEqual([message["author_type"] for message in visible], ["agent"])
                 job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
                 self.assertIsNotNone(job)
-                self.assertEqual(job.status, "failed")
+                self.assertEqual(job.status, "succeeded")
+                hidden = service.db.query_one(
+                    "SELECT hidden_at FROM messages WHERE id = ?",
+                    (sent["user_message"]["id"],),
+                )
+                self.assertIsNotNone(hidden["hidden_at"])
+                self.assertEqual(
+                    service.db.scalar(
+                        "SELECT COUNT(*) FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+                        (str(admin["id"]),),
+                    ),
+                    2,
+                )
             finally:
                 agent.release.set()
                 service.close()
 
-    def test_clear_preserves_visible_history_when_session_rotation_fails(self):
+    def test_clear_does_not_touch_session_or_runtime_cleanup(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
@@ -2541,15 +2646,33 @@ class PlatformServiceTests(unittest.TestCase):
                     service.agent_scopes,
                     "rotate_session",
                     side_effect=OSError("disk full"),
-                ):
-                    with self.assertRaises(OSError):
-                        service.clear_private_messages(admin, admin["id"])
+                ) as rotate, mock.patch.object(service, "_cleanup_agent_scope") as cleanup:
+                    cleared = service.clear_private_messages(admin, admin["id"])
+                self.assertEqual(cleared["deleted"], 2)
+                rotate.assert_not_called()
+                cleanup.assert_not_called()
 
                 after = service.agent_scopes.get_private_scope(admin["id"])
                 self.assertEqual(after.session_id, before.session_id)
                 messages = service.audit_private_messages(admin, admin["id"])["messages"]
-                self.assertEqual(messages[0]["id"], sent["user_message"]["id"])
-                self.assertEqual(len(messages), 2)
+                self.assertEqual(messages, [])
+                retained = service.db.query(
+                    "SELECT id, hidden_at FROM messages WHERE scope_type = 'private' AND scope_id = ?",
+                    (str(admin["id"]),),
+                )
+                self.assertEqual(len(retained), 2)
+                self.assertTrue(all(row["hidden_at"] is not None for row in retained))
+
+                service.send_private_message(admin, "continue after hidden history")
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
+                seeded_history = service.agent_client.calls[-1]["history"]
+                self.assertEqual(
+                    [item["content"] for item in seeded_history[-2:]],
+                    [
+                        "keep this if rotation fails",
+                        "agent response to keep this if rotation fails",
+                    ],
+                )
             finally:
                 service.close()
 
@@ -2583,6 +2706,55 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 service.close()
 
+    def test_permission_revocation_before_runtime_submission_prevents_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            entered = threading.Event()
+            release = threading.Event()
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.create_user(
+                    username="pre-submit-revoke",
+                    password="pre-submit-revoke-pass",
+                    display_name="Pre-submit Revoke",
+                    permission_group="member",
+                    actor=admin,
+                )
+                _, user = service.authenticate("pre-submit-revoke", "pre-submit-revoke-pass")
+                original = service._runtime_submission_barrier
+
+                def delayed_barrier(task, scope_key):
+                    entered.set()
+                    self.assertTrue(release.wait(timeout=3))
+                    return original(task, scope_key)
+
+                with mock.patch.object(
+                    service,
+                    "_runtime_submission_barrier",
+                    side_effect=delayed_barrier,
+                ):
+                    sent = service.send_private_message(user, "must not start after revoke")
+                    self.assertTrue(entered.wait(timeout=2))
+                    service.update_user(admin, user["id"], {"permission_group": "viewer"})
+                    release.set()
+                    service.wait_for_agent_idle("private", str(user["id"]), timeout=5)
+
+                self.assertEqual(agent.calls, [])
+                job = service.jobs.get_by_key(
+                    "agent", f"message:{sent['user_message']['id']}"
+                )
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "failed")
+                self.assertIsNone(
+                    service.agent_message_replying_to(
+                        "private", str(user["id"]), sent["user_message"]["id"]
+                    )
+                )
+            finally:
+                release.set()
+                service.close()
+
     def test_stale_authenticated_actor_cannot_write_after_deactivation(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -2613,7 +2785,7 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_deleting_source_message_cancels_inflight_agent_reply(self):
+    def test_hiding_source_message_does_not_cancel_inflight_agent_reply(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
@@ -2626,15 +2798,22 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
 
-                self.assertEqual(service.audit_private_messages(admin, admin["id"])["messages"], [])
+                visible = service.audit_private_messages(admin, admin["id"])["messages"]
+                self.assertEqual(len(visible), 1)
+                self.assertEqual(visible[0]["author_type"], "agent")
                 job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
                 self.assertIsNotNone(job)
-                self.assertEqual(job.status, "failed")
+                self.assertEqual(job.status, "succeeded")
+                source = service.db.query_one(
+                    "SELECT hidden_at FROM messages WHERE id = ?",
+                    (sent["user_message"]["id"],),
+                )
+                self.assertIsNotNone(source["hidden_at"])
             finally:
                 agent.release.set()
                 service.close()
 
-    def test_attachment_write_and_message_delete_are_serialized(self):
+    def test_hiding_message_during_attachment_write_preserves_attachment(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             entered = threading.Event()
@@ -2677,7 +2856,7 @@ class PlatformServiceTests(unittest.TestCase):
                     )
                     delete_thread.start()
                     time.sleep(0.05)
-                    self.assertTrue(delete_thread.is_alive())
+                    self.assertFalse(delete_thread.is_alive())
                     release.set()
                     append_thread.join(timeout=3)
                     delete_thread.join(timeout=3)
@@ -2685,9 +2864,13 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(append_errors, [])
                 self.assertFalse(append_thread.is_alive())
                 self.assertFalse(delete_thread.is_alive())
-                self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
+                self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 1)
                 self.assertEqual(
-                    [path for path in service._attachment_root().rglob("*") if path.is_file()],
+                    len([path for path in service._attachment_root().rglob("*") if path.is_file()]),
+                    1,
+                )
+                self.assertEqual(
+                    service.audit_private_messages(admin, admin["id"])["messages"],
                     [],
                 )
             finally:

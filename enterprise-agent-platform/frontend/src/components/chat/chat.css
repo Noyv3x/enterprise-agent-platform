@@ -91,6 +91,46 @@
 
 .chat-copy.is-copied { color: var(--ok); }
 .chat-copy.is-failed { color: var(--danger); }
+
+.scheduled-message-marker {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(16px, 1fr) auto minmax(16px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  color: var(--muted);
+}
+
+.scheduled-message-marker__line {
+  height: 1px;
+  background: var(--line);
+}
+
+.scheduled-message-marker__content {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.scheduled-message-marker__content svg { color: var(--accent); }
+.scheduled-message-marker__content strong {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+.scheduled-message-marker__content time { color: var(--faint); }
+
+@media (max-width: 520px) {
+  .scheduled-message-marker__content > span { display: none; }
+  .scheduled-message-marker__content strong { max-width: 120px; }
+}
 .chat-copy__icon { font-family: var(--font-mono); font-size: 13px; }
 
 .msg__body {

@@ -49,6 +49,11 @@ export interface RunMetadata extends JsonObject {
   approval_owner_run_id?: string;
   approval_scope_key?: string;
   approval_session_id?: string;
+  trigger?: string;
+  unattended?: boolean;
+  schedule_id?: string;
+  schedule_run_id?: string;
+  scheduled_for?: string;
 }
 
 export type UserInput = string | Array<TextContent | ImageContent>;
@@ -128,7 +133,7 @@ export interface ResolvedModel {
 }
 
 export interface GatewayToolRequest {
-  tool: "memory" | "session" | "knowledge" | "web" | "browser";
+  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule";
   action: string;
   arguments: JsonObject;
   context: {

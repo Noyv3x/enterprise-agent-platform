@@ -1,0 +1,218 @@
+.scheduled-tasks {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.schedule-panel__toolbar {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.schedule-panel__toolbar > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-panel__loading {
+  min-height: 220px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.schedule-list,
+.schedule-history {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.schedule-card {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-1);
+}
+
+.schedule-card__head,
+.schedule-card__head > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.schedule-card__head { justify-content: space-between; }
+
+.schedule-card__head h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-card__id,
+.schedule-run__id {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.schedule-status,
+.schedule-run__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-status .dot,
+.schedule-run__status .dot { width: 7px; height: 7px; }
+.schedule-status.is-ok,
+.schedule-run__status.is-ok { color: var(--ok); }
+.schedule-status.is-warn,
+.schedule-run__status.is-warn { color: var(--warn); }
+.schedule-run__status.is-error { color: var(--danger); }
+
+.schedule-card__prompt {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.schedule-card__facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+
+.schedule-card__facts > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+
+.schedule-card__facts dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.schedule-card__facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+}
+
+.schedule-card__meta {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-card__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.schedule-card__actions .btn { min-width: 0; }
+
+.schedule-runs {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.schedule-run {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.schedule-run__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.schedule-run__times {
+  display: grid;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.schedule-run__error {
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.schedule-panel__more {
+  display: grid;
+  place-items: center;
+  padding: 8px;
+}
+
+.schedule-panel__load-more { justify-self: center; }
+
+@media (max-width: 520px) {
+  .schedule-card { padding: 12px; }
+  .schedule-card__facts { grid-template-columns: 1fr; }
+  .schedule-card__actions .btn { flex: 1 1 auto; }
+}

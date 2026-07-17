@@ -7,15 +7,19 @@ import type { RunRequest } from "../src/types.js";
 test("PlatformGateway adapts memory and credential calls to protected platform routes", async () => {
   const seen: string[] = [];
   let memoryBody: Record<string, unknown> = {};
+  let scheduleBody: Record<string, unknown> = {};
   const server = createServer(async (request, response) => {
     seen.push(`${request.method} ${request.url} ${request.headers.authorization || ""}`);
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     if (request.url === "/api/agent/tools/memory/search") {
       memoryBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    } else if (request.url === "/internal/agent/tools/schedule") {
+      scheduleBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     }
     response.setHeader("content-type", "application/json");
     if (request.url === "/api/agent/tools/memory/search") response.end(JSON.stringify({ memories: [{ id: 1, content: "remembered" }] }));
+    else if (request.url === "/internal/agent/tools/schedule") response.end(JSON.stringify({ data: { id: 7 } }));
     else if (request.url === "/api/agent/tools/credentials/resolve") response.end(JSON.stringify({ access_token: "fresh-token" }));
     else { response.statusCode = 404; response.end(JSON.stringify({ error: "not found" })); }
   });
@@ -47,6 +51,21 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
     assert.equal(memoryBody.scope_key, "scope");
     assert.equal(memoryBody.lifecycle_id, "life");
     assert.equal(memoryBody.session_id, "session");
+    await gateway.invoke(request, "scheduled-run", "schedule", "pause", {
+      schedule_id: 7,
+      scope_key: "forged-scope",
+    });
+    assert.equal(scheduleBody.tool, "schedule");
+    assert.equal(scheduleBody.action, "pause");
+    assert.deepEqual(scheduleBody.arguments, { schedule_id: 7, scope_key: "forged-scope" });
+    assert.deepEqual(scheduleBody.context, {
+      run_id: "scheduled-run",
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace: "/tmp",
+      owner_user_id: 42,
+    });
     assert.equal(await gateway.token(request, "openai-codex"), "fresh-token");
     assert.ok(seen.every((entry) => entry.endsWith("Bearer rotated-token")));
   } finally {

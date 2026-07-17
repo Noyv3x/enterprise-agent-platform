@@ -41,7 +41,8 @@ export type IconName =
   | "link"
   | "users"
   | "browser"
-  | "terminal";
+  | "terminal"
+  | "calendar";
 
 /** Top-level workspace view. */
 export type ActiveView =
@@ -85,6 +86,8 @@ export interface User {
   permission_group?: string;
   permission_group_label?: string;
   position?: string;
+  /** IANA time-zone name used for schedule display and execution. */
+  timezone?: string;
   permissions?: string[];
   model_name?: string;
   thinking_depth?: string;
@@ -209,6 +212,15 @@ export interface MessageMetadata {
   stream_segment?: boolean;
   knowledge_suggestions?: KnowledgeSuggestion[];
   agent_work?: AgentWork;
+  /** Marks the compact source message emitted by a scheduled task run. */
+  scheduled_task?: ScheduledTaskMessageMarker;
+}
+
+export interface ScheduledTaskMessageMarker {
+  schedule_id: Id;
+  schedule_run_id: Id;
+  name: string;
+  scheduled_for: string;
 }
 
 export interface Message {
@@ -264,6 +276,53 @@ export interface PrivateTelegram {
   gateway?: PrivateTelegramGateway;
   link?: PrivateTelegramLink | null;
   pending?: PrivateTelegramPending | null;
+}
+
+/* ---------------------------------------------------- scheduled Agent work */
+
+export type AgentScheduleRule =
+  | { type: "once"; at: string }
+  | { type: "interval"; every_seconds: number; starts_at?: string | null }
+  | { type: "cron"; expression: string };
+
+export type AgentScheduleDelivery = "chat" | "chat_and_telegram";
+export type AgentScheduleState = "active" | "paused" | "completed";
+export type AgentScheduleRunStatus =
+  | "queued"
+  | "running"
+  | "blocked"
+  | "needs_review"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "cancelled"
+  | (string & {});
+
+export interface AgentScheduleRun {
+  id: number;
+  schedule_id: number;
+  scheduled_for: string;
+  status: AgentScheduleRunStatus;
+  source_message_id: number | null;
+  response_message_id: number | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string;
+}
+
+export interface AgentSchedule {
+  id: number;
+  name: string;
+  prompt: string;
+  schedule: AgentScheduleRule;
+  timezone: string;
+  delivery: AgentScheduleDelivery;
+  state: AgentScheduleState;
+  enabled: boolean;
+  next_run_at: string | null;
+  last_run: AgentScheduleRun | null;
+  created_at: string;
+  updated_at: string;
 }
 
 /* ------------------------------------------------------------- knowledge */

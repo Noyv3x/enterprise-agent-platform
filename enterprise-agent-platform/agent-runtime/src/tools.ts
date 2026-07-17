@@ -163,6 +163,87 @@ const browserSchema = Type.Object({
   arguments: Type.Optional(browserArgumentsSchema),
 }, { additionalProperties: false });
 
+const rfc3339Schema = Type.String({
+  minLength: 20,
+  maxLength: 40,
+  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$",
+});
+
+const scheduleDefinitionSchema = Type.Union([
+  Type.Object({
+    type: Type.Literal("once"),
+    at: rfc3339Schema,
+  }, { additionalProperties: false }),
+  Type.Object({
+    type: Type.Literal("interval"),
+    every_seconds: Type.Integer({ minimum: 300, maximum: 31_622_400 }),
+    starts_at: Type.Optional(rfc3339Schema),
+  }, { additionalProperties: false }),
+  Type.Object({
+    type: Type.Literal("cron"),
+    expression: Type.String({
+      minLength: 9,
+      maxLength: 200,
+      pattern: "^\\S+(?:\\s+\\S+){4}$",
+    }),
+  }, { additionalProperties: false }),
+]);
+
+const scheduleDeliverySchema = Type.Union([
+  Type.Literal("chat"),
+  Type.Literal("chat_and_telegram"),
+]);
+
+const scheduleIdSchema = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
+const emptyScheduleArgumentsSchema = Type.Object({}, { additionalProperties: false });
+const scheduleTargetArgumentsSchema = Type.Object({
+  schedule_id: scheduleIdSchema,
+}, { additionalProperties: false });
+
+const scheduleSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("list"),
+    arguments: Type.Optional(emptyScheduleArgumentsSchema),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("get"),
+    arguments: scheduleTargetArgumentsSchema,
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("history"),
+    arguments: Type.Object({
+      schedule_id: scheduleIdSchema,
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      before_id: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("create"),
+    arguments: Type.Object({
+      name: Type.String({ minLength: 1, maxLength: 120 }),
+      prompt: Type.String({ minLength: 1, maxLength: 20_000 }),
+      schedule: scheduleDefinitionSchema,
+      timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+      delivery: Type.Optional(scheduleDeliverySchema),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("update"),
+    arguments: Type.Object({
+      schedule_id: scheduleIdSchema,
+      name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+      prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
+      schedule: Type.Optional(scheduleDefinitionSchema),
+      timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+      delivery: Type.Optional(scheduleDeliverySchema),
+    }, { additionalProperties: false, minProperties: 2 }),
+  }, { additionalProperties: false }),
+  ...(["pause", "resume", "delete", "run_now"] as const).map((action) => Type.Object({
+    action: Type.Literal(action),
+    arguments: scheduleTargetArgumentsSchema,
+  }, { additionalProperties: false })),
+]);
+
 const delegateSchema = Type.Object({
   prompt: Type.String({ minLength: 1 }),
   system_prompt: Type.Optional(Type.String()),
@@ -402,6 +483,28 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     },
   };
 
+  const scheduleTool: AgentTool<typeof scheduleSchema, JsonValue> = {
+    name: "schedule",
+    label: "Schedule",
+    description: gatewayDescription("schedule"),
+    parameters: scheduleSchema,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal) {
+      const arguments_ = objectValue(params.arguments);
+      if (isScheduleMutation(params.action)) context.markSideEffect();
+      return gatewayResult(
+        await context.gateway.invoke(
+          context.request,
+          context.runId,
+          "schedule",
+          params.action,
+          arguments_,
+          signal,
+        ),
+      );
+    },
+  };
+
   const sessionTool: AgentTool<typeof gatewaySchema, JsonValue> = {
     name: "session",
     label: "Session",
@@ -441,8 +544,13 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     sessionTool,
     ...gatewayTools,
     browserTool,
+    ...(isCanonicalPrivateScope(context.request.scope_key) ? [scheduleTool] : []),
     delegateTool,
   ];
+}
+
+function isCanonicalPrivateScope(scopeKey: string): boolean {
+  return /^private:[1-9][0-9]*$/.test(scopeKey);
 }
 
 export interface ToolPolicyResult {
@@ -504,6 +612,9 @@ export async function classifyToolCall(toolName: string, args: unknown, workspac
     "close_session",
   ].includes(String(values.action || ""))) {
     return { approvalReason: "Perform a sensitive browser action" };
+  }
+  if (toolName === "schedule" && isScheduleMutation(values.action)) {
+    return { approvalReason: "Manage this Agent's scheduled work" };
   }
   return {};
 }
@@ -662,15 +773,22 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function gatewayDescription(name: "memory" | "session" | "knowledge" | "web" | "browser"): string {
+function gatewayDescription(name: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule"): string {
   const descriptions = {
     memory: "Manage durable memory isolated to this Agent. Actions: search, read, list, store, replace, forget, clear.",
     session: "Inspect this Agent's isolated session journal. Actions: search (arguments.query), read (arguments.index), list; arguments.limit bounds results.",
     knowledge: "Use the platform knowledge base. Actions: search, read.",
     web: "Use the managed web gateway. Actions: search, extract.",
     browser: "Use this Agent's persistent, isolated Camoufox browser. navigate opens or reuses a tab and returns an accessibility snapshot; tab_id is optional after a tab exists. Actions: navigate, new_tab, list, snapshot (offset for pagination), screenshot, vision (question), click (ref/selector), type (ref/selector/text), press, scroll, wait, back, forward, refresh, viewport, links, images, downloads (list metadata only; does not fetch, save, or clear files), stats, extract, console, close, cleanup.",
+    schedule: "Manage scheduled work for this Agent. Read actions: list, get, history. Mutation actions: create, update, pause, resume, delete, run_now. Schedules may run once at an RFC3339 timestamp, at intervals of at least 300 seconds, or from a five-field cron expression.",
   };
   return descriptions[name];
+}
+
+const SCHEDULE_MUTATIONS = new Set(["create", "update", "pause", "resume", "delete", "run_now"]);
+
+export function isScheduleMutation(action: unknown): boolean {
+  return typeof action === "string" && SCHEDULE_MUTATIONS.has(action);
 }
 
 function isGatewayMutation(name: string, action: string): boolean {

@@ -31,17 +31,25 @@ import { ContentRouter } from "./ContentRouter";
 import { Scrim } from "./Scrim";
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
+import { ensureCurrentUserTimezone } from "../../data/accountActions";
 
 export function AppShell() {
   const store = useStoreHandle();
   const { t } = useI18n();
   const sidebarOpen = useStore((state) => state.sidebarOpen);
+  const userId = useStore((state) => state.user?.id);
+  const userTimezone = useStore((state) => state.user?.timezone);
   const isMobile = useMediaQuery("(max-width: 800px)");
 
   // Poll only while SSE is unavailable or reconnecting. A newly opened stream
   // suppresses redundant full-message polling; any error re-enables it.
   const realtimeConnected = useRealtime();
   usePolling(!realtimeConnected);
+
+  useEffect(() => {
+    if (userId == null) return;
+    void ensureCurrentUserTimezone(store, userId, userTimezone).catch(() => undefined);
+  }, [store, userId, userTimezone]);
 
   const closeSidebar = () => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
 

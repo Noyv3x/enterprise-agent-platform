@@ -7,6 +7,7 @@ import "./components/chat/chat.css";
 import "./components/admin/admin.css";
 import "./styles/workspace-modern.css";
 import "./components/preview/preview.css";
+import "./components/scheduled-tasks/scheduled-tasks.css";
 
 const root = document.getElementById("react-root");
 if (!root) {

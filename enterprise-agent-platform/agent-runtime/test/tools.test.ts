@@ -78,6 +78,112 @@ test("browser schema omits unsupported interactions and download deletion", () =
   assert.match(browser.description, /downloads \(list metadata only/);
 });
 
+test("schedule schema strictly describes every supported action", () => {
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const schedule = tools.find((tool) => tool.name === "schedule");
+  assert.ok(schedule);
+  const schema = JSON.stringify(schedule.parameters);
+  for (const action of ["list", "get", "history", "create", "update", "pause", "resume", "delete", "run_now"]) {
+    assert.match(schema, new RegExp(`"const":"${action}"`));
+  }
+  assert.match(schema, /"minimum":300/);
+  assert.match(schema, /"maximum":31622400/);
+  assert.match(schema, /"minProperties":2/);
+  assert.match(schema, /chat_and_telegram/);
+  assert.match(schema, /additionalProperties/);
+  assert.equal(collectObjectSchemas(schedule.parameters).every((entry) => entry.additionalProperties === false), true);
+});
+
+test("schedule tool forwards strict arguments and marks only mutations as side effects", async () => {
+  const invocations: Array<{ tool: string; action: string; arguments_: Record<string, unknown> }> = [];
+  let sideEffects = 0;
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async (_request: unknown, _runId: string, tool: string, action: string, arguments_: Record<string, unknown>) => {
+        invocations.push({ tool, action, arguments_ });
+        return { data: { ok: true } };
+      },
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => { sideEffects += 1; },
+  });
+  const schedule = tools.find((tool) => tool.name === "schedule");
+  assert.ok(schedule);
+  await schedule.execute("call-list", { action: "list", arguments: {} }, undefined);
+  await schedule.execute("call-create", {
+    action: "create",
+    arguments: {
+      name: "Daily summary",
+      prompt: "Summarize today's work",
+      schedule: { type: "cron", expression: "0 18 * * 1-5" },
+      timezone: "Asia/Shanghai",
+      delivery: "chat",
+    },
+  }, undefined);
+  assert.equal(sideEffects, 1);
+  assert.deepEqual(invocations, [
+    { tool: "schedule", action: "list", arguments_: {} },
+    {
+      tool: "schedule",
+      action: "create",
+      arguments_: {
+        name: "Daily summary",
+        prompt: "Summarize today's work",
+        schedule: { type: "cron", expression: "0 18 * * 1-5" },
+        timezone: "Asia/Shanghai",
+        delivery: "chat",
+      },
+    },
+  ]);
+});
+
+test("schedule tool is exposed only to canonical private Agent scopes", () => {
+  const toolNames = (scopeKey: string): string[] => createTools({
+    runId: "run",
+    request: { scope_key: scopeKey } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  }).map((tool) => tool.name);
+
+  for (const scopeKey of ["private:1", "private:987654321"]) {
+    assert.ok(toolNames(scopeKey).includes("schedule"), scopeKey);
+  }
+  for (const scopeKey of [
+    "channel:1:main-agent",
+    "private:1/delegate/child",
+    "private:0",
+    "private:01",
+    "private:-1",
+    "private:1/",
+  ]) {
+    assert.equal(toolNames(scopeKey).includes("schedule"), false, scopeKey);
+  }
+});
+
+test("schedule policy approves reads and requires approval for every mutation", async () => {
+  for (const action of ["list", "get", "history"]) {
+    assert.deepEqual(await classifyToolCall("schedule", { action, arguments: {} }), {});
+  }
+  for (const action of ["create", "update", "pause", "resume", "delete", "run_now"]) {
+    assert.match((await classifyToolCall("schedule", { action, arguments: {} })).approvalReason || "", /scheduled work/);
+  }
+});
+
 test("read-only browser operations do not mark the run as side-effecting", async () => {
   let sideEffects = 0;
   const tools = createTools({
@@ -185,3 +291,13 @@ test("file reads reject FIFOs without waiting for a writer", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+function collectObjectSchemas(value: unknown): Array<Record<string, unknown>> {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap((entry) => collectObjectSchemas(entry));
+  const object = value as Record<string, unknown>;
+  return [
+    ...(object.type === "object" ? [object] : []),
+    ...Object.values(object).flatMap((entry) => collectObjectSchemas(entry)),
+  ];
+}

@@ -7,6 +7,8 @@ import type {
   AgentApprovalChoice,
   AgentStatus,
   AgentRuntimeConfigState,
+  AgentSchedule,
+  AgentScheduleRun,
   AutoUpdateConfigState,
   Channel,
   CogneeConfigState,
@@ -46,8 +48,9 @@ export interface LoginResponse {
 }
 
 export interface UpdateCurrentUserRequest {
-  display_name: string;
-  position: string;
+  display_name?: string;
+  position?: string;
+  timezone?: string;
 }
 
 export interface UpdateCurrentUserResponse {
@@ -115,6 +118,28 @@ export type PrivateTelegramResponse = PrivateTelegram;
 
 /** Creating a Telegram link challenge accepts an intentionally empty object. */
 export type PrivateTelegramUpdateRequest = Record<string, never>;
+
+export interface AgentSchedulesResponse {
+  schedules: AgentSchedule[];
+}
+
+export interface AgentScheduleResponse {
+  schedule: AgentSchedule;
+}
+
+export interface AgentScheduleRunsResponse {
+  runs: AgentScheduleRun[];
+  next_before_id: number | null;
+}
+
+export interface AgentScheduleRunNowResponse extends AgentScheduleResponse {
+  run: AgentScheduleRun;
+}
+
+export interface DeleteAgentScheduleResponse {
+  deleted: true;
+  id: number;
+}
 
 /* --------------------------------------------------------------- mentions */
 

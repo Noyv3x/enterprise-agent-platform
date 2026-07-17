@@ -20,7 +20,7 @@ import { PlatformGateway } from "./platform-gateway.js";
 import { AlwaysApprovalStore, IdempotencyStore, type PersistentIdempotencyRecord } from "./persistence.js";
 import { ProcessRegistry } from "./process-registry.js";
 import { SessionStore } from "./session-store.js";
-import { classifyToolCall, createTools, readRegularFileRange } from "./tools.js";
+import { classifyToolCall, createTools, isScheduleMutation, readRegularFileRange } from "./tools.js";
 import type { ApprovalDecision, JsonObject, JsonValue, RunRecord, RunRequest, RunResult, RuntimeConfig } from "./types.js";
 import { abortError, assertNonEmpty, errorMessage, id, resolveWorkspacePath, scopeOwns, truncate } from "./utils.js";
 
@@ -70,6 +70,7 @@ export class RunCoordinator {
   private readonly childRuns = new Set<string>();
   private readonly scopeCleanupFences = new Set<ScopeCleanupFence>();
   private readonly forcedReviewReasons = new Map<string, string>();
+  private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, string>>();
 
   constructor(options: RunCoordinatorOptions) {
     this.config = options.config;
@@ -352,19 +353,35 @@ export class RunCoordinator {
           if (record.controller.signal.aborted) {
             return { block: true, reason: "Agent run is no longer active" };
           }
+          const metadata = record.request.metadata;
+          const unattendedScheduled = metadata?.trigger === "scheduled" && metadata.unattended === true;
           const policy = await classifyToolCall(
             toolContext.toolCall.name,
             toolContext.args,
             record.request.workspace,
           );
           if (policy.hardBlock) return { block: true, reason: policy.hardBlock };
+          if (
+            unattendedScheduled
+            && toolContext.toolCall.name === "schedule"
+            && isScheduleMutation(recordValue(toolContext.args).action)
+          ) {
+            const reason = "Unattended scheduled runs cannot mutate schedules";
+            this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
+            return { block: true, reason };
+          }
           if (!policy.approvalReason) return undefined;
-          const metadata = record.request.metadata as JsonObject | undefined;
           const approvalRunId = typeof metadata?.approval_owner_run_id === "string" ? metadata.approval_owner_run_id : record.id;
           const approvalScopeKey = typeof metadata?.approval_scope_key === "string" ? metadata.approval_scope_key : record.request.scope_key;
           const approvalSessionId = typeof metadata?.approval_session_id === "string"
             ? metadata.approval_session_id
             : record.request.session_id;
+          if (unattendedScheduled) {
+            if (this.approvals.hasPersistentAlways(approvalScopeKey, toolContext.toolCall.name)) return undefined;
+            const reason = `Unattended scheduled runs require an existing persistent always authorization for the ${toolContext.toolCall.name} tool`;
+            this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
+            return { block: true, reason };
+          }
           const allowed = await this.approvals.request({
             runId: approvalRunId,
             scopeKey: approvalScopeKey,
@@ -449,6 +466,7 @@ export class RunCoordinator {
       record.controller.signal.removeEventListener("abort", abortRun);
       this.agents.delete(record.id);
       this.forcedReviewReasons.delete(record.id);
+      this.unattendedAuthorizationBlocks.delete(record.id);
       this.approvals.cancelRun(record.id);
       if (!record.result) this.processes.killRun(record.id);
     }
@@ -480,13 +498,33 @@ export class RunCoordinator {
     } else if (event.type === "tool_execution_update") {
       journal.publish("tool.updated", { tool_call_id: event.toolCallId, tool_name: event.toolName, partial_result: event.partialResult as JsonObject });
     } else if (event.type === "tool_execution_end") {
+      const unattendedAuthorizationReason = this.takeUnattendedAuthorizationBlock(record.id, event.toolCallId);
       journal.publish(event.isError ? "tool.failed" : "tool.completed", {
         tool_call_id: event.toolCallId,
         tool_name: event.toolName,
         result: sanitizeToolResultForJournal(event.result) as JsonObject,
         is_error: event.isError,
+        ...(unattendedAuthorizationReason ? {
+          unattended_authorization_required: true,
+          reason: unattendedAuthorizationReason,
+        } : {}),
       });
     }
+  }
+
+  private rememberUnattendedAuthorizationBlock(runId: string, toolCallId: string, reason: string): void {
+    const blocked = this.unattendedAuthorizationBlocks.get(runId) ?? new Map<string, string>();
+    blocked.set(toolCallId, reason);
+    this.unattendedAuthorizationBlocks.set(runId, blocked);
+  }
+
+  private takeUnattendedAuthorizationBlock(runId: string, toolCallId: string): string | undefined {
+    const blocked = this.unattendedAuthorizationBlocks.get(runId);
+    if (!blocked) return undefined;
+    const reason = blocked.get(toolCallId);
+    blocked.delete(toolCallId);
+    if (blocked.size === 0) this.unattendedAuthorizationBlocks.delete(runId);
+    return reason;
   }
 
   private async enrichBrowserVisionResult(
@@ -648,6 +686,20 @@ export class RunCoordinator {
     };
     const child = this.createRun(childRequest, true);
     const journal = this.journals.get(approvalOwnerRunId) ?? this.journals.get(parent.id)!;
+    const childJournal = this.journals.get(child.id);
+    const unsubscribeChildJournal = childJournal?.subscribe(0, (event) => {
+      if (event.type !== "tool.failed" || event.data.unattended_authorization_required !== true) return;
+      const forwarded: JsonObject = {
+        child_run_id: child.id,
+        unattended_authorization_required: true,
+        reason: typeof event.data.reason === "string" && event.data.reason
+          ? event.data.reason
+          : "Unattended authorization required in a delegated Agent",
+      };
+      if (typeof event.data.tool_call_id === "string") forwarded.tool_call_id = event.data.tool_call_id;
+      if (typeof event.data.tool_name === "string") forwarded.tool_name = event.data.tool_name;
+      journal.publish("tool.failed", forwarded);
+    });
     journal.publish("delegation.started", { child_run_id: child.id, depth: depth + 1 });
     const onAbort = (): void => { this.cancel(child.id); };
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -672,6 +724,7 @@ export class RunCoordinator {
       journal.publish("delegation.completed", { child_run_id: child.id, content: completed.result.content });
       return completed.result.content;
     } finally {
+      unsubscribeChildJournal?.();
       signal?.removeEventListener("abort", onAbort);
       this.processes.killScope(child.request.scope_key, child.request.lifecycle_id);
       await this.processes.waitForScopeExit(

@@ -375,6 +375,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 permission_group=str(body.get("permission_group", "")) or None,
                 model_name=str(body.get("model_name", body.get("model", ""))),
                 thinking_depth=str(body.get("thinking_depth", "medium")),
+                timezone_name=str(body.get("timezone", "")),
                 actor=actor,
             )
             self._json({"user": user}, status=201)
@@ -491,6 +492,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/private-agent/telegram" and method == "DELETE":
             self._json(service.unlink_telegram_private_config(actor))
+            return
+        if path == "/api/private-agent/schedules" and method == "GET":
+            self._json(service.list_private_schedules(actor))
+            return
+        m = re.fullmatch(r"/api/private-agent/schedules/(\d+)/runs", path)
+        if m and method == "GET":
+            before_raw = first(query, "before_id", "")
+            try:
+                before_id = int(before_raw) if before_raw else None
+            except ValueError as exc:
+                raise ServiceError(400, "before_id must be a positive integer") from exc
+            self._json(
+                service.private_schedule_runs(
+                    actor,
+                    int(m.group(1)),
+                    limit=int_arg(query, "limit", 20),
+                    before_id=before_id,
+                )
+            )
+            return
+        m = re.fullmatch(r"/api/private-agent/schedules/(\d+)/(pause|resume|run-now)", path)
+        if m and method == "POST":
+            schedule_id = int(m.group(1))
+            action = m.group(2)
+            if action == "pause":
+                payload = service.pause_private_schedule(actor, schedule_id)
+            elif action == "resume":
+                payload = service.resume_private_schedule(actor, schedule_id)
+            else:
+                payload = service.run_private_schedule_now(actor, schedule_id)
+            self._json(payload)
+            return
+        m = re.fullmatch(r"/api/private-agent/schedules/(\d+)", path)
+        if m and method == "GET":
+            self._json(service.get_private_schedule(actor, int(m.group(1))))
+            return
+        if m and method == "DELETE":
+            self._json(service.delete_private_schedule(actor, int(m.group(1))))
             return
 
         m = re.fullmatch(r"/api/admin/channels/(\d+)/messages/(\d+)", path)
@@ -664,7 +703,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid Agent runtime token")
         if method != "POST":
             raise ServiceError(405, "method not allowed")
-        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser)", path):
+        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser|schedule)", path):
             body = self._body_json()
             body["tool"] = path.rsplit("/", 1)[-1]
             self._json(service.invoke_agent_runtime_tool(body))
