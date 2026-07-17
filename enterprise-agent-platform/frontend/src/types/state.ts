@@ -56,6 +56,7 @@ export interface AppState {
   pendingMessages: Message[];
   drafts: Record<string, string>;
   draftFiles: Record<string, File[]>;
+  failedSends: Record<string, FailedSend[]>;
   agentStatuses: AgentStatuses;
   expandedAgentRuns: Record<string, boolean>;
   mentionTargets: MentionTarget[];
@@ -99,6 +100,13 @@ export interface ResourceState {
   updatedAt: number | null;
 }
 
+/** A failed payload retained intact until it can be restored into the composer. */
+export interface FailedSend {
+  id: string;
+  content: string;
+  files: File[];
+}
+
 /* ----------------------------- per-slice state sub-types (for slice files) */
 
 export type AuthSliceState = Pick<AppState, "user" | "busy" | "pendingOperations" | "error">;
@@ -113,6 +121,7 @@ export type ChatSliceState = Pick<
   | "pendingMessages"
   | "drafts"
   | "draftFiles"
+  | "failedSends"
   | "agentStatuses"
   | "expandedAgentRuns"
   | "mentionTargets"
@@ -214,7 +223,13 @@ interface RemoveOptimisticMessageAction {
 }
 interface SetAgentStatusAction {
   type: "SET_AGENT_STATUS";
-  payload: { mode: ChatMode; scopeId: string; status: AgentStatus | null };
+  payload: {
+    mode: ChatMode;
+    scopeId: string;
+    status: AgentStatus | null;
+    /** A transport fence proved this response is current for the scope. */
+    authoritative?: boolean;
+  };
 }
 interface SetAgentStatusesAction {
   type: "SET_AGENT_STATUSES";
@@ -250,6 +265,14 @@ interface SetDraftFilesAction {
 }
 interface RemoveDraftFilesAction {
   type: "REMOVE_DRAFT_FILES";
+  payload: { key: string };
+}
+interface AddFailedSendAction {
+  type: "ADD_FAILED_SEND";
+  payload: { key: string; send: FailedSend };
+}
+interface RestoreNextFailedSendAction {
+  type: "RESTORE_NEXT_FAILED_SEND";
   payload: { key: string };
 }
 interface SetPrivateTelegramAction {
@@ -404,6 +427,8 @@ export type Action =
   | SetDraftAction
   | SetDraftFilesAction
   | RemoveDraftFilesAction
+  | AddFailedSendAction
+  | RestoreNextFailedSendAction
   | SetPrivateTelegramAction
   | SetPrivateTelegramExpandedAction
   /* knowledge */

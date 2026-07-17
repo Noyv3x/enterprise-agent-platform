@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { RunCoordinator } from "./run-coordinator.js";
-import type { ApprovalDecision, RunRequest, RuntimeConfig, RuntimeEvent } from "./types.js";
+import type { ApprovalDecision, RunInputRequest, RunRequest, RuntimeConfig, RuntimeEvent } from "./types.js";
 import { errorMessage, safeEqual } from "./utils.js";
 
 const VERSION = "0.1.0";
@@ -74,7 +74,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     return;
   }
 
-  const runMatch = /^\/v1\/runs\/([^/]+)(?:\/(events|approval|cancel))?$/.exec(url.pathname);
+  const runMatch = /^\/v1\/runs\/([^/]+)(?:\/(events|approval|cancel|input))?$/.exec(url.pathname);
   if (runMatch) {
     const runId = decodeURIComponent(runMatch[1]!);
     const action = runMatch[2];
@@ -88,6 +88,16 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       const headerSequence = Number.parseInt(String(request.headers["last-event-id"] || "0"), 10);
       const querySequence = Number.parseInt(url.searchParams.get("after") || "0", 10);
       streamEvents(response, coordinator.getJournal(runId)!, Math.max(Number.isFinite(headerSequence) ? headerSequence : 0, Number.isFinite(querySequence) ? querySequence : 0));
+      return;
+    }
+    if (request.method === "POST" && action === "input") {
+      const body = await readJson<RunInputRequest>(
+        request,
+        config.maxBodyBytes,
+        config.requestBodyTimeoutMs,
+      );
+      const accepted = await coordinator.submitInput(runId, body);
+      json(response, accepted.state === "injected" ? 200 : 202, accepted);
       return;
     }
     if (request.method === "POST" && action === "approval") {

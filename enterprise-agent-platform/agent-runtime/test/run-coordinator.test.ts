@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
   adaptImageContentForModel,
   RunCoordinator,
+  RunInputConflictError,
+  RunValidationError,
   sanitizeToolResultForJournal,
 } from "../src/run-coordinator.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
@@ -38,6 +40,397 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "finished");
     assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "tool.completed"));
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator injects idempotent active-run inputs and returns only the consolidated final response", async () => {
+  const home = await temporaryDirectory("agent-steering-");
+  const workspace = await temporaryDirectory("agent-steering-workspace-");
+  const faux = fauxProvider();
+  let consolidatedContext: AgentMessage[] = [];
+  const toolTurn = fauxAssistantMessage(
+    fauxToolCall("terminal", { command: "touch approved.txt" }),
+    { stopReason: "toolUse" },
+  );
+  toolTurn.usage.input = 11;
+  toolTurn.usage.totalTokens = 11;
+  faux.setResponses([
+    toolTurn,
+    (context) => {
+      consolidatedContext = structuredClone(context.messages);
+      const answer = fauxAssistantMessage("one consolidated answer");
+      answer.usage.input = 13;
+      answer.usage.output = 7;
+      answer.usage.totalTokens = 20;
+      return answer;
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const request = {
+      scope_key: "private:7",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "start the task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: { idempotency_key: "steering-run" },
+    };
+    const run = coordinator.createRun(request);
+    const approval = await waitUntil(
+      () => coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested"),
+    );
+    const first = {
+      message_id: "message-2",
+      scope_key: "private:7",
+      lifecycle_id: "life",
+      input: "also include the risks",
+    };
+    const accepted = await coordinator.submitInput(run.id, first);
+    assert.equal(accepted.state, "accepted");
+    assert.deepEqual(await coordinator.submitInput(run.id, first), accepted);
+    const executionEquivalentRetry = {
+      ...first,
+      attachments: [],
+      client_trace: { attempt: 2 },
+    };
+    assert.deepEqual(
+      await coordinator.submitInput(run.id, executionEquivalentRetry),
+      accepted,
+    );
+    assert.deepEqual(
+      await coordinator.submitInput(run.id, {
+        input: first.input,
+        lifecycle_id: first.lifecycle_id,
+        scope_key: first.scope_key,
+        message_id: first.message_id,
+      }),
+      accepted,
+    );
+    await coordinator.submitInput(run.id, {
+      message_id: "message-3",
+      scope_key: "private:7",
+      lifecycle_id: "life",
+      input: "and give me a short checklist",
+    });
+    await assert.rejects(
+      coordinator.submitInput(run.id, { ...first, input: "different content" }),
+      RunInputConflictError,
+    );
+    await assert.rejects(
+      coordinator.submitInput(run.id, { ...first, message_id: "wrong-scope", scope_key: "private:8" }),
+      RunInputConflictError,
+    );
+
+    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "one consolidated answer");
+    assert.deepEqual(completed.result?.input_message_ids, ["message-2", "message-3"]);
+    assert.deepEqual(completed.result?.unconsumed_input_message_ids, []);
+    assert.match(JSON.stringify(consolidatedContext), /also include the risks/);
+    assert.match(JSON.stringify(consolidatedContext), /and give me a short checklist/);
+
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    const billedTurns = events
+      .filter((event) => event.type === "message.final")
+      .map((event) => event.data.usage as Record<string, number>);
+    assert.equal(
+      completed.result?.usage?.input,
+      billedTurns.reduce((total, usage) => total + Number(usage.input || 0), 0),
+    );
+    assert.equal(
+      completed.result?.usage?.totalTokens,
+      billedTurns.reduce((total, usage) => total + Number(usage.totalTokens || 0), 0),
+    );
+    assert.deepEqual(
+      events.filter((event) => event.type === "input.injected").map((event) => event.data.message_id),
+      ["message-2", "message-3"],
+    );
+    const finalTurns = events
+      .filter((event) => event.type === "message.final")
+      .map((event) => Number(event.data.turn_index));
+    assert.deepEqual(finalTurns, [1, 2]);
+    const completedEvent = events.find((event) => event.type === "run.completed");
+    assert.deepEqual(completedEvent?.data.input_message_ids, ["message-2", "message-3"]);
+
+    coordinator.shutdown();
+    const restartedFaux = fauxProvider();
+    restartedFaux.setResponses([fauxAssistantMessage("must not execute")]);
+    const restarted = new RunCoordinator({
+      config: testConfig(home),
+      streamFn: restartedFaux.provider.streamSimple,
+    });
+    const reused = restarted.createRun(structuredClone(request));
+    assert.equal(reused.id, run.id);
+    assert.equal(reused.status, "completed");
+    assert.deepEqual(await restarted.submitInput(reused.id, executionEquivalentRetry), {
+      run_id: run.id,
+      message_id: first.message_id,
+      state: "injected",
+    });
+    const restoredTerminal = restarted.getJournal(reused.id)?.list().find(
+      (event) => event.type === "run.completed",
+    );
+    assert.deepEqual(restoredTerminal?.data.input_message_ids, ["message-2", "message-3"]);
+    assert.deepEqual(restoredTerminal?.data.unconsumed_input_message_ids, []);
+    assert.equal(restartedFaux.state.callCount, 0);
+    restarted.shutdown();
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator rejects an unpreparable input without a false accepted event", async () => {
+  const home = await temporaryDirectory("agent-steering-invalid-");
+  const workspace = await temporaryDirectory("agent-steering-invalid-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: "touch approved.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("finished without the invalid input"),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:8",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "start",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const approval = await waitUntil(
+      () => coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested"),
+    );
+    await assert.rejects(
+      coordinator.submitInput(run.id, {
+        message_id: "missing-attachment",
+        scope_key: "private:8",
+        lifecycle_id: "life",
+        input: "use this file",
+        attachments: [{ path: `${workspace}/does-not-exist.png`, mime_type: "image/png" }],
+      }),
+      RunValidationError,
+    );
+    const inputEvents = coordinator.getJournal(run.id)?.list().filter(
+      (event) => String(event.data.message_id || "") === "missing-attachment",
+    ) ?? [];
+    assert.deepEqual(inputEvents.map((event) => event.type), ["input.unconsumed"]);
+    await assert.rejects(
+      coordinator.submitInput(run.id, {
+        message_id: "later-message",
+        scope_key: "private:8",
+        lifecycle_id: "life",
+        input: "must not overtake",
+      }),
+      RunInputConflictError,
+    );
+    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
+    const completed = await coordinator.wait(run.id);
+    assert.deepEqual(completed.result?.input_message_ids, []);
+    assert.deepEqual(completed.result?.unconsumed_input_message_ids, ["missing-attachment"]);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator accepts active-run input only for canonical private root scopes", async () => {
+  const home = await temporaryDirectory("agent-steering-scope-");
+  const workspace = await temporaryDirectory("agent-steering-scope-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage("noncanonical"),
+    fauxAssistantMessage("scheduled"),
+    fauxAssistantMessage("delegated"),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  const candidates = [
+    { scope_key: "private:1-other", metadata: undefined },
+    { scope_key: "private:1", metadata: { trigger: "scheduled" } },
+    { scope_key: "private:1", metadata: { parent_run_id: "run_parent", delegation_depth: 1 } },
+  ];
+  try {
+    for (const [index, candidate] of candidates.entries()) {
+      const run = coordinator.createRun({
+        scope_key: candidate.scope_key,
+        lifecycle_id: `life-${index}`,
+        session_id: `session-${index}`,
+        workspace,
+        system_prompt: "You are ubitech agent.",
+        input: "start",
+        model: { provider: "openai-codex", id: "gpt-5.5" },
+        ...(candidate.metadata ? { metadata: candidate.metadata } : {}),
+      });
+      await assert.rejects(
+        coordinator.submitInput(run.id, {
+          message_id: `message-${index}`,
+          scope_key: candidate.scope_key,
+          lifecycle_id: `life-${index}`,
+          input: "must not join",
+        }),
+        RunInputConflictError,
+      );
+      assert.equal((await coordinator.wait(run.id)).status, "completed");
+      assert.equal(
+        coordinator.getJournal(run.id)?.list().some((event) => event.type === "input.accepted"),
+        false,
+      );
+    }
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator preserves endpoint order when an earlier attachment prepares more slowly", async () => {
+  const home = await temporaryDirectory("agent-steering-order-");
+  const workspace = await temporaryDirectory("agent-steering-order-workspace-");
+  await writeFile(`${workspace}/first.png`, Buffer.alloc(1024 * 1024, 7));
+  const faux = fauxProvider();
+  let consolidatedContext: AgentMessage[] = [];
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: "touch approved.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    (context) => {
+      consolidatedContext = structuredClone(context.messages);
+      return fauxAssistantMessage("ordered answer");
+    },
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:9",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "start",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const approval = await waitUntil(
+      () => coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested"),
+    );
+    const slow = coordinator.submitInput(run.id, {
+      message_id: "slow-first",
+      scope_key: "private:9",
+      lifecycle_id: "life",
+      input: "first addition",
+      attachments: [{ path: "first.png", mime_type: "image/png" }],
+    });
+    const fast = coordinator.submitInput(run.id, {
+      message_id: "fast-second",
+      scope_key: "private:9",
+      lifecycle_id: "life",
+      input: "second addition",
+    });
+    await Promise.all([slow, fast]);
+    const acceptedOrder = coordinator.getJournal(run.id)?.list()
+      .filter((event) => event.type === "input.accepted")
+      .map((event) => String(event.data.message_id)) ?? [];
+    assert.deepEqual(acceptedOrder, ["fast-second", "slow-first"]);
+
+    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const injectedOrder = coordinator.getJournal(run.id)?.list()
+      .filter((event) => event.type === "input.injected")
+      .map((event) => String(event.data.message_id)) ?? [];
+    assert.deepEqual(injectedOrder, ["slow-first", "fast-second"]);
+    const serialized = JSON.stringify(consolidatedContext);
+    const firstIndex = serialized.indexOf("first addition");
+    const secondIndex = serialized.indexOf("second addition");
+    assert.ok(firstIndex >= 0);
+    assert.ok(secondIndex >= 0);
+    assert.ok(firstIndex < secondIndex);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator closes an accepted queued input as unconsumed", async () => {
+  const home = await temporaryDirectory("agent-steering-close-");
+  const workspace = await temporaryDirectory("agent-steering-close-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: "touch blocker.txt" }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { maxConcurrency: 1 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const blocker = coordinator.createRun({
+      scope_key: "scope:blocker",
+      lifecycle_id: "blocker-life",
+      session_id: "blocker-session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "block",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    await waitUntil(
+      () => coordinator.getJournal(blocker.id)?.list().find((event) => event.type === "approval.requested"),
+    );
+    const queued = coordinator.createRun({
+      scope_key: "private:10",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "start",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const followUp = {
+      message_id: "queued-follow-up",
+      scope_key: "private:10",
+      lifecycle_id: "life",
+      input: "join while queued",
+    };
+    assert.equal((await coordinator.submitInput(queued.id, followUp)).state, "accepted");
+    coordinator.cancel(queued.id);
+    assert.equal((await coordinator.wait(queued.id)).status, "cancelled");
+    assert.deepEqual(
+      coordinator.getJournal(queued.id)?.list()
+        .filter((event) => String(event.data.message_id || "") === followUp.message_id)
+        .map((event) => event.type),
+      ["input.accepted", "input.unconsumed"],
+    );
+    await assert.rejects(
+      coordinator.submitInput(queued.id, followUp),
+      (error: unknown) => error instanceof RunInputConflictError && error.inputState === "unconsumed",
+    );
+    coordinator.cancel(blocker.id);
+    await coordinator.wait(blocker.id);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

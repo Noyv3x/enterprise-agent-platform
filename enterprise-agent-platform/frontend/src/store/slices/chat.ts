@@ -9,6 +9,7 @@
    while viewing) is handled by <ContentRouter>'s coercion effect. */
 
 import { hasPermission, isAdmin } from "../selectors";
+import { mergeAgentStatus, mergeAgentStatuses } from "../agentStatus";
 import { revokeAttachmentUrls } from "../../utils/composerFiles";
 import type { Action, AppState, ChatSliceState, Message } from "../../types";
 
@@ -21,6 +22,7 @@ export const chatInitial: ChatSliceState = {
   pendingMessages: [],
   drafts: {},
   draftFiles: {},
+  failedSends: {},
   agentStatuses: { channels: {}, private: null },
   expandedAgentRuns: {},
   mentionTargets: [],
@@ -48,7 +50,10 @@ export function chatReducer(state: AppState, action: Action): AppState {
     case "SET_PENDING_MESSAGES":
       return { ...state, pendingMessages: action.payload };
     case "SET_AGENT_STATUSES":
-      return { ...state, agentStatuses: action.payload };
+      return {
+        ...state,
+        agentStatuses: mergeAgentStatuses(state.agentStatuses, action.payload),
+      };
     case "SET_EXPANDED_AGENT_RUNS":
       return { ...state, expandedAgentRuns: action.payload };
     case "SET_MENTION_TARGETS":
@@ -71,6 +76,40 @@ export function chatReducer(state: AppState, action: Action): AppState {
       const next = { ...state.draftFiles };
       delete next[action.payload.key];
       return { ...state, draftFiles: next };
+    }
+    case "ADD_FAILED_SEND": {
+      const previous = state.failedSends[action.payload.key] || [];
+      return {
+        ...state,
+        failedSends: {
+          ...state.failedSends,
+          [action.payload.key]: [...previous, action.payload.send],
+        },
+      };
+    }
+    case "RESTORE_NEXT_FAILED_SEND": {
+      const key = action.payload.key;
+      const queued = state.failedSends[key] || [];
+      if (
+        !queued.length ||
+        !!state.drafts[key] ||
+        !!state.draftFiles[key]?.length
+      ) {
+        return state;
+      }
+      const [next, ...remaining] = queued;
+      const failedSends = { ...state.failedSends };
+      if (remaining.length) failedSends[key] = remaining;
+      else delete failedSends[key];
+      const draftFiles = { ...state.draftFiles };
+      if (next.files.length) draftFiles[key] = next.files;
+      else delete draftFiles[key];
+      return {
+        ...state,
+        drafts: { ...state.drafts, [key]: next.content },
+        draftFiles,
+        failedSends,
+      };
     }
     case "SET_PRIVATE_TELEGRAM":
       return { ...state, privateTelegram: action.payload };
@@ -100,10 +139,26 @@ export function chatReducer(state: AppState, action: Action): AppState {
       revokeAttachmentUrls(state.pendingMessages.find((message) => message.id === tempId));
       const pendingMessages = state.pendingMessages.filter((message) => message.id !== tempId);
       const apply = (list: Message[]): Message[] => {
-        const next = list.filter((message) => message.id !== tempId);
-        // Dedupe guard: a poll/SSE update may have already inserted the saved
-        // message before the POST resolved (legacy replaceOptimisticMessage).
-        if (saved && !next.some((message) => message.id === saved.id)) next.push(saved);
+        const savedAlreadyPresent = !!saved && list.some((message) => message.id === saved.id);
+        const next: Message[] = [];
+        for (const message of list) {
+          if (message.id !== tempId) {
+            next.push(message);
+          } else if (saved && !savedAlreadyPresent) {
+            // Replace in place so several rapidly sent optimistic bubbles never
+            // jump around while their serialized POSTs resolve.
+            next.push(saved);
+          }
+        }
+        // The visible scope may have changed or a refresh may have omitted the
+        // optimistic row. Preserve the legacy append fallback in that case.
+        if (
+          saved &&
+          !savedAlreadyPresent &&
+          !next.some((message) => message.id === saved.id)
+        ) {
+          next.push(saved);
+        }
         return next;
       };
       if (mode === "private") {
@@ -138,18 +193,28 @@ export function chatReducer(state: AppState, action: Action): AppState {
     /* Per-scope agent-status write (legacy setAgentStatus, :2862-2866): no-op on a
        falsy status; otherwise replace just that scope's entry. */
     case "SET_AGENT_STATUS": {
-      const { mode, scopeId, status } = action.payload;
+      const { mode, scopeId, status, authoritative } = action.payload;
       if (!status) return state;
       if (mode === "private") {
         return {
           ...state,
-          agentStatuses: { channels: state.agentStatuses.channels, private: status },
+          agentStatuses: {
+            channels: state.agentStatuses.channels,
+            private: mergeAgentStatus(state.agentStatuses.private, status, { authoritative }),
+          },
         };
       }
       return {
         ...state,
         agentStatuses: {
-          channels: { ...state.agentStatuses.channels, [String(scopeId)]: status },
+          channels: {
+            ...state.agentStatuses.channels,
+            [String(scopeId)]: mergeAgentStatus(
+              state.agentStatuses.channels[String(scopeId)],
+              status,
+              { authoritative },
+            ) || status,
+          },
           private: state.agentStatuses.private,
         },
       };
@@ -171,6 +236,7 @@ export function chatReducer(state: AppState, action: Action): AppState {
         ...state,
         pendingMessages: [],
         draftFiles: {},
+        failedSends: {},
         mentionTargets: [],
         typingUsers: [],
       };

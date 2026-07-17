@@ -125,6 +125,22 @@ export const chatMessages = defineMessages({
   "chat.composer.inputLabel": { "zh-CN": "消息输入框", en: "Message input", "zh-TW": "訊息輸入框" },
   "chat.composer.send": { "zh-CN": "发送", en: "Send", "zh-TW": "傳送" },
   "chat.sendFailed": { "zh-CN": "发送失败", en: "Send failed", "zh-TW": "傳送失敗" },
+  "chat.failedSend.title": {
+    "zh-CN": { other: "有 {count} 条发送失败的消息待恢复" },
+    en: { one: "{count} failed message is waiting", other: "{count} failed messages are waiting" },
+    "zh-TW": { other: "有 {count} 則傳送失敗的訊息待恢復" },
+  },
+  "chat.failedSend.attachments": {
+    "zh-CN": { other: "{count} 个附件" },
+    en: { one: "{count} attachment", other: "{count} attachments" },
+    "zh-TW": { other: "{count} 個附件" },
+  },
+  "chat.failedSend.restore": { "zh-CN": "恢复", en: "Restore", "zh-TW": "恢復" },
+  "chat.failedSend.restoreBlocked": {
+    "zh-CN": "请先发送或清空当前草稿",
+    en: "Send or clear the current draft first",
+    "zh-TW": "請先傳送或清空目前草稿",
+  },
   "chat.approvalSubmitted": {
     "zh-CN": "权限审批已提交",
     en: "Access approval submitted",
@@ -200,6 +216,11 @@ export const chatMessages = defineMessages({
   },
 
   "chat.status.processing": { "zh-CN": "Agent 正在处理", en: "Agent is working", "zh-TW": "Agent 正在處理" },
+  "chat.status.merging": {
+    "zh-CN": { other: "Agent 正在合并处理 {count} 条消息" },
+    en: { one: "Agent is handling {count} message", other: "Agent is combining {count} messages into one reply" },
+    "zh-TW": { other: "Agent 正在合併處理 {count} 則訊息" },
+  },
   "chat.status.approval": {
     "zh-CN": "等待 {target} 审批权限",
     en: "Waiting for {target} to approve access",

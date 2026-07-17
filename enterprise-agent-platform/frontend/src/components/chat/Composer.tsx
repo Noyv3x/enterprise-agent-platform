@@ -22,11 +22,13 @@ import { useMention } from "../../hooks/useMention";
 import { useToast } from "../../hooks/useToast";
 import { useTypingNotifier } from "../../hooks/useTypingNotifier";
 import { sendMessage } from "../../data/chatActions";
+import { preserveFailedSend, restoreNextFailedSend } from "../../data/failedSendRecovery";
 import { scopeTypeFor } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
 import type { ChatMode } from "../../types";
 import { ComposerField } from "./ComposerField";
 import { ComposerFiles } from "./ComposerFiles";
+import { FailedSendRecovery } from "./FailedSendRecovery";
 import { ComposerHint } from "./ComposerHint";
 import type { ComposerTextareaProps } from "./ComposerTextarea";
 
@@ -59,6 +61,7 @@ export function Composer({
   const draft = useStore((state) => state.drafts[draftKey] || "");
   const rawFiles = useStore((state) => state.draftFiles[draftKey]);
   const selectedFiles = rawFiles ?? EMPTY_FILES;
+  const failedSends = useStore((state) => state.failedSends[draftKey] || []);
   const mentionTargets = useStore((state) => state.mentionTargets);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -148,17 +151,19 @@ export function Composer({
     // sync dispatches batch with the optimistic insert inside sendMessage.
     setDraft("");
     dispatch({ type: "REMOVE_DRAFT_FILES", payload: { key: draftKey } });
+    // If an earlier failed payload is waiting, promote it intact after the
+    // current draft has been captured. The user can keep sending in FIFO order
+    // without merging unrelated files into one message.
+    restoreNextFailedSend(store, draftKey);
     onBumpFocus();
     onBumpForceBottom();
     notify(false);
     const sent = await sendMessage(store, mode, scopeId, content, files);
     if (sent === false) {
-      // Restore the user's text + files so nothing is lost, then re-focus.
-      setDraft(content);
-      if (files.length) dispatch({ type: "SET_DRAFT_FILES", payload: { key: draftKey, files } });
+      preserveFailedSend(store, draftKey, content, files);
       onBumpFocus();
     }
-  }, [disabled, draftKey, mode, scopeId, store, dispatch, setDraft, notify, onBumpFocus, onBumpForceBottom]);
+  }, [disabled, draftKey, mode, scopeId, store, dispatch, setDraft, notify, toast, t, onBumpFocus, onBumpForceBottom]);
 
   const textareaProps: ComposerTextareaProps = {
     textareaRef,
@@ -186,6 +191,16 @@ export function Composer({
       }}
     >
       <div className="composer__wrap">
+        {failedSends.length ? (
+          <FailedSendRecovery
+            sends={failedSends}
+            blocked={!!draft || !!selectedFiles.length}
+            onRestore={() => {
+              restoreNextFailedSend(store, draftKey);
+              onBumpFocus();
+            }}
+          />
+        ) : null}
         <ComposerField
           disabled={disabled}
           fileInputRef={fileInputRef}

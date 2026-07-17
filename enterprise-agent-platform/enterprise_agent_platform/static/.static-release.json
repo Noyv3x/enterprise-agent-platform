@@ -1,15 +1,15 @@
 {
   "version": 1,
   "current_assets": [
+    "app-pX81Ryh2.js",
+    "chunk-MarkdownContent-DBHTTblF.js",
+    "chunk-ScheduledTasksPanel-BzsjIfYx.js",
+    "styles-Dm_dXqII.css"
+  ],
+  "previous_assets": [
     "app-C0Zk0u5n.js",
     "chunk-MarkdownContent-G5OgziNb.js",
     "chunk-ScheduledTasksPanel-DS8c7rTj.js",
     "styles-B7pgCOOP.css"
-  ],
-  "previous_assets": [
-    "app-B8IyZZB7.js",
-    "chunk-MarkdownContent-Ct5Ug7zw.js",
-    "chunk-ScheduledTasksPanel-DtAYGxtz.js",
-    "styles-B-3UtLy3.css"
   ]
 }

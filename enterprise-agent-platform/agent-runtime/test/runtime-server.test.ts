@@ -108,7 +108,7 @@ test("runtime approval endpoint accepts decision and rejects retired compatibili
     const address = await runtime.listen();
     const base = `http://${address.host}:${address.port}`;
     const run = coordinator.createRun({
-      scope_key: "scope",
+      scope_key: "private:1",
       lifecycle_id: "life",
       session_id: "session",
       workspace,
@@ -125,6 +125,38 @@ test("runtime approval endpoint accepts decision and rejects retired compatibili
     assert.ok(approval);
     const approvalId = String(approval.data.approval_id);
     const headers = { authorization: "Bearer secret", "content-type": "application/json" };
+    const inputBody = {
+      message_id: "message-2",
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      input: "include this follow-up",
+    };
+    assert.equal((await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(inputBody),
+    })).status, 401);
+    assert.equal((await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...inputBody, scope_key: "another-scope" }),
+    })).status, 409);
+    const joined = await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(inputBody),
+    });
+    assert.equal(joined.status, 202);
+    assert.deepEqual(await joined.json(), {
+      run_id: run.id,
+      message_id: "message-2",
+      state: "accepted",
+    });
+    assert.equal((await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(inputBody),
+    })).status, 202);
 
     const choiceAlias = await fetch(`${base}/v1/runs/${run.id}/approval`, {
       method: "POST",
@@ -153,6 +185,13 @@ test("runtime approval endpoint accepts decision and rejects retired compatibili
       resolved: true,
     });
     assert.equal((await coordinator.wait(run.id)).status, "completed");
+    const replayedInput = await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(inputBody),
+    });
+    assert.equal(replayedInput.status, 200);
+    assert.equal((await replayedInput.json() as { state: string }).state, "injected");
   } finally {
     await runtime.close();
     await rm(home, { recursive: true, force: true });

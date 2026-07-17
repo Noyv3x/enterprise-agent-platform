@@ -126,6 +126,16 @@ class _FakeRuntime:
                         },
                     )
                     return
+                if self.path == "/v1/runs/run-1/input":
+                    self._json(
+                        202,
+                        {
+                            "run_id": "run-1",
+                            "message_id": body.get("message_id"),
+                            "state": "accepted",
+                        },
+                    )
+                    return
                 if self.path == "/v1/runs/run-1/cancel":
                     self._json(200, {"ok": True, "status": "cancelled"})
                     return
@@ -272,6 +282,95 @@ class AgentRuntimeClientTests(unittest.TestCase):
 
         self.assertEqual(result.content, "Chunked response accepted")
         self.assertEqual(result.session_id, "session-2")
+
+    def test_steer_run_posts_an_idempotent_scoped_input(self):
+        result = self.client.steer_run(
+            run_id="run-1",
+            message_id="42",
+            scope_key="private:7",
+            lifecycle_id="life-7",
+            user_message="also add a checklist",
+            attachments=[
+                {
+                    "local_path": "/tmp/workspace-7/brief.txt",
+                    "filename": "brief.txt",
+                    "mime_type": "text/plain",
+                }
+            ],
+        )
+
+        self.assertEqual(result["state"], "accepted")
+        request = self.runtime.request("POST", "/v1/runs/run-1/input")
+        self.assertEqual(
+            request["body"],
+            {
+                "message_id": "42",
+                "scope_key": "private:7",
+                "lifecycle_id": "life-7",
+                "input": "also add a checklist",
+                "attachments": [
+                    {
+                        "path": "/tmp/workspace-7/brief.txt",
+                        "name": "brief.txt",
+                        "mime_type": "text/plain",
+                    }
+                ],
+            },
+        )
+
+    def test_new_runtime_turn_replaces_stream_fallback_and_preserves_input_ids(self):
+        self.runtime.events = [
+            _event(1, "message.delta", {"delta": "old draft", "turn_id": "run-1:1", "turn_index": 1}),
+            _event(2, "message.final", {"content": "old draft", "turn_id": "run-1:1", "turn_index": 1}),
+            _event(3, "input.injected", {"message_id": "42", "turn_id": "run-1:2", "turn_index": 2}),
+            _event(4, "message.delta", {"delta": "new answer", "turn_id": "run-1:2", "turn_index": 2}),
+            _event(
+                5,
+                "run.completed",
+                {
+                    "output": "new answer",
+                    "session_id": "session-2",
+                    "input_message_ids": ["42"],
+                    "unconsumed_input_message_ids": [],
+                },
+            ),
+        ]
+        content: list[str | None] = []
+        content_turns: list[tuple[str | None, str, int]] = []
+        progress: list[dict[str, Any]] = []
+
+        def on_content(
+            value: str | None,
+            *,
+            turn_id: str = "",
+            turn_index: int = 0,
+        ) -> None:
+            content.append(value)
+            content_turns.append((value, turn_id, turn_index))
+
+        result = self.client.generate(
+            system_prompt="system",
+            user_message="question",
+            history=[],
+            session_id="session-1",
+            session_key="private:7",
+            content_callback=on_content,
+            progress_callback=progress.append,
+        )
+
+        self.assertEqual(result.content, "new answer")
+        self.assertEqual(content, ["old draft", None, "new answer"])
+        self.assertEqual(
+            content_turns,
+            [
+                ("old draft", "run-1:1", 1),
+                (None, "run-1:2", 2),
+                ("new answer", "run-1:2", 2),
+            ],
+        )
+        self.assertEqual(result.raw["input_message_ids"], ["42"])
+        self.assertEqual(result.raw["unconsumed_input_message_ids"], [])
+        self.assertEqual([item["event"] for item in progress], ["input.injected"])
 
     def test_unbounded_json_response_uses_an_argumentless_read(self):
         response = mock.Mock()

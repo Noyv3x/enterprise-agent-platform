@@ -96,6 +96,8 @@ export interface PostMessageRequest {
 export interface PostMessageResponse {
   user_message: Message;
   agent_status?: AgentStatus | null;
+  processing_mode?: "started" | "joined" | "queued" | string;
+  input_group_id?: string;
 }
 
 export interface AgentApprovalSubmitRequest {

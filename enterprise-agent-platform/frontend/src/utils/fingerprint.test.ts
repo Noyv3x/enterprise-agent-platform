@@ -98,7 +98,17 @@ describe("agentStatusFingerprint", () => {
         updated_at: 100,
         username: "Agent One",
         created_at: 90,
+        turn_id: "run:1",
+        turn_index: 1,
         active: true,
+      },
+      input_group_id: "agent:job-1",
+      processing_mode: "started",
+      active_input_group: {
+        id: "agent:job-1",
+        state: "collecting",
+        message_count: 1,
+        message_ids: [10],
       },
     };
     const before = agentStatusFingerprint(status);
@@ -108,7 +118,16 @@ describe("agentStatusFingerprint", () => {
         ...status.stream_message,
         username: "Agent Two",
         created_at: 91,
+        turn_id: "run:2",
+        turn_index: 2,
         active: false,
+      },
+      processing_mode: "joined",
+      active_input_group: {
+        id: "agent:job-1",
+        state: "accepted",
+        message_count: 2,
+        message_ids: [10, 11],
       },
     });
     expect(after).not.toEqual(before);

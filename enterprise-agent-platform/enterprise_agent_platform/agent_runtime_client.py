@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import socket
 import threading
@@ -12,7 +13,7 @@ from typing import Any, Callable, Protocol
 
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
-AgentContentCallback = Callable[[str | None], None]
+AgentContentCallback = Callable[..., None]
 AgentRunStartedCallback = Callable[[str], None]
 
 
@@ -56,6 +57,18 @@ class AgentClient(Protocol):
         ...
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
+        ...
+
+    def steer_run(
+        self,
+        *,
+        run_id: str,
+        message_id: str,
+        scope_key: str,
+        lifecycle_id: str,
+        user_message: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         ...
 
     def cleanup_scope(
@@ -142,6 +155,9 @@ _PROGRESS_EVENT_TYPES = frozenset(
         "tool.failed",
         "approval.requested",
         "approval.resolved",
+        "input.accepted",
+        "input.injected",
+        "input.unconsumed",
     }
 )
 
@@ -356,6 +372,50 @@ class AgentRuntimeClient:
                 self._pending_approvals.pop(clean_run_id, None)
         return result
 
+    def steer_run(
+        self,
+        *,
+        run_id: str,
+        message_id: str,
+        scope_key: str,
+        lifecycle_id: str,
+        user_message: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        clean_run_id = self._required_id("run_id", run_id)
+        clean_message_id = self._required_id("message_id", message_id)
+        body = {
+            "message_id": clean_message_id,
+            "scope_key": self._required_id("scope_key", scope_key),
+            "lifecycle_id": self._required_id("lifecycle_id", lifecycle_id),
+            "input": str(user_message or ""),
+            "attachments": self._normalize_attachments(attachments or []),
+        }
+        path = f"/v1/runs/{urllib.parse.quote(clean_run_id, safe='')}/input"
+        for attempt in range(2):
+            try:
+                result, _ = self._json_request(
+                    "POST",
+                    path,
+                    body,
+                    timeout=min(self.timeout_seconds, 15.0),
+                )
+                break
+            except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError):
+                if attempt == 0:
+                    continue
+                raise
+        state = str(result.get("state") or "").strip()
+        if (
+            str(result.get("run_id") or "") != clean_run_id
+            or str(result.get("message_id") or "") != clean_message_id
+            or state not in {"accepted", "injected"}
+        ):
+            raise AgentRuntimeProtocolError(
+                f"Agent runtime POST {path} returned an invalid input acknowledgement"
+            )
+        return result
+
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         clean_run_id = self._required_id("run_id", run_id)
         result, _ = self._json_request(
@@ -480,6 +540,7 @@ class AgentRuntimeClient:
         usage: dict[str, Any] | None = None
         terminal_type = ""
         terminal_error = ""
+        current_turn_id = ""
         raw_events: list[dict[str, Any]] = []
         event_count = 0
         event_name = "message"
@@ -488,6 +549,7 @@ class AgentRuntimeClient:
         def dispatch() -> bool:
             nonlocal data_lines, event_name, event_count
             nonlocal final_output, final_session_id, usage, terminal_type, terminal_error
+            nonlocal current_turn_id, content_parts
             if not data_lines:
                 event_name = "message"
                 return False
@@ -531,14 +593,46 @@ class AgentRuntimeClient:
                     payload.setdefault("tool", tool_name)
 
             if event_type == "message.delta":
+                turn_id = str(payload.get("turn_id") or "").strip()
+                if turn_id and current_turn_id and turn_id != current_turn_id:
+                    content_parts = []
+                    final_output = ""
+                    self._emit_content(
+                        content_callback,
+                        None,
+                        turn_id=turn_id,
+                        turn_index=payload.get("turn_index"),
+                    )
+                if turn_id:
+                    current_turn_id = turn_id
                 delta = _text_from_content(payload.get("delta", payload.get("content")))
                 if delta:
                     content_parts.append(delta)
-                    self._emit_content(content_callback, delta)
+                    self._emit_content(
+                        content_callback,
+                        delta,
+                        turn_id=turn_id,
+                        turn_index=payload.get("turn_index"),
+                    )
                 return False
             if event_type == "message.final":
+                turn_id = str(payload.get("turn_id") or "").strip()
+                if turn_id:
+                    current_turn_id = turn_id
                 final_output = _text_from_content(payload.get("output", payload.get("content")))
                 return False
+            if event_type == "input.injected":
+                turn_id = str(payload.get("turn_id") or "").strip()
+                if turn_id and turn_id != current_turn_id:
+                    current_turn_id = turn_id
+                    content_parts = []
+                    final_output = ""
+                    self._emit_content(
+                        content_callback,
+                        None,
+                        turn_id=turn_id,
+                        turn_index=payload.get("turn_index"),
+                    )
             if event_type == "approval.requested":
                 approval_id = str(payload.get("approval_id") or payload.get("id") or "").strip()
                 payload.setdefault("description", str(payload.get("reason") or "").strip())
@@ -566,10 +660,21 @@ class AgentRuntimeClient:
                 raw_usage = payload.get("usage")
                 if isinstance(raw_usage, dict):
                     usage = raw_usage
+                for key in ("input_message_ids", "unconsumed_input_message_ids"):
+                    values = payload.get(key)
+                    if isinstance(values, list):
+                        raw_values = [str(value) for value in values if str(value or "").strip()]
+                        payload[key] = raw_values
                 return True
             if event_type in _TERMINAL_EVENTS - {"run.completed"}:
                 terminal_type = event_type
                 terminal_error = _error_message(payload) or event_type
+                for key in ("input_message_ids", "unconsumed_input_message_ids"):
+                    values = payload.get(key)
+                    if isinstance(values, list):
+                        payload[key] = [
+                            str(value) for value in values if str(value or "").strip()
+                        ]
                 return True
 
             if event_type in _PROGRESS_EVENT_TYPES:
@@ -609,6 +714,23 @@ class AgentRuntimeClient:
             raw["model_config"] = model
         if usage is not None:
             raw["usage"] = usage
+        terminal_payload = next(
+            (
+                event.get("data")
+                for event in reversed(raw_events)
+                if isinstance(event, dict)
+                and str(event.get("type") or event.get("event") or "") == terminal_type
+                and isinstance(event.get("data"), dict)
+            ),
+            {},
+        )
+        if isinstance(terminal_payload, dict):
+            for key in ("input_message_ids", "unconsumed_input_message_ids"):
+                values = terminal_payload.get(key)
+                if isinstance(values, list):
+                    raw[key] = [
+                        str(value) for value in values if str(value or "").strip()
+                    ]
         if terminal_type in _TERMINAL_EVENTS - {"run.completed"}:
             raw["error"] = terminal_error
             raw["terminal_event"] = terminal_type
@@ -843,11 +965,40 @@ class AgentRuntimeClient:
             return
 
     @staticmethod
-    def _emit_content(callback: AgentContentCallback | None, content: str) -> None:
-        if callback is None or not content:
+    def _emit_content(
+        callback: AgentContentCallback | None,
+        content: str | None,
+        *,
+        turn_id: str = "",
+        turn_index: Any = 0,
+    ) -> None:
+        if callback is None:
             return
         try:
-            callback(content)
+            signature = inspect.signature(callback)
+            parameters = signature.parameters
+            supports_turn_metadata = (
+                "turn_id" in parameters
+                and "turn_index" in parameters
+            ) or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_turn_metadata = False
+        try:
+            if supports_turn_metadata:
+                try:
+                    clean_turn_index = max(0, int(turn_index or 0))
+                except (TypeError, ValueError):
+                    clean_turn_index = 0
+                callback(
+                    content,
+                    turn_id=str(turn_id or ""),
+                    turn_index=clean_turn_index,
+                )
+            else:
+                callback(content)
         except Exception:
             return
 

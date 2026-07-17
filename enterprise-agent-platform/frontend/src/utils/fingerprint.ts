@@ -39,6 +39,10 @@ export function messageFingerprint(message: Message): unknown {
     pending: !!message.metadata?.local_pending,
     streaming: !!message.metadata?.streaming,
     stream_segment: !!message.metadata?.stream_segment,
+    input_group_id: message.metadata?.input_group_id || "",
+    processing_mode: message.metadata?.processing_mode || "",
+    reply_to_message_ids: message.metadata?.reply_to_message_ids || [],
+    durable_job_ids: message.metadata?.durable_job_ids || [],
     scheduled_task: message.metadata?.scheduled_task
       ? {
           schedule_id: message.metadata.scheduled_task.schedule_id,
@@ -82,6 +86,7 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
     state: status.state,
     queued_count: status.queued_count || 0,
     started_at: status.started_at || 0,
+    updated_at: status.updated_at || 0,
     scope_type: status.scope_type || "",
     scope_id: status.scope_id == null ? "" : String(status.scope_id),
     current_step: status.current_step || "",
@@ -94,6 +99,8 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
           active: status.stream_message.active !== false,
           username: status.stream_message.username || "",
           created_at: status.stream_message.created_at || 0,
+          turn_id: status.stream_message.turn_id || "",
+          turn_index: status.stream_message.turn_index || 0,
         }
       : null,
     stream_messages: (status.stream_messages || []).map((item) => ({
@@ -103,7 +110,21 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
       active: item.active !== false,
       username: item.username || "",
       created_at: item.created_at || 0,
+      turn_id: item.turn_id || "",
+      turn_index: item.turn_index || 0,
     })),
+    input_group_id: status.input_group_id || "",
+    processing_mode: status.processing_mode || "",
+    active_input_group: status.active_input_group
+      ? {
+          id: status.active_input_group.id,
+          state: status.active_input_group.state || "",
+          message_count: status.active_input_group.message_count,
+          message_ids: status.active_input_group.message_ids || [],
+          first_message_id: status.active_input_group.first_message_id || "",
+          last_message_id: status.active_input_group.last_message_id || "",
+        }
+      : null,
     approval: status.approval
       ? {
           run_id: status.approval.run_id || "",

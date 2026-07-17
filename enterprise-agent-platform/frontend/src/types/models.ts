@@ -159,8 +159,20 @@ export interface StreamMsg {
   updated_at?: number;
   username?: string;
   created_at?: number;
+  /** Runtime turn identity. A newer turn supersedes an earlier draft. */
+  turn_id?: string;
+  turn_index?: number;
   /** false marks a finalized segment; undefined/true = live. */
   active?: boolean;
+}
+
+export interface AgentInputGroup {
+  id: string;
+  state?: "collecting" | "reserved" | "accepted" | "injected" | string;
+  message_count: number;
+  message_ids?: Id[];
+  first_message_id?: Id;
+  last_message_id?: Id;
 }
 
 /** Who the agent is currently replying to (legacy-app.js:2918-2925). */
@@ -178,6 +190,7 @@ export interface AgentWork {
   current_step?: string;
   queued_count?: number;
   started_at?: number;
+  updated_at?: number;
   scope_type?: ScopeType;
   scope_id?: Id;
   activity?: ActivityStep[];
@@ -189,6 +202,9 @@ export interface AgentStatus extends AgentWork {
   replying_to?: AgentReplyTarget | null;
   stream_message?: StreamMsg | null;
   stream_messages?: StreamMsg[];
+  input_group_id?: string;
+  processing_mode?: "started" | "joined" | "queued" | string;
+  active_input_group?: AgentInputGroup | null;
   last_error?: string;
 }
 
@@ -210,6 +226,10 @@ export interface MessageMetadata {
   local_pending?: boolean;
   streaming?: boolean;
   stream_segment?: boolean;
+  input_group_id?: string;
+  processing_mode?: "started" | "joined" | "queued" | string;
+  reply_to_message_ids?: Id[];
+  durable_job_ids?: Id[];
   knowledge_suggestions?: KnowledgeSuggestion[];
   agent_work?: AgentWork;
   /** Marks the compact source message emitted by a scheduled task run. */

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque
 
 from .auth import TokenSigner, hash_password, verify_password
+from .agent_inputs import AgentRunInput, AgentRunInputStore
 from .agent_scopes import AgentExecutionScope, AgentScopeManager
 from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
@@ -34,6 +35,7 @@ from .agent_runtime_client import (
     AgentClient,
     AgentResult,
     AgentRuntimeClient,
+    AgentRuntimeHTTPError,
     AgentRuntimeError,
     AgentRuntimeRunError,
 )
@@ -339,12 +341,15 @@ class EnterpriseService:
         self._acquire_instance_lock()
         self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
+        self.agent_inputs = AgentRunInputStore(self.db)
         self.schedules = AgentScheduleStore(self.db)
         # Agent runs and Telegram sends can have external side effects. An
         # interrupted running record is quarantined rather than blindly
         # repeated; queued work remains recoverable and is claimed at least
         # once after its exact Agent reply becomes available.
+        self.agent_inputs.recover_reserved_jobs()
         self.jobs.recover_interrupted(unsafe_kinds={"agent", TELEGRAM_DELIVERY_JOB_KIND})
+        self.agent_inputs.quarantine_interrupted_jobs()
         # Telegram updates interrupted before acknowledgement are made
         # claimable again. Telegram will redeliver an unacknowledged webhook or
         # an uncommitted long-poll update; the update-id row remains the dedupe
@@ -384,6 +389,9 @@ class EnterpriseService:
         # Fixed stripes close the final permission-check -> runtime-submission
         # window without retaining one lock per short-lived delegate scope.
         self._agent_run_start_locks = tuple(threading.Lock() for _ in range(64))
+        # Preserve private-message ingress order across simultaneous browser
+        # tabs and Telegram/web requests before they reach the per-run pump.
+        self._agent_ingress_locks = tuple(threading.Lock() for _ in range(64))
         self._agent_browser_tabs_lock = threading.RLock()
         self._agent_browser_current_tabs: dict[str, str] = {}
         self._agent_browser_activity: dict[str, float] = {}
@@ -593,6 +601,12 @@ class EnterpriseService:
         digest = hashlib.sha256(str(scope_key).encode("utf-8")).digest()
         return self._agent_run_start_locks[int.from_bytes(digest[:4], "big") % len(self._agent_run_start_locks)]
 
+    def _agent_ingress_lock(self, conversation_key: str) -> threading.Lock:
+        digest = hashlib.sha256(str(conversation_key).encode("utf-8")).digest()
+        return self._agent_ingress_locks[
+            int.from_bytes(digest[:4], "big") % len(self._agent_ingress_locks)
+        ]
+
     def _cleanup_agent_scope(
         self,
         scope_key: str,
@@ -747,7 +761,30 @@ class EnterpriseService:
     ) -> AgentResult:
         release, supports_callback = self._runtime_submission_barrier(task, scope_key)
         if supports_callback:
-            kwargs["run_started_callback"] = release
+            def run_started(run_id: str) -> None:
+                # Keep the established conversation -> start-lock ordering:
+                # release the lifecycle barrier before taking conversation state.
+                release(run_id)
+                try:
+                    self._register_active_runtime_run(task, scope_key, run_id)
+                except BaseException as exc:
+                    # The runtime has already durably accepted this run. A local
+                    # registration/SQLite/pump failure must never escape here:
+                    # AgentRuntimeClient has not opened the SSE stream yet, so an
+                    # escaping callback would orphan a side-effectful run.
+                    try:
+                        self._contain_runtime_registration_failure(
+                            task,
+                            scope_key,
+                            run_id,
+                            exc,
+                        )
+                    except BaseException:
+                        # This callback is an acceptance boundary: even the
+                        # containment/reporting path must not escape it.
+                        pass
+
+            kwargs["run_started_callback"] = run_started
         try:
             # Clients without the optional callback remain behind the barrier
             # for the whole call. This is conservative but preserves safety for
@@ -755,6 +792,116 @@ class EnterpriseService:
             return self.agent_client.generate(**kwargs)
         finally:
             release()
+            self._freeze_active_input_group(task)
+
+    def _register_active_runtime_run(
+        self,
+        task: dict[str, Any],
+        scope_key: str,
+        run_id: str,
+    ) -> None:
+        if str(task.get("scope_type")) != "private" or not task.get("_accepting_inputs"):
+            return
+        key = self._conversation_key("private", str(task["scope_id"]))
+        with self._conversation_lock:
+            if self._agent_active_tasks.get(key) is not task or self._closed:
+                return
+            task["_runtime_run_id"] = str(run_id)
+            task["_agent_scope_key"] = str(scope_key)
+            group_id = str(task.get("_input_group_id") or "")
+            if group_id:
+                self.agent_inputs.set_runtime_run(group_id, str(run_id))
+            pending: list[dict[str, Any]] = []
+            for child in list(task.get("_joined_input_tasks") or []):
+                association = self.agent_inputs.get_by_message(
+                    int(child["user_message"]["id"])
+                )
+                if association is not None and association.state == "reserved":
+                    pending.append(child)
+        if pending:
+            # A single per-run pump preserves user arrival order even when
+            # several HTTP/Telegram request threads join concurrently.
+            self._drain_joined_private_inputs(task)
+
+    def _contain_runtime_registration_failure(
+        self,
+        task: dict[str, Any],
+        scope_key: str,
+        run_id: str,
+        error: BaseException,
+    ) -> None:
+        """Keep observing an accepted run while closing unsafe input admission."""
+
+        detail = (
+            "active-run input registration failed after runtime acceptance: "
+            f"{type(error).__name__}: {error}"
+        )[:2000]
+        try:
+            key = self._conversation_key("private", str(task.get("scope_id") or ""))
+            with self._conversation_lock:
+                if self._agent_active_tasks.get(key) is task:
+                    # Preserve the authoritative identifiers in memory even if
+                    # persisting them was the operation that failed. The parent
+                    # run can then finish through its normal SSE/terminal path.
+                    task["_runtime_run_id"] = str(run_id)
+                    task["_agent_scope_key"] = str(scope_key)
+                    task["_accepting_inputs"] = False
+                    task["_input_registration_error"] = detail
+                    status = self._agent_status.get(key)
+                    if status is not None:
+                        updated = dict(status)
+                        self._update_active_input_group_status(updated, task)
+                        updated["updated_at"] = now_ts()
+                        self._agent_status[key] = updated
+        except BaseException:
+            # This is a last-resort containment boundary. Never replace the
+            # already accepted runtime run with a local callback exception.
+            pass
+
+        # Inputs still in ``reserved`` provably never reached the runtime and
+        # can safely fall back to FIFO standalone work. ``submitting`` inputs
+        # remain quarantined for terminal consumed/unconsumed reconciliation.
+        try:
+            children = list(task.get("_joined_input_tasks") or [])
+        except BaseException:
+            children = []
+        for child in children:
+            try:
+                association = self.agent_inputs.get_by_message(
+                    int(child["user_message"]["id"])
+                )
+                if association is not None and association.state == "reserved":
+                    self._fallback_joined_private_input(task, child, detail)
+            except BaseException:
+                continue
+        try:
+            print(detail, file=sys.stderr)
+        except BaseException:
+            pass
+
+    def _freeze_active_input_group(self, task: dict[str, Any]) -> None:
+        if str(task.get("scope_type")) != "private":
+            return
+        key = self._conversation_key("private", str(task.get("scope_id") or ""))
+        with self._conversation_lock:
+            if self._agent_active_tasks.get(key) is task:
+                task["_accepting_inputs"] = False
+                status = self._agent_status.get(key)
+                if status is not None:
+                    updated = dict(status)
+                    self._update_active_input_group_status(updated, task)
+                    updated["updated_at"] = now_ts()
+                    self._agent_status[key] = updated
+
+    def _freeze_and_wait_for_input_submissions(self, task: dict[str, Any]) -> None:
+        """Close admission and wait for the one in-flight steering POST."""
+
+        self._freeze_active_input_group(task)
+        submit_lock = task.get("_input_submit_lock")
+        if submit_lock is None:
+            return
+        with submit_lock:
+            pass
 
     def _ensure_agent_task_can_run(self, task: dict[str, Any]) -> None:
         if not self._task_scope_is_current(task):
@@ -796,6 +943,9 @@ class EnterpriseService:
         key = self._conversation_key(scope_type, scope_id)
         with self._conversation_lock:
             self._agent_scope_epochs[key] = int(self._agent_scope_epochs.get(key, 0)) + 1
+            active = self._agent_active_tasks.get(key)
+            if active is not None:
+                active["_accepting_inputs"] = False
             queued = list(self._agent_queues.pop(key, deque()))
             self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
             self._typing.pop(key, None)
@@ -840,6 +990,19 @@ class EnterpriseService:
             if scope_type == "private":
                 conn.execute(
                     """
+                    UPDATE agent_run_inputs
+                    SET state = 'failed', last_error = ?, updated_at = ?
+                    WHERE job_id IN (
+                        SELECT id FROM durable_jobs
+                        WHERE kind = 'agent' AND scope_type = 'private'
+                          AND scope_id = ? AND status = 'failed'
+                    )
+                      AND state NOT IN ('succeeded', 'failed')
+                    """,
+                    (str(reason)[:2000], timestamp, scope_id),
+                )
+                conn.execute(
+                    """
                     UPDATE durable_jobs
                     SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
                     WHERE kind = ? AND scope_type = 'private' AND scope_id = ? AND status = 'queued'
@@ -872,6 +1035,7 @@ class EnterpriseService:
         self._repair_schedule_run_job_gaps()
         self._surface_interrupted_agent_jobs()
         self._surface_failed_agent_jobs_without_message()
+        self.agent_inputs.reconcile_terminal_jobs()
         self._sync_schedule_runs_from_jobs()
         self._recover_agent_message_job_gaps()
 
@@ -915,12 +1079,30 @@ class EnterpriseService:
             if self._durable_job_success_message_exists(job.id):
                 self.jobs.mark_succeeded(job.id, reconcile=True)
                 continue
+            association = self.agent_inputs.get_by_job(job.id)
+            if association is not None and association.parent_job_id != association.job_id:
+                continue
             if self._durable_job_message_exists(job.id):
                 continue
             task = dict(job.payload)
             if not self._valid_recovered_agent_task(task):
                 continue
             task["_job_id"] = job.id
+            if association is not None:
+                task["_input_group_id"] = association.input_group_id
+                recovered_children: list[dict[str, Any]] = []
+                for item in self.agent_inputs.for_group(association.input_group_id):
+                    if item.job_id == job.id:
+                        continue
+                    child_job = self.jobs.get(item.job_id)
+                    if child_job is None or child_job.status != "needs_review":
+                        continue
+                    child = dict(child_job.payload)
+                    if not self._valid_recovered_agent_task(child):
+                        continue
+                    child["_job_id"] = child_job.id
+                    recovered_children.append(child)
+                task["_consumed_input_tasks"] = recovered_children
             self._append_agent_error(
                 task,
                 "Agent execution was interrupted during restart; its side effects are uncertain and it was not run twice.",
@@ -941,6 +1123,9 @@ class EnterpriseService:
             job = self.jobs.get(int(row["id"]))
             if job is None or self._durable_job_message_exists(job.id):
                 continue
+            association = self.agent_inputs.get_by_job(job.id)
+            if association is not None and association.parent_job_id != association.job_id:
+                continue
             task = dict(job.payload)
             if not self._valid_recovered_agent_task(task):
                 continue
@@ -959,6 +1144,21 @@ class EnterpriseService:
                 # after the user has lost access to the private Agent.
                 continue
             task["_job_id"] = job.id
+            if association is not None:
+                task["_input_group_id"] = association.input_group_id
+                recovered_children: list[dict[str, Any]] = []
+                for item in self.agent_inputs.for_group(association.input_group_id):
+                    if item.job_id == job.id:
+                        continue
+                    child_job = self.jobs.get(item.job_id)
+                    if child_job is None or child_job.status != "failed":
+                        continue
+                    child = dict(child_job.payload)
+                    if not self._valid_recovered_agent_task(child):
+                        continue
+                    child["_job_id"] = child_job.id
+                    recovered_children.append(child)
+                task["_consumed_input_tasks"] = recovered_children
             try:
                 self._append_agent_error(
                     task,
@@ -1058,8 +1258,16 @@ class EnterpriseService:
             "SELECT metadata_json FROM messages WHERE author_type = 'agent' ORDER BY id DESC"
         )
         for row in rows:
+            metadata = decode_json(row.get("metadata_json"))
+            stored_job_ids = metadata.get("durable_job_ids") if isinstance(metadata, dict) else None
+            if isinstance(stored_job_ids, list):
+                try:
+                    if int(job_id) in {int(value) for value in stored_job_ids}:
+                        return True
+                except (TypeError, ValueError):
+                    pass
             try:
-                stored_job_id = int(decode_json(row.get("metadata_json")).get("durable_job_id") or 0)
+                stored_job_id = int(metadata.get("durable_job_id") or 0)
             except (AttributeError, TypeError, ValueError):
                 continue
             if stored_job_id == int(job_id):
@@ -1072,11 +1280,18 @@ class EnterpriseService:
         )
         for row in rows:
             metadata = decode_json(row.get("metadata_json"))
+            work = metadata.get("agent_work") if isinstance(metadata, dict) else None
+            stored_job_ids = metadata.get("durable_job_ids") if isinstance(metadata, dict) else None
+            if isinstance(stored_job_ids, list) and isinstance(work, dict) and work.get("state") == "complete":
+                try:
+                    if int(job_id) in {int(value) for value in stored_job_ids}:
+                        return True
+                except (TypeError, ValueError):
+                    pass
             try:
                 stored_job_id = int(metadata.get("durable_job_id") or 0)
             except (AttributeError, TypeError, ValueError):
                 continue
-            work = metadata.get("agent_work") if isinstance(metadata, dict) else None
             if stored_job_id == int(job_id) and isinstance(work, dict) and work.get("state") == "complete":
                 return True
         return False
@@ -1903,6 +2118,13 @@ class EnterpriseService:
         )
         for row in rows:
             metadata = decode_json(row.get("metadata_json"))
+            reply_ids = metadata.get("reply_to_message_ids") if isinstance(metadata, dict) else None
+            if isinstance(reply_ids, list):
+                try:
+                    if int(user_message_id) in {int(value) for value in reply_ids}:
+                        return self._message_from_row(row)
+                except (TypeError, ValueError):
+                    pass
             reply_to = metadata.get("reply_to") if isinstance(metadata, dict) else None
             try:
                 reply_message_id = int((reply_to or {}).get("message_id") or 0)
@@ -2137,6 +2359,8 @@ class EnterpriseService:
     ) -> None:
         payload = job.payload
         text_delivery = str(payload.get("delivery_type") or "") == "text"
+        delivery_owner_message_id: int | None = None
+        delivery_target: dict[str, Any] = {}
         if text_delivery:
             if payload.get("chat_id") is None or not str(payload.get("text") or "").strip():
                 self.jobs.mark_failed(job.id, "Telegram text delivery payload is invalid")
@@ -2174,6 +2398,9 @@ class EnterpriseService:
                     "metadata": {"reply_to": {"message_id": user_message_id}},
                 }
             actor = self.get_user(int(payload.get("user_id") or 0)) or {}
+            delivery_owner_message_id, delivery_target = (
+                self._telegram_delivery_owner_for_agent_message(agent_message)
+            )
 
         claimed = self.jobs.mark_running(
             job.id,
@@ -2184,6 +2411,17 @@ class EnterpriseService:
         if not text_delivery and not actor.get("active"):
             self.jobs.mark_failed(job.id, "Telegram delivery user is missing or inactive")
             return
+        if (
+            not text_delivery
+            and delivery_owner_message_id is not None
+            and int(user_message_id) != delivery_owner_message_id
+        ):
+            # A consolidated Agent response may target several rapid Telegram
+            # turns. Only the latest Telegram turn owns the one Bot API send.
+            self.jobs.mark_succeeded(job.id)
+            return
+        if delivery_target:
+            payload = {**payload, **delivery_target}
         identity_lock: threading.Lock | None = None
         if payload.get("scheduled_delivery"):
             identity_lock = self._telegram_identity_delivery_lock(int(payload.get("user_id") or 0))
@@ -2264,6 +2502,58 @@ class EnterpriseService:
         finally:
             if identity_lock is not None:
                 identity_lock.release()
+
+    def _telegram_delivery_owner_for_agent_message(
+        self,
+        agent_message: dict[str, Any],
+    ) -> tuple[int | None, dict[str, Any]]:
+        metadata = (
+            agent_message.get("metadata")
+            if isinstance(agent_message.get("metadata"), dict)
+            else {}
+        )
+        values = metadata.get("reply_to_message_ids")
+        message_ids: list[int] = []
+        if isinstance(values, list):
+            for value in values:
+                try:
+                    message_ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+        if not message_ids:
+            reply_to = metadata.get("reply_to")
+            try:
+                message_ids = [int((reply_to or {}).get("message_id") or 0)]
+            except (AttributeError, TypeError, ValueError):
+                message_ids = []
+        message_ids = [message_id for message_id in message_ids if message_id > 0]
+        if not message_ids:
+            return None, {}
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = self.db.query(
+            f"""
+            SELECT id, metadata_json FROM messages
+            WHERE id IN ({placeholders}) AND author_type = 'user'
+            ORDER BY id DESC
+            """,
+            message_ids,
+        )
+        for row in rows:
+            user_metadata = decode_json(row.get("metadata_json"))
+            target = (
+                user_metadata.get("telegram_delivery")
+                if isinstance(user_metadata, dict)
+                and isinstance(user_metadata.get("telegram_delivery"), dict)
+                else None
+            )
+            if target is None or target.get("chat_id") is None:
+                continue
+            return int(row["id"]), {
+                "chat_id": target.get("chat_id"),
+                "reply_to_message_id": target.get("reply_to_message_id"),
+                "message_thread_id": target.get("message_thread_id"),
+            }
+        return None, {}
 
     def claim_telegram_update(self, update_id: int) -> bool:
         """Atomically claim a Telegram update across webhook/poller workers."""
@@ -3399,7 +3689,7 @@ class EnterpriseService:
                     "agent_status": self.agent_status(actor, "channel", scope_id),
                 }
             agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-            status = self._enqueue_agent_reply(
+            enqueue_result = self._enqueue_agent_reply(
                 {
                     "scope_type": "channel",
                     "scope_id": scope_id,
@@ -3411,7 +3701,11 @@ class EnterpriseService:
                     "user_message": user_msg,
                 }
             )
-        return {"user_message": user_msg, "agent_message": None, "agent_status": status}
+        return {
+            "user_message": user_msg,
+            "agent_message": None,
+            "agent_status": enqueue_result["agent_status"],
+        }
 
     def _send_channel_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         scope_id = str(task["scope_id"])
@@ -3474,8 +3768,14 @@ class EnterpriseService:
                 if self._task_scope_is_current(task)
                 else None
             ),
-            content_callback=lambda delta: (
-                self._record_agent_content_delta("channel", scope_id, delta)
+            content_callback=lambda delta, turn_id="", turn_index=0: (
+                self._record_agent_content_delta(
+                    "channel",
+                    scope_id,
+                    delta,
+                    turn_id=turn_id,
+                    turn_index=turn_index,
+                )
                 if self._task_scope_is_current(task)
                 else None
             ),
@@ -3536,6 +3836,9 @@ class EnterpriseService:
         attachments: list[UploadedFile] | None = None,
         *,
         telegram_update_id: int | None = None,
+        telegram_chat_id: int | str | None = None,
+        telegram_message_id: int | None = None,
+        telegram_thread_id: int | None = None,
     ) -> dict[str, Any]:
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
         content = content.strip()
@@ -3548,6 +3851,30 @@ class EnterpriseService:
             except (TypeError, ValueError) as exc:
                 raise ServiceError(400, "Telegram update id is invalid") from exc
         scope_id = str(actor["id"])
+        with self._agent_ingress_lock(self._conversation_key("private", scope_id)):
+            return self._send_private_message_ordered(
+                actor,
+                scope_id,
+                content,
+                uploads,
+                telegram_update_id=telegram_update_id,
+                telegram_chat_id=telegram_chat_id,
+                telegram_message_id=telegram_message_id,
+                telegram_thread_id=telegram_thread_id,
+            )
+
+    def _send_private_message_ordered(
+        self,
+        actor: dict[str, Any],
+        scope_id: str,
+        content: str,
+        uploads: list[UploadedFile],
+        *,
+        telegram_update_id: int | None,
+        telegram_chat_id: int | str | None,
+        telegram_message_id: int | None,
+        telegram_thread_id: int | None,
+    ) -> dict[str, Any]:
         with self._conversation_lock:
             actor = self._fresh_active_actor(actor)
             require_permission(actor, PERMISSION_PRIVATE_AGENT)
@@ -3566,6 +3893,11 @@ class EnterpriseService:
                 }
                 if telegram_update_id is not None:
                     metadata["telegram_update_id"] = telegram_update_id
+                    metadata["telegram_delivery"] = {
+                        "chat_id": telegram_chat_id,
+                        "reply_to_message_id": telegram_message_id,
+                        "message_thread_id": telegram_thread_id,
+                    }
                 user_msg = self._append_message(
                     scope_type="private",
                     scope_id=scope_id,
@@ -3585,22 +3917,23 @@ class EnterpriseService:
             task_content = str(user_msg.get("content") or "")
             agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
             agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
-            status = self._enqueue_agent_reply(
-                {
-                    "scope_type": "private",
-                    "scope_id": scope_id,
-                    "actor": dict(actor),
-                    "content": task_content,
-                    "attachments": agent_attachments,
-                    "generation": generation,
-                    "user_message": user_msg,
-                }
-            )
+            task = {
+                "scope_type": "private",
+                "scope_id": scope_id,
+                "actor": dict(actor),
+                "content": task_content,
+                "attachments": agent_attachments,
+                "generation": generation,
+                "user_message": user_msg,
+            }
+        enqueue_result = self._enqueue_agent_reply(task)
         return {
             "user_message": user_msg,
             "agent_message": None,
-            "agent_status": status,
+            "agent_status": enqueue_result["agent_status"],
             "execution": agent_scope.to_execution_dict(),
+            "processing_mode": enqueue_result["processing_mode"],
+            "input_group_id": enqueue_result["input_group_id"],
         }
 
     def _fresh_active_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -3649,6 +3982,8 @@ class EnterpriseService:
         user_msg = task["user_message"]
         self._record_agent_activity("private", scope_id, "preparing", "准备私人工作区", f"u{actor['id']}")
         agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
+        task["_agent_scope_key"] = agent_scope.scope_key
+        task["_agent_lifecycle_id"] = agent_scope.lifecycle_id
         execution = agent_scope.to_execution_dict()
         suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
         system_prompt = self._private_system_prompt(actor, agent_scope, suggestions)
@@ -3695,12 +4030,20 @@ class EnterpriseService:
                 if self._task_scope_is_current(task)
                 else None
             ),
-            content_callback=lambda delta: (
-                self._record_agent_content_delta("private", scope_id, delta)
+            content_callback=lambda delta, turn_id="", turn_index=0: (
+                self._record_agent_content_delta(
+                    "private",
+                    scope_id,
+                    delta,
+                    turn_id=turn_id,
+                    turn_index=turn_index,
+                )
                 if self._task_scope_is_current(task)
                 else None
             ),
         )
+        self._freeze_and_wait_for_input_submissions(task)
+        self._reconcile_completed_input_group(task, result)
         self._ensure_agent_task_can_run(task)
         clean_content, generated_attachments = self._extract_generated_attachments(
             result.content, owner_id=int(scope_id)
@@ -3722,6 +4065,7 @@ class EnterpriseService:
                 "knowledge_suggestions": [h.to_dict() for h in suggestions],
                 "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "reply_to": self._reply_target(task),
+                **self._input_group_metadata(task),
             }
             if task.get("_job_id"):
                 metadata["durable_job_id"] = int(task["_job_id"])
@@ -7246,19 +7590,606 @@ class EnterpriseService:
             scope_id=scope_id,
         )
         if job.status != "queued":
-            key = self._conversation_key(scope_type, scope_id)
+            association = self.agent_inputs.get_by_job(job.id)
             with self._conversation_lock:
-                return self._copy_status(
+                status = self._copy_status(
                     self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
                 )
+            return {
+                "agent_status": status,
+                "processing_mode": (
+                    "joined"
+                    if association is not None and association.parent_job_id != association.job_id
+                    else "started"
+                ),
+                "input_group_id": (
+                    association.input_group_id if association is not None else f"agent:{job.id}"
+                ),
+            }
         task = dict(job.payload)
         task["_scope_epoch"] = scope_epoch
         task["_job_id"] = job.id
+        input_group_id = f"agent:{job.id}"
+        interactive_private = scope_type == "private" and not task.get("schedule_run_id")
+        if interactive_private:
+            task["_input_group_id"] = input_group_id
+            joined = self._try_join_active_private_task(task)
+            if joined is not None:
+                return joined
+        with self._conversation_lock:
+            was_busy = bool(self._agent_active_tasks.get(key) or self._agent_queues.get(key))
         try:
-            return self._schedule_agent_task(task, enforce_limit=True)
+            status = self._schedule_agent_task(task, enforce_limit=True)
         except Exception as exc:
             self.jobs.mark_failed(job.id, str(exc))
             raise
+        return {
+            "agent_status": status,
+            "processing_mode": "queued" if was_busy else "started",
+            "input_group_id": input_group_id if interactive_private else "",
+        }
+
+    def _try_join_active_private_task(
+        self,
+        task: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        key = self._conversation_key("private", str(task["scope_id"]))
+        child_job_id = int(task["_job_id"])
+        child_message_id = int(task["user_message"]["id"])
+        with self._conversation_lock:
+            parent = self._agent_active_tasks.get(key)
+            pending_root_claim = False
+            queue = self._agent_queues.get(key)
+            if parent is None and queue:
+                candidate = queue[0]
+                if candidate.get("_admission_pending_claim"):
+                    parent = candidate
+                    pending_root_claim = True
+            if (
+                parent is None
+                or not parent.get("_accepting_inputs")
+                or int(parent.get("_scope_epoch") or 0)
+                != int(self._agent_scope_epochs.get(key, 0))
+                or parent.get("schedule_run_id")
+                or str(parent.get("scope_type")) != "private"
+            ):
+                return None
+            group_id = str(parent.get("_input_group_id") or "")
+            parent_job_id = int(parent.get("_job_id") or 0)
+            joined_tasks = list(parent.get("_joined_input_tasks") or [])
+            queued_behind_parent = max(0, len(queue or ()) - (1 if pending_root_claim else 0))
+            outstanding = (
+                1
+                + self._active_joined_input_count(parent)
+                + queued_behind_parent
+            )
+            if not group_id or parent_job_id <= 0 or outstanding >= MAX_AGENT_QUEUE_DEPTH:
+                return None
+            existing_child = next(
+                (
+                    child
+                    for child in joined_tasks
+                    if int(child.get("_job_id") or 0) == child_job_id
+                ),
+                None,
+            )
+            if child_job_id == parent_job_id or existing_child is not None:
+                status = self._copy_status(
+                    self._agent_status.get(key)
+                    or self._status_for_task(parent, "queued", queued_count=len(queue or ()))
+                )
+                return {
+                    "agent_status": status,
+                    "processing_mode": "started" if child_job_id == parent_job_id else "joined",
+                    "input_group_id": group_id,
+                }
+            child = dict(task)
+            child["_input_group_id"] = group_id
+            child["_processing_mode"] = "joined"
+            if pending_root_claim:
+                # The root durable job is still queued and has not been claimed.
+                # Keep the child queued too; the worker atomically claims both
+                # only after it owns the root. A crash here safely recovers the
+                # child as ordinary standalone queued work.
+                child["_pending_input_claim"] = True
+                joined_tasks.append(child)
+                parent["_joined_input_tasks"] = joined_tasks
+                status = dict(
+                    self._agent_status.get(key)
+                    or self._status_for_task(parent, "queued", queued_count=len(queue or ()))
+                )
+                self._update_active_input_group_status(status, parent)
+                self._agent_status[key] = status
+                return {
+                    "agent_status": self._copy_status(status),
+                    "processing_mode": "joined",
+                    "input_group_id": group_id,
+                }
+            try:
+                association = self.agent_inputs.reserve_and_claim(
+                    message_id=child_message_id,
+                    job_id=child_job_id,
+                    parent_job_id=parent_job_id,
+                    input_group_id=group_id,
+                    lease_seconds=AGENT_JOB_LEASE_SECONDS,
+                )
+            except Exception:
+                return None
+            if association is None:
+                return None
+            joined_tasks.append(child)
+            parent["_joined_input_tasks"] = joined_tasks
+            runtime_run_id = str(parent.get("_runtime_run_id") or "")
+            status = dict(
+                self._agent_status.get(key)
+                or self._status_for_task(parent, "replying", queued_count=len(queue or ()))
+            )
+            self._update_active_input_group_status(status, parent)
+            self._agent_status[key] = status
+            copied_status = self._copy_status(status)
+        if runtime_run_id:
+            self._drain_joined_private_inputs(parent)
+            with self._conversation_lock:
+                copied_status = self._copy_status(
+                    self._agent_status.get(key) or copied_status
+                )
+        latest_association = self.agent_inputs.get_by_message(child_message_id)
+        processing_mode = (
+            "queued"
+            if latest_association is not None
+            and latest_association.state == "unconsumed"
+            else "joined"
+        )
+        return {
+            "agent_status": copied_status,
+            "processing_mode": processing_mode,
+            "input_group_id": (
+                f"agent:{child_job_id}"
+                if processing_mode == "queued"
+                else association.input_group_id
+            ),
+        }
+
+    def _active_joined_input_count(self, task: dict[str, Any]) -> int:
+        count = 0
+        for child in list(task.get("_joined_input_tasks") or []):
+            if child.get("_pending_input_claim"):
+                count += 1
+                continue
+            association = self.agent_inputs.get_by_message(
+                int(child["user_message"]["id"])
+            )
+            if association is not None and association.state in {
+                "reserved",
+                "submitting",
+                "accepted",
+                "injected",
+            }:
+                count += 1
+        return count
+
+    def _drain_joined_private_inputs(self, parent: dict[str, Any]) -> None:
+        submit_lock = parent.get("_input_submit_lock")
+        if submit_lock is None:
+            return
+        with submit_lock:
+            while True:
+                with self._conversation_lock:
+                    key = self._conversation_key("private", str(parent["scope_id"]))
+                    active = self._agent_active_tasks.get(key) is parent
+                    accepting = active and bool(parent.get("_accepting_inputs")) and not self._closed
+                    runtime_run_id = str(parent.get("_runtime_run_id") or "")
+                    children = list(parent.get("_joined_input_tasks") or [])
+                if not accepting:
+                    for child in children:
+                        association = self.agent_inputs.get_by_message(
+                            int(child["user_message"]["id"])
+                        )
+                        if association is not None and association.state == "reserved":
+                            self._fallback_joined_private_input(
+                                parent,
+                                child,
+                                "active run closed before input submission",
+                            )
+                    return
+                if not runtime_run_id:
+                    return
+
+                next_child: dict[str, Any] | None = None
+                blocked_by_ambiguous_input = False
+                for child in children:
+                    association = self.agent_inputs.get_by_message(
+                        int(child["user_message"]["id"])
+                    )
+                    if association is None:
+                        continue
+                    if association.state in {"accepted", "injected", "succeeded"}:
+                        continue
+                    if association.state == "reserved":
+                        next_child = child
+                        break
+                    # Never inject a later correction ahead of a message whose
+                    # submission outcome is uncertain or which had to fall back.
+                    blocked_by_ambiguous_input = True
+                    break
+                if next_child is None:
+                    if blocked_by_ambiguous_input:
+                        self._freeze_active_input_group(parent)
+                        for child in children:
+                            association = self.agent_inputs.get_by_message(
+                                int(child["user_message"]["id"])
+                            )
+                            if association is not None and association.state == "reserved":
+                                self._fallback_joined_private_input(
+                                    parent,
+                                    child,
+                                    "an earlier joined input could not be submitted in order",
+                                )
+                    return
+                outcome = self._submit_joined_private_input(
+                    parent,
+                    next_child,
+                    runtime_run_id,
+                )
+                if outcome == "accepted":
+                    continue
+                self._freeze_active_input_group(parent)
+                for child in children:
+                    association = self.agent_inputs.get_by_message(
+                        int(child["user_message"]["id"])
+                    )
+                    if association is not None and association.state == "reserved":
+                        self._fallback_joined_private_input(
+                            parent,
+                            child,
+                            "an earlier joined input could not be submitted in order",
+                        )
+                return
+
+    def _submit_joined_private_input(
+        self,
+        parent: dict[str, Any],
+        child: dict[str, Any],
+        runtime_run_id: str,
+    ) -> str:
+        message_id = int(child["user_message"]["id"])
+        association = self.agent_inputs.get_by_message(message_id)
+        if association is None or association.state not in {"reserved", "submitting"}:
+            return "accepted" if association is not None and association.state in {"accepted", "injected"} else "fallback"
+        with self._conversation_lock:
+            key = self._conversation_key("private", str(parent["scope_id"]))
+            still_active = (
+                self._agent_active_tasks.get(key) is parent
+                and bool(parent.get("_accepting_inputs"))
+                and not self._closed
+            )
+        if not still_active:
+            self._fallback_joined_private_input(parent, child, "active run closed before input submission")
+            return "fallback"
+        if association.state == "reserved":
+            self.agent_inputs.transition(
+                message_id,
+                "submitting",
+                allowed_from=("reserved",),
+                runtime_run_id=runtime_run_id,
+            )
+        steer = getattr(self.agent_client, "steer_run", None)
+        if not callable(steer):
+            self._fallback_joined_private_input(
+                parent,
+                child,
+                "Agent runtime does not support active-run input",
+            )
+            return "fallback"
+        attachments = list(child.get("attachments") or [])
+        prompt_content = self._agent_prompt_content(
+            str(child.get("content") or ""),
+            attachments,
+            default="请处理这些附件。",
+        )
+        try:
+            acknowledgement = steer(
+                run_id=runtime_run_id,
+                message_id=str(message_id),
+                scope_key=str(parent.get("_agent_scope_key") or ""),
+                lifecycle_id=str(parent.get("_agent_lifecycle_id") or ""),
+                user_message=prompt_content,
+                attachments=attachments,
+            )
+        except AgentRuntimeHTTPError as exc:
+            # An HTTP response is a definite endpoint rejection. Only
+            # connection/timeout failures below are ambiguous after retry.
+            self._fallback_joined_private_input(parent, child, str(exc))
+            return "fallback"
+        except (ValueError, TypeError) as exc:
+            self._fallback_joined_private_input(parent, child, str(exc))
+            return "fallback"
+        except AgentRuntimeError as exc:
+            # The POST may have reached the runtime. Keep ``submitting`` until
+            # the parent's terminal consumed/unconsumed arrays reconcile it.
+            self.agent_inputs.transition(
+                message_id,
+                "submitting",
+                allowed_from=("submitting",),
+                runtime_run_id=runtime_run_id,
+                error=str(exc),
+            )
+            return "ambiguous"
+        state = str((acknowledgement or {}).get("state") or "accepted")
+        self.agent_inputs.transition(
+            message_id,
+            "injected" if state == "injected" else "accepted",
+            allowed_from=("submitting", "accepted"),
+            runtime_run_id=runtime_run_id,
+        )
+        return "accepted"
+
+    def _fallback_joined_private_input(
+        self,
+        parent: dict[str, Any],
+        child: dict[str, Any],
+        reason: str,
+    ) -> None:
+        message_id = int(child["user_message"]["id"])
+        job_id = int(child["_job_id"])
+        association = self.agent_inputs.get_by_message(message_id)
+        if association is None or association.state in {"succeeded", "failed", "needs_review"}:
+            return
+        self.agent_inputs.transition(
+            message_id,
+            "unconsumed",
+            allowed_from=("reserved", "submitting", "accepted", "unconsumed"),
+            error=reason,
+        )
+        if not self.jobs.requeue(job_id, error=reason):
+            return
+        key = self._conversation_key("private", str(child["scope_id"]))
+        with self._conversation_lock:
+            queue = self._agent_queues.setdefault(key, deque())
+            if not any(int(item.get("_job_id") or 0) == job_id for item in queue):
+                fallback = dict(child)
+                fallback["_input_group_id"] = f"agent:{job_id}"
+                fallback["_processing_mode"] = "queued"
+                fallback.pop("_pending_input_claim", None)
+                self._insert_agent_queue_by_job_id_locked(queue, fallback)
+            status = dict(
+                self._agent_status.get(key)
+                or self._status_for_task(parent, "replying", queued_count=len(queue))
+            )
+            status["queued_count"] = len(queue)
+            self._update_active_input_group_status(status, parent)
+            status["updated_at"] = now_ts()
+            self._agent_status[key] = status
+
+    @staticmethod
+    def _runtime_input_ids(raw: dict[str, Any], key: str) -> set[int]:
+        values = raw.get(key)
+        if not isinstance(values, list):
+            return set()
+        result: set[int] = set()
+        for value in values:
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _reconcile_completed_input_group(
+        self,
+        task: dict[str, Any],
+        result: AgentResult,
+    ) -> None:
+        if str(task.get("scope_type")) != "private" or not task.get("_input_group_id"):
+            return
+        consumed_ids = self._runtime_input_ids(result.raw, "input_message_ids")
+        unconsumed_ids = self._runtime_input_ids(
+            result.raw,
+            "unconsumed_input_message_ids",
+        )
+        consumed_tasks: list[dict[str, Any]] = []
+        for child in list(task.get("_joined_input_tasks") or []):
+            message_id = int(child["user_message"]["id"])
+            association = self.agent_inputs.get_by_message(message_id)
+            if association is None:
+                continue
+            if message_id in consumed_ids or association.state == "injected":
+                consumed_tasks.append(child)
+                self.agent_inputs.transition(
+                    message_id,
+                    "injected",
+                    allowed_from=("submitting", "accepted", "injected"),
+                    runtime_run_id=str(task.get("_runtime_run_id") or association.runtime_run_id),
+                )
+                continue
+            if message_id in unconsumed_ids or association.state in {"reserved", "unconsumed"}:
+                self._fallback_joined_private_input(
+                    task,
+                    child,
+                    "runtime closed before joined input was consumed",
+                )
+                continue
+            error = "joined input submission outcome was not confirmed by the completed runtime run"
+            self.agent_inputs.transition(
+                message_id,
+                "needs_review",
+                allowed_from=("submitting", "accepted"),
+                error=error,
+            )
+            self.jobs.mark_failed(int(child["_job_id"]), error, needs_review=True)
+        task["_consumed_input_tasks"] = consumed_tasks
+
+    def _reconcile_failed_input_group(
+        self,
+        task: dict[str, Any],
+        error: Exception,
+        *,
+        parent_needs_review: bool,
+        allow_fallback: bool = True,
+    ) -> None:
+        if str(task.get("scope_type")) != "private" or not task.get("_input_group_id"):
+            return
+        raw = error.raw if isinstance(error, AgentRuntimeRunError) else {}
+        consumed_ids = self._runtime_input_ids(raw, "input_message_ids")
+        unconsumed_ids = self._runtime_input_ids(raw, "unconsumed_input_message_ids")
+        consumed_tasks: list[dict[str, Any]] = []
+        for child in list(task.get("_joined_input_tasks") or []):
+            message_id = int(child["user_message"]["id"])
+            association = self.agent_inputs.get_by_message(message_id)
+            if association is None:
+                continue
+            consumed = message_id in consumed_ids or association.state == "injected"
+            unconsumed = message_id in unconsumed_ids or association.state in {
+                "reserved",
+                "unconsumed",
+            }
+            if unconsumed and allow_fallback:
+                self._fallback_joined_private_input(
+                    task,
+                    child,
+                    "parent run ended before joined input was consumed",
+                )
+                continue
+            child_needs_review = parent_needs_review or (
+                not consumed and association.state in {"submitting", "accepted"}
+            )
+            state = "needs_review" if child_needs_review else "failed"
+            detail = str(error)
+            self.agent_inputs.transition(
+                message_id,
+                state,
+                allowed_from=(
+                    "reserved",
+                    "submitting",
+                    "accepted",
+                    "injected",
+                    "unconsumed",
+                ),
+                error=detail,
+            )
+            self.jobs.mark_failed(
+                int(child["_job_id"]),
+                detail,
+                needs_review=child_needs_review,
+            )
+            if consumed:
+                consumed_tasks.append(child)
+        task["_consumed_input_tasks"] = consumed_tasks
+
+    def _input_group_metadata(self, task: dict[str, Any]) -> dict[str, Any]:
+        if str(task.get("scope_type")) != "private" or not task.get("_input_group_id"):
+            return {}
+        input_tasks = [task, *list(task.get("_consumed_input_tasks") or [])]
+        return {
+            "input_group_id": str(task["_input_group_id"]),
+            "processing_mode": "started",
+            "reply_to_message_ids": [
+                int(item["user_message"]["id"]) for item in input_tasks
+            ],
+            "durable_job_ids": [
+                int(item["_job_id"]) for item in input_tasks if item.get("_job_id")
+            ],
+        }
+
+    def _mark_input_group_succeeded(self, task: dict[str, Any]) -> None:
+        if str(task.get("scope_type")) != "private" or not task.get("_input_group_id"):
+            return
+        input_tasks = [task, *list(task.get("_consumed_input_tasks") or [])]
+        for item in input_tasks:
+            job_id = int(item.get("_job_id") or 0)
+            message_id = int(item["user_message"]["id"])
+            if item is not task and job_id:
+                self.jobs.mark_succeeded(job_id)
+            self.agent_inputs.transition(
+                message_id,
+                "succeeded",
+                allowed_from=("running", "injected"),
+            )
+
+    def _mark_input_root_failed(
+        self,
+        task: dict[str, Any],
+        error: str,
+        *,
+        needs_review: bool,
+    ) -> None:
+        if str(task.get("scope_type")) != "private" or not task.get("_input_group_id"):
+            return
+        self.agent_inputs.transition(
+            int(task["user_message"]["id"]),
+            "needs_review" if needs_review else "failed",
+            allowed_from=("running",),
+            error=error,
+        )
+
+    @staticmethod
+    def _prepare_private_input_admission(task: dict[str, Any], job_id: int) -> None:
+        """Expose a queue-head private root as joinable before its worker runs."""
+
+        if (
+            str(task.get("scope_type")) != "private"
+            or task.get("schedule_run_id")
+            or int(job_id) <= 0
+        ):
+            return
+        task["_input_group_id"] = str(
+            task.get("_input_group_id") or f"agent:{int(job_id)}"
+        )
+        task["_processing_mode"] = str(task.get("_processing_mode") or "started")
+        task["_accepting_inputs"] = True
+        task.setdefault("_joined_input_tasks", [])
+        task.setdefault("_runtime_run_id", "")
+        task.setdefault("_input_submit_lock", threading.Lock())
+        task["_admission_pending_claim"] = True
+
+    @staticmethod
+    def _insert_agent_queue_by_job_id_locked(
+        queue: Deque[dict[str, Any]],
+        task: dict[str, Any],
+    ) -> None:
+        """Insert fallback work at its durable ingress position."""
+
+        job_id = int(task.get("_job_id") or 0)
+        if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):
+            return
+        items = list(queue)
+        position = len(items)
+        if job_id:
+            for index, item in enumerate(items):
+                queued_job_id = int(item.get("_job_id") or 0)
+                if queued_job_id and queued_job_id > job_id:
+                    position = index
+                    break
+        items.insert(position, task)
+        queue.clear()
+        queue.extend(items)
+
+    def _release_pending_root_inputs_locked(
+        self,
+        task: dict[str, Any],
+        queue: Deque[dict[str, Any]],
+    ) -> None:
+        """Return never-claimed children to the standalone FIFO."""
+
+        for child in list(task.get("_joined_input_tasks") or []):
+            if not child.get("_pending_input_claim"):
+                continue
+            fallback = dict(child)
+            fallback.pop("_pending_input_claim", None)
+            fallback["_input_group_id"] = f"agent:{int(fallback['_job_id'])}"
+            fallback["_processing_mode"] = "queued"
+            fallback["_accepting_inputs"] = False
+            self._insert_agent_queue_by_job_id_locked(queue, fallback)
+        task["_joined_input_tasks"] = [
+            child
+            for child in list(task.get("_joined_input_tasks") or [])
+            if not child.get("_pending_input_claim")
+        ]
+        if queue:
+            first = queue[0]
+            self._prepare_private_input_admission(
+                first,
+                int(first.get("_job_id") or 0),
+            )
 
     def _schedule_agent_task(self, task: dict[str, Any], *, enforce_limit: bool) -> dict[str, Any]:
         scope_type = str(task["scope_type"])
@@ -7272,8 +8203,12 @@ class EnterpriseService:
             if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):
                 status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
                 return self._copy_status(status)
-            if enforce_limit and len(queue) >= MAX_AGENT_QUEUE_DEPTH:
+            active = self._agent_active_tasks.get(key)
+            joined_count = self._active_joined_input_count(active or {})
+            if enforce_limit and len(queue) + joined_count >= MAX_AGENT_QUEUE_DEPTH:
                 raise ServiceError(429, "agent is busy; too many queued messages for this conversation")
+            if not active and not queue:
+                self._prepare_private_input_admission(task, job_id)
             queue.append(task)
             status = self._agent_status.get(key)
             if not status or status.get("state") == "idle":
@@ -7312,7 +8247,60 @@ class EnterpriseService:
                         # Another worker (or a terminal transition) already owns
                         # this ledger entry. Never execute a side-effectful Agent
                         # run unless this worker atomically claimed it.
+                        self._release_pending_root_inputs_locked(task, queue)
                         continue
+                    if (
+                        str(task.get("scope_type")) == "private"
+                        and not task.get("schedule_run_id")
+                        and job_id
+                    ):
+                        input_group_id = str(task.get("_input_group_id") or f"agent:{job_id}")
+                        task["_input_group_id"] = input_group_id
+                        task["_processing_mode"] = str(task.get("_processing_mode") or "started")
+                        task["_accepting_inputs"] = True
+                        task["_admission_pending_claim"] = False
+                        task.setdefault("_joined_input_tasks", [])
+                        task.setdefault("_runtime_run_id", "")
+                        task.setdefault("_input_submit_lock", threading.Lock())
+                        self.agent_inputs.start_root(
+                            message_id=int(task["user_message"]["id"]),
+                            job_id=job_id,
+                            input_group_id=input_group_id,
+                        )
+                        claimed_children: list[dict[str, Any]] = []
+                        unclaimed_children: list[dict[str, Any]] = []
+                        for child in list(task.get("_joined_input_tasks") or []):
+                            if not child.get("_pending_input_claim"):
+                                claimed_children.append(child)
+                                continue
+                            try:
+                                association = self.agent_inputs.reserve_and_claim(
+                                    message_id=int(child["user_message"]["id"]),
+                                    job_id=int(child["_job_id"]),
+                                    parent_job_id=job_id,
+                                    input_group_id=input_group_id,
+                                    lease_seconds=AGENT_JOB_LEASE_SECONDS,
+                                )
+                            except Exception:
+                                association = None
+                            if association is None:
+                                unclaimed_children.append(child)
+                                continue
+                            claimed = dict(child)
+                            claimed.pop("_pending_input_claim", None)
+                            claimed_children.append(claimed)
+                        task["_joined_input_tasks"] = claimed_children
+                        for child in unclaimed_children:
+                            fallback = dict(child)
+                            fallback.pop("_pending_input_claim", None)
+                            fallback["_input_group_id"] = (
+                                f"agent:{int(fallback['_job_id'])}"
+                            )
+                            fallback["_processing_mode"] = "queued"
+                            fallback["_accepting_inputs"] = False
+                            self._insert_agent_queue_by_job_id_locked(queue, fallback)
+                    else:
+                        task["_accepting_inputs"] = False
                     self._update_schedule_run_for_task(task, "running")
                     self._agent_active_tasks[key] = task
                     self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
@@ -7339,6 +8327,7 @@ class EnterpriseService:
                     # in-memory epoch changed between commit and this update.
                     ledger_succeeded = self.jobs.mark_succeeded(job_id) if job_id else True
                     if ledger_succeeded:
+                        self._mark_input_group_succeeded(task)
                         self._update_schedule_run_for_task(
                             task,
                             "blocked" if task.get("_unattended_authorization_required") else "succeeded",
@@ -7356,12 +8345,24 @@ class EnterpriseService:
                         )
                 except _AgentTaskCancelled as exc:
                     error = str(exc)
+                    self._freeze_and_wait_for_input_submissions(task)
+                    self._reconcile_failed_input_group(
+                        task,
+                        exc,
+                        parent_needs_review=exc.needs_review,
+                        allow_fallback=False,
+                    )
                     ledger_failed = (
                         self.jobs.mark_failed(job_id, error, needs_review=exc.needs_review)
                         if job_id
                         else True
                     )
                     if ledger_failed:
+                        self._mark_input_root_failed(
+                            task,
+                            error,
+                            needs_review=exc.needs_review,
+                        )
                         self._update_schedule_run_for_task(
                             task,
                             "needs_review" if exc.needs_review else "cancelled",
@@ -7380,6 +8381,13 @@ class EnterpriseService:
                             task["_scheduled_terminal_status"] = "blocked"
                     with self._conversation_lock:
                         shutting_down = self._closed
+                    self._freeze_and_wait_for_input_submissions(task)
+                    self._reconcile_failed_input_group(
+                        task,
+                        exc,
+                        parent_needs_review=runtime_needs_review or shutting_down,
+                        allow_fallback=not shutting_down,
+                    )
                     if shutting_down:
                         ledger_failed = (
                             self.jobs.mark_failed(job_id, error, needs_review=True)
@@ -7387,6 +8395,11 @@ class EnterpriseService:
                             else True
                         )
                         if ledger_failed:
+                            self._mark_input_root_failed(
+                                task,
+                                error,
+                                needs_review=True,
+                            )
                             self._update_schedule_run_for_task(task, "needs_review", error=error)
                         error_persisted = True
                     else:
@@ -7421,6 +8434,11 @@ class EnterpriseService:
                             int(task["user_message"]["id"]),
                         )
                         if ledger_failed:
+                            self._mark_input_root_failed(
+                                task,
+                                error,
+                                needs_review=runtime_needs_review,
+                            )
                             self._update_schedule_run_for_task(
                                 task,
                                 "needs_review"
@@ -7521,7 +8539,11 @@ class EnterpriseService:
         require_current: bool = False,
     ) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
-        metadata = {"error": error, "reply_to": self._reply_target(task)}
+        metadata = {
+            "error": error,
+            "reply_to": self._reply_target(task),
+            **self._input_group_metadata(task),
+        }
         if task.get("_job_id"):
             metadata["durable_job_id"] = int(task["_job_id"])
         scheduled_terminal_status = str(task.get("_scheduled_terminal_status") or "")
@@ -7589,7 +8611,7 @@ class EnterpriseService:
     def _status_for_task(self, task: dict[str, Any], state: str, queued_count: int) -> dict[str, Any]:
         label = "等待 Agent 处理" if state == "queued" else "等待 Agent 运行过程"
         started_at = now_ts()
-        return {
+        status = {
             "scope_type": str(task["scope_type"]),
             "scope_id": str(task["scope_id"]),
             "run_id": self._run_id_for_task(task),
@@ -7613,6 +8635,54 @@ class EnterpriseService:
             "stream_messages": [],
             "stream_message": None,
             "approval": None,
+            "input_group_id": str(task.get("_input_group_id") or ""),
+            "processing_mode": str(task.get("_processing_mode") or ("queued" if state == "queued" else "started")),
+            "active_input_group": None,
+        }
+        self._update_active_input_group_status(status, task)
+        return status
+
+    def _update_active_input_group_status(
+        self,
+        status: dict[str, Any],
+        task: dict[str, Any],
+    ) -> None:
+        group_id = str(task.get("_input_group_id") or "")
+        if str(task.get("scope_type")) != "private" or not group_id:
+            status["active_input_group"] = None
+            return
+        message_ids = [int(task["user_message"]["id"])]
+        states: list[str] = []
+        for child in list(task.get("_joined_input_tasks") or []):
+            message_id = int(child["user_message"]["id"])
+            association = self.agent_inputs.get_by_message(message_id)
+            if association is None and child.get("_pending_input_claim"):
+                message_ids.append(message_id)
+                states.append("reserved")
+                continue
+            if association is None or association.state in {
+                "unconsumed",
+                "failed",
+                "needs_review",
+            }:
+                continue
+            message_ids.append(message_id)
+            states.append(association.state)
+        group_state = "collecting"
+        if states and all(state == "injected" for state in states):
+            group_state = "injected"
+        elif any(state in {"accepted", "injected"} for state in states):
+            group_state = "accepted"
+        elif states:
+            group_state = "reserved"
+        status["input_group_id"] = group_id
+        status["active_input_group"] = {
+            "id": group_id,
+            "state": group_state,
+            "message_count": len(message_ids),
+            "message_ids": message_ids,
+            "first_message_id": message_ids[0],
+            "last_message_id": message_ids[-1],
         }
 
     @staticmethod
@@ -7632,6 +8702,9 @@ class EnterpriseService:
             "stream_messages": [],
             "stream_message": None,
             "approval": None,
+            "input_group_id": "",
+            "processing_mode": "",
+            "active_input_group": None,
         }
 
     @staticmethod
@@ -7645,6 +8718,11 @@ class EnterpriseService:
             copied["stream_message"] = dict(copied["stream_message"])
         if copied.get("approval"):
             copied["approval"] = dict(copied["approval"])
+        if copied.get("active_input_group"):
+            copied["active_input_group"] = dict(copied["active_input_group"])
+            copied["active_input_group"]["message_ids"] = list(
+                copied["active_input_group"].get("message_ids") or []
+            )
         return copied
 
     def _record_agent_activity(
@@ -7704,13 +8782,30 @@ class EnterpriseService:
         status["stream_message"] = None
         return status
 
-    def _record_agent_content_delta(self, scope_type: str, scope_id: str, delta: str | None) -> None:
+    def _record_agent_content_delta(
+        self,
+        scope_type: str,
+        scope_id: str,
+        delta: str | None,
+        *,
+        turn_id: str = "",
+        turn_index: int = 0,
+    ) -> None:
         key = self._conversation_key(scope_type, str(scope_id))
         timestamp = now_ts()
+        clean_turn_id = str(turn_id or "").strip()
+        try:
+            clean_turn_index = max(0, int(turn_index or 0))
+        except (TypeError, ValueError):
+            clean_turn_index = 0
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
             if delta is None:
-                status = self._finalize_stream_message(status, timestamp)
+                # A new runtime turn supersedes the earlier draft after joined
+                # user input. Keep a single live Agent bubble instead of
+                # concatenating or preserving an obsolete intermediate answer.
+                status["stream_message"] = None
+                status["stream_messages"] = []
                 status["updated_at"] = timestamp
                 self._agent_status[key] = status
                 return
@@ -7718,14 +8813,26 @@ class EnterpriseService:
             if not delta:
                 return
             stream = dict(status.get("stream_message") or {})
+            if (
+                clean_turn_id
+                and stream.get("turn_id")
+                and str(stream.get("turn_id")) != clean_turn_id
+            ):
+                # Defense in depth for clients that provide turn metadata but do
+                # not emit the compatibility ``None`` reset callback.
+                stream = {}
             stream.setdefault(
                 "id",
                 f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}:"
-                f"{len(status.get('stream_messages') or [])}",
+                f"{clean_turn_id or len(status.get('stream_messages') or [])}",
             )
             stream.setdefault("author_type", "agent")
             stream.setdefault("username", "Main Agent" if scope_type == "channel" else "Private Agent")
             stream.setdefault("created_at", status.get("started_at") or timestamp)
+            if clean_turn_id:
+                stream["turn_id"] = clean_turn_id
+            if clean_turn_index:
+                stream["turn_index"] = clean_turn_index
             stream["content"] = str(stream.get("content") or "") + delta
             stream["updated_at"] = timestamp
             stream["active"] = True
@@ -7740,8 +8847,16 @@ class EnterpriseService:
         scope_id: str,
         event: dict[str, Any],
     ) -> None:
+        event_type = str(
+            event.get("runtime_event_type")
+            or event.get("event")
+            or event.get("type")
+            or ""
+        ).strip().lower()
+        if event_type in {"input.accepted", "input.injected", "input.unconsumed"}:
+            self._record_joined_input_progress(task, event_type, event)
         if task.get("schedule_run_id"):
-            event_type = str(
+            schedule_event_type = str(
                 event.get("event") or event.get("event_type") or event.get("status") or ""
             ).strip().lower()
             reason = str(
@@ -7755,7 +8870,7 @@ class EnterpriseService:
             compatibility_prefix = reason.startswith(
                 ("unattended authorization required", "unattended_authorization_required")
             )
-            if event_type in {"tool.failed", "failed", "failure"} and (
+            if schedule_event_type in {"tool.failed", "failed", "failure"} and (
                 explicitly_blocked or compatibility_prefix
             ):
                 task["_unattended_authorization_required"] = True
@@ -7763,6 +8878,61 @@ class EnterpriseService:
                     reason or "unattended authorization required"
                 )[:2000]
         self._record_agent_progress(scope_type, scope_id, event)
+
+    def _record_joined_input_progress(
+        self,
+        task: dict[str, Any],
+        event_type: str,
+        event: dict[str, Any],
+    ) -> None:
+        try:
+            message_id = int(event.get("message_id"))
+        except (TypeError, ValueError):
+            return
+        association = self.agent_inputs.get_by_message(message_id)
+        if (
+            association is None
+            or association.input_group_id != str(task.get("_input_group_id") or "")
+        ):
+            return
+        child = next(
+            (
+                item
+                for item in list(task.get("_joined_input_tasks") or [])
+                if int(item["user_message"]["id"]) == message_id
+            ),
+            None,
+        )
+        if event_type == "input.unconsumed":
+            if child is not None:
+                self._fallback_joined_private_input(
+                    task,
+                    child,
+                    str(event.get("reason") or "runtime did not consume joined input"),
+                )
+            return
+        target = "injected" if event_type == "input.injected" else "accepted"
+        self.agent_inputs.transition(
+            message_id,
+            target,
+            allowed_from=("submitting", "accepted", "injected"),
+            runtime_run_id=str(event.get("run_id") or association.runtime_run_id),
+            turn_id=str(event.get("turn_id") or association.turn_id),
+            turn_index=int(event.get("turn_index") or association.turn_index or 0),
+        )
+        key = self._conversation_key("private", str(task["scope_id"]))
+        with self._conversation_lock:
+            status = self._agent_status.get(key)
+            if status is not None:
+                updated = dict(status)
+                if event_type == "input.injected":
+                    # The next model turn supersedes any partially streamed
+                    # draft from before the user's correction.
+                    updated["stream_message"] = None
+                    updated["stream_messages"] = []
+                self._update_active_input_group_status(updated, task)
+                updated["updated_at"] = now_ts()
+                self._agent_status[key] = updated
 
     def _record_agent_progress(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):

@@ -87,6 +87,10 @@ export function agentStatusText(
   if (!isAgentActive(status)) return "";
   const target = status?.replying_to?.username || translate("chat.userFallback");
   if (status?.state === "approval") return translate("chat.status.approval", { target });
+  const inputCount = status?.active_input_group?.message_count || 0;
+  if (inputCount > 1) {
+    return translate("chat.status.merging", { count: inputCount });
+  }
   return status?.state === "queued"
     ? translate("chat.status.queued", { target })
     : translate("chat.status.replying", { target });

@@ -549,7 +549,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
   ];
 }
 
-function isCanonicalPrivateScope(scopeKey: string): boolean {
+export function isCanonicalPrivateScope(scopeKey: string): boolean {
   return /^private:[1-9][0-9]*$/.test(scopeKey);
 }
 

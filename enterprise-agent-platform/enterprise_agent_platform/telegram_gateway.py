@@ -337,14 +337,17 @@ class TelegramGateway:
         update_id: int | None,
     ) -> dict[str, Any]:
         scope_id = str(actor["id"])
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         result = self.service.send_private_message(
             actor,
             text,
             attachments,
             telegram_update_id=update_id,
+            telegram_chat_id=chat.get("id"),
+            telegram_message_id=_int_or_none(message.get("message_id")),
+            telegram_thread_id=_int_or_none(message.get("message_thread_id")),
         )
         user_message_id = int(result["user_message"]["id"])
-        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         delivery = self.service.enqueue_telegram_delivery(
             actor=actor,
             update_id=update_id,

@@ -73,6 +73,16 @@ export interface RunRequest {
   metadata?: RunMetadata;
 }
 
+export interface RunInputRequest {
+  message_id: string;
+  scope_key: string;
+  lifecycle_id: string;
+  input: UserInput;
+  attachments?: AttachmentRequest[];
+}
+
+export type RunInputState = "accepted" | "injected" | "unconsumed";
+
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "needs_review";
 
 export interface RuntimeEvent<T = JsonObject> {
@@ -88,6 +98,8 @@ export interface RunResult {
   messages: AgentMessage[];
   model: { provider: string; id: string };
   usage?: JsonObject;
+  input_message_ids?: string[];
+  unconsumed_input_message_ids?: string[];
 }
 
 export interface RunRecord {

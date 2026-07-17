@@ -63,10 +63,15 @@ describe("MessageList Agent work records", () => {
         description: "Run a command",
         choices: ["once", "deny"],
       },
+      active_input_group: {
+        id: "agent:job-1",
+        message_count: 2,
+      },
     });
 
     expect(screen.getByText("Waiting for Administrator to approve access")).toBeTruthy();
     expect(screen.getByText("Access approval")).toBeTruthy();
+    expect(screen.queryByText(/combining 2 messages/)).toBeNull();
     expect(view.container.querySelector(".agent-work")).toBeNull();
   });
 
@@ -102,5 +107,69 @@ describe("MessageList Agent work records", () => {
     expect(view.container.querySelector(".agent-work")).not.toBeNull();
     expect(screen.getByText(/Using Web search/)).toBeTruthy();
     expect(screen.queryByText(/Unrelated lifecycle row/)).toBeNull();
+  });
+
+  it("shows one compact status for a joined rapid-message group", () => {
+    renderMessageList({
+      state: "replying",
+      replying_to: { username: "Administrator" },
+      active_input_group: {
+        id: "agent:job-1",
+        state: "accepted",
+        message_count: 3,
+        message_ids: [11, 12, 13],
+      },
+    });
+
+    expect(screen.getByText("Agent is combining 3 messages into one reply")).toBeTruthy();
+    expect(screen.queryByText("Agent is replying to Administrator")).toBeNull();
+  });
+
+  it("hides an obsolete streamed draft after a newer steering turn starts", () => {
+    renderMessageList({
+      state: "replying",
+      stream_messages: [
+        {
+          id: "old-turn",
+          content: "obsolete draft",
+          turn_id: "run:1",
+          turn_index: 1,
+          active: false,
+        },
+      ],
+      stream_message: {
+        id: "new-turn",
+        content: "consolidated answer",
+        turn_id: "run:2",
+        turn_index: 2,
+        active: true,
+      },
+    });
+
+    expect(screen.queryByText("obsolete draft")).toBeNull();
+    expect(screen.getByText("consolidated answer")).toBeTruthy();
+  });
+
+  it("prefers the live draft when turn metadata is only partially available", () => {
+    renderMessageList({
+      state: "replying",
+      stream_messages: [
+        {
+          id: "tagged-old-turn",
+          content: "tagged obsolete draft",
+          turn_id: "run:1",
+          turn_index: 1,
+          active: false,
+        },
+      ],
+      stream_message: {
+        id: "untagged-live-turn",
+        content: "live consolidated answer",
+        active: true,
+      },
+    });
+
+    expect(screen.queryByText("tagged obsolete draft")).toBeNull();
+    expect(screen.getByText("live consolidated answer")).toBeTruthy();
   });
 });

@@ -59,7 +59,11 @@ export interface PersistentIdempotencyRecord {
   created_at: number;
   updated_at: number;
   expires_at: number;
-  result?: Pick<RunResult, "content" | "model" | "usage">;
+  result?: Pick<
+    RunResult,
+    "content" | "model" | "usage" | "input_message_ids" | "unconsumed_input_message_ids"
+  >;
+  inputs?: Record<string, { fingerprint: string; state: "accepted" | "injected" | "unconsumed" }>;
   error?: string;
 }
 
@@ -113,7 +117,13 @@ export class IdempotencyStore {
   update(
     scopeKey: string,
     idempotencyKey: string,
-    patch: { status: RunStatus; retentionMs: number; result?: RunResult; error?: string },
+    patch: {
+      status: RunStatus;
+      retentionMs: number;
+      result?: RunResult;
+      inputs?: PersistentIdempotencyRecord["inputs"];
+      error?: string;
+    },
   ): void {
     const hash = this.hash(scopeKey, idempotencyKey);
     const current = this.records.get(hash);
@@ -130,8 +140,15 @@ export class IdempotencyStore {
         content: patch.result.content,
         model: patch.result.model,
         ...(patch.result.usage ? { usage: patch.result.usage } : {}),
+        ...(patch.result.input_message_ids
+          ? { input_message_ids: patch.result.input_message_ids }
+          : {}),
+        ...(patch.result.unconsumed_input_message_ids
+          ? { unconsumed_input_message_ids: patch.result.unconsumed_input_message_ids }
+          : {}),
       };
     }
+    if (patch.inputs) next.inputs = structuredClone(patch.inputs);
     if (patch.error) next.error = patch.error;
     this.records.set(hash, next);
     this.flush();

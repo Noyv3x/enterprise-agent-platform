@@ -16,7 +16,12 @@
    already lives in hooks/useTypingNotifier.ts).
    ===================================================================== */
 
-import { api, isApiRequestCancelled, type ApiOptions } from "../lib/api";
+import {
+  api,
+  ApiRequestCancelledError,
+  isApiRequestCancelled,
+  type ApiOptions,
+} from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
 import { t } from "../i18n";
@@ -26,6 +31,13 @@ import { chatSnapshot } from "../utils/fingerprint";
 import { runBusy } from "./sessionActions";
 import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
 import { ensureAdminPageResource } from "./adminResources";
+import {
+  beginStatusMutation,
+  finishStatusMutation,
+  isStatusMutationCurrent,
+  isStatusReadCurrent,
+  issueStatusRead,
+} from "./statusFence";
 import {
   loadChannelMessages,
   loadDocuments,
@@ -75,22 +87,30 @@ function applyAgentStatus(
   mode: ChatMode,
   scopeId: string,
   status: AgentStatus | null | undefined,
+  authoritative = false,
 ): void {
   if (!status) return;
-  const current = store.getState().agentStatuses;
-  if (mode === "private") {
-    store.dispatch({
-      type: "SET_AGENT_STATUSES",
-      payload: { channels: current.channels, private: status },
-    });
-  } else {
-    store.dispatch({
-      type: "SET_AGENT_STATUSES",
-      payload: {
-        channels: { ...current.channels, [String(scopeId)]: status },
-        private: current.private,
-      },
-    });
+  store.dispatch({
+    type: "SET_AGENT_STATUS",
+    payload: { mode, scopeId, status, authoritative },
+  });
+}
+
+async function runStatusMutation<T extends { agent_status?: AgentStatus | null }>(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const ticket = beginStatusMutation(store, mode, scopeId);
+  try {
+    const result = await operation();
+    if (isStatusMutationCurrent(ticket)) {
+      applyAgentStatus(store, mode, scopeId, result.agent_status, true);
+    }
+    return result;
+  } finally {
+    finishStatusMutation(ticket);
   }
 }
 
@@ -124,10 +144,12 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
   try {
     if (mode === "channel") {
       const channelId = String(initial.activeChannelId);
+      const statusRead = issueStatusRead(store, "channel", channelId);
       const result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
       const state = store.getState();
       // Channel-switch race guard: discard a response for a channel we left.
       if (String(state.activeChannelId) !== channelId) return;
+      if (!isStatusReadCurrent(statusRead)) return;
       const before = chatSnapshot(
         "channel",
         channelId,
@@ -141,21 +163,23 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
       const after = chatSnapshot("channel", channelId, nextMessages, nextStatus, nextTyping);
       if (before === after) return;
       store.dispatch({ type: "SET_MESSAGES", payload: nextMessages });
-      applyAgentStatus(store, "channel", channelId, result.agent_status);
+      applyAgentStatus(store, "channel", channelId, result.agent_status, true);
       store.dispatch({ type: "SET_TYPING_USERS", payload: nextTyping });
     } else {
+      const scopeId = scopeIdFor(initial, "private");
+      const statusRead = issueStatusRead(store, "private", scopeId);
       const [messagesResult, telegramResult] = await Promise.all([
         api<PrivateMessagesResponse>(endpoints.privateMessages.path()),
         api<PrivateTelegramResponse>(endpoints.privateTelegram.path()),
       ]);
       const state = store.getState();
-      const scopeId = scopeIdFor(state, "private");
       // Telegram is refreshed alongside private messages but updated INDEPENDENTLY
       // of the message/agent fingerprint gate (legacy applied it unconditionally),
       // so a link/unlink/status change that doesn't touch messages still surfaces.
       if (JSON.stringify(telegramResult) !== JSON.stringify(state.privateTelegram)) {
         store.dispatch({ type: "SET_PRIVATE_TELEGRAM", payload: telegramResult });
       }
+      if (!isStatusReadCurrent(statusRead)) return;
       const before = chatSnapshot(
         "private",
         scopeId,
@@ -168,7 +192,7 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
       const after = chatSnapshot("private", scopeId, nextMessages, nextStatus, []);
       if (before === after) return;
       store.dispatch({ type: "SET_PRIVATE_MESSAGES", payload: nextMessages });
-      applyAgentStatus(store, "private", scopeId, messagesResult.agent_status);
+      applyAgentStatus(store, "private", scopeId, messagesResult.agent_status, true);
     }
   } catch {
     // Polling/SSE refresh is best-effort.
@@ -214,6 +238,36 @@ export async function selectChannel(store: AppStore, channelId: Id): Promise<voi
    localMessageSeq, legacy-app.js:65). */
 let localMessageSeq = 0;
 
+/* Private messages are shown optimistically but their POSTs are serialized per
+   store/scope. This preserves the user's send order when Enter is pressed several
+   times quickly, allowing the backend to steer messages 2..N into the run started
+   by message 1. A rejected item cannot poison the tail. */
+const privateSendTails = new WeakMap<AppStore, Map<string, Promise<void>>>();
+
+function enqueuePrivatePost<T>(
+  store: AppStore,
+  scopeId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let queues = privateSendTails.get(store);
+  if (!queues) {
+    queues = new Map();
+    privateSendTails.set(store, queues);
+  }
+  const key = String(scopeId);
+  const previous = queues.get(key) || Promise.resolve();
+  const result = previous.then(operation);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  queues.set(key, tail);
+  void tail.finally(() => {
+    if (queues?.get(key) === tail) queues.delete(key);
+  });
+  return result;
+}
+
 /** Build the optimistic user message (legacy appendOptimisticMessage, :2963-2981).
  *  optimisticAttachments mints blob: preview URLs that are revoked in the slice's
  *  REPLACE/REMOVE transition (and on logout). */
@@ -243,6 +297,8 @@ function buildOptimisticMessage(
  *  -> POST (multipart with files, else JSON {content}) -> replace temp with the
  *  saved user_message (SSE dedupe-guarded in the reducer) + set agent_status ->
  *  refresh; on error remove the temp message + toast "发送失败" and return false.
+ *  Private POSTs use a per-scope FIFO while channel POSTs retain their existing
+ *  independent behavior.
  *  Focus/scroll are component-owned (ChatView's focusToken / forceBottomToken), so
  *  this never touches them. Payloads are byte-for-byte preserved. */
 export async function sendMessage(
@@ -258,31 +314,42 @@ export async function sendMessage(
   store.dispatch({ type: "ADD_PENDING_MESSAGE", payload: { mode, scopeId, message } });
 
   try {
-    let request: ApiOptions;
-    if (files.length) {
-      const form = new FormData();
-      form.append("content", content);
-      // Field name "files" (repeated, with filename); no Content-Type — the
-      // browser sets the multipart boundary and api() leaves FormData headers alone.
-      for (const file of files) form.append("files", file, file.name);
-      request = { method: "POST", body: form };
-    } else {
-      request = { method: "POST", body: JSON.stringify({ content }) };
-    }
+    const post = async (): Promise<PostMessageResponse> => {
+      // RESET_SESSION removes all pending messages. Do not let an old queued
+      // request start later under a newly authenticated browser session.
+      if (!store.getState().pendingMessages.some((pending) => pending.id === message.id)) {
+        throw new ApiRequestCancelledError();
+      }
+      let request: ApiOptions;
+      if (files.length) {
+        const form = new FormData();
+        form.append("content", content);
+        // Field name "files" (repeated, with filename); no Content-Type — the
+        // browser sets the multipart boundary and api() leaves FormData headers alone.
+        for (const file of files) form.append("files", file, file.name);
+        request = { method: "POST", body: form };
+      } else {
+        request = { method: "POST", body: JSON.stringify({ content }) };
+      }
+      return runStatusMutation(store, mode, scopeId, () =>
+        mode === "private"
+          ? api<PostMessageResponse>(endpoints.postPrivateMessage.path(), request)
+          : api<PostMessageResponse>(endpoints.postChannelMessage.path(scopeId), request),
+      );
+    };
     const result =
       mode === "private"
-        ? await api<PostMessageResponse>(endpoints.postPrivateMessage.path(), request)
-        : await api<PostMessageResponse>(endpoints.postChannelMessage.path(scopeId), request);
+        ? await enqueuePrivatePost(store, scopeId, post)
+        : await post();
     store.dispatch({
       type: "REPLACE_OPTIMISTIC_MESSAGE",
       payload: { mode, scopeId, tempId: message.id, saved: result.user_message ?? null },
     });
-    store.dispatch({
-      type: "SET_AGENT_STATUS",
-      payload: { mode, scopeId, status: result.agent_status ?? null },
-    });
-    // Pull the latest server state (fingerprint-gated, no forced render).
-    await refreshActiveChat(store);
+    // Channel behavior retains the immediate safety refresh. Private chat is
+    // already updated by the POST plus its scope SSE; skipping a competing GET
+    // here prevents a response from message N-1 from overwriting message N's
+    // newer input-group status.
+    if (mode === "channel") await refreshActiveChat(store);
     return true;
   } catch (error) {
     // A logout/account switch already reset the optimistic state. Do not put the
@@ -303,20 +370,17 @@ export async function respondAgentApproval(
   choice: AgentApprovalChoice,
 ): Promise<boolean> {
   try {
-    const result =
+    await runStatusMutation(store, mode, scopeId, () =>
       mode === "private"
-        ? await api<AgentApprovalSubmitResponse>(endpoints.privateAgentApproval.path(), {
+        ? api<AgentApprovalSubmitResponse>(endpoints.privateAgentApproval.path(), {
             method: "POST",
             body: JSON.stringify({ choice }),
           })
-        : await api<AgentApprovalSubmitResponse>(endpoints.channelAgentApproval.path(scopeId), {
+        : api<AgentApprovalSubmitResponse>(endpoints.channelAgentApproval.path(scopeId), {
             method: "POST",
             body: JSON.stringify({ choice }),
-          });
-    store.dispatch({
-      type: "SET_AGENT_STATUS",
-      payload: { mode, scopeId, status: result.agent_status ?? null },
-    });
+          }),
+    );
     await refreshActiveChat(store);
     toast(t("chat.approvalSubmitted"), { type: "ok", title: t("chat.approvalProcessed") });
     return true;

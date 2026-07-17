@@ -25,6 +25,44 @@ import { TypingUsers } from "./TypingUsers";
 
 const EMPTY_TYPING: TypingUser[] = [];
 
+/** Steering starts a new model turn. If a status briefly contains buffers from
+ * both turns, render only the newest turn so an obsolete draft never appears
+ * beside the consolidated answer. Older servers omit turn fields, in which case
+ * the existing segment behavior is preserved. */
+function currentTurnStreams(status: AgentStatus): StreamMsg[] {
+  const active = status.stream_message?.content ? status.stream_message : null;
+  const streams = [
+    ...(status.stream_messages || []).filter((stream) => !!stream?.content),
+    ...(active ? [active] : []),
+  ];
+  const hasTurnMetadata = streams.some(
+    (stream) => Number.isFinite(stream.turn_index) || !!stream.turn_id,
+  );
+  // During a rolling transition an active stream can be the first item produced
+  // without the fields carried by older buffered segments (or vice versa).
+  // Prefer the live buffer instead of hiding it behind partially tagged history.
+  if (
+    active &&
+    hasTurnMetadata &&
+    !Number.isFinite(active.turn_index) &&
+    !active.turn_id
+  ) {
+    return [active];
+  }
+  if (active?.turn_id && !Number.isFinite(active.turn_index)) {
+    return streams.filter((stream) => stream.turn_id === active.turn_id);
+  }
+  const indexed = streams.filter((stream) => Number.isFinite(stream.turn_index));
+  if (indexed.length) {
+    const newestTurn = Math.max(...indexed.map((stream) => Number(stream.turn_index)));
+    return streams.filter((stream) => Number(stream.turn_index) === newestTurn);
+  }
+  const newestTurnId =
+    status.stream_message?.turn_id ||
+    [...streams].reverse().find((stream) => !!stream.turn_id)?.turn_id;
+  return newestTurnId ? streams.filter((stream) => stream.turn_id === newestTurnId) : streams;
+}
+
 /** Synthesize pseudo-messages from a status's streaming buffers so they render
  *  through <MessageBubble> (legacy agentStreamingMessages, :948-966). */
 function agentStreamingMessages(
@@ -34,12 +72,7 @@ function agentStreamingMessages(
   scopeId: string,
   translate: Translator,
 ): Message[] {
-  const segments: StreamMsg[] = [];
-  for (const stream of status.stream_messages || []) {
-    if (stream?.content) segments.push(stream);
-  }
-  const active = status.stream_message || null;
-  if (active?.content) segments.push(active);
+  const segments = currentTurnStreams(status);
   return segments.map((stream, index) => ({
     id: stream.id || `stream-${status.run_id || status.started_at || "agent"}-${index}`,
     scope_type: scopeType,
@@ -80,14 +113,11 @@ export function MessageList({
   const canApprove = useStore((state) =>
     mode === "private" ? hasPermission(state, "private_agent") : hasPermission(state, "chat"),
   );
-  const streamCount = status
-    ? (status.stream_messages || []).filter((stream) => !!stream?.content).length +
-      (status.stream_message?.content ? 1 : 0)
-    : 0;
+  const currentStreams = status ? currentTurnStreams(status) : [];
+  const streamCount = currentStreams.length;
   const contentRevision =
     messages.reduce((total, message) => total + (message.content?.length || 0), 0) +
-    (status?.stream_messages || []).reduce((total, stream) => total + (stream.content?.length || 0), 0) +
-    (status?.stream_message?.content?.length || 0) +
+    currentStreams.reduce((total, stream) => total + (stream.content?.length || 0), 0) +
     (status?.activity || []).reduce(
       (total, step) => total + (step.label?.length || 0) + (step.detail?.length || 0) + (step.line?.length || 0),
       0,

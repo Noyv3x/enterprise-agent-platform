@@ -21,7 +21,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from enterprise_agent_platform.agent_runtime_client import AgentResult, AgentRuntimeRunError
+from enterprise_agent_platform.agent_runtime_client import (
+    AgentResult,
+    AgentRuntimeHTTPError,
+    AgentRuntimeRunError,
+)
 from enterprise_agent_platform.auto_update import AutoUpdateManager
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
@@ -151,6 +155,145 @@ class BlockingAgent:
         )
 
 
+class SteeringBlockingAgent:
+    def __init__(self):
+        self.calls = []
+        self.steers = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._progress_callback = None
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        self._progress_callback = kwargs.get("progress_callback")
+        if kwargs.get("run_started_callback"):
+            kwargs["run_started_callback"]("fake-steering-run")
+        self.started.set()
+        self.release.wait(timeout=5)
+        return AgentResult(
+            content="one consolidated response",
+            session_id=kwargs["session_id"],
+            raw={
+                "input_message_ids": [item["message_id"] for item in self.steers],
+                "unconsumed_input_message_ids": [],
+            },
+        )
+
+    def steer_run(self, **kwargs):
+        self.steers.append(dict(kwargs))
+        if self._progress_callback:
+            self._progress_callback(
+                {
+                    "event": "input.accepted",
+                    "runtime_event_type": "input.accepted",
+                    "run_id": kwargs["run_id"],
+                    "message_id": kwargs["message_id"],
+                }
+            )
+            self._progress_callback(
+                {
+                    "event": "input.injected",
+                    "runtime_event_type": "input.injected",
+                    "run_id": kwargs["run_id"],
+                    "message_id": kwargs["message_id"],
+                    "turn_id": f"{kwargs['run_id']}:2",
+                    "turn_index": 2,
+                }
+            )
+        return {
+            "run_id": kwargs["run_id"],
+            "message_id": kwargs["message_id"],
+            "state": "injected",
+        }
+
+
+class OrderedSteeringAgent(SteeringBlockingAgent):
+    def __init__(self):
+        super().__init__()
+        self.first_steer_started = threading.Event()
+        self.release_first_steer = threading.Event()
+
+    def steer_run(self, **kwargs):
+        if kwargs["user_message"] == "second":
+            self.first_steer_started.set()
+            self.release_first_steer.wait(timeout=5)
+        return super().steer_run(**kwargs)
+
+
+class TerminalRacingRejectAgent:
+    def __init__(self):
+        self.calls = []
+        self.started = threading.Event()
+        self.release_run = threading.Event()
+        self.steer_started = threading.Event()
+        self.release_steer = threading.Event()
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            if kwargs.get("run_started_callback"):
+                kwargs["run_started_callback"]("rejecting-run")
+            self.started.set()
+            self.release_run.wait(timeout=5)
+            return AgentResult(
+                content="first response",
+                session_id=kwargs["session_id"],
+                raw={
+                    "input_message_ids": [],
+                    "unconsumed_input_message_ids": [],
+                },
+            )
+        return AgentResult(
+            content=f"fallback response to {kwargs['user_message']}",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+    def steer_run(self, **_kwargs):
+        self.steer_started.set()
+        self.release_steer.wait(timeout=5)
+        raise AgentRuntimeHTTPError(409, "run already completed")
+
+
+class RegistrationFailureAgent:
+    def __init__(self):
+        self.calls = []
+        self.steers = []
+        self.before_first_callback = threading.Event()
+        self.allow_first_callback = threading.Event()
+        self.first_callback_returned = threading.Event()
+        self.release_first_run = threading.Event()
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        call_number = len(self.calls)
+        callback = kwargs.get("run_started_callback")
+        if call_number == 1:
+            self.before_first_callback.set()
+            self.allow_first_callback.wait(timeout=5)
+        if callback:
+            callback(f"registration-run-{call_number}")
+        if call_number == 1:
+            self.first_callback_returned.set()
+            self.release_first_run.wait(timeout=5)
+        return AgentResult(
+            content=f"observed response {call_number}",
+            session_id=kwargs["session_id"],
+            raw={
+                "input_message_ids": [],
+                "unconsumed_input_message_ids": [],
+            },
+        )
+
+    def steer_run(self, **kwargs):
+        self.steers.append(dict(kwargs))
+        return {
+            "run_id": kwargs["run_id"],
+            "message_id": kwargs["message_id"],
+            "state": "accepted",
+        }
+
+
 class ProgressAgent:
     def __init__(self):
         self.calls = []
@@ -242,6 +385,26 @@ class StreamingAgent:
             content_callback("world")
         return AgentResult(
             content="Hello world",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
+class TurnAwareStreamingAgent:
+    def __init__(self):
+        self.new_turn_delta = threading.Event()
+        self.release = threading.Event()
+
+    def generate(self, **kwargs):
+        content_callback = kwargs.get("content_callback")
+        if content_callback:
+            content_callback("obsolete", turn_id="stream-run:1", turn_index=1)
+            content_callback(None, turn_id="stream-run:2", turn_index=2)
+            content_callback("current", turn_id="stream-run:2", turn_index=2)
+            self.new_turn_delta.set()
+            self.release.wait(timeout=5)
+        return AgentResult(
+            content="current answer",
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
@@ -1276,6 +1439,30 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 service.close()
 
+    def test_stream_status_keeps_only_latest_runtime_turn_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = TurnAwareStreamingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "stream with a correction")
+                self.assertTrue(agent.new_turn_delta.wait(timeout=2))
+
+                status = service.private_status(user)["agent_status"]
+                self.assertEqual(status["stream_message"]["content"], "current")
+                self.assertEqual(
+                    status["stream_message"]["turn_id"],
+                    "stream-run:2",
+                )
+                self.assertEqual(status["stream_message"]["turn_index"], 2)
+                self.assertEqual(status["stream_messages"], [])
+                self.assertFalse(
+                    any(item.get("source") == "agent" for item in status["activity"])
+                )
+            finally:
+                agent.release.set()
+                service.close()
+
     def test_channel_agent_reply_clears_pre_tool_stream_on_substantive_tool(self):
         with tempfile.TemporaryDirectory() as td:
             agent = ToolBoundaryStreamingAgent()
@@ -1536,6 +1723,66 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertNotIn("request-one", delivered[102])
                 self.assertEqual(service.jobs.counts(kind="telegram_delivery")["succeeded"], 2)
                 self.assertFalse(any(thread.name.startswith("telegram-response-") for thread in threading.enumerate()))
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_rapid_telegram_turns_join_and_deliver_one_reply_to_the_latest_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = SteeringBlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            bot = FakeTelegramBot()
+            gateway = TelegramGateway(service, bot=bot, autostart=False)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                self._complete_telegram_link(service, user, "88882", "joined_tg")
+                updates = [
+                    {
+                        "update_id": 811,
+                        "message": {
+                            "message_id": 111,
+                            "chat": {"id": 88882, "type": "private"},
+                            "from": {"id": 88882, "username": "joined_tg"},
+                            "text": "prepare the report",
+                        },
+                    },
+                    {
+                        "update_id": 812,
+                        "message": {
+                            "message_id": 112,
+                            "chat": {"id": 88882, "type": "private"},
+                            "from": {"id": 88882, "username": "joined_tg"},
+                            "text": "include the risks",
+                        },
+                    },
+                ]
+                results: list[dict] = []
+                threads = [
+                    threading.Thread(
+                        target=lambda item=item: results.append(gateway.process_update(item))
+                    )
+                    for item in updates
+                ]
+                threads[0].start()
+                self.assertTrue(agent.started.wait(2))
+                threads[1].start()
+                deadline = time.time() + 2
+                while len(agent.steers) < 1 and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(agent.steers), 1)
+                agent.release.set()
+                for thread in threads:
+                    thread.join(5)
+
+                self.assertEqual(len(results), 2)
+                self.assertEqual(len(bot.sent), 1)
+                self.assertEqual(bot.sent[0]["reply_to_message_id"], 112)
+                self.assertEqual(bot.sent[0]["text"], "one consolidated response")
+                self.assertEqual(len(agent.calls), 1)
+                self.assertEqual(
+                    service.jobs.counts(kind="telegram_delivery")["succeeded"],
+                    2,
+                )
             finally:
                 agent.release.set()
                 service.close()
@@ -2162,6 +2409,379 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertNotIn("container", agent.calls[-1]["metadata"])
             service.close()
 
+    def test_private_agent_joins_rapid_messages_into_one_active_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = SteeringBlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, user = service.authenticate("admin", "admin")
+                first = service.send_private_message(user, "prepare the report")
+                self.assertEqual(first["processing_mode"], "started")
+                self.assertTrue(agent.started.wait(timeout=2))
+
+                second = service.send_private_message(user, "include the risks")
+                third = service.send_private_message(user, "add a short checklist")
+                self.assertEqual(second["processing_mode"], "joined")
+                self.assertEqual(third["processing_mode"], "joined")
+                self.assertEqual(first["input_group_id"], second["input_group_id"])
+                self.assertEqual(second["input_group_id"], third["input_group_id"])
+                self.assertEqual(
+                    third["agent_status"]["active_input_group"]["message_count"],
+                    3,
+                )
+                self.assertEqual(len(agent.calls), 1)
+                self.assertEqual(
+                    [item["user_message"] for item in agent.steers],
+                    ["include the risks", "add a short checklist"],
+                )
+
+                agent.release.set()
+                self.assertEqual(
+                    service.wait_for_agent_idle("private", str(user["id"]), timeout=3)["state"],
+                    "idle",
+                )
+                messages = service.list_messages(
+                    user,
+                    "private",
+                    str(user["id"]),
+                    limit=20,
+                )
+                agent_messages = [
+                    message for message in messages if message["author_type"] == "agent"
+                ]
+                self.assertEqual(len(agent_messages), 1)
+                response = agent_messages[0]
+                self.assertEqual(response["content"], "one consolidated response")
+                self.assertEqual(
+                    response["metadata"]["reply_to_message_ids"],
+                    [
+                        first["user_message"]["id"],
+                        second["user_message"]["id"],
+                        third["user_message"]["id"],
+                    ],
+                )
+                self.assertEqual(len(response["metadata"]["durable_job_ids"]), 3)
+                for sent in (first, second, third):
+                    job = service.jobs.get_by_key(
+                        "agent",
+                        f"message:{sent['user_message']['id']}",
+                    )
+                    self.assertIsNotNone(job)
+                    self.assertEqual(job.status, "succeeded")
+                    self.assertEqual(
+                        service.agent_message_replying_to(
+                            "private",
+                            str(user["id"]),
+                            sent["user_message"]["id"],
+                        )["id"],
+                        response["id"],
+                    )
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_private_agent_accepts_join_before_queue_head_worker_claims_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = SteeringBlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            worker_entered = threading.Event()
+            release_worker = threading.Event()
+            original_worker = service._agent_worker
+
+            def delayed_worker(key):
+                worker_entered.set()
+                release_worker.wait(timeout=5)
+                original_worker(key)
+
+            service._agent_worker = delayed_worker
+            try:
+                _, user = service.authenticate("admin", "admin")
+                first = service.send_private_message(user, "prepare the report")
+                self.assertTrue(worker_entered.wait(timeout=2))
+                self.assertFalse(agent.started.is_set())
+
+                second = service.send_private_message(user, "include the risks")
+                self.assertEqual(second["processing_mode"], "joined")
+                self.assertEqual(first["input_group_id"], second["input_group_id"])
+                self.assertEqual(
+                    second["agent_status"]["active_input_group"]["message_count"],
+                    2,
+                )
+                second_job = service.jobs.get_by_key(
+                    "agent",
+                    f"message:{second['user_message']['id']}",
+                )
+                self.assertEqual(second_job.status, "queued")
+                self.assertIsNone(
+                    service.agent_inputs.get_by_message(second["user_message"]["id"])
+                )
+
+                release_worker.set()
+                self.assertTrue(agent.started.wait(timeout=2))
+                deadline = time.time() + 2
+                while len(agent.steers) < 1 and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(
+                    [item["user_message"] for item in agent.steers],
+                    ["include the risks"],
+                )
+                agent.release.set()
+                self.assertEqual(
+                    service.wait_for_agent_idle(
+                        "private",
+                        str(user["id"]),
+                        timeout=3,
+                    )["state"],
+                    "idle",
+                )
+                messages = service.list_messages(
+                    user,
+                    "private",
+                    str(user["id"]),
+                    limit=20,
+                )
+                replies = [
+                    message for message in messages if message["author_type"] == "agent"
+                ]
+                self.assertEqual(len(agent.calls), 1)
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(
+                    replies[0]["metadata"]["reply_to_message_ids"],
+                    [
+                        first["user_message"]["id"],
+                        second["user_message"]["id"],
+                    ],
+                )
+            finally:
+                release_worker.set()
+                agent.release.set()
+                service.close()
+
+    def test_runtime_registration_failure_does_not_orphan_accepted_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RegistrationFailureAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            original_set_runtime_run = service.agent_inputs.set_runtime_run
+            failed_once = False
+
+            def fail_registration_once(input_group_id, run_id):
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise OSError("simulated input-ledger write failure")
+                return original_set_runtime_run(input_group_id, run_id)
+
+            service.agent_inputs.set_runtime_run = fail_registration_once
+            try:
+                _, user = service.authenticate("admin", "admin")
+                first = service.send_private_message(user, "first request")
+                self.assertTrue(agent.before_first_callback.wait(timeout=2))
+                second = service.send_private_message(user, "late correction")
+                self.assertEqual(second["processing_mode"], "joined")
+
+                agent.allow_first_callback.set()
+                self.assertTrue(agent.first_callback_returned.wait(timeout=2))
+                # The accepted parent is still being observed, while the child
+                # that never reached the runtime has safely returned to FIFO.
+                parent_job = service.jobs.get_by_key(
+                    "agent",
+                    f"message:{first['user_message']['id']}",
+                )
+                child_job = service.jobs.get_by_key(
+                    "agent",
+                    f"message:{second['user_message']['id']}",
+                )
+                self.assertEqual(parent_job.status, "running")
+                self.assertEqual(child_job.status, "queued")
+
+                agent.release_first_run.set()
+                self.assertEqual(
+                    service.wait_for_agent_idle(
+                        "private",
+                        str(user["id"]),
+                        timeout=4,
+                    )["state"],
+                    "idle",
+                )
+                messages = service.list_messages(
+                    user,
+                    "private",
+                    str(user["id"]),
+                    limit=20,
+                )
+                replies = [
+                    message for message in messages if message["author_type"] == "agent"
+                ]
+                self.assertEqual([message["content"] for message in replies], [
+                    "observed response 1",
+                    "observed response 2",
+                ])
+                self.assertEqual(len(agent.calls), 2)
+                self.assertEqual(agent.steers, [])
+                for sent in (first, second):
+                    job = service.jobs.get_by_key(
+                        "agent",
+                        f"message:{sent['user_message']['id']}",
+                    )
+                    association = service.agent_inputs.get_by_message(
+                        sent["user_message"]["id"]
+                    )
+                    self.assertEqual(job.status, "succeeded")
+                    self.assertEqual(association.state, "succeeded")
+                status = service.private_status(user)["agent_status"]
+                self.assertEqual(status["state"], "idle")
+                self.assertIsNone(status["active_input_group"])
+            finally:
+                agent.allow_first_callback.set()
+                agent.release_first_run.set()
+                service.close()
+
+    def test_joined_private_inputs_are_submitted_in_user_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = OrderedSteeringAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            threads = []
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                self.assertTrue(agent.started.wait(timeout=2))
+                results = {}
+
+                def send(label):
+                    results[label] = service.send_private_message(user, label)
+
+                second_thread = threading.Thread(target=send, args=("second",))
+                third_thread = threading.Thread(target=send, args=("third",))
+                threads.extend((second_thread, third_thread))
+                second_thread.start()
+                self.assertTrue(agent.first_steer_started.wait(timeout=2))
+                third_thread.start()
+                time.sleep(0.1)
+                self.assertEqual(agent.steers, [])
+
+                agent.release_first_steer.set()
+                second_thread.join(timeout=2)
+                third_thread.join(timeout=2)
+                self.assertFalse(second_thread.is_alive())
+                self.assertFalse(third_thread.is_alive())
+                self.assertEqual(
+                    [item["user_message"] for item in agent.steers],
+                    ["second", "third"],
+                )
+                self.assertEqual(results["second"]["processing_mode"], "joined")
+                self.assertEqual(results["third"]["processing_mode"], "joined")
+            finally:
+                agent.release_first_steer.set()
+                agent.release.set()
+                for thread in threads:
+                    thread.join(timeout=1)
+                service.close()
+
+    def test_pre_runtime_failure_requeues_a_late_join_instead_of_stranding_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            entered = threading.Event()
+            release = threading.Event()
+            calls = 0
+            original_suggest = service.knowledge.suggest
+
+            def flaky_suggest(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    entered.set()
+                    release.wait(timeout=5)
+                    raise RuntimeError("knowledge lookup failed before runtime start")
+                return original_suggest(*args, **kwargs)
+
+            service.knowledge.suggest = flaky_suggest
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                self.assertTrue(entered.wait(timeout=2))
+                second = service.send_private_message(user, "second")
+                self.assertEqual(second["processing_mode"], "joined")
+
+                release.set()
+                self.assertEqual(
+                    service.wait_for_agent_idle("private", str(user["id"]), timeout=4)["state"],
+                    "idle",
+                )
+                job = service.jobs.get_by_key(
+                    "agent",
+                    f"message:{second['user_message']['id']}",
+                )
+                association = service.agent_inputs.get_by_message(
+                    second["user_message"]["id"]
+                )
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "succeeded")
+                self.assertIsNotNone(association)
+                self.assertEqual(association.state, "succeeded")
+                self.assertEqual(
+                    [call["user_message"] for call in agent.calls],
+                    ["second"],
+                )
+            finally:
+                release.set()
+                service.close()
+
+    def test_terminal_run_waits_for_definite_steer_rejection_then_falls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = TerminalRacingRejectAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            second_thread = None
+            try:
+                _, user = service.authenticate("admin", "admin")
+                service.send_private_message(user, "first")
+                self.assertTrue(agent.started.wait(timeout=2))
+                result = {}
+
+                def send_second():
+                    result["value"] = service.send_private_message(user, "second")
+
+                second_thread = threading.Thread(target=send_second)
+                second_thread.start()
+                self.assertTrue(agent.steer_started.wait(timeout=2))
+                agent.release_run.set()
+                time.sleep(0.1)
+                child_row = service.db.query_one(
+                    """
+                    SELECT id FROM durable_jobs
+                    WHERE kind = 'agent' AND scope_type = 'private'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                )
+                child = service.jobs.get(int(child_row["id"]))
+                self.assertIsNotNone(child)
+                self.assertEqual(child.status, "running")
+
+                agent.release_steer.set()
+                second_thread.join(timeout=3)
+                self.assertFalse(second_thread.is_alive())
+                self.assertEqual(result["value"]["processing_mode"], "queued")
+                self.assertEqual(
+                    service.wait_for_agent_idle("private", str(user["id"]), timeout=4)["state"],
+                    "idle",
+                )
+                second_message_id = result["value"]["user_message"]["id"]
+                child = service.jobs.get_by_key(
+                    "agent",
+                    f"message:{second_message_id}",
+                )
+                association = service.agent_inputs.get_by_message(second_message_id)
+                self.assertEqual(child.status, "succeeded")
+                self.assertEqual(association.state, "succeeded")
+                self.assertEqual(len(agent.calls), 2)
+                self.assertEqual(agent.calls[1]["user_message"], "second")
+            finally:
+                agent.release_run.set()
+                agent.release_steer.set()
+                if second_thread is not None:
+                    second_thread.join(timeout=1)
+                service.close()
+
     def test_private_reuses_runtime_returned_session_after_rotation(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RotatingSessionAgent("compacted-private-session")
@@ -2702,6 +3322,11 @@ class PlatformServiceTests(unittest.TestCase):
                 job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
                 self.assertIsNotNone(job)
                 self.assertEqual(job.status, "failed")
+                association = service.agent_inputs.get_by_message(
+                    sent["user_message"]["id"]
+                )
+                self.assertIsNotNone(association)
+                self.assertEqual(association.state, "failed")
             finally:
                 agent.release.set()
                 service.close()
@@ -4021,6 +4646,150 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(agent.calls, [])
             finally:
                 second.close()
+
+    def test_startup_recovers_grouped_input_ledgers_and_one_interruption_reply(self):
+        def seed_group(config, *, committed):
+            first = EnterpriseService(config, agent_client=RecordingAgent())
+            _, user = first.authenticate("admin", "admin")
+            generation = first.account_generation_config(user)
+            messages = []
+            for index, content in enumerate(("root request", "joined correction"), start=101):
+                messages.append(
+                    first._append_message(
+                        scope_type="private",
+                        scope_id=str(user["id"]),
+                        author_type="user",
+                        user_id=user["id"],
+                        username=user["display_name"],
+                        content=content,
+                        metadata={
+                            "generation": generation,
+                            "telegram_delivery": {
+                                "chat_id": 999,
+                                "reply_to_message_id": index,
+                                "message_thread_id": None,
+                            },
+                        },
+                    )
+                )
+            tasks = [
+                {
+                    "scope_type": "private",
+                    "scope_id": str(user["id"]),
+                    "actor": user,
+                    "content": message["content"],
+                    "attachments": [],
+                    "generation": generation,
+                    "user_message": message,
+                }
+                for message in messages
+            ]
+            jobs = []
+            for task, message in zip(tasks, messages):
+                job, _ = first.jobs.enqueue(
+                    kind="agent",
+                    dedupe_key=f"message:{message['id']}",
+                    payload=task,
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                )
+                jobs.append(job)
+            first.jobs.mark_running(jobs[0].id, lease_seconds=60)
+            group_id = f"agent:{jobs[0].id}"
+            first.agent_inputs.start_root(
+                message_id=messages[0]["id"],
+                job_id=jobs[0].id,
+                input_group_id=group_id,
+            )
+            first.agent_inputs.reserve_and_claim(
+                message_id=messages[1]["id"],
+                job_id=jobs[1].id,
+                parent_job_id=jobs[0].id,
+                input_group_id=group_id,
+                lease_seconds=60,
+            )
+            first.agent_inputs.transition(
+                messages[1]["id"],
+                "injected",
+                allowed_from=("reserved",),
+                runtime_run_id="interrupted-run",
+            )
+            if committed:
+                first._append_message(
+                    scope_type="private",
+                    scope_id=str(user["id"]),
+                    author_type="agent",
+                    user_id=None,
+                    username="Private Agent",
+                    content="committed grouped response",
+                    metadata={
+                        "input_group_id": group_id,
+                        "processing_mode": "started",
+                        "reply_to_message_ids": [message["id"] for message in messages],
+                        "durable_job_ids": [job.id for job in jobs],
+                        "durable_job_id": jobs[0].id,
+                        "reply_to": {"message_id": messages[0]["id"]},
+                        "agent_work": {"state": "complete"},
+                    },
+                )
+            first.close()
+            return user, messages, jobs
+
+        with tempfile.TemporaryDirectory() as committed_dir:
+            config = make_config(Path(committed_dir))
+            user, messages, jobs = seed_group(config, committed=True)
+            recovered = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                self.assertEqual(
+                    [recovered.jobs.get(job.id).status for job in jobs],
+                    ["succeeded", "succeeded"],
+                )
+                self.assertEqual(
+                    [
+                        recovered.agent_inputs.get_by_message(message["id"]).state
+                        for message in messages
+                    ],
+                    ["succeeded", "succeeded"],
+                )
+            finally:
+                recovered.close()
+
+        with tempfile.TemporaryDirectory() as interrupted_dir:
+            config = make_config(Path(interrupted_dir))
+            user, messages, jobs = seed_group(config, committed=False)
+            recovered = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                replies = [
+                    message
+                    for message in recovered.audit_private_messages(
+                        user,
+                        user["id"],
+                    )["messages"]
+                    if message["author_type"] == "agent"
+                ]
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(
+                    replies[0]["metadata"]["reply_to_message_ids"],
+                    [message["id"] for message in messages],
+                )
+                owner_id, target = recovered._telegram_delivery_owner_for_agent_message(
+                    replies[0]
+                )
+                self.assertEqual(owner_id, messages[1]["id"])
+                self.assertEqual(target["reply_to_message_id"], 102)
+                self.assertEqual(
+                    [recovered.jobs.get(job.id).status for job in jobs],
+                    ["needs_review", "needs_review"],
+                )
+                self.assertEqual(
+                    [
+                        recovered.agent_inputs.get_by_message(message["id"]).state
+                        for message in messages
+                    ],
+                    ["needs_review", "needs_review"],
+                )
+            finally:
+                recovered.close()
 
     def test_startup_repairs_user_message_committed_before_agent_job(self):
         with tempfile.TemporaryDirectory() as td:

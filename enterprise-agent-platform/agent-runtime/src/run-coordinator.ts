@@ -20,9 +20,34 @@ import { PlatformGateway } from "./platform-gateway.js";
 import { AlwaysApprovalStore, IdempotencyStore, type PersistentIdempotencyRecord } from "./persistence.js";
 import { ProcessRegistry } from "./process-registry.js";
 import { SessionStore } from "./session-store.js";
-import { classifyToolCall, createTools, isScheduleMutation, readRegularFileRange } from "./tools.js";
-import type { ApprovalDecision, JsonObject, JsonValue, RunRecord, RunRequest, RunResult, RuntimeConfig } from "./types.js";
-import { abortError, assertNonEmpty, errorMessage, id, resolveWorkspacePath, scopeOwns, truncate } from "./utils.js";
+import {
+  classifyToolCall,
+  createTools,
+  isCanonicalPrivateScope,
+  isScheduleMutation,
+  readRegularFileRange,
+} from "./tools.js";
+import type {
+  ApprovalDecision,
+  JsonObject,
+  JsonValue,
+  RunInputRequest,
+  RunInputState,
+  RunRecord,
+  RunRequest,
+  RunResult,
+  RuntimeConfig,
+} from "./types.js";
+import {
+  abortError,
+  assertNonEmpty,
+  errorMessage,
+  id,
+  resolveWorkspacePath,
+  scopeOwns,
+  stableHash,
+  truncate,
+} from "./utils.js";
 
 interface RunCompletion {
   promise: Promise<RunRecord>;
@@ -34,12 +59,31 @@ interface ScopeCleanupFence {
   lifecycleId?: string;
 }
 
+interface AcceptedRunInput {
+  fingerprint: string;
+  preparation: Promise<UserMessage>;
+  settled: Promise<void>;
+  message: UserMessage | undefined;
+  state: RunInputState | "preparing";
+  queued: boolean;
+}
+
 export class RunCapacityError extends Error {
   readonly statusCode = 429;
 }
 
 export class RunValidationError extends Error {
   readonly statusCode = 400;
+}
+
+export class RunInputConflictError extends Error {
+  readonly statusCode = 409;
+  readonly inputState: RunInputState | undefined;
+
+  constructor(message: string, inputState?: RunInputState) {
+    super(message);
+    this.inputState = inputState;
+  }
 }
 
 export interface RunCoordinatorOptions {
@@ -63,6 +107,10 @@ export class RunCoordinator {
   private readonly journals = new Map<string, EventJournal>();
   private readonly completions = new Map<string, RunCompletion>();
   private readonly agents = new Map<string, Agent>();
+  private readonly runInputs = new Map<string, Map<string, AcceptedRunInput>>();
+  private readonly inputMessageIds = new WeakMap<object, string>();
+  private readonly acceptingInputs = new Set<string>();
+  private readonly turnIndexes = new Map<string, number>();
   private readonly delegateCounts = new Map<string, number>();
   private readonly idempotencyIndex = new Map<string, string>();
   private readonly topLevelQueue: string[] = [];
@@ -150,6 +198,8 @@ export class RunCoordinator {
     this.runs.set(runId, record);
     this.journals.set(runId, journal);
     this.completions.set(runId, completion);
+    this.runInputs.set(runId, new Map());
+    if (acceptsInteractiveInputs(record)) this.acceptingInputs.add(runId);
     if (childRun) this.childRuns.add(runId);
     if (idempotencyKey) {
       this.idempotencyIndex.set(idempotencyKey, runId);
@@ -172,6 +222,106 @@ export class RunCoordinator {
     return this.journals.get(runId);
   }
 
+  async submitInput(
+    runId: string,
+    request: RunInputRequest,
+  ): Promise<{ run_id: string; message_id: string; state: RunInputState }> {
+    validateRunInputRequest(request);
+    const record = this.runs.get(runId);
+    if (!record) throw new Error("Run not found");
+    if (record.request.scope_key !== request.scope_key || record.request.lifecycle_id !== request.lifecycle_id) {
+      throw new RunInputConflictError("Run input does not belong to this scope or lifecycle");
+    }
+    const inputs = this.runInputs.get(runId) ?? new Map<string, AcceptedRunInput>();
+    this.runInputs.set(runId, inputs);
+    const fingerprint = runInputFingerprint(request);
+    const existing = inputs.get(request.message_id);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new RunInputConflictError(
+          "message_id was already used with different input",
+          existing.state === "preparing" ? undefined : existing.state,
+        );
+      }
+      await existing.settled;
+      if (existing.state === "unconsumed") {
+        throw new RunInputConflictError("Run no longer accepts this input", existing.state);
+      }
+      if (existing.state === "preparing") {
+        throw new RunInputConflictError("Run input preparation has not settled");
+      }
+      return { run_id: runId, message_id: request.message_id, state: existing.state };
+    }
+    if (
+      !this.acceptingInputs.has(runId)
+      || record.controller.signal.aborted
+      || (record.status !== "queued" && record.status !== "running")
+    ) {
+      throw new RunInputConflictError("Run is no longer accepting input");
+    }
+    const preparation = buildPrompt(
+      {
+        ...record.request,
+        input: request.input,
+        ...(request.attachments ? { attachments: request.attachments } : { attachments: [] }),
+      },
+      record.controller.signal,
+    );
+    let settle!: () => void;
+    const accepted: AcceptedRunInput = {
+      fingerprint,
+      preparation,
+      settled: new Promise<void>((resolve) => { settle = resolve; }),
+      message: undefined,
+      state: "preparing",
+      queued: false,
+    };
+    inputs.set(request.message_id, accepted);
+    let message: UserMessage;
+    try {
+      message = await preparation;
+    } catch (error) {
+      if (accepted.state !== "unconsumed") {
+        accepted.state = "unconsumed";
+        this.journals.get(runId)?.publish("input.unconsumed", {
+          message_id: request.message_id,
+          state: "unconsumed",
+          reason: `Input preparation failed: ${truncate(errorMessage(error), 500)}`,
+        });
+      }
+      try {
+        this.closeInputs(record, "An earlier input could not be prepared in order");
+      } finally {
+        settle();
+      }
+      throw new RunValidationError(errorMessage(error));
+    }
+    if (
+      accepted.state === "unconsumed"
+      || !this.acceptingInputs.has(runId)
+      || record.controller.signal.aborted
+      || (record.status !== "queued" && record.status !== "running")
+    ) {
+      accepted.state = "unconsumed";
+      settle();
+      throw new RunInputConflictError("Run is no longer accepting input", accepted.state);
+    }
+    accepted.message = message;
+    accepted.state = "accepted";
+    this.inputMessageIds.set(message, request.message_id);
+    try {
+      this.journals.get(runId)?.publish("input.accepted", {
+        message_id: request.message_id,
+        state: "accepted",
+      });
+      this.flushReadyInputs(record);
+      this.persistRunStatus(record);
+      return { run_id: runId, message_id: request.message_id, state: "accepted" };
+    } finally {
+      settle();
+    }
+  }
+
   async wait(runId: string): Promise<RunRecord> {
     const completion = this.completions.get(runId);
     if (!completion) throw new Error("Run not found");
@@ -188,6 +338,7 @@ export class RunCoordinator {
     const record = this.runs.get(runId);
     if (!record) throw new Error("Run not found");
     if (isTerminal(record.status)) return record;
+    this.closeInputs(record, "Run was cancelled before queued input could be injected");
     record.controller.abort();
     this.agents.get(runId)?.abort();
     this.approvals.cancelRun(runId);
@@ -279,6 +430,7 @@ export class RunCoordinator {
       if (isTerminal(record.status)) return;
       record.timedOut = true;
       journal.publish("run.timeout", { timeout_ms: this.config.runTimeoutMs });
+      this.closeInputs(record, "Run timed out before queued input could be injected");
       record.controller.abort();
       this.agents.get(record.id)?.abort();
       this.approvals.cancelRun(record.id);
@@ -319,9 +471,12 @@ export class RunCoordinator {
       });
       const agentOptions: ConstructorParameters<typeof Agent>[0] = {
         initialState: {
-          systemPrompt: recalledMemory
-            ? `${record.request.system_prompt}\n\n<recalled_memory>\n${recalledMemory}\n</recalled_memory>`
-            : record.request.system_prompt,
+          systemPrompt: appendInteractiveInputInstruction(
+            recalledMemory
+              ? `${record.request.system_prompt}\n\n<recalled_memory>\n${recalledMemory}\n</recalled_memory>`
+              : record.request.system_prompt,
+            acceptsInteractiveInputs(record),
+          ),
           model: resolved.model,
           thinkingLevel: record.request.thinking_level ?? "off",
           tools,
@@ -333,6 +488,7 @@ export class RunCoordinator {
         // tool calls ordered so two sensitive calls can never create competing
         // pending approvals that the user cannot address independently.
         toolExecution: "sequential",
+        steeringMode: "all",
         transformContext: async (messages) => {
           const compatibleMessages = adaptImageContentForModel(messages, modelSupportsImages(resolved.model));
           if (estimateTokens(compatibleMessages) < resolved.model.contextWindow * this.config.compactionThreshold) {
@@ -405,6 +561,7 @@ export class RunCoordinator {
       if (record.controller.signal.aborted) throw abortError();
       const agent = new Agent(agentOptions);
       this.agents.set(record.id, agent);
+      this.flushReadyInputs(record);
       const onAbort = (): void => agent.abort();
       record.controller.signal.addEventListener("abort", onAbort, { once: true });
       agent.subscribe(async (event) => await this.handleAgentEvent(record, event));
@@ -413,13 +570,22 @@ export class RunCoordinator {
         if (record.controller.signal.aborted) throw abortError();
         await agent.prompt(prompt);
       } finally {
+        this.closeInputs(record, "Run completed before queued input could be injected");
         record.controller.signal.removeEventListener("abort", onAbort);
       }
       if (record.controller.signal.aborted) throw abortError();
       const forcedReviewReason = this.forcedReviewReasons.get(record.id);
       if (forcedReviewReason) throw new Error(forcedReviewReason);
       if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
-      const result = resultFromMessages(agent.state.messages, resolved.model.provider, resolved.model.id);
+      const result = resultFromMessages(
+        agent.state.messages,
+        resolved.model.provider,
+        resolved.model.id,
+        history.length,
+      );
+      const inputSummary = this.inputSummary(record.id);
+      result.input_message_ids = inputSummary.input_message_ids;
+      result.unconsumed_input_message_ids = inputSummary.unconsumed_input_message_ids;
       record.result = result;
       await this.sessions.appendRun(identity, { run_id: record.id, status: "completed" });
       this.finish(record, "completed", undefined, {
@@ -428,6 +594,7 @@ export class RunCoordinator {
         session_id: record.request.session_id,
         model: result.model,
         usage: result.usage ?? {},
+        ...inputSummary,
       });
     })();
     try {
@@ -459,6 +626,7 @@ export class RunCoordinator {
       const message = cleanupConfirmed
         ? baseMessage
         : `${baseMessage}; Agent cleanup did not settle within ${this.config.cleanupGraceMs} ms`;
+      this.closeInputs(record, message);
       await this.sessions.appendRun(identity, { run_id: record.id, status, error: message }).catch(() => undefined);
       this.finish(record, status, message);
     } finally {
@@ -475,11 +643,30 @@ export class RunCoordinator {
   private async handleAgentEvent(record: RunRecord, event: AgentEvent): Promise<void> {
     if (isTerminal(record.status)) return;
     const journal = this.journals.get(record.id)!;
+    if (event.type === "turn_start") {
+      this.turnIndexes.set(record.id, (this.turnIndexes.get(record.id) ?? 0) + 1);
+      return;
+    }
+    if (event.type === "message_start" && event.message.role === "user") {
+      const messageId = this.inputMessageIds.get(event.message);
+      const input = messageId ? this.runInputs.get(record.id)?.get(messageId) : undefined;
+      if (messageId && input && input.state === "accepted") {
+        input.state = "injected";
+        journal.publish("input.injected", {
+          message_id: messageId,
+          state: "injected",
+          ...this.turnIdentity(record.id),
+        });
+        this.persistRunStatus(record);
+      }
+      return;
+    }
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
-      if (update.type === "text_delta") journal.publish("message.delta", { delta: update.delta, content_index: update.contentIndex });
-      else if (update.type === "thinking_delta") journal.publish("thinking.delta", { delta: update.delta, content_index: update.contentIndex });
-      else if (update.type === "toolcall_delta") journal.publish("tool.arguments.delta", { delta: update.delta, content_index: update.contentIndex });
+      const turn = this.turnIdentity(record.id);
+      if (update.type === "text_delta") journal.publish("message.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
+      else if (update.type === "thinking_delta") journal.publish("thinking.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
+      else if (update.type === "toolcall_delta") journal.publish("tool.arguments.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
       return;
     }
     if (event.type === "message_end") {
@@ -489,6 +676,7 @@ export class RunCoordinator {
           content: assistantText(event.message),
           stop_reason: event.message.stopReason,
           usage: event.message.usage as unknown as JsonObject,
+          ...this.turnIdentity(record.id),
         });
       }
       return;
@@ -510,6 +698,58 @@ export class RunCoordinator {
         } : {}),
       });
     }
+  }
+
+  private turnIdentity(runId: string): { turn_id: string; turn_index: number } {
+    const turnIndex = Math.max(1, this.turnIndexes.get(runId) ?? 1);
+    return { turn_id: `${runId}:${turnIndex}`, turn_index: turnIndex };
+  }
+
+  private inputSummary(runId: string): {
+    input_message_ids: string[];
+    unconsumed_input_message_ids: string[];
+  } {
+    const inputs = [...(this.runInputs.get(runId)?.entries() ?? [])];
+    return {
+      input_message_ids: inputs
+        .filter(([, input]) => input.state === "injected")
+        .map(([messageId]) => messageId),
+      unconsumed_input_message_ids: inputs
+        .filter(([, input]) => input.state === "unconsumed")
+        .map(([messageId]) => messageId),
+    };
+  }
+
+  private flushReadyInputs(record: RunRecord): void {
+    if (!this.acceptingInputs.has(record.id)) return;
+    const agent = this.agents.get(record.id);
+    if (!agent) return;
+    for (const input of this.runInputs.get(record.id)?.values() ?? []) {
+      // Map insertion order is the endpoint arrival order. Never let a faster
+      // attachment read overtake an earlier input that is still preparing.
+      if (input.state === "preparing") return;
+      if (input.state === "unconsumed") return;
+      if (input.state === "accepted" && input.message && !input.queued) {
+        input.queued = true;
+        agent.steer(input.message);
+      }
+    }
+  }
+
+  private closeInputs(record: RunRecord, reason: string): void {
+    if (!this.acceptingInputs.delete(record.id)) return;
+    const journal = this.journals.get(record.id);
+    for (const [messageId, input] of this.runInputs.get(record.id)?.entries() ?? []) {
+      if (input.state !== "accepted" && input.state !== "preparing") continue;
+      input.state = "unconsumed";
+      journal?.publish("input.unconsumed", {
+        message_id: messageId,
+        state: "unconsumed",
+        reason,
+      });
+    }
+    this.agents.get(record.id)?.clearSteeringQueue();
+    this.persistRunStatus(record);
   }
 
   private rememberUnattendedAuthorizationBlock(runId: string, toolCallId: string, reason: string): void {
@@ -753,12 +993,18 @@ export class RunCoordinator {
 
   private finish(record: RunRecord, status: RunRecord["status"], error?: string, data: JsonObject = {}): void {
     if (isTerminal(record.status) && record.status !== "running") return;
+    this.closeInputs(record, error || `Run ${status}`);
     record.status = status;
     record.updatedAt = Date.now();
     if (error) record.error = error;
     this.persistRunStatus(record);
     const eventType = status === "needs_review" ? "run.needs_review" : `run.${status}`;
-    this.journals.get(record.id)?.publish(eventType, { status, ...(error ? { error } : {}), ...data });
+    this.journals.get(record.id)?.publish(eventType, {
+      status,
+      ...(error ? { error } : {}),
+      ...this.inputSummary(record.id),
+      ...data,
+    });
     this.completions.get(record.id)?.resolve(record);
     this.scheduleRetention(record, Date.now() + this.config.runRetentionMs);
   }
@@ -770,6 +1016,9 @@ export class RunCoordinator {
       this.completions.delete(record.id);
       this.delegateCounts.delete(record.id);
       this.childRuns.delete(record.id);
+      this.runInputs.delete(record.id);
+      this.acceptingInputs.delete(record.id);
+      this.turnIndexes.delete(record.id);
       const idempotencyKey = runIdempotencyKey(record.request);
       if (idempotencyKey && this.idempotencyIndex.get(idempotencyKey) === record.id) {
         this.idempotencyIndex.delete(idempotencyKey);
@@ -786,8 +1035,20 @@ export class RunCoordinator {
       status: record.status,
       retentionMs: this.config.runRetentionMs,
       ...(record.result ? { result: record.result } : {}),
+      inputs: this.persistentInputStates(record.id),
       ...(record.error ? { error: record.error } : {}),
     });
+  }
+
+  private persistentInputStates(
+    runId: string,
+  ): Record<string, { fingerprint: string; state: RunInputState }> {
+    const result: Record<string, { fingerprint: string; state: RunInputState }> = {};
+    for (const [messageId, input] of this.runInputs.get(runId)?.entries() ?? []) {
+      if (input.state === "preparing") continue;
+      result[messageId] = { fingerprint: input.fingerprint, state: input.state };
+    }
+    return result;
   }
 
   private restorePersistentRun(request: RunRequest, persisted: PersistentIdempotencyRecord, mapKey: string): RunRecord {
@@ -802,6 +1063,12 @@ export class RunCoordinator {
       messages: [],
       model: persisted.result.model,
       ...(persisted.result.usage ? { usage: persisted.result.usage } : {}),
+      ...(persisted.result.input_message_ids
+        ? { input_message_ids: persisted.result.input_message_ids }
+        : {}),
+      ...(persisted.result.unconsumed_input_message_ids
+        ? { unconsumed_input_message_ids: persisted.result.unconsumed_input_message_ids }
+        : {}),
     } : undefined;
     const record: RunRecord = {
       id: persisted.run_id,
@@ -815,9 +1082,35 @@ export class RunCoordinator {
       ...(error ? { error } : {}),
     };
     const journal = new EventJournal(record.id);
+    const converted = status !== persisted.status || error !== persisted.error;
     this.runs.set(record.id, record);
     this.journals.set(record.id, journal);
     this.completions.set(record.id, deferred(record));
+    const restoredInputs = new Map<string, AcceptedRunInput>();
+    for (const [messageId, input] of Object.entries(persisted.inputs ?? {})) {
+      if (
+        !input
+        || typeof input.fingerprint !== "string"
+        || !["accepted", "injected", "unconsumed"].includes(input.state)
+      ) {
+        continue;
+      }
+      const restoredState: RunInputState =
+        converted && input.state === "accepted" ? "unconsumed" : input.state;
+      restoredInputs.set(messageId, {
+        fingerprint: input.fingerprint,
+        preparation: Promise.resolve({
+          role: "user",
+          content: "",
+          timestamp: persisted.updated_at,
+        }),
+        settled: Promise.resolve(),
+        message: undefined,
+        state: restoredState,
+        queued: restoredState === "injected",
+      });
+    }
+    this.runInputs.set(record.id, restoredInputs);
     this.idempotencyIndex.set(mapKey, record.id);
     journal.publish("run.reused", { status, persisted: true });
     const terminalType = status === "needs_review" ? "run.needs_review" : `run.${status}`;
@@ -830,10 +1123,12 @@ export class RunCoordinator {
         session_id: persisted.session_id,
         model: result.model,
         usage: result.usage ?? {},
+        input_message_ids: result.input_message_ids ?? [],
+        unconsumed_input_message_ids: result.unconsumed_input_message_ids ?? [],
       } : {}),
+      ...this.inputSummary(record.id),
       ...(error ? { error } : {}),
     });
-    const converted = status !== persisted.status || error !== persisted.error;
     if (converted) this.persistRunStatus(record);
     this.scheduleRetention(record, converted ? Date.now() + this.config.runRetentionMs : persisted.expires_at);
     return record;
@@ -970,6 +1265,97 @@ function sessionContentText(value: unknown): string {
     }
     return typeof item.type === "string" ? `[${item.type}]` : "";
   }).filter(Boolean).join("\n");
+}
+
+function acceptsInteractiveInputs(record: RunRecord): boolean {
+  const metadata = record.request.metadata;
+  if (!isCanonicalPrivateScope(record.request.scope_key)) return false;
+  if (metadata?.trigger === "scheduled" || metadata?.unattended === true) return false;
+  if (typeof metadata?.parent_run_id === "string" && metadata.parent_run_id) return false;
+  return Number(metadata?.delegation_depth ?? 0) === 0;
+}
+
+function runInputFingerprint(request: RunInputRequest): string {
+  // Hash only fields that affect execution. Unknown top-level fields are
+  // intentionally ignored for forward-compatible callers, while attachment
+  // entries retain every field that buildPrompt() currently observes.
+  const attachments = (request.attachments ?? []).map((attachment) => ({
+    ...(attachment.path === undefined ? {} : { path: attachment.path }),
+    ...(attachment.name === undefined ? {} : { name: attachment.name }),
+    ...(attachment.mime_type === undefined ? {} : { mime_type: attachment.mime_type }),
+    ...(attachment.url === undefined ? {} : { url: attachment.url }),
+  }));
+  return stableHash(canonicalJson({
+    message_id: request.message_id,
+    scope_key: request.scope_key,
+    lifecycle_id: request.lifecycle_id,
+    input: request.input,
+    attachments,
+  }));
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function appendInteractiveInputInstruction(systemPrompt: string, enabled: boolean): string {
+  if (!enabled) return systemPrompt;
+  return `${systemPrompt}\n\nAdditional user messages may arrive while you work. Treat them as additions or corrections `
+    + "to the current request. After incorporating them, make the final response self-contained and cover the complete "
+    + "request without referring to an earlier draft answer.";
+}
+
+function validateRunInputRequest(request: RunInputRequest): void {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new RunValidationError("run input request must be an object");
+  }
+  try {
+    assertNonEmpty(request.message_id, "message_id");
+    assertNonEmpty(request.scope_key, "scope_key");
+    assertNonEmpty(request.lifecycle_id, "lifecycle_id");
+    assertMaximumLength(request.message_id, 512, "message_id");
+    assertMaximumLength(request.scope_key, 512, "scope_key");
+    assertMaximumLength(request.lifecycle_id, 512, "lifecycle_id");
+    if (typeof request.input !== "string" && !Array.isArray(request.input)) {
+      throw new Error("input must be a string or content array");
+    }
+    if (Array.isArray(request.input)) {
+      for (const block of request.input as unknown[]) {
+        if (!block || typeof block !== "object" || Array.isArray(block)) {
+          throw new Error("input content blocks must be objects");
+        }
+        const candidate = block as Record<string, unknown>;
+        if (candidate.type === "text" && typeof candidate.text === "string") continue;
+        if (
+          candidate.type === "image"
+          && typeof candidate.data === "string"
+          && typeof candidate.mimeType === "string"
+        ) continue;
+        throw new Error("input content blocks must be valid text or image blocks");
+      }
+    }
+    if (request.attachments !== undefined) {
+      if (!Array.isArray(request.attachments) || request.attachments.length > 64) {
+        throw new Error("attachments must be an array with at most 64 items");
+      }
+      for (const attachment of request.attachments as unknown[]) {
+        if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+          throw new Error("attachment entries must be objects");
+        }
+      }
+    }
+  } catch (error) {
+    if (error instanceof RunValidationError) throw error;
+    throw new RunValidationError(errorMessage(error));
+  }
 }
 
 function validateRunRequest(request: RunRequest): void {
@@ -1190,14 +1576,39 @@ function emptyUsage(): AssistantMessage["usage"] {
   };
 }
 
-function resultFromMessages(messages: AgentMessage[], provider: string, model: string): RunResult {
+function resultFromMessages(
+  messages: AgentMessage[],
+  provider: string,
+  model: string,
+  runMessageStart = 0,
+): RunResult {
   const assistant = [...messages].reverse().find((message): message is AssistantMessage => message.role === "assistant");
   if (!assistant) throw new Error("Agent completed without an assistant response");
+  const usage = emptyUsage();
+  for (const message of messages.slice(Math.max(0, runMessageStart))) {
+    if (message.role !== "assistant") continue;
+    usage.input += Number(message.usage.input || 0);
+    usage.output += Number(message.usage.output || 0);
+    usage.cacheRead += Number(message.usage.cacheRead || 0);
+    usage.cacheWrite += Number(message.usage.cacheWrite || 0);
+    usage.totalTokens += Number(message.usage.totalTokens || 0);
+    usage.cost.input += Number(message.usage.cost?.input || 0);
+    usage.cost.output += Number(message.usage.cost?.output || 0);
+    usage.cost.cacheRead += Number(message.usage.cost?.cacheRead || 0);
+    usage.cost.cacheWrite += Number(message.usage.cost?.cacheWrite || 0);
+    usage.cost.total += Number(message.usage.cost?.total || 0);
+    if (typeof message.usage.reasoning === "number") {
+      usage.reasoning = Number(usage.reasoning || 0) + message.usage.reasoning;
+    }
+    if (typeof message.usage.cacheWrite1h === "number") {
+      usage.cacheWrite1h = Number(usage.cacheWrite1h || 0) + message.usage.cacheWrite1h;
+    }
+  }
   return {
     content: assistantText(assistant),
     messages: durableRunResultMessages(messages),
     model: { provider, id: model },
-    usage: assistant.usage as unknown as JsonObject,
+    usage: usage as unknown as JsonObject,
   };
 }
 

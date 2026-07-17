@@ -12,6 +12,7 @@ import { api, isApiRequestCancelled } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
+import { isStatusReadCurrent, issueStatusRead } from "./statusFence";
 import type {
   Action,
   AgentRuntimeConfigResponse,
@@ -61,31 +62,20 @@ function mergePending(
   return [...messages, ...pending];
 }
 
-/** Per-scope agent-status write (legacy setAgentStatus, legacy-app.js:2862-2866):
- *  no-op on a falsy status; otherwise replace the scope's entry. Uses the
- *  whole-map SET_AGENT_STATUSES action so the slice stays stub-only this phase. */
+/** Per-scope Agent-status write. The reducer owns the shared version merge; a
+ *  transport-fenced read is marked authoritative for equal-second snapshots. */
 function applyAgentStatus(
   store: AppStore,
   mode: ChatMode,
   scopeId: string,
   status: AgentStatus | null | undefined,
+  authoritative = false,
 ): void {
   if (!status) return;
-  const current = store.getState().agentStatuses;
-  if (mode === "private") {
-    store.dispatch({
-      type: "SET_AGENT_STATUSES",
-      payload: { channels: current.channels, private: status },
-    });
-  } else {
-    store.dispatch({
-      type: "SET_AGENT_STATUSES",
-      payload: {
-        channels: { ...current.channels, [String(scopeId)]: status },
-        private: current.private,
-      },
-    });
-  }
+  store.dispatch({
+    type: "SET_AGENT_STATUS",
+    payload: { mode, scopeId, status, authoritative },
+  });
 }
 
 /* --------------------------------------------------------------- loaders */
@@ -122,28 +112,32 @@ export async function loadChannelMessages(store: AppStore): Promise<void> {
   const activeChannelId = store.getState().activeChannelId;
   if (!activeChannelId) return;
   const channelId = String(activeChannelId);
+  const statusRead = issueStatusRead(store, "channel", channelId);
   const result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
   // Channel-switch race guard: discard a response for a channel we left.
   if (String(store.getState().activeChannelId) !== channelId) return;
+  if (!isStatusReadCurrent(statusRead)) return;
   store.dispatch({
     type: "SET_MESSAGES",
     payload: mergePending(store.getState(), "channel", channelId, result.messages || []),
   });
-  applyAgentStatus(store, "channel", channelId, result.agent_status);
+  applyAgentStatus(store, "channel", channelId, result.agent_status, true);
   store.dispatch({ type: "SET_TYPING_USERS", payload: result.typing || [] });
 }
 
 export async function loadPrivateMessages(store: AppStore): Promise<void> {
+  const scopeId = scopeIdFor(store.getState(), "private");
+  const statusRead = issueStatusRead(store, "private", scopeId);
   const [result] = await Promise.all([
     api<PrivateMessagesResponse>(endpoints.privateMessages.path()),
     loadPrivateTelegram(store),
   ]);
-  const scopeId = scopeIdFor(store.getState(), "private");
+  if (!isStatusReadCurrent(statusRead)) return;
   store.dispatch({
     type: "SET_PRIVATE_MESSAGES",
     payload: mergePending(store.getState(), "private", scopeId, result.messages || []),
   });
-  applyAgentStatus(store, "private", scopeId, result.agent_status);
+  applyAgentStatus(store, "private", scopeId, result.agent_status, true);
 }
 
 export async function loadPrivateTelegram(store: AppStore): Promise<void> {
