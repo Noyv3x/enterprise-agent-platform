@@ -504,6 +504,7 @@ input, textarea, select { min-height: 40px; border-radius: var(--r-sm); }
   .auth--login { grid-template-columns: 1fr; }
   .auth--login .auth__aside { display: none; }
   .auth--login .auth__card .brand__logo { display: block; height: 24px; }
+  .shell { grid-template-columns: minmax(0, 1fr); }
   .topbar {
     min-height: 60px;
     padding-block: 8px;
