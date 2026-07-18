@@ -84,6 +84,7 @@ from .schedules import (
     rfc3339_utc,
 )
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
+from .skills import SkillStore, SkillStoreError
 
 
 class ServiceError(Exception):
@@ -388,6 +389,7 @@ class EnterpriseService:
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.agent_scopes = AgentScopeManager(config, self.db)
+        self.skills = SkillStore(config.data_dir)
         if not self.get_setting("agent_tool_token"):
             self.set_setting(
                 "agent_tool_token",
@@ -3770,6 +3772,9 @@ class EnterpriseService:
                 "source_message_id": int(user_msg["id"]),
                 "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(task["actor"]),
+                "available_skills": self._available_skill_index(
+                    agent_scope.scope_key
+                ),
                 "execution": execution,
                 "workspace": {
                     "path": str(workspace_path),
@@ -4028,6 +4033,9 @@ class EnterpriseService:
                 "source_message_id": int(user_msg["id"]),
                 "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(actor),
+                "available_skills": self._available_skill_index(
+                    agent_scope.scope_key
+                ),
                 "execution": execution,
                 "workspace": {
                     "path": agent_scope.workspace_path,
@@ -6510,6 +6518,8 @@ class EnterpriseService:
             result = self._agent_browser_tool(scope_key, action, arguments)
         elif tool == "schedule":
             result = self._agent_schedule_tool(action, arguments, context)
+        elif tool == "skill":
+            result = self._agent_skill_tool(action, arguments, context)
         else:
             raise ServiceError(404, "Agent tool not found")
         content_result = result
@@ -6525,6 +6535,171 @@ class EnterpriseService:
             "data": result,
             "is_error": False,
         }
+
+    def _agent_skill_tool(
+        self,
+        action: str,
+        arguments: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        forbidden = {
+            "owner",
+            "owner_id",
+            "owner_user_id",
+            "user_id",
+            "scope",
+            "scope_id",
+            "scope_key",
+            "lifecycle_id",
+        }
+        if forbidden.intersection(arguments):
+            raise ServiceError(
+                400, "skill owner and scope come from the Agent run context"
+            )
+        raw_scope_key = str(context.get("scope_key") or "").strip()
+        parent_key = raw_scope_key.split(":child:", 1)[0].split(
+            "/delegate/", 1
+        )[0]
+        scope = self.agent_scopes.get_scope(parent_key)
+        if scope is None:
+            raise ServiceError(404, "Agent scope not found")
+        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
+        if not lifecycle_id or lifecycle_id != scope.lifecycle_id:
+            raise ServiceError(409, "Agent skill lifecycle is stale")
+        if scope.scope_type == "private":
+            try:
+                context_owner_user_id = int(context.get("owner_user_id"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(
+                    403, "private Agent skill access requires its owner"
+                ) from exc
+            if str(context_owner_user_id) != str(scope.scope_id):
+                raise ServiceError(
+                    403, "skill owner does not match private Agent scope"
+                )
+
+        mutations = {
+            "create",
+            "update",
+            "delete",
+            "enable",
+            "disable",
+            "write_file",
+            "remove_file",
+        }
+        if action in mutations:
+            try:
+                owner_user_id = int(context.get("owner_user_id"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(
+                    403, "skill mutation requires an active user"
+                ) from exc
+            actor = self.get_user(owner_user_id)
+            if actor is None or not actor.get("active"):
+                raise ServiceError(403, "skill mutation owner is unavailable")
+            if scope.scope_type == "private":
+                require_permission(actor, PERMISSION_PRIVATE_AGENT)
+            else:
+                require_permission(actor, PERMISSION_CHAT)
+
+        skill_id = str(arguments.get("id") or "").strip()
+        try:
+            if action == "list":
+                try:
+                    limit = max(1, min(int(arguments.get("limit") or 100), 100))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "skill limit is invalid") from exc
+                skills = self.skills.list(
+                    scope.scope_key,
+                    query=str(arguments.get("query") or "").strip(),
+                    category=str(arguments.get("category") or "").strip(),
+                    limit=100,
+                )
+                skills = [
+                    skill
+                    for skill in skills
+                    if skill.get("enabled") is True
+                ][:limit]
+                return {"skills": skills, "count": len(skills)}
+            if action == "load":
+                skill = self.skills.load(scope.scope_key, skill_id)
+                if skill.get("enabled") is not True:
+                    raise ServiceError(409, "Agent skill is disabled")
+                return {"skill": skill}
+            if action == "read":
+                skill = self.skills.get(scope.scope_key, skill_id)
+                if skill.get("enabled") is not True:
+                    raise ServiceError(409, "Agent skill is disabled")
+                support = self.skills.read_support(
+                    scope.scope_key,
+                    skill_id,
+                    str(arguments.get("file_path") or ""),
+                )
+                return {"id": skill_id, **support}
+            if action == "create":
+                return {
+                    "skill": self.skills.create(
+                        scope.scope_key,
+                        name=arguments.get("name"),
+                        description=arguments.get("description"),
+                        instructions=arguments.get("instructions"),
+                        category=arguments.get("category"),
+                        version=arguments.get("version"),
+                        tags=arguments.get("tags"),
+                        enabled=True,
+                    )
+                }
+            if action == "update":
+                fields = {
+                    key: arguments[key]
+                    for key in (
+                        "name",
+                        "description",
+                        "instructions",
+                        "category",
+                        "version",
+                        "tags",
+                    )
+                    if key in arguments
+                }
+                return {
+                    "skill": self.skills.update(
+                        scope.scope_key, skill_id, **fields
+                    )
+                }
+            if action == "delete":
+                self.skills.delete(scope.scope_key, skill_id)
+                return {"deleted": True, "id": skill_id}
+            if action in {"enable", "disable"}:
+                return {
+                    "skill": self.skills.set_enabled(
+                        scope.scope_key, skill_id, action == "enable"
+                    )
+                }
+            if action == "write_file":
+                return {
+                    "skill": self.skills.write_support(
+                        scope.scope_key,
+                        skill_id,
+                        str(arguments.get("file_path") or ""),
+                        arguments.get("content"),
+                    )
+                }
+            if action == "remove_file":
+                return {
+                    "skill": self.skills.remove_support(
+                        scope.scope_key,
+                        skill_id,
+                        str(arguments.get("file_path") or ""),
+                    )
+                }
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        raise ServiceError(
+            400,
+            "skill action must be list, load, read, create, update, delete, "
+            "enable, disable, write_file or remove_file",
+        )
 
     def _agent_schedule_tool(
         self,
@@ -8819,6 +8994,204 @@ class EnterpriseService:
     ) -> dict[str, Any]:
         return self._decide_memory_candidate(actor, candidate_id, "rejected")
 
+    def _skill_scope_for_actor(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        *,
+        mutation: bool = False,
+    ) -> AgentExecutionScope:
+        normalized_type, normalized_id = self._normalize_conversation(
+            actor, scope_type, scope_id
+        )
+        if mutation and normalized_type == "channel":
+            require_permission(actor, PERMISSION_CHAT)
+        if normalized_type == "private":
+            return self.agent_scopes.ensure_private_scope(int(normalized_id))
+        return self.agent_scopes.ensure_channel_scope(normalized_id)
+
+    @staticmethod
+    def _raise_skill_store_error(error: SkillStoreError) -> None:
+        raise ServiceError(int(error.status), str(error)) from error
+
+    @staticmethod
+    def _public_user_skill(skill: dict[str, Any]) -> dict[str, Any]:
+        public = dict(skill)
+        public.pop("skill_dir", None)
+        public.pop("scope_key", None)
+        return public
+
+    def user_list_skills(
+        self,
+        actor: dict[str, Any],
+        *,
+        scope_type: str,
+        scope_id: str,
+        query: str = "",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        scope = self._skill_scope_for_actor(actor, scope_type, scope_id)
+        try:
+            skills = self.skills.list(
+                scope.scope_key,
+                query=str(query or "").strip(),
+                limit=max(1, min(int(limit), 100)),
+            )
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        public = [self._public_user_skill(skill) for skill in skills]
+        return {"skills": public, "count": len(public)}
+
+    def user_get_skill(
+        self,
+        actor: dict[str, Any],
+        *,
+        scope_type: str,
+        scope_id: str,
+        skill_id: str,
+    ) -> dict[str, Any]:
+        scope = self._skill_scope_for_actor(actor, scope_type, scope_id)
+        try:
+            skill = self.skills.load(scope.scope_key, str(skill_id))
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        return {"skill": self._public_user_skill(skill)}
+
+    def user_create_skill(
+        self,
+        actor: dict[str, Any],
+        *,
+        scope_type: str,
+        scope_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope = self._skill_scope_for_actor(
+            actor, scope_type, scope_id, mutation=True
+        )
+        allowed_keys = {
+            "name",
+            "description",
+            "instructions",
+            "category",
+            "version",
+            "tags",
+            "enabled",
+        }
+        unknown = set(body) - allowed_keys
+        if unknown:
+            raise ServiceError(
+                400,
+                f"unsupported skill fields: {', '.join(sorted(unknown))}",
+            )
+        self._validate_user_skill_field_types(body)
+        enabled = body.get("enabled", True)
+        if type(enabled) is not bool:
+            raise ServiceError(400, "skill enabled must be a boolean")
+        try:
+            skill = self.skills.create(
+                scope.scope_key,
+                name=body.get("name"),
+                description=body.get("description"),
+                instructions=body.get("instructions"),
+                category=body.get("category"),
+                version=body.get("version"),
+                tags=body.get("tags"),
+                enabled=enabled,
+            )
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        return {"skill": self._public_user_skill(skill)}
+
+    def user_update_skill(
+        self,
+        actor: dict[str, Any],
+        *,
+        scope_type: str,
+        scope_id: str,
+        skill_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope = self._skill_scope_for_actor(
+            actor, scope_type, scope_id, mutation=True
+        )
+        allowed_keys = {
+            "name",
+            "description",
+            "instructions",
+            "category",
+            "version",
+            "tags",
+            "enabled",
+        }
+        unknown = set(body) - allowed_keys
+        if unknown:
+            raise ServiceError(
+                400,
+                f"unsupported skill fields: {', '.join(sorted(unknown))}",
+            )
+        self._validate_user_skill_field_types(body)
+        allowed = {
+            key: body[key]
+            for key in (
+                "name",
+                "description",
+                "instructions",
+                "category",
+                "version",
+                "tags",
+                "enabled",
+            )
+            if key in body
+        }
+        if not allowed:
+            raise ServiceError(400, "skill update has no supported fields")
+        if "enabled" in body and type(body["enabled"]) is not bool:
+            raise ServiceError(400, "skill enabled must be a boolean")
+        try:
+            skill = self.skills.update(
+                scope.scope_key,
+                str(skill_id),
+                **allowed,
+            )
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        return {"skill": self._public_user_skill(skill)}
+
+    @staticmethod
+    def _validate_user_skill_field_types(body: dict[str, Any]) -> None:
+        for key in (
+            "name",
+            "description",
+            "instructions",
+            "category",
+            "version",
+        ):
+            if key in body and not isinstance(body[key], str):
+                raise ServiceError(400, f"skill {key} must be a string")
+        if "tags" in body and (
+            not isinstance(body["tags"], list)
+            or any(not isinstance(tag, str) for tag in body["tags"])
+        ):
+            raise ServiceError(400, "skill tags must be a list of strings")
+
+    def user_delete_skill(
+        self,
+        actor: dict[str, Any],
+        *,
+        scope_type: str,
+        scope_id: str,
+        skill_id: str,
+    ) -> dict[str, Any]:
+        scope = self._skill_scope_for_actor(
+            actor, scope_type, scope_id, mutation=True
+        )
+        try:
+            self.skills.delete(scope.scope_key, str(skill_id))
+        except SkillStoreError as exc:
+            self._raise_skill_store_error(exc)
+        return {"deleted": True, "id": str(skill_id)}
+
     # User-facing knowledge reads require read_workspace. The bare
     # search_knowledge/get_knowledge_document methods stay unauthenticated for
     # the agent-tool boundary, which is gated separately by the agent token.
@@ -10296,8 +10669,12 @@ class EnterpriseService:
         scope_id = str(scope_id)
         if scope_type == "channel":
             require_permission(actor, PERMISSION_READ_WORKSPACE)
-            self.get_channel(actor, int(scope_id))
-            return "channel", scope_id
+            try:
+                channel_id = int(scope_id)
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "channel scope id is invalid") from exc
+            self.get_channel(actor, channel_id)
+            return "channel", str(channel_id)
         if scope_type == "private":
             require_permission(actor, PERMISSION_PRIVATE_AGENT)
             if scope_id != str(actor["id"]):
@@ -11829,6 +12206,16 @@ class EnterpriseService:
             "知识库通过 knowledge 工具提供；使用 search 操作检索，使用 read 操作读取完整条目。\n"
             f"{passive}"
         )
+
+    def _available_skill_index(self, scope_key: str) -> list[dict[str, Any]]:
+        try:
+            return self.skills.prompt_index(str(scope_key), max_chars=32_768)
+        except SkillStoreError as exc:
+            print(
+                f"Failed to build Agent skill index for {scope_key}: {exc}",
+                file=sys.stderr,
+            )
+            return []
 
 
 def _dedupe_knowledge_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:

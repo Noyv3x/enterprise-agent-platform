@@ -221,3 +221,60 @@ test("PlatformGateway forwards typed platform session-search actions within the 
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
+
+test("PlatformGateway keeps Skill model arguments separate from authoritative run context", async () => {
+  let body: Record<string, unknown> = {};
+  let path = "";
+  const server = createServer(async (request, response) => {
+    path = request.url || "";
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data: { skill: { id: "code-review" } } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const gateway = new PlatformGateway(`http://127.0.0.1:${address.port}`, "token");
+    await gateway.invoke({
+      scope_key: "private:42",
+      lifecycle_id: "trusted-life",
+      session_id: "trusted-session",
+      workspace: "/trusted/workspace",
+      system_prompt: "system",
+      input: "input",
+      model: { provider: "openai-codex", id: "gpt-5" },
+      metadata: { actor: { id: 42 }, source_message_id: 77 },
+    }, "trusted-run", "skill", "load", {
+      id: "code-review",
+      scope_key: "forged-scope",
+      lifecycle_id: "forged-life",
+      owner_user_id: 999,
+    });
+
+    assert.equal(path, "/internal/agent/tools/skill");
+    assert.equal(body.tool, "skill");
+    assert.equal(body.action, "load");
+    assert.deepEqual(body.arguments, {
+      id: "code-review",
+      scope_key: "forged-scope",
+      lifecycle_id: "forged-life",
+      owner_user_id: 999,
+    });
+    // Reserved fields stay in the model-controlled arguments object, where the
+    // platform rejects them; they cannot replace the trusted context envelope.
+    assert.deepEqual(body.context, {
+      run_id: "trusted-run",
+      scope_key: "private:42",
+      lifecycle_id: "trusted-life",
+      session_id: "trusted-session",
+      workspace: "/trusted/workspace",
+      owner_user_id: 42,
+      source_message_id: 77,
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});

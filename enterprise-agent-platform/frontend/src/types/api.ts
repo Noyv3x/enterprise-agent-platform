@@ -8,6 +8,7 @@ import type {
   AgentMemory,
   AgentMemoryCandidate,
   AgentMemoryTarget,
+  AgentSkill,
   AgentStatus,
   AgentRuntimeConfigState,
   AgentSchedule,
@@ -188,6 +189,34 @@ export interface AgentMemoryCandidateDecisionResponse {
   candidate: AgentMemoryCandidate;
   memory?: AgentMemory | null;
   created?: boolean;
+}
+
+/* --------------------------------------------------------- Agent skills */
+
+export interface AgentSkillsResponse {
+  skills: AgentSkill[];
+  count: number;
+}
+
+export interface AgentSkillResponse {
+  skill: AgentSkill;
+}
+
+export interface AgentSkillCreateRequest {
+  name: string;
+  description: string;
+  instructions: string;
+  category: string;
+  version: string;
+  tags: string[];
+  enabled: boolean;
+}
+
+export type AgentSkillPatchRequest = Partial<AgentSkillCreateRequest>;
+
+export interface DeleteAgentSkillResponse {
+  deleted: true;
+  id: string;
 }
 
 /* --------------------------------------------------------------- mentions */

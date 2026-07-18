@@ -524,6 +524,63 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             self._json(payload)
             return
+        if path == "/api/agent-skills" and method == "GET":
+            self._json(
+                service.user_list_skills(
+                    actor,
+                    scope_type=first(query, "scope_type", ""),
+                    scope_id=first(query, "scope_id", ""),
+                    query=first(query, "q", ""),
+                    limit=int_arg(query, "limit", 100),
+                )
+            )
+            return
+        if path == "/api/agent-skills" and method == "POST":
+            self._json(
+                service.user_create_skill(
+                    actor,
+                    scope_type=first(query, "scope_type", ""),
+                    scope_id=first(query, "scope_id", ""),
+                    body=self._body_json(),
+                ),
+                status=201,
+            )
+            return
+        m = re.fullmatch(
+            r"/api/agent-skills/([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)",
+            path,
+        )
+        if m and method == "GET":
+            self._json(
+                service.user_get_skill(
+                    actor,
+                    scope_type=first(query, "scope_type", ""),
+                    scope_id=first(query, "scope_id", ""),
+                    skill_id=m.group(1),
+                )
+            )
+            return
+        if m and method == "PATCH":
+            self._json(
+                service.user_update_skill(
+                    actor,
+                    scope_type=first(query, "scope_type", ""),
+                    scope_id=first(query, "scope_id", ""),
+                    skill_id=m.group(1),
+                    body=self._body_json(),
+                )
+            )
+            return
+        if m and method == "DELETE":
+            self._json(
+                service.user_delete_skill(
+                    actor,
+                    scope_type=first(query, "scope_type", ""),
+                    scope_id=first(query, "scope_id", ""),
+                    skill_id=m.group(1),
+                )
+            )
+            return
         if path == "/api/private-agent/agent-status" and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
             return
@@ -767,7 +824,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid Agent runtime token")
         if method != "POST":
             raise ServiceError(405, "method not allowed")
-        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser|schedule)", path):
+        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser|schedule|skill)", path):
             body = self._body_json()
             body["tool"] = path.rsplit("/", 1)[-1]
             self._json(service.invoke_agent_runtime_tool(body))

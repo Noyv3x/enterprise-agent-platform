@@ -55,6 +55,7 @@ export interface RunMetadata extends JsonObject {
   schedule_id?: string;
   schedule_run_id?: string;
   scheduled_for?: string;
+  available_skills?: unknown;
 }
 
 export type UserInput = string | Array<TextContent | ImageContent>;
@@ -146,7 +147,7 @@ export interface ResolvedModel {
 }
 
 export interface GatewayToolRequest {
-  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule";
+  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule" | "skill";
   action: string;
   arguments: JsonObject;
   context: {

@@ -8,7 +8,7 @@
  *  coercion throughout the legacy code, so callers may hold either. */
 export type Id = string | number;
 
-/** The 30 icon names registered in the legacy ICONS map (legacy-app.js:135). */
+/** Icon names registered in the shared SVG icon map. */
 export type IconName =
   | "hash"
   | "bot"
@@ -42,7 +42,8 @@ export type IconName =
   | "users"
   | "browser"
   | "terminal"
-  | "calendar";
+  | "calendar"
+  | "sparkles";
 
 /** Top-level workspace view. */
 export type ActiveView =
@@ -371,6 +372,23 @@ export interface AgentMemoryCandidate {
   created_at: number | string;
   decided_at: number | string | null;
   memory_id: number | null;
+}
+
+/* ------------------------------------------------------- procedural Agent skills */
+
+export interface AgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  /** List responses may omit the full Markdown body until the editor opens. */
+  instructions?: string;
+  category: string;
+  version: string;
+  tags: string[];
+  enabled: boolean;
+  linked_files: string[];
+  created_at: string;
+  updated_at: string;
 }
 
 /* ------------------------------------------------------------- knowledge */

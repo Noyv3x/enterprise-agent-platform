@@ -196,4 +196,9 @@ export const ICONS: Record<IconName, readonly IconPrimitive[]> = {
     ["path", { d: "M8 18h.01" }],
     ["path", { d: "M12 18h.01" }],
   ],
+  sparkles: [
+    ["path", { d: "m12 3 1.25 3.75L17 8l-3.75 1.25L12 13l-1.25-3.75L7 8l3.75-1.25L12 3z" }],
+    ["path", { d: "m5 14 .75 2.25L8 17l-2.25.75L5 20l-.75-2.25L2 17l2.25-.75L5 14z" }],
+    ["path", { d: "m19 13 .75 2.25L22 16l-2.25.75L19 19l-.75-2.25L16 16l2.25-.75L19 13z" }],
+  ],
 };

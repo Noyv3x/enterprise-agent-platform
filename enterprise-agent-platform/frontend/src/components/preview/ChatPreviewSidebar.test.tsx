@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   terminalRender: vi.fn(),
   schedulesRender: vi.fn(),
   memoryRender: vi.fn(),
+  skillsRender: vi.fn(),
+  skillsCanManageRender: vi.fn(),
 }));
 
 vi.mock("./usePreviewAvailability", () => ({
@@ -58,12 +60,32 @@ vi.mock("../memory/MemoryPanel", () => ({
   },
 }));
 
+vi.mock("../skills/SkillsPanel", () => ({
+  SkillsPanel: ({
+    scope,
+    canManage,
+  }: {
+    scope: AgentPreviewScope;
+    canManage?: boolean;
+  }) => {
+    mocks.skillsRender(scope);
+    mocks.skillsCanManageRender(canManage);
+    return <div data-testid="skills-panel-fixture" />;
+  },
+}));
+
 const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" };
 
-function renderSidebar(scope: AgentPreviewScope | null = privateScope) {
+function renderSidebar(
+  scope: AgentPreviewScope | null = privateScope,
+  canManageSkills = true,
+) {
   return render(
     <I18nProvider>
-      <ChatPreviewSidebar scope={scope}>
+      <ChatPreviewSidebar
+        scope={scope}
+        canManageSkills={canManageSkills}
+      >
         <div>Chat content</div>
       </ChatPreviewSidebar>
     </I18nProvider>,
@@ -79,6 +101,8 @@ describe("ChatPreviewSidebar", () => {
     mocks.terminalRender.mockClear();
     mocks.schedulesRender.mockClear();
     mocks.memoryRender.mockClear();
+    mocks.skillsRender.mockClear();
+    mocks.skillsCanManageRender.mockClear();
   });
 
   afterEach(() => {
@@ -86,18 +110,55 @@ describe("ChatPreviewSidebar", () => {
     localStorage.clear();
   });
 
-  it("keeps private memory and task entries visible while live preview resources are idle", () => {
+  it("keeps private memory, Skill, and task entries visible while live preview resources are idle", () => {
     renderSidebar();
 
     expect(screen.getByText("Chat content")).toBeVisible();
     expect(screen.getByRole("navigation", { name: "Agent side tools" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open memory manager" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open scheduled tasks" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Open browser preview" })).not.toBeInTheDocument();
     expect(mocks.browserRender).not.toHaveBeenCalled();
     expect(mocks.terminalRender).not.toHaveBeenCalled();
     expect(mocks.schedulesRender).not.toHaveBeenCalled();
     expect(mocks.memoryRender).not.toHaveBeenCalled();
+    expect(mocks.skillsRender).not.toHaveBeenCalled();
+  });
+
+  it("opens Agent-scoped Skill management for private and channel chats", async () => {
+    const view = renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
+
+    expect(screen.getByRole("complementary", { name: "Skills" })).toBeVisible();
+    expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
+    expect(mocks.skillsRender).toHaveBeenLastCalledWith(privateScope);
+
+    const channelScope: AgentPreviewScope = { scope_type: "channel", scope_id: "4" };
+    view.rerender(
+      <I18nProvider>
+        <ChatPreviewSidebar scope={channelScope}>
+          <div>Channel chat</div>
+        </ChatPreviewSidebar>
+      </I18nProvider>,
+    );
+    expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
+    expect(screen.queryByTestId("skills-panel-fixture")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
+    expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
+    expect(mocks.skillsRender).toHaveBeenLastCalledWith(channelScope);
+  });
+
+  it("passes read-only Skill management state to the lazy panel", async () => {
+    renderSidebar(
+      { scope_type: "channel", scope_id: "4" },
+      false,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
+
+    expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
+    expect(mocks.skillsCanManageRender).toHaveBeenLastCalledWith(false);
   });
 
   it("opens memory management on demand only for a private Agent", async () => {
@@ -115,6 +176,7 @@ describe("ChatPreviewSidebar", () => {
     );
     expect(screen.queryByRole("button", { name: "Open memory manager" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("memory-panel-fixture")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
   });
 
   it("opens scheduled tasks on demand only for a private Agent", async () => {
@@ -132,6 +194,7 @@ describe("ChatPreviewSidebar", () => {
     );
     expect(screen.queryByRole("button", { name: "Open scheduled tasks" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
   });
 
   it("shows only the active browser control and mounts the full preview on demand", async () => {

@@ -56,7 +56,7 @@ export function ChatView({ mode }: { mode: ChatMode }) {
       : t("chat.composer.readOnly");
 
   return (
-    <ChatPreviewSidebar scope={previewScope}>
+    <ChatPreviewSidebar scope={previewScope} canManageSkills={canChat}>
       <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken} />
       <Composer
         mode={mode}

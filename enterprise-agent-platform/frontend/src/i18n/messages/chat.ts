@@ -282,6 +282,7 @@ export const chatMessages = defineMessages({
   "chat.activity.toolName.search_files": { "zh-CN": "文件搜索", en: "File search", "zh-TW": "檔案搜尋" },
   "chat.activity.toolName.session": { "zh-CN": "会话搜索", en: "Session search", "zh-TW": "工作階段搜尋" },
   "chat.activity.toolName.memory": { "zh-CN": "记忆", en: "Memory", "zh-TW": "記憶" },
+  "chat.activity.toolName.skill": { "zh-CN": "Skill", en: "Skill", "zh-TW": "Skill" },
   "chat.activity.toolName.knowledge": { "zh-CN": "知识库", en: "Knowledge", "zh-TW": "知識庫" },
   "chat.activity.toolName.web": { "zh-CN": "网页搜索", en: "Web search", "zh-TW": "網頁搜尋" },
   "chat.activity.toolName.browser": { "zh-CN": "浏览器", en: "Browser", "zh-TW": "瀏覽器" },

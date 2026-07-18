@@ -18,19 +18,30 @@ const MemoryPanel = lazy(() =>
     default: module.MemoryPanel,
   })),
 );
+const SkillsPanel = lazy(() =>
+  import("../skills/SkillsPanel").then((module) => ({
+    default: module.SkillsPanel,
+  })),
+);
 
-type SidePanelKind = "memory" | "tasks" | "browser" | "terminal";
+type SidePanelKind = "memory" | "skills" | "tasks" | "browser" | "terminal";
 
 interface ChatPreviewSidebarProps {
   scope: AgentPreviewScope | null;
+  canManageSkills?: boolean;
   children: ReactNode;
 }
 
-export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps) {
+export function ChatPreviewSidebar({
+  scope,
+  canManageSkills = true,
+  children,
+}: ChatPreviewSidebarProps) {
   const { t } = useI18n();
   const { state } = usePreviewAvailability(scope);
   const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
   const memoryButton = useRef<HTMLButtonElement>(null);
+  const skillsButton = useRef<HTMLButtonElement>(null);
   const tasksButton = useRef<HTMLButtonElement>(null);
   const browserButton = useRef<HTMLButtonElement>(null);
   const terminalButton = useRef<HTMLButtonElement>(null);
@@ -40,10 +51,12 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
   const terminalCount = scope ? state.runningTerminalCount : 0;
   const terminalActive = terminalCount > 0;
   const memoryActive = scope?.scope_type === "private";
+  const skillsActive = !!scope;
   const tasksActive = scope?.scope_type === "private";
-  const hasPreviews = memoryActive || tasksActive || browserActive || terminalActive;
+  const hasPreviews = memoryActive || skillsActive || tasksActive || browserActive || terminalActive;
   const visiblePreview = (
     (openPreview === "memory" && memoryActive)
+    || (openPreview === "skills" && skillsActive)
     || (openPreview === "tasks" && tasksActive)
     || (openPreview === "browser" && browserActive)
     || (openPreview === "terminal" && terminalActive)
@@ -58,7 +71,8 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
     if (openPreview === "terminal" && !terminalActive) setOpenPreview(null);
     if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
     if (openPreview === "memory" && !memoryActive) setOpenPreview(null);
-  }, [browserActive, memoryActive, openPreview, tasksActive, terminalActive]);
+    if (openPreview === "skills" && !skillsActive) setOpenPreview(null);
+  }, [browserActive, memoryActive, openPreview, skillsActive, tasksActive, terminalActive]);
 
   useEffect(() => {
     const wasOpen = previousOpen.current;
@@ -66,6 +80,8 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
     if (!wasOpen || openPreview) return;
     const trigger = wasOpen === "memory"
       ? memoryButton.current
+      : wasOpen === "skills"
+        ? skillsButton.current
       : wasOpen === "tasks"
         ? tasksButton.current
         : wasOpen === "browser"
@@ -92,6 +108,8 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
 
   const drawerTitle = visiblePreview === "memory"
     ? t("memory.title")
+    : visiblePreview === "skills"
+      ? t("skills.title")
     : visiblePreview === "tasks"
       ? t("scheduledTasks.title")
       : visiblePreview === "browser"
@@ -99,6 +117,8 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
         : t("terminalPreview.title");
   const drawerDescription = visiblePreview === "memory"
     ? t("memory.description")
+    : visiblePreview === "skills"
+      ? t("skills.description")
     : visiblePreview === "tasks"
       ? t("scheduledTasks.description")
       : visiblePreview === "browser"
@@ -106,6 +126,8 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
         : t("terminalPreview.description");
   const drawerIcon = visiblePreview === "memory"
     ? "library"
+    : visiblePreview === "skills"
+      ? "sparkles"
     : visiblePreview === "tasks"
       ? "calendar"
       : visiblePreview === "browser"
@@ -127,6 +149,24 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
         </Suspense>
       );
     }
+    if (visiblePreview === "skills") {
+      return (
+        <Suspense
+          fallback={(
+            <div className="skills-loading" role="status">
+              <Spinner size={20} />
+              <span>{t("skills.loading")}</span>
+            </div>
+          )}
+        >
+          <SkillsPanel
+            key={scopeKey}
+            scope={scope}
+            canManage={canManageSkills}
+          />
+        </Suspense>
+      );
+    }
     if (visiblePreview === "tasks") {
       return (
         <Suspense
@@ -142,7 +182,7 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
       );
     }
     return visiblePreview === "browser" ? <BrowserPreviewView scope={scope} /> : <TerminalPreviewView scope={scope} />;
-  }, [scope, t, visiblePreview]);
+  }, [canManageSkills, scope, t, visiblePreview]);
 
   return (
     <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
@@ -161,6 +201,20 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
               onClick={() => setOpenPreview((current) => current === "memory" ? null : "memory")}
             >
               <Icon name="library" size={19} />
+            </button>
+          ) : null}
+          {skillsActive ? (
+            <button
+              ref={skillsButton}
+              className={cx("chat-preview__toggle", visiblePreview === "skills" && "is-active")}
+              type="button"
+              aria-label={t("skills.open")}
+              aria-controls="chat-side-panel"
+              aria-expanded={visiblePreview === "skills"}
+              title={t("skills.open")}
+              onClick={() => setOpenPreview((current) => current === "skills" ? null : "skills")}
+            >
+              <Icon name="sparkles" size={19} />
             </button>
           ) : null}
           {tasksActive ? (

@@ -21,6 +21,10 @@ import type {
   AgentMemoryCandidatesResponse,
   AgentMemoryMutationRequest,
   AgentMemoryMutationResponse,
+  AgentSkillCreateRequest,
+  AgentSkillPatchRequest,
+  AgentSkillResponse,
+  AgentSkillsResponse,
   AgentPreviewStatusResponse,
   AgentScheduleResponse,
   AgentScheduleRunsResponse,
@@ -40,6 +44,7 @@ import type {
   DeleteResultResponse,
   DeleteAgentScheduleResponse,
   DeleteAgentMemoryResponse,
+  DeleteAgentSkillResponse,
   DocumentResponse,
   DocumentsResponse,
   ImpersonateUserResponse,
@@ -238,6 +243,60 @@ export const endpoints = {
   rejectPrivateAgentMemoryCandidate: ep<void, AgentMemoryCandidateDecisionResponse, [Id]>(
     "POST",
     (id) => `/api/private-agent/memory-candidates/${encodeURIComponent(String(id))}/reject`,
+  ),
+
+  /* Agent-scoped procedural skills */
+  agentSkills: ep<void, AgentSkillsResponse, [ScopeType, Id, string, number]>(
+    "GET",
+    (scopeType, scopeId, query, limit) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+        limit: String(limit),
+      });
+      if (query) params.set("q", query);
+      return `/api/agent-skills?${params.toString()}`;
+    },
+  ),
+  createAgentSkill: ep<AgentSkillCreateRequest, AgentSkillResponse, [ScopeType, Id]>(
+    "POST",
+    (scopeType, scopeId) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+      });
+      return `/api/agent-skills?${params.toString()}`;
+    },
+  ),
+  agentSkill: ep<void, AgentSkillResponse, [Id, ScopeType, Id]>(
+    "GET",
+    (id, scopeType, scopeId) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+      });
+      return `/api/agent-skills/${encodeURIComponent(String(id))}?${params.toString()}`;
+    },
+  ),
+  updateAgentSkill: ep<AgentSkillPatchRequest, AgentSkillResponse, [Id, ScopeType, Id]>(
+    "PATCH",
+    (id, scopeType, scopeId) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+      });
+      return `/api/agent-skills/${encodeURIComponent(String(id))}?${params.toString()}`;
+    },
+  ),
+  deleteAgentSkill: ep<void, DeleteAgentSkillResponse, [Id, ScopeType, Id]>(
+    "DELETE",
+    (id, scopeType, scopeId) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+      });
+      return `/api/agent-skills/${encodeURIComponent(String(id))}?${params.toString()}`;
+    },
   ),
 
   /* read-only Agent previews */

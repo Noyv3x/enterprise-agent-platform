@@ -37,6 +37,7 @@ const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   session: "chat.activity.toolName.session",
   session_search: "chat.activity.toolName.session",
   memory: "chat.activity.toolName.memory",
+  skill: "chat.activity.toolName.skill",
   knowledge: "chat.activity.toolName.knowledge",
   web: "chat.activity.toolName.web",
   browser: "chat.activity.toolName.browser",
