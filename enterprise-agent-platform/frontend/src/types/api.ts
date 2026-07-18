@@ -5,6 +5,9 @@
 
 import type {
   AgentApprovalChoice,
+  AgentMemory,
+  AgentMemoryCandidate,
+  AgentMemoryTarget,
   AgentStatus,
   AgentRuntimeConfigState,
   AgentSchedule,
@@ -141,6 +144,50 @@ export interface AgentScheduleRunNowResponse extends AgentScheduleResponse {
 export interface DeleteAgentScheduleResponse {
   deleted: true;
   id: number;
+}
+
+export interface AgentMemoriesResponse {
+  memories: AgentMemory[];
+  count: number;
+  found: boolean;
+}
+
+export interface AgentMemoryMutationRequest {
+  target: AgentMemoryTarget;
+  content: string;
+  tags?: string[];
+}
+
+export interface AgentMemoryMutationResponse {
+  changed: AgentMemoryChange[];
+}
+
+export interface AgentMemoryChange {
+  action: "add" | "replace" | "remove" | "clear" | (string & {});
+  id?: number;
+  created?: boolean;
+  duplicate?: boolean;
+  deleted?: number;
+}
+
+export type DeleteAgentMemoryResponse = AgentMemoryMutationResponse;
+
+export interface AgentMemoriesExportResponse {
+  version: number;
+  exported_at: number | string;
+  memories: AgentMemory[];
+}
+
+export interface AgentMemoryCandidatesResponse {
+  candidates: AgentMemoryCandidate[];
+  count: number;
+  found: boolean;
+}
+
+export interface AgentMemoryCandidateDecisionResponse {
+  candidate: AgentMemoryCandidate;
+  memory?: AgentMemory | null;
+  created?: boolean;
 }
 
 /* --------------------------------------------------------------- mentions */

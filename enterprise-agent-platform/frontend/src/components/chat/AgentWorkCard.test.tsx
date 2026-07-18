@@ -42,6 +42,14 @@ describe("AgentWorkCard", () => {
           tool_status: "completed",
           detail: "config · ./src",
         },
+        {
+          source: "agent",
+          stage: "tool",
+          tool: "session_search",
+          tool_call_id: "session-search-1",
+          tool_status: "completed",
+          detail: "release notes",
+        },
       ],
     };
 
@@ -55,6 +63,7 @@ describe("AgentWorkCard", () => {
 
     expect(screen.getAllByText("✅ Completed File search · config · ./src")).toHaveLength(1);
     expect(screen.getAllByText("✅ Completed Command · pwd")).toHaveLength(1);
+    expect(screen.getAllByText("✅ Completed Session search · release notes")).toHaveLength(1);
     expect(screen.queryByText(/Using tool/i)).toBeNull();
   });
 });

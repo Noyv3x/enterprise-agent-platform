@@ -121,19 +121,19 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 self.assertEqual(res.status, 204)
                 self.assertEqual(len(options_body), 0)
                 self.assertEqual(
-                    res.getheader("Allow"), "GET, POST, PUT, DELETE, OPTIONS"
+                    res.getheader("Allow"),
+                    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
                 )
                 self.assertEqual(res.getheader("X-Frame-Options"), "DENY")
                 self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
 
-                # PATCH has no do_PATCH handler, so the stdlib raises 501. The
-                # overridden send_error routes it through the JSON envelope with
-                # the standard security headers instead of a bare HTML 501 page.
+                # PATCH is routed for memory editing and therefore receives the
+                # same write-origin protection and JSON security envelope.
                 conn2 = http.client.HTTPConnection(host, port, timeout=5)
                 conn2.request("PATCH", "/api/channels")
                 res2 = conn2.getresponse()
                 patch_body = res2.read().decode("utf-8")
-                self.assertEqual(res2.status, 501)
+                self.assertEqual(res2.status, 403)
                 self.assertIn("application/json", res2.getheader("Content-Type"))
                 self.assertEqual(res2.getheader("X-Frame-Options"), "DENY")
                 self.assertEqual(res2.getheader("X-Content-Type-Options"), "nosniff")

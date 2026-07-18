@@ -10,6 +10,16 @@ export interface SessionIdentity {
   session_id: string;
 }
 
+export interface TrackedSessionMessage {
+  entry_id: string;
+  message: AgentMessage;
+}
+
+export interface CompactedSessionMessage {
+  entry_id?: string;
+  message: AgentMessage;
+}
+
 interface SessionApprovalEntry {
   id: string;
   type: "grant" | "clear";
@@ -19,12 +29,15 @@ interface SessionApprovalEntry {
 }
 
 const MAX_SESSION_JOURNAL_BYTES = 64 * 1024 * 1024;
+const MAX_SESSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
 
 export class SessionStore {
   private readonly sessionsRoot: string;
   private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly initializeQueues = new Map<string, Promise<void>>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
+  private readonly mutationQueues = new Map<string, Promise<void>>();
+  private readonly archiveQueues = new Map<string, Promise<void>>();
 
   constructor(home: string) {
     this.sessionsRoot = join(home, "sessions");
@@ -41,24 +54,45 @@ export class SessionStore {
     return join(this.sessionsRoot, stableHash(identity.scope_key), stableHash(identity.lifecycle_id), "approvals.jsonl");
   }
 
+  archivePath(identity: SessionIdentity): string {
+    return this.path(identity).replace(/\.jsonl$/, ".archive.jsonl");
+  }
+
   async initialize(identity: SessionIdentity, history: AgentMessage[] = []): Promise<AgentMessage[]> {
+    return (await this.initializeTracked(identity, history)).map((entry) => entry.message);
+  }
+
+  async initializeTracked(
+    identity: SessionIdentity,
+    history: AgentMessage[] = [],
+  ): Promise<TrackedSessionMessage[]> {
     const file = this.path(identity);
     return await this.withQueue(this.initializeQueues, file, async () => {
-      const entries = await this.readEntries(identity);
-      if (entries.some((entry) => entry.type === "header")) {
-        return entries.filter((entry) => entry.type === "message").map((entry) => entry.payload as AgentMessage);
-      }
-      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-      await this.writeScopeManifest(identity.scope_key);
-      const header = this.entry(identity, "header", {
-        version: 1,
-        scope_key: identity.scope_key,
-        lifecycle_id: identity.lifecycle_id,
-        session_id: identity.session_id,
+      return await this.withQueue(this.mutationQueues, file, async () => {
+        const entries = await this.readEntries(identity);
+        if (entries.some((entry) => entry.type === "header")) {
+          return entries
+            .filter((entry) => entry.type === "message")
+            .map((entry) => ({ entry_id: entry.id, message: entry.payload as AgentMessage }));
+        }
+        await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+        await this.writeScopeManifest(identity.scope_key);
+        const header = this.entry(identity, "header", {
+          version: 1,
+          scope_key: identity.scope_key,
+          lifecycle_id: identity.lifecycle_id,
+          session_id: identity.session_id,
+        });
+        await this.appendRaw(file, header);
+        const tracked: TrackedSessionMessage[] = [];
+        for (const message of history) {
+          const entry = this.entry(identity, "message", durableSessionMessage(message));
+          await this.appendRaw(file, entry);
+          tracked.push({ entry_id: entry.id, message });
+        }
+        await this.writeManifest(identity);
+        return tracked;
       });
-      await this.appendRaw(file, header);
-      for (const message of history) await this.appendMessage(identity, message);
-      return history.slice();
     });
   }
 
@@ -71,15 +105,52 @@ export class SessionStore {
     return entries.filter((entry) => entry.type === "message").map((entry) => entry.payload as AgentMessage);
   }
 
+  async loadSearchable(identity: SessionIdentity): Promise<AgentMessage[]> {
+    return await this.withQueue(this.mutationQueues, this.path(identity), async () => {
+      const [archived, current] = await Promise.all([
+        this.readArchiveEntries(identity),
+        this.readEntries(identity),
+      ]);
+      const seen = new Set<string>();
+      const messages: AgentMessage[] = [];
+      for (const entry of [...archived, ...current]) {
+        if (entry.type !== "message" || seen.has(entry.id)) continue;
+        seen.add(entry.id);
+        messages.push(entry.payload as AgentMessage);
+      }
+      return messages;
+    });
+  }
+
   async readEntries(identity: SessionIdentity): Promise<SessionEntry[]> {
+    return await this.readSessionEntries(
+      this.path(identity),
+      "Agent session journal",
+      MAX_SESSION_JOURNAL_BYTES,
+    );
+  }
+
+  private async readArchiveEntries(identity: SessionIdentity): Promise<SessionEntry[]> {
+    return await this.readSessionEntries(
+      this.archivePath(identity),
+      "Agent session archive",
+      MAX_SESSION_ARCHIVE_BYTES,
+    );
+  }
+
+  private async readSessionEntries(
+    file: string,
+    label: string,
+    maximumBytes: number,
+  ): Promise<SessionEntry[]> {
     let text: string;
     try {
-      const info = await stat(this.path(identity));
-      if (!info.isFile()) throw new Error("Agent session journal is not a regular file");
-      if (info.size > MAX_SESSION_JOURNAL_BYTES) {
-        throw new Error(`Agent session journal exceeds ${MAX_SESSION_JOURNAL_BYTES} bytes`);
+      const info = await stat(file);
+      if (!info.isFile()) throw new Error(`${label} is not a regular file`);
+      if (info.size > maximumBytes) {
+        throw new Error(`${label} exceeds ${maximumBytes} bytes`);
       }
-      text = await readFile(this.path(identity), "utf8");
+      text = await readFile(file, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -95,14 +166,14 @@ export class SessionStore {
       } catch {
         // A process can die between write(2) and fsync(2). Ignore only the incomplete tail.
         const hasLaterContent = lines.slice(index + 1).some((candidate) => candidate.trim() !== "");
-        if (hasLaterContent) throw new Error(`Corrupt session entry at line ${index + 1}`);
+        if (hasLaterContent) throw new Error(`Corrupt ${label.toLowerCase()} entry at line ${index + 1}`);
       }
     }
     return entries;
   }
 
-  async appendMessage(identity: SessionIdentity, message: AgentMessage): Promise<void> {
-    await this.append(identity, "message", durableSessionMessage(message));
+  async appendMessage(identity: SessionIdentity, message: AgentMessage): Promise<string> {
+    return (await this.append(identity, "message", durableSessionMessage(message))).id;
   }
 
   async appendRun(identity: SessionIdentity, payload: JsonValue): Promise<void> {
@@ -111,24 +182,100 @@ export class SessionStore {
 
   async rewriteCompacted(
     identity: SessionIdentity,
-    messages: AgentMessage[],
+    messages: CompactedSessionMessage[],
     payload: JsonValue,
-  ): Promise<void> {
+    omittedEntryIds: readonly string[] = [],
+    discardedEntryIds: readonly string[] = [],
+  ): Promise<string[]> {
     const file = this.path(identity);
+    return await this.withQueue(this.mutationQueues, file, async () => {
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      await this.writeScopeManifest(identity.scope_key);
+      const current = await this.readEntries(identity);
+      const currentMessages = current.filter((entry) => entry.type === "message");
+      const currentById = new Map(currentMessages.map((entry) => [entry.id, entry]));
+      const archivedIds = new Set((await this.readArchiveEntries(identity)).map((entry) => entry.id));
+      const omittedIds = new Set(omittedEntryIds);
+      const discardedIds = new Set(discardedEntryIds);
+      const retainedIds = new Set<string>();
+      for (const message of messages) {
+        if (!message.entry_id) continue;
+        if (retainedIds.has(message.entry_id)) {
+          throw new Error(`Cannot compact duplicate retained session entry ${message.entry_id}`);
+        }
+        if (omittedIds.has(message.entry_id)) {
+          throw new Error(`Session entry ${message.entry_id} cannot be both retained and omitted`);
+        }
+        if (!currentById.has(message.entry_id)) {
+          throw new Error(`Cannot retain missing session entry ${message.entry_id}`);
+        }
+        retainedIds.add(message.entry_id);
+      }
+      for (const entryId of discardedIds) {
+        if (omittedIds.has(entryId) || retainedIds.has(entryId)) {
+          throw new Error(`Session entry ${entryId} cannot be discarded and retained or omitted`);
+        }
+        if (!currentById.has(entryId)) {
+          throw new Error(`Cannot discard missing session entry ${entryId}`);
+        }
+      }
+      for (const entryId of omittedIds) {
+        if (!currentById.has(entryId) && !archivedIds.has(entryId)) {
+          throw new Error(`Cannot archive missing session entry ${entryId}`);
+        }
+      }
+      const unexpected = currentMessages.find(
+        (entry) => !retainedIds.has(entry.id) && !omittedIds.has(entry.id) && !discardedIds.has(entry.id),
+      );
+      if (unexpected) {
+        throw new Error(`Cannot compact unclassified current session entry ${unexpected.id}`);
+      }
+      await this.appendArchiveEntries(
+        identity,
+        currentMessages.filter((entry) => omittedIds.has(entry.id)),
+      );
+      const compactedMessages = messages.map((message): SessionEntry => {
+        if (!message.entry_id) {
+          return this.entry(identity, "message", durableSessionMessage(message.message));
+        }
+        const currentEntry = currentById.get(message.entry_id)!;
+        return {
+          id: currentEntry.id,
+          type: "message",
+          timestamp: currentEntry.timestamp,
+          ...identity,
+          payload: durableSessionMessage(message.message),
+        };
+      });
+      const entries: SessionEntry[] = [
+        this.entry(identity, "header", {
+          version: 1,
+          scope_key: identity.scope_key,
+          lifecycle_id: identity.lifecycle_id,
+          session_id: identity.session_id,
+        }),
+        ...compactedMessages,
+        this.entry(identity, "compaction", payload),
+      ];
+      await this.replaceRaw(file, entries);
+      await this.writeManifest(identity);
+      return compactedMessages.map((entry) => entry.id);
+    });
+  }
+
+  private async appendArchiveEntries(identity: SessionIdentity, entries: SessionEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+    const file = this.archivePath(identity);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    await this.writeScopeManifest(identity.scope_key);
-    const entries: SessionEntry[] = [
-      this.entry(identity, "header", {
-        version: 1,
-        scope_key: identity.scope_key,
-        lifecycle_id: identity.lifecycle_id,
-        session_id: identity.session_id,
-      }),
-      ...messages.map((message) => this.entry(identity, "message", durableSessionMessage(message))),
-      this.entry(identity, "compaction", payload),
-    ];
-    await this.replaceRaw(file, entries);
-    await this.writeManifest(identity);
+    await this.withQueue(this.archiveQueues, file, async () => {
+      await this.repairJsonlTail(file, "Agent session archive", MAX_SESSION_ARCHIVE_BYTES);
+      const known = new Set((await this.readArchiveEntries(identity)).map((entry) => entry.id));
+      for (const entry of entries) {
+        if (known.has(entry.id)) continue;
+        await this.appendRaw(file, entry);
+        known.add(entry.id);
+      }
+    });
   }
 
   async deleteScope(scopeKey: string, lifecycleId?: string): Promise<void> {
@@ -202,11 +349,19 @@ export class SessionStore {
     await this.replaceText(manifest, `${JSON.stringify({ ...identity, updated_at: nowIso() }, null, 2)}\n`);
   }
 
-  private async append(identity: SessionIdentity, type: SessionEntry["type"], payload: JsonValue | AgentMessage): Promise<void> {
+  private async append(
+    identity: SessionIdentity,
+    type: SessionEntry["type"],
+    payload: JsonValue | AgentMessage,
+  ): Promise<SessionEntry> {
     const file = this.path(identity);
-    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    await this.appendRaw(file, this.entry(identity, type, payload));
-    await this.writeManifest(identity);
+    return await this.withQueue(this.mutationQueues, file, async () => {
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      const entry = this.entry(identity, type, payload);
+      await this.appendRaw(file, entry);
+      await this.writeManifest(identity);
+      return entry;
+    });
   }
 
   private entry(identity: SessionIdentity, type: SessionEntry["type"], payload: JsonValue | AgentMessage): SessionEntry {
@@ -241,6 +396,49 @@ export class SessionStore {
       await next;
     } finally {
       if (this.writeQueues.get(file) === tracked) this.writeQueues.delete(file);
+    }
+  }
+
+  private async repairJsonlTail(file: string, label: string, maximumBytes: number): Promise<void> {
+    let bytes: Buffer;
+    try {
+      const info = await stat(file);
+      if (!info.isFile()) throw new Error(`${label} is not a regular file`);
+      if (info.size > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`);
+      if (info.size === 0) return;
+      bytes = await readFile(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (bytes[bytes.length - 1] === 0x0a) return;
+    const previousLineEnd = bytes.lastIndexOf(0x0a);
+    const tailStart = previousLineEnd + 1;
+    const tail = bytes.subarray(tailStart).toString("utf8").trim();
+    let preserveTail = false;
+    if (tail) {
+      try {
+        const candidate = JSON.parse(tail) as { id?: unknown; type?: unknown };
+        preserveTail = Boolean(
+          candidate
+          && typeof candidate === "object"
+          && typeof candidate.id === "string"
+          && typeof candidate.type === "string",
+        );
+      } catch {
+        preserveTail = false;
+      }
+    }
+    const handle = await open(file, "r+");
+    try {
+      if (preserveTail) {
+        await handle.write("\n", bytes.length, "utf8");
+      } else {
+        await handle.truncate(tailStart);
+      }
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
   }
 

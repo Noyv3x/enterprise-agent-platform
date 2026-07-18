@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .memory_security import memory_content_hash
 from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
 
 
@@ -61,6 +62,8 @@ class Database:
         self._holders: "weakref.WeakSet[_ConnectionHolder]" = weakref.WeakSet()
         self._holders_lock = threading.Lock()
         self.fts_available = False
+        self.message_fts_available = False
+        self.message_fts_trigram_available = False
         self._closed = False
         self.init_schema()
 
@@ -244,11 +247,37 @@ class Database:
                     owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                     content TEXT NOT NULL,
                     tags_json TEXT NOT NULL DEFAULT '[]',
+                    source_type TEXT NOT NULL DEFAULT 'legacy',
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_memories_scope
                     ON agent_memories(scope_key, target, owner_user_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS agent_memory_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_key TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT 'memory' CHECK(target IN ('memory', 'user')),
+                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    memory_id INTEGER REFERENCES agent_memories(id) ON DELETE SET NULL,
+                    created_at INTEGER NOT NULL,
+                    decided_at INTEGER,
+                    decided_by_user_id INTEGER REFERENCES users(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_memory_candidates_scope
+                    ON agent_memory_candidates(
+                        scope_key, owner_user_id, status, created_at DESC
+                    );
 
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -306,11 +335,15 @@ class Database:
             )
             self._ensure_user_columns()
             self._ensure_message_columns()
+            self._ensure_agent_memory_columns()
+            self._ensure_agent_memory_candidate_columns()
+            self._ensure_agent_memory_dedupe()
             self._ensure_agent_scope_columns()
             self._ensure_agent_runtime_scopes()
             self._normalize_attachment_sources()
             self._ensure_telegram_update_columns()
             self._ensure_fts()
+            self._ensure_message_fts()
             self._conn.commit()
 
     def _ensure_user_columns(self) -> None:
@@ -351,6 +384,121 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_visible_scope "
             "ON messages(scope_type, scope_id, hidden_at, id)"
+        )
+
+    def _ensure_agent_memory_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(agent_memories)").fetchall()
+        }
+        additions = {
+            "source_type": (
+                "ALTER TABLE agent_memories "
+                "ADD COLUMN source_type TEXT NOT NULL DEFAULT 'legacy'"
+            ),
+            "source_run_id": (
+                "ALTER TABLE agent_memories "
+                "ADD COLUMN source_run_id TEXT NOT NULL DEFAULT ''"
+            ),
+            "source_message_id": (
+                "ALTER TABLE agent_memories "
+                "ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''"
+            ),
+            "content_hash": (
+                "ALTER TABLE agent_memories "
+                "ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+            ),
+        }
+        for name, sql in additions.items():
+            if name not in columns:
+                self._conn.execute(sql)
+        # Recompute under a temporarily relaxed index so a legacy/wrong hash
+        # can safely converge with its canonical duplicate before the unique
+        # expression index is recreated below.
+        self._conn.execute("DROP INDEX IF EXISTS uq_agent_memories_dedupe")
+        rows = self._conn.execute(
+            "SELECT id, content, content_hash FROM agent_memories"
+        ).fetchall()
+        self._conn.executemany(
+            "UPDATE agent_memories SET content_hash = ? WHERE id = ?",
+            (
+                (computed, int(row["id"]))
+                for row in rows
+                if (computed := memory_content_hash(str(row["content"])))
+                != str(row["content_hash"] or "")
+            ),
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_memories_content_hash "
+            "ON agent_memories(scope_key, target, owner_user_id, content_hash)"
+        )
+
+    def _ensure_agent_memory_candidate_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute(
+                "PRAGMA table_info(agent_memory_candidates)"
+            ).fetchall()
+        }
+        if "memory_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE agent_memory_candidates "
+                "ADD COLUMN memory_id INTEGER REFERENCES agent_memories(id) "
+                "ON DELETE SET NULL"
+            )
+
+    def _ensure_agent_memory_dedupe(self) -> None:
+        """Canonicalize legacy duplicates before enforcing idempotent writes."""
+
+        groups = self._conn.execute(
+            """
+            SELECT scope_key, target, COALESCE(owner_user_id, 0) AS owner_key,
+                   content_hash, MIN(id) AS canonical_id
+            FROM agent_memories
+            WHERE content_hash != ''
+            GROUP BY scope_key, target, COALESCE(owner_user_id, 0), content_hash
+            HAVING count(*) > 1
+            """
+        ).fetchall()
+        for group in groups:
+            duplicate_rows = self._conn.execute(
+                """
+                SELECT id FROM agent_memories
+                WHERE scope_key = ? AND target = ?
+                  AND COALESCE(owner_user_id, 0) = ?
+                  AND content_hash = ? AND id != ?
+                """,
+                (
+                    str(group["scope_key"]),
+                    str(group["target"]),
+                    int(group["owner_key"]),
+                    str(group["content_hash"]),
+                    int(group["canonical_id"]),
+                ),
+            ).fetchall()
+            duplicate_ids = [int(row["id"]) for row in duplicate_rows]
+            if not duplicate_ids:
+                continue
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            self._conn.execute(
+                f"""
+                UPDATE agent_memory_candidates SET memory_id = ?
+                WHERE memory_id IN ({placeholders})
+                """,
+                (int(group["canonical_id"]), *duplicate_ids),
+            )
+            self._conn.execute(
+                f"DELETE FROM agent_memories WHERE id IN ({placeholders})",
+                duplicate_ids,
+            )
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_memories_dedupe
+            ON agent_memories(
+                scope_key, target, COALESCE(owner_user_id, 0), content_hash
+            )
+            WHERE content_hash != ''
+            """
         )
 
     def _ensure_agent_scope_columns(self) -> None:
@@ -525,6 +673,91 @@ class Database:
             # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
             self.fts_available = False
 
+    def _ensure_message_fts(self) -> None:
+        """Maintain a message index for internal cross-session search.
+
+        Trigram tokenization materially improves CJK substring search, but it
+        is optional in some SQLite builds. Keep the normal unicode index
+        available even when creation of the trigram variant fails.
+        """
+
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts "
+                "USING fts5(content, content='messages', content_rowid='id')"
+            )
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS message_fts_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS message_fts_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO message_fts(message_fts, rowid, content)
+                    VALUES ('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS message_fts_au AFTER UPDATE OF content ON messages BEGIN
+                    INSERT INTO message_fts(message_fts, rowid, content)
+                    VALUES ('delete', old.id, old.content);
+                    INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                """
+            )
+            message_count = self._conn.execute(
+                "SELECT count(*) FROM messages"
+            ).fetchone()[0]
+            if message_count > 0:
+                indexed = self._conn.execute(
+                    "SELECT count(*) FROM message_fts_docsize"
+                ).fetchone()[0]
+                if indexed != message_count:
+                    self._conn.execute(
+                        "INSERT INTO message_fts(message_fts) VALUES('rebuild')"
+                    )
+            self.message_fts_available = True
+        except sqlite3.OperationalError:
+            self.message_fts_available = False
+
+        if not self.message_fts_available:
+            self.message_fts_trigram_available = False
+            return
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts_trigram "
+                "USING fts5(content, content='messages', content_rowid='id', tokenize='trigram')"
+            )
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS message_fts_trigram_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO message_fts_trigram(rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS message_fts_trigram_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO message_fts_trigram(message_fts_trigram, rowid, content)
+                    VALUES ('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS message_fts_trigram_au
+                AFTER UPDATE OF content ON messages BEGIN
+                    INSERT INTO message_fts_trigram(message_fts_trigram, rowid, content)
+                    VALUES ('delete', old.id, old.content);
+                    INSERT INTO message_fts_trigram(rowid, content)
+                    VALUES (new.id, new.content);
+                END;
+                """
+            )
+            message_count = self._conn.execute(
+                "SELECT count(*) FROM messages"
+            ).fetchone()[0]
+            if message_count > 0:
+                indexed = self._conn.execute(
+                    "SELECT count(*) FROM message_fts_trigram_docsize"
+                ).fetchone()[0]
+                if indexed != message_count:
+                    self._conn.execute(
+                        "INSERT INTO message_fts_trigram(message_fts_trigram) VALUES('rebuild')"
+                    )
+            self.message_fts_trigram_available = True
+        except sqlite3.OperationalError:
+            self.message_fts_trigram_available = False
+
     def _fts_index_is_stale(self, doc_count: int) -> bool:
         """Report whether the FTS index is missing rows that exist in the source.
 
@@ -544,7 +777,9 @@ class Database:
         return indexed < doc_count
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(
+        self, *, immediate: bool = False
+    ) -> Iterator[sqlite3.Connection]:
         """Run several writes on this thread's connection as one transaction.
 
         Yields the thread-local connection. Statements issued through the
@@ -558,6 +793,8 @@ class Database:
         """
         conn = self._conn
         try:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
         except BaseException:
             try:

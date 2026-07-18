@@ -13,8 +13,13 @@ const ScheduledTasksPanel = lazy(() =>
     default: module.ScheduledTasksPanel,
   })),
 );
+const MemoryPanel = lazy(() =>
+  import("../memory/MemoryPanel").then((module) => ({
+    default: module.MemoryPanel,
+  })),
+);
 
-type SidePanelKind = "tasks" | "browser" | "terminal";
+type SidePanelKind = "memory" | "tasks" | "browser" | "terminal";
 
 interface ChatPreviewSidebarProps {
   scope: AgentPreviewScope | null;
@@ -25,6 +30,7 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
   const { t } = useI18n();
   const { state } = usePreviewAvailability(scope);
   const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
+  const memoryButton = useRef<HTMLButtonElement>(null);
   const tasksButton = useRef<HTMLButtonElement>(null);
   const browserButton = useRef<HTMLButtonElement>(null);
   const terminalButton = useRef<HTMLButtonElement>(null);
@@ -33,10 +39,12 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
   const browserActive = !!scope && state.browserActive;
   const terminalCount = scope ? state.runningTerminalCount : 0;
   const terminalActive = terminalCount > 0;
+  const memoryActive = scope?.scope_type === "private";
   const tasksActive = scope?.scope_type === "private";
-  const hasPreviews = tasksActive || browserActive || terminalActive;
+  const hasPreviews = memoryActive || tasksActive || browserActive || terminalActive;
   const visiblePreview = (
-    (openPreview === "tasks" && tasksActive)
+    (openPreview === "memory" && memoryActive)
+    || (openPreview === "tasks" && tasksActive)
     || (openPreview === "browser" && browserActive)
     || (openPreview === "terminal" && terminalActive)
   ) ? openPreview : null;
@@ -49,17 +57,20 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
     if (openPreview === "browser" && !browserActive) setOpenPreview(null);
     if (openPreview === "terminal" && !terminalActive) setOpenPreview(null);
     if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
-  }, [browserActive, openPreview, tasksActive, terminalActive]);
+    if (openPreview === "memory" && !memoryActive) setOpenPreview(null);
+  }, [browserActive, memoryActive, openPreview, tasksActive, terminalActive]);
 
   useEffect(() => {
     const wasOpen = previousOpen.current;
     previousOpen.current = openPreview;
     if (!wasOpen || openPreview) return;
-    const trigger = wasOpen === "tasks"
-      ? tasksButton.current
-      : wasOpen === "browser"
-        ? browserButton.current
-        : terminalButton.current;
+    const trigger = wasOpen === "memory"
+      ? memoryButton.current
+      : wasOpen === "tasks"
+        ? tasksButton.current
+        : wasOpen === "browser"
+          ? browserButton.current
+          : terminalButton.current;
     requestAnimationFrame(() => {
       if (trigger?.isConnected) trigger.focus();
       else document.querySelector<HTMLElement>(".composer textarea")?.focus();
@@ -79,19 +90,43 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [closePreview, openPreview]);
 
-  const drawerTitle = visiblePreview === "tasks"
-    ? t("scheduledTasks.title")
-    : visiblePreview === "browser"
-      ? t("browserPreview.title")
-      : t("terminalPreview.title");
-  const drawerDescription = visiblePreview === "tasks"
-    ? t("scheduledTasks.description")
-    : visiblePreview === "browser"
-      ? t("browserPreview.description")
-      : t("terminalPreview.description");
-  const drawerIcon = visiblePreview === "tasks" ? "calendar" : visiblePreview === "browser" ? "browser" : "terminal";
+  const drawerTitle = visiblePreview === "memory"
+    ? t("memory.title")
+    : visiblePreview === "tasks"
+      ? t("scheduledTasks.title")
+      : visiblePreview === "browser"
+        ? t("browserPreview.title")
+        : t("terminalPreview.title");
+  const drawerDescription = visiblePreview === "memory"
+    ? t("memory.description")
+    : visiblePreview === "tasks"
+      ? t("scheduledTasks.description")
+      : visiblePreview === "browser"
+        ? t("browserPreview.description")
+        : t("terminalPreview.description");
+  const drawerIcon = visiblePreview === "memory"
+    ? "library"
+    : visiblePreview === "tasks"
+      ? "calendar"
+      : visiblePreview === "browser"
+        ? "browser"
+        : "terminal";
   const drawer = useMemo(() => {
     if (!scope || !visiblePreview) return null;
+    if (visiblePreview === "memory") {
+      return (
+        <Suspense
+          fallback={(
+            <div className="memory-loading" role="status">
+              <Spinner size={20} />
+              <span>{t("memory.loading")}</span>
+            </div>
+          )}
+        >
+          <MemoryPanel key={scopeKey} />
+        </Suspense>
+      );
+    }
     if (visiblePreview === "tasks") {
       return (
         <Suspense
@@ -114,6 +149,20 @@ export function ChatPreviewSidebar({ scope, children }: ChatPreviewSidebarProps)
       <div className="chat">{children}</div>
       {hasPreviews ? (
         <nav className="chat-preview__rail" aria-label={t("preview.sidebarLabel")}>
+          {memoryActive ? (
+            <button
+              ref={memoryButton}
+              className={cx("chat-preview__toggle", visiblePreview === "memory" && "is-active")}
+              type="button"
+              aria-label={t("memory.open")}
+              aria-controls="chat-side-panel"
+              aria-expanded={visiblePreview === "memory"}
+              title={t("memory.open")}
+              onClick={() => setOpenPreview((current) => current === "memory" ? null : "memory")}
+            >
+              <Icon name="library" size={19} />
+            </button>
+          ) : null}
           {tasksActive ? (
             <button
               ref={tasksButton}

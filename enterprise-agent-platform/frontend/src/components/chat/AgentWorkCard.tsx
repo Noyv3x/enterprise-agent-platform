@@ -35,6 +35,7 @@ const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   patch_file: "chat.activity.toolName.patch_file",
   search_files: "chat.activity.toolName.search_files",
   session: "chat.activity.toolName.session",
+  session_search: "chat.activity.toolName.session",
   memory: "chat.activity.toolName.memory",
   knowledge: "chat.activity.toolName.knowledge",
   web: "chat.activity.toolName.web",

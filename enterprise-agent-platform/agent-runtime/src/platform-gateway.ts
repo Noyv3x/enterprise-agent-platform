@@ -26,6 +26,7 @@ export class PlatformGateway {
     const { baseUrl, token } = this.connection(request);
     if (!baseUrl) throw new Error(`Platform gateway is not configured for ${tool}`);
     const owner = ownerUserId(request);
+    const sourceMessageId = sourceMessageIdFor(request);
     const body: GatewayToolRequest = {
       tool,
       action,
@@ -37,6 +38,7 @@ export class PlatformGateway {
         session_id: request.session_id,
         workspace: request.workspace,
         ...(owner === undefined ? {} : { owner_user_id: owner }),
+        ...(sourceMessageId === undefined ? {} : { source_message_id: sourceMessageId }),
       },
     };
     const target = gatewayTarget(baseUrl, body);
@@ -104,19 +106,23 @@ export class PlatformGateway {
 }
 
 function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: "GET" | "POST"; url: string; body?: JsonObject } {
+  const arguments_ = request.tool === "memory"
+    ? authoritativeMemoryArguments(request)
+    : request.arguments;
   const flattened: JsonObject = {
-    ...request.arguments,
+    ...arguments_,
     scope_key: request.context.scope_key,
     lifecycle_id: request.context.lifecycle_id,
     session_id: request.context.session_id,
     run_id: request.context.run_id,
-    ...(request.tool === "memory" && request.context.owner_user_id !== undefined
-      ? { owner_user_id: request.context.owner_user_id }
-      : {}),
   };
   if (request.tool === "memory") {
     if (["search", "read", "list"].includes(request.action)) {
-      return { method: "POST", url: `${baseUrl}/api/agent/tools/memory/search`, body: flattened };
+      return {
+        method: "POST",
+        url: `${baseUrl}/api/agent/tools/memory/search`,
+        body: { ...flattened, action: request.action },
+      };
     }
     const aliases: Record<string, string> = { store: "add", delete: "remove", forget: "remove" };
     return {
@@ -126,7 +132,18 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     };
   }
   if (request.tool === "session") {
-    return { method: "POST", url: `${baseUrl}/api/agent/tools/session/search`, body: flattened };
+    const requestedSession = request.arguments.session_id;
+    return {
+      method: "POST",
+      url: `${baseUrl}/api/agent/tools/session/search`,
+      body: {
+        ...flattened,
+        action: request.action,
+        ...(request.action === "read" && typeof requestedSession === "string"
+          ? { session_id: requestedSession }
+          : {}),
+      },
+    };
   }
   if (request.tool === "knowledge") {
     if (["read", "document", "get"].includes(request.action)) {
@@ -142,9 +159,64 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
   return { method: "POST", url: `${baseUrl}/internal/agent/tools/${request.tool}`, body: request as unknown as JsonObject };
 }
 
-function ownerUserId(request: RunRequest): number | undefined {
+function authoritativeMemoryArguments(request: GatewayToolRequest): JsonObject {
+  const owner = request.context.owner_user_id;
+  const result: JsonObject = { ...request.arguments };
+  delete result.owner_user_id;
+  if (owner !== undefined) result.owner_user_id = owner;
+  if (Array.isArray(request.arguments.operations)) {
+    result.operations = request.arguments.operations.map((operation) => {
+      if (!operation || typeof operation !== "object" || Array.isArray(operation)) return operation;
+      const normalized: JsonObject = { ...(operation as JsonObject) };
+      delete normalized.owner_user_id;
+      if (owner !== undefined) normalized.owner_user_id = owner;
+      delete normalized.source_run_id;
+      delete normalized.source_message_id;
+      delete normalized.source_message_key;
+      delete normalized.source_type;
+      delete normalized.candidate_hash;
+      const operationAction = typeof normalized.action === "string" ? normalized.action : request.action;
+      if (!["search", "read", "list"].includes(operationAction)) {
+        normalized.source_run_id = request.context.run_id;
+        normalized.source_type = "tool";
+        if (request.context.source_message_id !== undefined) {
+          normalized.source_message_id = request.context.source_message_id;
+        }
+      }
+      return normalized;
+    });
+  }
+  if (!["search", "read", "list"].includes(request.action)) {
+    result.source_run_id = request.context.run_id;
+    result.source_type = "tool";
+    if (request.context.source_message_id !== undefined) {
+      result.source_message_id = request.context.source_message_id;
+    } else {
+      delete result.source_message_id;
+    }
+    delete result.source_message_key;
+  } else {
+    delete result.source_run_id;
+    delete result.source_message_id;
+    delete result.source_message_key;
+    delete result.source_type;
+    delete result.candidate_hash;
+  }
+  delete result.candidate_hash;
+  return result;
+}
+
+export function ownerUserId(request: RunRequest): number | undefined {
   const actor = request.metadata?.actor;
   if (!actor || typeof actor !== "object" || Array.isArray(actor)) return undefined;
   const value = (actor as Record<string, unknown>).id;
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function sourceMessageIdFor(request: RunRequest): number | undefined {
+  const explicit = request.metadata?.source_message_id;
+  if (typeof explicit === "number" && Number.isSafeInteger(explicit) && explicit > 0) {
+    return explicit;
+  }
+  return undefined;
 }

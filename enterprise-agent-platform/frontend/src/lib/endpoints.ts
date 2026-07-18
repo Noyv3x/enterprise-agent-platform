@@ -15,6 +15,12 @@ import type {
   AutoUpdateConfigUpdateRequest,
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
+  AgentMemoriesExportResponse,
+  AgentMemoriesResponse,
+  AgentMemoryCandidateDecisionResponse,
+  AgentMemoryCandidatesResponse,
+  AgentMemoryMutationRequest,
+  AgentMemoryMutationResponse,
   AgentPreviewStatusResponse,
   AgentScheduleResponse,
   AgentScheduleRunsResponse,
@@ -33,6 +39,7 @@ import type {
   DeleteClearAllRequest,
   DeleteResultResponse,
   DeleteAgentScheduleResponse,
+  DeleteAgentMemoryResponse,
   DocumentResponse,
   DocumentsResponse,
   ImpersonateUserResponse,
@@ -69,7 +76,7 @@ import type {
   UsersResponse,
 } from "../types";
 
-export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 /** An endpoint descriptor. `Body`/`Res` are phantom (type-only) so the data
  *  layer can derive request/response types from a single declaration. */
@@ -183,6 +190,54 @@ export const endpoints = {
   deletePrivateSchedule: ep<void, DeleteAgentScheduleResponse, [Id]>(
     "DELETE",
     (id) => `/api/private-agent/schedules/${encodeURIComponent(String(id))}`,
+  ),
+
+  /* private Agent durable memory */
+  privateAgentMemories: ep<void, AgentMemoriesResponse, [string, string, number]>(
+    "GET",
+    (target, query, limit) => {
+      const params = new URLSearchParams({ target, limit: String(limit) });
+      if (query) params.set("q", query);
+      return `/api/private-agent/memories?${params.toString()}`;
+    },
+  ),
+  createPrivateAgentMemory: ep<AgentMemoryMutationRequest, AgentMemoryMutationResponse>(
+    "POST",
+    () => "/api/private-agent/memories",
+  ),
+  updatePrivateAgentMemory: ep<AgentMemoryMutationRequest, AgentMemoryMutationResponse, [Id]>(
+    "PATCH",
+    (id) => `/api/private-agent/memories/${encodeURIComponent(String(id))}`,
+  ),
+  deletePrivateAgentMemory: ep<void, DeleteAgentMemoryResponse, [Id]>(
+    "DELETE",
+    (id) => `/api/private-agent/memories/${encodeURIComponent(String(id))}`,
+  ),
+  clearPrivateAgentMemories: ep<void, DeleteAgentMemoryResponse, [string]>(
+    "DELETE",
+    (target) => {
+      const params = new URLSearchParams({ target });
+      return `/api/private-agent/memories?${params.toString()}`;
+    },
+  ),
+  exportPrivateAgentMemories: ep<void, AgentMemoriesExportResponse>(
+    "GET",
+    () => "/api/private-agent/memories/export",
+  ),
+  privateAgentMemoryCandidates: ep<void, AgentMemoryCandidatesResponse, [string, number]>(
+    "GET",
+    (status, limit) => {
+      const params = new URLSearchParams({ status, limit: String(limit) });
+      return `/api/private-agent/memory-candidates?${params.toString()}`;
+    },
+  ),
+  approvePrivateAgentMemoryCandidate: ep<void, AgentMemoryCandidateDecisionResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/memory-candidates/${encodeURIComponent(String(id))}/approve`,
+  ),
+  rejectPrivateAgentMemoryCandidate: ep<void, AgentMemoryCandidateDecisionResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/memory-candidates/${encodeURIComponent(String(id))}/reject`,
   ),
 
   /* read-only Agent previews */

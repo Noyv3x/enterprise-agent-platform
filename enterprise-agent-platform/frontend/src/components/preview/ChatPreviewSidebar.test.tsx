@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   browserRender: vi.fn(),
   terminalRender: vi.fn(),
   schedulesRender: vi.fn(),
+  memoryRender: vi.fn(),
 }));
 
 vi.mock("./usePreviewAvailability", () => ({
@@ -50,6 +51,13 @@ vi.mock("../scheduled-tasks/ScheduledTasksPanel", () => ({
   },
 }));
 
+vi.mock("../memory/MemoryPanel", () => ({
+  MemoryPanel: () => {
+    mocks.memoryRender();
+    return <div data-testid="memory-panel-fixture" />;
+  },
+}));
+
 const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" };
 
 function renderSidebar(scope: AgentPreviewScope | null = privateScope) {
@@ -70,6 +78,7 @@ describe("ChatPreviewSidebar", () => {
     mocks.browserRender.mockClear();
     mocks.terminalRender.mockClear();
     mocks.schedulesRender.mockClear();
+    mocks.memoryRender.mockClear();
   });
 
   afterEach(() => {
@@ -77,16 +86,35 @@ describe("ChatPreviewSidebar", () => {
     localStorage.clear();
   });
 
-  it("keeps a private task entry visible while live preview resources are idle", () => {
+  it("keeps private memory and task entries visible while live preview resources are idle", () => {
     renderSidebar();
 
     expect(screen.getByText("Chat content")).toBeVisible();
     expect(screen.getByRole("navigation", { name: "Agent side tools" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open memory manager" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open scheduled tasks" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Open browser preview" })).not.toBeInTheDocument();
     expect(mocks.browserRender).not.toHaveBeenCalled();
     expect(mocks.terminalRender).not.toHaveBeenCalled();
     expect(mocks.schedulesRender).not.toHaveBeenCalled();
+    expect(mocks.memoryRender).not.toHaveBeenCalled();
+  });
+
+  it("opens memory management on demand only for a private Agent", async () => {
+    const view = renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Open memory manager" }));
+    expect(screen.getByRole("complementary", { name: "Memory" })).toBeVisible();
+    expect(await screen.findByTestId("memory-panel-fixture")).toBeVisible();
+
+    view.rerender(
+      <I18nProvider>
+        <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+          <div>Channel chat</div>
+        </ChatPreviewSidebar>
+      </I18nProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Open memory manager" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("memory-panel-fixture")).not.toBeInTheDocument();
   });
 
   it("opens scheduled tasks on demand only for a private Agent", async () => {
@@ -134,6 +162,17 @@ describe("ChatPreviewSidebar", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open browser preview" }));
     expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
+  });
+
+  it("keeps memory and scheduled tasks mutually exclusive", async () => {
+    renderSidebar();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open memory manager" }));
+    expect(await screen.findByTestId("memory-panel-fixture")).toBeVisible();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
+    expect(screen.queryByTestId("memory-panel-fixture")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
   });
 
   it("shows the running terminal count and closes the drawer as soon as terminals finish", async () => {

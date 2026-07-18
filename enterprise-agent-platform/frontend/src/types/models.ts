@@ -345,6 +345,34 @@ export interface AgentSchedule {
   updated_at: string;
 }
 
+/* ------------------------------------------------------- durable Agent memory */
+
+export type AgentMemoryTarget = "memory" | "user";
+
+export interface AgentMemory {
+  id: number;
+  target: AgentMemoryTarget;
+  content: string;
+  tags: string[];
+  created_at: number | string;
+  updated_at: number | string;
+  source_type: "legacy" | "manual" | "tool" | "candidate";
+  blocked: boolean;
+  blocked_reasons: string[];
+}
+
+export interface AgentMemoryCandidate {
+  id: number;
+  target: AgentMemoryTarget;
+  content: string;
+  tags: string[];
+  status: "pending" | "approved" | "rejected";
+  source_message_id: string;
+  created_at: number | string;
+  decided_at: number | string | null;
+  memory_id: number | null;
+}
+
 /* ------------------------------------------------------------- knowledge */
 
 export interface KnowledgeDocument {

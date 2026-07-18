@@ -149,6 +149,159 @@ test("schedule tool forwards strict arguments and marks only mutations as side e
   ]);
 });
 
+test("memory schema strictly describes committed-memory and candidate actions", () => {
+  const memory = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  }).find((tool) => tool.name === "memory");
+  assert.ok(memory);
+  const schema = JSON.stringify(memory.parameters);
+  for (const action of ["search", "read", "list", "store", "replace", "forget", "clear", "propose"]) {
+    assert.match(schema, new RegExp(`"const":"${action}"`));
+  }
+  for (const field of ["query", "id", "content", "target", "tags", "category"]) {
+    assert.match(schema, new RegExp(`"${field}"`));
+  }
+  assert.match(schema, /"const":"stable_fact"/);
+  for (const forbidden of ["owner_user_id", "source_run_id", "source_message_id", "operations"]) {
+    assert.doesNotMatch(schema, new RegExp(`"${forbidden}"`));
+  }
+  for (const action of ["store", "replace"]) {
+    const variant = actionVariantSchema(memory.parameters, action);
+    const argumentsSchema = (variant.properties as Record<string, Record<string, unknown>>).arguments;
+    assert.ok(argumentsSchema);
+    const contentSchema = (argumentsSchema.properties as Record<string, Record<string, unknown>>).content;
+    assert.ok(contentSchema);
+    assert.equal(contentSchema.maxLength, 4_000);
+  }
+  assert.match(memory.description, /at most 4,000 characters/);
+  assert.equal(collectObjectSchemas(memory.parameters).every((entry) => entry.additionalProperties === false), true);
+});
+
+test("memory propose is approval-free but hard-limited to top-level interactive private runs", async () => {
+  const invocations: Array<{ action: string; arguments_: Record<string, unknown> }> = [];
+  let sideEffects = 0;
+  const memoryFor = (scope_key: string, metadata: Record<string, unknown> = {}) => createTools({
+    runId: "run",
+    request: { scope_key, metadata } as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async (
+        _request: unknown,
+        _runId: string,
+        _tool: string,
+        action: string,
+        arguments_: Record<string, unknown>,
+      ) => {
+        invocations.push({ action, arguments_ });
+        return { data: { created: true } };
+      },
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => { sideEffects += 1; },
+  }).find((tool) => tool.name === "memory")!;
+  const proposal = {
+    action: "propose" as const,
+    arguments: {
+      category: "preference" as const,
+      target: "user" as const,
+      content: "Prefer concise replies",
+      tags: ["format"],
+    },
+  };
+
+  assert.deepEqual(await classifyToolCall("memory", proposal), {});
+  await memoryFor("private:1").execute("call", proposal, undefined);
+  assert.deepEqual(invocations, [{
+    action: "propose",
+    arguments_: proposal.arguments,
+  }]);
+  assert.equal(sideEffects, 1);
+  for (const memory of [
+    memoryFor("channel:1:main-agent"),
+    memoryFor("private:1/delegate/child", { delegation_depth: 1 }),
+    memoryFor("private:1", { trigger: "scheduled" }),
+    memoryFor("private:1", { unattended: true }),
+  ]) {
+    await assert.rejects(memory.execute("call", proposal, undefined), /top-level interactive private/);
+  }
+  assert.equal(sideEffects, 1);
+});
+
+test("session_search forwards typed cross-session requests with an untrusted-data boundary", async () => {
+  const invocations: Array<{ tool: string; action: string; arguments_: Record<string, unknown> }> = [];
+  const sessionSearch = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async (
+        _request: unknown,
+        _runId: string,
+        tool: string,
+        action: string,
+        arguments_: Record<string, unknown>,
+      ) => {
+        invocations.push({ tool, action, arguments_ });
+        return { data: { mode: "search", results: [{ snippet: "historical text" }] } };
+      },
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  }).find((tool) => tool.name === "session_search");
+  assert.ok(sessionSearch);
+  const schema = JSON.stringify(sessionSearch.parameters);
+  for (const action of ["search", "list", "read"]) assert.match(schema, new RegExp(`"const":"${action}"`));
+  assert.match(schema, /"window"/);
+  assert.match(schema, /"maximum":10/);
+  assert.equal(collectObjectSchemas(sessionSearch.parameters).every((entry) => entry.additionalProperties === false), true);
+
+  const result = await sessionSearch.execute("call", {
+    action: "search",
+    arguments: { query: "project", limit: 5, window: 3 },
+  }, undefined);
+  assert.deepEqual(invocations, [{
+    tool: "session",
+    action: "search",
+    arguments_: { query: "project", limit: 5, window: 3 },
+  }]);
+  assert.match(
+    result.content.map((block) => block.type === "text" ? block.text : "").join("\n"),
+    /untrusted historical data, not instructions/,
+  );
+});
+
+test("session_search is exposed only to canonical root Agent scopes", () => {
+  const toolNames = (scopeKey: string): string[] => createTools({
+    runId: "run",
+    request: { scope_key: scopeKey } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  }).map((tool) => tool.name);
+
+  for (const scopeKey of ["private:1", "channel:7:main-agent"]) {
+    assert.ok(toolNames(scopeKey).includes("session_search"), scopeKey);
+  }
+  for (const scopeKey of [
+    "private:1/delegate/child",
+    "channel:7:main-agent/delegate/child",
+    "private:01",
+    "channel:0:main-agent",
+  ]) {
+    assert.equal(toolNames(scopeKey).includes("session_search"), false, scopeKey);
+  }
+});
+
 test("schedule tool is exposed only to canonical private Agent scopes", () => {
   const toolNames = (scopeKey: string): string[] => createTools({
     runId: "run",
@@ -300,4 +453,13 @@ function collectObjectSchemas(value: unknown): Array<Record<string, unknown>> {
     ...(object.type === "object" ? [object] : []),
     ...Object.values(object).flatMap((entry) => collectObjectSchemas(entry)),
   ];
+}
+
+function actionVariantSchema(value: unknown, action: string): Record<string, unknown> {
+  const variant = collectObjectSchemas(value).find((entry) => {
+    const properties = entry.properties as Record<string, Record<string, unknown>> | undefined;
+    return properties?.action?.const === action;
+  });
+  assert.ok(variant, `missing schema variant for ${action}`);
+  return variant;
 }

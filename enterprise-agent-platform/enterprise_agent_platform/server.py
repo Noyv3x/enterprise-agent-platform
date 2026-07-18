@@ -28,10 +28,7 @@ from .service import BOOTSTRAP_ADMIN_PASSWORD_FILE, EnterpriseService, ServiceEr
 COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
-# Only methods that are actually routed (none use PATCH today) need CSRF
-# same-origin enforcement; a method with no do_<METHOD> handler can never reach
-# the dispatcher, so listing it here would be dead.
-UNSAFE_METHODS = {"POST", "PUT", "DELETE"}
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Server-sent events: how often the stream checks for scope changes, and the
 # max lifetime of one connection before the browser's EventSource reconnects.
 SSE_POLL_INTERVAL = 0.4
@@ -172,6 +169,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         self._dispatch("PUT")
 
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
+
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")
 
@@ -180,7 +180,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         # an Allow advertisement and the standard security headers instead of the
         # stdlib's bare HTML 501 page.
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Allow", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Allow", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self._send_security_headers()
@@ -464,6 +464,66 @@ class RequestHandler(BaseHTTPRequestHandler):
             content, attachments = self._body_message()
             self._json(service.send_private_message(actor, content, attachments), status=201)
             return
+        if path == "/api/private-agent/memories/export" and method == "GET":
+            self._json(service.user_export_memories(actor))
+            return
+        if path == "/api/private-agent/memories" and method == "GET":
+            self._json(
+                service.user_list_memories(
+                    actor,
+                    target=first(query, "target", "all"),
+                    query=first(query, "q", ""),
+                    limit=int_arg(query, "limit", 200),
+                )
+            )
+            return
+        if path == "/api/private-agent/memories" and method == "POST":
+            self._json(
+                service.user_create_memory(actor, self._body_json()),
+                status=201,
+            )
+            return
+        if path == "/api/private-agent/memories" and method == "DELETE":
+            self._json(
+                service.user_clear_memories(actor, first(query, "target", ""))
+            )
+            return
+        m = re.fullmatch(r"/api/private-agent/memories/(\d+)", path)
+        if m and method == "GET":
+            self._json(service.user_get_memory(actor, int(m.group(1))))
+            return
+        if m and method == "PATCH":
+            self._json(
+                service.user_update_memory(
+                    actor, int(m.group(1)), self._body_json()
+                )
+            )
+            return
+        if m and method == "DELETE":
+            self._json(service.user_delete_memory(actor, int(m.group(1))))
+            return
+        if path == "/api/private-agent/memory-candidates" and method == "GET":
+            self._json(
+                service.user_list_memory_candidates(
+                    actor,
+                    status=first(query, "status", "pending"),
+                    limit=int_arg(query, "limit", 100),
+                )
+            )
+            return
+        m = re.fullmatch(
+            r"/api/private-agent/memory-candidates/(\d+)/(approve|reject)",
+            path,
+        )
+        if m and method == "POST":
+            candidate_id = int(m.group(1))
+            payload = (
+                service.user_approve_memory_candidate(actor, candidate_id)
+                if m.group(2) == "approve"
+                else service.user_reject_memory_candidate(actor, candidate_id)
+            )
+            self._json(payload)
+            return
         if path == "/api/private-agent/agent-status" and method == "GET":
             self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
             return
@@ -686,7 +746,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(service.agent_memory_search(self._body_json()))
             return
         if path == "/api/agent/tools/memory" and method == "POST":
-            self._json(service.agent_memory_mutate(self._body_json()))
+            body = self._body_json()
+            if str(body.get("action") or "").strip().lower() == "propose":
+                self._json(service.agent_memory_propose(body))
+            else:
+                self._json(service.agent_memory_mutate(body))
             return
         if path == "/api/agent/tools/session/search" and method == "POST":
             self._json(service.agent_session_search(self._body_json()))

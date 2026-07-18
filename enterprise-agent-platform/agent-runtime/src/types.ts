@@ -46,6 +46,7 @@ export interface RunMetadata extends JsonObject {
   parent_run_id?: string;
   delegation_depth?: number;
   idempotency_key?: string;
+  source_message_id?: number;
   approval_owner_run_id?: string;
   approval_scope_key?: string;
   approval_session_id?: string;
@@ -155,12 +156,16 @@ export interface GatewayToolRequest {
     session_id: string;
     workspace: string;
     owner_user_id?: number;
+    source_message_id?: number;
   };
 }
 
 export interface GatewayToolResponse {
   content?: string;
   data?: JsonValue;
+  memories?: JsonValue[];
+  memory?: JsonValue;
+  found?: boolean;
   is_error?: boolean;
   error?: string;
 }

@@ -6,6 +6,7 @@ import { coreMessages } from "./messages/core";
 import { workspaceMessages } from "./messages/workspace";
 import { previewMessages } from "./messages/preview";
 import { scheduledTaskMessages } from "./messages/scheduledTasks";
+import { memoryMessages } from "./messages/memory";
 import {
   LOCALE_STORAGE_KEY,
   applyDocumentLocale,
@@ -110,7 +111,15 @@ describe("translation catalogs", () => {
   it("does not shadow keys while merging domain catalogs", () => {
     const seen = new Set<string>();
     const duplicates: string[] = [];
-    for (const domain of [coreMessages, adminMessages, chatMessages, workspaceMessages, previewMessages, scheduledTaskMessages]) {
+    for (const domain of [
+      coreMessages,
+      adminMessages,
+      chatMessages,
+      workspaceMessages,
+      previewMessages,
+      scheduledTaskMessages,
+      memoryMessages,
+    ]) {
       for (const key of Object.keys(domain)) {
         if (seen.has(key)) duplicates.push(key);
         seen.add(key);
