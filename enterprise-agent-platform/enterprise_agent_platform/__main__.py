@@ -17,6 +17,13 @@ def main() -> None:
     serve.add_argument("--host", default=None)
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument("--data", default=None)
+    serve.add_argument("--listen-host", default=None, help=argparse.SUPPRESS)
+    serve.add_argument("--listen-port", type=int, default=None, help=argparse.SUPPRESS)
+
+    gateway = sub.add_parser("gateway", help="Start the persistent platform gateway")
+    from .gateway import add_gateway_args
+
+    add_gateway_args(gateway)
 
     init_admin = sub.add_parser("init-admin", help="Create an admin user")
     init_admin.add_argument("username")
@@ -48,7 +55,16 @@ def main() -> None:
         config = replace(config, port=args.port)
 
     if cmd == "serve":
-        run_server(config)
+        run_server(
+            config,
+            listen_host=getattr(args, "listen_host", None),
+            listen_port=getattr(args, "listen_port", None),
+        )
+        return
+    if cmd == "gateway":
+        from .gateway import run_gateway
+
+        run_gateway(config, mode=args.mode)
         return
 
     service = EnterpriseService(config, autostart_runtime=False)

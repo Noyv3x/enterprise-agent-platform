@@ -45,7 +45,7 @@ class _ServeExitRunner:
 
     def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
         self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout, "check": check})
-        if len(cmd) >= 2 and cmd[1] == "serve":
+        if len(cmd) >= 2 and cmd[1] == "gateway":
             return subprocess.CompletedProcess(cmd, self.serve_returncode)
         return subprocess.CompletedProcess(cmd, 0)
 
@@ -62,7 +62,7 @@ class RunForegroundRegressionTests(unittest.TestCase):
             manager = self._make_manager(Path(td), runner)
             with self.assertRaises(DeploymentError):
                 manager.run_foreground(host="127.0.0.1", port=8765)
-            self.assertTrue(any(call["cmd"][1] == "serve" for call in runner.calls))
+            self.assertTrue(any(call["cmd"][1] == "gateway" for call in runner.calls))
 
     def test_run_foreground_succeeds_on_clean_exit(self):
         with tempfile.TemporaryDirectory() as td:

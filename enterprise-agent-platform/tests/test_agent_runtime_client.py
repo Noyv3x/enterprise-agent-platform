@@ -76,6 +76,16 @@ class _FakeRuntime:
                 if self.path == "/v1/scopes/process-summary?scope_key=private%3A7&lifecycle_id=life-7":
                     self._json(200, {"running_terminal_count": 2})
                     return
+                if self.path == "/v1/processes/update-blockers":
+                    self._json(
+                        200,
+                        {
+                            "running_background_terminal_count": 3,
+                            "update_blocking_terminal_count": 2,
+                            "terminable_background_terminal_count": 1,
+                        },
+                    )
+                    return
                 if self.path == "/v1/runs/run-1/events":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -689,6 +699,48 @@ class AgentRuntimeClientTests(unittest.TestCase):
         )
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
         self.assertEqual(request["accept"], "application/json")
+
+    def test_update_blocker_summary_uses_the_global_metadata_only_endpoint(self):
+        result = self.client.update_blocker_summary()
+
+        self.assertEqual(
+            result,
+            {
+                "running_background_terminal_count": 3,
+                "update_blocking_terminal_count": 2,
+                "terminable_background_terminal_count": 1,
+            },
+        )
+        request = self.runtime.request("GET", "/v1/processes/update-blockers")
+        self.assertEqual(request["authorization"], "Bearer runtime-secret")
+        self.assertEqual(request["accept"], "application/json")
+
+    def test_update_blocker_summary_rejects_invalid_or_inconsistent_counts(self):
+        cases = [
+            {
+                "running_background_terminal_count": True,
+                "update_blocking_terminal_count": 0,
+                "terminable_background_terminal_count": 1,
+            },
+            {
+                "running_background_terminal_count": 2,
+                "update_blocking_terminal_count": -1,
+                "terminable_background_terminal_count": 3,
+            },
+            {
+                "running_background_terminal_count": 4,
+                "update_blocking_terminal_count": 2,
+                "terminable_background_terminal_count": 1,
+            },
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload), mock.patch.object(
+                self.client,
+                "_json_request",
+                return_value=(payload, {}),
+            ):
+                with self.assertRaises(AgentRuntimeProtocolError):
+                    self.client.update_blocker_summary()
 
     def test_http_error_exposes_status_and_runtime_message(self):
         self.runtime.errors["/health"] = (503, {"error": {"message": "runtime is warming up"}})

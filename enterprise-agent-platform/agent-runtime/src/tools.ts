@@ -91,6 +91,12 @@ const terminalSchema = Type.Object({
   background: Type.Optional(Type.Boolean({
     description: "Start a long-lived process and return its process id immediately.",
   })),
+  update_behavior: Type.Optional(Type.Union([
+    Type.Literal("wait"),
+    Type.Literal("terminate"),
+  ], {
+    description: "Update policy for a background process. Defaults to wait; use terminate only for disposable work that may stop during a platform update.",
+  })),
 });
 
 const processSchema = Type.Object({
@@ -551,6 +557,10 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     parameters: terminalSchema,
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, onUpdate) {
+      const background = params.background ?? false;
+      if (!background && params.update_behavior !== undefined) {
+        throw new Error("update_behavior is supported only when background=true");
+      }
       context.markSideEffect();
       const cwd = resolveWorkspacePath(context.request.workspace, params.cwd || ".");
       const options: Parameters<ProcessRegistry["run"]>[0] = {
@@ -559,7 +569,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         lifecycleId: context.request.lifecycle_id,
         command: params.command,
         cwd,
-        background: params.background ?? false,
+        background,
         onUpdate(update) {
           const output = update.stdout ?? update.stderr ?? "";
           onUpdate?.(textResult(output, update));
@@ -567,6 +577,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       };
       if (signal) options.signal = signal;
       if (params.timeout_ms !== undefined) options.timeoutMs = params.timeout_ms;
+      if (params.update_behavior !== undefined) options.updateBehavior = params.update_behavior;
       const result = await context.processes.run(options);
       return textResult(
         result.status === "running"

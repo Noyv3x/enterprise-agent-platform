@@ -701,7 +701,27 @@ export interface AutoUpdateConfigValues {
   webhook_url?: string;
 }
 
+export type PlatformUpdateState =
+  | "idle"
+  | "checking"
+  | "waiting_for_tasks"
+  | "launching"
+  | "updating"
+  | "failed";
+
+/** Public, deliberately redacted update state used before authentication. */
+export interface PlatformUpdateStatus {
+  state: PlatformUpdateState;
+  /** Accepted temporarily while older/newer backend revisions overlap. */
+  phase?: PlatformUpdateState;
+  instance_id?: string;
+  retry_after_ms?: number;
+}
+
 export interface AutoUpdateStatus {
+  state?: PlatformUpdateState;
+  /** Compatibility alias for revisions that shipped the phase name first. */
+  phase?: PlatformUpdateState;
   in_progress?: boolean;
   update_started?: boolean;
   update_available?: boolean;
@@ -712,6 +732,10 @@ export interface AutoUpdateStatus {
   last_trigger?: string;
   last_error?: string;
   dirty_summary?: string;
+  active_tasks?: number;
+  queued_tasks?: number;
+  protected_processes?: number;
+  waiting_since?: number | string;
 }
 
 export interface AutoUpdateConfigState {

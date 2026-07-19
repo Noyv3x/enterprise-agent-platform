@@ -94,6 +94,9 @@ class AgentClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def update_blocker_summary(self) -> dict[str, int]:
+        ...
+
 
 class AgentRuntimeError(RuntimeError):
     """Base error for the platform-owned Agent runtime client."""
@@ -514,6 +517,38 @@ class AgentRuntimeClient:
                 "Agent runtime process summary has an invalid running terminal count"
             )
         return {"running_terminal_count": count}
+
+    def update_blocker_summary(self) -> dict[str, int]:
+        """Fetch global background-terminal counts without process details."""
+
+        result, _ = self._json_request(
+            "GET",
+            "/v1/processes/update-blockers",
+            None,
+            timeout=min(self.timeout_seconds, 5.0),
+            max_response_bytes=64 * 1024,
+        )
+        summary: dict[str, int] = {}
+        for field in (
+            "running_background_terminal_count",
+            "update_blocking_terminal_count",
+            "terminable_background_terminal_count",
+        ):
+            count = result.get(field)
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise AgentRuntimeProtocolError(
+                    f"Agent runtime update blocker summary has an invalid {field}"
+                )
+            summary[field] = count
+        if (
+            summary["running_background_terminal_count"]
+            != summary["update_blocking_terminal_count"]
+            + summary["terminable_background_terminal_count"]
+        ):
+            raise AgentRuntimeProtocolError(
+                "Agent runtime update blocker summary has inconsistent counts"
+            )
+        return summary
 
     def _cancel_after_stream_failure(self, run_id: str) -> None:
         """Fail closed when the client can no longer observe a live run."""

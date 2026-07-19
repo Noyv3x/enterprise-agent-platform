@@ -5,6 +5,7 @@ import {
   ApiRequestCancelledError,
   ApiTimeoutError,
   api,
+  registerPlatformUpdatingHandler,
   resetApiSession,
 } from "./api";
 
@@ -59,6 +60,22 @@ describe("api request lifecycle", () => {
     vi.stubGlobal("fetch", vi.fn(async () => response(403, { error: "forbidden" })));
     const request = api("/api/protected");
     await expect(request).rejects.toMatchObject({ status: 403, message: "forbidden" });
+  });
+
+  it("preserves the maintenance code and notifies the update gate", async () => {
+    const handler = vi.fn();
+    const unregister = registerPlatformUpdatingHandler(handler);
+    vi.stubGlobal("fetch", vi.fn(async () => response(503, {
+      code: "platform_updating",
+      error: "platform_updating",
+    })));
+
+    await expect(api("/api/test")).rejects.toMatchObject({
+      status: 503,
+      code: "platform_updating",
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+    unregister();
   });
 
   it("localizes client-generated timeout and HTTP fallback errors", async () => {

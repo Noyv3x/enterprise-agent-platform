@@ -339,6 +339,7 @@ test("runtime exposes a lightweight live-process summary without terminal output
       command: "printf sibling-summary-secret; sleep 30",
       cwd: workspace,
       background: true,
+      updateBehavior: "terminate",
     });
     await coordinator.processes.run({
       runId: "old-life-live-run",
@@ -370,6 +371,25 @@ test("runtime exposes a lightweight live-process summary without terminal output
     const raw = await response.text();
     assert.deepEqual(JSON.parse(raw), { running_terminal_count: 2 });
     assert.doesNotMatch(raw, /summary-secret|command|stdout|stderr|output|processes/);
+
+    assert.equal((await fetch(`${base}/v1/processes/update-blockers`)).status, 401);
+    assert.equal((await fetch(`${base}/v1/processes/update-blockers?scope_key=private%3A9`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+    const blockerResponse = await fetch(`${base}/v1/processes/update-blockers`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    assert.equal(blockerResponse.status, 200);
+    const blockerRaw = await blockerResponse.text();
+    assert.deepEqual(JSON.parse(blockerRaw), {
+      running_background_terminal_count: 4,
+      update_blocking_terminal_count: 3,
+      terminable_background_terminal_count: 1,
+    });
+    assert.doesNotMatch(
+      blockerRaw,
+      /summary-secret|command|scope|lifecycle|pid|stdout|stderr|output|processes/,
+    );
   } finally {
     coordinator.processes.killScope("private:9");
     coordinator.processes.killScope("private:90");

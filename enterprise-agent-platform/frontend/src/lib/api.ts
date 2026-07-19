@@ -11,8 +11,10 @@
 import { t } from "../i18n";
 
 type SessionExpiredHandler = () => void;
+type PlatformUpdatingHandler = () => void;
 
 let sessionExpiredHandler: SessionExpiredHandler | null = null;
+let platformUpdatingHandler: PlatformUpdatingHandler | null = null;
 let sessionGeneration = 0;
 const activeRequests = new Set<AbortController>();
 
@@ -20,11 +22,13 @@ export const DEFAULT_API_TIMEOUT_MS = 60_000;
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -57,6 +61,19 @@ export function registerSessionExpiredHandler(fn: SessionExpiredHandler): () => 
   return () => {
     if (sessionExpiredHandler === fn) sessionExpiredHandler = null;
   };
+}
+
+/** UpdateGate registers this so an API maintenance response switches the
+ * already-open application to its blocking screen without waiting for a poll. */
+export function registerPlatformUpdatingHandler(fn: PlatformUpdatingHandler): () => void {
+  platformUpdatingHandler = fn;
+  return () => {
+    if (platformUpdatingHandler === fn) platformUpdatingHandler = null;
+  };
+}
+
+export function _invokePlatformUpdating(): void {
+  platformUpdatingHandler?.();
 }
 
 /** Invoked by api() on a 401 (unless skipAuthHandling). */
@@ -134,8 +151,16 @@ export async function api<T = unknown>(path: string, options: ApiOptions = {}): 
       if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
     }
     if (!res.ok) {
-      const err = data as { error?: string; detail?: string };
-      throw new ApiError(err.error || err.detail || t("api.failed", { status: res.status }), res.status);
+      const err = data as { code?: string; error?: string; detail?: string };
+      const code = err.code || (err.error === "platform_updating" ? err.error : undefined);
+      if (res.status === 503 && code === "platform_updating") {
+        _invokePlatformUpdating();
+      }
+      throw new ApiError(
+        err.error || err.detail || t("api.failed", { status: res.status }),
+        res.status,
+        code,
+      );
     }
     return data as T;
   } catch (error) {

@@ -39,6 +39,51 @@ export const coreMessages = defineMessages({
     en: "Restoring your secure session…",
     "zh-TW": "正在恢復安全工作階段…",
   },
+  "maintenance.eyebrow": {
+    "zh-CN": "系统维护",
+    en: "System maintenance",
+    "zh-TW": "系統維護",
+  },
+  "maintenance.probingTitle": {
+    "zh-CN": "正在连接 ubitech agent",
+    en: "Connecting to ubitech agent",
+    "zh-TW": "正在連線至 ubitech agent",
+  },
+  "maintenance.probingDetail": {
+    "zh-CN": "正在确认服务状态，请稍候。",
+    en: "Checking service status. Please wait.",
+    "zh-TW": "正在確認服務狀態，請稍候。",
+  },
+  "maintenance.title": {
+    "zh-CN": "正在更新 ubitech agent",
+    en: "Updating ubitech agent",
+    "zh-TW": "正在更新 ubitech agent",
+  },
+  "maintenance.detail": {
+    "zh-CN": "服务暂时停止使用。更新和健康检查完成后，页面会自动恢复。",
+    en: "The service is temporarily unavailable. This page will recover automatically after the update and health checks finish.",
+    "zh-TW": "服務暫時停止使用。更新與健康檢查完成後，頁面會自動恢復。",
+  },
+  "maintenance.hint": {
+    "zh-CN": "请保持此页面打开，无需手动刷新。",
+    en: "Keep this page open. No manual refresh is needed.",
+    "zh-TW": "請保持此頁面開啟，無需手動重新整理。",
+  },
+  "maintenance.failedTitle": {
+    "zh-CN": "更新未能安全完成",
+    en: "The update could not finish safely",
+    "zh-TW": "更新未能安全完成",
+  },
+  "maintenance.failedDetail": {
+    "zh-CN": "ubitech agent 已暂停使用，正在等待管理员处理。",
+    en: "ubitech agent is unavailable while an administrator resolves the update.",
+    "zh-TW": "ubitech agent 已暫停使用，正在等待管理員處理。",
+  },
+  "maintenance.failedHint": {
+    "zh-CN": "服务恢复后，此页面会自动重新加载。",
+    en: "This page will reload automatically when service is restored.",
+    "zh-TW": "服務恢復後，此頁面會自動重新載入。",
+  },
   "errorBoundary.title": {
     "zh-CN": "页面暂时无法显示",
     en: "This page cannot be displayed",

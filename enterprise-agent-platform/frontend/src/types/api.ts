@@ -25,6 +25,7 @@ import type {
   OAuthProvider,
   OAuthProvidersState,
   PermissionGroup,
+  PlatformUpdateStatus,
   PrivateConversation,
   PrivateTelegram,
   RuntimeMap,
@@ -362,6 +363,8 @@ export interface TelegramConfigUpdateRequest {
 }
 
 export type AutoUpdateConfigResponse = AutoUpdateConfigState;
+
+export type PlatformUpdateStatusResponse = PlatformUpdateStatus;
 
 export interface AutoUpdateConfigUpdateRequest {
   enabled: boolean;

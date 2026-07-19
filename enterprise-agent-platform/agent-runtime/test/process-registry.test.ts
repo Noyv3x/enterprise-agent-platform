@@ -96,6 +96,61 @@ test("ProcessRegistry confirms scope cleanup only after the child close event", 
   }
 });
 
+test("ProcessRegistry protects background work from updates unless explicitly terminable", async () => {
+  const workspace = await temporaryDirectory("agent-process-update-blockers-");
+  const registry = new ProcessRegistry();
+  try {
+    const protectedByDefault = await registry.run({
+      runId: "default-wait",
+      scopeKey: "private:1",
+      command: "sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    const protectedExplicitly = await registry.run({
+      runId: "explicit-wait",
+      scopeKey: "private:2",
+      command: "sleep 30",
+      cwd: workspace,
+      background: true,
+      updateBehavior: "wait",
+    });
+    const terminable = await registry.run({
+      runId: "terminable",
+      scopeKey: "private:3",
+      command: "sleep 30",
+      cwd: workspace,
+      background: true,
+      updateBehavior: "terminate",
+    });
+
+    assert.equal(protectedByDefault.update_behavior, "wait");
+    assert.equal(protectedExplicitly.update_behavior, "wait");
+    assert.equal(terminable.update_behavior, "terminate");
+    assert.deepEqual(registry.updateBlockerSummary(), {
+      running_background_terminal_count: 3,
+      update_blocking_terminal_count: 2,
+      terminable_background_terminal_count: 1,
+    });
+    await assert.rejects(
+      registry.run({
+        runId: "foreground",
+        scopeKey: "private:1",
+        command: "true",
+        cwd: workspace,
+        updateBehavior: "terminate",
+      }),
+      /only for background processes/,
+    );
+  } finally {
+    for (const scope of ["private:1", "private:2", "private:3"]) registry.killScope(scope);
+    await Promise.all(
+      ["private:1", "private:2", "private:3"].map((scope) => registry.waitForScopeExit(scope)),
+    );
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("ProcessRegistry exposes a bounded control-free root and delegate preview without internal identifiers", async () => {
   const workspace = await temporaryDirectory("agent-process-preview-");
   const registry = new ProcessRegistry();

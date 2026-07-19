@@ -428,6 +428,17 @@ class EnterpriseService:
         self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_active_tasks: dict[str, dict[str, Any]] = {}
+        # Admissions cover the short message-persist -> durable-job-enqueue
+        # boundary. The auto-updater reserves an idle platform under the same
+        # lock, so a request either becomes durable work first or receives the
+        # maintenance response; it can never be stranded between the two.
+        self._agent_update_admissions = 0
+        self._agent_update_admission_epoch = 0
+        self._auto_update_probe_token = ""
+        self._auto_update_probe_id = ""
+        self._auto_update_reserved = False
+        self._auto_update_reservation_id = ""
+        self._auto_update_reservation_durable = False
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
@@ -464,6 +475,11 @@ class EnterpriseService:
             runner=auto_update_runner,
             launcher=auto_update_launcher,
         )
+        restored_update_id = self._auto_updater.blocking_update_id()
+        if self._auto_updater.blocks_platform_use():
+            self._auto_update_reserved = True
+            self._auto_update_reservation_id = restored_update_id
+            self._auto_update_reservation_durable = True
         self._closed = False
         self._resources_closed = False
         self._close_lock = threading.Lock()
@@ -2964,6 +2980,241 @@ class EnterpriseService:
             return ""
         return f"{self.public_base_url()}/api/auto-update/webhook/{urllib.parse.quote(secret, safe='')}"
 
+    def auto_update_public_status(self) -> dict[str, Any]:
+        # Syncing here lets a freshly started backend begin serving immediately
+        # after deploy/rollback marks the durable handoff successful.
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+        public_status = getattr(self._auto_updater, "public_status", None)
+        if callable(public_status):
+            return public_status()
+        return {
+            "state": "updating" if self._auto_update_reserved else "idle",
+            "instance_id": "",
+            "retry_after_ms": 3000,
+        }
+
+    def platform_update_is_blocking(self) -> bool:
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+            return self._auto_update_reserved
+
+    def try_reserve_auto_update(
+        self,
+        update_id: str,
+        *,
+        prepare: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve the first natural global Agent idle point."""
+
+        clean_update_id = str(update_id or "").strip()
+        if not clean_update_id:
+            raise ValueError("update_id is required")
+        probe_token = secrets.token_urlsafe(18)
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+            result = self._auto_update_agent_blockers_locked()
+            if self._auto_update_reserved:
+                result["reserved"] = self._auto_update_reservation_id == clean_update_id
+                if not result["reserved"]:
+                    result["blocker_error"] = "another update already owns the platform"
+                return result
+            if self._auto_update_probe_token:
+                result["blocker_error"] = "another update readiness check is in progress"
+                return result
+            if self._auto_update_has_agent_blockers(result):
+                return result
+            # Claim this readiness probe before performing the potentially
+            # slow runtime inventory request. The token only deduplicates
+            # update probes: normal Agent admissions remain usable and advance
+            # the epoch, causing the final commit below to yield and retry at a
+            # later natural idle boundary.
+            self._auto_update_probe_token = probe_token
+            self._auto_update_probe_id = clean_update_id
+            admission_epoch = self._agent_update_admission_epoch
+
+        # Query outside the global lock. If Agent work enters while this call
+        # is in flight, its epoch change invalidates the snapshot below.
+        process_result = self._auto_update_process_blockers()
+        result.update(process_result)
+
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+            result.update(self._auto_update_agent_blockers_locked())
+            result.update(process_result)
+            if self._auto_update_reserved:
+                self._clear_auto_update_probe_locked(probe_token)
+                result["reserved"] = self._auto_update_reservation_id == clean_update_id
+                if not result["reserved"]:
+                    result["blocker_error"] = "another update already owns the platform"
+                return result
+            if self._auto_update_probe_token != probe_token:
+                result["blocker_error"] = (
+                    result.get("blocker_error")
+                    or "update readiness reservation changed before commit"
+                )
+                return result
+            if (
+                self._closed
+                or self._agent_update_admission_epoch != admission_epoch
+                or self._auto_update_has_agent_blockers(result)
+                or result["protected_processes"]
+                or result["blocker_error"]
+            ):
+                if self._closed and not result["blocker_error"]:
+                    result["blocker_error"] = "service is shutting down"
+                elif (
+                    self._agent_update_admission_epoch != admission_epoch
+                    and not result["blocker_error"]
+                ):
+                    result["blocker_error"] = "Agent admission changed during update readiness check"
+                self._clear_auto_update_probe_locked(probe_token)
+                return result
+
+            try:
+                if prepare is not None:
+                    prepare()
+            except Exception:
+                self._clear_auto_update_probe_locked(probe_token)
+                raise
+            self._auto_update_reserved = True
+            self._auto_update_reservation_id = clean_update_id
+            self._auto_update_reservation_durable = prepare is not None
+            self._clear_auto_update_probe_locked(probe_token)
+            result["reserved"] = True
+            return result
+
+    def _clear_auto_update_probe_locked(self, probe_token: str) -> None:
+        if self._auto_update_probe_token != probe_token:
+            return
+        self._auto_update_probe_token = ""
+        self._auto_update_probe_id = ""
+
+    def _auto_update_agent_blockers_locked(self) -> dict[str, Any]:
+        counts = {
+            str(row["status"]): int(row["count"])
+            for row in self.db.query(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM durable_jobs
+                WHERE kind = 'agent' AND status IN ('queued', 'running')
+                GROUP BY status
+                """
+            )
+        }
+        return {
+            "reserved": False,
+            "active_agent_tasks": len(self._agent_active_tasks),
+            "queued_agent_jobs": counts.get("queued", 0),
+            "running_agent_jobs": counts.get("running", 0),
+            "admissions_in_progress": self._agent_update_admissions,
+            "protected_processes": 0,
+            "terminable_processes": 0,
+            "blocker_error": "",
+        }
+
+    @staticmethod
+    def _auto_update_has_agent_blockers(result: dict[str, Any]) -> bool:
+        return any(
+            int(result.get(field) or 0) > 0
+            for field in (
+                "active_agent_tasks",
+                "queued_agent_jobs",
+                "running_agent_jobs",
+                "admissions_in_progress",
+            )
+        )
+
+    def _auto_update_process_blockers(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "protected_processes": 0,
+            "terminable_processes": 0,
+            "blocker_error": "",
+        }
+        blocker_summary = getattr(self.agent_client, "update_blocker_summary", None)
+        if not callable(blocker_summary):
+            result["blocker_error"] = (
+                "Agent runtime does not expose the protected terminal inventory"
+            )
+            return result
+        try:
+            raw_summary = blocker_summary()
+            if not isinstance(raw_summary, dict):
+                raise RuntimeError("Agent runtime returned an invalid update blocker summary")
+            result["protected_processes"] = max(
+                0,
+                int(raw_summary.get("update_blocking_terminal_count") or 0),
+            )
+            result["terminable_processes"] = max(
+                0,
+                int(raw_summary.get("terminable_background_terminal_count") or 0),
+            )
+        except Exception as exc:
+            # Restarting while the process inventory is unknown can destroy a
+            # large transfer. Keep waiting until the runtime can prove that no
+            # protected terminal exists.
+            result["blocker_error"] = str(exc)[:500] or "could not query protected terminals"
+        return result
+
+    def release_auto_update_reservation(
+        self,
+        update_id: str,
+        *,
+        cleanup: Callable[[], None] | None = None,
+    ) -> bool:
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+            if (
+                not self._auto_update_reserved
+                or self._auto_update_reservation_id != str(update_id or "").strip()
+            ):
+                return False
+            if cleanup is not None:
+                cleanup()
+            self._auto_update_reserved = False
+            self._auto_update_reservation_id = ""
+            self._auto_update_reservation_durable = False
+            self._start_deferred_agent_workers_locked()
+        return True
+
+    def _sync_auto_update_reservation_locked(self) -> None:
+        """Synchronize process-local admission with the durable update marker."""
+
+        blocking_update_id_getter = getattr(self._auto_updater, "blocking_update_id", None)
+        blocking_getter = getattr(self._auto_updater, "blocks_platform_use", None)
+        if not callable(blocking_update_id_getter) or not callable(blocking_getter):
+            return
+        blocking_update_id = blocking_update_id_getter()
+        blocking = blocking_getter()
+        if blocking:
+            self._auto_update_reserved = True
+            self._auto_update_reservation_id = blocking_update_id
+            self._auto_update_reservation_durable = True
+            if self._auto_update_probe_token:
+                self._clear_auto_update_probe_locked(self._auto_update_probe_token)
+        elif self._auto_update_reserved and self._auto_update_reservation_durable:
+            self._auto_update_reserved = False
+            self._auto_update_reservation_id = ""
+            self._auto_update_reservation_durable = False
+            self._start_deferred_agent_workers_locked()
+
+    def _begin_agent_update_admission(self) -> None:
+        with self._conversation_lock:
+            self._sync_auto_update_reservation_locked()
+            if self._auto_update_reserved:
+                raise ServiceError(503, "platform is updating; retry after maintenance")
+            if self._closed:
+                raise ServiceError(503, "service is shutting down")
+            self._agent_update_admissions += 1
+            self._agent_update_admission_epoch += 1
+
+    def _end_agent_update_admission(self) -> None:
+        with self._conversation_lock:
+            self._agent_update_admissions = max(0, self._agent_update_admissions - 1)
+        notify = getattr(self._auto_updater, "notify_work_state_changed", None)
+        if callable(notify):
+            notify()
+
     def auto_update_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         return {
@@ -2981,7 +3232,16 @@ class EnterpriseService:
     def update_auto_update_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         if "enabled" in body:
-            self.set_setting(AUTO_UPDATE_SETTING_ENABLED, "1" if parse_bool(body.get("enabled")) else "0")
+            requested_enabled = parse_bool(body.get("enabled"))
+            if not requested_enabled:
+                # Invalidate the listener lifecycle before persisting the
+                # disabled flag. A check finishing its reserved reinspection
+                # can therefore never win a setting-write -> stop() race.
+                self._auto_updater.stop()
+            self.set_setting(
+                AUTO_UPDATE_SETTING_ENABLED,
+                "1" if requested_enabled else "0",
+            )
         if "interval_seconds" in body:
             try:
                 interval = int(body.get("interval_seconds"))
@@ -3669,6 +3929,24 @@ class EnterpriseService:
         content: str,
         attachments: list[UploadedFile] | None = None,
     ) -> dict[str, Any]:
+        self._begin_agent_update_admission()
+        try:
+            return self._send_channel_message_admitted(
+                actor,
+                channel_id,
+                content,
+                attachments,
+            )
+        finally:
+            self._end_agent_update_admission()
+
+    def _send_channel_message_admitted(
+        self,
+        actor: dict[str, Any],
+        channel_id: int,
+        content: str,
+        attachments: list[UploadedFile] | None = None,
+    ) -> dict[str, Any]:
         require_permission(actor, PERMISSION_CHAT)
         channel = self.get_channel(actor, channel_id)
         content = content.strip()
@@ -3888,6 +4166,33 @@ class EnterpriseService:
             )
 
     def _send_private_message_ordered(
+        self,
+        actor: dict[str, Any],
+        scope_id: str,
+        content: str,
+        uploads: list[UploadedFile],
+        *,
+        telegram_update_id: int | None,
+        telegram_chat_id: int | str | None,
+        telegram_message_id: int | None,
+        telegram_thread_id: int | None,
+    ) -> dict[str, Any]:
+        self._begin_agent_update_admission()
+        try:
+            return self._send_private_message_ordered_admitted(
+                actor,
+                scope_id,
+                content,
+                uploads,
+                telegram_update_id=telegram_update_id,
+                telegram_chat_id=telegram_chat_id,
+                telegram_message_id=telegram_message_id,
+                telegram_thread_id=telegram_thread_id,
+            )
+        finally:
+            self._end_agent_update_admission()
+
+    def _send_private_message_ordered_admitted(
         self,
         actor: dict[str, Any],
         scope_id: str,
@@ -4553,6 +4858,10 @@ class EnterpriseService:
         with self._conversation_lock:
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
+            self._sync_auto_update_reservation_locked()
+            if self._auto_update_reserved:
+                raise ServiceError(503, "platform is updating; scheduled task deferred")
+            self._agent_update_admission_epoch += 1
             # Permission/profile state must be read inside the same lifecycle
             # boundary used by revocation. Otherwise a completed downgrade can
             # race an earlier actor snapshot and still materialize new work.
@@ -9651,6 +9960,13 @@ class EnterpriseService:
             self._drop_empty_conversation_maps_locked(key)
 
     def _enqueue_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
+        self._begin_agent_update_admission()
+        try:
+            return self._enqueue_agent_reply_admitted(task)
+        finally:
+            self._end_agent_update_admission()
+
+    def _enqueue_agent_reply_admitted(self, task: dict[str, Any]) -> dict[str, Any]:
         scope_type = str(task["scope_type"])
         scope_id = str(task["scope_id"])
         key = self._conversation_key(scope_type, scope_id)
@@ -10305,12 +10621,31 @@ class EnterpriseService:
             self._agent_status[key] = status
             self._prune_agent_status_locked()
 
-            worker = self._agent_workers.get(key)
-            if worker is None or not worker.is_alive():
-                worker = threading.Thread(target=self._agent_worker, args=(key,), name=f"agent-reply-{key}", daemon=True)
-                self._agent_workers[key] = worker
-                worker.start()
+            if not self._auto_update_reserved:
+                self._start_agent_worker_locked(key)
             return self._copy_status(status)
+
+    def _start_agent_worker_locked(self, key: str) -> None:
+        worker = self._agent_workers.get(key)
+        if worker is not None and worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=self._agent_worker,
+            args=(key,),
+            name=f"agent-reply-{key}",
+            daemon=True,
+        )
+        self._agent_workers[key] = worker
+        worker.start()
+
+    def _start_deferred_agent_workers_locked(self) -> None:
+        """Resume recovered queues only after durable maintenance has ended."""
+
+        if self._auto_update_reserved or self._closed:
+            return
+        for key, queue in list(self._agent_queues.items()):
+            if queue:
+                self._start_agent_worker_locked(key)
 
     def _agent_worker(self, key: str) -> None:
         # Wrapped in try/finally so the worker is always unregistered (and any
@@ -10579,6 +10914,9 @@ class EnterpriseService:
                     self._agent_workers.pop(key, None)
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
+            notify = getattr(self._auto_updater, "notify_work_state_changed", None)
+            if callable(notify):
+                notify()
 
     def _update_schedule_run_for_task(
         self,

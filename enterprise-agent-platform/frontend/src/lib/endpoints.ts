@@ -59,6 +59,7 @@ import type {
   OAuthPollRequest,
   OAuthProvidersResponse,
   PermissionGroupsResponse,
+  PlatformUpdateStatusResponse,
   PostMessageRequest,
   PostMessageResponse,
   PrivateConversationsResponse,
@@ -105,6 +106,12 @@ function ep<Body = void, Res = unknown, Args extends unknown[] = []>(
 export const EMPTY_BODY = "{}";
 
 export const endpoints = {
+  /* public platform lifecycle */
+  platformUpdateStatus: ep<void, PlatformUpdateStatusResponse>(
+    "GET",
+    () => "/api/platform/update-status",
+  ),
+
   /* auth */
   authMe: ep<void, AuthMeResponse>("GET", () => "/api/auth/me"),
   updateCurrentUser: ep<UpdateCurrentUserRequest, UpdateCurrentUserResponse>(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import hashlib
 import json
@@ -9,6 +10,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -25,6 +27,12 @@ from pathlib import PurePosixPath
 from typing import Protocol
 
 from .config import PlatformConfig
+from .gateway import (
+    gateway_code_signature,
+    gateway_process_is_live,
+    read_gateway_state,
+    request_gateway_reload,
+)
 from .runtimes import PlatformRuntimeManager
 from .secure_fs import ensure_private_directory
 
@@ -35,6 +43,8 @@ DEFAULT_PIP_NETWORK_RETRIES = 8
 DEFAULT_PIP_TIMEOUT_SECONDS = 120
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
+AUTO_UPDATE_SOURCE_PID_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_PID"
+AUTO_UPDATE_SOURCE_MODE_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"
 MINIMUM_NODE_VERSION = (22, 19)
 MANAGED_NODE_VERSION = "22.19.0"
 MAX_MANAGED_NODE_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -223,12 +233,56 @@ class DeploymentManager:
             if prepare_runtime:
                 self.prepare_agent_runtime_artifact(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port))
+
+        # Every supported serving mode publishes the locked runtime before it
+        # changes the backend. When a persistent gateway already owns the
+        # public listener, refresh only its backend so clients continuously
+        # receive either the application or the maintenance response.
+        self.prepare_agent_runtime_artifact(host=host, port=port)
+        live_gateway = read_gateway_state(self.paths.data_dir)
+        live_mode = str((live_gateway or {}).get("mode") or "")
+        if gateway_process_is_live(live_gateway) and (
+            mode == "auto" or mode == live_mode
+        ):
+            if live_mode == "service":
+                self._write_user_service(host=host, port=port)
+                self.runner.run(["systemctl", "--user", "daemon-reload"], timeout=30)
+                self.runner.run(["systemctl", "--user", "enable", self.paths.service_name], timeout=60)
+            self._reload_live_gateway(
+                host=host,
+                port=port,
+                previous_generation=int((live_gateway or {}).get("generation") or 0),
+                previous_exec_generation=int((live_gateway or {}).get("exec_generation") or 0),
+                mode=live_mode,
+            )
+            if live_mode == "service":
+                self.ensure_user_linger()
+            return DeploymentResult(
+                mode=live_mode or "foreground",
+                url=self.effective_public_url(host, port),
+                service_path=str(self.paths.service_path) if live_mode == "service" else "",
+                service_started=live_mode == "service",
+                foreground_started=False,
+            )
+
+        foreground_source_pid = self._foreground_update_source_pid()
+        if foreground_source_pid is not None and mode in {"auto", "foreground"}:
+            self._handoff_foreground_update(
+                source_pid=foreground_source_pid,
+                host=host,
+                port=port,
+            )
+            return DeploymentResult(
+                mode="foreground",
+                url=self.effective_public_url(host, port),
+                foreground_started=True,
+            )
+
         if mode == "service":
             # Publish the sidecar that matches the checked-out source before
             # restarting the platform. The installer compares its persisted
             # source signature, so this is cheap when nothing changed and is
             # also what restores the matching sidecar after an update rollback.
-            self.prepare_agent_runtime_artifact(host=host, port=port)
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
         if mode == "foreground":
@@ -237,7 +291,6 @@ class DeploymentManager:
             # native Camoufox dependencies before starting the platform. The
             # preparation is signature/idempotency guarded, so a healthy
             # installation does not repeat downloads or apt mutations.
-            self.prepare_agent_runtime_artifact(host=host, port=port)
             self.run_foreground(host=host, port=port)
             return DeploymentResult(mode=mode, url=self.effective_public_url(host, port), foreground_started=True)
         if mode != "auto":
@@ -246,7 +299,6 @@ class DeploymentManager:
         # ``auto`` may choose either systemd or foreground execution. Prepare
         # the managed sidecar first in both cases so a subsequent service
         # switch can never observe a build from a different source revision.
-        self.prepare_agent_runtime_artifact(host=host, port=port)
         if self.user_systemd_available():
             service_path = self.install_user_service(host=host, port=port)
             return DeploymentResult(mode="service", url=self.effective_public_url(host, port), service_path=str(service_path), service_started=True)
@@ -647,14 +699,248 @@ class DeploymentManager:
         return result.returncode == 0
 
     def install_user_service(self, *, host: str, port: int) -> Path:
-        self.paths.service_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.service_path.write_text(user_service_unit(self.paths, host=host, port=port), encoding="utf-8")
+        self._write_user_service(host=host, port=port)
         self.runner.run(["systemctl", "--user", "daemon-reload"], timeout=30)
         self.runner.run(["systemctl", "--user", "enable", self.paths.service_name], timeout=60)
         self.runner.run(["systemctl", "--user", "restart", self.paths.service_name], timeout=60)
         self.ensure_user_linger()
         self.wait_for_service_ready(host=host, port=port)
         return self.paths.service_path
+
+    def _write_user_service(self, *, host: str, port: int) -> None:
+        self.paths.service_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.service_path.write_text(
+            user_service_unit(self.paths, host=host, port=port),
+            encoding="utf-8",
+        )
+
+    def _reload_live_gateway(
+        self,
+        *,
+        host: str,
+        port: int,
+        previous_generation: int,
+        previous_exec_generation: int,
+        mode: str,
+    ) -> None:
+        expected_code_signature = gateway_code_signature()
+        request_gateway_reload(self.paths.data_dir)
+        deadline = time.monotonic() + service_stop_timeout_seconds() + service_ready_timeout_seconds()
+        while True:
+            state = read_gateway_state(self.paths.data_dir)
+            if (
+                gateway_process_is_live(state)
+                and bool((state or {}).get("backend_ready"))
+                and int((state or {}).get("generation") or 0) > previous_generation
+                and int((state or {}).get("exec_generation") or 0) > previous_exec_generation
+                and str((state or {}).get("code_signature") or "") == expected_code_signature
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise DeploymentError("the platform gateway did not activate the updated backend")
+            time.sleep(0.5)
+        if mode == "service":
+            self.wait_for_service_ready(host=host, port=port)
+            return
+        deadline = time.monotonic() + service_ready_timeout_seconds()
+        if not self._wait_for_service_http(host=host, port=port, deadline=deadline):
+            raise DeploymentError("the refreshed platform backend did not become ready")
+        if not self._wait_for_agent_http(host=host, port=port, deadline=deadline):
+            raise DeploymentError("the refreshed Pi Agent runtime did not become ready")
+        if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
+            raise DeploymentError("the refreshed managed Camoufox browser did not become ready")
+
+    def _foreground_update_source_pid(self) -> int | None:
+        """Return the authenticated handoff candidate supplied by auto-update."""
+
+        if os.getenv(AUTO_UPDATE_SOURCE_MODE_ENV, "").strip().lower() != "foreground":
+            return None
+        raw_pid = os.getenv(AUTO_UPDATE_SOURCE_PID_ENV, "").strip()
+        try:
+            source_pid = int(raw_pid)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DeploymentError("the foreground auto-update source PID is invalid") from exc
+        if source_pid <= 1 or source_pid == os.getpid():
+            raise DeploymentError("the foreground auto-update source PID is invalid")
+        return source_pid
+
+    def _handoff_foreground_update(self, *, source_pid: int, host: str, port: int) -> None:
+        """Replace a legacy foreground server with a detached persistent gateway."""
+
+        self._stop_foreground_source(source_pid)
+        process = self._start_detached_gateway(host=host, port=port)
+        try:
+            deadline = time.monotonic() + service_ready_timeout_seconds()
+            expected_signature = gateway_code_signature()
+            while True:
+                state = read_gateway_state(self.paths.data_dir)
+                if (
+                    gateway_process_is_live(state)
+                    and int((state or {}).get("pid") or 0) == process.pid
+                    and bool((state or {}).get("backend_ready"))
+                    and str((state or {}).get("code_signature") or "") == expected_signature
+                ):
+                    break
+                returncode = process.poll()
+                if returncode is not None:
+                    raise DeploymentError(
+                        f"the detached platform gateway exited with code {returncode}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise DeploymentError("the detached platform gateway did not become ready")
+                time.sleep(0.25)
+            deadline = time.monotonic() + service_ready_timeout_seconds()
+            if not self._wait_for_service_http(host=host, port=port, deadline=deadline):
+                raise DeploymentError("the detached platform backend did not become ready")
+            if not self._wait_for_agent_http(host=host, port=port, deadline=deadline):
+                raise DeploymentError("the detached Pi Agent runtime did not become ready")
+            if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
+                raise DeploymentError("the detached managed Camoufox browser did not become ready")
+        except BaseException:
+            self._terminate_detached_gateway(process)
+            raise
+
+    def _stop_foreground_source(self, source_pid: int) -> None:
+        """Verify the legacy instance lock before signalling the supplied PID."""
+
+        lock_path = self.paths.data_dir / ".enterprise-platform.lock"
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags)
+        except FileNotFoundError:
+            if _process_is_live(source_pid):
+                raise DeploymentError(
+                    "could not authenticate the running foreground process for update handoff"
+                )
+            return
+        except OSError as exc:
+            raise DeploymentError(
+                "could not inspect the foreground process lock for update handoff"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_size > 64
+            ):
+                raise DeploymentError("the foreground process lock is not trustworthy")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            raw_owner = os.read(descriptor, 65).decode("ascii", errors="strict").strip()
+            try:
+                lock_owner = int(raw_owner)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DeploymentError("the foreground process lock owner is invalid") from exc
+            if lock_owner != source_pid:
+                raise DeploymentError(
+                    "the foreground process changed before update handoff"
+                )
+
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if not _process_is_live(source_pid):
+                    raise DeploymentError(
+                        "the foreground process lock remained held after its owner exited"
+                    )
+                try:
+                    os.kill(source_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    raise DeploymentError(
+                        "could not stop the foreground process for update handoff"
+                    ) from exc
+                deadline = time.monotonic() + service_stop_timeout_seconds()
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise DeploymentError(
+                                "the foreground process did not stop for update handoff"
+                            )
+                        time.sleep(0.1)
+            # If the lock was already free, the legacy server had completed its
+            # shutdown. Crucially, do not signal a live PID that merely matches
+            # stale file contents.
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(descriptor)
+
+    def _start_detached_gateway(self, *, host: str, port: int) -> subprocess.Popen:
+        env = os.environ.copy()
+        env_values = runtime_env(self.paths, host=host, port=port)
+        env.update(env_values)
+        command = [
+            str(self.paths.platform_cli),
+            "gateway",
+            "--host",
+            env_values["ENTERPRISE_PLATFORM_HOST"],
+            "--port",
+            env_values["ENTERPRISE_PLATFORM_PORT"],
+            "--data",
+            str(self.paths.data_dir),
+            "--mode",
+            "foreground",
+        ]
+        log_dir = self.paths.data_dir / "logs"
+        ensure_private_directory(log_dir)
+        log_path = log_dir / "gateway.log"
+        with log_path.open("ab") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=str(self.paths.platform_dir),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        return process
+
+    @staticmethod
+    def _terminate_detached_gateway(process: subprocess.Popen) -> None:
+        """Reap the detached gateway and every backend in its process group."""
+
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=min(10, service_stop_timeout_seconds()))
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     def ensure_user_linger(self) -> None:
         """Best-effort enable systemd user linger so the service survives logout.
@@ -740,14 +1026,35 @@ class DeploymentManager:
             self._raise_service_failed("the managed Camoufox browser capability did not become ready")
 
     def _wait_for_service_http(self, *, host: str, port: int, deadline: float) -> bool:
-        env = runtime_env(self.paths, host=host, port=port)
-        url = _loopback_http_url(
-            env["ENTERPRISE_PLATFORM_HOST"],
-            int(env["ENTERPRISE_PLATFORM_PORT"]),
-        ) + "/healthz"
+        gateway_state = read_gateway_state(self.paths.data_dir)
+        if gateway_process_is_live(gateway_state):
+            backend_host = str((gateway_state or {}).get("backend_host") or "")
+            try:
+                backend_port = int((gateway_state or {}).get("backend_port") or 0)
+            except (TypeError, ValueError):
+                backend_port = 0
+            if not bool((gateway_state or {}).get("backend_ready")) or not backend_host or backend_port <= 0:
+                url = ""
+            else:
+                url = _loopback_http_url(backend_host, backend_port) + "/healthz"
+        else:
+            env = runtime_env(self.paths, host=host, port=port)
+            url = _loopback_http_url(
+                env["ENTERPRISE_PLATFORM_HOST"],
+                int(env["ENTERPRISE_PLATFORM_PORT"]),
+            ) + "/healthz"
         while True:
-            if _probe_json_health(url, expected_service="ubitech-agent-platform"):
+            if url and _probe_json_health(url, expected_service="ubitech-agent-platform"):
                 return True
+            gateway_state = read_gateway_state(self.paths.data_dir)
+            if gateway_process_is_live(gateway_state) and bool((gateway_state or {}).get("backend_ready")):
+                backend_host = str((gateway_state or {}).get("backend_host") or "")
+                try:
+                    backend_port = int((gateway_state or {}).get("backend_port") or 0)
+                except (TypeError, ValueError):
+                    backend_port = 0
+                if backend_host and backend_port > 0:
+                    url = _loopback_http_url(backend_host, backend_port) + "/healthz"
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.5)
@@ -835,7 +1142,18 @@ class DeploymentManager:
         port = int(env_values["ENTERPRISE_PLATFORM_PORT"])
         try:
             result = self.runner.run(
-                [str(self.paths.platform_cli), "serve", "--host", host, "--port", str(port), "--data", str(self.paths.data_dir)],
+                [
+                    str(self.paths.platform_cli),
+                    "gateway",
+                    "--host",
+                    host,
+                    "--port",
+                    str(port),
+                    "--data",
+                    str(self.paths.data_dir),
+                    "--mode",
+                    "foreground",
+                ],
                 cwd=self.paths.platform_dir,
                 env=env,
                 timeout=None,
@@ -899,13 +1217,15 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
     exec_start = " ".join(
         [
             _systemd_quote(str(paths.platform_cli)),
-            "serve",
+            "gateway",
             "--host",
             _systemd_quote(env["ENTERPRISE_PLATFORM_HOST"]),
             "--port",
             env["ENTERPRISE_PLATFORM_PORT"],
             "--data",
             _systemd_quote(str(paths.data_dir)),
+            "--mode",
+            "service",
         ]
     )
     lines = [
@@ -1342,6 +1662,20 @@ def _loopback_base_url(base_url: str) -> str:
     return urllib.parse.urlunparse(
         (parsed.scheme, authority, parsed.path.rstrip("/"), "", "", "")
     )
+
+
+def _process_is_live(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _fsync_directory(path: Path) -> None:

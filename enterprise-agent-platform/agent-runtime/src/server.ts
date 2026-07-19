@@ -187,6 +187,14 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/processes/update-blockers") {
+    if ([...url.searchParams.keys()].length > 0) {
+      throw httpError(400, "Update blocker summary does not accept query parameters");
+    }
+    json(response, 200, coordinator.processes.updateBlockerSummary());
+    return;
+  }
+
   throw httpError(404, "Not found");
 }
 

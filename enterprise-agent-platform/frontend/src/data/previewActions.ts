@@ -1,4 +1,4 @@
-import { _invokeSessionExpired, ApiError } from "../lib/api";
+import { _invokePlatformUpdating, _invokeSessionExpired, ApiError } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { t } from "../i18n";
 import type {
@@ -76,13 +76,26 @@ function decodedHeader(response: Response, ...names: string[]): string {
 async function previewError(response: Response): Promise<Error> {
   if (response.status === 401) _invokeSessionExpired();
   let message = "";
+  let code = "";
   try {
-    const body = (await response.clone().json()) as { error?: string; detail?: string };
+    const body = (await response.clone().json()) as {
+      code?: string;
+      error?: string;
+      detail?: string;
+    };
     message = body.error || body.detail || "";
+    code = body.code || (body.error === "platform_updating" ? body.error : "");
   } catch {
     // Binary/proxy responses do not necessarily have a JSON error body.
   }
-  return new ApiError(message || t("api.failed", { status: response.status }), response.status);
+  if (response.status === 503 && code === "platform_updating") {
+    _invokePlatformUpdating();
+  }
+  return new ApiError(
+    message || t("api.failed", { status: response.status }),
+    response.status,
+    code || undefined,
+  );
 }
 
 function assertBoundedResponse(response: Response, maxBytes: number, message: string): void {

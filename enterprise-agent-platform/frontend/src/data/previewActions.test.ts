@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { registerPlatformUpdatingHandler } from "../lib/api";
 import {
   fetchBrowserPreview,
   fetchPreviewAvailability,
@@ -116,6 +117,21 @@ describe("preview availability transport", () => {
     await expect(
       fetchPreviewAvailability(scope, "", new AbortController().signal),
     ).rejects.toThrow();
+  });
+
+  it("notifies the update gate when maintenance blocks a preview request", async () => {
+    const handler = vi.fn();
+    const unregister = registerPlatformUpdatingHandler(handler);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      error: "platform is updating",
+      code: "platform_updating",
+    }), { status: 503, headers: { "Content-Type": "application/json" } })));
+
+    await expect(
+      fetchPreviewAvailability(scope, "", new AbortController().signal),
+    ).rejects.toMatchObject({ status: 503, code: "platform_updating" });
+    expect(handler).toHaveBeenCalledTimes(1);
+    unregister();
   });
 });
 

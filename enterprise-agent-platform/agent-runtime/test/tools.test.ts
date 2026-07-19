@@ -56,6 +56,59 @@ test("tool descriptions route semantic file work away from terminal scripts", ()
   assert.match(writeFile.description, /do not create files by terminal heredoc/);
 });
 
+test("terminal forwards an explicit background update policy and defaults to protected work", async () => {
+  const invocations: Array<Record<string, unknown>> = [];
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1", lifecycle_id: "life", workspace: "/tmp" } as never,
+    processes: {
+      async run(options: Record<string, unknown>) {
+        invocations.push(options);
+        return {
+          id: `process-${invocations.length}`,
+          run_id: "run",
+          scope_key: "private:1",
+          lifecycle_id: "life",
+          command: "sleep 30",
+          cwd: "/tmp",
+          status: "running",
+          stdout: "",
+          stderr: "",
+          started_at: new Date().toISOString(),
+          background: true,
+        };
+      },
+    } as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const terminal = tools.find((tool) => tool.name === "terminal");
+  assert.ok(terminal);
+  const schema = JSON.stringify(terminal.parameters);
+  assert.match(schema, /update_behavior/);
+  assert.match(schema, /"const":"wait"/);
+  assert.match(schema, /"const":"terminate"/);
+
+  await terminal.execute("default", { command: "sleep 30", background: true }, undefined);
+  await terminal.execute("terminable", {
+    command: "sleep 30",
+    background: true,
+    update_behavior: "terminate",
+  }, undefined);
+  assert.equal(invocations[0]?.background, true);
+  assert.equal(invocations[0]?.updateBehavior, undefined);
+  assert.equal(invocations[1]?.updateBehavior, "terminate");
+  await assert.rejects(
+    terminal.execute("foreground", {
+      command: "true",
+      update_behavior: "terminate",
+    }, undefined),
+    /only when background=true/,
+  );
+});
+
 test("browser screenshots become native image content without base64 in details", () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
   const encoded = png.toString("base64");

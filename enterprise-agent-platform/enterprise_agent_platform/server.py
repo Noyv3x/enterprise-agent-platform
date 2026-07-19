@@ -212,6 +212,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._json({"status": "ok", "service": "ubitech-agent-platform"})
                 return
+            if path == "/api/platform/update-status":
+                if method != "GET":
+                    self._json({"error": "method not allowed"}, status=405)
+                    return
+                self._json(self.server.service.auto_update_public_status())
+                return
+            if self.server.service.platform_update_is_blocking():
+                self._json(
+                    {
+                        "error": "platform is updating",
+                        "code": "platform_updating",
+                    },
+                    status=503,
+                    headers={"Retry-After": "2"},
+                )
+                return
             if path.startswith("/api/auto-update/webhook/"):
                 self._handle_auto_update_webhook(method, path)
                 return
@@ -1343,14 +1359,32 @@ def normalized_origin(value: str) -> str | None:
     return f"{parsed.scheme}://{netloc}"
 
 
-def make_server(config: PlatformConfig | None = None, service: EnterpriseService | None = None) -> EnterpriseHTTPServer:
+def make_server(
+    config: PlatformConfig | None = None,
+    service: EnterpriseService | None = None,
+    *,
+    listen_host: str | None = None,
+    listen_port: int | None = None,
+) -> EnterpriseHTTPServer:
     config = config or PlatformConfig.from_env(Path(__file__).resolve().parents[1])
     service = service or EnterpriseService(config)
-    return EnterpriseHTTPServer((config.host, config.port), RequestHandler, service)
+    return EnterpriseHTTPServer(
+        (
+            listen_host if listen_host is not None else config.host,
+            listen_port if listen_port is not None else config.port,
+        ),
+        RequestHandler,
+        service,
+    )
 
 
-def run_server(config: PlatformConfig | None = None) -> None:
-    server = make_server(config)
+def run_server(
+    config: PlatformConfig | None = None,
+    *,
+    listen_host: str | None = None,
+    listen_port: int | None = None,
+) -> None:
+    server = make_server(config, listen_host=listen_host, listen_port=listen_port)
     host, port = server.server_address[:2]
     print(f"ubitech agent running at http://{host}:{port}")
     bootstrap_password_path = server.service.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE

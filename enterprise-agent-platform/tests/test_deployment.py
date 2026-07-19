@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -399,6 +400,137 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(["systemctl", "--user", "enable", paths.service_name], commands)
             self.assertIn(["systemctl", "--user", "restart", paths.service_name], commands)
             self.assertNotIn(["systemctl", "--user", "enable", "--now", paths.service_name], commands)
+
+    def test_live_gateway_reload_waits_for_gateway_exec_and_updated_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=RecordingDeployRunner(),
+            )
+            manager._wait_for_service_http = mock.Mock(return_value=True)
+            manager._wait_for_agent_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_http = mock.Mock(return_value=True)
+            old_process_state = {
+                "pid": os.getpid(),
+                "heartbeat_at": time.time(),
+                "backend_ready": True,
+                "generation": 8,
+                "exec_generation": 2,
+                "code_signature": "new-code",
+            }
+            reexecuted_state = {
+                **old_process_state,
+                "exec_generation": 3,
+            }
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment.request_gateway_reload",
+                ) as reload_gateway,
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_code_signature",
+                    return_value="new-code",
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    side_effect=[old_process_state, reexecuted_state],
+                ) as read_state,
+                mock.patch("enterprise_agent_platform.deployment.time.sleep"),
+            ):
+                manager._reload_live_gateway(
+                    host="127.0.0.1",
+                    port=8765,
+                    previous_generation=7,
+                    previous_exec_generation=2,
+                    mode="foreground",
+                )
+
+            reload_gateway.assert_called_once_with(manager.paths.data_dir)
+            self.assertEqual(read_state.call_count, 2)
+
+    def test_auto_bootstrap_hands_legacy_foreground_instance_to_detached_gateway(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_submodules",
+                "ensure_source_repos",
+                "ensure_platform_venv",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
+            manager._handoff_foreground_update = mock.Mock()
+            manager.user_systemd_available = mock.Mock(
+                side_effect=AssertionError("legacy foreground handoff must preserve its mode")
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "foreground",
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_PID": "424242",
+                },
+                clear=False,
+            ):
+                result = manager.bootstrap(
+                    host="127.0.0.1",
+                    port=8765,
+                    mode="auto",
+                )
+
+            self.assertEqual(result.mode, "foreground")
+            manager._handoff_foreground_update.assert_called_once_with(
+                source_pid=424242,
+                host="127.0.0.1",
+                port=8765,
+            )
+            manager.user_systemd_available.assert_not_called()
+
+    def test_foreground_handoff_signals_only_the_verified_instance_lock_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
+            paths.data_dir.mkdir()
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            lock_path = paths.data_dir / ".enterprise-platform.lock"
+            child_code = (
+                "import fcntl, os, signal, sys\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "os.ftruncate(fd, 0)\n"
+                "os.write(fd, (str(os.getpid()) + '\\n').encode('ascii'))\n"
+                "print('ready', flush=True)\n"
+                "signal.pause()\n"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(lock_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                manager._stop_foreground_source(child.pid)
+                self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+                probe = os.open(lock_path, os.O_RDWR)
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(probe)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+                if child.stdout is not None:
+                    child.stdout.close()
+                if child.stderr is not None:
+                    child.stderr.close()
 
     def test_service_switches_prepare_matching_agent_runtime_before_restart(self):
         with tempfile.TemporaryDirectory() as td:

@@ -318,6 +318,108 @@ select {
 .boot-status p { margin: 0; line-height: 1.55; }
 .boot-status__loading { display: flex; align-items: center; gap: 10px; color: var(--muted); }
 
+/* Platform update gate. It is mounted outside the authenticated app and error
+   boundary, so this screen remains usable while the backend is replaced. */
+.update-screen {
+  position: fixed;
+  z-index: calc(var(--z-toast) + 10);
+  inset: 0;
+  display: grid;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: auto;
+  padding:
+    max(72px, calc(env(safe-area-inset-top) + 56px))
+    max(22px, env(safe-area-inset-right))
+    max(36px, env(safe-area-inset-bottom))
+    max(22px, env(safe-area-inset-left));
+  background:
+    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--accent-soft) 72%, transparent), transparent 42%),
+    var(--bg);
+  color: var(--ink);
+}
+.update-screen__locale {
+  position: fixed;
+  z-index: 1;
+  inset-block-start: max(16px, env(safe-area-inset-top));
+  inset-inline-end: max(16px, env(safe-area-inset-right));
+}
+.update-screen__card {
+  width: min(520px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 22px;
+  padding: clamp(24px, 5vw, 44px);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: var(--shadow-2);
+  text-align: center;
+}
+.update-screen__card .brand { justify-items: center; }
+.update-screen__card .brand__logo { height: 25px; }
+.update-screen__indicator {
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--accent-line);
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.update-screen--failed .update-screen__indicator {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.update-screen__indicator > span {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1;
+}
+.update-screen__copy {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+}
+.update-screen__copy h1 {
+  max-width: 440px;
+  font-size: clamp(24px, 5vw, 32px);
+  line-height: 1.2;
+}
+.update-screen__copy > p:last-child {
+  max-width: 460px;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.7;
+}
+.update-screen__progress {
+  width: min(290px, 82%);
+  height: 4px;
+  overflow: hidden;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+.update-screen__progress span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-solid);
+  animation: update-screen-progress 1.65s ease-in-out infinite;
+}
+.update-screen__hint {
+  color: var(--faint);
+  font-size: 12.5px;
+}
+@keyframes update-screen-progress {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(340%); }
+}
+
 .field { display: grid; gap: 6px; }
 .field { min-width: 0; }
 .field > span { font-size: 12.5px; font-weight: 550; color: var(--muted); }
@@ -2186,6 +2288,14 @@ select {
 }
 
 @media (max-width: 360px) {
+  .update-screen {
+    padding-inline-start: max(14px, env(safe-area-inset-left));
+    padding-inline-end: max(14px, env(safe-area-inset-right));
+  }
+  .update-screen__card {
+    gap: 18px;
+    padding: 22px 17px;
+  }
   .topbar .language-select {
     width: 88px;
     max-width: 88px;

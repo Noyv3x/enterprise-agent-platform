@@ -83,6 +83,14 @@ systemctl_user() {
 # Holds the pre-update HEAD so a failed redeploy can be rolled back.
 PREV_SHA=""
 UPDATE_LOCK_FD=""
+UPDATE_LOCK_PATH=""
+UPDATE_STATE_PROTOCOL_AVAILABLE=0
+UPDATE_STATE_ACTIVE=0
+UPDATE_SOURCE_MOVED=0
+UPDATE_HEARTBEAT_PID=""
+UPDATE_RECOVERY_ATTEMPTED=0
+UPDATE_COMPLETED=0
+UPDATE_COMMAND_ARGS=()
 
 acquire_update_lock() {
   if ! command -v git >/dev/null 2>&1; then
@@ -98,41 +106,58 @@ acquire_update_lock() {
     exit 1
   fi
 
-  local lock_path
-  lock_path="$(git -C "$ROOT" rev-parse --git-path ubitech-agent-update.lock)"
-  if [[ "$lock_path" != /* ]]; then
-    lock_path="$ROOT/$lock_path"
+  UPDATE_LOCK_PATH="$(git -C "$ROOT" rev-parse --git-path ubitech-agent-update.lock)"
+  if [[ "$UPDATE_LOCK_PATH" != /* ]]; then
+    UPDATE_LOCK_PATH="$ROOT/$UPDATE_LOCK_PATH"
   fi
-  exec {UPDATE_LOCK_FD}>"$lock_path"
+  exec {UPDATE_LOCK_FD}>"$UPDATE_LOCK_PATH"
   if ! flock -n "$UPDATE_LOCK_FD"; then
     echo "Another ubitech agent update is already in progress." >&2
     exit 1
   fi
+  # The durable marker may need to take over state left by an interrupted
+  # updater. Pass the inherited descriptor so update_state can verify that
+  # this deployment really owns the repository-wide update lock.
+  export ENTERPRISE_AUTO_UPDATE_LOCK_FD="$UPDATE_LOCK_FD"
+  export ENTERPRISE_AUTO_UPDATE_LOCK_PATH="$UPDATE_LOCK_PATH"
 }
 
 update_repo() {
   if ! command -v git >/dev/null 2>&1; then
     echo "git is required to update the repository." >&2
-    exit 1
+    return 1
   fi
   if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "$ROOT is not a git work tree." >&2
-    exit 1
+    return 1
   fi
 
-  local branch upstream
+  local branch upstream remote target_branch
   branch="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD || true)"
   upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  remote="${ENTERPRISE_AUTO_UPDATE_REMOTE:-origin}"
+  target_branch="${ENTERPRISE_AUTO_UPDATE_BRANCH:-}"
+  if [[ "$remote" == -* || ! "$remote" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "Cannot update: invalid git remote name." >&2
+    return 1
+  fi
+  if [[ -n "$target_branch" ]] && ! git check-ref-format --branch "$target_branch" >/dev/null 2>&1; then
+    echo "Cannot update: invalid git branch name." >&2
+    return 1
+  fi
 
   # Rollback uses a hard reset to restore the previous revision. Refuse to
   # enter that workflow when any staged, unstaged, or untracked user changes
   # are present so a failed update can never erase local work.
   local worktree_status
-  worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"
+  if ! worktree_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"; then
+    echo "Cannot update: repository status could not be verified." >&2
+    return 1
+  fi
   if [[ -n "$worktree_status" ]]; then
     echo "Cannot update: the repository has staged, unstaged, or untracked changes." >&2
     echo "Commit, stash, or remove local changes before running ./deploy.sh update." >&2
-    exit 1
+    return 1
   fi
 
   # Checkpoint the current revision before moving the working tree forward so
@@ -141,16 +166,19 @@ update_repo() {
     PREV_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   fi
 
-  git -C "$ROOT" fetch --recurse-submodules origin
-  if [[ -n "$upstream" ]]; then
-    git -C "$ROOT" pull --ff-only --recurse-submodules
+  git -C "$ROOT" fetch --recurse-submodules "$remote" || return 1
+  if [[ -n "$target_branch" ]]; then
+    git -C "$ROOT" merge --ff-only "$remote/$target_branch" || return 1
+  elif [[ -n "$upstream" && "$remote" == "${upstream%%/*}" ]]; then
+    git -C "$ROOT" merge --ff-only "$upstream" || return 1
   elif [[ -n "$branch" ]]; then
-    git -C "$ROOT" pull --ff-only --recurse-submodules origin "$branch"
+    git -C "$ROOT" merge --ff-only "$remote/$branch" || return 1
   else
     echo "Cannot update while the repository is in detached HEAD state." >&2
-    exit 1
+    return 1
   fi
-  git -C "$ROOT" submodule update --init --recursive
+  UPDATE_SOURCE_MOVED=1
+  git -C "$ROOT" submodule update --init --recursive || return 1
 }
 
 # Revert the working tree (and submodules) to the pre-update revision and
@@ -189,11 +217,148 @@ rollback_update() {
   # known-good code again. If even this fails, surface manual recovery steps.
   if python_bootstrap_checked auto "$@"; then
     echo "Rolled back to ${PREV_SHA}." >&2
+    return 0
   else
     echo "Rollback redeploy failed. Recover manually with:" >&2
     echo "  git -C \"$ROOT\" reset --keep ${PREV_SHA} && git -C \"$ROOT\" submodule update --init --recursive && ./deploy.sh" >&2
   fi
   return 1
+}
+
+update_state() {
+  local action="$1"
+  shift || true
+  if (( ! UPDATE_STATE_PROTOCOL_AVAILABLE )); then
+    return 0
+  fi
+  if [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/update_state.py" ]]; then
+    echo "Auto-update state helper disappeared during deployment." >&2
+    return 1
+  fi
+  export ENTERPRISE_PLATFORM_DATA="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}"
+  export PYTHONPATH="$PLATFORM_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  "$PYTHON_BIN" -m enterprise_agent_platform.update_state "$action" "$@"
+}
+
+begin_update_state() {
+  if [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/update_state.py" ]]; then
+    return 0
+  fi
+  # Freeze protocol availability before git can move the source tree.
+  UPDATE_STATE_PROTOCOL_AVAILABLE=1
+  if [[ -z "${ENTERPRISE_AUTO_UPDATE_ID:-}" ]]; then
+    ENTERPRISE_AUTO_UPDATE_ID="manual-$(date +%s)-$$"
+    export ENTERPRISE_AUTO_UPDATE_ID
+  fi
+  ENTERPRISE_AUTO_UPDATE_OWNER_PID=$$
+  export ENTERPRISE_AUTO_UPDATE_OWNER_PID
+  update_state begin --phase pulling --takeover
+  UPDATE_STATE_ACTIVE=1
+  start_update_heartbeat
+}
+
+start_update_heartbeat() {
+  if (( ! UPDATE_STATE_ACTIVE )) || [[ -n "$UPDATE_HEARTBEAT_PID" ]]; then
+    return 0
+  fi
+  # Run one Python process rather than a shell/sleep/process chain. Killing
+  # this PID cannot leave a child behind to race a terminal state transition.
+  "$PYTHON_BIN" -m enterprise_agent_platform.update_state \
+    heartbeat-loop --phase deploying --interval 5 >/dev/null 2>&1 &
+  UPDATE_HEARTBEAT_PID=$!
+}
+
+stop_update_heartbeat() {
+  if [[ -z "$UPDATE_HEARTBEAT_PID" ]]; then
+    return 0
+  fi
+  kill "$UPDATE_HEARTBEAT_PID" >/dev/null 2>&1 || true
+  wait "$UPDATE_HEARTBEAT_PID" >/dev/null 2>&1 || true
+  UPDATE_HEARTBEAT_PID=""
+}
+
+finish_update_success() {
+  if (( UPDATE_STATE_ACTIVE )); then
+    stop_update_heartbeat
+    if ! update_state success --outcome success; then
+      return 1
+    fi
+    UPDATE_STATE_ACTIVE=0
+  fi
+}
+
+finish_update_failure() {
+  local rollback_succeeded="${1:-0}"
+  if (( ! UPDATE_STATE_ACTIVE )); then
+    return 0
+  fi
+  stop_update_heartbeat
+  if [[ "$rollback_succeeded" == "1" ]]; then
+    update_state failure --rollback-succeeded --error "updated deployment failed; previous version restored" || true
+  else
+    update_state failure --error "update and automatic recovery did not complete" || true
+  fi
+  UPDATE_STATE_ACTIVE=0
+}
+
+recover_failed_update() {
+  if (( UPDATE_RECOVERY_ATTEMPTED )); then
+    return 0
+  fi
+  UPDATE_RECOVERY_ATTEMPTED=1
+  local rollback_succeeded=1
+  if (( UPDATE_SOURCE_MOVED )); then
+    rollback_succeeded=0
+    if rollback_update "${UPDATE_COMMAND_ARGS[@]}"; then
+      rollback_succeeded=1
+    fi
+  fi
+  finish_update_failure "$rollback_succeeded"
+}
+
+finalize_update_on_exit() {
+  local status=$?
+  trap - EXIT
+  if (( ! UPDATE_COMPLETED && ! UPDATE_RECOVERY_ATTEMPTED )) \
+    && (( status != 0 || UPDATE_STATE_ACTIVE || UPDATE_SOURCE_MOVED )); then
+    # This catches signals and failures in marker/heartbeat steps as well as
+    # deployment failures. Once source moved, every incomplete exit attempts
+    # the same conservative rollback used by the explicit error paths.
+    set +e
+    recover_failed_update
+    set -e
+  fi
+  return "$status"
+}
+
+capture_update_context() {
+  local previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "data" ]]; then
+      ENTERPRISE_PLATFORM_DATA="$argument"
+      export ENTERPRISE_PLATFORM_DATA
+      previous=""
+      continue
+    fi
+    case "$argument" in
+      --data)
+        previous="data"
+        ;;
+      --data=*)
+        ENTERPRISE_PLATFORM_DATA="${argument#--data=}"
+        export ENTERPRISE_PLATFORM_DATA
+        ;;
+    esac
+  done
+}
+
+wait_for_gateway_writes() {
+  if [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/gateway.py" ]]; then
+    return 0
+  fi
+  export PYTHONPATH="$PLATFORM_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  "$PYTHON_BIN" -c \
+    'import os, sys; from enterprise_agent_platform.gateway import wait_for_gateway_drain; sys.exit(0 if wait_for_gateway_drain(os.environ["ENTERPRISE_PLATFORM_DATA"], timeout=60) else 1)'
 }
 
 activate_managed_node_runtime
@@ -205,12 +370,40 @@ case "$cmd" in
     ;;
   update|upgrade)
     shift || true
+    UPDATE_COMMAND_ARGS=("$@")
     acquire_update_lock
-    update_repo
-    if ! python_bootstrap_checked auto "$@"; then
-      rollback_update "$@" || true
+    trap finalize_update_on_exit EXIT
+    capture_update_context "$@"
+    begin_update_state
+    if ! wait_for_gateway_writes; then
+      echo "Cannot update: existing write requests did not drain safely." >&2
+      recover_failed_update
       exit 1
     fi
+    if ! update_repo; then
+      recover_failed_update
+      exit 1
+    fi
+    # Freeze capability detection before the pull. During the first rollout
+    # the old source has no state helper; do not start speaking the new state
+    # protocol merely because the pulled tree now contains it.
+    if (( UPDATE_STATE_ACTIVE )); then
+      if ! update_state heartbeat --phase deploying; then
+        echo "Update state could not advance after the source changed; rolling back." >&2
+        recover_failed_update
+        exit 1
+      fi
+    fi
+    if ! python_bootstrap_checked auto "$@"; then
+      recover_failed_update
+      exit 1
+    fi
+    if ! finish_update_success; then
+      echo "Updated deployment could not finalize its maintenance state; rolling back." >&2
+      recover_failed_update
+      exit 1
+    fi
+    UPDATE_COMPLETED=1
     ;;
   deploy|up)
     shift || true

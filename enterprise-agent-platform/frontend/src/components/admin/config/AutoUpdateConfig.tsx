@@ -1,15 +1,16 @@
-/* <AutoUpdateConfig/> — GitHub-webhook/polling auto-update watcher config + an
-   on-demand status board (legacy renderAutoUpdateConfig, legacy-app.js:2364-2456).
+/* <AutoUpdateConfig/> — GitHub-webhook/polling auto-update watcher config + a
+   live status board (based on legacy renderAutoUpdateConfig, legacy-app.js:2364-2456).
    interval_seconds is kept as STRING state and sent raw; the webhook secret is
-   never seeded (empty = keep) and clears via the post-save re-seed. The status is
-   NOT live-polled — it only refreshes on save or "立即检查" (legacy parity). The
-   "立即检查" button is gated on the LIVE config.enabled (not the form draft). */
+   never seeded (empty = keep) and clears via the post-save re-seed. Status polls
+   without overwriting an in-progress form draft. The "立即检查" button is gated
+   on the LIVE config.enabled (not the form draft). */
 
 import { useEffect, useState } from "react";
 import { checkAutoUpdateNow, saveAutoUpdateConfig } from "../../../data/adminActions";
+import { loadAutoUpdateConfig } from "../../../data/loaders";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import { formatTime, shortSha } from "../../../utils/format";
-import type { AutoUpdateConfigValues } from "../../../types";
+import { formatTime, formatTimestamp, shortSha } from "../../../utils/format";
+import type { AutoUpdateConfigValues, AutoUpdateStatus } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
@@ -27,6 +28,35 @@ function updateTriggerLabel(t: ReturnType<typeof useI18n>["t"], trigger: string 
     case "poll": return t("admin.updates.trigger.poll");
     default: return trigger || "-";
   }
+}
+
+function updateStateLabel(
+  t: ReturnType<typeof useI18n>["t"],
+  status: AutoUpdateStatus,
+): string {
+  const state = String(status.state || status.phase || "");
+  switch (state) {
+    case "checking": return t("admin.updates.state.checking");
+    case "waiting_for_tasks": return t("admin.updates.state.waiting");
+    case "launching": return t("admin.updates.state.launching");
+    case "updating": return t("admin.updates.state.updating");
+    case "failed": return t("admin.updates.state.failed");
+    case "idle": return t("admin.updates.idle");
+    default:
+      return status.in_progress
+        ? t("admin.updates.checking")
+        : status.update_started
+          ? t("admin.updates.triggered")
+          : status.update_available
+            ? t("admin.updates.available")
+            : t("admin.updates.idle");
+  }
+}
+
+function updateTime(value: number | string | undefined): string {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return formatTime(numeric);
+  return formatTimestamp(value);
 }
 
 interface AutoUpdateFormState {
@@ -56,34 +86,79 @@ export function AutoUpdateConfig() {
   const config = autoUpdateConfig?.config || {};
   const status = autoUpdateConfig?.status || {};
   const webhookUrl = config.webhook_url || t("admin.updates.webhookPlaceholder");
-  const updateState = status.in_progress
-    ? t("admin.updates.checking")
-    : status.update_started
-      ? t("admin.updates.triggered")
-      : status.update_available
-        ? t("admin.updates.available")
-        : t("admin.updates.idle");
+  const updateState = updateStateLabel(t, status);
+  const phase = status.state || status.phase || "";
   const clean = !status.dirty;
+  const configFingerprint = JSON.stringify(config);
 
   const [form, setForm] = useState<AutoUpdateFormState>(() =>
     seedForm(autoUpdateConfig?.config || {}),
   );
 
   useEffect(() => {
-    setForm(seedForm(autoUpdateConfig?.config || {}));
-  }, [autoUpdateConfig]);
+    setForm(seedForm(config));
+  }, [configFingerprint]);
+
+  useEffect(() => {
+    let stopped = false;
+    let running = false;
+    let timer: number | null = null;
+
+    const schedule = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      if (stopped || document.hidden) return;
+      const liveStatus = store.getState().autoUpdateConfig?.status;
+      const livePhase = liveStatus?.state || liveStatus?.phase || "";
+      const delay = ["checking", "waiting_for_tasks", "launching", "updating"].includes(livePhase)
+        ? 2_000
+        : 5_000;
+      timer = window.setTimeout(() => void refresh(), delay);
+    };
+    const refresh = async () => {
+      if (stopped || running || document.hidden) return;
+      running = true;
+      try {
+        await loadAutoUpdateConfig(store);
+      } catch {
+        // The top-level update gate owns maintenance/reconnect feedback.
+      } finally {
+        running = false;
+        schedule();
+      }
+    };
+    const resume = () => {
+      if (document.hidden) {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = null;
+      } else {
+        void refresh();
+      }
+    };
+
+    document.addEventListener("visibilitychange", resume);
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", resume);
+    };
+  }, [store]);
 
   const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(autoUpdateConfig?.config || {}));
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
-    void saveAutoUpdateConfig(store, {
-      enabled: form.enabled,
-      interval_seconds: form.interval,
-      remote: form.remote,
-      branch: form.branch,
-      webhook_secret: form.webhookSecret,
-    });
+    void saveAutoUpdateConfig(
+      store,
+      {
+        enabled: form.enabled,
+        interval_seconds: form.interval,
+        remote: form.remote,
+        branch: form.branch,
+        webhook_secret: form.webhookSecret,
+      },
+      () => setForm((current) => ({ ...current, webhookSecret: "" })),
+    );
   };
 
   return (
@@ -173,12 +248,19 @@ export function AutoUpdateConfig() {
       </form>
       <div className="metric-grid metric-grid--compact">
         <UsageMetricTile label={t("admin.updates.status")} value={updateState} />
+        <UsageMetricTile label={t("admin.updates.activeTasks")} value={status.active_tasks ?? "-"} />
+        <UsageMetricTile label={t("admin.updates.queuedTasks")} value={status.queued_tasks ?? "-"} />
+        <UsageMetricTile label={t("admin.updates.protectedProcesses")} value={status.protected_processes ?? "-"} />
+        <UsageMetricTile label={t("admin.updates.waitingSince")} value={updateTime(status.waiting_since) || "-"} />
         <UsageMetricTile label={t("admin.updates.worktree")} value={t(clean ? "admin.updates.clean" : "admin.updates.dirty")} />
         <UsageMetricTile label={t("admin.updates.currentRevision")} value={shortSha(status.current_revision)} />
         <UsageMetricTile label={t("admin.updates.remoteRevision")} value={shortSha(status.remote_revision)} />
         <UsageMetricTile label={t("admin.updates.lastCheck")} value={formatTime(Number(status.last_check_at) || undefined) || "-"} />
         <UsageMetricTile label={t("admin.updates.lastTrigger")} value={updateTriggerLabel(t, status.last_trigger)} />
       </div>
+      {phase === "waiting_for_tasks" ? (
+        <div className="notice">{t("admin.updates.waitingNotice")}</div>
+      ) : null}
       {status.last_error ? <div className="notice notice--warn">{status.last_error}</div> : null}
       {status.dirty_summary ? <pre className="config-preview">{status.dirty_summary}</pre> : null}
     </section>

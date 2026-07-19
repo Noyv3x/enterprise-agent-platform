@@ -27,6 +27,7 @@ from enterprise_agent_platform.agent_runtime_client import (
     AgentRuntimeRunError,
 )
 from enterprise_agent_platform.auto_update import AutoUpdateManager
+from enterprise_agent_platform.update_state import clear_state
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.runtimes import (
@@ -686,6 +687,14 @@ class AutoUpdateLaunchTests(unittest.TestCase):
             self.assertIn("--setenv=ENTERPRISE_SERVICE_NAME=ubitech-custom.service", command)
             self.assertIn("--setenv=ENTERPRISE_PLATFORM_HOST=0.0.0.0", command)
             self.assertIn("--setenv=ENTERPRISE_PLATFORM_PORT=9123", command)
+            self.assertIn(
+                f"--setenv=ENTERPRISE_AUTO_UPDATE_SOURCE_PID={os.getpid()}",
+                command,
+            )
+            self.assertIn(
+                "--setenv=ENTERPRISE_AUTO_UPDATE_SOURCE_MODE=service",
+                command,
+            )
             self.assertEqual(command[-10:], [
                 str(root / "deploy.sh"),
                 "update",
@@ -752,6 +761,15 @@ class AutoUpdateLaunchTests(unittest.TestCase):
 
             self.assertEqual(command[:2], [str(root / "deploy.sh"), "update"])
             popen.assert_called_once()
+            child_env = popen.call_args.kwargs["env"]
+            self.assertEqual(
+                child_env["ENTERPRISE_AUTO_UPDATE_SOURCE_PID"],
+                str(os.getpid()),
+            )
+            self.assertEqual(
+                child_env["ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"],
+                "foreground",
+            )
             self.assertTrue((root / "custom-state" / "logs" / "auto-update.log").exists())
 
 
@@ -810,6 +828,9 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertTrue(status["update_started"])
             self.assertEqual(launched, ["webhook"])
             self.assertEqual(status["branch"], "main")
+            # A successful deploy/rollback owns the durable maintenance marker;
+            # emulate that handoff completion before checking the next poll.
+            clear_state(manager._data_dir, update_id=status["update_id"])
 
             (downstream / "local-change.txt").write_text("dirty\n", encoding="utf-8")
             dirty = manager.check_once("poll")
