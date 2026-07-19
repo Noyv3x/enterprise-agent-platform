@@ -25,7 +25,7 @@ import { sendMessage } from "../../data/chatActions";
 import { preserveFailedSend, restoreNextFailedSend } from "../../data/failedSendRecovery";
 import { scopeTypeFor } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
-import type { ChatMode } from "../../types";
+import type { ChatMode, FailedSend } from "../../types";
 import { ComposerField } from "./ComposerField";
 import { ComposerFiles } from "./ComposerFiles";
 import { FailedSendRecovery } from "./FailedSendRecovery";
@@ -33,6 +33,7 @@ import { ComposerHint } from "./ComposerHint";
 import type { ComposerTextareaProps } from "./ComposerTextarea";
 
 const EMPTY_FILES: File[] = [];
+const EMPTY_FAILED_SENDS: FailedSend[] = [];
 
 export function Composer({
   mode,
@@ -61,7 +62,8 @@ export function Composer({
   const draft = useStore((state) => state.drafts[draftKey] || "");
   const rawFiles = useStore((state) => state.draftFiles[draftKey]);
   const selectedFiles = rawFiles ?? EMPTY_FILES;
-  const failedSends = useStore((state) => state.failedSends[draftKey] || []);
+  const rawFailedSends = useStore((state) => state.failedSends[draftKey]);
+  const failedSends = rawFailedSends ?? EMPTY_FAILED_SENDS;
   const mentionTargets = useStore((state) => state.mentionTargets);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
