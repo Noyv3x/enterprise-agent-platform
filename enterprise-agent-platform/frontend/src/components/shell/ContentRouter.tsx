@@ -11,16 +11,29 @@
    Realtime/poll note: AppShell owns useRealtime()/usePolling() — the views must
    not mount them again, so this router only selects which view subtree renders. */
 
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { cx } from "../../lib/cx";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useDispatch, useStore } from "../../store/useStore";
 import type { ActiveView } from "../../types";
 import { ChatView } from "../chat/ChatView";
 import { TelegramLinkPopover } from "../chat/TelegramLinkPopover";
-import { KnowledgeView } from "../knowledge/KnowledgeView";
-import { AdminPanel } from "../admin/AdminPanel";
-import { SettingsView } from "../settings/SettingsView";
+import { Spinner } from "../common/Spinner";
+import {
+  loadAdminRoute,
+  loadKnowledgeRoute,
+  loadSettingsRoute,
+} from "./routePreload";
+
+const KnowledgeView = lazy(() =>
+  loadKnowledgeRoute().then((module) => ({ default: module.KnowledgeView })),
+);
+const SettingsView = lazy(() =>
+  loadSettingsRoute().then((module) => ({ default: module.SettingsView })),
+);
+const AdminPanel = lazy(() =>
+  loadAdminRoute().then((module) => ({ default: module.AdminPanel })),
+);
 
 /* ------------------------------------------------------------- router */
 
@@ -52,7 +65,9 @@ export function ContentRouter() {
   return (
     // key on the effective view replays the .view-enter keyframe once per change.
     <section className={cx("content", "view-enter")} key={effective}>
-      {body}
+      <Suspense fallback={<div className="view-loading" role="status"><Spinner size={24} /></div>}>
+        {body}
+      </Suspense>
       {effective === "private" && telegramExpanded ? <TelegramLinkPopover /> : null}
     </section>
   );

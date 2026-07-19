@@ -150,12 +150,13 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   }
 
   if (request.method === "GET" && url.pathname === "/v1/scopes/processes") {
-    const allowedQuery = new Set(["scope_key", "lifecycle_id"]);
+    const allowedQuery = new Set(["scope_key", "lifecycle_id", "since_revision"]);
     if ([...url.searchParams.keys()].some((key) => !allowedQuery.has(key))) {
-      throw httpError(400, "Process preview accepts only scope_key and lifecycle_id");
+      throw httpError(400, "Process preview accepts only scope_key, lifecycle_id, and since_revision");
     }
     const scopeKeys = url.searchParams.getAll("scope_key");
     const lifecycleIds = url.searchParams.getAll("lifecycle_id");
+    const sinceRevisions = url.searchParams.getAll("since_revision");
     const scopeKey = scopeKeys.length === 1 ? scopeKeys[0]!.trim() : "";
     const lifecycleId = lifecycleIds.length === 1 ? lifecycleIds[0]!.trim() : "";
     if (!scopeKey || scopeKey.length > 512) {
@@ -164,7 +165,18 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     if (!lifecycleId || lifecycleId.length > 512) {
       throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
     }
-    json(response, 200, { processes: coordinator.processes.preview(scopeKey, lifecycleId) });
+    let sinceRevision: string | undefined;
+    if (sinceRevisions.length > 0) {
+      const value = sinceRevisions.length === 1 ? sinceRevisions[0]! : "";
+      const legacyRevision = /^(?:0|[1-9]\d*)$/.test(value)
+        && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+      const opaqueRevision = /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/.test(value);
+      if (!legacyRevision && !opaqueRevision) {
+        throw httpError(400, "since_revision must be one opaque revision token");
+      }
+      sinceRevision = value;
+    }
+    json(response, 200, coordinator.processes.preview(scopeKey, lifecycleId, sinceRevision));
     return;
   }
 

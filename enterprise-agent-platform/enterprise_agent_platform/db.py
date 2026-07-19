@@ -163,6 +163,15 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope_type, scope_id, id);
 
+                CREATE TABLE IF NOT EXISTS conversation_revisions (
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    reset_revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_type, scope_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS attachments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -203,6 +212,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_token_usage_user_time ON token_usage_events(user_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_token_usage_scope_time ON token_usage_events(scope_type, scope_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_token_usage_model_time ON token_usage_events(provider, model, created_at);
+                CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage_events(created_at);
 
                 CREATE TABLE IF NOT EXISTS agent_scopes (
                     scope_key TEXT PRIMARY KEY,
@@ -335,6 +345,7 @@ class Database:
             )
             self._ensure_user_columns()
             self._ensure_message_columns()
+            self._ensure_conversation_revisions()
             self._ensure_agent_memory_columns()
             self._ensure_agent_memory_candidate_columns()
             self._ensure_agent_memory_dedupe()
@@ -384,6 +395,87 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_visible_scope "
             "ON messages(scope_type, scope_id, hidden_at, id)"
+        )
+
+    def _ensure_conversation_revisions(self) -> None:
+        """Install durable, transactionally maintained conversation versions.
+
+        Existing conversations start at a reset boundary so a client carrying a
+        revision from a prior build is forced through one full synchronization.
+        The triggers cover every writer, including scheduled-task inserts and
+        administrative hides/deletes, instead of relying on each service path to
+        remember to update a parallel counter.
+        """
+
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO conversation_revisions(
+                scope_type, scope_id, revision, reset_revision, updated_at
+            )
+            SELECT scope_type, scope_id, MAX(id), MAX(id), MAX(created_at)
+            FROM messages
+            GROUP BY scope_type, scope_id
+            """
+        )
+        self._conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS conversation_revision_ai
+            AFTER INSERT ON messages BEGIN
+                INSERT INTO conversation_revisions(
+                    scope_type, scope_id, revision, reset_revision, updated_at
+                ) VALUES (
+                    new.scope_type, new.scope_id, 1, 0,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                )
+                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                    revision = conversation_revisions.revision + 1,
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS conversation_revision_hidden_au
+            AFTER UPDATE OF hidden_at ON messages
+            WHEN old.hidden_at IS NOT new.hidden_at BEGIN
+                INSERT INTO conversation_revisions(
+                    scope_type, scope_id, revision, reset_revision, updated_at
+                ) VALUES (
+                    new.scope_type, new.scope_id, 1, 1,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                )
+                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                    revision = conversation_revisions.revision + 1,
+                    reset_revision = conversation_revisions.revision + 1,
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS conversation_revision_metadata_au
+            AFTER UPDATE OF metadata_json ON messages
+            WHEN old.metadata_json IS NOT new.metadata_json BEGIN
+                INSERT INTO conversation_revisions(
+                    scope_type, scope_id, revision, reset_revision, updated_at
+                ) VALUES (
+                    new.scope_type, new.scope_id, 1, 1,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                )
+                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                    revision = conversation_revisions.revision + 1,
+                    reset_revision = conversation_revisions.revision + 1,
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS conversation_revision_ad
+            AFTER DELETE ON messages BEGIN
+                INSERT INTO conversation_revisions(
+                    scope_type, scope_id, revision, reset_revision, updated_at
+                ) VALUES (
+                    old.scope_type, old.scope_id, 1, 1,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                )
+                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                    revision = conversation_revisions.revision + 1,
+                    reset_revision = conversation_revisions.revision + 1,
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+            END;
+            """
         )
 
     def _ensure_agent_memory_columns(self) -> None:

@@ -131,7 +131,7 @@ export function useBrowserPreview(scope: AgentPreviewScope | null) {
       clearTimer();
       if (document.hidden) {
         controller?.abort();
-        // Release the potentially large PNG while it cannot be observed. Clear
+        // Release the potentially large frame while it cannot be observed. Clear
         // the validator too, so becoming visible fetches bytes instead of a 304
         // for a blob that no longer exists.
         discardFrame(true);

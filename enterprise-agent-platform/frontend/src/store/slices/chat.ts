@@ -23,6 +23,7 @@ export const chatInitial: ChatSliceState = {
   drafts: {},
   draftFiles: {},
   failedSends: {},
+  messageSyncCursors: {},
   agentStatuses: { channels: {}, private: null },
   expandedAgentRuns: {},
   mentionTargets: [],
@@ -47,6 +48,14 @@ export function chatReducer(state: AppState, action: Action): AppState {
       return { ...state, messages: action.payload };
     case "SET_PRIVATE_MESSAGES":
       return { ...state, privateMessages: action.payload };
+    case "SET_MESSAGE_SYNC_CURSOR":
+      return {
+        ...state,
+        messageSyncCursors: {
+          ...state.messageSyncCursors,
+          [action.payload.key]: action.payload.cursor,
+        },
+      };
     case "SET_PENDING_MESSAGES":
       return { ...state, pendingMessages: action.payload };
     case "SET_AGENT_STATUSES":
@@ -237,6 +246,7 @@ export function chatReducer(state: AppState, action: Action): AppState {
         pendingMessages: [],
         draftFiles: {},
         failedSends: {},
+        messageSyncCursors: {},
         mentionTargets: [],
         typingUsers: [],
       };

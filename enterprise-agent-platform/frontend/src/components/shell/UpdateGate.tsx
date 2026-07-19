@@ -13,9 +13,9 @@ import { Brand } from "../common/Brand";
 import { LanguageSelect } from "../common/LanguageSelect";
 import { Spinner } from "../common/Spinner";
 
-const DEFAULT_POLL_MS = 3_000;
+const DEFAULT_POLL_MS = 5_000;
 const MIN_POLL_MS = 750;
-const MAX_POLL_MS = 10_000;
+const MAX_POLL_MS = 30_000;
 const STATUS_TIMEOUT_MS = 5_000;
 const KNOWN_STATES = new Set<PlatformUpdateState>([
   "idle",
@@ -77,6 +77,12 @@ export async function fetchPlatformUpdateStatus(
 
 function blocksPlatform(state: PlatformUpdateState | undefined): boolean {
   return state === "launching" || state === "updating" || state === "failed";
+}
+
+function pollInterval(state: PlatformUpdateState | undefined): number {
+  if (state === "launching" || state === "updating" || state === "failed") return 1_000;
+  if (state === "waiting_for_tasks") return 3_000;
+  return DEFAULT_POLL_MS;
 }
 
 interface UpdateStatusScreenProps {
@@ -207,7 +213,7 @@ export function UpdateGate({
       running = true;
       controller = new AbortController();
       const requestEpoch = maintenanceEpoch.current;
-      let delay = normalizedRetryAfter(statusRef.current?.retry_after_ms);
+      let delay = pollInterval(statusRef.current?.state);
       try {
         const next = await loadStatus(controller.signal);
         if (stopped) return;
@@ -215,11 +221,17 @@ export function UpdateGate({
           delay = MIN_POLL_MS;
           return;
         }
-        delay = normalizedRetryAfter(next.retry_after_ms);
+        delay = pollInterval(next.state);
         acceptStatus(next);
       } catch {
         // Once maintenance has been observed, a restart-related network gap
         // must never reveal a usable application underneath it.
+        if (requestEpoch !== maintenanceEpoch.current) {
+          // A business request can force maintenance while this probe is still
+          // carrying the previous idle interval. Its abort must not leave the
+          // temporary page waiting for the next healthy-state status check.
+          delay = MIN_POLL_MS;
+        }
       } finally {
         running = false;
         controller = null;
@@ -262,7 +274,10 @@ export function UpdateGate({
     };
   }, [acceptStatus, loadStatus]);
 
-  if (!status) return <UpdateStatusScreen state="probing" />;
+  // The status probe runs alongside session bootstrap. A maintenance response
+  // from any business API still flips this gate synchronously via the registered
+  // handler, while a slow tunnel no longer delays every healthy page load.
+  if (!status) return <>{children}</>;
   if (blocksPlatform(status.state)) {
     const screenState: UpdateStatusScreenProps["state"] =
       status.state === "failed"

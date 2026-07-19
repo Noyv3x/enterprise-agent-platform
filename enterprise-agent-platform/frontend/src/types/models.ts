@@ -443,6 +443,9 @@ export interface RuntimeRow {
   error?: string;
   path?: string;
   managed?: boolean;
+  /** Cache freshness used to schedule a non-blocking health recheck. */
+  status_stale?: boolean;
+  status_checked_at?: number | null;
 }
 
 export type RuntimeMap = Record<string, RuntimeRow>;

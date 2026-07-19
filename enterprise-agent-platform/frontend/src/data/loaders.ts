@@ -12,7 +12,13 @@ import { api, isApiRequestCancelled } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
-import { isStatusReadCurrent, issueStatusRead } from "./statusFence";
+import { cacheChat, chatScopeKey } from "./chatCache";
+import { messageSyncCursor } from "./messageSync";
+import {
+  isScopeReadCurrent,
+  isStatusReadCurrent,
+  issueStatusRead,
+} from "./statusFence";
 import type {
   Action,
   AgentRuntimeConfigResponse,
@@ -34,6 +40,7 @@ import type {
   PrivateMessagesResponse,
   PrivateTelegramResponse,
   RuntimeResponse,
+  SessionBootstrapResponse,
   SecretsResponse,
   SecurityConfigResponse,
   TelegramConfigResponse,
@@ -44,6 +51,14 @@ import type {
 
 /** The store handle the thunks operate over (getState + dispatch). */
 export type AppStore = Store<AppState, Action>;
+
+const RUNTIME_STATUS_RETRY_MS = 1_500;
+const MAX_RUNTIME_STATUS_RETRIES = 24;
+interface RuntimeRefreshRetry {
+  timer: ReturnType<typeof setTimeout>;
+  attempt: number;
+}
+const runtimeRefreshRetries = new WeakMap<AppStore, RuntimeRefreshRetry>();
 
 /* ----------------------------------------------------------- local helpers */
 
@@ -85,6 +100,63 @@ export async function loadInitial(store: AppStore): Promise<void> {
   await loadChannelMessages(store);
 }
 
+/** Apply the authenticated shell snapshot returned by the compact bootstrap API. */
+export function hydrateSessionBootstrap(
+  store: AppStore,
+  result: SessionBootstrapResponse,
+): void {
+  const channels = result.channels || [];
+  const requestedScope = result.active_scope;
+  const requestedChannel = requestedScope?.scope_type === "channel"
+    ? channels.find((channel) => String(channel.id) === String(requestedScope.scope_id))
+    : undefined;
+  const activeChannelId = requestedChannel?.id ?? channels[0]?.id ?? null;
+  const mode: ChatMode = requestedScope?.scope_type === "private" ? "private" : "channel";
+  const scopeId = mode === "private"
+    ? String(result.user.id)
+    : String(activeChannelId || requestedScope?.scope_id || "");
+  const messages = result.messages || [];
+
+  store.dispatch({ type: "SET_USER", payload: result.user });
+  store.dispatch({ type: "SET_CHANNELS", payload: channels });
+  store.dispatch({ type: "SET_MENTION_TARGETS", payload: result.mention_targets || [] });
+  store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: activeChannelId });
+  store.dispatch({ type: "SET_ACTIVE_VIEW", payload: mode });
+  store.dispatch({
+    type: mode === "private" ? "SET_PRIVATE_MESSAGES" : "SET_MESSAGES",
+    payload: mergePending(store.getState(), mode, scopeId, messages),
+  });
+  applyAgentStatus(store, mode, scopeId, result.agent_status, true);
+  store.dispatch({
+    type: "SET_TYPING_USERS",
+    payload: mode === "channel" ? result.typing || [] : [],
+  });
+  const cursor = messageSyncCursor(
+    result,
+    store.getState().messageSyncCursors[chatScopeKey(mode, scopeId)],
+  );
+  if (cursor) {
+    store.dispatch({
+      type: "SET_MESSAGE_SYNC_CURSOR",
+      payload: {
+        key: chatScopeKey(mode, scopeId),
+        cursor,
+      },
+    });
+  }
+  cacheChat(store, mode, scopeId, messages, cursor);
+}
+
+export async function loadSessionBootstrap(store: AppStore): Promise<void> {
+  const result = await api<SessionBootstrapResponse>(endpoints.sessionBootstrap.path(), {
+    skipAuthHandling: true,
+  });
+  hydrateSessionBootstrap(store, result);
+  if (result.active_scope?.scope_type === "private") {
+    void loadPrivateTelegram(store).catch(() => undefined);
+  }
+}
+
 export async function loadChannels(store: AppStore): Promise<void> {
   const result = await api<ChannelsResponse>(endpoints.channels.path());
   store.dispatch({ type: "SET_CHANNELS", payload: result.channels });
@@ -116,13 +188,35 @@ export async function loadChannelMessages(store: AppStore): Promise<void> {
   const result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
   // Channel-switch race guard: discard a response for a channel we left.
   if (String(store.getState().activeChannelId) !== channelId) return;
-  if (!isStatusReadCurrent(statusRead)) return;
+  if (!isScopeReadCurrent(statusRead)) return;
   store.dispatch({
     type: "SET_MESSAGES",
     payload: mergePending(store.getState(), "channel", channelId, result.messages || []),
   });
-  applyAgentStatus(store, "channel", channelId, result.agent_status, true);
+  if (isStatusReadCurrent(statusRead)) {
+    applyAgentStatus(store, "channel", channelId, result.agent_status, true);
+  }
   store.dispatch({ type: "SET_TYPING_USERS", payload: result.typing || [] });
+  const cursor = messageSyncCursor(
+    result,
+    store.getState().messageSyncCursors[chatScopeKey("channel", channelId)],
+  );
+  if (cursor) {
+    store.dispatch({
+      type: "SET_MESSAGE_SYNC_CURSOR",
+      payload: {
+        key: chatScopeKey("channel", channelId),
+        cursor,
+      },
+    });
+  }
+  cacheChat(
+    store,
+    "channel",
+    channelId,
+    store.getState().messages,
+    cursor,
+  );
 }
 
 export async function loadPrivateMessages(store: AppStore): Promise<void> {
@@ -132,12 +226,34 @@ export async function loadPrivateMessages(store: AppStore): Promise<void> {
     api<PrivateMessagesResponse>(endpoints.privateMessages.path()),
     loadPrivateTelegram(store),
   ]);
-  if (!isStatusReadCurrent(statusRead)) return;
+  if (!isScopeReadCurrent(statusRead)) return;
   store.dispatch({
     type: "SET_PRIVATE_MESSAGES",
     payload: mergePending(store.getState(), "private", scopeId, result.messages || []),
   });
-  applyAgentStatus(store, "private", scopeId, result.agent_status, true);
+  if (isStatusReadCurrent(statusRead)) {
+    applyAgentStatus(store, "private", scopeId, result.agent_status, true);
+  }
+  const cursor = messageSyncCursor(
+    result,
+    store.getState().messageSyncCursors[chatScopeKey("private", scopeId)],
+  );
+  if (cursor) {
+    store.dispatch({
+      type: "SET_MESSAGE_SYNC_CURSOR",
+      payload: {
+        key: chatScopeKey("private", scopeId),
+        cursor,
+      },
+    });
+  }
+  cacheChat(
+    store,
+    "private",
+    scopeId,
+    store.getState().privateMessages,
+    cursor,
+  );
 }
 
 export async function loadPrivateTelegram(store: AppStore): Promise<void> {
@@ -230,7 +346,50 @@ export async function loadOAuthProviders(store: AppStore): Promise<void> {
 }
 
 export async function loadRuntime(store: AppStore): Promise<void> {
-  store.dispatch({ type: "SET_RUNTIMES", payload: await api<RuntimeResponse>(endpoints.runtime.path()) });
+  const existing = runtimeRefreshRetries.get(store);
+  if (existing) clearTimeout(existing.timer);
+  runtimeRefreshRetries.delete(store);
+  const result = await api<RuntimeResponse>(endpoints.runtime.path());
+  store.dispatch({ type: "SET_RUNTIMES", payload: result });
+  scheduleRuntimeStatusRefresh(store, result, 0);
+}
+
+function scheduleRuntimeStatusRefresh(
+  store: AppStore,
+  result: RuntimeResponse,
+  attempt: number,
+): void {
+  if (
+    attempt >= MAX_RUNTIME_STATUS_RETRIES ||
+    !Object.values(result).some((runtime) => runtime.status_stale)
+  ) {
+    runtimeRefreshRetries.delete(store);
+    return;
+  }
+  const timer = setTimeout(async () => {
+    const scheduled = runtimeRefreshRetries.get(store);
+    if (!scheduled || scheduled.timer !== timer) return;
+    runtimeRefreshRetries.delete(store);
+    if (!store.getState().user) return;
+    try {
+      const refreshed = await api<RuntimeResponse>(
+        endpoints.runtime.path(),
+      );
+      store.dispatch({ type: "SET_RUNTIMES", payload: refreshed });
+      scheduleRuntimeStatusRefresh(store, refreshed, attempt + 1);
+    } catch {
+      if (store.getState().user) {
+        scheduleRuntimeStatusRefresh(store, result, attempt + 1);
+      }
+    }
+  }, RUNTIME_STATUS_RETRY_MS);
+  runtimeRefreshRetries.set(store, { timer, attempt });
+}
+
+export function clearRuntimeStatusRefresh(store: AppStore): void {
+  const retry = runtimeRefreshRetries.get(store);
+  if (retry) clearTimeout(retry.timer);
+  runtimeRefreshRetries.delete(store);
 }
 
 export async function loadSecurityConfig(store: AppStore): Promise<void> {

@@ -3,6 +3,7 @@ import type { AppStore } from "./loaders";
 
 interface ScopeFence {
   mutationRevision: number;
+  realtimeStatusRevision: number;
   pendingMutations: Set<number>;
   nextReadId: number;
   latestReadId: number;
@@ -16,6 +17,7 @@ export interface StatusMutationTicket {
 export interface StatusReadTicket {
   fence: ScopeFence;
   mutationRevision: number;
+  realtimeStatusRevision: number;
   readId: number;
   issuedDuringMutation: boolean;
 }
@@ -38,6 +40,7 @@ function scopeFence(store: AppStore, mode: ChatMode, scopeId: string): ScopeFenc
   if (!fence) {
     fence = {
       mutationRevision: 0,
+      realtimeStatusRevision: 0,
       pendingMutations: new Set(),
       nextReadId: 0,
       latestReadId: 0,
@@ -78,16 +81,35 @@ export function issueStatusRead(
   return {
     fence,
     mutationRevision: fence.mutationRevision,
+    realtimeStatusRevision: fence.realtimeStatusRevision,
     readId: fence.nextReadId,
     issuedDuringMutation: fence.pendingMutations.size > 0,
   };
 }
 
-export function isStatusReadCurrent(ticket: StatusReadTicket): boolean {
+/** Make every status read issued before an out-of-band realtime update stale. */
+export function invalidateStatusReads(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+): void {
+  const fence = scopeFence(store, mode, scopeId);
+  fence.realtimeStatusRevision += 1;
+}
+
+/** Whether this is still the newest safe conversation read for the scope. */
+export function isScopeReadCurrent(ticket: StatusReadTicket): boolean {
   return (
     !ticket.issuedDuringMutation &&
     ticket.fence.pendingMutations.size === 0 &&
     ticket.fence.mutationRevision === ticket.mutationRevision &&
     ticket.fence.latestReadId === ticket.readId
+  );
+}
+
+export function isStatusReadCurrent(ticket: StatusReadTicket): boolean {
+  return (
+    isScopeReadCurrent(ticket) &&
+    ticket.fence.realtimeStatusRevision === ticket.realtimeStatusRevision
   );
 }

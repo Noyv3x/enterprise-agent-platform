@@ -29,15 +29,25 @@ import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { optimisticAttachments } from "../utils/composerFiles";
 import { chatSnapshot } from "../utils/fingerprint";
 import { runBusy } from "./sessionActions";
+import {
+  cacheChat,
+  cacheVisibleChat,
+  chatScopeKey,
+  restoreCachedChat,
+  upsertCachedMessage,
+} from "./chatCache";
 import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
 import { ensureAdminPageResource } from "./adminResources";
 import {
   beginStatusMutation,
   finishStatusMutation,
+  invalidateStatusReads,
   isStatusMutationCurrent,
+  isScopeReadCurrent,
   isStatusReadCurrent,
   issueStatusRead,
 } from "./statusFence";
+import { messageSyncCursor } from "./messageSync";
 import {
   loadChannelMessages,
   loadDocuments,
@@ -56,13 +66,18 @@ import type {
   Message,
   PostMessageResponse,
   PrivateMessagesResponse,
-  PrivateTelegramResponse,
+  TypingUser,
 } from "../types";
 
 /* The cross-source re-entrancy mutex (legacy module-level `pollInFlight`): SSE
    update handlers and the 4s poll both call refreshActiveChat and must not
    overlap. */
 let pollInFlight = false;
+let pendingRefresh: {
+  store: AppStore;
+  authoritativeStatus: boolean;
+} | null = null;
+const CHAT_WINDOW_LIMIT = 100;
 
 /* --------- local mirrors of the loaders' private merge/status helpers ---------
    refreshActiveChat fetches directly (instead of via the dispatching loaders) so
@@ -131,11 +146,129 @@ function scopeModeFor(view: ActiveView): ChatMode | null {
   return view === "private" ? "private" : view === "channel" ? "channel" : null;
 }
 
-/** Re-fetch the active scope and dispatch only when the fingerprint differs.
+function messageSyncPath(
+  path: string,
+  state: AppState,
+  mode: ChatMode,
+  scopeId: string,
+): string {
+  const params = new URLSearchParams();
+  const cursor = state.messageSyncCursors[chatScopeKey(mode, scopeId)];
+  if (cursor) {
+    params.set("after_id", cursor.afterId);
+    params.set("since_revision", String(cursor.revision));
+  }
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+function mergeDelta(
+  state: AppState,
+  mode: ChatMode,
+  scopeId: string,
+  delta: Message[],
+): Message[] {
+  const pendingIds = new Set(
+    state.pendingMessages
+      .filter(
+        (message) =>
+          message.scope_type === scopeTypeFor(mode) &&
+          message.scope_id === String(scopeId),
+      )
+      .map((message) => String(message.id)),
+  );
+  const current = (mode === "private" ? state.privateMessages : state.messages)
+    .filter((message) => !pendingIds.has(String(message.id)));
+  const positions = new Map(current.map((message, index) => [String(message.id), index]));
+  const merged = [...current];
+  for (const message of delta) {
+    const index = positions.get(String(message.id));
+    if (index === undefined) {
+      positions.set(String(message.id), merged.length);
+      merged.push(message);
+    } else {
+      merged[index] = message;
+    }
+  }
+  merged.sort((left, right) => {
+    const leftId = Number(left.id);
+    const rightId = Number(right.id);
+    return Number.isFinite(leftId) && Number.isFinite(rightId) ? leftId - rightId : 0;
+  });
+  return mergePending(
+    state,
+    mode,
+    scopeId,
+    merged.slice(-CHAT_WINDOW_LIMIT),
+  );
+}
+
+export interface ScopeRealtimeUpdate {
+  agent_status?: AgentStatus | null;
+  typing?: TypingUser[];
+  message_revision?: string | number;
+  revision?: string | number;
+  latest_message_id?: Id | null;
+}
+
+/** Apply cheap SSE state directly and report whether persisted messages changed. */
+export function applyScopeRealtimeUpdate(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+  update: ScopeRealtimeUpdate,
+): boolean {
+  if (update.agent_status) {
+    // An SSE snapshot is newer than any status GET already in flight. Invalidate
+    // those reads before applying it so an equal-second watchdog response
+    // cannot authoritatively roll the status back.
+    invalidateStatusReads(store, mode, scopeId);
+  }
+  applyAgentStatus(store, mode, scopeId, update.agent_status);
+  const state = store.getState();
+  if (
+    mode === "channel" &&
+    String(state.activeChannelId) === scopeId &&
+    Array.isArray(update.typing) &&
+    (
+      update.typing.length !== state.typingUsers.length ||
+      update.typing.some((item, index) => (
+        String(item.user_id ?? "") !== String(state.typingUsers[index]?.user_id ?? "") ||
+        String(item.username ?? "") !== String(state.typingUsers[index]?.username ?? "")
+      ))
+    )
+  ) {
+    store.dispatch({ type: "SET_TYPING_USERS", payload: update.typing });
+  }
+  const revision = update.message_revision ?? update.revision;
+  const cursor = state.messageSyncCursors[chatScopeKey(mode, scopeId)];
+  const currentRevision = cursor?.revision;
+  const revisionChanged = revision !== undefined &&
+    (currentRevision === undefined || String(revision) !== String(currentRevision));
+  const remoteLatest = update.latest_message_id == null ||
+    String(update.latest_message_id) === "0"
+    ? ""
+    : String(update.latest_message_id);
+  const latestChanged = update.latest_message_id != null &&
+    remoteLatest !== (cursor?.afterId === "0" ? "" : cursor?.afterId ?? "");
+  return revisionChanged || latestChanged;
+}
+
+/** Synchronize the active scope and dispatch only when its fingerprint differs.
  *  Best-effort: explicit user actions surface their own errors. */
-export async function refreshActiveChat(store: AppStore): Promise<void> {
+export async function refreshActiveChat(
+  store: AppStore,
+  { authoritativeStatus = true }: { authoritativeStatus?: boolean } = {},
+): Promise<void> {
   const initial = store.getState();
-  if (!initial.user || pollInFlight) return;
+  if (!initial.user) return;
+  if (pollInFlight) {
+    // Slow links can leave an older GET in flight when SSE announces a newer
+    // revision. Coalesce follow-up triggers, but never discard the newest one:
+    // run it immediately after the current request settles.
+    pendingRefresh = { store, authoritativeStatus };
+    return;
+  }
   const mode = scopeModeFor(initial.activeView);
   if (!mode) return;
   if (mode === "channel" && !initial.activeChannelId) return;
@@ -145,11 +278,14 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
     if (mode === "channel") {
       const channelId = String(initial.activeChannelId);
       const statusRead = issueStatusRead(store, "channel", channelId);
-      const result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
+      const result = await api<ChannelMessagesResponse>(
+        messageSyncPath(endpoints.channelMessages.path(channelId), initial, "channel", channelId),
+      );
       const state = store.getState();
       // Channel-switch race guard: discard a response for a channel we left.
       if (String(state.activeChannelId) !== channelId) return;
-      if (!isStatusReadCurrent(statusRead)) return;
+      if (!isScopeReadCurrent(statusRead)) return;
+      const acceptStatus = isStatusReadCurrent(statusRead);
       const before = chatSnapshot(
         "channel",
         channelId,
@@ -157,29 +293,53 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
         agentStatusFor(state, "channel"),
         state.typingUsers,
       );
-      const nextMessages = mergePending(state, "channel", channelId, result.messages || []);
-      const nextStatus = result.agent_status ?? agentStatusFor(state, "channel");
+      const nextMessages = result.mode === "delta"
+        ? mergeDelta(state, "channel", channelId, result.messages || [])
+        : mergePending(state, "channel", channelId, result.messages || []);
+      const refreshedStatus = acceptStatus ? result.agent_status : undefined;
+      const nextStatus = refreshedStatus ?? agentStatusFor(state, "channel");
       const nextTyping = result.typing || [];
       const after = chatSnapshot("channel", channelId, nextMessages, nextStatus, nextTyping);
-      if (before === after) return;
-      store.dispatch({ type: "SET_MESSAGES", payload: nextMessages });
-      applyAgentStatus(store, "channel", channelId, result.agent_status, true);
-      store.dispatch({ type: "SET_TYPING_USERS", payload: nextTyping });
+      if (before !== after) {
+        store.dispatch({ type: "SET_MESSAGES", payload: nextMessages });
+        applyAgentStatus(
+          store,
+          "channel",
+          channelId,
+          refreshedStatus,
+          authoritativeStatus,
+        );
+        store.dispatch({ type: "SET_TYPING_USERS", payload: nextTyping });
+      }
+      const cursor = messageSyncCursor(
+        result,
+        state.messageSyncCursors[chatScopeKey("channel", channelId)],
+      );
+      if (cursor) {
+        store.dispatch({
+          type: "SET_MESSAGE_SYNC_CURSOR",
+          payload: {
+            key: chatScopeKey("channel", channelId),
+            cursor,
+          },
+        });
+      }
+      cacheChat(
+        store,
+        "channel",
+        channelId,
+        store.getState().messages,
+        cursor,
+      );
     } else {
       const scopeId = scopeIdFor(initial, "private");
       const statusRead = issueStatusRead(store, "private", scopeId);
-      const [messagesResult, telegramResult] = await Promise.all([
-        api<PrivateMessagesResponse>(endpoints.privateMessages.path()),
-        api<PrivateTelegramResponse>(endpoints.privateTelegram.path()),
-      ]);
+      const messagesResult = await api<PrivateMessagesResponse>(
+        messageSyncPath(endpoints.privateMessages.path(), initial, "private", scopeId),
+      );
       const state = store.getState();
-      // Telegram is refreshed alongside private messages but updated INDEPENDENTLY
-      // of the message/agent fingerprint gate (legacy applied it unconditionally),
-      // so a link/unlink/status change that doesn't touch messages still surfaces.
-      if (JSON.stringify(telegramResult) !== JSON.stringify(state.privateTelegram)) {
-        store.dispatch({ type: "SET_PRIVATE_TELEGRAM", payload: telegramResult });
-      }
-      if (!isStatusReadCurrent(statusRead)) return;
+      if (!isScopeReadCurrent(statusRead)) return;
+      const acceptStatus = isStatusReadCurrent(statusRead);
       const before = chatSnapshot(
         "private",
         scopeId,
@@ -187,17 +347,54 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
         agentStatusFor(state, "private"),
         [],
       );
-      const nextMessages = mergePending(state, "private", scopeId, messagesResult.messages || []);
-      const nextStatus = messagesResult.agent_status ?? agentStatusFor(state, "private");
+      const nextMessages = messagesResult.mode === "delta"
+        ? mergeDelta(state, "private", scopeId, messagesResult.messages || [])
+        : mergePending(state, "private", scopeId, messagesResult.messages || []);
+      const refreshedStatus = acceptStatus ? messagesResult.agent_status : undefined;
+      const nextStatus = refreshedStatus ?? agentStatusFor(state, "private");
       const after = chatSnapshot("private", scopeId, nextMessages, nextStatus, []);
-      if (before === after) return;
-      store.dispatch({ type: "SET_PRIVATE_MESSAGES", payload: nextMessages });
-      applyAgentStatus(store, "private", scopeId, messagesResult.agent_status, true);
+      if (before !== after) {
+        store.dispatch({ type: "SET_PRIVATE_MESSAGES", payload: nextMessages });
+        applyAgentStatus(
+          store,
+          "private",
+          scopeId,
+          refreshedStatus,
+          authoritativeStatus,
+        );
+      }
+      const cursor = messageSyncCursor(
+        messagesResult,
+        state.messageSyncCursors[chatScopeKey("private", scopeId)],
+      );
+      if (cursor) {
+        store.dispatch({
+          type: "SET_MESSAGE_SYNC_CURSOR",
+          payload: {
+            key: chatScopeKey("private", scopeId),
+            cursor,
+          },
+        });
+      }
+      cacheChat(
+        store,
+        "private",
+        scopeId,
+        store.getState().privateMessages,
+        cursor,
+      );
     }
   } catch {
     // Polling/SSE refresh is best-effort.
   } finally {
     pollInFlight = false;
+    const next = pendingRefresh;
+    pendingRefresh = null;
+    if (next) {
+      void refreshActiveChat(next.store, {
+        authoritativeStatus: next.authoritativeStatus,
+      });
+    }
   }
 }
 
@@ -207,12 +404,15 @@ export async function refreshActiveChat(store: AppStore): Promise<void> {
  *  (legacy navItem onclick, legacy-app.js:489-501). Channel view loads via
  *  selectChannel / existing state, so it has no loader here. */
 export async function navigateToView(store: AppStore, view: ActiveView): Promise<void> {
+  cacheVisibleChat(store);
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: view });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
   if (view !== "private") {
     store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false });
   }
   if (view === "private") {
+    const scopeId = scopeIdFor(store.getState(), "private");
+    restoreCachedChat(store, "private", scopeId);
     await runResourceLoad(store, resourceKeys.privateChat, () => loadPrivateMessages(store));
   } else if (view === "knowledge") {
     await ensureResource(store, resourceKeys.knowledgeList, () => loadDocuments(store));
@@ -225,8 +425,13 @@ export async function navigateToView(store: AppStore, view: ActiveView): Promise
 /** Select a channel + close the drawer, then load its messages (legacy channel
  *  button onclick, legacy-app.js:453-459). */
 export async function selectChannel(store: AppStore, channelId: Id): Promise<void> {
+  cacheVisibleChat(store);
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
   store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: channelId });
+  if (!restoreCachedChat(store, "channel", String(channelId))) {
+    store.dispatch({ type: "SET_MESSAGES", payload: [] });
+  }
+  store.dispatch({ type: "SET_TYPING_USERS", payload: [] });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
   store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false });
   await runResourceLoad(store, resourceKeys.channelChat(channelId), () => loadChannelMessages(store));
@@ -345,6 +550,7 @@ export async function sendMessage(
       type: "REPLACE_OPTIMISTIC_MESSAGE",
       payload: { mode, scopeId, tempId: message.id, saved: result.user_message ?? null },
     });
+    upsertCachedMessage(store, mode, scopeId, result.user_message);
     // Channel behavior retains the immediate safety refresh. Private chat is
     // already updated by the POST plus its scope SSE; skipping a competing GET
     // here prevents a response from message N-1 from overwriting message N's

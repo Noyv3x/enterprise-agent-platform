@@ -629,6 +629,12 @@ select {
 .scrim { display: none; appearance: none; border: 0; margin: 0; padding: 0; font: inherit; cursor: pointer; }
 
 .content { min-width: 0; min-height: 0; overflow: hidden; position: relative; display: grid; }
+.view-loading {
+  min-height: 40vh;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
 
 /* Entrance animation, applied only when the view changes */
 @keyframes view-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }

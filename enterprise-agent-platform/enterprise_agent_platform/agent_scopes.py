@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,8 @@ class AgentScopeManager:
         self._workspace_root = self.config.workspace_dir.expanduser()
         ensure_private_directory(self._workspace_root)
         self._workspace_root = self._workspace_root.resolve()
+        self._scope_cache: dict[str, AgentExecutionScope] = {}
+        self._scope_cache_lock = threading.RLock()
 
     @staticmethod
     def private_scope_key(user_id: int) -> str:
@@ -142,7 +145,37 @@ class AgentScopeManager:
         scope_id: str,
         default_session_id: str,
     ) -> AgentExecutionScope:
+        # Always re-resolve and lstat the workspace components. The metadata
+        # cache removes repeated SQLite transactions and marker rewrites, but it
+        # must not turn a later directory-to-symlink replacement into a durable
+        # cross-scope workspace escape.
         workspace = self._expected_workspace(scope_type, scope_id)
+        with self._scope_cache_lock:
+            cached = self._scope_cache.get(scope_key)
+        if (
+            cached is not None
+            and cached.scope_type == scope_type
+            and cached.scope_id == scope_id
+            and Path(cached.workspace_path) == workspace
+            and self._scope_marker_matches(cached)
+        ):
+            return cached
+        if cached is not None:
+            with self._scope_cache_lock:
+                self._scope_cache.pop(scope_key, None)
+
+        existing = self.get_scope(scope_key)
+        if (
+            existing is not None
+            and existing.scope_type == scope_type
+            and existing.scope_id == scope_id
+            and Path(existing.workspace_path) == workspace
+            and self._scope_marker_matches(existing)
+        ):
+            with self._scope_cache_lock:
+                self._scope_cache[scope_key] = existing
+            return existing
+
         ts = now_ts()
         scope_lifecycle_id = secrets.token_hex(16)
         runtime_lifecycle_id = secrets.token_hex(16)
@@ -186,6 +219,8 @@ class AgentScopeManager:
         scope = self._from_row(dict(row))
         self._record_session_alias(scope)
         self._write_scope_marker(scope)
+        with self._scope_cache_lock:
+            self._scope_cache[scope_key] = scope
         return scope
 
     def get_scope(self, scope_key: str) -> AgentExecutionScope | None:
@@ -202,6 +237,7 @@ class AgentScopeManager:
         if not self._valid_session_id(session_id):
             raise ValueError("invalid Agent session id")
         ts = now_ts()
+        updated_scope: AgentExecutionScope | None = None
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE agent_runtime_scopes SET session_id = ?, updated_at = ? WHERE scope_key = ?",
@@ -214,6 +250,10 @@ class AgentScopeManager:
             if row is not None:
                 scope = self._from_row(dict(row))
                 self._record_session_alias(scope, conn=conn, timestamp=ts)
+                updated_scope = scope
+        if updated_scope is not None:
+            with self._scope_cache_lock:
+                self._scope_cache[scope_key] = updated_scope
 
     def rotate_session(self, scope_key: str) -> AgentExecutionScope:
         """Start a fresh Agent conversation while preserving its workspace.
@@ -262,6 +302,8 @@ class AgentScopeManager:
         if refreshed is None:
             raise RuntimeError(f"failed to rotate Agent session {scope.scope_key}")
         self._write_scope_marker(refreshed)
+        with self._scope_cache_lock:
+            self._scope_cache[scope.scope_key] = refreshed
         return refreshed
 
     def deactivate_private_scope(self, user_id: int) -> None:
@@ -340,3 +382,20 @@ class AgentScopeManager:
         write_private_file_exclusive(temporary, (payload + "\n").encode("utf-8"))
         os.replace(temporary, marker)
         marker.chmod(0o600)
+
+    @staticmethod
+    def _scope_marker_matches(scope: AgentExecutionScope) -> bool:
+        marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            return bool(
+                isinstance(payload, dict)
+                and payload.get("scope_key") == scope.scope_key
+                and payload.get("scope_type") == scope.scope_type
+                and str(payload.get("scope_id")) == scope.scope_id
+                and payload.get("lifecycle_id") == scope.lifecycle_id
+                and payload.get("execution_backend") == "host"
+                and payload.get("isolation") == "logical"
+            )
+        except (OSError, ValueError, TypeError):
+            return False

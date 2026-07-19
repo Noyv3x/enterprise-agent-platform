@@ -36,8 +36,15 @@ describe("UpdateGate", () => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
   });
 
+  it("does not hold the healthy application behind a slow initial probe", () => {
+    renderGate(vi.fn(() => new Promise<PlatformUpdateStatus>(() => undefined)));
+    expect(screen.getByText("Application content")).toBeInTheDocument();
+    expect(screen.queryByText("Checking platform status")).not.toBeInTheDocument();
+  });
+
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     window.localStorage.clear();
@@ -48,6 +55,25 @@ describe("UpdateGate", () => {
 
     expect(await screen.findByText("Application content")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Updating ubitech agent" })).not.toBeInTheDocument();
+  });
+
+  it("rechecks an idle platform within five seconds", async () => {
+    vi.useFakeTimers();
+    const loadStatus = vi.fn(async () => status("idle"));
+    renderGate(loadStatus);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(loadStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_999);
+    });
+    expect(loadStatus).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(loadStatus).toHaveBeenCalledTimes(2);
   });
 
   it("blocks the product for launching, updating, and failed states", async () => {

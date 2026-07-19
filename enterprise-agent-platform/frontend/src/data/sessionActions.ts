@@ -15,8 +15,21 @@ import { toast } from "../context/ToastContext";
 import { t } from "../i18n";
 import { hasPermission, isAdmin } from "../store/selectors";
 import { revokeAttachmentUrls } from "../utils/composerFiles";
-import type { ActiveView, AuthMeResponse, LoginResponse } from "../types";
-import { loadInitial, type AppStore } from "./loaders";
+import type {
+  ActiveView,
+  AuthMeResponse,
+  LoginResponse,
+  SessionBootstrapResponse,
+} from "../types";
+import { clearChatCache } from "./chatCache";
+import {
+  hydrateSessionBootstrap,
+  clearRuntimeStatusRefresh,
+  loadInitial,
+  loadPrivateTelegram,
+  loadSessionBootstrap,
+  type AppStore,
+} from "./loaders";
 
 /* ------------------------------------------------ session teardown registry */
 
@@ -52,6 +65,8 @@ export function resetSession(
     : [];
   resetApiSession();
   runSessionTeardowns();
+  clearRuntimeStatusRefresh(store);
+  clearChatCache(store);
   for (const message of store.getState().pendingMessages) revokeAttachmentUrls(message);
   store.dispatch({ type: "RESET_SESSION" });
   for (const operationId of pendingOperations) {
@@ -136,8 +151,27 @@ export async function login(store: AppStore, username: string, password: string)
     body: JSON.stringify({ username, password }),
   });
   resetSession(store, { preservePendingOperations: true });
-  store.dispatch({ type: "SET_USER", payload: result.user });
-  await loadInitial(store);
+  const embedded = result.bootstrap || (
+    Array.isArray(result.channels) &&
+    Array.isArray(result.mention_targets) &&
+    Array.isArray(result.messages)
+      ? result as SessionBootstrapResponse
+      : null
+  );
+  if (embedded) {
+    hydrateSessionBootstrap(store, embedded);
+    if (embedded.active_scope?.scope_type === "private") {
+      void loadPrivateTelegram(store).catch(() => undefined);
+    }
+  } else {
+    store.dispatch({ type: "SET_USER", payload: result.user });
+    try {
+      await loadSessionBootstrap(store);
+    } catch (error) {
+      if (isApiRequestCancelled(error)) throw error;
+      await loadInitial(store);
+    }
+  }
   coerceActiveView(store);
 }
 
@@ -147,9 +181,20 @@ export type BootResult = "authenticated" | "anonymous" | "error";
 
 export async function boot(store: AppStore): Promise<BootResult> {
   try {
-    const result = await api<AuthMeResponse>(endpoints.authMe.path(), { skipAuthHandling: true });
-    store.dispatch({ type: "SET_USER", payload: result.user });
-    await loadInitial(store);
+    try {
+      await loadSessionBootstrap(store);
+    } catch (bootstrapError) {
+      if (isApiError(bootstrapError, 401) || isApiRequestCancelled(bootstrapError)) {
+        throw bootstrapError;
+      }
+      // Rolling deployments can briefly pair a new frontend with an older
+      // backend. Keep the established auth + loader path as a safe fallback.
+      const result = await api<AuthMeResponse>(endpoints.authMe.path(), {
+        skipAuthHandling: true,
+      });
+      store.dispatch({ type: "SET_USER", payload: result.user });
+      await loadInitial(store);
+    }
     coerceActiveView(store);
     return "authenticated";
   } catch (error) {

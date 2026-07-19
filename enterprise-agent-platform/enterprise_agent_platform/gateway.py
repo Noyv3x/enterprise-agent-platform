@@ -9,6 +9,8 @@ import re
 import secrets
 import signal
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -32,6 +34,15 @@ from .update_state import (
 
 GATEWAY_STATE_FILENAME = "gateway-state.json"
 GATEWAY_STATE_SCHEMA_VERSION = 1
+GATEWAY_CONTROL_SOCKET_FILENAME = "gateway-control.sock"
+# sockaddr_un.sun_path is only 108 bytes on Linux (and can be shorter on
+# other POSIX systems). Keep a little portability headroom rather than letting
+# a valid, relocated platform data directory make the gateway fail at bind().
+GATEWAY_CONTROL_DIRECT_PATH_MAX_BYTES = 100
+GATEWAY_CONTROL_FALLBACK_DIRECTORY_PREFIX = "ubitech-agent-gateway"
+GATEWAY_CONTROL_SCHEMA_VERSION = 1
+GATEWAY_CONTROL_TIMEOUT_SECONDS = 1.0
+GATEWAY_CONTROL_MAX_BYTES = 16 * 1024
 GATEWAY_HEARTBEAT_SECONDS = 2.0
 BACKEND_START_TIMEOUT_SECONDS = 90.0
 BACKEND_STOP_TIMEOUT_SECONDS = 120.0
@@ -64,6 +75,28 @@ HOP_BY_HOP_HEADERS = frozenset(
 
 def gateway_state_path(data_dir: Path | str) -> Path:
     return Path(data_dir).expanduser().resolve() / GATEWAY_STATE_FILENAME
+
+
+def gateway_control_socket_path(data_dir: Path | str) -> Path:
+    resolved_data_dir = Path(data_dir).expanduser().resolve()
+    preferred = resolved_data_dir / GATEWAY_CONTROL_SOCKET_FILENAME
+    if len(os.fsencode(preferred)) <= GATEWAY_CONTROL_DIRECT_PATH_MAX_BYTES:
+        return preferred
+
+    # /tmp is intentionally only the namespace parent. GatewayControlServer
+    # creates and validates the per-user child as an owner-only directory, the
+    # socket itself is 0600, and SO_PEERCRED still authenticates every client.
+    # Hashing the canonical data directory keeps the path stable across the
+    # gateway and deploy processes without exposing or truncating path segments.
+    uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    digest = hashlib.sha256(os.fsencode(resolved_data_dir)).hexdigest()[:32]
+    fallback_directory = Path("/tmp") / (
+        f"{GATEWAY_CONTROL_FALLBACK_DIRECTORY_PREFIX}-{uid}"
+    )
+    fallback = fallback_directory / f"{digest}.sock"
+    if len(os.fsencode(fallback)) > GATEWAY_CONTROL_DIRECT_PATH_MAX_BYTES:
+        raise RuntimeError("gateway control socket fallback path is too long")
+    return fallback
 
 
 def read_gateway_state(data_dir: Path | str) -> dict[str, Any] | None:
@@ -123,6 +156,130 @@ class RequestFramingError(ValueError):
         self.status = status
 
 
+class GatewayControlServer:
+    """Private local channel for authoritative, non-durable gateway counters."""
+
+    def __init__(self, supervisor: "GatewaySupervisor"):
+        self.supervisor = supervisor
+        self.path = gateway_control_socket_path(supervisor.config.data_dir)
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._socket_identity: tuple[int, int] | None = None
+
+    def start(self) -> None:
+        ensure_private_directory(self.path.parent)
+        self._remove_stale_socket()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.path))
+            metadata = self.path.lstat()
+            self._socket_identity = (metadata.st_dev, metadata.st_ino)
+            os.chmod(self.path, 0o600)
+            listener.listen(8)
+            listener.settimeout(0.25)
+        except BaseException:
+            listener.close()
+            self._unlink_owned_socket()
+            raise
+        self._listener = listener
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="platform-gateway-control",
+            daemon=True,
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        thread = self._thread
+        self._thread = None
+        if (
+            thread is not None
+            and thread.ident is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2)
+        self._unlink_owned_socket()
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            self._socket_identity = None
+            return
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise RuntimeError("gateway control path is not a Unix socket")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.2)
+        try:
+            probe.connect(str(self.path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            self.path.unlink(missing_ok=True)
+            return
+        except OSError as exc:
+            raise RuntimeError("gateway control socket could not be verified") from exc
+        finally:
+            probe.close()
+        raise RuntimeError("another platform gateway control socket is already active")
+
+    def _serve(self) -> None:
+        while not self._stop_event.is_set():
+            listener = self._listener
+            if listener is None:
+                return
+            try:
+                connection, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop_event.is_set():
+                    return
+                continue
+            with connection:
+                connection.settimeout(GATEWAY_CONTROL_TIMEOUT_SECONDS)
+                try:
+                    if not _control_peer_is_current_user(connection):
+                        continue
+                    request = _read_control_line(connection)
+                    if request != b"drain-status":
+                        continue
+                    payload = self.supervisor.control_status()
+                    encoded = (
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                    connection.sendall(encoded)
+                except (OSError, ValueError):
+                    continue
+
+    def _unlink_owned_socket(self) -> None:
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            self._socket_identity = None
+            return
+        if (
+            stat.S_ISSOCK(metadata.st_mode)
+            and self._socket_identity == (metadata.st_dev, metadata.st_ino)
+        ):
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        self._socket_identity = None
+
+
 class GatewaySupervisor:
     def __init__(
         self,
@@ -155,6 +312,7 @@ class GatewaySupervisor:
         self._active_business_requests = 0
         self._active_mutating_requests = 0
         self._server: GatewayHTTPServer | None = None
+        self._control_server: GatewayControlServer | None = None
 
     def public_update_status(self) -> dict[str, Any]:
         stored = read_state(self.config.data_dir)
@@ -179,11 +337,24 @@ class GatewaySupervisor:
         with self._lock:
             return self._target if self._backend_ready else None
 
+    def control_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "schema_version": GATEWAY_CONTROL_SCHEMA_VERSION,
+                "pid": os.getpid(),
+                "gateway_instance_id": self.gateway_instance_id,
+                "generation": self._generation,
+                "accepting_business_requests": self._accept_business_requests,
+                "active_business_requests": self._active_business_requests,
+                "active_mutating_requests": self._active_mutating_requests,
+            }
+
     def admit_business_request(self, method: str) -> BusinessRequestAdmission | None:
         mutating = method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
         # The marker transition and gateway admission use the same cross-process
-        # lock. The counter is durably published before that lock is released,
-        # so deploy.sh cannot observe a blocking marker plus a stale zero count.
+        # lock. Once the marker is blocking, the updater reads the authoritative
+        # in-memory counter through the private control socket while holding this
+        # lock, so it cannot race with a newly admitted business request.
         with update_state_lock(self.config.data_dir):
             with self._lock:
                 stored = read_state(self.config.data_dir)
@@ -198,17 +369,14 @@ class GatewaySupervisor:
                 self._active_business_requests += 1
                 if mutating:
                     self._active_mutating_requests += 1
-                self._write_state()
                 return admission
 
     def end_business_request(self, admission: BusinessRequestAdmission) -> None:
-        with update_state_lock(self.config.data_dir):
-            with self._business_condition:
-                self._active_business_requests = max(0, self._active_business_requests - 1)
-                if admission.mutating:
-                    self._active_mutating_requests = max(0, self._active_mutating_requests - 1)
-                self._write_state()
-                self._business_condition.notify_all()
+        with self._business_condition:
+            self._active_business_requests = max(0, self._active_business_requests - 1)
+            if admission.mutating:
+                self._active_mutating_requests = max(0, self._active_mutating_requests - 1)
+            self._business_condition.notify_all()
 
     def request_reload(self) -> None:
         self._reload_event.set()
@@ -229,6 +397,12 @@ class GatewaySupervisor:
         )
         self._server = server
         thread = threading.Thread(target=server.serve_forever, name="platform-gateway-http", daemon=True)
+        try:
+            self._start_control_server()
+        except BaseException:
+            server.server_close()
+            self._server = None
+            raise
         thread.start()
         self._write_state()
         self._restart_backend()
@@ -253,6 +427,7 @@ class GatewaySupervisor:
             thread.join(timeout=10)
             server.server_close()
             self._stop_backend()
+            self._stop_control_server()
             self._remove_state()
 
     def _reexec_gateway(
@@ -280,6 +455,7 @@ class GatewaySupervisor:
         if not server.wait_for_request_handlers(GATEWAY_HANDLER_DRAIN_SECONDS):
             server.close_active_requests()
             server.wait_for_request_handlers(1.0)
+        self._stop_control_server()
 
         listener_fd = server.listener_fd_for_exec()
         env = os.environ.copy()
@@ -423,14 +599,26 @@ class GatewaySupervisor:
             backend.kill()
             backend.wait(timeout=10)
 
+    def _start_control_server(self) -> None:
+        control = GatewayControlServer(self)
+        control.start()
+        self._control_server = control
+
+    def _stop_control_server(self) -> None:
+        control = self._control_server
+        self._control_server = None
+        if control is not None:
+            control.stop()
+
     def _write_state(self) -> None:
-        # All state changes take _lock before the writer lock. Keeping this
-        # order avoids a lock inversion with admission, which must publish its
-        # counter while holding _lock and the cross-process update-state lock.
+        # This durable file is a lifecycle/heartbeat record. High-frequency
+        # request counters are snapshots for diagnostics only; update draining
+        # reads their authoritative values through the control socket.
         with self._lock:
             with self._state_write_lock:
                 backend = self._backend
                 target = self._target
+                control = self._control_server
                 value = {
                     "schema_version": GATEWAY_STATE_SCHEMA_VERSION,
                     "pid": os.getpid(),
@@ -447,6 +635,7 @@ class GatewaySupervisor:
                     "accepting_business_requests": self._accept_business_requests,
                     "active_business_requests": self._active_business_requests,
                     "active_mutating_requests": self._active_mutating_requests,
+                    "control_socket": str(control.path) if control is not None else "",
                     "heartbeat_at": time.time(),
                 }
                 _atomic_json_write(gateway_state_path(self.config.data_dir), value)
@@ -889,31 +1078,111 @@ def run_gateway(config: PlatformConfig, *, mode: str = "foreground") -> None:
                 pass
 
 
+def _control_peer_is_current_user(connection: socket.socket) -> bool:
+    peer_credentials = getattr(socket, "SO_PEERCRED", None)
+    if peer_credentials is None:
+        return True
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, peer_credentials, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+    except (OSError, struct.error):
+        return False
+    return uid == os.geteuid()
+
+
+def _read_control_line(connection: socket.socket) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total < GATEWAY_CONTROL_MAX_BYTES:
+        chunk = connection.recv(min(4096, GATEWAY_CONTROL_MAX_BYTES - total))
+        if not chunk:
+            break
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            chunks.append(chunk[:newline])
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+    raise ValueError("invalid gateway control message")
+
+
+def _query_gateway_control(
+    data_dir: Path | str,
+    state: dict[str, Any],
+    *,
+    timeout: float = GATEWAY_CONTROL_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    expected_path = gateway_control_socket_path(data_dir)
+    if str(state.get("control_socket") or "") != str(expected_path):
+        return None
+    try:
+        expected_pid = int(state.get("pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    expected_instance_id = str(state.get("gateway_instance_id") or "")
+    if expected_pid <= 1 or not expected_instance_id:
+        return None
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(max(0.01, min(float(timeout), GATEWAY_CONTROL_TIMEOUT_SECONDS)))
+    try:
+        client.connect(str(expected_path))
+        client.sendall(b"drain-status\n")
+        raw = _read_control_line(client)
+    except (OSError, ValueError):
+        return None
+    finally:
+        client.close()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != GATEWAY_CONTROL_SCHEMA_VERSION
+        or value.get("pid") != expected_pid
+        or str(value.get("gateway_instance_id") or "") != expected_instance_id
+    ):
+        return None
+    return value
+
+
 def wait_for_gateway_drain(data_dir: Path | str, *, timeout: float = 60.0) -> bool:
     """Wait for writes admitted before maintenance to finish without killing them."""
 
     deadline = time.monotonic() + max(0.0, float(timeout))
     observed_gateway = False
     while True:
-        # Admission publishes its mutating counter while holding this same
-        # cross-process lock. Once the update marker is blocking, a zero read
-        # here therefore cannot race with a newly admitted business request.
+        # Admission and this live counter query share the marker lock. Once the
+        # update marker is blocking, a zero response cannot race with a newly
+        # admitted write. Request completion needs no filesystem operation.
         with update_state_lock(data_dir):
             state = read_gateway_state(data_dir)
-        if state is None:
-            return not observed_gateway
-        observed_gateway = True
-        if not gateway_process_is_live(state):
+            if state is None:
+                return not observed_gateway
+            observed_gateway = True
+            if not gateway_process_is_live(state):
+                return False
+            control = _query_gateway_control(
+                data_dir,
+                state,
+                timeout=max(0.01, deadline - time.monotonic()),
+            )
+        # A live gateway without a verified control response is ambiguous:
+        # never trust its stale lifecycle snapshot as a drain decision.
+        if control is None:
             return False
         try:
-            active = int(state.get("active_mutating_requests") or 0)
-        except (TypeError, ValueError):
+            active = int(control.get("active_mutating_requests") or 0)
+        except (TypeError, ValueError, OverflowError):
             return False
-        if active <= 0:
+        if active < 0:
+            return False
+        if active == 0:
             return True
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(0.25)
+        time.sleep(min(0.25, remaining))
 
 
 def gateway_code_signature() -> str:

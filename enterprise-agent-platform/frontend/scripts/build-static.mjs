@@ -13,6 +13,12 @@ import {
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import {
+  brotliCompress as brotliCompressCallback,
+  constants as zlibConstants,
+  gzip as gzipCallback,
+} from "node:zlib";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const frontendDir = resolve(scriptDir, "..");
@@ -31,8 +37,13 @@ const FIXED_FILES = new Set([
 ]);
 const HASHED_ASSET_RE = /-[A-Za-z0-9_-]{8,}\.(?:js|css)$/;
 const MANAGED_ASSET_RE = /^(?:.*\/)?(?:app-|chunk-|styles-|asset-).+/;
+const FIXED_VARIANT_RE = /^(?:index\.html|theme-init\.js|app\.js|styles\.css)\.(?:br|gz)$/;
 const LEGACY_ASSETS = new Set(["app.js", "styles.css"]);
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const COMPRESSIBLE_ASSET_RE = /\.(?:css|html|js|json|map|svg|txt|xml)$/i;
+const PRECOMPRESS_MIN_BYTES = 512;
+const brotliCompress = promisify(brotliCompressCallback);
+const gzip = promisify(gzipCallback);
 
 async function exists(path) {
   try {
@@ -155,13 +166,26 @@ async function assertLiveTreeSafe(root) {
   }
 }
 
-export async function atomicPublish(stageDir, liveDir, manifest, { beforeCommit } = {}) {
+export async function atomicPublish(
+  stageDir,
+  liveDir,
+  manifest,
+  { beforeCommit, afterInstall } = {},
+) {
   await mkdir(liveDir, { recursive: true });
   await assertLiveTreeSafe(liveDir);
   await writeFile(join(stageDir, RELEASE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   const files = await listFiles(stageDir);
   if (!files.includes("index.html")) throw new Error("cannot publish without index.html");
-  const ordered = [...files.filter((name) => name !== "index.html"), "index.html"];
+  // A compressed index is just as much an entry point as the identity file.
+  // Publish every dependency first, then both encoded variants, and use the
+  // identity index as the final commit marker for the whole release.
+  const entryFiles = ["index.html.br", "index.html.gz", "index.html"];
+  const entrySet = new Set(entryFiles);
+  const ordered = [
+    ...files.filter((name) => !entrySet.has(name)),
+    ...entryFiles.filter((name) => files.includes(name)),
+  ];
   const releaseId = `${process.pid}-${Date.now()}`;
   const rollbackDir = join(stageDir, ".rollback");
   const installed = [];
@@ -187,6 +211,7 @@ export async function atomicPublish(stageDir, liveDir, manifest, { beforeCommit 
       }
       await atomicCopy(source, destination, releaseId);
       installed.push({ relativePath, destination, backup });
+      await afterInstall?.(relativePath);
       if (relativePath === "index.html") committed = true;
     }
   } catch (error) {
@@ -228,7 +253,9 @@ async function assetsReferencedByLiveIndex(liveDir) {
 }
 
 function isManagedAsset(relativePath) {
-  return LEGACY_ASSETS.has(relativePath) || MANAGED_ASSET_RE.test(relativePath);
+  return LEGACY_ASSETS.has(relativePath)
+    || FIXED_VARIANT_RE.test(relativePath)
+    || MANAGED_ASSET_RE.test(relativePath);
 }
 
 export function retainedPreviousAssets(currentAssets, previousManifest, discoveredAssets = []) {
@@ -295,6 +322,38 @@ async function writeLegacyEntrypoints(stageDir, validated) {
   await writeFile(join(stageDir, "styles.css"), `@import url("/${validated.styles[0]}");\n`, "utf8");
 }
 
+export async function precompressStaticAssets(stageDir) {
+  const files = await listFiles(stageDir);
+  const compressed = [];
+  for (const relativePath of files) {
+    if (
+      relativePath.endsWith(".br") ||
+      relativePath.endsWith(".gz") ||
+      !COMPRESSIBLE_ASSET_RE.test(relativePath)
+    ) {
+      continue;
+    }
+    const sourcePath = assertInside(stageDir, relativePath);
+    const source = await readFile(sourcePath);
+    if (source.length < PRECOMPRESS_MIN_BYTES) continue;
+    const [brotli, gzipped] = await Promise.all([
+      brotliCompress(source, {
+        params: {
+          [zlibConstants.BROTLI_PARAM_QUALITY]: 7,
+          [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
+        },
+      }),
+      gzip(source, { level: 6, mtime: 0 }),
+    ]);
+    await Promise.all([
+      writeFile(`${sourcePath}.br`, brotli, { mode: 0o644 }),
+      writeFile(`${sourcePath}.gz`, gzipped, { mode: 0o644 }),
+    ]);
+    compressed.push(relativePath);
+  }
+  return compressed;
+}
+
 async function main() {
   await mkdir(platformPackageDir, { recursive: true });
   const stageDir = join(platformPackageDir, `.static-staging-${process.pid}-${Date.now()}`);
@@ -309,9 +368,16 @@ async function main() {
     await copyLogoIntoStage(stageDir);
     const validated = await validateStagedBuild(stageDir);
     await writeLegacyEntrypoints(stageDir, validated);
+    await precompressStaticAssets(stageDir);
     const previousManifest = await readManifest(liveStaticDir);
     const discoveredPrevious = await assetsReferencedByLiveIndex(liveStaticDir);
-    const currentAssets = validated.files.filter((name) => !FIXED_FILES.has(name));
+    // Re-read the staged tree after precompression. The release manifest is
+    // also the post-publish cleanup allowlist, so omitting .br/.gz sidecars
+    // here would cause removeStaleAssets() to delete the new variants
+    // immediately after a successful publication.
+    const currentAssets = (await listFiles(stageDir)).filter(
+      (name) => !FIXED_FILES.has(name),
+    );
     const previousAssets = retainedPreviousAssets(currentAssets, previousManifest, discoveredPrevious);
     const manifest = {
       version: 1,

@@ -186,7 +186,9 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
     });
     await waitUntil(() => registry.get("private:7", running.id, "life-7").stdout.includes("running-output"));
 
-    const preview = registry.preview("private:7", "life-7");
+    const previewResult = registry.preview("private:7", "life-7");
+    const preview = previewResult.processes;
+    assert.match(previewResult.revision, /^preview_[a-f0-9]{32}:[1-9]\d*$/);
     assert.equal(preview.length, 3);
     assert.deepEqual(registry.previewSummary("private:7", "life-7"), {
       running_terminal_count: 1,
@@ -200,9 +202,10 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
       }
     }
     const rootPreview = preview.find((process) => process.id === root.id)!;
-    assert.equal(rootPreview.stdout, "root-output");
     assert.equal(rootPreview.output, "root-output");
-    assert.doesNotMatch(rootPreview.stdout, /\u001b|\u0001|host-title/);
+    assert.equal("stdout" in rootPreview, false);
+    assert.equal("stderr" in rootPreview, false);
+    assert.doesNotMatch(rootPreview.output, /\u001b|\u0001|host-title/);
     for (const secret of [
       "root-secret",
       "url-secret",
@@ -230,6 +233,87 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
   }
 });
 
+test("ProcessRegistry preview revisions change only when owned process state changes", async () => {
+  const workspace = await temporaryDirectory("agent-process-preview-revision-");
+  const registry = new ProcessRegistry();
+  try {
+    const empty = registry.preview("private:7", "life-7");
+    assert.deepEqual(empty.processes, []);
+    assert.match(empty.revision, /^preview_[a-f0-9]{32}:0$/);
+    assert.deepEqual(registry.preview("private:7", "life-7", empty.revision), {
+      processes: [],
+      revision: empty.revision,
+      unchanged: true,
+    });
+
+    const running = await registry.run({
+      runId: "revision-run",
+      scopeKey: "private:7/delegate/child",
+      lifecycleId: "life-7",
+      command: "sleep 0.1; printf stdout-ready; printf stderr-ready >&2; trap 'sleep 0.15; exit 0' TERM; while :; do sleep 1; done",
+      cwd: workspace,
+      background: true,
+    });
+    const started = registry.preview("private:7", "life-7");
+    assert.notEqual(started.revision, empty.revision);
+    assert.equal(started.processes[0]?.id, running.id);
+    assert.deepEqual(registry.preview("private:7", "life-7", started.revision), {
+      processes: [],
+      revision: started.revision,
+      unchanged: true,
+    });
+
+    await waitUntil(() => registry.get("private:7/delegate/child", running.id, "life-7").stdout.includes("stdout-ready"));
+    await waitUntil(() => registry.get("private:7/delegate/child", running.id, "life-7").stderr.includes("stderr-ready"));
+    const withOutput = registry.preview("private:7", "life-7");
+    assert.notEqual(withOutput.revision, started.revision);
+    assert.match(withOutput.processes[0]!.output, /stdout-ready/);
+    assert.match(withOutput.processes[0]!.output, /stderr-ready/);
+    assert.equal("stdout" in withOutput.processes[0]!, false);
+    assert.equal("stderr" in withOutput.processes[0]!, false);
+
+    await registry.run({
+      runId: "unowned-run",
+      scopeKey: "private:70",
+      lifecycleId: "life-7",
+      command: "printf unrelated",
+      cwd: workspace,
+    });
+    assert.deepEqual(registry.preview("private:7", "life-7", withOutput.revision), {
+      processes: [],
+      revision: withOutput.revision,
+      unchanged: true,
+    });
+
+    registry.kill("private:7/delegate/child", running.id, "life-7");
+    const cancelled = registry.preview("private:7", "life-7");
+    assert.notEqual(cancelled.revision, withOutput.revision);
+    assert.equal(cancelled.processes[0]?.status, "cancelled");
+
+    await registry.waitForScopeExit("private:7", "life-7", 1_000);
+    const finished = registry.preview("private:7", "life-7");
+    assert.notEqual(finished.revision, cancelled.revision);
+    assert.ok(finished.processes[0]?.finished_at);
+    assert.deepEqual(registry.preview("private:7", "life-7", finished.revision), {
+      processes: [],
+      revision: finished.revision,
+      unchanged: true,
+    });
+  } finally {
+    registry.killScope("private:7", "life-7");
+    await registry.waitForScopeExit("private:7", "life-7", 5_000);
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("ProcessRegistry preview revisions carry a fresh runtime epoch", () => {
+  const first = new ProcessRegistry().preview("private:7", "life-7").revision;
+  const second = new ProcessRegistry().preview("private:7", "life-7").revision;
+  assert.notEqual(first, second);
+  assert.match(first, /^preview_[a-f0-9]{32}:0$/);
+  assert.match(second, /^preview_[a-f0-9]{32}:0$/);
+});
+
 test("ProcessRegistry caps preview process count and returns only a bounded output tail", async () => {
   const workspace = await temporaryDirectory("agent-process-preview-bounds-");
   const registry = new ProcessRegistry();
@@ -251,13 +335,12 @@ test("ProcessRegistry caps preview process count and returns only a bounded outp
       cwd: workspace,
     });
 
-    const preview = registry.preview("scope", "life");
+    const preview = registry.preview("scope", "life").processes;
     assert.equal(preview.length, 16);
     const largePreview = preview.find((process) => process.id === large.id)!;
     assert.ok(largePreview);
-    assert.ok(Buffer.byteLength(largePreview.stdout, "utf8") <= 8 * 1024);
     assert.ok(Buffer.byteLength(largePreview.output, "utf8") <= 16 * 1024);
-    assert.equal(largePreview.stdout.endsWith("7"), true);
+    assert.equal(largePreview.output.endsWith("7"), true);
     assert.equal(largePreview.truncated, true);
   } finally {
     await rm(workspace, { recursive: true, force: true });

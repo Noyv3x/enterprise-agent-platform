@@ -3907,6 +3907,67 @@ class PlatformServiceTests(unittest.TestCase):
 
             self.assertTrue(all(not process.running for process in launcher.processes))
 
+    def test_runtime_service_reads_cached_health_without_blocking_probes(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                cached_snapshot = {
+                    name: {
+                        "name": name,
+                        "state": "cached",
+                        "available": name == "agent",
+                    }
+                    for name in ("agent", "cognee", "camofox", "firecrawl")
+                }
+                cached_snapshot.update(
+                    {"checked_at": 1_784_600_400, "stale": False}
+                )
+                with (
+                    mock.patch.object(
+                        service.runtimes,
+                        "cached_status",
+                        return_value=cached_snapshot,
+                    ) as cached_status,
+                    mock.patch.object(
+                        service.runtimes,
+                        "status",
+                        side_effect=AssertionError("synchronous health probe"),
+                    ),
+                    mock.patch.object(
+                        service.runtimes,
+                        "agent_runtime_status",
+                        side_effect=AssertionError("synchronous Agent health probe"),
+                    ),
+                ):
+                    status = service.runtime_status(admin)
+                    agent_config = service.agent_runtime_config(admin)
+
+                self.assertEqual(
+                    set(status),
+                    {"agent", "cognee", "camofox", "firecrawl"},
+                )
+                self.assertEqual(status["agent"]["state"], "cached")
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in agent_config["runtime"].items()
+                        if not key.startswith("status_")
+                    },
+                    cached_snapshot["agent"],
+                )
+                self.assertFalse(status["agent"]["status_stale"])
+                self.assertEqual(
+                    status["agent"]["status_checked_at"],
+                    1_784_600_400,
+                )
+                self.assertEqual(cached_status.call_count, 2)
+            finally:
+                service.close()
+
     def test_agent_tool_token_rotation_refreshes_owned_runtime_client(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -6011,6 +6072,7 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIsNotNone(event_block)
                 self.assertIn('"agent_status"', event_block)
                 self.assertIn('"latest_message_id"', event_block)
+                self.assertIn('"message_revision"', event_block)
 
                 service.update_typing(alice, "channel", "1", True)
                 next_update = None

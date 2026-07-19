@@ -30,7 +30,7 @@ describe("browser preview transport", () => {
     );
   });
 
-  it("accepts only bounded PNG frames and decodes safe metadata headers", async () => {
+  it("accepts bounded PNG frames and decodes safe metadata headers", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([137, 80, 78, 71]), {
       status: 200,
       headers: {
@@ -53,6 +53,17 @@ describe("browser preview transport", () => {
       capturedAt: "1784060400000",
     });
     expect(result.kind === "frame" && result.blob.size).toBe(4);
+  });
+
+  it("accepts bandwidth-efficient JPEG and WebP frames", async () => {
+    for (const contentType of ["image/jpeg", "image/webp"]) {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "Content-Type": contentType },
+      })));
+      const result = await fetchBrowserPreview(scope, "", new AbortController().signal);
+      expect(result).toMatchObject({ kind: "frame" });
+    }
   });
 
   it("models a scope without an open tab as idle", async () => {
@@ -139,12 +150,13 @@ describe("terminal preview transport", () => {
   it("normalizes a bounded process snapshot and supports conditional refresh", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       captured_at: 1784060400000,
+      revision: "preview_epoch:8",
       processes: [{
         id: "term-1",
         title: "Build",
         cwd: "/workspace",
         command: "npm test",
-        screen: "ok\n",
+        output: "ok\n",
         running: true,
       }],
     }), {
@@ -153,23 +165,47 @@ describe("terminal preview transport", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await fetchTerminalPreviews(scope, '"term-1"', new AbortController().signal);
+    const result = await fetchTerminalPreviews(
+      scope,
+      '"term-1"',
+      "preview_epoch:7",
+      new AbortController().signal,
+    );
     expect(result).toMatchObject({
       kind: "snapshot",
       etag: '"term-2"',
+      revision: "preview_epoch:8",
       capturedAt: "1784060400000",
-      processes: [{ id: "term-1", title: "Build", screen: "ok\n", running: true }],
+      processes: [{ id: "term-1", title: "Build", output: "ok\n", running: true }],
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/agent-previews/terminals?scope_type=private&scope_id=7",
+      "/api/agent-previews/terminals?scope_type=private&scope_id=7&since_revision=preview_epoch%3A7",
       expect.objectContaining({ headers: { "If-None-Match": '"term-1"' } }),
     );
   });
 
   it("returns unchanged for terminal 304 responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 304 })));
-    await expect(fetchTerminalPreviews(scope, '"term-2"', new AbortController().signal)).resolves.toEqual({
+    await expect(
+      fetchTerminalPreviews(scope, '"term-2"', 8, new AbortController().signal),
+    ).resolves.toEqual({ kind: "unchanged" });
+  });
+
+  it("returns a revision-only unchanged response without replacing processes", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      processes: [],
+      revision: 8,
+      unchanged: true,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ETag: '"term-unchanged"' },
+    })));
+    await expect(
+      fetchTerminalPreviews(scope, '"term-2"', 8, new AbortController().signal),
+    ).resolves.toEqual({
       kind: "unchanged",
+      etag: '"term-unchanged"',
+      revision: 8,
     });
   });
 });

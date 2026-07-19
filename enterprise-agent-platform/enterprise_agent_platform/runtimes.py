@@ -22,8 +22,11 @@ import urllib.request
 import uuid
 import zipfile
 from contextlib import contextmanager, nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -79,6 +82,7 @@ CAMOFOX_BROWSER_MAX_COMPRESSION_RATIO = 1_000
 CAMOFOX_BROWSER_DOWNLOAD_DEADLINE_SECONDS = 30 * 60
 CAMOFOX_CAPABILITY_REPROBE_AFTER_SECONDS = 30.0
 CAMOFOX_CAPABILITY_RETRY_SECONDS = 2.0
+RUNTIME_STATUS_CACHE_SECONDS = 10.0
 CAMOFOX_BROWSER_ASSETS = {
     ("Linux", "x86_64"): (
         "camoufox-150.0.2-alpha.26-lin.x86_64.zip",
@@ -112,6 +116,20 @@ FIRECRAWL_SERVICE_IMAGES = (
     ("foundationdb", FIRECRAWL_FOUNDATIONDB_IMAGE),
     ("foundationdb-init", FIRECRAWL_FOUNDATIONDB_IMAGE),
 )
+
+
+def invalidates_runtime_status_cache(method):
+    """Keep lifecycle mutations from publishing transition snapshots as fresh."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        self.invalidate_status_cache()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.invalidate_status_cache()
+
+    return wrapped
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -249,6 +267,12 @@ class PlatformRuntimeManager:
         self._camofox_capability_next_probe_at = 0.0
         self._camofox_capability_probe_lock = threading.Lock()
         self._camofox_process_generation = 0
+        self._status_cache_lock = threading.Lock()
+        self._status_cache: dict[str, Any] | None = None
+        self._status_cache_checked_at = 0.0
+        self._status_cache_generation = 0
+        self._status_refresh_thread: threading.Thread | None = None
+        self._closed = False
 
     def prepare(self) -> dict[str, Any]:
         with self._lock:
@@ -264,17 +288,92 @@ class PlatformRuntimeManager:
             }
 
     def status(self, *, refresh: bool = True) -> dict[str, Any]:
-        with self._lock:
-            agent = self.agent_runtime_status(refresh=refresh)
-            cognee = self.cognee_status()
-            camofox = self.camofox_status(refresh=refresh)
-            firecrawl = self.firecrawl_status(refresh=refresh)
-            return {
-                "agent": agent.to_dict(),
-                "cognee": cognee.to_dict(),
-                "camofox": camofox.to_dict(),
-                "firecrawl": firecrawl.to_dict(),
-            }
+        if refresh:
+            # These probes target independent loopback services. Running them
+            # concurrently keeps one unhealthy optional runtime from adding its
+            # timeout to every other runtime, and none of the network I/O holds
+            # the broad lifecycle lock used by start/stop operations.
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="runtime-health") as executor:
+                agent_future = executor.submit(self.agent_runtime_status, refresh=True)
+                camofox_future = executor.submit(self.camofox_status, refresh=True)
+                firecrawl_future = executor.submit(self.firecrawl_status, refresh=True)
+                agent = agent_future.result()
+                camofox = camofox_future.result()
+                firecrawl = firecrawl_future.result()
+        else:
+            agent = self.agent_runtime_status(refresh=False)
+            camofox = self.camofox_status(refresh=False)
+            firecrawl = self.firecrawl_status(refresh=False)
+        cognee = self.cognee_status()
+        return {
+            "agent": agent.to_dict(),
+            "cognee": cognee.to_dict(),
+            "camofox": camofox.to_dict(),
+            "firecrawl": firecrawl.to_dict(),
+        }
+
+    def cached_status(self, *, max_age_seconds: float = RUNTIME_STATUS_CACHE_SECONDS) -> dict[str, Any]:
+        """Return a non-blocking status snapshot and refresh it in one background thread."""
+
+        now = time.time()
+        with self._status_cache_lock:
+            snapshot = deepcopy(self._status_cache)
+            checked_at = self._status_cache_checked_at
+            stale = snapshot is None or now - checked_at >= max(0.0, float(max_age_seconds))
+            refresh_running = self._status_refresh_thread is not None
+        if snapshot is None:
+            snapshot = self.status(refresh=False)
+        if stale and not refresh_running:
+            self.refresh_status_async()
+        return {
+            **snapshot,
+            "checked_at": int(checked_at) if checked_at > 0 else None,
+            "stale": stale,
+        }
+
+    def refresh_status_async(self) -> None:
+        """Start a single-flight health refresh without delaying an HTTP request."""
+
+        with self._status_cache_lock:
+            if self._closed or self._status_refresh_thread is not None:
+                return
+            generation = self._status_cache_generation
+            thread = threading.Thread(
+                target=self._refresh_status_cache,
+                args=(generation,),
+                name="runtime-status-refresh",
+                daemon=True,
+            )
+            self._status_refresh_thread = thread
+            thread.start()
+
+    def invalidate_status_cache(self) -> None:
+        """Mark the current snapshot stale after a runtime lifecycle mutation."""
+
+        with self._status_cache_lock:
+            self._status_cache_generation += 1
+            self._status_cache_checked_at = 0.0
+
+    def _refresh_status_cache(self, generation: int) -> None:
+        try:
+            snapshot = self.status(refresh=True)
+            checked_at = time.time()
+            with self._status_cache_lock:
+                if (
+                    not self._closed
+                    and generation == self._status_cache_generation
+                ):
+                    self._status_cache = deepcopy(snapshot)
+                    self._status_cache_checked_at = checked_at
+        except Exception:
+            # Individual RuntimeStatus values normally carry probe errors. If a
+            # probe unexpectedly raises, preserve the last snapshot and let the
+            # next request schedule another single-flight refresh.
+            pass
+        finally:
+            with self._status_cache_lock:
+                if self._status_refresh_thread is threading.current_thread():
+                    self._status_refresh_thread = None
 
     def agent_runtime_config(self) -> dict[str, Any]:
         """Return the platform-owned runtime configuration without secrets."""
@@ -348,6 +447,7 @@ class PlatformRuntimeManager:
             install_state="ready" if available else "missing",
         )
 
+    @invalidates_runtime_status_cache
     def install_agent_runtime(self, *, force: bool = False) -> RuntimeStatus:
         """Install the locked Node sidecar into the managed data directory."""
 
@@ -424,34 +524,43 @@ class PlatformRuntimeManager:
             return self.prepare_agent_runtime()
 
     def ensure_agent_runtime_ready(self, *, wait: bool = True) -> RuntimeStatus:
-        with self._lock:
-            current = self.agent_runtime_status(refresh=True)
-            if current.available or current.state == "invalid_config":
-                return current
-            if self._managed_agent_runtime_enabled() and not (self._agent_runtime_app_dir() / "dist" / "src" / "server.js").is_file():
-                installed = self.install_agent_runtime(force=False)
-                if not installed.available:
-                    return installed
-            if self._agent_process is None or self._agent_process.poll() is not None:
-                self._start_agent_runtime()
-            process = self._agent_process
-        if not wait:
+        started = False
+        try:
+            with self._lock:
+                current = self.agent_runtime_status(refresh=True)
+                if current.available or current.state == "invalid_config":
+                    return current
+                if self._managed_agent_runtime_enabled() and not (self._agent_runtime_app_dir() / "dist" / "src" / "server.js").is_file():
+                    installed = self.install_agent_runtime(force=False)
+                    if not installed.available:
+                        return installed
+                if self._agent_process is None or self._agent_process.poll() is not None:
+                    started = True
+                    self.invalidate_status_cache()
+                    self._start_agent_runtime()
+                process = self._agent_process
+            if not wait:
+                return self.agent_runtime_status(refresh=True)
+            deadline = time.monotonic() + max(0.0, self.config.runtime_startup_wait_seconds)
+            while time.monotonic() < deadline:
+                status = self.agent_runtime_status(refresh=True)
+                if status.available:
+                    return status
+                if process is None or process.poll() is not None:
+                    return status
+                time.sleep(0.25)
             return self.agent_runtime_status(refresh=True)
-        deadline = time.monotonic() + max(0.0, self.config.runtime_startup_wait_seconds)
-        while time.monotonic() < deadline:
-            status = self.agent_runtime_status(refresh=True)
-            if status.available:
-                return status
-            if process is None or process.poll() is not None:
-                return status
-            time.sleep(0.25)
-        return self.agent_runtime_status(refresh=True)
+        finally:
+            if started:
+                self.invalidate_status_cache()
 
+    @invalidates_runtime_status_cache
     def restart_agent_runtime(self) -> RuntimeStatus:
         with self._lock:
             self._stop_process("_agent_process")
         return self.ensure_agent_runtime_ready(wait=True)
 
+    @invalidates_runtime_status_cache
     def stop_agent_runtime(self) -> RuntimeStatus:
         with self._lock:
             self._stop_process("_agent_process")
@@ -776,6 +885,7 @@ class PlatformRuntimeManager:
             install_state="ready" if available else "missing",
         )
 
+    @invalidates_runtime_status_cache
     def install_camofox(self, *, force: bool = False) -> RuntimeStatus:
         """Install the fully locked Camoufox service and browser cache."""
 
@@ -904,40 +1014,48 @@ class PlatformRuntimeManager:
             return self.prepare_camofox()
 
     def ensure_camofox_ready(self, *, wait: bool = True) -> RuntimeStatus:
-        with self._lock:
-            if not self._managed_camofox_enabled():
-                return self.camofox_status(refresh=False)
-            # During auto-update the live process still serves requests while a
-            # separate deployment process publishes the next locked app. Keep
-            # using that known-owned healthy process instead of making the old
-            # service contend for the installer lock after git fast-forwards.
-            if self._camofox_process is not None and self._camofox_process.poll() is None:
+        started = False
+        try:
+            with self._lock:
+                if not self._managed_camofox_enabled():
+                    return self.camofox_status(refresh=False)
+                # During auto-update the live process still serves requests while a
+                # separate deployment process publishes the next locked app. Keep
+                # using that known-owned healthy process instead of making the old
+                # service contend for the installer lock after git fast-forwards.
+                if self._camofox_process is not None and self._camofox_process.poll() is None:
+                    current = self.camofox_status(refresh=True)
+                    if current.available:
+                        return current
+                prepared = self.prepare_camofox()
+                if (
+                    not prepared.available
+                    and not self._effective_camofox_command()
+                    and prepared.state != "invalid_config"
+                ):
+                    prepared = self.install_camofox(force=False)
+                if not prepared.available:
+                    return prepared
                 current = self.camofox_status(refresh=True)
                 if current.available:
                     return current
-            prepared = self.prepare_camofox()
-            if (
-                not prepared.available
-                and not self._effective_camofox_command()
-                and prepared.state != "invalid_config"
-            ):
-                prepared = self.install_camofox(force=False)
-            if not prepared.available:
-                return prepared
-            current = self.camofox_status(refresh=True)
-            if current.available:
-                return current
-            if self._camofox_process is None or self._camofox_process.poll() is not None:
-                self._start_camofox()
-            started_process = self._camofox_process
-            should_wait = wait
-        # Release the broad lock before the (now much larger) cold-start wait so
-        # status polls, other runtime startup paths, and shutdown stay
-        # responsive while the browser package downloads.
-        if should_wait:
-            return self._wait_for_runtime("camofox", started_process)
-        return self.camofox_status(refresh=True)
+                if self._camofox_process is None or self._camofox_process.poll() is not None:
+                    started = True
+                    self.invalidate_status_cache()
+                    self._start_camofox()
+                started_process = self._camofox_process
+                should_wait = wait
+            # Release the broad lock before the (now much larger) cold-start wait so
+            # status polls, other runtime startup paths, and shutdown stay
+            # responsive while the browser package downloads.
+            if should_wait:
+                return self._wait_for_runtime("camofox", started_process)
+            return self.camofox_status(refresh=True)
+        finally:
+            if started:
+                self.invalidate_status_cache()
 
+    @invalidates_runtime_status_cache
     def restart_camofox(self) -> RuntimeStatus:
         with self._lock:
             self.stop_camofox()
@@ -945,6 +1063,7 @@ class PlatformRuntimeManager:
         # cold-start wait, so do not hold the broad lock around it here.
         return self.ensure_camofox_ready(wait=True)
 
+    @invalidates_runtime_status_cache
     def stop_camofox(self) -> RuntimeStatus:
         with self._lock:
             self._reset_camofox_capability_state()
@@ -1041,26 +1160,34 @@ class PlatformRuntimeManager:
         )
 
     def ensure_firecrawl_ready(self, *, wait: bool = True) -> RuntimeStatus:
-        with self._lock:
-            if not self._managed_firecrawl_enabled():
-                return self.firecrawl_status(refresh=False)
-            prepared = self.prepare_firecrawl()
-            if not prepared.available:
-                return prepared
-            current = self.firecrawl_status(refresh=True)
-            if current.available:
-                return current
-            if self._firecrawl_process is None or self._firecrawl_process.poll() is not None:
-                self._start_firecrawl()
-            started_process = self._firecrawl_process
-            should_wait = wait
-        # Release the broad lock before the (now much larger) cold-start wait so
-        # status polls, other runtime startup paths, and shutdown stay
-        # responsive while docker pulls the multi-hundred-MB images.
-        if should_wait:
-            return self._wait_for_runtime("firecrawl", started_process)
-        return self.firecrawl_status(refresh=True)
+        started = False
+        try:
+            with self._lock:
+                if not self._managed_firecrawl_enabled():
+                    return self.firecrawl_status(refresh=False)
+                prepared = self.prepare_firecrawl()
+                if not prepared.available:
+                    return prepared
+                current = self.firecrawl_status(refresh=True)
+                if current.available:
+                    return current
+                if self._firecrawl_process is None or self._firecrawl_process.poll() is not None:
+                    started = True
+                    self.invalidate_status_cache()
+                    self._start_firecrawl()
+                started_process = self._firecrawl_process
+                should_wait = wait
+            # Release the broad lock before the (now much larger) cold-start wait so
+            # status polls, other runtime startup paths, and shutdown stay
+            # responsive while docker pulls the multi-hundred-MB images.
+            if should_wait:
+                return self._wait_for_runtime("firecrawl", started_process)
+            return self.firecrawl_status(refresh=True)
+        finally:
+            if started:
+                self.invalidate_status_cache()
 
+    @invalidates_runtime_status_cache
     def restart_firecrawl(self) -> RuntimeStatus:
         with self._lock:
             self.stop_firecrawl()
@@ -1068,6 +1195,7 @@ class PlatformRuntimeManager:
         # the cold-start wait, so do not hold the broad lock around it here.
         return self.ensure_firecrawl_ready(wait=True)
 
+    @invalidates_runtime_status_cache
     def stop_firecrawl(self) -> RuntimeStatus:
         with self._lock:
             self._teardown_firecrawl_compose()
@@ -1174,6 +1302,8 @@ class PlatformRuntimeManager:
             }
 
     def close(self) -> None:
+        with self._status_cache_lock:
+            self._closed = True
         self.stop_agent_runtime()
         self.stop_camofox()
         self.stop_firecrawl()

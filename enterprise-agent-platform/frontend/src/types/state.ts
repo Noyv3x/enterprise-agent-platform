@@ -57,6 +57,7 @@ export interface AppState {
   drafts: Record<string, string>;
   draftFiles: Record<string, File[]>;
   failedSends: Record<string, FailedSend[]>;
+  messageSyncCursors: Record<string, MessageSyncCursor>;
   agentStatuses: AgentStatuses;
   expandedAgentRuns: Record<string, boolean>;
   mentionTargets: MentionTarget[];
@@ -107,6 +108,18 @@ export interface FailedSend {
   files: File[];
 }
 
+/**
+ * The last server-confirmed synchronization point for a conversation.
+ *
+ * Keep this separate from the visible message list: a successful optimistic
+ * POST can add a newer durable message before an older SSE-announced message
+ * has been pulled. Advancing from the rendered list would skip that gap.
+ */
+export interface MessageSyncCursor {
+  afterId: string;
+  revision: string | number;
+}
+
 /* ----------------------------- per-slice state sub-types (for slice files) */
 
 export type AuthSliceState = Pick<AppState, "user" | "busy" | "pendingOperations" | "error">;
@@ -122,6 +135,7 @@ export type ChatSliceState = Pick<
   | "drafts"
   | "draftFiles"
   | "failedSends"
+  | "messageSyncCursors"
   | "agentStatuses"
   | "expandedAgentRuns"
   | "mentionTargets"
@@ -204,6 +218,10 @@ interface SetMessagesAction {
 interface SetPrivateMessagesAction {
   type: "SET_PRIVATE_MESSAGES";
   payload: Message[];
+}
+interface SetMessageSyncCursorAction {
+  type: "SET_MESSAGE_SYNC_CURSOR";
+  payload: { key: string; cursor: MessageSyncCursor };
 }
 interface SetPendingMessagesAction {
   type: "SET_PENDING_MESSAGES";
@@ -413,6 +431,7 @@ export type Action =
   | SetActiveChannelIdAction
   | SetMessagesAction
   | SetPrivateMessagesAction
+  | SetMessageSyncCursorAction
   | SetPendingMessagesAction
   | AddPendingMessageAction
   | ReplaceOptimisticMessageAction

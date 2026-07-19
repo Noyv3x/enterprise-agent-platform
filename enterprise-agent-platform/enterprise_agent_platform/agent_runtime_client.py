@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import socket
 import threading
 import urllib.error
@@ -15,6 +16,10 @@ from typing import Any, Callable, Protocol
 AgentProgressCallback = Callable[[dict[str, Any]], None]
 AgentContentCallback = Callable[..., None]
 AgentRunStartedCallback = Callable[[str], None]
+PreviewRevision = int | str
+_PREVIEW_REVISION_RE = re.compile(
+    r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}"
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,7 @@ class AgentClient(Protocol):
         self,
         scope_key: str,
         lifecycle_id: str,
+        since_revision: PreviewRevision | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -467,27 +473,77 @@ class AgentRuntimeClient:
         self,
         scope_key: str,
         lifecycle_id: str,
+        since_revision: PreviewRevision | None = None,
     ) -> dict[str, Any]:
         """Fetch the bounded read-only process view for one root Agent scope."""
 
         clean_scope_key = self._required_id("scope_key", scope_key)
         clean_lifecycle_id = self._required_id("lifecycle_id", lifecycle_id)
-        query = urllib.parse.urlencode(
-            {
-                "scope_key": clean_scope_key,
-                "lifecycle_id": clean_lifecycle_id,
-            }
-        )
-        result, _ = self._json_request(
-            "GET",
-            f"/v1/scopes/processes?{query}",
-            None,
-            timeout=min(self.timeout_seconds, 5.0),
-            max_response_bytes=2 * 1024 * 1024,
-        )
-        if not isinstance(result.get("processes"), list):
+        if since_revision is not None and not _valid_preview_revision(
+            since_revision
+        ):
+            raise ValueError("since_revision must be an opaque revision token")
+
+        query_values: dict[str, Any] = {
+            "scope_key": clean_scope_key,
+            "lifecycle_id": clean_lifecycle_id,
+        }
+        if since_revision is not None:
+            query_values["since_revision"] = since_revision
+
+        def request(values: dict[str, Any]) -> dict[str, Any]:
+            query = urllib.parse.urlencode(values)
+            result, _ = self._json_request(
+                "GET",
+                f"/v1/scopes/processes?{query}",
+                None,
+                timeout=min(self.timeout_seconds, 5.0),
+                max_response_bytes=2 * 1024 * 1024,
+            )
+            return result
+
+        try:
+            result = request(query_values)
+        except AgentRuntimeHTTPError as exc:
+            # During a rolling update, an older runtime rejects the new query
+            # parameter. Retry once without it so preview remains available;
+            # the missing revision below deliberately disables delta polling.
+            if since_revision is None or exc.status_code != 400:
+                raise
+            result = request(
+                {
+                    "scope_key": clean_scope_key,
+                    "lifecycle_id": clean_lifecycle_id,
+                }
+            )
+
+        processes = result.get("processes")
+        if not isinstance(processes, list):
             raise AgentRuntimeProtocolError("Agent runtime process preview has no processes list")
-        return result
+        # A runtime from before revision-based polling returned only
+        # ``processes``. Keep that shape so the platform/frontend continues
+        # using ETags without sending an unsupported since_revision forever.
+        if "revision" not in result:
+            if "unchanged" in result:
+                raise AgentRuntimeProtocolError(
+                    "Agent runtime unchanged process preview has no revision"
+                )
+            return result
+        revision = result.get("revision")
+        if not _valid_preview_revision(revision):
+            raise AgentRuntimeProtocolError(
+                "Agent runtime process preview has an invalid revision"
+            )
+        unchanged = result.get("unchanged")
+        if unchanged is not None and unchanged is not True:
+            raise AgentRuntimeProtocolError(
+                "Agent runtime process preview has an invalid unchanged flag"
+            )
+        if unchanged is True and processes:
+            raise AgentRuntimeProtocolError(
+                "Agent runtime unchanged process preview must be empty"
+            )
+        return {**result, "revision": revision}
 
     def terminal_preview_summary(
         self,
@@ -1103,3 +1159,16 @@ def _callback_timestamp(value: Any) -> Any:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return value
+
+
+def _valid_preview_revision(value: Any) -> bool:
+    """Accept legacy safe integers and restart-safe opaque runtime tokens."""
+
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= 9_007_199_254_740_991
+    return bool(
+        isinstance(value, str)
+        and _PREVIEW_REVISION_RE.fullmatch(value)
+    )

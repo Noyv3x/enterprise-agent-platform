@@ -6,6 +6,7 @@ import {
   fetchPreviewAvailability,
   type PreviewAvailabilityResult,
 } from "../../data/previewActions";
+import { publishRealtimePreview } from "../../data/realtimeEvents";
 import type { AgentPreviewScope } from "../../types";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 
@@ -33,7 +34,7 @@ describe("usePreviewAvailability", () => {
     vi.restoreAllMocks();
   });
 
-  it("polls every two seconds and retains availability after a 304", async () => {
+  it("polls every fifteen seconds and retains availability after a 304", async () => {
     fetchAvailabilityMock
       .mockResolvedValueOnce({
         kind: "snapshot",
@@ -52,7 +53,7 @@ describe("usePreviewAvailability", () => {
       error: "",
     });
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
     expect(result.current.state.browserActive).toBe(true);
     expect(result.current.state.runningTerminalCount).toBe(2);
     expect(fetchAvailabilityMock.mock.calls[1]?.[1]).toBe('"status-1"');
@@ -98,6 +99,52 @@ describe("usePreviewAvailability", () => {
       await Promise.resolve();
     });
     expect(result.current.state).toMatchObject({ browserActive: false, runningTerminalCount: 1 });
+  });
+
+  it("applies a matching realtime preview snapshot without waiting for the fallback poll", async () => {
+    fetchAvailabilityMock.mockResolvedValue({
+      kind: "snapshot",
+      etag: '"initial"',
+      browserActive: false,
+      runningTerminalCount: 0,
+    });
+    const { result } = renderHook(() => usePreviewAvailability(scope));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+    act(() => publishRealtimePreview({
+      scope,
+      browserActive: true,
+      runningTerminalCount: 2,
+    }));
+
+    expect(result.current.state).toMatchObject({
+      browserActive: true,
+      runningTerminalCount: 2,
+      loading: false,
+    });
+    expect(fetchAvailabilityMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces realtime invalidations behind a two-second request floor", async () => {
+    fetchAvailabilityMock.mockResolvedValue({
+      kind: "snapshot",
+      etag: '"status"',
+      browserActive: false,
+      runningTerminalCount: 0,
+    });
+    renderHook(() => usePreviewAvailability(scope));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+
+    act(() => {
+      publishRealtimePreview({ scope });
+      publishRealtimePreview({ scope });
+      publishRealtimePreview({ scope });
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+    expect(fetchAvailabilityMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchAvailabilityMock).toHaveBeenCalledTimes(2);
   });
 
   it("synchronously clears a previous scope and ignores its late response", async () => {

@@ -4,6 +4,8 @@ import http.client
 import json
 import os
 import socket
+import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -12,11 +14,14 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
+from enterprise_agent_platform import gateway as gateway_module
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.gateway import (
     BackendTarget,
@@ -27,6 +32,7 @@ from enterprise_agent_platform.gateway import (
     MAX_PROXY_BODY_BYTES,
     _atomic_json_write,
     _gateway_exec_argv,
+    gateway_control_socket_path,
     gateway_process_is_live,
     gateway_state_path,
     read_gateway_state,
@@ -36,7 +42,6 @@ from enterprise_agent_platform.update_state import (
     mark_failure,
     mark_success,
     mark_updating,
-    update_state_lock,
 )
 
 
@@ -326,6 +331,53 @@ class GatewayTests(unittest.TestCase):
         stale = {**state, "heartbeat_at": time.time() - 100}
         self.assertFalse(gateway_process_is_live(stale))
 
+    def test_gateway_control_socket_uses_stable_private_fallback_for_long_data_path(self):
+        long_data_dir = self.data_dir / ("relocated-" + ("x" * 120))
+        preferred = long_data_dir.resolve() / gateway_module.GATEWAY_CONTROL_SOCKET_FILENAME
+        self.assertGreater(
+            len(os.fsencode(preferred)),
+            gateway_module.GATEWAY_CONTROL_DIRECT_PATH_MAX_BYTES,
+        )
+
+        first = gateway_control_socket_path(long_data_dir)
+        second = gateway_control_socket_path(long_data_dir)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, preferred)
+        self.assertLessEqual(
+            len(os.fsencode(first)),
+            gateway_module.GATEWAY_CONTROL_DIRECT_PATH_MAX_BYTES,
+        )
+        self.assertRegex(first.name, r"^[0-9a-f]{32}\.sock$")
+        self.assertEqual(
+            first.parent.name,
+            f"{gateway_module.GATEWAY_CONTROL_FALLBACK_DIRECTORY_PREFIX}-{os.geteuid()}",
+        )
+
+        supervisor = GatewaySupervisor(
+            replace(self.config, data_dir=long_data_dir),
+            mode="foreground",
+            backend_command=["unused"],
+        )
+        try:
+            supervisor._start_control_server()
+            supervisor._write_state()
+            metadata = first.stat()
+            self.assertTrue(stat.S_ISSOCK(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(first.parent.stat().st_mode), 0o700)
+            self.assertEqual(first.parent.stat().st_uid, os.geteuid())
+            self.assertEqual(
+                read_gateway_state(long_data_dir)["control_socket"],
+                str(first),
+            )
+            self.assertTrue(wait_for_gateway_drain(long_data_dir, timeout=1))
+        finally:
+            supervisor._stop_control_server()
+            try:
+                first.parent.rmdir()
+            except OSError:
+                pass
+
     def test_admission_and_update_marker_share_one_cross_process_boundary(self):
         target = BackendTarget("127.0.0.1", self.backend.server_address[1])
         supervisor = GatewaySupervisor(
@@ -336,49 +388,60 @@ class GatewayTests(unittest.TestCase):
         with supervisor._lock:
             supervisor._target = target
             supervisor._backend_ready = True
+        supervisor._start_control_server()
+        self.addCleanup(supervisor._stop_control_server)
+        supervisor._write_state()
 
-        write_started = threading.Event()
-        release_write = threading.Event()
-        original_write = supervisor._write_state
+        admission_inside_boundary = threading.Event()
+        release_admission = threading.Event()
+        original_boundary = gateway_module.update_state_lock
 
-        def delayed_write():
-            write_started.set()
-            self.assertTrue(release_write.wait(5))
-            original_write()
+        @contextmanager
+        def observed_boundary(data_dir):
+            with original_boundary(data_dir):
+                if threading.current_thread().name == "test-admission":
+                    admission_inside_boundary.set()
+                    self.assertTrue(release_admission.wait(5))
+                yield
 
-        supervisor._write_state = delayed_write
         admitted: list[BusinessRequestAdmission | None] = []
-        admission_thread = threading.Thread(
-            target=lambda: admitted.append(supervisor.admit_business_request("POST")),
-        )
-        admission_thread.start()
-        self.assertTrue(write_started.wait(5))
+        with mock.patch.object(gateway_module, "update_state_lock", observed_boundary):
+            with mock.patch.object(supervisor, "_write_state") as state_write:
+                admission_thread = threading.Thread(
+                    name="test-admission",
+                    target=lambda: admitted.append(supervisor.admit_business_request("POST")),
+                )
+                admission_thread.start()
+                self.assertTrue(admission_inside_boundary.wait(5))
 
-        marker_thread = threading.Thread(
-            target=lambda: mark_updating(
-                self.data_dir,
-                update_id="atomic-1",
-                instance_id="old",
-                reason="test",
-                target_revision="new",
-                remote="origin",
-                branch="main",
-            ),
-        )
-        marker_thread.start()
-        time.sleep(0.05)
-        self.assertTrue(marker_thread.is_alive(), "marker bypassed the admission lock")
+                marker_thread = threading.Thread(
+                    target=lambda: mark_updating(
+                        self.data_dir,
+                        update_id="atomic-1",
+                        instance_id="old",
+                        reason="test",
+                        target_revision="new",
+                        remote="origin",
+                        branch="main",
+                    ),
+                )
+                marker_thread.start()
+                time.sleep(0.05)
+                self.assertTrue(marker_thread.is_alive(), "marker bypassed the admission lock")
 
-        release_write.set()
-        admission_thread.join(timeout=5)
-        marker_thread.join(timeout=5)
-        supervisor._write_state = original_write
+                release_admission.set()
+                admission_thread.join(timeout=5)
+                marker_thread.join(timeout=5)
+                state_write.assert_not_called()
+
         self.assertFalse(admission_thread.is_alive())
         self.assertFalse(marker_thread.is_alive())
         self.assertIsNotNone(admitted[0])
         self.assertFalse(wait_for_gateway_drain(self.data_dir, timeout=0.05))
 
-        supervisor.end_business_request(admitted[0])
+        with mock.patch.object(supervisor, "_write_state") as state_write:
+            supervisor.end_business_request(admitted[0])
+            state_write.assert_not_called()
         self.assertTrue(wait_for_gateway_drain(self.data_dir, timeout=1))
 
     def test_inherited_listener_remains_bound_and_becomes_close_on_exec(self):
@@ -421,26 +484,40 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["--mode", "service"])
 
     def test_gateway_drain_waits_for_mutating_request_count(self):
-        path = gateway_state_path(self.data_dir)
-        state = {
-            "schema_version": 1,
-            "pid": os.getpid(),
-            "heartbeat_at": time.time(),
-            "generation": 3,
-            "active_mutating_requests": 1,
-        }
-        _atomic_json_write(path, state)
+        target = BackendTarget("127.0.0.1", self.backend.server_address[1])
+        supervisor = GatewaySupervisor(
+            self.config,
+            mode="foreground",
+            backend_command=["unused"],
+        )
+        with supervisor._lock:
+            supervisor._target = target
+            supervisor._backend_ready = True
+        supervisor._start_control_server()
+        self.addCleanup(supervisor._stop_control_server)
+        supervisor._write_state()
+        path = gateway_control_socket_path(self.data_dir)
+        self.assertTrue(stat.S_ISSOCK(path.stat().st_mode))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        admission = supervisor.admit_business_request("POST")
+        self.assertIsNotNone(admission)
+        mark_updating(
+            self.data_dir,
+            update_id="drain-1",
+            instance_id="old",
+            reason="test",
+            target_revision="new",
+            remote="origin",
+            branch="main",
+        )
+        # The heartbeat snapshot still says zero. Draining must use the live
+        # control response rather than trusting this stale durable value.
+        self.assertEqual(read_gateway_state(self.data_dir)["active_mutating_requests"], 0)
 
         def release():
             time.sleep(0.1)
-            _atomic_json_write(
-                path,
-                {
-                    **state,
-                    "heartbeat_at": time.time(),
-                    "active_mutating_requests": 0,
-                },
-            )
+            supervisor.end_business_request(admission)
 
         thread = threading.Thread(target=release)
         thread.start()
@@ -448,6 +525,36 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue(wait_for_gateway_drain(self.data_dir, timeout=2))
         finally:
             thread.join(timeout=2)
+
+    def test_gateway_drain_fails_closed_when_live_control_socket_is_unavailable(self):
+        supervisor = GatewaySupervisor(
+            self.config,
+            mode="foreground",
+            backend_command=["unused"],
+        )
+        supervisor._start_control_server()
+        supervisor._write_state()
+        supervisor._stop_control_server()
+        self.assertTrue(gateway_process_is_live(read_gateway_state(self.data_dir)))
+        self.assertFalse(wait_for_gateway_drain(self.data_dir, timeout=0.05))
+
+    def test_gateway_drain_fails_closed_after_recorded_gateway_process_dies(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        pid = process.pid
+        process.wait(timeout=5)
+        _atomic_json_write(
+            gateway_state_path(self.data_dir),
+            {
+                "schema_version": 1,
+                "pid": pid,
+                "heartbeat_at": time.time(),
+                "gateway_instance_id": "dead-gateway",
+                "control_socket": str(gateway_control_socket_path(self.data_dir)),
+            },
+        )
+        state = read_gateway_state(self.data_dir)
+        self.assertFalse(gateway_process_is_live(state))
+        self.assertFalse(wait_for_gateway_drain(self.data_dir, timeout=0.05))
 
     def test_supervisor_keeps_public_listener_during_backend_reload(self):
         script_template = textwrap.dedent(

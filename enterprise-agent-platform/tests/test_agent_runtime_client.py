@@ -63,14 +63,24 @@ class _FakeRuntime:
                     self._json(
                         200,
                         {
+                            "revision": 3,
                             "processes": [
                                 {
                                     "id": "process-1",
                                     "status": "running",
-                                    "stdout": "hello",
+                                    "output": "hello",
                                 }
                             ]
                         },
+                    )
+                    return
+                if self.path == (
+                    "/v1/scopes/processes?scope_key=private%3A7"
+                    "&lifecycle_id=life-7&since_revision=3"
+                ):
+                    self._json(
+                        200,
+                        {"processes": [], "revision": 3, "unchanged": True},
                     )
                     return
                 if self.path == "/v1/scopes/process-summary?scope_key=private%3A7&lifecycle_id=life-7":
@@ -682,12 +692,98 @@ class AgentRuntimeClientTests(unittest.TestCase):
         result = self.client.terminal_previews("private:7", "life-7")
 
         self.assertEqual(result["processes"][0]["id"], "process-1")
+        self.assertEqual(result["revision"], 3)
         request = self.runtime.request(
             "GET",
             "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7",
         )
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
         self.assertEqual(request["accept"], "application/json")
+
+        unchanged = self.client.terminal_previews(
+            "private:7",
+            "life-7",
+            since_revision=3,
+        )
+        self.assertEqual(
+            unchanged,
+            {"processes": [], "revision": 3, "unchanged": True},
+        )
+        self.runtime.request(
+            "GET",
+            "/v1/scopes/processes?scope_key=private%3A7"
+            "&lifecycle_id=life-7&since_revision=3",
+        )
+
+    def test_terminal_previews_validate_revision_schema(self):
+        cases = [
+            {"processes": [], "revision": True},
+            {"processes": [], "revision": -1},
+            {"processes": [], "revision": 1, "unchanged": False},
+            {
+                "processes": [{"id": "process-1"}],
+                "revision": 1,
+                "unchanged": True,
+            },
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload), mock.patch.object(
+                self.client,
+                "_json_request",
+                return_value=(payload, {}),
+            ), self.assertRaises(AgentRuntimeProtocolError):
+                self.client.terminal_previews("private:7", "life-7")
+
+        for invalid in (
+            -1,
+            True,
+            9_007_199_254_740_992,
+            "",
+            "bad token",
+            "slash/value",
+            "x" * 129,
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.client.terminal_previews(
+                    "private:7",
+                    "life-7",
+                    since_revision=invalid,
+                )
+
+    def test_terminal_previews_accept_restart_safe_opaque_revisions(self):
+        payload = {
+            "processes": [],
+            "revision": "preview_abcdef0123456789:42",
+            "unchanged": True,
+        }
+        with mock.patch.object(
+            self.client,
+            "_json_request",
+            return_value=(payload, {}),
+        ) as request:
+            result = self.client.terminal_previews(
+                "private:7",
+                "life-7",
+                since_revision="preview_abcdef0123456789:42",
+            )
+
+        self.assertEqual(result, payload)
+        self.assertIn(
+            "since_revision=preview_abcdef0123456789%3A42",
+            request.call_args.args[1],
+        )
+
+    def test_terminal_previews_accept_a_legacy_snapshot_without_revision(self):
+        legacy = {"processes": [{"id": "process-1", "output": "legacy"}]}
+        with mock.patch.object(
+            self.client,
+            "_json_request",
+            return_value=(legacy, {}),
+        ):
+            self.assertEqual(
+                self.client.terminal_previews("private:7", "life-7"),
+                legacy,
+            )
 
     def test_terminal_preview_summary_uses_the_lightweight_scope_endpoint(self):
         result = self.client.terminal_preview_summary("private:7", "life-7")

@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { navigateToView } from "../../data/chatActions";
+import { preloadRoute } from "./routePreload";
 import { logout } from "../../data/sessionActions";
 import { useTheme } from "../../hooks/useTheme";
 import { SUPPORTED_LOCALES, useI18n, type Locale } from "../../i18n";
@@ -73,6 +74,8 @@ export function UserMenu() {
             className="user-menu__item"
             type="button"
             onClick={() => void navigateToView(store, "settings")}
+            onPointerEnter={() => preloadRoute("settings")}
+            onFocus={() => preloadRoute("settings")}
           >
             <Icon name="settings" />
             <span>{t("shell.userMenu.settings")}</span>

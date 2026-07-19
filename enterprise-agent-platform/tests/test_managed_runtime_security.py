@@ -795,6 +795,14 @@ function isBrowserSurvivor(cmdline) {
   if (/camoufox-bin|\/usr\/bin\/Xvfb\\b/.test(cmdline)) return true;
   return false;
 }
+async function screenshotFixture(req, res, found, userId, pluginEvents) {
+    const fullPage = req.query.fullPage === 'true';
+    const { tabState } = found;
+    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);
+}
 let browser = null;
 function clearBrowserIdleTimer() {}
 async function closeFixture() {
@@ -924,6 +932,9 @@ after();
             self.assertIn("await stopVirtualDisplay(displayToClose)", patched)
             self.assertIn("const launchProxyToClose = browserLaunchProxy", patched)
             self.assertNotIn("camoufox-bin|\\/usr\\/bin\\/Xvfb", patched)
+            self.assertIn("const format = req.query.format === 'jpeg' ? 'jpeg' : 'png'", patched)
+            self.assertIn("options.quality = quality", patched)
+            self.assertIn("format === 'jpeg' ? 'image/jpeg' : 'image/png'", patched)
             fallback = {
                 "virtual": False,
                 "killed": True,

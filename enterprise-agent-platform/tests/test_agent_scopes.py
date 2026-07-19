@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from enterprise_agent_platform.agent_scopes import AgentScopeManager
 from enterprise_agent_platform.db import Database
@@ -12,6 +13,90 @@ from test_platform import make_config
 
 
 class AgentScopeSessionTests(unittest.TestCase):
+    def test_repeated_ensure_uses_read_only_scope_fast_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                first = manager.ensure_private_scope(1)
+                updated_at = db.scalar(
+                    "SELECT updated_at FROM agent_scopes WHERE scope_key = ?",
+                    (first.scope_key,),
+                )
+                with (
+                    mock.patch.object(manager, "_write_scope_marker") as write_marker,
+                    mock.patch.object(db, "transaction", wraps=db.transaction) as transaction,
+                ):
+                    second = manager.ensure_private_scope(1)
+                self.assertEqual(second, first)
+                write_marker.assert_not_called()
+                transaction.assert_not_called()
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT updated_at FROM agent_scopes WHERE scope_key = ?",
+                        (first.scope_key,),
+                    ),
+                    updated_at,
+                )
+            finally:
+                db.close()
+
+    def test_cached_scope_rejects_workspace_replaced_by_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                scope = manager.ensure_private_scope(1)
+                workspace = Path(scope.workspace_path)
+                original = workspace.with_name(f"{workspace.name}-original")
+                workspace.rename(original)
+                escape = Path(td) / "outside-workspace"
+                escape.mkdir()
+                workspace.symlink_to(escape, target_is_directory=True)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "outside the managed workspace root|must not contain symlink",
+                ):
+                    manager.ensure_private_scope(1)
+            finally:
+                db.close()
+
+    def test_existing_valid_scope_is_reused_after_manager_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                first = AgentScopeManager(config, db).ensure_private_scope(1)
+                restarted = AgentScopeManager(config, db)
+                with (
+                    mock.patch.object(restarted, "_write_scope_marker") as write_marker,
+                    mock.patch.object(db, "transaction", wraps=db.transaction) as transaction,
+                ):
+                    second = restarted.ensure_private_scope(1)
+                self.assertEqual(second, first)
+                write_marker.assert_not_called()
+                transaction.assert_not_called()
+            finally:
+                db.close()
+
+    def test_session_update_refreshes_scope_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                original = manager.ensure_private_scope(1)
+                manager.update_session_id(original.scope_key, "updated-session")
+                self.assertEqual(
+                    manager.ensure_private_scope(1).session_id,
+                    "updated-session",
+                )
+            finally:
+                db.close()
+
     def test_session_updates_are_scoped_and_recorded_for_current_lifecycle(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

@@ -29,10 +29,15 @@ describe("useTerminalPreviews", () => {
       .mockResolvedValueOnce({
         kind: "snapshot",
         etag: '"terminal-one"',
+        revision: "preview_epoch:4",
         capturedAt: "1784060400000",
         processes: [{ id: "term-1", output: "ready\n", running: true }],
       })
-      .mockResolvedValueOnce({ kind: "unchanged" });
+      .mockResolvedValueOnce({
+        kind: "unchanged",
+        etag: '"terminal-unchanged"',
+        revision: "preview_epoch:4",
+      });
 
     const { result } = renderHook(() => useTerminalPreviews(scope));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -42,7 +47,9 @@ describe("useTerminalPreviews", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(result.current.state.processes[0]?.output).toBe("ready\n");
+    expect(result.current.state.revision).toBe("preview_epoch:4");
     expect(fetchPreviewsMock.mock.calls[1]?.[1]).toBe('"terminal-one"');
+    expect(fetchPreviewsMock.mock.calls[1]?.[2]).toBe("preview_epoch:4");
   });
 
   it("clears the old terminal list immediately when the Agent scope changes", async () => {
@@ -50,6 +57,7 @@ describe("useTerminalPreviews", () => {
       .mockResolvedValueOnce({
         kind: "snapshot",
         etag: '"one"',
+        revision: 1,
         processes: [{ id: "term-channel", output: "channel", running: true }],
       })
       .mockResolvedValueOnce({ kind: "unchanged" });
@@ -65,5 +73,33 @@ describe("useTerminalPreviews", () => {
     expect(result.current.state.processes).toEqual([]);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(fetchPreviewsMock.mock.calls[1]?.[1]).toBe("");
+    expect(fetchPreviewsMock.mock.calls[1]?.[2]).toBeUndefined();
+  });
+
+  it("falls back to ETag-only polling after a legacy snapshot omits revision", async () => {
+    fetchPreviewsMock
+      .mockResolvedValueOnce({
+        kind: "snapshot",
+        etag: '"revisioned"',
+        revision: 5,
+        processes: [{ id: "term-1", output: "new", running: true }],
+      })
+      .mockResolvedValueOnce({
+        kind: "snapshot",
+        etag: '"legacy"',
+        processes: [{ id: "term-1", output: "legacy", running: true }],
+      })
+      .mockResolvedValueOnce({ kind: "unchanged" });
+
+    const { result } = renderHook(() => useTerminalPreviews(scope));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(result.current.state.revision).toBe(5);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(result.current.state.revision).toBeNull();
+    expect(result.current.state.processes[0]?.output).toBe("legacy");
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(fetchPreviewsMock.mock.calls[2]?.[2]).toBeUndefined();
   });
 });

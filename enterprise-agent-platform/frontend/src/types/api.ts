@@ -17,6 +17,7 @@ import type {
   Channel,
   CogneeConfigState,
   FullDocument,
+  Id,
   KnowledgeDocument,
   KnowledgeHit,
   MentionTarget,
@@ -43,6 +44,26 @@ export interface AuthMeResponse {
   user: User;
 }
 
+export type MessageRevision = string | number;
+
+export interface SessionBootstrapScope {
+  scope_type: "channel" | "private";
+  scope_id: string | number;
+}
+
+/** Authenticated shell data returned in one round trip. */
+export interface SessionBootstrapResponse {
+  user: User;
+  channels: Channel[];
+  mention_targets: MentionTarget[];
+  active_scope: SessionBootstrapScope | null;
+  messages: Message[];
+  agent_status?: AgentStatus | null;
+  typing?: TypingUser[];
+  message_revision?: MessageRevision;
+  next_after_id?: Id;
+}
+
 export interface LoginRequest {
   username: string;
   password: string;
@@ -50,6 +71,16 @@ export interface LoginRequest {
 
 export interface LoginResponse {
   user: User;
+  /** New servers return this; older servers remain valid during rollout. */
+  bootstrap?: SessionBootstrapResponse;
+  channels?: Channel[];
+  mention_targets?: MentionTarget[];
+  active_scope?: SessionBootstrapScope | null;
+  messages?: Message[];
+  agent_status?: AgentStatus | null;
+  typing?: TypingUser[];
+  message_revision?: MessageRevision;
+  next_after_id?: Id;
 }
 
 export interface UpdateCurrentUserRequest {
@@ -86,11 +117,17 @@ export interface ChannelMessagesResponse {
   messages: Message[];
   agent_status?: AgentStatus | null;
   typing?: TypingUser[];
+  message_revision?: MessageRevision;
+  next_after_id?: Id;
+  mode?: "full" | "delta";
 }
 
 export interface PrivateMessagesResponse {
   messages: Message[];
   agent_status?: AgentStatus | null;
+  message_revision?: MessageRevision;
+  next_after_id?: Id;
+  mode?: "full" | "delta";
 }
 
 /** JSON send body (the FormData variant carries `content` + repeated `files`). */
@@ -419,16 +456,10 @@ export interface TerminalPreviewProcess {
   title?: string;
   command?: string;
   cwd?: string;
-  /** Bounded, plain-text terminal screen returned by the platform. */
-  content?: string;
+  /** Bounded, plain-text combined terminal output returned by the platform. */
   output?: string;
-  screen?: string;
-  stdout?: string;
-  stderr?: string;
   status?: string;
   running?: boolean;
-  rows?: number;
-  columns?: number;
   updated_at?: number | string;
   started_at?: number | string;
   finished_at?: number | string;
@@ -439,5 +470,6 @@ export interface TerminalPreviewProcess {
 export interface TerminalPreviewsResponse {
   processes: TerminalPreviewProcess[];
   captured_at?: number | string;
-  revision?: string;
+  revision?: number | string;
+  unchanged?: true;
 }

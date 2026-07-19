@@ -192,6 +192,23 @@ const closeTimeoutCleanupAfter = `  } finally {
   // Force-kill browser survivors.`;
 const survivorScanBefore = `if (/camoufox-bin|\\/usr\\/bin\\/Xvfb\\b/.test(cmdline))`;
 const survivorScanAfter = `if (/camoufox-bin/.test(cmdline))`;
+const screenshotEncodingBefore = `    const { tabState } = found;
+    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);`;
+const screenshotEncodingAfter = `    const { tabState } = found;
+    const format = req.query.format === 'jpeg' ? 'jpeg' : 'png';
+    const requestedQuality = Number.parseInt(String(req.query.quality || ''), 10);
+    const quality = Number.isFinite(requestedQuality)
+      ? Math.max(30, Math.min(90, requestedQuality))
+      : 65;
+    const options = { type: format, fullPage };
+    if (format === 'jpeg') options.quality = quality;
+    const buffer = await tabState.page.screenshot(options);
+    pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+    res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
+    res.send(buffer);`;
 const displayAfter = `    let displayStartupError = null;
     try {
       if (os.platform() === 'linux') {
@@ -296,6 +313,7 @@ applyExactPatch("browser-close-display-capture", closeDisplayCaptureBefore, clos
 applyExactPatch("browser-close-timeout-display-cleanup", closeTimeoutCleanupBefore, closeTimeoutCleanupAfter);
 applyExactPatch("scoped-browser-survivor-scan", survivorScanBefore, survivorScanAfter);
 applyExactPatch("platform-managed-display", displayBefore, displayAfter);
+applyExactPatch("low-bandwidth-screenshot-encoding", screenshotEncodingBefore, screenshotEncodingAfter);
 
 const source = fs.readFileSync(target, "utf8");
 if (patched === source) process.exit(0);

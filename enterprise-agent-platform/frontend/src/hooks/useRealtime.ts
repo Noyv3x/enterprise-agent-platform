@@ -7,7 +7,8 @@
    closes the stream and clears the reconnect timer.
 
    Preserved semantics:
-   - "update" events trigger refreshActiveChat (guarded against a stale instance);
+   - "update" events apply ephemeral status/typing directly and synchronize
+     messages only when the persisted conversation revision changes;
    - on a terminal close (readyState === 2) we probe GET /api/auth/me (NOT
      skipAuthHandling, so a 401 drops to login) and, if still authed + visible,
      schedule a single 3s reconnect;
@@ -20,8 +21,25 @@ import { api } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { SSE_RECONNECT_MS } from "../lib/constants";
 import { registerSessionTeardown } from "../data/sessionActions";
-import { currentScopeStreamUrl, refreshActiveChat } from "../data/chatActions";
+import {
+  applyScopeRealtimeUpdate,
+  currentScopeStreamUrl,
+  refreshActiveChat,
+  type ScopeRealtimeUpdate,
+} from "../data/chatActions";
+import { publishRealtimePreview } from "../data/realtimeEvents";
 import { useStore, useStoreHandle } from "../store/useStore";
+import type { AgentPreviewScope, ChatMode } from "../types";
+
+interface RealtimePayload extends ScopeRealtimeUpdate {
+  preview?: {
+    browser_active?: boolean;
+    browserActive?: boolean;
+    running_terminal_count?: number;
+    runningTerminalCount?: number;
+  };
+  preview_changed?: boolean;
+}
 
 export function useRealtime(): boolean {
   const store = useStoreHandle();
@@ -37,6 +55,12 @@ export function useRealtime(): boolean {
 
     let es: EventSource | null = null;
     let reconnect: number | null = null;
+    const mode: ChatMode = view === "private" ? "private" : "channel";
+    const scopeId = mode === "private" ? String(userId) : String(activeChannelId || "");
+    const previewScope: AgentPreviewScope = {
+      scope_type: mode,
+      scope_id: scopeId,
+    };
     // Guards the async auth-probe below: if the effect is torn down (scope change,
     // logout) while the probe is in flight, its .then() must not schedule a
     // reconnect that would open a second EventSource bound to the now-stale scope.
@@ -71,8 +95,37 @@ export function useRealtime(): boolean {
       current.addEventListener("open", () => {
         if (es === current && !disposed) setConnected(true);
       });
-      current.addEventListener("update", () => {
-        if (es === current) void refreshActiveChat(store);
+      current.addEventListener("update", (event) => {
+        if (es !== current) return;
+        let payload: RealtimePayload;
+        try {
+          payload = JSON.parse((event as MessageEvent<string>).data || "{}") as RealtimePayload;
+        } catch {
+          return;
+        }
+        if (payload.preview || payload.preview_changed) {
+          const preview = payload.preview;
+          publishRealtimePreview({
+            scope: previewScope,
+            ...(preview && typeof (preview.browser_active ?? preview.browserActive) === "boolean"
+              ? { browserActive: Boolean(preview.browser_active ?? preview.browserActive) }
+              : {}),
+            ...(preview && Number.isFinite(
+              Number(preview.running_terminal_count ?? preview.runningTerminalCount),
+            )
+              ? {
+                  runningTerminalCount: Number(
+                    preview.running_terminal_count ?? preview.runningTerminalCount,
+                  ),
+                }
+              : {}),
+          });
+        }
+        if (applyScopeRealtimeUpdate(store, mode, scopeId, payload)) {
+          // The SSE snapshot is newer than a GET that may already be in flight;
+          // do not let an equal-second response authoritatively roll it back.
+          void refreshActiveChat(store, { authoritativeStatus: false });
+        }
       });
       current.addEventListener("error", () => {
         if (es !== current) return;

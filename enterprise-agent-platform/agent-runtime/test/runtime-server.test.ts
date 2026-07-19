@@ -284,13 +284,40 @@ test("runtime exposes only bounded read-only processes owned by a root scope", a
       headers: { authorization: "Bearer secret" },
     });
     assert.equal(response.status, 200);
-    const body = await response.json() as { processes: Array<Record<string, unknown>> };
+    const body = await response.json() as {
+      processes: Array<Record<string, unknown>>;
+      revision: string;
+      unchanged?: true;
+    };
+    assert.match(body.revision, /^preview_[a-f0-9]{32}:\d+$/);
+    assert.equal(body.unchanged, undefined);
     assert.deepEqual(new Set(body.processes.map((process) => process.id)), new Set([root.id, child.id]));
     for (const process of body.processes) {
-      for (const internal of ["pid", "run_id", "scope_key", "lifecycle_id"]) {
+      for (const internal of ["pid", "run_id", "scope_key", "lifecycle_id", "stdout", "stderr"]) {
         assert.equal(internal in process, false);
       }
+      assert.equal(typeof process.output, "string");
     }
+    const unchanged = await fetch(`${base}/v1/scopes/processes?${query}&since_revision=${body.revision}`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    assert.equal(unchanged.status, 200);
+    assert.deepEqual(await unchanged.json(), {
+      processes: [],
+      revision: body.revision,
+      unchanged: true,
+    });
+    for (const invalid of ["", "-1", "+1", "bad token", "slash/value", "x".repeat(129)]) {
+      assert.equal((await fetch(`${base}/v1/scopes/processes?${query}&since_revision=${encodeURIComponent(invalid)}`, {
+        headers: { authorization: "Bearer secret" },
+      })).status, 400);
+    }
+    assert.equal((await fetch(`${base}/v1/scopes/processes?${query}&since_revision=1&since_revision=1`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
+    assert.equal((await fetch(`${base}/v1/scopes/processes?${query}&extra=1`, {
+      headers: { authorization: "Bearer secret" },
+    })).status, 400);
     assert.equal((await fetch(`${base}/v1/scopes/processes?${query}`, {
       method: "POST",
       headers: { authorization: "Bearer secret" },

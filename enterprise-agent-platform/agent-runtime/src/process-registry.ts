@@ -27,8 +27,6 @@ export interface ProcessPreview {
   title: string;
   command: string;
   cwd: string;
-  stdout: string;
-  stderr: string;
   output: string;
   status: ProcessSnapshot["status"];
   running: boolean;
@@ -38,6 +36,17 @@ export interface ProcessPreview {
   finished_at?: string;
   truncated: boolean;
 }
+
+export type ProcessPreviewResult =
+  | {
+      processes: ProcessPreview[];
+      revision: string;
+    }
+  | {
+      processes: [];
+      revision: string;
+      unchanged: true;
+    };
 
 export interface ProcessPreviewSummary {
   running_terminal_count: number;
@@ -55,21 +64,19 @@ interface ManagedProcess extends ProcessSnapshot {
   streamedBytes: number;
   outputLimitExceeded: boolean;
   exitConfirmed: boolean;
-  previewStdout: string;
-  previewStderr: string;
-  previewStdoutTruncated: boolean;
-  previewStderrTruncated: boolean;
+  previewOutput: string;
+  previewOutputTruncated: boolean;
   previewUpdatedAt: string;
 }
 
 const PREVIEW_PROCESS_LIMIT = 16;
 const PREVIEW_CAPTURE_BYTES = 64 * 1024;
-// stdout + stderr + the combined output field remain below roughly 1 MiB for
-// the maximum 16-process response, even when JSON escaping doubles newlines.
-const PREVIEW_STREAM_BYTES = 8 * 1024;
+// The combined output field remains below roughly 512 KiB for the maximum
+// 16-process response, even when JSON escaping doubles newlines.
 const PREVIEW_COMBINED_BYTES = 16 * 1024;
 const PREVIEW_COMMAND_BYTES = 4 * 1024;
 const PREVIEW_CWD_BYTES = 2 * 1024;
+const PREVIEW_REVISION_KEY_LIMIT = 4_096;
 
 export interface RunCommandOptions {
   runId: string;
@@ -88,6 +95,9 @@ export interface RunCommandOptions {
 export class ProcessRegistry {
   private readonly processes = new Map<string, ManagedProcess>();
   private readonly completedLru = new Map<string, true>();
+  private readonly previewRevisions = new Map<string, number>();
+  private readonly previewRevisionEpoch = id("preview");
+  private previewRevisionSequence = 0;
   private readonly maxCapturedBytes: number;
   private readonly maxStreamedBytes: number;
   private readonly maxOutputBytes: number;
@@ -161,13 +171,12 @@ export class ProcessRegistry {
       streamedBytes: 0,
       outputLimitExceeded: false,
       exitConfirmed: false,
-      previewStdout: "",
-      previewStderr: "",
-      previewStdoutTruncated: false,
-      previewStderrTruncated: false,
+      previewOutput: "",
+      previewOutputTruncated: false,
       previewUpdatedAt: new Date().toISOString(),
     };
     this.processes.set(processId, managed);
+    this.markPreviewChanged(managed);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -182,6 +191,7 @@ export class ProcessRegistry {
         managed.stderr = truncate(`${managed.stderr}\n${errorMessage(error)}`.trim(), this.maxCapturedBytes);
         managed.finished_at = new Date().toISOString();
         managed.previewUpdatedAt = managed.finished_at;
+        this.markPreviewChanged(managed);
         reject(error);
       });
       child.once("close", (code, signal) => {
@@ -191,6 +201,7 @@ export class ProcessRegistry {
         else managed.status = code === 0 ? "completed" : "failed";
         managed.exitConfirmed = true;
         managed.previewUpdatedAt = managed.finished_at;
+        this.markPreviewChanged(managed);
         this.rememberCompleted(managed);
         resolve(this.snapshot(managed));
       });
@@ -226,9 +237,13 @@ export class ProcessRegistry {
    * Return a bounded, presentation-safe view of a root Agent scope and its
    * delegates. This intentionally has no companion write/kill operation.
    */
-  preview(scopeKey: string, lifecycleId: string): ProcessPreview[] {
+  preview(scopeKey: string, lifecycleId: string, sinceRevision?: string): ProcessPreviewResult {
     this.pruneCompleted();
-    return [...this.processes.values()]
+    const revision = this.previewRevisionFor(scopeKey, lifecycleId);
+    if (sinceRevision === revision) {
+      return { processes: [], revision, unchanged: true };
+    }
+    const processes = [...this.processes.values()]
       .filter((process) => scopeOwns(scopeKey, process.scope_key) && process.lifecycle_id === lifecycleId)
       .sort((left, right) => {
         const running = Number(right.status === "running") - Number(left.status === "running");
@@ -238,6 +253,7 @@ export class ProcessRegistry {
       })
       .slice(0, PREVIEW_PROCESS_LIMIT)
       .map((process, index) => this.previewSnapshot(process, index));
+    return { processes, revision };
   }
 
   /**
@@ -355,6 +371,7 @@ export class ProcessRegistry {
       const finishedAt = process?.finished_at ? Date.parse(process.finished_at) : Number.NaN;
       if (!process || (Number.isFinite(finishedAt) && now - finishedAt >= this.completedRecordTtlMs)) {
         this.completedLru.delete(processId);
+        if (process) this.markPreviewChanged(process);
         this.processes.delete(processId);
       }
     }
@@ -362,6 +379,8 @@ export class ProcessRegistry {
       const oldest = this.completedLru.keys().next().value as string | undefined;
       if (!oldest) break;
       this.completedLru.delete(oldest);
+      const process = this.processes.get(oldest);
+      if (process) this.markPreviewChanged(process);
       this.processes.delete(oldest);
     }
   }
@@ -375,12 +394,11 @@ export class ProcessRegistry {
     const bytes = Buffer.byteLength(chunk);
     process.outputBytes += bytes;
     process[channel] = truncate(process[channel] + chunk, this.maxCapturedBytes);
-    const previewKey = channel === "stdout" ? "previewStdout" : "previewStderr";
-    const truncatedKey = channel === "stdout" ? "previewStdoutTruncated" : "previewStderrTruncated";
-    const preview = utf8Tail(process[previewKey] + chunk, PREVIEW_CAPTURE_BYTES);
-    process[previewKey] = preview.value;
-    process[truncatedKey] ||= preview.truncated;
+    const preview = utf8Tail(process.previewOutput + chunk, PREVIEW_CAPTURE_BYTES);
+    process.previewOutput = preview.value;
+    process.previewOutputTruncated ||= preview.truncated;
     process.previewUpdatedAt = new Date().toISOString();
+    this.markPreviewChanged(process);
     if (process.streamedBytes < this.maxStreamedBytes) {
       const remaining = this.maxStreamedBytes - process.streamedBytes;
       const selected = Buffer.from(chunk).subarray(0, remaining).toString("utf8");
@@ -401,6 +419,7 @@ export class ProcessRegistry {
     if (process.status !== "running") return;
     process.status = "cancelled";
     process.previewUpdatedAt = new Date().toISOString();
+    this.markPreviewChanged(process);
     const pid = process.child.pid;
     try {
       if (pid && globalThis.process.platform !== "win32") globalThis.process.kill(-pid, "SIGTERM");
@@ -427,10 +446,8 @@ export class ProcessRegistry {
       streamedBytes: _streamedBytes,
       outputLimitExceeded: _outputLimitExceeded,
       exitConfirmed: _exitConfirmed,
-      previewStdout: _previewStdout,
-      previewStderr: _previewStderr,
-      previewStdoutTruncated: _previewStdoutTruncated,
-      previewStderrTruncated: _previewStderrTruncated,
+      previewOutput: _previewOutput,
+      previewOutputTruncated: _previewOutputTruncated,
       previewUpdatedAt: _previewUpdatedAt,
       ...snapshot
     } = process;
@@ -438,34 +455,72 @@ export class ProcessRegistry {
   }
 
   private previewSnapshot(process: ManagedProcess, index: number): ProcessPreview {
-    const stdout = boundedPlainText(process.previewStdout, PREVIEW_STREAM_BYTES);
-    const stderr = boundedPlainText(process.previewStderr, PREVIEW_STREAM_BYTES);
-    const combined = stdout.value && stderr.value
-      ? `${stdout.value}\n[stderr]\n${stderr.value}`
-      : stdout.value || stderr.value;
-    const output = utf8Tail(combined, PREVIEW_COMBINED_BYTES);
+    const output = boundedPlainText(process.previewOutput, PREVIEW_COMBINED_BYTES);
     const result: ProcessPreview = {
       id: process.id,
       title: `Terminal ${index + 1}`,
       command: redactPreviewCommand(process.command),
       cwd: boundedPlainText(process.cwd, PREVIEW_CWD_BYTES).value,
-      stdout: stdout.value,
-      stderr: stderr.value,
       output: output.value,
       status: process.status,
       running: process.status === "running",
       started_at: process.started_at,
       updated_at: process.previewUpdatedAt,
-      truncated: process.previewStdoutTruncated
-        || process.previewStderrTruncated
-        || stdout.truncated
-        || stderr.truncated
-        || output.truncated,
+      truncated: process.previewOutputTruncated || output.truncated,
     };
     if (process.exit_code !== undefined) result.exit_code = process.exit_code;
     if (process.finished_at !== undefined) result.finished_at = process.finished_at;
     return result;
   }
+
+  private markPreviewChanged(process: Pick<ManagedProcess, "scope_key" | "lifecycle_id">): void {
+    let scopeKey = process.scope_key;
+    while (true) {
+      if (this.previewRevisionSequence >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("Process preview revision limit exceeded");
+      }
+      this.previewRevisionSequence += 1;
+      this.rememberPreviewRevision(
+        scopeKey,
+        process.lifecycle_id,
+        this.previewRevisionSequence,
+      );
+      const delegateBoundary = scopeKey.lastIndexOf("/delegate/");
+      if (delegateBoundary < 0) break;
+      scopeKey = scopeKey.slice(0, delegateBoundary);
+    }
+  }
+
+  private previewRevisionFor(scopeKey: string, lifecycleId: string): string {
+    const key = previewRevisionKey(scopeKey, lifecycleId);
+    const entry = this.previewRevisions.get(key);
+    if (entry === undefined) return `${this.previewRevisionEpoch}:0`;
+    // Treat this bounded map as an LRU. Lifecycle IDs are intentionally never
+    // reused, so retaining every completed scope forever would otherwise turn
+    // a lightweight preview optimization into a process-lifetime memory leak.
+    this.previewRevisions.delete(key);
+    this.previewRevisions.set(key, entry);
+    return `${this.previewRevisionEpoch}:${entry}`;
+  }
+
+  private rememberPreviewRevision(
+    scopeKey: string,
+    lifecycleId: string,
+    revision: number,
+  ): void {
+    const key = previewRevisionKey(scopeKey, lifecycleId);
+    this.previewRevisions.delete(key);
+    this.previewRevisions.set(key, revision);
+    while (this.previewRevisions.size > PREVIEW_REVISION_KEY_LIMIT) {
+      const oldest = this.previewRevisions.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.previewRevisions.delete(oldest);
+    }
+  }
+}
+
+function previewRevisionKey(scopeKey: string, lifecycleId: string): string {
+  return JSON.stringify([scopeKey, lifecycleId]);
 }
 
 function redactPreviewCommand(value: string): string {

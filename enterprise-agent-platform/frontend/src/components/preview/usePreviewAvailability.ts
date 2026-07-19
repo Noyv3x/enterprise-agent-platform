@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPreviewAvailability } from "../../data/previewActions";
+import { subscribeRealtimePreview } from "../../data/realtimeEvents";
 import type { AgentPreviewScope } from "../../types";
 
-const POLL_INTERVAL_MS = 2_000;
+const POLL_INTERVAL_MS = 15_000;
+const REALTIME_MIN_INTERVAL_MS = 2_000;
 
 export interface PreviewAvailabilityState {
   browserActive: boolean;
@@ -51,6 +53,8 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
     let inFlight = false;
     let generation = 0;
     let etag = "";
+    let lastRequestAt = 0;
+    let realtimeRefreshPending = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let controller: AbortController | null = null;
 
@@ -64,6 +68,8 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
     };
     const poll = async () => {
       if (stopped || document.hidden || inFlight) return;
+      lastRequestAt = Date.now();
+      realtimeRefreshPending = false;
       const requestGeneration = ++generation;
       const requestController = new AbortController();
       inFlight = true;
@@ -108,13 +114,27 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
         if (requestGeneration === generation) {
           inFlight = false;
           if (controller === requestController) controller = null;
-          schedule();
+          const realtimeDelay = Math.max(
+            0,
+            REALTIME_MIN_INTERVAL_MS - (Date.now() - lastRequestAt),
+          );
+          schedule(
+            realtimeRefreshPending
+              ? realtimeDelay
+              : POLL_INTERVAL_MS,
+          );
         }
       }
     };
 
     requestNow.current = () => {
-      if (!inFlight) schedule(0);
+      realtimeRefreshPending = true;
+      if (!inFlight) {
+        schedule(Math.max(
+          0,
+          REALTIME_MIN_INTERVAL_MS - (Date.now() - lastRequestAt),
+        ));
+      }
     };
     const onVisibilityChange = () => {
       clearTimer();
@@ -128,6 +148,27 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
       }
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
+    const unsubscribeRealtime = subscribeRealtimePreview((update) => {
+      if (scopeKey(update.scope) !== key) return;
+      if (
+        update.browserActive === undefined &&
+        update.runningTerminalCount === undefined
+      ) {
+        requestNow.current();
+        return;
+      }
+      setStoredState((current) => current.scopeKey === key ? {
+        ...current,
+        ...(update.browserActive !== undefined
+          ? { browserActive: update.browserActive }
+          : {}),
+        ...(update.runningTerminalCount !== undefined
+          ? { runningTerminalCount: update.runningTerminalCount }
+          : {}),
+        loading: false,
+        error: "",
+      } : current);
+    });
     schedule(0);
 
     return () => {
@@ -136,6 +177,7 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
       clearTimer();
       controller?.abort();
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      unsubscribeRealtime();
       requestNow.current = () => undefined;
     };
   }, [key, scope?.scope_id, scope?.scope_type]);

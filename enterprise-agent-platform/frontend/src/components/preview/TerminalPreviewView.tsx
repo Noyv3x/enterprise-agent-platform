@@ -10,11 +10,7 @@ import { useTerminalPreviews } from "./useTerminalPreviews";
 
 function processOutput(process: TerminalPreviewProcess | null): string {
   if (!process) return "";
-  const value = process.screen
-    || process.output
-    || process.content
-    || [process.stdout, process.stderr].filter(Boolean).join("\n");
-  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  return String(process.output || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 export function terminalProcessRunning(process: TerminalPreviewProcess): boolean {

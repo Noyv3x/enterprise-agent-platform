@@ -51,6 +51,7 @@ import type {
   KnowledgeSearchResponse,
   LoginRequest,
   LoginResponse,
+  SessionBootstrapResponse,
   MentionTargetsResponse,
   OAuthCompleteRequest,
   OAuthFlowResponse,
@@ -124,6 +125,10 @@ export const endpoints = {
   ),
   login: ep<LoginRequest, LoginResponse>("POST", () => "/api/auth/login"),
   logout: ep<void, unknown>("POST", () => "/api/auth/logout"),
+  sessionBootstrap: ep<void, SessionBootstrapResponse>(
+    "GET",
+    () => "/api/session/bootstrap",
+  ),
 
   /* channels */
   channels: ep<void, ChannelsResponse>("GET", () => "/api/channels"),
@@ -322,10 +327,13 @@ export const endpoints = {
       return `/api/agent-previews/browser?${params.toString()}`;
     },
   ),
-  terminalPreviews: ep<void, TerminalPreviewsResponse, [ScopeType, Id]>(
+  terminalPreviews: ep<void, TerminalPreviewsResponse, [ScopeType, Id, (number | string)?]>(
     "GET",
-    (scopeType, scopeId) => {
+    (scopeType, scopeId, sinceRevision) => {
       const params = new URLSearchParams({ scope_type: scopeType, scope_id: String(scopeId) });
+      if (sinceRevision !== undefined) {
+        params.set("since_revision", String(sinceRevision));
+      }
       return `/api/agent-previews/terminals?${params.toString()}`;
     },
   ),

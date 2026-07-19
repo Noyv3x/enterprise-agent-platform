@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import hmac
 import json
@@ -40,6 +41,15 @@ SSE_AUTH_RECHECK_SECONDS = 5.0
 # Size of the buffer used when streaming file responses to the client so large
 # attachments are not fully materialized in memory.
 FILE_STREAM_CHUNK_BYTES = 64 * 1024
+JSON_GZIP_MIN_BYTES = 1024
+SSE_KEEPALIVE_SECONDS = 20.0
+SENSITIVE_JSON_EXPORT_PATHS = frozenset(
+    {
+        "/api/private-agent/memories/export",
+        "/api/settings/agent-token",
+        "/api/system/oauth/credentials/export",
+    }
+)
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -202,6 +212,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return super().send_error(code, message, explain)
 
     def _dispatch(self, method: str) -> None:
+        self._request_started_monotonic = time.monotonic()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -218,7 +229,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._json(self.server.service.auto_update_public_status())
                 return
-            if self.server.service.platform_update_is_blocking():
+            # The outer gateway owns authoritative admission/draining in normal
+            # deployments. Avoid re-reading the maintenance marker and querying
+            # active work for every proxied request; direct/foreground serving
+            # keeps this defense-in-depth check.
+            if (
+                os.environ.get("ENTERPRISE_GATEWAY_ACTIVE") != "1"
+                and self.server.service.platform_update_is_blocking()
+            ):
                 self._json(
                     {
                         "error": "platform is updating",
@@ -305,13 +323,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 str(body.get("password", "")),
                 client_id=self._client_identity(),
             )
-            self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
+            self._json(
+                {
+                    "user": user,
+                    "bootstrap": service.session_bootstrap(user),
+                },
+                headers={"Set-Cookie": self._session_cookie(token)},
+            )
             return
         if path == "/api/auth/logout" and method == "POST":
             self._json({"ok": True}, headers={"Set-Cookie": self._clear_cookie()})
             return
 
         actor = self._require_user()
+        if path == "/api/session/bootstrap" and method == "GET":
+            self._json(service.session_bootstrap(actor))
+            return
         if path == "/api/agent-previews/status":
             if method != "GET":
                 raise ServiceError(405, "method not allowed")
@@ -409,14 +436,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({"user": service.deactivate_user(actor, int(m.group(1)))})
             return
         if path == "/api/agent-previews/terminals" and method == "GET":
-            if set(query) - {"scope_type", "scope_id"}:
-                raise ServiceError(400, "terminal preview accepts only scope_type and scope_id")
+            if set(query) - {"scope_type", "scope_id", "since_revision"}:
+                raise ServiceError(
+                    400,
+                    "terminal preview accepts only scope_type, scope_id, and since_revision",
+                )
             if len(query.get("scope_type", [])) != 1 or len(query.get("scope_id", [])) != 1:
                 raise ServiceError(400, "scope_type and scope_id are required exactly once")
+            since_revision = optional_preview_revision_arg(
+                query,
+                "since_revision",
+            )
             payload = service.agent_terminal_previews(
                 actor,
                 first(query, "scope_type", ""),
                 first(query, "scope_id", ""),
+                since_revision=since_revision,
             )
             self._preview_json(payload)
             return
@@ -432,11 +467,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
         if m and method == "GET":
             limit = int_arg(query, "limit", 100)
-            self._json({
-                "messages": service.list_messages(actor, "channel", m.group(1), limit=limit),
-                "agent_status": service.agent_status(actor, "channel", m.group(1)),
-                "typing": service.typing_users(actor, "channel", m.group(1)),
-            })
+            sync = service.message_sync(
+                actor,
+                "channel",
+                m.group(1),
+                limit=limit,
+                after_id=optional_int_arg(query, "after_id", minimum=0),
+                since_revision=optional_int_arg(
+                    query, "since_revision", minimum=0
+                ),
+            )
+            self._json(
+                {
+                    **sync,
+                    "agent_status": service.agent_status(
+                        actor, "channel", m.group(1)
+                    ),
+                    "typing": service.typing_users(
+                        actor, "channel", m.group(1)
+                    ),
+                }
+            )
             return
         if m and method == "POST":
             content, attachments = self._body_message()
@@ -470,11 +521,25 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/private-agent/messages" and method == "GET":
             limit = int_arg(query, "limit", 100)
-            self._json({
-                "messages": service.list_messages(actor, "private", str(actor["id"]), limit=limit),
-                "agent_status": service.agent_status(actor, "private", str(actor["id"])),
-                "typing": [],
-            })
+            sync = service.message_sync(
+                actor,
+                "private",
+                str(actor["id"]),
+                limit=limit,
+                after_id=optional_int_arg(query, "after_id", minimum=0),
+                since_revision=optional_int_arg(
+                    query, "since_revision", minimum=0
+                ),
+            )
+            self._json(
+                {
+                    **sync,
+                    "agent_status": service.agent_status(
+                        actor, "private", str(actor["id"])
+                    ),
+                    "typing": [],
+                }
+            )
             return
         if path == "/api/private-agent/messages" and method == "POST":
             content, attachments = self._body_message()
@@ -925,12 +990,31 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _json(self, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        response_headers = dict(headers or {})
+        request_path = urllib.parse.urlparse(self.path).path
+        compressible = (
+            len(body) >= JSON_GZIP_MIN_BYTES
+            and request_path not in SENSITIVE_JSON_EXPORT_PATHS
+        )
+        if compressible:
+            response_headers["Vary"] = _append_vary(
+                response_headers.get("Vary", ""), "Accept-Encoding"
+            )
+            if _encoding_quality(
+                self.headers.get("Accept-Encoding", ""), "gzip"
+            ) > 0:
+                body = gzip.compress(body, compresslevel=5, mtime=0)
+                response_headers["Content-Encoding"] = "gzip"
+        started = getattr(self, "_request_started_monotonic", None)
+        if started is not None and "Server-Timing" not in response_headers:
+            duration_ms = max(0.0, (time.monotonic() - float(started)) * 1000)
+            response_headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self._send_security_headers()
-        for key, value in (headers or {}).items():
+        for key, value in response_headers.items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
@@ -977,6 +1061,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         image = preview.get("image")
         if not isinstance(image, bytes) or len(image) > 8 * 1024 * 1024:
             raise ServiceError(502, "invalid browser preview frame")
+        mime_type = str(preview.get("mime_type") or "image/png").strip().lower()
+        if mime_type not in {"image/jpeg", "image/png"}:
+            raise ServiceError(502, "invalid browser preview media type")
         metadata_headers = {
             "ETag": etag,
             "Cache-Control": "private, no-cache, max-age=0",
@@ -1004,7 +1091,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(image)))
         self._send_security_headers()
         for key, value in metadata_headers.items():
@@ -1039,13 +1126,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         """Send a private, conditionally cacheable read-only preview."""
 
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        etag = f'"{hashlib.sha256(body).hexdigest()}"'
         response_headers = {
-            "ETag": etag,
             "Cache-Control": "private, no-cache, max-age=0",
             "Vary": "Cookie, Authorization",
             "Cross-Origin-Resource-Policy": "same-origin",
         }
+        if len(body) >= JSON_GZIP_MIN_BYTES:
+            response_headers["Vary"] = _append_vary(
+                response_headers["Vary"], "Accept-Encoding"
+            )
+            if _encoding_quality(
+                self.headers.get("Accept-Encoding", ""), "gzip"
+            ) > 0:
+                body = gzip.compress(body, compresslevel=5, mtime=0)
+                response_headers["Content-Encoding"] = "gzip"
+        etag = f'"{hashlib.sha256(body).hexdigest()}"'
+        response_headers["ETag"] = etag
         if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
@@ -1097,7 +1193,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         service = self.server.service
         # Authorize before emitting any response so a denial becomes a normal
         # JSON error (no headers are sent yet).
-        service.agent_status(actor, scope_type, scope_id)
+        authorized_status = service.agent_status(actor, scope_type, scope_id)
         # Admission control: bound the number of concurrent long-lived streams
         # globally and per user so a scripted client cannot pin worker threads
         # (and their per-thread SQLite connections) indefinitely. Reject before
@@ -1124,24 +1220,83 @@ class RequestHandler(BaseHTTPRequestHandler):
             deadline = time.time() + SSE_MAX_SECONDS
             next_auth_check = time.time() + SSE_AUTH_RECHECK_SECONDS
             last_token = None
+            last_write = 0.0
+            last_revision: int | None = None
+            latest = 0
+            cached_jobs = dict(authorized_status.get("jobs") or {})
+            last_jobs_token = (
+                authorized_status.get("run_id"),
+                authorized_status.get("state"),
+                authorized_status.get("queued_count"),
+                authorized_status.get("updated_at"),
+            )
             while time.time() < deadline and not self.server.shutdown_event.is_set():
                 now = time.time()
                 if now >= next_auth_check:
                     # Promptly end the stream if the session was deactivated or
                     # revoked (password reset / role change / explicit revoke)
                     # rather than waiting for the SSE_MAX_SECONDS backstop.
-                    if not service.user_from_token(token):
+                    fresh_actor = service.user_from_token(token)
+                    if not fresh_actor:
                         return
+                    # Channel archival/removal does not necessarily revoke the
+                    # whole login token. Recheck scope access at this slower
+                    # cadence so the 0.4s hot path stays in memory without
+                    # leaving an archived channel readable until reconnect.
+                    service.authorize_conversation(
+                        fresh_actor,
+                        scope_type,
+                        scope_id,
+                    )
                     next_auth_check = now + SSE_AUTH_RECHECK_SECONDS
-                status = service.agent_status(actor, scope_type, scope_id)
-                latest = service.latest_message_id(scope_type, scope_id)
-                typing = service.typing_users(actor, scope_type, scope_id)
+                status = service.agent_status_for_system(scope_type, scope_id)
+                jobs_token = (
+                    status.get("run_id"),
+                    status.get("state"),
+                    status.get("queued_count"),
+                    status.get("updated_at"),
+                )
+                if jobs_token != last_jobs_token:
+                    status = service.agent_status_for_system(
+                        scope_type,
+                        scope_id,
+                        include_jobs=True,
+                    )
+                    cached_jobs = dict(status.get("jobs") or {})
+                    last_jobs_token = (
+                        status.get("run_id"),
+                        status.get("state"),
+                        status.get("queued_count"),
+                        status.get("updated_at"),
+                    )
+                else:
+                    status["jobs"] = cached_jobs
+                revision = service.conversation_revision(
+                    scope_type,
+                    scope_id,
+                )["revision"]
+                if revision != last_revision:
+                    latest = service.latest_message_id(scope_type, scope_id)
+                    last_revision = revision
+                typing = service.typing_users_for_system(
+                    scope_type,
+                    scope_id,
+                    exclude_user_id=int(actor["id"]),
+                )
                 stream = status.get("stream_message") or {}
                 approval = status.get("approval") or {}
+                activity = status.get("activity") or []
+                last_activity = activity[-1] if activity else {}
+                jobs = status.get("jobs") or {}
                 token_tuple = (
                     latest,
+                    revision,
                     status.get("state"),
                     status.get("updated_at"),
+                    status.get("current_step"),
+                    len(activity),
+                    last_activity.get("stage"),
+                    last_activity.get("line"),
                     stream.get("content"),
                     len(status.get("stream_messages") or []),
                     approval.get("run_id"),
@@ -1151,21 +1306,37 @@ class RequestHandler(BaseHTTPRequestHandler):
                         (item.get("user_id"), item.get("updated_at"))
                         for item in typing
                     ),
+                    tuple(
+                        sorted(
+                            (str(key), str(value))
+                            for key, value in jobs.items()
+                        )
+                    ),
                 )
                 if token_tuple != last_token:
                     payload = json.dumps(
                         {
                             "agent_status": status,
                             "latest_message_id": latest,
+                            "message_revision": revision,
                             "typing": typing,
+                            # Browser/terminal activity is observed through a
+                            # separate lightweight endpoint. Nudge that observer
+                            # whenever the Agent status may have changed so a
+                            # newly opened preview button does not wait for its
+                            # 15-second watchdog.
+                            "preview_changed": True,
                         },
                         ensure_ascii=False,
                     )
                     self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
                     last_token = token_tuple
-                else:
+                    last_write = time.monotonic()
+                    self.wfile.flush()
+                elif time.monotonic() - last_write >= SSE_KEEPALIVE_SECONDS:
                     self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
+                    last_write = time.monotonic()
+                    self.wfile.flush()
                 time.sleep(SSE_POLL_INTERVAL)
         except Exception:
             # Client disconnected or the scope became unavailable; just end the
@@ -1185,6 +1356,24 @@ class RequestHandler(BaseHTTPRequestHandler):
         target = static_dir / clean
         if not target.exists() or not target.is_file():
             target = static_dir / "index.html"
+        original_target = target
+        content_encoding = ""
+        accepted = self.headers.get("Accept-Encoding", "")
+        variants = sorted(
+            (
+                (_encoding_quality(accepted, "br"), 1, "br", ".br"),
+                (_encoding_quality(accepted, "gzip"), 0, "gzip", ".gz"),
+            ),
+            reverse=True,
+        )
+        for quality, _preference, encoding, suffix in variants:
+            if quality <= 0:
+                continue
+            candidate = Path(str(original_target) + suffix)
+            if candidate.exists() and candidate.is_file():
+                target = candidate
+                content_encoding = encoding
+                break
         # Open before sending headers (see _serve_attachment) so an open failure
         # cannot produce a corrupt double response after a 200 is already sent.
         try:
@@ -1193,16 +1382,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._not_found()
             return
         with fh:
-            size = os.fstat(fh.fileno()).st_size
+            stat = os.fstat(fh.fileno())
+            size = stat.st_size
+            etag = (
+                f'"{stat.st_mtime_ns:x}-{size:x}-'
+                f'{content_encoding or "identity"}"'
+            )
+            cache_control = (
+                "no-cache"
+                if original_target.name
+                in {"index.html", "theme-init.js", "app.js", "styles.css"}
+                else (
+                    "public, max-age=31536000, immutable"
+                    if re.search(
+                        r"-[A-Za-z0-9_-]{8,}\.(?:js|css)$",
+                        original_target.name,
+                    )
+                    else "public, max-age=3600"
+                )
+            )
+            if _etag_matches(self.headers.get("If-None-Match", ""), etag):
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", cache_control)
+                self.send_header("ETag", etag)
+                self.send_header("Vary", "Accept-Encoding")
+                if content_encoding:
+                    self.send_header("Content-Encoding", content_encoding)
+                self._send_security_headers()
+                self.end_headers()
+                return
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
+            self.send_header(
+                "Content-Type",
+                mimetypes.guess_type(str(original_target))[0]
+                or "application/octet-stream",
+            )
             self.send_header("Content-Length", str(size))
-            if target.name in {"index.html", "theme-init.js", "app.js", "styles.css"}:
-                self.send_header("Cache-Control", "no-cache")
-            elif re.search(r"-[A-Za-z0-9_-]{8,}\.(?:js|css)$", target.name):
-                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-            else:
-                self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("ETag", etag)
+            self.send_header("Vary", "Accept-Encoding")
+            if content_encoding:
+                self.send_header("Content-Encoding", content_encoding)
             self._send_security_headers()
             self.end_headers()
             self._stream_file_handle(fh)
@@ -1333,6 +1554,86 @@ def int_arg(query: dict[str, list[str]], key: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError) as exc:
         raise ServiceError(400, f"invalid {key} parameter") from exc
+
+
+def optional_int_arg(
+    query: dict[str, list[str]],
+    key: str,
+    *,
+    minimum: int | None = None,
+) -> int | None:
+    values = query.get(key)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise ServiceError(400, f"invalid {key} parameter")
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError) as exc:
+        raise ServiceError(400, f"invalid {key} parameter") from exc
+    if minimum is not None and value < minimum:
+        raise ServiceError(400, f"invalid {key} parameter")
+    return value
+
+
+def optional_preview_revision_arg(
+    query: dict[str, list[str]],
+    key: str,
+) -> int | str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise ServiceError(400, f"invalid {key} parameter")
+    value = values[0]
+    if re.fullmatch(r"(?:0|[1-9]\d*)", value):
+        parsed = int(value)
+        if parsed <= 9_007_199_254_740_991:
+            return parsed
+    elif re.fullmatch(r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}", value):
+        return value
+    raise ServiceError(400, f"invalid {key} parameter")
+
+
+def _encoding_quality(header: str, encoding: str) -> float:
+    """Return one content-coding's RFC-style q value from Accept-Encoding."""
+
+    wanted = str(encoding or "").strip().lower()
+    wildcard: float | None = None
+    for item in str(header or "").split(","):
+        token, *parameters = item.split(";")
+        name = token.strip().lower()
+        if not name:
+            continue
+        quality = 1.0
+        for parameter in parameters:
+            key, separator, raw_value = parameter.strip().partition("=")
+            if separator and key.strip().lower() == "q":
+                try:
+                    quality = min(1.0, max(0.0, float(raw_value.strip())))
+                except ValueError:
+                    quality = 0.0
+        if name == wanted:
+            return quality
+        if name == "*":
+            wildcard = quality
+    return wildcard or 0.0
+
+
+def _append_vary(current: str, value: str) -> str:
+    items = [item.strip() for item in str(current or "").split(",") if item.strip()]
+    if value.lower() not in {item.lower() for item in items}:
+        items.append(value)
+    return ", ".join(items)
+
+
+def _etag_matches(header: str, etag: str) -> bool:
+    candidates = {
+        item.strip()
+        for item in str(header or "").split(",")
+        if item.strip()
+    }
+    return "*" in candidates or etag in candidates or f"W/{etag}" in candidates
 
 
 def bearer_token(value: str) -> str | None:

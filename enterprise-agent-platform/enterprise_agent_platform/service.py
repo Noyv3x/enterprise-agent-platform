@@ -22,7 +22,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Deque
+from typing import Any, Callable, Deque, Iterable
 
 from .auth import TokenSigner, hash_password, verify_password
 from .agent_inputs import AgentRunInput, AgentRunInputStore
@@ -208,6 +208,9 @@ MAX_BROWSER_PREVIEW_CACHE_BYTES = 32 * 1024 * 1024
 MAX_BROWSER_PREVIEW_FAMILY_SCOPES = 64
 MAX_BROWSER_PREVIEW_DIMENSION = 16_384
 MAX_BROWSER_PREVIEW_PIXELS = 50_000_000
+TERMINAL_PREVIEW_REVISION_RE = re.compile(
+    r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}"
+)
 # Global ceiling on concurrent in-flight Agent generations. Each conversation
 # still drains its own queue in FIFO order, while this bound prevents a burst of
 # distinct conversations from exhausting host threads and sockets.
@@ -1770,7 +1773,7 @@ class EnterpriseService:
         if not payload:
             return None
         row = self.db.query_one(
-            "SELECT active, token_version FROM users WHERE id = ?",
+            "SELECT * FROM users WHERE id = ?",
             (payload.user_id,),
         )
         if not row or not row.get("active"):
@@ -1779,7 +1782,7 @@ class EnterpriseService:
         # reset, role/permission change, deactivation, explicit revoke).
         if int(row.get("token_version") or 1) != int(payload.version):
             return None
-        return self.get_user(payload.user_id)
+        return self.public_user(row)
 
     def revoke_user_sessions(self, user_id: int) -> None:
         """Invalidate all outstanding session tokens for a user."""
@@ -2115,6 +2118,148 @@ class EnterpriseService:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         return self._messages_for_scope(scope_type, scope_id, limit)
 
+    def session_bootstrap(self, actor: dict[str, Any], *, limit: int = 100) -> dict[str, Any]:
+        """Return the authenticated shell and its first conversation in one RTT."""
+
+        channels = self.list_channels(actor)
+        permissions = set(actor.get("permissions") or [])
+        mention_targets = (
+            self.mention_targets(actor)
+            if PERMISSION_CHAT in permissions
+            else []
+        )
+        active_scope: dict[str, str] | None = None
+        if channels:
+            active_scope = {
+                "scope_type": "channel",
+                "scope_id": str(channels[0]["id"]),
+            }
+        elif PERMISSION_PRIVATE_AGENT in permissions:
+            active_scope = {
+                "scope_type": "private",
+                "scope_id": str(actor["id"]),
+            }
+
+        messages: list[dict[str, Any]] = []
+        agent_status: dict[str, Any] | None = None
+        typing: list[dict[str, Any]] = []
+        revision = 0
+        next_after_id = 0
+        if active_scope is not None:
+            scope_type = active_scope["scope_type"]
+            scope_id = active_scope["scope_id"]
+            sync = self.message_sync(
+                actor,
+                scope_type,
+                scope_id,
+                limit=limit,
+            )
+            messages = sync["messages"]
+            revision = int(sync["message_revision"])
+            next_after_id = int(sync["next_after_id"])
+            agent_status = self.agent_status(actor, scope_type, scope_id)
+            if scope_type == "channel":
+                typing = self.typing_users(actor, scope_type, scope_id)
+
+        return {
+            "user": actor,
+            "channels": channels,
+            "mention_targets": mention_targets,
+            "active_scope": active_scope,
+            "messages": messages,
+            "agent_status": agent_status,
+            "typing": typing,
+            "message_revision": revision,
+            "next_after_id": next_after_id,
+        }
+
+    def message_sync(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        *,
+        limit: int = 100,
+        after_id: int | None = None,
+        since_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a full window or a safe append-only delta for one scope.
+
+        A hide/delete advances ``reset_revision``. Clients whose last revision
+        predates that boundary receive a full window, because an append-only
+        response cannot describe removals.
+        """
+
+        scope_type, scope_id = self._normalize_conversation(
+            actor, scope_type, scope_id
+        )
+        clean_limit = max(1, min(int(limit), 300))
+        revision_state = self.conversation_revision(scope_type, scope_id)
+        revision = int(revision_state["revision"])
+        reset_revision = int(revision_state["reset_revision"])
+        can_delta = (
+            after_id is not None
+            and since_revision is not None
+            and int(after_id) >= 0
+            and int(since_revision) >= reset_revision
+            and int(since_revision) <= revision
+        )
+        mode = "delta" if can_delta else "full"
+        if can_delta:
+            rows = self.db.query(
+                """
+                SELECT * FROM messages
+                WHERE scope_type = ? AND scope_id = ? AND hidden_at IS NULL
+                  AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (scope_type, scope_id, int(after_id), clean_limit + 1),
+            )
+            # A bounded full window is safer than claiming a partial delta is
+            # synchronized when more than ``limit`` rows accumulated offline.
+            if len(rows) > clean_limit:
+                mode = "full"
+                messages = self._messages_for_scope(
+                    scope_type, scope_id, clean_limit
+                )
+            else:
+                messages = self._messages_from_rows(rows)
+        else:
+            messages = self._messages_for_scope(
+                scope_type, scope_id, clean_limit
+            )
+        if messages:
+            next_after_id = max(int(message["id"]) for message in messages)
+        elif mode == "delta" and after_id is not None:
+            next_after_id = int(after_id)
+        else:
+            next_after_id = 0
+        return {
+            "messages": messages,
+            "mode": mode,
+            "message_revision": revision,
+            "next_after_id": next_after_id,
+            "revision": revision,
+            "reset_revision": reset_revision,
+        }
+
+    def conversation_revision(
+        self, scope_type: str, scope_id: str
+    ) -> dict[str, int]:
+        row = self.db.query_one(
+            """
+            SELECT revision, reset_revision
+            FROM conversation_revisions
+            WHERE scope_type = ? AND scope_id = ?
+            """,
+            (str(scope_type), str(scope_id)),
+        )
+        return {
+            "revision": int(row["revision"]) if row else 0,
+            "reset_revision": int(row["reset_revision"]) if row else 0,
+        }
+
     def _messages_for_scope(self, scope_type: str, scope_id: str, limit: int = 100) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 300))
         rows = self.db.query(
@@ -2126,7 +2271,38 @@ class EnterpriseService:
             """,
             (scope_type, str(scope_id), limit),
         )
-        return [self._message_from_row(row) for row in reversed(rows)]
+        return self._messages_from_rows(reversed(rows))
+
+    def _messages_from_rows(
+        self, rows: Iterable[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        materialized = list(rows)
+        if not materialized:
+            return []
+        message_ids = [int(row["id"]) for row in materialized]
+        placeholders = ",".join("?" for _ in message_ids)
+        attachment_rows = self.db.query(
+            f"""
+            SELECT * FROM attachments
+            WHERE message_id IN ({placeholders})
+            ORDER BY message_id, id
+            """,
+            message_ids,
+        )
+        attachments: dict[int, list[dict[str, Any]]] = {
+            message_id: [] for message_id in message_ids
+        }
+        for row in attachment_rows:
+            attachments[int(row["message_id"])].append(
+                self._attachment_from_row(row)
+            )
+        return [
+            self._message_from_row(
+                row,
+                attachments=attachments[int(row["id"])],
+            )
+            for row in materialized
+        ]
 
     def latest_message_id(self, scope_type: str, scope_id: str) -> int:
         row = self.db.query_one(
@@ -2187,10 +2363,29 @@ class EnterpriseService:
                 return None
             time.sleep(min(TELEGRAM_DELIVERY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
-    def agent_status_for_system(self, scope_type: str, scope_id: str) -> dict[str, Any]:
+    def agent_status_for_system(
+        self,
+        scope_type: str,
+        scope_id: str,
+        *,
+        include_jobs: bool = False,
+    ) -> dict[str, Any]:
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
-            return self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            status = self._agent_status.get(key)
+            if status is None:
+                status = self._idle_agent_status(scope_type, str(scope_id))
+                # A read must not manufacture a new observable status version
+                # on every poll merely because this scope has never run.
+                status["updated_at"] = 0
+            result = self._copy_status(status)
+        if include_jobs:
+            result["jobs"] = self.jobs.counts(
+                kind="agent",
+                scope_type=scope_type,
+                scope_id=str(scope_id),
+            )
+        return result
 
     def telegram_enabled(self) -> bool:
         raw = self.get_setting(TELEGRAM_SETTING_ENABLED)
@@ -3385,7 +3580,7 @@ class EnterpriseService:
         )
         return {
             "channel": channel,
-            "messages": [self._message_from_row(row) for row in reversed(rows)],
+            "messages": self._messages_from_rows(reversed(rows)),
             "total": int(total or 0),
         }
 
@@ -3526,7 +3721,7 @@ class EnterpriseService:
         )
         return {
             "subject": self.public_user(subject),
-            "messages": [self._message_from_row(row) for row in reversed(rows)],
+            "messages": self._messages_from_rows(reversed(rows)),
             "total": int(total or 0),
         }
 
@@ -4449,10 +4644,35 @@ class EnterpriseService:
     # authenticated runtime tool may create or edit them.
     def list_private_schedules(self, actor: dict[str, Any]) -> dict[str, Any]:
         actor = self._schedule_actor(actor)
+        rows = self.schedules.list(int(actor["id"]))
+        schedule_ids = [int(row["id"]) for row in rows]
+        latest_by_schedule: dict[int, dict[str, Any]] = {}
+        if schedule_ids:
+            placeholders = ",".join("?" for _ in schedule_ids)
+            latest_rows = self.db.query(
+                f"""
+                SELECT r.*
+                FROM agent_schedule_runs r
+                JOIN (
+                    SELECT schedule_id, MAX(id) AS latest_id
+                    FROM agent_schedule_runs
+                    WHERE schedule_id IN ({placeholders})
+                    GROUP BY schedule_id
+                ) latest ON latest.latest_id = r.id
+                """,
+                schedule_ids,
+            )
+            latest_by_schedule = {
+                int(row["schedule_id"]): row for row in latest_rows
+            }
         return {
             "schedules": [
-                self._public_schedule(row)
-                for row in self.schedules.list(int(actor["id"]))
+                self._public_schedule(
+                    row,
+                    latest_run=latest_by_schedule.get(int(row["id"])),
+                    latest_run_loaded=True,
+                )
+                for row in rows
             ]
         }
 
@@ -4719,7 +4939,15 @@ class EnterpriseService:
             raise ServiceError(400, "schedule delivery must be chat or chat_and_telegram")
         return delivery
 
-    def _public_schedule(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _public_schedule(
+        self,
+        row: dict[str, Any],
+        *,
+        latest_run: dict[str, Any] | None = None,
+        latest_run_loaded: bool = False,
+    ) -> dict[str, Any]:
+        if not latest_run_loaded:
+            latest_run = self.schedules.latest_run(int(row["id"]))
         return {
             "id": int(row["id"]),
             "name": str(row["name"]),
@@ -4731,8 +4959,8 @@ class EnterpriseService:
             "enabled": bool(row.get("enabled")),
             "next_run_at": rfc3339_utc(row.get("next_run_at")),
             "last_run": (
-                self._public_schedule_run(latest)
-                if (latest := self.schedules.latest_run(int(row["id"]))) is not None
+                self._public_schedule_run(latest_run)
+                if latest_run is not None
                 else None
             ),
             "created_at": rfc3339_utc(row.get("created_at")),
@@ -5378,6 +5606,8 @@ class EnterpriseService:
         actor: dict[str, Any],
         scope_type: str,
         scope_id: str,
+        *,
+        since_revision: int | str | None = None,
     ) -> dict[str, Any]:
         """Return a bounded read-only terminal view for an authorized scope.
 
@@ -5387,6 +5617,11 @@ class EnterpriseService:
         """
 
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        if (
+            since_revision is not None
+            and not _valid_terminal_preview_revision(since_revision)
+        ):
+            raise ServiceError(400, "since_revision must be an opaque revision token")
         scope_key = (
             self.agent_scopes.private_scope_key(int(scope_id))
             if scope_type == "private"
@@ -5394,20 +5629,50 @@ class EnterpriseService:
         )
         scope = self.agent_scopes.get_scope(scope_key)
         if scope is None:
-            return {"processes": []}
+            return {"processes": [], "revision": 0}
         preview = getattr(self.agent_client, "terminal_previews", None)
         if not callable(preview):
-            return {"processes": []}
+            return {"processes": [], "revision": 0}
         try:
-            payload = preview(scope.scope_key, scope.lifecycle_id)
+            supports_revision = False
+            if since_revision is not None:
+                try:
+                    parameters = inspect.signature(preview).parameters
+                    supports_revision = "since_revision" in parameters or any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    supports_revision = False
+            payload = (
+                preview(
+                    scope.scope_key,
+                    scope.lifecycle_id,
+                    since_revision=since_revision,
+                )
+                if supports_revision
+                else preview(scope.scope_key, scope.lifecycle_id)
+            )
         except AgentRuntimeError:
             # Preview availability is not an execution trigger. A stopped or
             # rolling-upgrade runtime therefore appears as an empty read-only
             # view instead of being started by an observation request.
-            return {"processes": []}
+            return {"processes": [], "revision": 0}
         raw_processes = payload.get("processes") if isinstance(payload, dict) else None
         if not isinstance(raw_processes, list):
-            return {"processes": []}
+            return {"processes": [], "revision": 0}
+        has_revision = "revision" in payload
+        raw_revision = payload.get("revision")
+        if has_revision and not _valid_terminal_preview_revision(raw_revision):
+            return {"processes": [], "revision": 0}
+        if payload.get("unchanged") is True:
+            if raw_processes or not has_revision:
+                return {"processes": [], "revision": 0}
+            return {
+                "processes": [],
+                "revision": raw_revision,
+                "unchanged": True,
+            }
 
         processes: list[dict[str, Any]] = []
         for raw in raw_processes[:256]:
@@ -5424,15 +5689,20 @@ class EnterpriseService:
             process_id = _preview_text_head(raw.get("id"), 256)
             if not process_id:
                 continue
-            stdout = _preview_text_tail(raw.get("stdout"), 8 * 1024)
-            stderr = _preview_text_tail(raw.get("stderr"), 8 * 1024)
             output = _preview_text_tail(raw.get("output"), 16 * 1024)
             platform_output_truncated = (
-                len(_preview_plain_text(raw.get("stdout")).encode("utf-8")) > 8 * 1024
-                or len(_preview_plain_text(raw.get("stderr")).encode("utf-8")) > 8 * 1024
-                or len(_preview_plain_text(raw.get("output")).encode("utf-8")) > 16 * 1024
+                len(_preview_plain_text(raw.get("output")).encode("utf-8")) > 16 * 1024
             )
             if not output:
+                # Compatibility with runtimes from before the combined-output
+                # field became authoritative. Never expose the two streams as
+                # separate public fields.
+                stdout = _preview_text_tail(raw.get("stdout"), 8 * 1024)
+                stderr = _preview_text_tail(raw.get("stderr"), 8 * 1024)
+                platform_output_truncated = platform_output_truncated or (
+                    len(_preview_plain_text(raw.get("stdout")).encode("utf-8")) > 8 * 1024
+                    or len(_preview_plain_text(raw.get("stderr")).encode("utf-8")) > 8 * 1024
+                )
                 output = _preview_text_tail(
                     f"{stdout}\n[stderr]\n{stderr}" if stdout and stderr else stdout or stderr,
                     16 * 1024,
@@ -5445,8 +5715,6 @@ class EnterpriseService:
                     4 * 1024,
                 ),
                 "cwd": _preview_text_head(raw.get("cwd"), 2 * 1024),
-                "stdout": stdout,
-                "stderr": stderr,
                 "output": output,
                 "status": status,
                 "running": status == "running",
@@ -5466,7 +5734,10 @@ class EnterpriseService:
             processes.append(process)
             if len(processes) >= 16:
                 break
-        return {"processes": processes}
+        result: dict[str, Any] = {"processes": processes}
+        if has_revision:
+            result["revision"] = raw_revision
+        return result
 
     def agent_preview_status(
         self,
@@ -5520,7 +5791,18 @@ class EnterpriseService:
 
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        return self.runtimes.status(refresh=True)
+        cached = self.runtimes.cached_status()
+        cache_metadata = {
+            "status_checked_at": cached.get("checked_at"),
+            "status_stale": cached.get("stale") is True,
+        }
+        return {
+            name: {
+                **cached[name],
+                **cache_metadata,
+            }
+            for name in ("agent", "cognee", "camofox", "firecrawl")
+        }
 
     def agent_runtime_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -5528,9 +5810,14 @@ class EnterpriseService:
             config = self.runtimes.agent_runtime_config()
             config["model_catalog"] = self._oauth_model_catalogs()
             config["oauth"] = self.oauth_provider_status(actor)
+            cached = self.runtimes.cached_status()
             return {
                 "config": config,
-                "runtime": self.runtimes.agent_runtime_status(refresh=True).to_dict(),
+                "runtime": {
+                    **cached["agent"],
+                    "status_checked_at": cached.get("checked_at"),
+                    "status_stale": cached.get("stale") is True,
+                },
             }
 
     def update_agent_runtime_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -5601,6 +5888,8 @@ class EnterpriseService:
                 )
             if self.runtimes._managed_agent_runtime_enabled():
                 self.runtimes.restart_agent_runtime()
+            if updates:
+                self.runtimes.invalidate_status_cache()
             if self._uses_default_agent_client:
                 self.agent_client = self._new_agent_runtime_client()
             return self.agent_runtime_config(actor)
@@ -5642,30 +5931,46 @@ class EnterpriseService:
         require_admin(actor)
         clean = name.strip().lower()
         if clean == "agent":
-            return {"runtime": self.runtimes.restart_agent_runtime().to_dict()}
-        if clean == "camofox":
-            return {"runtime": self.runtimes.restart_camofox().to_dict()}
-        if clean == "firecrawl":
-            return {"runtime": self.runtimes.restart_firecrawl().to_dict()}
-        if clean == "cognee":
+            status = self.runtimes.restart_agent_runtime()
+        elif clean == "camofox":
+            status = self.runtimes.restart_camofox()
+        elif clean == "firecrawl":
+            status = self.runtimes.restart_firecrawl()
+        elif clean == "cognee":
             self.cognee.refresh_status()
-            return {"runtime": self.runtimes.ensure_cognee_ready().to_dict()}
-        raise ServiceError(404, "runtime not found")
+            status = self.runtimes.ensure_cognee_ready()
+        else:
+            raise ServiceError(404, "runtime not found")
+        self.runtimes.invalidate_status_cache()
+        return {"runtime": status.to_dict()}
 
     def install_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
         require_admin(actor)
         clean = name.strip().lower()
         if clean == "agent":
             install_status = self.runtimes.install_agent_runtime(force=True)
-            return {"runtime": install_status.to_dict(), "config": self.runtimes.agent_runtime_config()}
-        if clean == "camofox":
+            result = {
+                "runtime": install_status.to_dict(),
+                "config": self.runtimes.agent_runtime_config(),
+            }
+        elif clean == "camofox":
             installed = self.runtimes.install_camofox(force=True)
             if not installed.available:
-                return {"runtime": installed.to_dict()}
-            return {"runtime": self.runtimes.restart_camofox().to_dict()}
-        if clean == "firecrawl":
-            return {"runtime": self.runtimes.ensure_firecrawl_ready(wait=True).to_dict()}
-        raise ServiceError(404, "runtime not found")
+                result = {"runtime": installed.to_dict()}
+            else:
+                result = {
+                    "runtime": self.runtimes.restart_camofox().to_dict()
+                }
+        elif clean == "firecrawl":
+            result = {
+                "runtime": self.runtimes.ensure_firecrawl_ready(
+                    wait=True
+                ).to_dict()
+            }
+        else:
+            raise ServiceError(404, "runtime not found")
+        self.runtimes.invalidate_status_cache()
+        return result
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -7371,7 +7676,14 @@ class EnterpriseService:
                     return dict(cached["frame"])
 
             encoded_tab_id = urllib.parse.quote(selected_tab_id, safe="")
-            query = urllib.parse.urlencode({"userId": user_id, "fullPage": "false"})
+            query = urllib.parse.urlencode(
+                {
+                    "userId": user_id,
+                    "fullPage": "false",
+                    "format": "jpeg",
+                    "quality": "65",
+                }
+            )
             try:
                 # Validate immediately before and after capture.  Besides keeping
                 # metadata fresh, this preserves the browser URL policy even when a
@@ -7390,7 +7702,7 @@ class EnterpriseService:
                     headers=headers,
                     timeout=8,
                     max_bytes=8 * 1024 * 1024,
-                    allowed_content_types={"image/png"},
+                    allowed_content_types={"image/jpeg", "image/png"},
                 )
                 after = self._runtime_json_request(
                     f"{base_url}/tabs/{encoded_tab_id}/stats?"
@@ -7405,22 +7717,39 @@ class EnterpriseService:
             except ServiceError:
                 return cache_idle("browser_unavailable")
 
-            if (
-                mime_type != "image/png"
-                or len(image) < 24
-                or not image.startswith(b"\x89PNG\r\n\x1a\n")
-                or image[12:16] != b"IHDR"
-            ):
-                return cache_idle("browser_unavailable")
-            width = int.from_bytes(image[16:20], "big")
-            height = int.from_bytes(image[20:24], "big")
-            if (
-                width <= 0
-                or height <= 0
-                or width > MAX_BROWSER_PREVIEW_DIMENSION
-                or height > MAX_BROWSER_PREVIEW_DIMENSION
-                or width * height > MAX_BROWSER_PREVIEW_PIXELS
-            ):
+            width = 0
+            height = 0
+            if mime_type == "image/png":
+                if (
+                    len(image) < 24
+                    or not image.startswith(b"\x89PNG\r\n\x1a\n")
+                    or image[12:16] != b"IHDR"
+                ):
+                    return cache_idle("browser_unavailable")
+                width = int.from_bytes(image[16:20], "big")
+                height = int.from_bytes(image[20:24], "big")
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > MAX_BROWSER_PREVIEW_DIMENSION
+                    or height > MAX_BROWSER_PREVIEW_DIMENSION
+                    or width * height > MAX_BROWSER_PREVIEW_PIXELS
+                ):
+                    return cache_idle("browser_unavailable")
+            elif mime_type == "image/jpeg":
+                dimensions = _jpeg_dimensions(image)
+                if dimensions is None:
+                    return cache_idle("browser_unavailable")
+                width, height = dimensions
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > MAX_BROWSER_PREVIEW_DIMENSION
+                    or height > MAX_BROWSER_PREVIEW_DIMENSION
+                    or width * height > MAX_BROWSER_PREVIEW_PIXELS
+                ):
+                    return cache_idle("browser_unavailable")
+            else:
                 return cache_idle("browser_unavailable")
 
             captured_at = int(time.time() * 1000)
@@ -7452,7 +7781,7 @@ class EnterpriseService:
                 "status": "live",
                 "state": "live",
                 "image": image,
-                "mime_type": "image/png",
+                "mime_type": mime_type,
                 "etag": f'"{etag_digest.hexdigest()}"',
                 "captured_at": captured_at,
                 "tab_id": selected_tab_id,
@@ -9919,6 +10248,22 @@ class EnterpriseService:
         with self._conversation_lock:
             return self._typing_users_locked(key, exclude_user_id=int(actor["id"]))
 
+    def typing_users_for_system(
+        self,
+        scope_type: str,
+        scope_id: str,
+        *,
+        exclude_user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read already-authorized ephemeral typing state without database I/O."""
+
+        key = self._conversation_key(str(scope_type), str(scope_id))
+        with self._conversation_lock:
+            return self._typing_users_locked(
+                key,
+                exclude_user_id=exclude_user_id,
+            )
+
     def wait_for_agent_idle(self, scope_type: str, scope_id: str, timeout: float = 5) -> dict[str, Any]:
         key = self._conversation_key(scope_type, str(scope_id))
         deadline = time.time() + timeout
@@ -11025,6 +11370,16 @@ class EnterpriseService:
                 raise ServiceError(403, "private agent conversation is user scoped")
             return "private", scope_id
         raise ServiceError(400, "unsupported message scope")
+
+    def authorize_conversation(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> tuple[str, str]:
+        """Revalidate a live reader without materializing conversation data."""
+
+        return self._normalize_conversation(actor, scope_type, scope_id)
 
     @staticmethod
     def _conversation_key(scope_type: str, scope_id: str) -> str:
@@ -12366,7 +12721,12 @@ class EnterpriseService:
             cleaned = (cleaned + "\n\n" + "\n".join(notes)).strip()
         return cleaned, attachments
 
-    def _message_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _message_from_row(
+        self,
+        row: dict[str, Any],
+        *,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": int(row["id"]),
             "scope_type": row["scope_type"],
@@ -12376,7 +12736,11 @@ class EnterpriseService:
             "username": row["username"],
             "content": row["content"],
             "metadata": decode_json(row["metadata_json"]),
-            "attachments": self._attachments_for_message(int(row["id"])),
+            "attachments": (
+                attachments
+                if attachments is not None
+                else self._attachments_for_message(int(row["id"]))
+            ),
             "created_at": row["created_at"],
         }
 
@@ -12816,6 +13180,64 @@ def is_safe_inline_attachment_mime(mime_type: str) -> bool:
     return str(mime_type or "").split(";", 1)[0].strip().lower() in SAFE_INLINE_ATTACHMENT_MIME_TYPES
 
 
+def _jpeg_dimensions(image: bytes) -> tuple[int, int] | None:
+    """Read JPEG SOF dimensions without decoding potentially huge pixels."""
+
+    if (
+        len(image) < 12
+        or not image.startswith(b"\xff\xd8")
+        or not image.endswith(b"\xff\xd9")
+    ):
+        return None
+    # SOF markers that carry dimensions. DHT (C4), JPG (C8), DAC (CC), and
+    # restart/standalone markers are deliberately excluded.
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    offset = 2
+    dimensions: tuple[int, int] | None = None
+    while offset < len(image) - 2:
+        if image[offset] != 0xFF:
+            return None
+        while offset < len(image) and image[offset] == 0xFF:
+            offset += 1
+        if offset >= len(image):
+            return None
+        marker = image[offset]
+        offset += 1
+        if marker == 0xDA:  # Start of scan; dimensions precede entropy data.
+            return dimensions
+        if marker == 0xD9:
+            return None
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(image):
+            return None
+        segment_length = int.from_bytes(image[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(image):
+            return None
+        if marker in sof_markers:
+            if segment_length < 8:
+                return None
+            height = int.from_bytes(image[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(image[offset + 5 : offset + 7], "big")
+            dimensions = (width, height)
+        offset += segment_length
+    return None
+
+
 def safe_attachment_suffix(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if not suffix or len(suffix) > 24 or not re.fullmatch(r"\.[a-z0-9][a-z0-9._-]{0,22}", suffix):
@@ -13044,6 +13466,17 @@ def _preview_plain_text(value: Any) -> str:
     clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", clean)
     clean = re.sub(r"\x1b[@-_]", "", clean)
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", clean)
+
+
+def _valid_terminal_preview_revision(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= 9_007_199_254_740_991
+    return bool(
+        isinstance(value, str)
+        and TERMINAL_PREVIEW_REVISION_RE.fullmatch(value)
+    )
 
 
 def _preview_text_head(value: Any, max_bytes: int) -> str:

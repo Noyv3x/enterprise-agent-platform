@@ -27,6 +27,20 @@ def png_fixture(width: int = 960, height: int = 540, suffix: bytes = b"") -> byt
     )
 
 
+def jpeg_fixture(width: int = 960, height: int = 540) -> bytes:
+    # Minimal marker-complete single-component JPEG fixture. The service parses
+    # only SOF dimensions and structural boundaries; it never decodes pixels.
+    return (
+        b"\xff\xd8"
+        + b"\xff\xc0\x00\x0b\x08"
+        + int(height).to_bytes(2, "big")
+        + int(width).to_bytes(2, "big")
+        + b"\x01\x01\x11\x00"
+        + b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+        + b"\x00\xff\xd9"
+    )
+
+
 class BrowserPreviewServiceTests(unittest.TestCase):
     def _service(self, root: Path) -> EnterpriseService:
         return EnterpriseService(make_config(root), agent_client=RecordingAgent())
@@ -227,6 +241,91 @@ class BrowserPreviewServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_preview_requests_low_quality_jpeg_and_preserves_media_type(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                service._runtime_json_request = lambda *_args, **_kwargs: {
+                    "url": "https://example.test/page",
+                    "title": "Page",
+                }
+                binary = mock.Mock(
+                    return_value=(jpeg_fixture(), "image/jpeg")
+                )
+                service._runtime_binary_request = binary
+                service._validate_browser_page_url = lambda _value: None
+
+                preview = service._capture_browser_preview_frame(
+                    root_scope_key="private:1",
+                    selected_scope_key="private:1",
+                    selected_tab_id="tab-1",
+                    selected_tab={"title": "Page"},
+                    tab_count=1,
+                    user_id="agent-test",
+                    base_url="http://127.0.0.1:9377",
+                    headers={"Authorization": "Bearer test"},
+                )
+
+                self.assertTrue(preview["active"])
+                self.assertEqual(preview["mime_type"], "image/jpeg")
+                self.assertEqual((preview["width"], preview["height"]), (960, 540))
+                screenshot_url = binary.call_args.args[0]
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(screenshot_url).query
+                )
+                self.assertEqual(query["format"], ["jpeg"])
+                self.assertEqual(query["quality"], ["65"])
+                self.assertEqual(
+                    binary.call_args.kwargs["allowed_content_types"],
+                    {"image/jpeg", "image/png"},
+                )
+            finally:
+                service.close()
+
+    def test_malformed_or_excessive_jpeg_is_rejected_before_browser_decode(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                service._runtime_json_request = lambda *_args, **_kwargs: {
+                    "url": "https://example.test/page",
+                    "title": "Page",
+                }
+                service._validate_browser_page_url = lambda _value: None
+                arguments = {
+                    "root_scope_key": "private:1",
+                    "selected_scope_key": "private:1",
+                    "selected_tab_id": "tab-1",
+                    "selected_tab": {"title": "Page"},
+                    "tab_count": 1,
+                    "user_id": "agent-test",
+                    "base_url": "http://127.0.0.1:9377",
+                    "headers": {"Authorization": "Bearer test"},
+                }
+                for image in (
+                    b"\xff\xd8jpeg-preview",
+                    jpeg_fixture(20_000, 20_000),
+                ):
+                    with self.subTest(size=len(image)):
+                        service._runtime_binary_request = (
+                            lambda *_args, image=image, **_kwargs: (
+                                image,
+                                "image/jpeg",
+                            )
+                        )
+                        with service._agent_browser_tabs_lock:
+                            service._browser_preview_cache.clear()
+                            service._browser_preview_cache_bytes = 0
+                        preview = service._capture_browser_preview_frame(
+                            **arguments
+                        )
+                        self.assertFalse(preview["active"])
+                        self.assertEqual(
+                            preview["reason"],
+                            "browser_unavailable",
+                        )
+            finally:
+                service.close()
+
     def test_capture_failure_is_shortly_negative_cached_for_other_observers(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
@@ -378,6 +477,43 @@ class BrowserPreviewHTTPTests(unittest.TestCase):
                 self.assertEqual(not_modified.getheader("ETag"), etag)
                 self.assertEqual(not_modified.getheader("Cross-Origin-Resource-Policy"), "same-origin")
                 self.assertEqual(not_modified.getheader("Vary"), "Cookie, Authorization")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_binary_frame_preserves_jpeg_content_type(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            image = b"\xff\xd8jpeg-preview"
+            service.browser_preview = mock.Mock(
+                return_value={
+                    "active": True,
+                    "image": image,
+                    "mime_type": "image/jpeg",
+                    "etag": '"jpeg-preview"',
+                    "refresh_interval_ms": 2000,
+                }
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                token, actor = service.authenticate("admin", "admin")
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET",
+                    (
+                        "/api/agent-previews/browser?scope_type=private&scope_id="
+                        + str(actor["id"])
+                    ),
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.read(), image)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "image/jpeg")
             finally:
                 server.shutdown()
                 server.server_close()

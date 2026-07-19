@@ -7,6 +7,7 @@ import { navigateToView } from "../../data/chatActions";
 import { useStoreHandle } from "../../store/useStore";
 import type { ActiveView, IconName } from "../../types";
 import { Icon } from "../common/Icon";
+import { preloadRoute } from "./routePreload";
 
 export interface NavItemProps {
   view: ActiveView;
@@ -23,6 +24,9 @@ export function NavItem({ view, label, icon, active }: NavItemProps) {
       className={cx("nav__item", active && "is-active")}
       aria-current={active ? "page" : undefined}
       onClick={() => void navigateToView(store, view)}
+      onPointerEnter={() => preloadRoute(view)}
+      onFocus={() => preloadRoute(view)}
+      onTouchStart={() => preloadRoute(view)}
     >
       <Icon name={icon} />
       <span className="nav__label">{label}</span>

@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiRequestCancelledError, resetApiSession } from "../lib/api";
 import { createStore } from "../lib/store";
 import { initialAppState, rootReducer } from "../store/reducer";
-import { loadMentionTargets } from "./loaders";
+import type { User } from "../types";
+import {
+  clearRuntimeStatusRefresh,
+  loadMentionTargets,
+  loadRuntime,
+} from "./loaders";
 
 function response(status: number, body: unknown) {
   return {
@@ -13,6 +18,7 @@ function response(status: number, body: unknown) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   resetApiSession();
   vi.unstubAllGlobals();
 });
@@ -58,5 +64,39 @@ describe("loadMentionTargets", () => {
 
     await expect(loadMentionTargets(store)).resolves.toBeUndefined();
     expect(store.getState().mentionTargets).toEqual([]);
+  });
+});
+
+describe("loadRuntime", () => {
+  it("publishes the cached snapshot immediately and refreshes stale health in the background", async () => {
+    vi.useFakeTimers();
+    const rows = (stale: boolean, state: string) => ({
+      agent: { name: "agent", state, status_stale: stale },
+      cognee: { name: "cognee", state, status_stale: stale },
+      camofox: { name: "camofox", state, status_stale: stale },
+      firecrawl: { name: "firecrawl", state, status_stale: stale },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(200, rows(true, "starting")))
+      .mockResolvedValueOnce(response(200, rows(false, "running")));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user: {
+        id: 7,
+        username: "admin",
+        permissions: ["admin"],
+      } as User,
+    });
+
+    await loadRuntime(store);
+    expect(store.getState().runtimes?.agent?.state).toBe("starting");
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(store.getState().runtimes?.agent?.state).toBe("running");
+
+    clearRuntimeStatusRefresh(store);
+    vi.useRealTimers();
   });
 });

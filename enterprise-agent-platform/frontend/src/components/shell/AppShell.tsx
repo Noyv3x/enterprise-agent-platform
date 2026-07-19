@@ -12,9 +12,9 @@
      .menu-btn that opened it (legacy openSidebar/closeSidebar, :423-437).
    - Escape closes the drawer while open (legacy global listener, :3488-3493).
 
-   The SSE stream + 4s poll are shell-owned (legacy syncScopeStream/startPolling
-   ran globally from afterRender/boot, not per chat view), so useRealtime +
-   usePolling mount here and track the active scope.
+   The SSE stream + safety poll are shell-owned (legacy
+   syncScopeStream/startPolling ran globally from afterRender/boot, not per chat
+   view), so useRealtime + usePolling mount here and track the active scope.
 
    A11y improvement (deviation from strict legacy parity): the <main> column is
    marked inert + aria-hidden while the mobile drawer is open, giving a real focus
@@ -41,10 +41,12 @@ export function AppShell() {
   const userTimezone = useStore((state) => state.user?.timezone);
   const isMobile = useMediaQuery("(max-width: 800px)");
 
-  // Poll only while SSE is unavailable or reconnecting. A newly opened stream
-  // suppresses redundant full-message polling; any error re-enables it.
+  // A connected stream uses cheap revision events for normal delivery. Keep a
+  // low-frequency watchdog as well: if the one GET triggered by an SSE event
+  // crosses a transient tunnel failure, the unchanged stream has no reason to
+  // emit that same event again.
   const realtimeConnected = useRealtime();
-  usePolling(!realtimeConnected);
+  usePolling(realtimeConnected ? 30_000 : 4_000);
 
   useEffect(() => {
     if (userId == null) return;

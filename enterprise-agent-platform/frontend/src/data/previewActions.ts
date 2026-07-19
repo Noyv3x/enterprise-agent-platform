@@ -51,6 +51,7 @@ export type BrowserPreviewResult = BrowserPreviewFrame | BrowserPreviewIdle | Pr
 export interface TerminalPreviewResult {
   kind: "snapshot" | "unchanged";
   etag?: string;
+  revision?: number | string;
   processes?: TerminalPreviewProcess[];
   capturedAt?: string;
 }
@@ -171,7 +172,9 @@ export async function fetchBrowserPreview(
     }
     return { kind: "idle", etag: responseEtag, status };
   }
-  if (contentType !== "image/png") throw new Error(t("preview.loadFailed"));
+  if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+    throw new Error(t("preview.loadFailed"));
+  }
   assertBoundedResponse(response, MAX_BROWSER_FRAME_BYTES, t("preview.frameTooLarge"));
   const blob = await response.blob();
   if (blob.size > MAX_BROWSER_FRAME_BYTES) throw new Error(t("preview.frameTooLarge"));
@@ -203,15 +206,9 @@ function normalizeProcess(value: unknown, index: number): TerminalPreviewProcess
     title: string("title") || string("name") || `Terminal ${index + 1}`,
     command: string("command"),
     cwd: string("cwd"),
-    content: string("content"),
     output: string("output"),
-    screen: string("screen"),
-    stdout: string("stdout"),
-    stderr: string("stderr"),
     status: string("status"),
     running: boolean("running"),
-    rows: number("rows"),
-    columns: number("columns"),
     updated_at: (string("updated_at") ?? number("updated_at")),
     started_at: (string("started_at") ?? number("started_at")),
     finished_at: (string("finished_at") ?? number("finished_at")),
@@ -220,13 +217,32 @@ function normalizeProcess(value: unknown, index: number): TerminalPreviewProcess
   };
 }
 
+function previewRevision(value: unknown): number | string | undefined {
+  if (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return value;
+  }
+  return typeof value === "string" &&
+    /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/.test(value)
+    ? value
+    : undefined;
+}
+
 export async function fetchTerminalPreviews(
   scope: AgentPreviewScope,
   etag: string,
+  sinceRevision: number | string | undefined,
   signal: AbortSignal,
 ): Promise<TerminalPreviewResult> {
   const response = await fetch(
-    endpoints.terminalPreviews.path(scope.scope_type, scope.scope_id),
+    endpoints.terminalPreviews.path(
+      scope.scope_type,
+      scope.scope_id,
+      sinceRevision,
+    ),
     {
       method: "GET",
       credentials: "include",
@@ -242,9 +258,26 @@ export async function fetchTerminalPreviews(
   if (new Blob([text]).size > MAX_TERMINAL_SNAPSHOT_BYTES) throw new Error(t("preview.loadFailed"));
   const body = (text ? JSON.parse(text) : {}) as Record<string, unknown>;
   const values = Array.isArray(body.processes) ? body.processes : [];
+  const revision = previewRevision(body.revision);
+  if (body.revision !== undefined && revision === undefined) {
+    throw new Error(t("preview.loadFailed"));
+  }
+  if (body.unchanged !== undefined && body.unchanged !== true) {
+    throw new Error(t("preview.loadFailed"));
+  }
+  const responseEtag = response.headers.get("etag") || "";
+  if (body.unchanged === true) {
+    if (values.length > 0) throw new Error(t("preview.loadFailed"));
+    return {
+      kind: "unchanged",
+      etag: responseEtag,
+      revision,
+    };
+  }
   return {
     kind: "snapshot",
-    etag: response.headers.get("etag") || (typeof body.revision === "string" ? body.revision : ""),
+    etag: responseEtag,
+    revision,
     processes: values.map(normalizeProcess).filter((item): item is TerminalPreviewProcess => item !== null),
     capturedAt:
       header(response, "x-preview-captured-at") ||

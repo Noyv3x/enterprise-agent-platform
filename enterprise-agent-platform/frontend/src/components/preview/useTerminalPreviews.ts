@@ -12,6 +12,7 @@ export interface TerminalPreviewsState {
   error: string;
   capturedAt: string;
   checkedAt: number | null;
+  revision: number | string | null;
 }
 
 const initialState: TerminalPreviewsState = {
@@ -21,6 +22,7 @@ const initialState: TerminalPreviewsState = {
   error: "",
   capturedAt: "",
   checkedAt: null,
+  revision: null,
 };
 
 function abortError(error: unknown): boolean {
@@ -41,6 +43,7 @@ export function useTerminalPreviews(scope: AgentPreviewScope | null) {
     let stopped = false;
     let inFlight = false;
     let etag = "";
+    let revision: number | string | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let controller: AbortController | null = null;
 
@@ -57,19 +60,29 @@ export function useTerminalPreviews(scope: AgentPreviewScope | null) {
       inFlight = true;
       controller = new AbortController();
       try {
-        const result = await fetchTerminalPreviews(scope, etag, controller.signal);
+        const result = await fetchTerminalPreviews(
+          scope,
+          etag,
+          revision,
+          controller.signal,
+        );
         if (stopped) return;
         const checkedAt = Date.now();
+        if (result.etag) etag = result.etag;
         if (result.kind === "unchanged") {
+          if (result.revision !== undefined) revision = result.revision;
           setState((current) => ({
             ...current,
             connection: "connected",
             loading: false,
             error: "",
             checkedAt,
+            revision: revision ?? current.revision,
           }));
         } else {
-          if (result.etag) etag = result.etag;
+          // A legacy platform returns a full snapshot without revision.
+          // Clearing the cursor keeps subsequent polls on its ETag-only path.
+          revision = result.revision;
           setState({
             connection: "connected",
             loading: false,
@@ -77,6 +90,7 @@ export function useTerminalPreviews(scope: AgentPreviewScope | null) {
             error: "",
             capturedAt: result.capturedAt || "",
             checkedAt,
+            revision: result.revision ?? null,
           });
         }
       } catch (error) {
