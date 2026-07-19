@@ -15,12 +15,22 @@ dependencies = []
 [project.scripts]
 enterprise-agent-platform = "enterprise_agent_platform.__main__:main"
 
-[tool.setuptools]
-packages = ["enterprise_agent_platform"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["enterprise_agent_platform*"]
+namespaces = true
 
 [tool.setuptools.package-data]
 enterprise_agent_platform = [
   "static/*",
+  "bundled_skills/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+enterprise_agent_platform = [
+  "bundled_skills/**/__pycache__/*",
+  "bundled_skills/**/*.pyc",
+  "bundled_skills/**/*.pyo",
 ]
 
 # The managed Node.js runtime is installed outside site-packages so npm can

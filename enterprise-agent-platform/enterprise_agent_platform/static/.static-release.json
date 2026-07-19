@@ -1,18 +1,19 @@
 {
   "version": 1,
   "current_assets": [
-    "app-DtfF35ts.js",
-    "chunk-MarkdownContent-RpdKtO9f.js",
-    "chunk-MemoryPanel-CtBiCyH0.js",
-    "chunk-ScheduledTasksPanel-CJdOg7Rd.js",
-    "chunk-SkillsPanel-tkyxGp8Q.js",
-    "styles-DXXN12RP.css"
+    "app-mfPuI0Kb.js",
+    "chunk-MarkdownContent-BZr45yNH.js",
+    "chunk-MemoryPanel-CWyFg7OU.js",
+    "chunk-ScheduledTasksPanel-C87HlAi5.js",
+    "chunk-SkillsPanel-C5h7pO35.js",
+    "styles-_cOfGGbb.css"
   ],
   "previous_assets": [
-    "app-DlMfrUIu.js",
-    "chunk-MarkdownContent-D_q5zKgq.js",
-    "chunk-MemoryPanel-DwSrW74T.js",
-    "chunk-ScheduledTasksPanel-CrjtWF_1.js",
-    "styles-BlvhRxvq.css"
+    "app-Cbiud1C1.js",
+    "chunk-MarkdownContent-CnDgv7Zt.js",
+    "chunk-MemoryPanel-CkZW-Ixr.js",
+    "chunk-ScheduledTasksPanel-GNjLvzFY.js",
+    "chunk-SkillsPanel-D6Jaczhs.js",
+    "styles-DTdjuNyp.css"
   ]
 }

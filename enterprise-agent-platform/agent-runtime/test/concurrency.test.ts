@@ -169,7 +169,7 @@ test("a delegated child that needs review forces the parent to needs_review", as
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "child side effect" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch child-marker" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch child-marker && stat child-marker" }), { stopReason: "toolUse" }),
     async () => { throw new Error("child provider failed"); },
     fauxAssistantMessage("parent tried to recover"),
   ]);

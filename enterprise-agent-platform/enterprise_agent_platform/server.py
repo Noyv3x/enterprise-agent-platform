@@ -531,7 +531,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     scope_type=first(query, "scope_type", ""),
                     scope_id=first(query, "scope_id", ""),
                     query=first(query, "q", ""),
-                    limit=int_arg(query, "limit", 100),
+                    limit=int_arg(query, "limit", 200),
                 )
             )
             return

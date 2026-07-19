@@ -10,7 +10,7 @@ import type {
   Id,
 } from "../types";
 
-const DEFAULT_SKILL_LIMIT = 100;
+const DEFAULT_SKILL_LIMIT = 200;
 
 export function loadAgentSkills(
   scope: AgentPreviewScope,

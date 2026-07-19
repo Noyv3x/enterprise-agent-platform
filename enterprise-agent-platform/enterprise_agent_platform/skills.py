@@ -19,6 +19,7 @@ from .secure_fs import ensure_private_directory
 
 
 MAX_SKILLS_PER_SCOPE = 100
+MAX_SKILL_LIST_RESULTS = MAX_SKILLS_PER_SCOPE * 2
 MAX_NAME_CHARS = 64
 MAX_DESCRIPTION_CHARS = 1024
 MAX_INSTRUCTIONS_BYTES = 64 * 1024
@@ -31,6 +32,16 @@ PROMPT_DESCRIPTION_CHARS = 240
 MAX_SKILL_QUERY_CHARS = 4000
 
 SUPPORT_DIRECTORIES = frozenset({"references", "templates", "scripts", "assets"})
+BUNDLED_METADATA_FILES = frozenset(
+    {
+        "ATTRIBUTION.md",
+        "LICENSE",
+        "LICENSE.md",
+        "NOTICE",
+        "NOTICE.md",
+    }
+)
+DEFAULT_BUNDLED_SKILLS_DIR = Path(__file__).with_name("bundled_skills")
 _SKILL_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _SCOPE_CREATE_ORPHAN_RE = re.compile(
     r"^\.create-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-[0-9a-f]{12}$"
@@ -67,15 +78,25 @@ SkillError = SkillStoreError
 
 
 class SkillStore:
-    """Filesystem-backed, per-Agent Skill packages.
+    """Filesystem-backed, per-Agent Skill packages with bundled defaults.
 
     Scope keys never appear in filesystem paths. Each key is mapped to a
     SHA-256 directory below ``<data_dir>/agent-skills``. The package's
     ``SKILL.md`` is portable; the private ``.skill.json`` sidecar contains only
     platform lifecycle state.
+
+    Repository-owned packages below ``bundled_skills`` are a global, read-only
+    layer. They are visible in every scope without copying release files into
+    mutable platform data. A user Skill with the same id or case-insensitive
+    name shadows the bundled package, so upgrades never overwrite user work.
     """
 
-    def __init__(self, data_dir: Path | str):
+    def __init__(
+        self,
+        data_dir: Path | str,
+        *,
+        bundled_skills_dir: Path | str | None = DEFAULT_BUNDLED_SKILLS_DIR,
+    ):
         requested_data_dir = Path(data_dir).expanduser()
         try:
             ensured_data_dir = ensure_private_directory(requested_data_dir)
@@ -91,6 +112,11 @@ class SkillStore:
             ) from exc
         self._scope_locks_guard = threading.Lock()
         self._scope_thread_locks: dict[str, threading.RLock] = {}
+        self._bundled_root: Path | None = None
+        self._bundled_records: dict[str, dict[str, Any]] = {}
+        self._bundled_skill_dirs: dict[str, Path] = {}
+        if bundled_skills_dir is not None:
+            self._load_bundled_catalog(Path(bundled_skills_dir).expanduser())
 
     def list(
         self,
@@ -98,7 +124,7 @@ class SkillStore:
         *,
         query: str | None = None,
         category: str | None = None,
-        limit: int = MAX_SKILLS_PER_SCOPE,
+        limit: int = MAX_SKILL_LIST_RESULTS,
     ) -> list[dict[str, Any]]:
         """Return metadata for every Skill, including disabled Skills."""
 
@@ -140,18 +166,32 @@ class SkillStore:
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= MAX_SKILLS_PER_SCOPE
+            or not 1 <= limit <= MAX_SKILL_LIST_RESULTS
         ):
             raise SkillStoreError(
                 400,
-                f"limit must be between 1 and {MAX_SKILLS_PER_SCOPE}",
+                f"limit must be between 1 and {MAX_SKILL_LIST_RESULTS}",
                 code="invalid_skill_limit",
             )
         with self._locked_scope(scope_key) as scope_dir:
-            records = [
+            user_records = [
                 self._read_record(skill_dir, include_instructions=False)
                 for skill_dir in self._iter_skill_dirs(scope_dir)
             ]
+        shadowed_ids = {str(record["id"]) for record in user_records}
+        shadowed_names = {
+            str(record["name"]).casefold()
+            for record in user_records
+        }
+        records = [
+            *user_records,
+            *(
+                _copy_skill_record(record)
+                for skill_id, record in self._bundled_records.items()
+                if skill_id not in shadowed_ids
+                and str(record["name"]).casefold() not in shadowed_names
+            ),
+        ]
         if category_filter is not None:
             records = [
                 record
@@ -169,6 +209,7 @@ class SkillStore:
                         str(record["name"]),
                         str(record["description"]),
                         str(record["category"]),
+                        str(record["source"]),
                         *(str(tag) for tag in record["tags"]),
                     )
                 ).casefold()
@@ -185,16 +226,38 @@ class SkillStore:
     def get(self, scope_key: str, skill_id: str) -> dict[str, Any]:
         """Return Skill metadata without loading its instructions."""
 
+        normalized_id = _validate_skill_id(skill_id)
         with self._locked_scope(scope_key) as scope_dir:
-            skill_dir = self._require_skill_dir(scope_dir, skill_id)
-            return self._read_record(skill_dir, include_instructions=False)
+            skill_dir = self._find_skill_dir(scope_dir, normalized_id)
+            if skill_dir is not None:
+                return self._read_record(skill_dir, include_instructions=False)
+            bundled = self._visible_bundled_record(scope_dir, normalized_id)
+            if bundled is not None:
+                return _copy_skill_record(bundled)
+        raise SkillStoreError(
+            404,
+            f"Skill not found: {normalized_id}",
+            code="skill_not_found",
+        )
 
     def load(self, scope_key: str, skill_id: str) -> dict[str, Any]:
         """Load a complete Skill and the absolute directory for its resources."""
 
+        normalized_id = _validate_skill_id(skill_id)
         with self._locked_scope(scope_key) as scope_dir:
-            skill_dir = self._require_skill_dir(scope_dir, skill_id)
-            return self._read_record(skill_dir, include_instructions=True)
+            skill_dir = self._find_skill_dir(scope_dir, normalized_id)
+            if skill_dir is not None:
+                return self._read_record(skill_dir, include_instructions=True)
+            if self._visible_bundled_record(scope_dir, normalized_id) is not None:
+                return self._read_bundled_record(
+                    self._bundled_skill_dirs[normalized_id],
+                    include_instructions=True,
+                )
+        raise SkillStoreError(
+            404,
+            f"Skill not found: {normalized_id}",
+            code="skill_not_found",
+        )
 
     def create(
         self,
@@ -406,21 +469,47 @@ class SkillStore:
         """Read one UTF-8 supporting file from an allowed package directory."""
 
         relative = _validate_support_path(file_path)
+        normalized_id = _validate_skill_id(skill_id)
         with self._locked_scope(scope_key) as scope_dir:
-            skill_dir = self._require_skill_dir(scope_dir, skill_id)
-            self._read_record(skill_dir, include_instructions=False)
-            target = self._support_target(skill_dir, relative, must_exist=True)
-            content, size_bytes = _read_private_text(
-                target,
-                max_bytes=MAX_SUPPORT_FILE_BYTES,
-                missing_status=404,
-                label="supporting file",
-            )
-            return {
-                "path": relative,
-                "content": content,
-                "size_bytes": size_bytes,
-            }
+            skill_dir = self._find_skill_dir(scope_dir, normalized_id)
+            if skill_dir is not None:
+                self._read_record(skill_dir, include_instructions=False)
+                target = self._support_target(
+                    skill_dir,
+                    relative,
+                    must_exist=True,
+                )
+                content, size_bytes = _read_private_text(
+                    target,
+                    max_bytes=MAX_SUPPORT_FILE_BYTES,
+                    missing_status=404,
+                    label="supporting file",
+                )
+                return {
+                    "path": relative,
+                    "content": content,
+                    "size_bytes": size_bytes,
+                }
+            if self._visible_bundled_record(scope_dir, normalized_id) is not None:
+                skill_dir = self._bundled_skill_dirs[normalized_id]
+                self._read_bundled_record(skill_dir, include_instructions=False)
+                target = self._support_target(skill_dir, relative, must_exist=True)
+                content, size_bytes = _read_private_text(
+                    target,
+                    max_bytes=MAX_SUPPORT_FILE_BYTES,
+                    missing_status=404,
+                    label="supporting file",
+                )
+                return {
+                    "path": relative,
+                    "content": content,
+                    "size_bytes": size_bytes,
+                }
+        raise SkillStoreError(
+            404,
+            f"Skill not found: {normalized_id}",
+            code="skill_not_found",
+        )
 
     def write_support(
         self,
@@ -927,17 +1016,12 @@ class SkillStore:
                 )
             yield entry
 
-    def _require_skill_dir(self, scope_dir: Path, skill_id: str) -> Path:
-        normalized_id = _validate_skill_id(skill_id)
-        candidate = scope_dir / normalized_id
+    def _find_skill_dir(self, scope_dir: Path, skill_id: str) -> Path | None:
+        candidate = scope_dir / skill_id
         try:
             info = candidate.lstat()
-        except FileNotFoundError as exc:
-            raise SkillStoreError(
-                404,
-                f"Skill not found: {normalized_id}",
-                code="skill_not_found",
-            ) from exc
+        except FileNotFoundError:
+            return None
         except OSError as exc:
             raise SkillStoreError(
                 500,
@@ -967,6 +1051,41 @@ class SkillStore:
             )
         return candidate
 
+    def _require_skill_dir(self, scope_dir: Path, skill_id: str) -> Path:
+        normalized_id = _validate_skill_id(skill_id)
+        candidate = self._find_skill_dir(scope_dir, normalized_id)
+        if candidate is None:
+            if self._visible_bundled_record(scope_dir, normalized_id) is not None:
+                raise SkillStoreError(
+                    403,
+                    "bundled Skills are read-only; create a user Skill to customize it",
+                    code="bundled_skill_read_only",
+                )
+            raise SkillStoreError(
+                404,
+                f"Skill not found: {normalized_id}",
+                code="skill_not_found",
+            )
+        return candidate
+
+    def _visible_bundled_record(
+        self,
+        scope_dir: Path,
+        skill_id: str,
+    ) -> dict[str, Any] | None:
+        bundled = self._bundled_records.get(skill_id)
+        if bundled is None:
+            return None
+        bundled_name = str(bundled["name"]).casefold()
+        for skill_dir in self._iter_skill_dirs(scope_dir):
+            record = self._read_record(skill_dir, include_instructions=False)
+            if (
+                str(record["id"]) == skill_id
+                or str(record["name"]).casefold() == bundled_name
+            ):
+                return None
+        return bundled
+
     def _read_record(
         self,
         skill_dir: Path,
@@ -987,11 +1106,188 @@ class SkillStore:
             "linked_files": [path for path, _ in linked],
             "created_at": sidecar["created_at"],
             "updated_at": sidecar["updated_at"],
+            "source": "user",
+            "read_only": False,
         }
         if include_instructions:
             record["instructions"] = document["instructions"]
             record["skill_dir"] = str(skill_dir.resolve(strict=True))
         return record
+
+    def _load_bundled_catalog(self, requested_root: Path) -> None:
+        try:
+            info = requested_root.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot inspect bundled Skill storage: {exc}",
+                code="bundled_skill_invalid",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SkillStoreError(
+                500,
+                "bundled Skill storage must be a non-symlink directory",
+                code="bundled_skill_invalid",
+            )
+        try:
+            root = requested_root.resolve(strict=True)
+            entries = sorted(root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot list bundled Skills: {exc}",
+                code="bundled_skill_invalid",
+            ) from exc
+
+        self._bundled_root = root
+        names: set[str] = set()
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if not _SKILL_ID_RE.fullmatch(entry.name):
+                raise SkillStoreError(
+                    500,
+                    f"invalid bundled Skill id: {entry.name}",
+                    code="bundled_skill_invalid",
+                )
+            try:
+                entry_info = entry.lstat()
+                resolved = entry.resolve(strict=True)
+            except OSError as exc:
+                raise SkillStoreError(
+                    500,
+                    f"cannot inspect bundled Skill {entry.name}: {exc}",
+                    code="bundled_skill_invalid",
+                ) from exc
+            if (
+                stat.S_ISLNK(entry_info.st_mode)
+                or not stat.S_ISDIR(entry_info.st_mode)
+                or resolved.parent != root
+            ):
+                raise SkillStoreError(
+                    500,
+                    f"bundled Skill package is unsafe: {entry.name}",
+                    code="bundled_skill_invalid",
+                )
+            record = self._read_bundled_record(
+                entry,
+                include_instructions=False,
+            )
+            folded_name = str(record["name"]).casefold()
+            if folded_name in names:
+                raise SkillStoreError(
+                    500,
+                    f"duplicate bundled Skill name: {record['name']}",
+                    code="bundled_skill_invalid",
+                )
+            names.add(folded_name)
+            self._bundled_records[entry.name] = record
+            self._bundled_skill_dirs[entry.name] = entry
+            if len(self._bundled_records) > MAX_SKILLS_PER_SCOPE:
+                raise SkillStoreError(
+                    500,
+                    (
+                        "the bundled Skill catalog may contain at most "
+                        f"{MAX_SKILLS_PER_SCOPE} packages"
+                    ),
+                    code="bundled_skill_invalid",
+                )
+
+    def _read_bundled_record(
+        self,
+        skill_dir: Path,
+        *,
+        include_instructions: bool,
+    ) -> dict[str, Any]:
+        self._validate_bundled_package_root(skill_dir)
+        document = self._read_document(skill_dir)
+        linked = self._scan_linked_files(
+            skill_dir,
+            allowed_root_entries={
+                "SKILL.md",
+                *BUNDLED_METADATA_FILES,
+                *SUPPORT_DIRECTORIES,
+            },
+            ignore_generated_python_cache=True,
+        )
+        record: dict[str, Any] = {
+            "id": skill_dir.name,
+            "name": document["name"],
+            "description": document["description"],
+            "category": document["category"],
+            "version": document["version"],
+            "tags": list(document["tags"]),
+            "enabled": True,
+            "linked_files": [path for path, _ in linked],
+            "created_at": None,
+            "updated_at": None,
+            "source": "bundled",
+            "read_only": True,
+        }
+        if include_instructions:
+            record["instructions"] = document["instructions"]
+            record["skill_dir"] = str(skill_dir.resolve(strict=True))
+        return record
+
+    def _validate_bundled_package_root(self, skill_dir: Path) -> None:
+        try:
+            info = skill_dir.lstat()
+            resolved = skill_dir.resolve(strict=True)
+            entries = list(skill_dir.iterdir())
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot inspect bundled Skill package: {exc}",
+                code="bundled_skill_invalid",
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or self._bundled_root is None
+            or resolved.parent != self._bundled_root
+        ):
+            raise SkillStoreError(
+                500,
+                f"bundled Skill package is unsafe: {skill_dir.name}",
+                code="bundled_skill_invalid",
+            )
+        allowed = {
+            "SKILL.md",
+            *BUNDLED_METADATA_FILES,
+            *SUPPORT_DIRECTORIES,
+        }
+        unexpected = sorted(
+            entry.name for entry in entries if entry.name not in allowed
+        )
+        if unexpected:
+            raise SkillStoreError(
+                500,
+                (
+                    f"unexpected file in bundled Skill package {skill_dir.name}: "
+                    f"{unexpected[0]}"
+                ),
+                code="bundled_skill_invalid",
+            )
+        for metadata_name in BUNDLED_METADATA_FILES:
+            metadata_path = skill_dir / metadata_name
+            try:
+                metadata_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise SkillStoreError(
+                    500,
+                    f"cannot inspect bundled Skill metadata {metadata_name}: {exc}",
+                    code="bundled_skill_invalid",
+                ) from exc
+            _inspect_private_file_size(
+                metadata_path,
+                max_bytes=MAX_SUPPORT_FILE_BYTES,
+                missing_status=500,
+                label=f"bundled Skill metadata {metadata_name}",
+            )
 
     def _read_document(self, skill_dir: Path) -> dict[str, Any]:
         text, _ = _read_private_text(
@@ -1066,10 +1362,20 @@ class SkillStore:
                 )
         return value
 
-    def _scan_linked_files(self, skill_dir: Path) -> list[tuple[str, int]]:
+    def _scan_linked_files(
+        self,
+        skill_dir: Path,
+        *,
+        allowed_root_entries: set[str] | None = None,
+        ignore_generated_python_cache: bool = False,
+    ) -> list[tuple[str, int]]:
         linked: list[tuple[str, int]] = []
         total_bytes = 0
-        allowed_root_entries = {"SKILL.md", ".skill.json", *SUPPORT_DIRECTORIES}
+        allowed_entries = (
+            {"SKILL.md", ".skill.json", *SUPPORT_DIRECTORIES}
+            if allowed_root_entries is None
+            else allowed_root_entries
+        )
         try:
             root_entries = list(skill_dir.iterdir())
         except OSError as exc:
@@ -1079,7 +1385,7 @@ class SkillStore:
                 code="skill_read_failed",
             ) from exc
         for entry in root_entries:
-            if entry.name not in allowed_root_entries:
+            if entry.name not in allowed_entries:
                 raise SkillStoreError(
                     500,
                     f"unexpected file in Skill package: {entry.name}",
@@ -1113,6 +1419,25 @@ class SkillStore:
                 current = Path(current_root)
                 directory_names.sort()
                 file_names.sort()
+                if ignore_generated_python_cache:
+                    for child_name in tuple(directory_names):
+                        if child_name != "__pycache__":
+                            continue
+                        cache_dir = current / child_name
+                        cache_info = cache_dir.lstat()
+                        if (
+                            stat.S_ISLNK(cache_info.st_mode)
+                            or not stat.S_ISDIR(cache_info.st_mode)
+                        ):
+                            raise SkillStoreError(
+                                409,
+                                (
+                                    "unsafe generated Python cache: "
+                                    f"{cache_dir.relative_to(skill_dir)}"
+                                ),
+                                code="unsafe_skill_path",
+                            )
+                        directory_names.remove(child_name)
                 for child_name in directory_names:
                     child = current / child_name
                     info = child.lstat()
@@ -1123,6 +1448,11 @@ class SkillStore:
                             code="unsafe_skill_path",
                         )
                 for file_name in file_names:
+                    if (
+                        ignore_generated_python_cache
+                        and file_name.endswith((".pyc", ".pyo"))
+                    ):
+                        continue
                     path = current / file_name
                     relative = path.relative_to(skill_dir).as_posix()
                     size_bytes = _inspect_private_file_size(
@@ -1844,6 +2174,13 @@ def _remove_tree_quietly(path: Path) -> None:
         pass
     except OSError:
         pass
+
+
+def _copy_skill_record(record: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(record)
+    copied["tags"] = list(record.get("tags") or [])
+    copied["linked_files"] = list(record.get("linked_files") or [])
+    return copied
 
 
 def _without_load_fields(record: dict[str, Any]) -> dict[str, Any]:

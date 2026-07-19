@@ -33,6 +33,7 @@ interface SkillDraft {
 type SkillEditor =
   | { mode: "create"; draft: SkillDraft; linkedFileCount: 0 }
   | { mode: "edit"; id: string; draft: SkillDraft; linkedFileCount: number }
+  | { mode: "view"; id: string; draft: SkillDraft; linkedFileCount: number; preset: boolean }
   | null;
 
 interface DeleteConfirmation {
@@ -93,7 +94,7 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function skillTime(value: string, locale: string): string {
+function skillTime(value: string | null | undefined, locale: string): string {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -109,7 +110,7 @@ interface SkillCardProps {
   canManage: boolean;
   locale: string;
   onToggle: () => void;
-  onEdit: () => void;
+  onEdit: (trigger: HTMLButtonElement) => void;
   onDelete: () => void;
 }
 
@@ -125,6 +126,7 @@ function SkillCard({
   const { t } = useI18n();
   const updated = skillTime(skill.updated_at, locale);
   const linkedFileCount = (skill.linked_files || []).length;
+  const readOnly = skill.read_only === true || skill.source === "bundled";
   const toggleLabel = t(skill.enabled ? "skills.disable" : "skills.enable");
 
   return (
@@ -134,12 +136,15 @@ function SkillCard({
           <span className="skill-card__icon"><Icon name="sparkles" size={15} /></span>
           <div>
             <h3>{skill.name}</h3>
-            <span className={cx("skill-card__state", skill.enabled ? "is-enabled" : "is-disabled")}>
-              {t(skill.enabled ? "skills.enabled" : "skills.disabled")}
-            </span>
+            <div className="skill-card__states">
+              <span className={cx("skill-card__state", skill.enabled ? "is-enabled" : "is-disabled")}>
+                {t(skill.enabled ? "skills.enabled" : "skills.disabled")}
+              </span>
+              {readOnly ? <span className="skill-card__state is-preset">{t("skills.preset")}</span> : null}
+            </div>
           </div>
         </div>
-        {canManage ? (
+        {canManage && !readOnly ? (
           <button
             className={cx("skill-switch", skill.enabled && "is-on")}
             type="button"
@@ -175,9 +180,26 @@ function SkillCard({
           <span>{t("skills.attachments", { count: linkedFileCount })}</span>
           {updated ? <span>{t("skills.updatedAt", { time: updated })}</span> : null}
         </div>
-        {canManage ? (
+        {readOnly ? (
           <div className="skill-card__actions">
-            <button className="btn btn--sm" type="button" disabled={busy} onClick={onEdit}>
+            <button
+              className="btn btn--sm"
+              type="button"
+              aria-label={t("skills.viewNamed", { name: skill.name })}
+              disabled={busy}
+              onClick={(event) => onEdit(event.currentTarget)}
+            >
+              {t("skills.view")}
+            </button>
+          </div>
+        ) : canManage ? (
+          <div className="skill-card__actions">
+            <button
+              className="btn btn--sm"
+              type="button"
+              disabled={busy}
+              onClick={(event) => onEdit(event.currentTarget)}
+            >
               {t("skills.edit")}
             </button>
             <button className="btn btn--sm btn--danger" type="button" disabled={busy} onClick={onDelete}>
@@ -206,6 +228,9 @@ function SkillEditorForm({
 }) {
   const { t } = useI18n();
   const { draft } = editor;
+  const readOnly = editor.mode === "view";
+  const preset = editor.mode === "view" && editor.preset;
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const requiredReady = !!(
     draft.name.trim()
     && draft.description.trim()
@@ -215,18 +240,32 @@ function SkillEditorForm({
     onChange({ ...draft, [key]: value });
   };
 
+  useEffect(() => {
+    if (!readOnly) return;
+    const heading = headingRef.current;
+    if (!heading) return;
+    heading.focus({ preventScroll: true });
+    heading.scrollIntoView?.({ block: "nearest" });
+  }, [editor, readOnly]);
+
   return (
     <form className="skill-editor" onSubmit={onSubmit}>
       <header className="skill-editor__head">
         <div>
           <span className="skill-editor__icon"><Icon name="sparkles" size={16} /></span>
-          <h3>{t(editor.mode === "create" ? "skills.createTitle" : "skills.editTitle")}</h3>
+          <h3 ref={headingRef} tabIndex={readOnly ? -1 : undefined}>{t(
+            editor.mode === "create"
+              ? "skills.createTitle"
+              : editor.mode === "view"
+                ? "skills.viewTitle"
+                : "skills.editTitle",
+          )}</h3>
         </div>
         <button
           className="icon-btn"
           type="button"
-          aria-label={t("skills.cancel")}
-          title={t("skills.cancel")}
+          aria-label={t(readOnly ? "skills.close" : "skills.cancel")}
+          title={t(readOnly ? "skills.close" : "skills.cancel")}
           disabled={busy}
           onClick={onCancel}
         >
@@ -238,11 +277,12 @@ function SkillEditorForm({
         <label>
           <span>{t("skills.form.name")}</span>
           <input
-            autoFocus
+            autoFocus={!readOnly}
             required
             value={draft.name}
             maxLength={64}
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.namePlaceholder")}
             onChange={(event) => update("name", event.target.value)}
           />
@@ -253,6 +293,7 @@ function SkillEditorForm({
             value={draft.category}
             maxLength={64}
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.categoryPlaceholder")}
             onChange={(event) => update("category", event.target.value)}
           />
@@ -263,6 +304,7 @@ function SkillEditorForm({
             value={draft.version}
             maxLength={32}
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.versionPlaceholder")}
             onChange={(event) => update("version", event.target.value)}
           />
@@ -274,6 +316,7 @@ function SkillEditorForm({
             value={draft.description}
             maxLength={1024}
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.descriptionPlaceholder")}
             onChange={(event) => update("description", event.target.value)}
           />
@@ -284,6 +327,7 @@ function SkillEditorForm({
             value={draft.tags}
             maxLength={1320}
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.tagsPlaceholder")}
             onChange={(event) => update("tags", event.target.value)}
           />
@@ -298,6 +342,7 @@ function SkillEditorForm({
             maxLength={65_536}
             spellCheck
             disabled={busy}
+            readOnly={readOnly}
             placeholder={t("skills.form.instructionsPlaceholder")}
             onChange={(event) => update("instructions", event.target.value)}
           />
@@ -310,34 +355,40 @@ function SkillEditorForm({
           <Icon name="paperclip" size={14} />
           <span>
             <strong>{t("skills.attachments", { count: editor.linkedFileCount })}</strong>
-            {t("skills.attachmentsReadOnly")}
+            {t(preset ? "skills.presetAttachmentsReadOnly" : "skills.attachmentsReadOnly")}
           </span>
         </div>
       ) : null}
 
-      <label className="skill-editor__enabled">
-        <button
-          className={cx("skill-switch", draft.enabled && "is-on")}
-          type="button"
-          role="switch"
-          aria-checked={draft.enabled}
-          aria-label={t("skills.form.enabled")}
-          disabled={busy}
-          onClick={() => update("enabled", !draft.enabled)}
-        >
-          <span />
-        </button>
-        <span>{t("skills.form.enabled")}</span>
-      </label>
+      {preset ? (
+        <InlineAlert variant="info">{t("skills.presetHint")}</InlineAlert>
+      ) : readOnly ? null : (
+        <label className="skill-editor__enabled">
+          <button
+            className={cx("skill-switch", draft.enabled && "is-on")}
+            type="button"
+            role="switch"
+            aria-checked={draft.enabled}
+            aria-label={t("skills.form.enabled")}
+            disabled={busy}
+            onClick={() => update("enabled", !draft.enabled)}
+          >
+            <span />
+          </button>
+          <span>{t("skills.form.enabled")}</span>
+        </label>
+      )}
 
       <footer className="skill-editor__actions">
         <button className="btn" type="button" disabled={busy} onClick={onCancel}>
-          {t("skills.cancel")}
+          {t(readOnly ? "skills.close" : "skills.cancel")}
         </button>
-        <button className="btn btn--primary" type="submit" disabled={busy || !requiredReady}>
-          {busy ? <Spinner size={14} /> : null}
-          {t("skills.save")}
-        </button>
+        {!readOnly ? (
+          <button className="btn btn--primary" type="submit" disabled={busy || !requiredReady}>
+            {busy ? <Spinner size={14} /> : null}
+            {t("skills.save")}
+          </button>
+        ) : null}
       </footer>
     </form>
   );
@@ -365,9 +416,12 @@ export function SkillsPanel({
   const listRequestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
   const busyRef = useRef(false);
+  const canManageRef = useRef(canManage);
+  const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const scopeRef = useRef(scope);
   const queryRef = useRef(query);
   const scopeKey = `${scope.scope_type}:${scope.scope_id}`;
+  canManageRef.current = canManage;
   scopeRef.current = scope;
   queryRef.current = query;
   const intl = intlLocale(locale);
@@ -422,10 +476,15 @@ export function SkillsPanel({
     detailController.current?.abort();
     detailController.current = null;
     detailRequestVersion.current += 1;
+    detailTriggerRef.current = null;
   }, [scopeKey]);
 
   useEffect(() => {
     if (canManage) return;
+    detailController.current?.abort();
+    detailController.current = null;
+    detailRequestVersion.current += 1;
+    detailTriggerRef.current = null;
     setEditor(null);
     setConfirmation(null);
     setMutationError("");
@@ -496,12 +555,15 @@ export function SkillsPanel({
     detailController.current?.abort();
     detailController.current = null;
     detailRequestVersion.current += 1;
+    detailTriggerRef.current = null;
     setEditor({ mode: "create", draft: emptyDraft(), linkedFileCount: 0 });
     setMutationError("");
   };
 
-  const openEdit = async (skill: AgentSkill) => {
-    if (!canManage || busyRef.current) return;
+  const openEdit = async (skill: AgentSkill, trigger: HTMLButtonElement) => {
+    const listReadOnly = skill.read_only === true || skill.source === "bundled";
+    if ((!canManageRef.current && !listReadOnly) || busyRef.current) return;
+    detailTriggerRef.current = trigger;
     busyRef.current = true;
     setBusyKey(`detail:${skill.id}`);
     setMutationError("");
@@ -520,19 +582,33 @@ export function SkillsPanel({
         && `${currentScope.scope_type}:${currentScope.scope_id}` === requestedScopeKey
       ) {
         const detailed = result.skill;
-        setEditor({
-          mode: "edit",
+        const preset = detailed.read_only === true || detailed.source === "bundled";
+        const viewOnly = preset || !canManageRef.current;
+        const detail = {
           id: detailed.id,
           draft: draftFromSkill(detailed),
           linkedFileCount: (detailed.linked_files || []).length,
-        });
+        };
+        setEditor(viewOnly
+          ? { mode: "view", preset, ...detail }
+          : { mode: "edit", ...detail });
       }
     } catch (error) {
       if (!controller.signal.aborted && detailRequestVersion.current === requestVersion) {
+        if (detailTriggerRef.current === trigger) detailTriggerRef.current = null;
         setMutationError(errorText(error) || t("skills.detailLoadFailed"));
       }
     } finally {
       if (detailController.current === controller) detailController.current = null;
+      if (
+        detailTriggerRef.current === trigger
+        && (
+          controller.signal.aborted
+          || detailRequestVersion.current !== requestVersion
+        )
+      ) {
+        detailTriggerRef.current = null;
+      }
       busyRef.current = false;
       setBusyKey("");
     }
@@ -540,7 +616,7 @@ export function SkillsPanel({
 
   const saveEditor = async (event: FormEvent) => {
     event.preventDefault();
-    if (!canManage || !editor) return;
+    if (!canManage || !editor || editor.mode === "view") return;
     const payload = payloadFromDraft(editor.draft);
     if (!payload.name || !payload.description || !payload.instructions) {
       setMutationError(t("skills.form.required"));
@@ -655,8 +731,11 @@ export function SkillsPanel({
           onChange={(draft) => setEditor((current) => current ? { ...current, draft } : current)}
           onCancel={() => {
             if (busyRef.current) return;
+            const trigger = detailTriggerRef.current;
+            detailTriggerRef.current = null;
             setEditor(null);
             setMutationError("");
+            if (trigger?.isConnected) trigger.focus();
           }}
           onSubmit={(event) => void saveEditor(event)}
         />
@@ -711,7 +790,7 @@ export function SkillsPanel({
               canManage={canManage}
               locale={intl}
               onToggle={() => void toggleSkill(skill)}
-              onEdit={() => void openEdit(skill)}
+              onEdit={(trigger) => void openEdit(skill, trigger)}
               onDelete={() => setConfirmation({
                 skill,
                 scope: { ...scopeRef.current },

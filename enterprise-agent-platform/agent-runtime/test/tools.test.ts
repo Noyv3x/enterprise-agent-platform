@@ -29,6 +29,33 @@ test("tool policy requires approval for host commands and mutations", async () =
   }
 });
 
+test("tool descriptions route semantic file work away from terminal scripts", () => {
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const terminal = tools.find((tool) => tool.name === "terminal");
+  const readFile = tools.find((tool) => tool.name === "read_file");
+  const searchFiles = tools.find((tool) => tool.name === "search_files");
+  const patchFile = tools.find((tool) => tool.name === "patch_file");
+  const writeFile = tools.find((tool) => tool.name === "write_file");
+  assert.ok(terminal && readFile && searchFiles && patchFile && writeFile);
+  assert.match(terminal.description, /Do not use cat\/head\/tail/);
+  assert.match(terminal.description, /Prefer search_files over grep\/rg\/find/);
+  assert.match(terminal.description, /use ls only when the directory listing itself matters/);
+  assert.match(terminal.description, /Do not use sed\/awk or Python to edit files/);
+  assert.match(terminal.description, /one-off Python scripts/);
+  assert.match(readFile.description, /before editing/);
+  assert.match(searchFiles.description, /definitions and usages/);
+  assert.match(patchFile.description, /re-read/);
+  assert.match(writeFile.description, /do not create files by terminal heredoc/);
+});
+
 test("browser screenshots become native image content without base64 in details", () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
   const encoded = png.toString("base64");
@@ -191,7 +218,7 @@ test("skill schema strictly describes progressively loaded skill actions and bou
   assert.equal(actionArgumentsSchema(skill.parameters, "update").minProperties, 2);
   assert.equal(
     (actionArgumentsSchema(skill.parameters, "list").properties as Record<string, Record<string, unknown>>).limit?.maximum,
-    100,
+    200,
   );
   const writeProperties = actionArgumentsSchema(skill.parameters, "write_file").properties as Record<string, Record<string, unknown>>;
   assert.equal(writeProperties.id?.maxLength, 64);

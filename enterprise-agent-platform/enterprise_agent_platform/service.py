@@ -84,7 +84,7 @@ from .schedules import (
     rfc3339_utc,
 )
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
-from .skills import SkillStore, SkillStoreError
+from .skills import MAX_SKILL_LIST_RESULTS, SkillStore, SkillStoreError
 
 
 class ServiceError(Exception):
@@ -6606,14 +6606,20 @@ class EnterpriseService:
         try:
             if action == "list":
                 try:
-                    limit = max(1, min(int(arguments.get("limit") or 100), 100))
+                    limit = max(
+                        1,
+                        min(
+                            int(arguments.get("limit") or MAX_SKILL_LIST_RESULTS),
+                            MAX_SKILL_LIST_RESULTS,
+                        ),
+                    )
                 except (TypeError, ValueError) as exc:
                     raise ServiceError(400, "skill limit is invalid") from exc
                 skills = self.skills.list(
                     scope.scope_key,
                     query=str(arguments.get("query") or "").strip(),
                     category=str(arguments.get("category") or "").strip(),
-                    limit=100,
+                    limit=MAX_SKILL_LIST_RESULTS,
                 )
                 skills = [
                     skill
@@ -9029,14 +9035,14 @@ class EnterpriseService:
         scope_type: str,
         scope_id: str,
         query: str = "",
-        limit: int = 100,
+        limit: int = MAX_SKILL_LIST_RESULTS,
     ) -> dict[str, Any]:
         scope = self._skill_scope_for_actor(actor, scope_type, scope_id)
         try:
             skills = self.skills.list(
                 scope.scope_key,
                 query=str(query or "").strip(),
-                limit=max(1, min(int(limit), 100)),
+                limit=max(1, min(int(limit), MAX_SKILL_LIST_RESULTS)),
             )
         except SkillStoreError as exc:
             self._raise_skill_store_error(exc)

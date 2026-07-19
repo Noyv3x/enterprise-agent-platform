@@ -54,7 +54,20 @@ class AgentRuntimePackagingTests(unittest.TestCase):
 
     def test_wheel_and_sdist_contain_complete_runtime_build_source(self):
         expected = _runtime_source_files(PROJECT_ROOT)
+        bundled_root = (
+            PROJECT_ROOT
+            / "enterprise_agent_platform"
+            / "bundled_skills"
+        )
+        expected_bundled = {
+            path.relative_to(bundled_root).as_posix()
+            for path in bundled_root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix not in {".pyc", ".pyo"}
+        }
         self.assertTrue(expected)
+        self.assertTrue(expected_bundled)
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -91,7 +104,15 @@ class AgentRuntimePackagingTests(unittest.TestCase):
                 timeout=120,
                 check=False,
             )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            build_output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, build_output)
+            self.assertNotRegex(
+                build_output,
+                (
+                    r"(?:is absent from|not listed in) "
+                    r"the [`']packages[`'] configuration"
+                ),
+            )
 
             wheel = next((source / "dist").glob("*.whl"))
             with zipfile.ZipFile(wheel) as archive:
@@ -102,6 +123,14 @@ class AgentRuntimePackagingTests(unittest.TestCase):
                     if marker in name and not name.endswith("/")
                 }
             self.assertEqual(wheel_files, expected)
+            with zipfile.ZipFile(wheel) as archive:
+                bundled_marker = "enterprise_agent_platform/bundled_skills/"
+                bundled_files = {
+                    name.split(bundled_marker, 1)[1]
+                    for name in archive.namelist()
+                    if bundled_marker in name and not name.endswith("/")
+                }
+            self.assertEqual(bundled_files, expected_bundled)
             with zipfile.ZipFile(wheel) as archive:
                 camofox_marker = "/share/ubitech-agent/camofox-runtime/"
                 camofox_files = {
@@ -128,6 +157,14 @@ class AgentRuntimePackagingTests(unittest.TestCase):
                     if marker in member.name and member.isfile()
                 }
             self.assertTrue(expected.issubset(sdist_files))
+            with tarfile.open(sdist, "r:gz") as archive:
+                bundled_marker = "/enterprise_agent_platform/bundled_skills/"
+                bundled_files = {
+                    member.name.split(bundled_marker, 1)[1]
+                    for member in archive.getmembers()
+                    if bundled_marker in member.name and member.isfile()
+                }
+            self.assertEqual(bundled_files, expected_bundled)
 
 
 if __name__ == "__main__":

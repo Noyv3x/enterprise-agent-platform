@@ -44,6 +44,22 @@ const reviewSkill: AgentSkill = {
   updated_at: "2025-07-20T13:46:40.000000Z",
 };
 
+const presetSkill: AgentSkill = {
+  id: "systematic-debugging",
+  name: "systematic-debugging",
+  description: "Find root causes before applying fixes.",
+  instructions: "# Systematic debugging\n\nReproduce, investigate, fix, and verify.",
+  category: "development",
+  version: "1.0.0",
+  tags: ["debugging"],
+  enabled: true,
+  linked_files: ["references/NOTICE.md"],
+  created_at: null,
+  updated_at: null,
+  source: "bundled",
+  read_only: true,
+};
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -172,6 +188,105 @@ describe("SkillsPanel", () => {
         enabled: true,
       }),
     );
+  });
+
+  it("labels bundled Skills as presets and exposes read-only details", async () => {
+    const user = userEvent.setup();
+    mocks.loadAgentSkills.mockResolvedValueOnce({ skills: [presetSkill], count: 1 });
+    mocks.loadAgentSkill.mockResolvedValueOnce({ skill: presetSkill });
+    renderPanel();
+
+    expect(await screen.findByRole("heading", { name: presetSkill.name })).toBeVisible();
+    expect(screen.getByText("Preset")).toBeVisible();
+    expect(screen.queryByRole("switch", { name: `Disable ${presetSkill.name}` })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+
+    const viewButton = screen.getByRole("button", { name: `View ${presetSkill.name}` });
+    await user.click(viewButton);
+    expect(mocks.loadAgentSkill).toHaveBeenCalledWith(
+      privateScope,
+      presetSkill.id,
+      expect.any(AbortSignal),
+    );
+    const heading = await screen.findByRole("heading", { name: "View Skill" });
+    expect(heading).toBeVisible();
+    expect(heading).toHaveFocus();
+    expect(screen.getByText(/read-only Skill ships with ubitech agent/)).toBeVisible();
+    expect(screen.getByText(/reads preset files on demand/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveAttribute("readonly");
+
+    const editor = heading.closest("form");
+    expect(editor).not.toBeNull();
+    const closeButtons = within(editor!).getAllByRole("button", { name: "Close" });
+    await user.click(closeButtons[closeButtons.length - 1]);
+    expect(screen.queryByRole("heading", { name: "View Skill" })).not.toBeInTheDocument();
+    expect(viewButton).toHaveFocus();
+  });
+
+  it("uses detail ownership when a preset is replaced while details load", async () => {
+    const user = userEvent.setup();
+    mocks.loadAgentSkills.mockResolvedValueOnce({ skills: [presetSkill], count: 1 });
+    mocks.loadAgentSkill.mockResolvedValueOnce({ skill: reviewSkill });
+    renderPanel();
+
+    await user.click(await screen.findByRole("button", { name: `View ${presetSkill.name}` }));
+
+    expect(await screen.findByRole("heading", { name: "Edit Skill" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Name" })).not.toHaveAttribute("readonly");
+    expect(screen.queryByText(/read-only Skill ships with ubitech agent/)).not.toBeInTheDocument();
+  });
+
+  it("discards pending editable details when management permission is revoked", async () => {
+    const user = userEvent.setup();
+    const pendingDetail = deferred<{ skill: AgentSkill }>();
+    let detailSignal: AbortSignal | undefined;
+    mocks.loadAgentSkill.mockImplementationOnce((
+      _scope: AgentPreviewScope,
+      _id: string,
+      signal: AbortSignal,
+    ) => {
+      detailSignal = signal;
+      return pendingDetail.promise;
+    });
+    const view = renderPanel();
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    expect(detailSignal).toBeDefined();
+    expect(detailSignal!.aborted).toBe(false);
+
+    view.rerender(
+      <I18nProvider>
+        <SkillsPanel scope={privateScope} canManage={false} />
+      </I18nProvider>,
+    );
+    expect(detailSignal!.aborted).toBe(true);
+
+    await act(async () => {
+      pendingDetail.resolve({ skill: reviewSkill });
+      await pendingDetail.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Loading Skill details")).not.toBeInTheDocument();
+    });
+    expect(screen.queryByRole("heading", { name: "Edit Skill" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("lets read-only channel viewers inspect a preset without exposing mutations", async () => {
+    const user = userEvent.setup();
+    mocks.loadAgentSkills.mockResolvedValueOnce({ skills: [presetSkill], count: 1 });
+    mocks.loadAgentSkill.mockResolvedValueOnce({ skill: presetSkill });
+    renderPanel(channelScope, false);
+
+    await user.click(await screen.findByRole("button", { name: `View ${presetSkill.name}` }));
+
+    expect(await screen.findByRole("heading", { name: "View Skill" })).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New Skill" })).not.toBeInTheDocument();
   });
 
   it("toggles availability and prevents a double delete submission", async () => {

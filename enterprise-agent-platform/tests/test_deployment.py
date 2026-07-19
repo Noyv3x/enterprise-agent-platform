@@ -1246,8 +1246,27 @@ class DeploymentTests(unittest.TestCase):
     def test_platform_pyproject_supports_editable_install(self):
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        package_finder = data["tool"]["setuptools"]["packages"]["find"]
+        self.assertEqual(package_finder["where"], ["."])
+        self.assertEqual(package_finder["include"], ["enterprise_agent_platform*"])
+        self.assertNotIn("exclude", package_finder)
+        self.assertTrue(package_finder["namespaces"])
         package_data = data["tool"]["setuptools"]["package-data"]
-        self.assertEqual(package_data["enterprise_agent_platform"], ["static/*"])
+        self.assertEqual(
+            package_data["enterprise_agent_platform"],
+            ["static/*", "bundled_skills/**/*"],
+        )
+        excluded_package_data = data["tool"]["setuptools"][
+            "exclude-package-data"
+        ]
+        self.assertEqual(
+            excluded_package_data["enterprise_agent_platform"],
+            [
+                "bundled_skills/**/__pycache__/*",
+                "bundled_skills/**/*.pyc",
+                "bundled_skills/**/*.pyo",
+            ],
+        )
 
 
 if __name__ == "__main__":

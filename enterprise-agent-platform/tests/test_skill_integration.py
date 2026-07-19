@@ -105,9 +105,13 @@ class SkillIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(status["state"], "idle")
                 available = agent.calls[-1]["metadata"]["available_skills"]
-                self.assertEqual([item["id"] for item in available], [skill_id])
+                available_ids = [item["id"] for item in available]
+                self.assertIn(skill_id, available_ids)
+                available_skill = next(
+                    item for item in available if item["id"] == skill_id
+                )
                 self.assertEqual(
-                    set(available[0]),
+                    set(available_skill),
                     {"id", "name", "description", "category"},
                 )
                 self.assertNotIn("instructions", json.dumps(available))
@@ -128,7 +132,10 @@ class SkillIntegrationTests(unittest.TestCase):
                     scope_id=scope_id,
                     query="changes",
                 )
-                self.assertEqual(listed["skills"][0]["id"], skill_id)
+                self.assertIn(
+                    skill_id,
+                    [skill["id"] for skill in listed["skills"]],
+                )
 
                 deleted = service.user_delete_skill(
                     admin,
@@ -200,9 +207,14 @@ class SkillIntegrationTests(unittest.TestCase):
                     {"id": skill_id},
                     context,
                 )
+                after_disable = service._agent_skill_tool("list", {}, context)
+                self.assertNotIn(
+                    skill_id,
+                    [skill["id"] for skill in after_disable["skills"]],
+                )
                 self.assertEqual(
-                    service._agent_skill_tool("list", {}, context),
-                    {"skills": [], "count": 0},
+                    after_disable["count"],
+                    len(after_disable["skills"]),
                 )
                 second_arguments = {
                     **create_arguments,
@@ -216,7 +228,7 @@ class SkillIntegrationTests(unittest.TestCase):
                 )["skill"]
                 limited = service._agent_skill_tool(
                     "list",
-                    {"limit": 1},
+                    {"limit": 1, "query": "Z enabled procedure"},
                     context,
                 )
                 self.assertEqual(
@@ -278,7 +290,11 @@ class SkillIntegrationTests(unittest.TestCase):
                     scope_id=canonical_id,
                 )
                 self.assertEqual(
-                    [skill["id"] for skill in listed["skills"]],
+                    [
+                        skill["id"]
+                        for skill in listed["skills"]
+                        if skill.get("source") == "user"
+                    ],
                     [created["id"]],
                 )
                 canonical_key = service.agent_scopes.channel_scope_key(
@@ -331,7 +347,11 @@ class SkillIntegrationTests(unittest.TestCase):
                     scope_id=channel_id,
                 )
                 self.assertEqual(
-                    [skill["id"] for skill in listed["skills"]],
+                    [
+                        skill["id"]
+                        for skill in listed["skills"]
+                        if skill.get("source") == "user"
+                    ],
                     [created["id"]],
                 )
                 with self.assertRaises(ServiceError) as create_denied:
@@ -433,10 +453,13 @@ class SkillIntegrationTests(unittest.TestCase):
 
                 status, listed = request(
                     "GET",
-                    f"/api/agent-skills?{query}&q=quality&limit=100",
+                    f"/api/agent-skills?{query}&q=quality&limit=200",
                 )
                 self.assertEqual(status, 200)
-                self.assertEqual(listed["skills"][0]["id"], skill_id)
+                self.assertIn(
+                    skill_id,
+                    [skill["id"] for skill in listed["skills"]],
+                )
 
                 status, updated = request(
                     "PATCH",

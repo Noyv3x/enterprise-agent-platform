@@ -98,7 +98,7 @@ test("runtime approval endpoint accepts decision and rejects retired compatibili
   const workspace = await temporaryDirectory("agent-server-approval-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("approved"),
   ]);
   const config = testConfig(home, { bearerToken: "secret", approvalTimeoutMs: 5_000 });

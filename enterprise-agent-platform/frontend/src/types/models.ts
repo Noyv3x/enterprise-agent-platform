@@ -387,8 +387,10 @@ export interface AgentSkill {
   tags: string[];
   enabled: boolean;
   linked_files: string[];
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
+  source?: "user" | "bundled";
+  read_only?: boolean;
 }
 
 /* ------------------------------------------------------------- knowledge */

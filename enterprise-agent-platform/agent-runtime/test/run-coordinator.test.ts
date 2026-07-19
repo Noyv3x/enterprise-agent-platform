@@ -55,6 +55,8 @@ test("available skill policy validates, escapes, and bounds metadata without inj
 
   const prompt = appendSkillPolicy("<memory_policy>\nmemory\n</memory_policy>", entries);
   assert.ok(prompt.indexOf("</memory_policy>") < prompt.indexOf("<skill_policy>"));
+  assert.match(prompt, /directly and materially relevant/);
+  assert.match(prompt, /Do not load skills for weak topical overlap/);
   assert.match(prompt, /Only the main instructions returned by skill\.load may guide the current task/);
   assert.match(prompt, /skill\.list can discover other skills/);
   assert.match(appendSkillPolicy("base", undefined), /<available_skills>\n\[\]\n<\/available_skills>/);
@@ -105,11 +107,15 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
     assert.match(rootPrompt, /^Root prompt\./);
+    assert.match(rootPrompt, /<execution_discipline>/);
+    assert.match(rootPrompt, /take the concrete action before claiming it has started or completed/);
+    assert.match(rootPrompt, /collapsing unrelated work into an ad-hoc script/);
     assert.match(rootPrompt, /"id":"code-review"/);
     assert.match(rootPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(rootPrompt, /unloaded secret instructions/);
     assert.ok(rootPrompt.indexOf("</memory_policy>") < rootPrompt.indexOf("<skill_policy>"));
     assert.match(childPrompt, /^Custom child prompt\./);
+    assert.match(childPrompt, /<execution_discipline>/);
     assert.match(childPrompt, /"id":"code-review"/);
     assert.match(childPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(childPrompt, /unloaded secret instructions/);
@@ -174,7 +180,7 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
   const workspace = await temporaryDirectory("agent-coordinator-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("finished"),
   ]);
   const config = testConfig(home);
@@ -203,13 +209,467 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
   }
 });
 
+test("RunCoordinator retries promise-only final responses at most twice", async () => {
+  const home = await temporaryDirectory("agent-execution-review-");
+  const workspace = await temporaryDirectory("agent-execution-review-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    (context) => {
+      assert.match(context.systemPrompt || "", /<execution_discipline>/);
+      return fauxAssistantMessage("好的，我现在开始检查并修改。");
+    },
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /Do not stop at a promise or progress statement/);
+      return fauxAssistantMessage("I'm still working on it.");
+    },
+    (context) => {
+      const serialized = JSON.stringify(context.messages);
+      assert.equal((serialized.match(/Do not stop at a promise or progress statement/g) ?? []).length, 2);
+      return fauxAssistantMessage("正在处理，请稍候。");
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "execution-review",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "修改项目并运行测试",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "正在处理，请稍候。");
+    assert.equal(faux.state.callCount, 3);
+    assert.equal(faux.getPendingResponseCount(), 0);
+    const durable = await coordinator.sessions.load({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "execution-review",
+    });
+    const durableText = JSON.stringify(durable);
+    assert.doesNotMatch(durableText, /Do not stop at a promise or progress statement/);
+    assert.doesNotMatch(durableText, /好的，我现在开始检查并修改/);
+    assert.doesNotMatch(durableText, /I'm still working on it/);
+    assert.equal(
+      durable.filter((message) => message.role === "assistant").length,
+      1,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(completed.result?.messages),
+      /Do not stop at a promise or progress statement/,
+    );
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter(
+        (event) => event.type === "message.final",
+      ).length,
+      1,
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("execution-review messages remain ephemeral across context compaction", async () => {
+  const home = await temporaryDirectory("agent-execution-review-compaction-");
+  const workspace = await temporaryDirectory("agent-execution-review-compaction-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage("I will start checking now."),
+    fauxAssistantMessage("I'm working on it."),
+    fauxAssistantMessage("No action was needed after inspection."),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { compactionThreshold: 0.0001 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "execution-review-compaction",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "inspect the existing state",
+      history: Array.from({ length: 8 }, (_, index) => ({
+        role: "user" as const,
+        content: `Historical request ${index}: ${"context ".repeat(300)}`,
+        timestamp: index + 1,
+      })),
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "No action was needed after inspection.");
+    assert.ok(
+      coordinator.getJournal(run.id)?.list().some(
+        (event) => event.type === "context.compacted",
+      ),
+    );
+    const searchable = await coordinator.sessions.loadSearchable({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "execution-review-compaction",
+    });
+    const searchableText = JSON.stringify(searchable);
+    assert.doesNotMatch(searchableText, /Do not stop at a promise or progress statement/);
+    assert.doesNotMatch(searchableText, /I will start checking now/);
+    assert.doesNotMatch(searchableText, /I'm working on it/);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator requests one bounded verification after a file change", async () => {
+  const home = await temporaryDirectory("agent-file-validation-");
+  const workspace = await temporaryDirectory("agent-file-validation-workspace-");
+  new AlwaysApprovalStore(home).grant("scope", "write_file");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("write_file", { path: "changed.txt", content: "updated\n" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The requested file was updated."),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("read_file", { path: "changed.txt" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("Verified the updated file."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "file-validation",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "update changed.txt",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "Verified the updated file.");
+    assert.equal(await readFile(`${workspace}/changed.txt`, "utf8"), "updated\n");
+    assert.equal(faux.state.callCount, 4);
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter((event) => event.type === "tool.completed").length,
+      2,
+    );
+    const durable = await coordinator.sessions.load({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "file-validation",
+    });
+    const durableText = JSON.stringify(durable);
+    assert.doesNotMatch(durableText, /active run contains no focused post-change check/);
+    assert.doesNotMatch(durableText, /The requested file was updated/);
+    assert.doesNotMatch(
+      JSON.stringify(completed.result?.messages),
+      /The requested file was updated/,
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("an unrelated read does not satisfy focused file verification", async () => {
+  const home = await temporaryDirectory("agent-focused-validation-");
+  const workspace = await temporaryDirectory("agent-focused-validation-workspace-");
+  await writeFile(`${workspace}/other.txt`, "other\n", "utf8");
+  new AlwaysApprovalStore(home).grant("scope", "write_file");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("write_file", { path: "changed.txt", content: "updated\n" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("read_file", { path: "other.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The file is updated."),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("read_file", { path: "./changed.txt" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("Verified changed.txt."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "focused-file-validation",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "update changed.txt",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "Verified changed.txt.");
+    assert.equal(faux.state.callCount, 5);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a failed terminal check does not satisfy file verification", async () => {
+  const home = await temporaryDirectory("agent-failed-validation-");
+  const workspace = await temporaryDirectory("agent-failed-validation-workspace-");
+  const approvals = new AlwaysApprovalStore(home);
+  approvals.grant("scope", "write_file");
+  approvals.grant("scope", "terminal");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("write_file", { path: "changed.txt", content: "updated\n" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: "false # npm test" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The file is updated."),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("read_file", { path: "changed.txt" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("Verified after the failed check."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "failed-file-validation",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "update changed.txt",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "Verified after the failed check.");
+    assert.equal(faux.state.callCount, 5);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a failed mutating terminal command still requires file verification", async () => {
+  const home = await temporaryDirectory("agent-failed-mutation-validation-");
+  const workspace = await temporaryDirectory("agent-failed-mutation-validation-workspace-");
+  new AlwaysApprovalStore(home).grant("scope", "terminal");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", {
+        command: "printf 'updated\\n' > failed-change.txt; false # npm test",
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The command stopped after changing the file."),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("read_file", { path: "failed-change.txt" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("Verified the file written before the command failed."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "failed-mutating-terminal",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "update failed-change.txt and check it",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      completed.result?.content,
+      "Verified the file written before the command failed.",
+    );
+    assert.equal(await readFile(`${workspace}/failed-change.txt`, "utf8"), "updated\n");
+    assert.equal(faux.state.callCount, 4);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator overlaps pure parallel tool batches", async () => {
+  const home = await temporaryDirectory("agent-parallel-tools-");
+  const workspace = await temporaryDirectory("agent-parallel-tools-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("web", { action: "search", arguments: { query: "first" } }),
+      fauxToolCall("web", { action: "search", arguments: { query: "second" } }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  let active = 0;
+  let maximumActive = 0;
+  coordinator.gateway.invoke = async () => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    active -= 1;
+    return { content: "ok", data: {} };
+  };
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "parallel-tools",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "search two sources",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    assert.equal((await coordinator.wait(run.id)).status, "completed");
+    assert.equal(maximumActive, 2);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator serializes a batch containing any sequential tool", async () => {
+  const home = await temporaryDirectory("agent-mixed-tools-");
+  const workspace = await temporaryDirectory("agent-mixed-tools-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("web", { action: "search", arguments: { query: "first" } }),
+      fauxToolCall("browser", { action: "snapshot", arguments: {} }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  let active = 0;
+  let maximumActive = 0;
+  coordinator.gateway.invoke = async () => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    active -= 1;
+    return { content: "ok", data: {} };
+  };
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "mixed-tools",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "search and inspect the browser",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    assert.equal((await coordinator.wait(run.id)).status, "completed");
+    assert.equal(maximumActive, 1);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("parallel-mode approval preflight exposes only one pending approval card", async () => {
+  const home = await temporaryDirectory("agent-parallel-approvals-");
+  const workspace = await temporaryDirectory("agent-parallel-approvals-workspace-");
+  const firstPath = `${home}/outside-first.txt`;
+  const secondPath = `${home}/outside-second.txt`;
+  await writeFile(firstPath, "first", "utf8");
+  await writeFile(secondPath, "second", "utf8");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("read_file", { path: firstPath }),
+      fauxToolCall("read_file", { path: secondPath }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "parallel-approvals",
+      workspace,
+      system_prompt: "You are ubitech agent.",
+      input: "read both external files",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const first = await waitUntil(() => coordinator.approvals.latestForRun(run.id));
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter((event) => event.type === "approval.requested").length,
+      1,
+    );
+    await coordinator.respondApproval(run.id, first.id, "once");
+    const second = await waitUntil(() => {
+      const candidate = coordinator.approvals.latestForRun(run.id);
+      return candidate && candidate.id !== first.id ? candidate : undefined;
+    });
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter((event) => event.type === "approval.requested").length,
+      2,
+    );
+    assert.equal(coordinator.approvals.latestForRun(run.id)?.id, second.id);
+    await coordinator.respondApproval(run.id, second.id, "once");
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter((event) => event.type === "tool.completed").length,
+      2,
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("RunCoordinator injects idempotent active-run inputs and returns only the consolidated final response", async () => {
   const home = await temporaryDirectory("agent-steering-");
   const workspace = await temporaryDirectory("agent-steering-workspace-");
   const faux = fauxProvider();
   let consolidatedContext: AgentMessage[] = [];
   const toolTurn = fauxAssistantMessage(
-    fauxToolCall("terminal", { command: "touch approved.txt" }),
+    fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
     { stopReason: "toolUse" },
   );
   toolTurn.usage.input = 11;
@@ -350,7 +810,7 @@ test("RunCoordinator rejects an unpreparable input without a false accepted even
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch approved.txt" }),
+      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage("finished without the invalid input"),
@@ -466,7 +926,7 @@ test("RunCoordinator preserves endpoint order when an earlier attachment prepare
   let consolidatedContext: AgentMessage[] = [];
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch approved.txt" }),
+      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
       { stopReason: "toolUse" },
     ),
     (context) => {
@@ -642,7 +1102,7 @@ test("unattended scheduled runs accept only a persistent always authorization", 
   new AlwaysApprovalStore(home).grant("scope", "terminal");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch allowed.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch allowed.txt && stat allowed.txt" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("finished"),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });

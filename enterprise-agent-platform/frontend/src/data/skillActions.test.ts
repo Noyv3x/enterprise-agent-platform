@@ -22,7 +22,7 @@ describe("skill actions", () => {
     await loadAgentSkills(scope, " code review ", controller.signal);
 
     expect(apiMock).toHaveBeenCalledWith(
-      "/api/agent-skills?scope_type=channel&scope_id=12&limit=100&q=code+review",
+      "/api/agent-skills?scope_type=channel&scope_id=12&limit=200&q=code+review",
       { signal: controller.signal },
     );
   });
