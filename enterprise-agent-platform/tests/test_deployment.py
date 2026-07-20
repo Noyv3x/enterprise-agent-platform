@@ -21,10 +21,12 @@ from enterprise_agent_platform.deployment import (
     DeploymentPaths,
     _camofox_system_dependency_problems,
     _existing_service_data_dir,
+    _probe_json_health,
     _resolve_existing_service_deployment,
     apt_get_command_base,
     python_venv_package_names,
     runtime_env,
+    searxng_ready_timeout_seconds,
     user_service_unit,
 )
 
@@ -367,7 +369,16 @@ class DeploymentTests(unittest.TestCase):
             root = Path(td)
             paths = DeploymentPaths.from_root(root, data_dir=root / "state")
 
-            unit = user_service_unit(paths, host="0.0.0.0", port=8765)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_MANAGE_SEARXNG": "0",
+                    "ENTERPRISE_SEARXNG_API_URL": "http://127.0.0.1:14567",
+                    "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": "37.5",
+                    "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": "420",
+                },
+            ):
+                unit = user_service_unit(paths, host="0.0.0.0", port=8765)
 
             self.assertIn("Restart=on-failure", unit)
             self.assertIn(f"ENTERPRISE_PLATFORM_DATA={root / 'state'}", unit)
@@ -375,6 +386,10 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(str(paths.managed_node_current / "bin"), unit)
             self.assertIn(f"ENTERPRISE_SERVICE_NAME={paths.service_name}", unit)
             self.assertIn(f"ENTERPRISE_COGNEE_REPO={root / 'cognee'}", unit)
+            self.assertIn("ENTERPRISE_MANAGE_SEARXNG=0", unit)
+            self.assertIn("ENTERPRISE_SEARXNG_API_URL=http://127.0.0.1:14567", unit)
+            self.assertIn("ENTERPRISE_SEARXNG_TIMEOUT_SECONDS=37.5", unit)
+            self.assertIn("ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS=420", unit)
             self.assertIn(str(paths.platform_cli), unit)
             self.assertIn(f"WorkingDirectory={root / 'enterprise-agent-platform'}", unit)
             self.assertNotIn(f"WorkingDirectory=\"{root / 'enterprise-agent-platform'}\"", unit)
@@ -410,6 +425,8 @@ class DeploymentTests(unittest.TestCase):
             manager._wait_for_service_http = mock.Mock(return_value=True)
             manager._wait_for_agent_http = mock.Mock(return_value=True)
             manager._wait_for_camofox_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_liveness_http = mock.Mock(return_value=True)
+            manager._wait_for_searxng_http = mock.Mock(return_value=True)
             old_process_state = {
                 "pid": os.getpid(),
                 "heartbeat_at": time.time(),
@@ -437,7 +454,11 @@ class DeploymentTests(unittest.TestCase):
                 ),
                 mock.patch(
                     "enterprise_agent_platform.deployment.read_gateway_state",
-                    side_effect=[old_process_state, reexecuted_state],
+                    side_effect=[
+                        old_process_state,
+                        reexecuted_state,
+                        reexecuted_state,
+                    ],
                 ) as read_state,
                 mock.patch("enterprise_agent_platform.deployment.time.sleep"),
             ):
@@ -450,7 +471,10 @@ class DeploymentTests(unittest.TestCase):
                 )
 
             reload_gateway.assert_called_once_with(manager.paths.data_dir)
-            self.assertEqual(read_state.call_count, 2)
+            self.assertEqual(read_state.call_count, 3)
+            self.assertEqual(manager._wait_for_service_http.call_count, 2)
+            self.assertEqual(manager._wait_for_searxng_http.call_count, 2)
+            manager._wait_for_camofox_liveness_http.assert_called_once()
 
     def test_auto_bootstrap_hands_legacy_foreground_instance_to_detached_gateway(self):
         with tempfile.TemporaryDirectory() as td:
@@ -630,6 +654,91 @@ class DeploymentTests(unittest.TestCase):
                 manager._raise_service_failed.call_args.args[0],
             )
 
+    def test_service_readiness_requires_managed_searxng_health(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._wait_for_service_http = mock.Mock(return_value=True)
+            manager._wait_for_agent_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_http = mock.Mock(return_value=True)
+            manager._wait_for_searxng_http = mock.Mock(return_value=False)
+            manager._raise_service_failed = mock.Mock(
+                side_effect=DeploymentError("not ready")
+            )
+
+            with self.assertRaisesRegex(DeploymentError, "not ready"):
+                manager.wait_for_service_ready(host="127.0.0.1", port=8765)
+
+            manager._wait_for_searxng_http.assert_called_once()
+            self.assertIn(
+                "SearXNG search health endpoint",
+                manager._raise_service_failed.call_args.args[0],
+            )
+
+    def test_service_readiness_gives_searxng_an_independent_cold_start_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._wait_for_service_http = mock.Mock(return_value=True)
+            manager._wait_for_agent_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_liveness_http = mock.Mock(return_value=True)
+            manager._wait_for_searxng_http = mock.Mock(return_value=True)
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment.time.monotonic",
+                    side_effect=[100.0, 125.0, 126.0],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.searxng_ready_timeout_seconds",
+                    return_value=300,
+                ),
+            ):
+                manager.wait_for_service_ready(host="127.0.0.1", port=8765)
+
+            self.assertEqual(
+                manager._wait_for_searxng_http.call_args_list[0].kwargs["deadline"],
+                425.0,
+            )
+            self.assertEqual(manager._wait_for_service_http.call_count, 2)
+            self.assertEqual(manager._wait_for_agent_http.call_count, 2)
+            manager._wait_for_camofox_http.assert_called_once()
+            manager._wait_for_camofox_liveness_http.assert_called_once()
+            self.assertEqual(manager._wait_for_searxng_http.call_count, 2)
+            self.assertEqual(
+                manager._wait_for_searxng_http.call_args_list[1].kwargs["deadline"],
+                136.0,
+            )
+            self.assertEqual(
+                manager._wait_for_service_http.call_args.kwargs["deadline"],
+                136.0,
+            )
+
+    def test_service_readiness_rechecks_platform_after_slow_searxng_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            manager._wait_for_service_http = mock.Mock(
+                side_effect=[True, False]
+            )
+            manager._wait_for_agent_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_http = mock.Mock(return_value=True)
+            manager._wait_for_camofox_liveness_http = mock.Mock(return_value=True)
+            manager._wait_for_searxng_http = mock.Mock(return_value=True)
+            manager._raise_service_failed = mock.Mock(
+                side_effect=DeploymentError("not ready")
+            )
+
+            with self.assertRaisesRegex(DeploymentError, "not ready"):
+                manager.wait_for_service_ready(host="127.0.0.1", port=8765)
+
+            self.assertEqual(manager._wait_for_service_http.call_count, 2)
+            self.assertIn(
+                "stopped while",
+                manager._raise_service_failed.call_args.args[0],
+            )
+
     def test_camofox_readiness_uses_runtime_capability_probe_and_skips_when_disabled(self):
         with tempfile.TemporaryDirectory() as td:
             paths = DeploymentPaths.from_root(Path(td), data_dir=Path(td) / "state")
@@ -671,6 +780,167 @@ class DeploymentTests(unittest.TestCase):
                 )
             disabled._probe_camofox_capability.assert_not_called()
             disabled.close.assert_called_once_with()
+
+    def test_final_camofox_recheck_uses_lightweight_loopback_liveness(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(
+                Path(td),
+                data_dir=Path(td) / "state",
+            )
+            paths.data_dir.mkdir(parents=True)
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            runtime = mock.Mock()
+            runtime._managed_camofox_enabled.return_value = True
+            runtime._effective_camofox_url.return_value = "http://localhost:9377"
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment.PlatformRuntimeManager",
+                    return_value=runtime,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment._probe_camofox_service_health",
+                    side_effect=[False, True],
+                ) as probe,
+                mock.patch("enterprise_agent_platform.deployment.time.sleep"),
+            ):
+                ready = manager._wait_for_camofox_liveness_http(
+                    host="127.0.0.1",
+                    port=8765,
+                    deadline=time.monotonic() + 30,
+                )
+
+            self.assertTrue(ready)
+            self.assertEqual(probe.call_count, 2)
+            probe.assert_called_with("http://127.0.0.1:9377/health")
+            runtime._probe_camofox_capability.assert_not_called()
+            runtime.close.assert_called_once_with()
+
+    def test_search_readiness_uses_platform_owned_health_for_managed_and_external_modes(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(
+                Path(td),
+                data_dir=Path(td) / "state",
+            )
+            manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_MANAGE_SEARXNG": "1",
+                        "ENTERPRISE_SEARXNG_API_URL": "http://127.0.0.1:14567",
+                    },
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment._probe_json_health",
+                    side_effect=[False, True],
+                ) as probe,
+                mock.patch("enterprise_agent_platform.deployment.time.sleep"),
+            ):
+                ready = manager._wait_for_searxng_http(
+                    host="127.0.0.1",
+                    port=8765,
+                    deadline=time.monotonic() + 30,
+                )
+
+            self.assertTrue(ready)
+            self.assertEqual(
+                probe.call_args_list,
+                [
+                    mock.call(
+                        "http://127.0.0.1:8765/healthz/search",
+                        expected_service="ubitech-agent-search",
+                    ),
+                    mock.call(
+                        "http://127.0.0.1:8765/healthz/search",
+                        expected_service="ubitech-agent-search",
+                    ),
+                ],
+            )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"ENTERPRISE_MANAGE_SEARXNG": "0"},
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment._probe_json_health",
+                    return_value=True,
+                ) as external_probe,
+            ):
+                self.assertTrue(
+                    manager._wait_for_searxng_http(
+                        host="127.0.0.1",
+                        port=8765,
+                        deadline=time.monotonic(),
+                    )
+                )
+            external_probe.assert_called_once_with(
+                "http://127.0.0.1:8765/healthz/search",
+                expected_service="ubitech-agent-search",
+            )
+
+            with (
+                mock.patch(
+                    "enterprise_agent_platform.deployment._probe_json_health",
+                    return_value=False,
+                ) as unavailable_probe,
+            ):
+                self.assertFalse(
+                    manager._wait_for_searxng_http(
+                        host="127.0.0.1",
+                        port=8765,
+                        deadline=time.monotonic(),
+                    )
+                )
+            unavailable_probe.assert_called_once()
+
+    def test_json_health_bypasses_proxies_only_for_loopback_targets(self):
+        payload = b'{"status":"ok","service":"ubitech-agent-runtime"}'
+
+        def response():
+            value = mock.MagicMock()
+            value.status = 200
+            value.headers = {"Content-Type": "application/json"}
+            value.read.return_value = payload
+            value.__enter__.return_value = value
+            return value
+
+        with (
+            mock.patch(
+                "enterprise_agent_platform.deployment.open_loopback_url",
+                return_value=response(),
+            ) as loopback_open,
+            mock.patch(
+                "enterprise_agent_platform.deployment.urllib.request.urlopen",
+            ) as external_open,
+        ):
+            self.assertTrue(
+                _probe_json_health(
+                    "http://127.0.0.1:8766/health",
+                    expected_service="ubitech-agent-runtime",
+                )
+            )
+        loopback_open.assert_called_once()
+        external_open.assert_not_called()
+
+        with (
+            mock.patch(
+                "enterprise_agent_platform.deployment.open_loopback_url",
+            ) as loopback_open,
+            mock.patch(
+                "enterprise_agent_platform.deployment.urllib.request.urlopen",
+                return_value=response(),
+            ) as external_open,
+        ):
+            self.assertTrue(
+                _probe_json_health(
+                    "https://runtime.example.test/health",
+                    expected_service="ubitech-agent-runtime",
+                )
+            )
+        loopback_open.assert_not_called()
+        external_open.assert_called_once()
 
     def test_existing_service_data_directory_is_discovered_from_unit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1112,12 +1382,66 @@ class DeploymentTests(unittest.TestCase):
             root = Path(td)
             paths = DeploymentPaths.from_root(root)
 
-            env = runtime_env(paths, host="127.0.0.1", port=9999)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_MANAGE_SEARXNG": "0",
+                    "ENTERPRISE_SEARXNG_API_URL": "http://127.0.0.1:14567",
+                    "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": "7.5",
+                    "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": "420",
+                },
+            ):
+                env = runtime_env(paths, host="127.0.0.1", port=9999)
 
             self.assertEqual(env["ENTERPRISE_AGENT_RUNTIME_HOME"], str(paths.data_dir / "runtimes" / "agent"))
             self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(root / "cognee"))
             self.assertEqual(env["ENTERPRISE_FIRECRAWL_REPO"], str(root / "firecrawl"))
+            self.assertEqual(env["ENTERPRISE_MANAGE_SEARXNG"], "0")
+            self.assertEqual(
+                env["ENTERPRISE_SEARXNG_API_URL"],
+                "http://127.0.0.1:14567",
+            )
+            self.assertEqual(env["ENTERPRISE_SEARXNG_TIMEOUT_SECONDS"], "7.5")
+            self.assertEqual(env["ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS"], "420")
             self.assertEqual(env["ENTERPRISE_PLATFORM_PORT"], "9999")
+
+    def test_runtime_env_normalizes_empty_searxng_values_consistently(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = DeploymentPaths.from_root(Path(td))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_MANAGE_SEARXNG": "",
+                    "ENTERPRISE_SEARXNG_API_URL": " ",
+                    "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": "",
+                    "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": " ",
+                },
+            ):
+                env = runtime_env(paths, host="127.0.0.1", port=8765)
+
+            self.assertEqual(env["ENTERPRISE_MANAGE_SEARXNG"], "0")
+            self.assertEqual(
+                env["ENTERPRISE_SEARXNG_API_URL"],
+                "http://127.0.0.1:13003",
+            )
+            self.assertEqual(env["ENTERPRISE_SEARXNG_TIMEOUT_SECONDS"], "20")
+            self.assertEqual(
+                env["ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS"],
+                "300",
+            )
+
+    def test_searxng_ready_timeout_is_configurable_with_safe_default(self):
+        with mock.patch.dict(
+            os.environ,
+            {"ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": "420"},
+        ):
+            self.assertEqual(searxng_ready_timeout_seconds(), 420)
+        for invalid in ("0", "-1", "not-a-number"):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                os.environ,
+                {"ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": invalid},
+            ):
+                self.assertEqual(searxng_ready_timeout_seconds(), 300)
 
     def test_deploy_script_exposes_one_command_entrypoint(self):
         script = Path(__file__).resolve().parents[2] / "deploy.sh"

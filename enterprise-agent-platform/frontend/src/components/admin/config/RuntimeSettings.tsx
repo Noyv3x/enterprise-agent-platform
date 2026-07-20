@@ -27,6 +27,17 @@ function runtimeStateLabel(t: Translator, state: string | undefined, available: 
   }
 }
 
+function runtimeNameLabel(t: Translator, name: string): string {
+  switch (name) {
+    case "agent":
+      return t("admin.runtime.agentName");
+    case "searxng":
+      return t("admin.runtime.searxngName");
+    default:
+      return name;
+  }
+}
+
 function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
   const store = useStoreHandle();
   const { t } = useI18n();
@@ -45,7 +56,7 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
         <div className="runtime-row__title">
           <span className={cx("dot", runtime.available ? "dot--pulse" : "dot--off")} />
           <span className="runtime-row__name">
-            {runtime.name === "agent" ? t("admin.runtime.agentName") : runtime.name}
+            {runtimeNameLabel(t, runtime.name)}
           </span>
           <StatusBadge
             ok={!!runtime.available}

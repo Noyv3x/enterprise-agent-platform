@@ -7,11 +7,11 @@
 - `enterprise-agent-platform/`：Python Web 服务、React 界面、测试与部署代码。
 - `enterprise-agent-platform/agent-runtime/`：基于 Pi Core 的平台自有 Node.js Agent 运行时，负责模型循环、工具、会话、记忆、审批与委派。
 - `cognee/`：可选知识图谱后端的 Git submodule。
-- `firecrawl/`：托管网页搜索与抓取运行时的 Git submodule。
+- `firecrawl/`：托管网页读取与抓取运行时的 Git submodule；网页搜索由平台独立管理的本地 SearXNG 服务提供。
 
 ## 快速开始
 
-需要 Python 3.11+。部署脚本会优先使用已有的 Node.js 22.19+ 与 npm；缺少兼容版本时，会在数据目录中校验并安装锁定版本。若启用托管 Firecrawl，还需要 Docker Compose。
+需要 Python 3.11+。部署脚本会优先使用已有的 Node.js 22.19+ 与 npm；缺少兼容版本时，会在数据目录中校验并安装锁定版本。默认启用的本地 SearXNG 以及托管 Firecrawl 需要较新的 Docker Compose（须支持 `docker compose up --wait`）。
 
 ```bash
 git clone --recurse-submodules https://github.com/Noyv3x/enterprise-agent-platform.git
@@ -25,7 +25,7 @@ cd enterprise-agent-platform
 git submodule update --init --recursive
 ```
 
-打开 `http://127.0.0.1:8765`。部署脚本会创建根目录 `.venv`、安装平台包、构建锁定依赖的 Agent 运行时、准备 Cognee/Firecrawl 状态，并通过 user-level systemd 或前台模式启动服务。
+打开 `http://127.0.0.1:8765`。部署脚本会创建根目录 `.venv`、安装平台包、构建锁定依赖的 Agent 运行时、准备 Cognee/Firecrawl/SearXNG 状态，并通过 user-level systemd 或前台模式启动服务。
 
 如果系统缺少 Python venv 支持且脚本无法自动安装：
 

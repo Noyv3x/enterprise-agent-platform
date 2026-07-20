@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -37,7 +38,8 @@ except ImportError:  # pragma: no cover - managed Camoufox currently targets Lin
 
 from .config import PlatformConfig
 from .db import now_ts
-from .secure_fs import ensure_private_directory
+from .loopback_http import build_loopback_opener
+from .secure_fs import ensure_private_directory, ensure_private_file
 
 
 AGENT_SETTING_MANAGED = "agent_runtime_manage"
@@ -107,6 +109,16 @@ FIRECRAWL_POSTGRES_IMAGE = "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29
 FIRECRAWL_REDIS_IMAGE = "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005"
 FIRECRAWL_RABBITMQ_IMAGE = "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
 FIRECRAWL_FOUNDATIONDB_IMAGE = "foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48"
+# SearXNG 2026.7.19-6da6eee26 multi-architecture manifest (amd64, arm64,
+# arm/v7). Keep the platform-owned search runtime immutable, matching the
+# digest-pinning policy used by other managed container runtimes.
+SEARXNG_IMAGE = "ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812"
+SEARXNG_COMPOSE_FILE = "docker-compose.ubitech.yaml"
+SEARXNG_LOOPBACK_PUBLISH = "127.0.0.1:13003"
+SEARXNG_LOOPBACK_URL = "http://127.0.0.1:13003"
+SEARXNG_COMPOSE_WAIT_MIN_SECONDS = 120
+SEARXNG_COMPOSE_CAPABILITY_CACHE_SECONDS = 30.0
+SEARXNG_COMPOSE_CAPABILITY_TIMEOUT_SECONDS = 15.0
 FIRECRAWL_SERVICE_IMAGES = (
     ("api", FIRECRAWL_IMAGE),
     ("playwright-service", FIRECRAWL_PLAYWRIGHT_IMAGE),
@@ -230,6 +242,18 @@ class RuntimeStatus:
         }
 
 
+@dataclass(frozen=True)
+class _SearXNGStateSnapshot:
+    generation: int
+    pid: int | None
+    process_running: bool
+    returncode: int | None
+    launch_confirmed: bool
+    teardown_owned: bool
+    last_error: str
+    last_started_at: int | None
+
+
 class PlatformRuntimeManager:
     """Prepare and supervise the runtimes owned by the platform."""
 
@@ -248,19 +272,29 @@ class PlatformRuntimeManager:
         self.command_runner = command_runner or SubprocessCommandRunner()
         self.setting_provider = setting_provider
         self._lock = threading.RLock()
+        self._searxng_state_lock = threading.RLock()
+        self._searxng_state_generation = 0
+        self._searxng_compose_capability_lock = threading.Lock()
+        self._searxng_compose_capability_checked_at = 0.0
+        self._searxng_compose_capability_error = ""
         self._agent_process: ProcessLike | None = None
         self._camofox_process: ProcessLike | None = None
+        self._searxng_process: ProcessLike | None = None
         self._firecrawl_process: ProcessLike | None = None
+        self._searxng_compose_teardown: tuple[list[str], Path | None] | None = None
+        self._searxng_launch_confirmed = False
         # When Firecrawl was launched via the managed `docker compose up` stack,
         # remember the (compose argv, cwd) needed to tear it down so stop/close
         # can run `docker compose down` instead of orphaning the containers.
         self._firecrawl_compose_teardown: tuple[list[str], Path | None] | None = None
         self._agent_last_started_at: int | None = None
         self._camofox_last_started_at: int | None = None
+        self._searxng_last_started_at: int | None = None
         self._firecrawl_last_started_at: int | None = None
         self._agent_last_error = ""
         self._cognee_last_error = ""
         self._camofox_last_error = ""
+        self._searxng_last_error = ""
         self._firecrawl_last_error = ""
         self._camofox_capability_verified = False
         self._camofox_capability_verified_at = 0.0
@@ -272,6 +306,11 @@ class PlatformRuntimeManager:
         self._status_cache_checked_at = 0.0
         self._status_cache_generation = 0
         self._status_refresh_thread: threading.Thread | None = None
+        self._searxng_status_cache_lock = threading.Lock()
+        self._searxng_status_cache: dict[str, Any] | None = None
+        self._searxng_status_cache_checked_at = 0.0
+        self._searxng_status_cache_generation = 0
+        self._searxng_status_refresh_thread: threading.Thread | None = None
         self._closed = False
 
     def prepare(self) -> dict[str, Any]:
@@ -279,11 +318,13 @@ class PlatformRuntimeManager:
             agent = self.prepare_agent_runtime()
             cognee = self.prepare_cognee()
             camofox = self.prepare_camofox()
+            searxng = self.prepare_searxng()
             firecrawl = self.prepare_firecrawl()
             return {
                 "agent": agent.to_dict(),
                 "cognee": cognee.to_dict(),
                 "camofox": camofox.to_dict(),
+                "searxng": searxng.to_dict(),
                 "firecrawl": firecrawl.to_dict(),
             }
 
@@ -293,22 +334,26 @@ class PlatformRuntimeManager:
             # concurrently keeps one unhealthy optional runtime from adding its
             # timeout to every other runtime, and none of the network I/O holds
             # the broad lifecycle lock used by start/stop operations.
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="runtime-health") as executor:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="runtime-health") as executor:
                 agent_future = executor.submit(self.agent_runtime_status, refresh=True)
                 camofox_future = executor.submit(self.camofox_status, refresh=True)
+                searxng_future = executor.submit(self.searxng_status, refresh=True)
                 firecrawl_future = executor.submit(self.firecrawl_status, refresh=True)
                 agent = agent_future.result()
                 camofox = camofox_future.result()
+                searxng = searxng_future.result()
                 firecrawl = firecrawl_future.result()
         else:
             agent = self.agent_runtime_status(refresh=False)
             camofox = self.camofox_status(refresh=False)
+            searxng = self.searxng_status(refresh=False)
             firecrawl = self.firecrawl_status(refresh=False)
         cognee = self.cognee_status()
         return {
             "agent": agent.to_dict(),
             "cognee": cognee.to_dict(),
             "camofox": camofox.to_dict(),
+            "searxng": searxng.to_dict(),
             "firecrawl": firecrawl.to_dict(),
         }
 
@@ -317,12 +362,19 @@ class PlatformRuntimeManager:
 
         now = time.time()
         with self._status_cache_lock:
+            if self._status_cache is None:
+                # The no-I/O snapshot is cheap, but it still needs to be
+                # materialized under the cache lock. Otherwise a burst of
+                # first requests can all observe ``None`` and independently
+                # rebuild the same initial snapshot before the background
+                # health refresh has a chance to commit.
+                self._status_cache = deepcopy(self.status(refresh=False))
             snapshot = deepcopy(self._status_cache)
             checked_at = self._status_cache_checked_at
-            stale = snapshot is None or now - checked_at >= max(0.0, float(max_age_seconds))
+            stale = checked_at <= 0 or now - checked_at >= max(
+                0.0, float(max_age_seconds)
+            )
             refresh_running = self._status_refresh_thread is not None
-        if snapshot is None:
-            snapshot = self.status(refresh=False)
         if stale and not refresh_running:
             self.refresh_status_async()
         return {
@@ -347,12 +399,77 @@ class PlatformRuntimeManager:
             self._status_refresh_thread = thread
             thread.start()
 
+    def cached_searxng_status(
+        self,
+        *,
+        max_age_seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        """Return a low-cost SearXNG-only snapshot with single-flight refresh."""
+
+        now = time.time()
+        with self._searxng_status_cache_lock:
+            if self._searxng_status_cache is None:
+                self._searxng_status_cache = (
+                    self.searxng_status(refresh=False).to_dict()
+                )
+            snapshot = deepcopy(self._searxng_status_cache)
+            checked_at = self._searxng_status_cache_checked_at
+            stale = checked_at <= 0 or now - checked_at >= max(
+                0.0, float(max_age_seconds)
+            )
+            refresh_running = self._searxng_status_refresh_thread is not None
+        if stale and not refresh_running:
+            self._refresh_searxng_status_async()
+        return {
+            **snapshot,
+            "checked_at": int(checked_at) if checked_at > 0 else None,
+            "stale": stale,
+        }
+
+    def _refresh_searxng_status_async(self) -> None:
+        with self._searxng_status_cache_lock:
+            if self._closed or self._searxng_status_refresh_thread is not None:
+                return
+            generation = self._searxng_status_cache_generation
+            thread = threading.Thread(
+                target=self._refresh_searxng_status_cache,
+                args=(generation,),
+                name="searxng-status-refresh",
+                daemon=True,
+            )
+            self._searxng_status_refresh_thread = thread
+            thread.start()
+
+    def _refresh_searxng_status_cache(self, generation: int) -> None:
+        try:
+            snapshot = self.searxng_status(refresh=True).to_dict()
+            checked_at = time.time()
+            with self._searxng_status_cache_lock:
+                if (
+                    not self._closed
+                    and generation == self._searxng_status_cache_generation
+                ):
+                    self._searxng_status_cache = deepcopy(snapshot)
+                    self._searxng_status_cache_checked_at = checked_at
+        except Exception:
+            pass
+        finally:
+            with self._searxng_status_cache_lock:
+                if (
+                    self._searxng_status_refresh_thread
+                    is threading.current_thread()
+                ):
+                    self._searxng_status_refresh_thread = None
+
     def invalidate_status_cache(self) -> None:
         """Mark the current snapshot stale after a runtime lifecycle mutation."""
 
         with self._status_cache_lock:
             self._status_cache_generation += 1
             self._status_cache_checked_at = 0.0
+        with self._searxng_status_cache_lock:
+            self._searxng_status_cache_generation += 1
+            self._searxng_status_cache_checked_at = 0.0
 
     def _refresh_status_cache(self, generation: int) -> None:
         try:
@@ -1124,11 +1241,413 @@ class PlatformRuntimeManager:
             source=self._camofox_source_label(),
         )
 
+    def prepare_searxng(self) -> RuntimeStatus:
+        runtime_dir = self._searxng_runtime_dir()
+        if not self._managed_searxng_enabled():
+            return self.searxng_status(refresh=True)
+        ensure_private_directory(runtime_dir)
+        ensure_private_directory(runtime_dir / "logs")
+        ensure_private_directory(runtime_dir / "config")
+        ensure_private_directory(runtime_dir / "cache")
+        url_error = self._searxng_loopback_url_error()
+        if url_error:
+            self._set_searxng_last_error(url_error)
+            return RuntimeStatus(
+                "searxng",
+                True,
+                False,
+                "invalid_config",
+                path=str(runtime_dir),
+                url=self._effective_searxng_api_url(),
+                error=url_error,
+                source=SEARXNG_IMAGE,
+            )
+        self._ensure_searxng_config()
+        capability_error = self._searxng_compose_wait_support_error()
+        if capability_error:
+            self._set_searxng_last_error(capability_error)
+            return RuntimeStatus(
+                "searxng",
+                True,
+                False,
+                "missing",
+                path=str(runtime_dir),
+                url=self._effective_searxng_api_url(),
+                error=capability_error,
+                source=SEARXNG_IMAGE,
+                install_state="missing",
+            )
+        command, cwd, detail = self._searxng_command()
+        available = bool(command)
+        self._set_searxng_last_error("" if available else detail)
+        with self._searxng_state_lock:
+            last_started_at = self._searxng_last_started_at
+        return RuntimeStatus(
+            "searxng",
+            True,
+            available,
+            "prepared" if available else "missing",
+            detail=detail if available else "",
+            path=str(cwd or runtime_dir),
+            url=self._effective_searxng_api_url(),
+            error="" if available else detail,
+            last_started_at=last_started_at,
+            source=SEARXNG_IMAGE,
+            install_state="ready" if available else "missing",
+        )
+
+    def ensure_searxng_ready(self, *, wait: bool = True) -> RuntimeStatus:
+        started = False
+        try:
+            if not self._managed_searxng_enabled():
+                return self.searxng_status(refresh=True)
+            with self._lock:
+                prepared = self.prepare_searxng()
+                if not prepared.available:
+                    return prepared
+            current = self.searxng_status(refresh=True)
+            if current.available:
+                return current
+            with self._lock:
+                with self._searxng_state_lock:
+                    process = self._searxng_process
+                    tracked_process_running = (
+                        process is not None and process.poll() is None
+                    )
+                    launch_confirmed = self._searxng_launch_confirmed
+                if not tracked_process_running and not launch_confirmed:
+                    # Containers using restart: unless-stopped can outlive an
+                    # unclean platform restart. Re-run Compose even when the
+                    # endpoint is already healthy so pinned configuration is
+                    # reconciled and this manager regains teardown ownership.
+                    started = True
+                    self.invalidate_status_cache()
+                    self._start_searxng()
+                with self._searxng_state_lock:
+                    started_process = self._searxng_process
+                should_wait = wait
+            if should_wait:
+                return self._wait_for_runtime("searxng", started_process)
+            return self.searxng_status(refresh=True)
+        finally:
+            if started:
+                self.invalidate_status_cache()
+
+    @invalidates_runtime_status_cache
+    def restart_searxng(self) -> RuntimeStatus:
+        with self._lock:
+            stopped = self.stop_searxng()
+            with self._searxng_state_lock:
+                teardown_pending = self._searxng_compose_teardown is not None
+            if teardown_pending:
+                return stopped
+        return self.ensure_searxng_ready(wait=True)
+
+    @invalidates_runtime_status_cache
+    def stop_searxng(self) -> RuntimeStatus:
+        with self._lock:
+            # ``compose up --detach --wait`` may still be pulling or waiting.
+            # Stop and reap that client before ``compose down``; otherwise the
+            # down command can inspect an empty project and return just before
+            # the still-running up command creates the service.
+            self._stop_searxng_compose_up_process()
+            self._teardown_searxng_compose()
+            return self.searxng_status(refresh=False)
+
+    def _stop_searxng_compose_up_process(self) -> None:
+        with self._searxng_state_lock:
+            process = self._searxng_process
+            changed = process is not None or self._searxng_launch_confirmed
+            self._searxng_process = None
+            self._searxng_launch_confirmed = False
+            if changed:
+                self._searxng_state_generation += 1
+        if process is not None:
+            self._terminate_process(process, timeout=12)
+
+    def _teardown_searxng_compose(self) -> None:
+        with self._searxng_state_lock:
+            teardown = self._searxng_compose_teardown
+        if teardown is None:
+            return
+        down_command, cwd = teardown
+        log_path = self._searxng_runtime_dir() / "logs" / "managed-searxng.log"
+        try:
+            result = self.command_runner.run(
+                down_command,
+                cwd=cwd,
+                env=self._searxng_compose_env(),
+                log_path=log_path,
+                timeout=self._searxng_compose_down_timeout(),
+            )
+            if result.returncode != 0:
+                self._set_searxng_last_error(
+                    "SearXNG compose teardown failed with exit code "
+                    f"{result.returncode}; see {log_path}"
+                )
+                return
+        except Exception as exc:
+            self._set_searxng_last_error(
+                f"SearXNG compose teardown failed: {exc}"
+            )
+            return
+        with self._searxng_state_lock:
+            if self._searxng_compose_teardown != teardown:
+                return
+            self._searxng_last_error = ""
+            self._searxng_compose_teardown = None
+            self._searxng_launch_confirmed = False
+            self._searxng_state_generation += 1
+
+    @staticmethod
+    def _searxng_compose_down_timeout() -> float:
+        raw = os.environ.get("ENTERPRISE_SEARXNG_COMPOSE_DOWN_TIMEOUT_SECONDS")
+        if raw:
+            try:
+                return max(1.0, float(raw))
+            except ValueError:
+                pass
+        return 90.0
+
+    def _searxng_compose_wait_support_error(self) -> str:
+        """Return an actionable error when Compose cannot prove service readiness."""
+
+        with self._searxng_compose_capability_lock:
+            now = time.monotonic()
+            if (
+                self._searxng_compose_capability_checked_at > 0
+                and now - self._searxng_compose_capability_checked_at
+                < SEARXNG_COMPOSE_CAPABILITY_CACHE_SECONDS
+            ):
+                return self._searxng_compose_capability_error
+
+            log_path = (
+                self._searxng_runtime_dir()
+                / "logs"
+                / "managed-searxng.log"
+            )
+            command = [
+                "docker",
+                "compose",
+                "up",
+                "--detach",
+                "--wait",
+                "--wait-timeout",
+                "1",
+                "--help",
+            ]
+            try:
+                result = self.command_runner.run(
+                    command,
+                    cwd=self._searxng_runtime_dir(),
+                    env=self._searxng_compose_env(),
+                    log_path=log_path,
+                    timeout=SEARXNG_COMPOSE_CAPABILITY_TIMEOUT_SECONDS,
+                )
+                if result.returncode == 0:
+                    error = ""
+                else:
+                    error = (
+                        "Docker Compose with `up --wait` support is required "
+                        "for managed SearXNG; update Docker Compose "
+                        f"(capability check exited with {result.returncode}; "
+                        f"see {log_path})"
+                    )
+            except Exception as exc:
+                error = (
+                    "Docker Compose with `up --wait` support is required "
+                    f"for managed SearXNG: {exc}"
+                )
+            self._searxng_compose_capability_checked_at = time.monotonic()
+            self._searxng_compose_capability_error = error
+            return error
+
+    def _set_searxng_last_error(self, error: str) -> None:
+        with self._searxng_state_lock:
+            if self._searxng_last_error == error:
+                return
+            self._searxng_last_error = error
+            self._searxng_state_generation += 1
+
+    def searxng_status(self, *, refresh: bool = True) -> RuntimeStatus:
+        runtime_dir = self._searxng_runtime_dir()
+        if not self._managed_searxng_enabled():
+            url_error = self._searxng_loopback_url_error(managed=False)
+            healthy = not url_error and (
+                self._probe_searxng_health() if refresh else False
+            )
+            error = (
+                url_error
+                or (
+                    "External SearXNG search API is not reachable"
+                    if refresh and not healthy
+                    else ""
+                )
+            )
+            return RuntimeStatus(
+                "searxng",
+                False,
+                healthy,
+                "running" if healthy else "external",
+                (
+                    "External SearXNG search API is reachable"
+                    if healthy
+                    else "External SearXNG search API is not managed by the platform"
+                ),
+                path=str(runtime_dir),
+                url=self._effective_searxng_api_url(),
+                error=error,
+                source="external",
+            )
+
+        command, cwd, detail = self._searxng_command()
+        snapshot = self._searxng_state_snapshot()
+        healthy = False
+        if refresh:
+            # Health I/O intentionally runs without either the broad lifecycle
+            # lock or the SearXNG state lock. Re-snapshot afterwards so a
+            # concurrent stop/restart cannot publish readiness from the state
+            # that existed before the probe began.
+            for _attempt in range(2):
+                probed_healthy = self._probe_searxng_health()
+                latest = self._searxng_state_snapshot()
+                if latest == snapshot:
+                    healthy = probed_healthy
+                    snapshot = latest
+                    break
+                snapshot = latest
+
+        return self._searxng_status_from_snapshot(
+            snapshot,
+            healthy=healthy,
+            command=command,
+            cwd=cwd,
+            detail=detail,
+            runtime_dir=runtime_dir,
+        )
+
+    def _searxng_state_snapshot(self) -> _SearXNGStateSnapshot:
+        with self._searxng_state_lock:
+            pid, process_running, returncode = self._process_state(
+                self._searxng_process
+            )
+            if (
+                returncode == 0
+                and self._searxng_compose_teardown is not None
+            ):
+                # ``docker compose up --detach --wait`` exits successfully only
+                # after the generated project owns a healthy service. Until
+                # this point, an unrelated process on the configured port must
+                # never satisfy readiness.
+                self._searxng_launch_confirmed = True
+                self._searxng_process = None
+                self._searxng_last_error = ""
+                self._searxng_state_generation += 1
+                pid = None
+                process_running = False
+                returncode = None
+            return _SearXNGStateSnapshot(
+                generation=self._searxng_state_generation,
+                pid=pid,
+                process_running=process_running,
+                returncode=returncode,
+                launch_confirmed=self._searxng_launch_confirmed,
+                teardown_owned=self._searxng_compose_teardown is not None,
+                last_error=self._searxng_last_error,
+                last_started_at=self._searxng_last_started_at,
+            )
+
+    def _searxng_status_from_snapshot(
+        self,
+        snapshot: _SearXNGStateSnapshot,
+        *,
+        healthy: bool,
+        command: list[str],
+        cwd: Path | None,
+        detail: str,
+        runtime_dir: Path,
+    ) -> RuntimeStatus:
+        exited = self._process_exit_error(
+            "SearXNG",
+            snapshot.returncode,
+            runtime_dir / "logs" / "managed-searxng.log",
+        )
+        ownership_error = exited or (
+            snapshot.last_error if not snapshot.process_running else ""
+        )
+        if healthy and snapshot.launch_confirmed and not ownership_error:
+            return RuntimeStatus(
+                "searxng",
+                True,
+                True,
+                "running",
+                "SearXNG search API is reachable",
+                pid=snapshot.pid,
+                url=self._effective_searxng_api_url(),
+                path=str(cwd or runtime_dir),
+                last_started_at=snapshot.last_started_at,
+                source=SEARXNG_IMAGE,
+                install_state="ready",
+            )
+        if ownership_error:
+            return RuntimeStatus(
+                "searxng",
+                True,
+                False,
+                "error",
+                ownership_error,
+                pid=snapshot.pid,
+                url=self._effective_searxng_api_url(),
+                path=str(cwd or runtime_dir),
+                error=ownership_error,
+                last_started_at=snapshot.last_started_at,
+                source=SEARXNG_IMAGE,
+                install_state="ready" if command else "missing",
+            )
+        if snapshot.process_running or snapshot.launch_confirmed:
+            return RuntimeStatus(
+                "searxng",
+                True,
+                False,
+                "starting",
+                (
+                    "SearXNG Compose project is ready; API health check is not ready yet"
+                    if snapshot.launch_confirmed
+                    else "SearXNG Compose project is starting"
+                ),
+                pid=snapshot.pid,
+                url=self._effective_searxng_api_url(),
+                path=str(cwd or runtime_dir),
+                error=snapshot.last_error,
+                last_started_at=snapshot.last_started_at,
+                source=SEARXNG_IMAGE,
+                install_state="ready",
+            )
+        state = "prepared" if command else "missing"
+        runtime_detail = (
+            "SearXNG is prepared but not running" if command else detail
+        )
+        error = snapshot.last_error if command else detail
+        return RuntimeStatus(
+            "searxng",
+            True,
+            False,
+            state,
+            runtime_detail,
+            pid=snapshot.pid,
+            url=self._effective_searxng_api_url(),
+            path=str(cwd or runtime_dir),
+            error=error,
+            last_started_at=snapshot.last_started_at,
+            source=SEARXNG_IMAGE,
+            install_state="ready" if command else "missing",
+        )
+
     def prepare_firecrawl(self) -> RuntimeStatus:
         if not self._managed_firecrawl_enabled():
             return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
-        self.config.firecrawl_runtime_dir.mkdir(parents=True, exist_ok=True)
-        (self.config.firecrawl_runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.config.firecrawl_runtime_dir)
+        ensure_private_directory(self.config.firecrawl_runtime_dir / "logs")
         url_error = self._managed_loopback_url_error("Firecrawl", self._effective_firecrawl_api_url())
         if url_error:
             self._firecrawl_last_error = url_error
@@ -1295,18 +1814,24 @@ class PlatformRuntimeManager:
         )
 
     def ensure_managed_tooling_ready(self, *, wait: bool = False) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "camofox": self.ensure_camofox_ready(wait=wait).to_dict(),
-                "firecrawl": self.ensure_firecrawl_ready(wait=wait).to_dict(),
-            }
+        # Each lifecycle method owns its own synchronization. Keeping the
+        # broad lock here would accidentally retain it across their health
+        # probes and cold-start waits.
+        return {
+            "camofox": self.ensure_camofox_ready(wait=wait).to_dict(),
+            "searxng": self.ensure_searxng_ready(wait=wait).to_dict(),
+            "firecrawl": self.ensure_firecrawl_ready(wait=wait).to_dict(),
+        }
 
     def close(self) -> None:
         with self._status_cache_lock:
             self._closed = True
+        with self._searxng_status_cache_lock:
+            self._closed = True
         self.stop_agent_runtime()
         self.stop_camofox()
         self.stop_firecrawl()
+        self.stop_searxng()
 
     def _start_camofox(self) -> None:
         command, cwd, detail = self._camofox_command()
@@ -1362,6 +1887,78 @@ class PlatformRuntimeManager:
             self._camofox_last_error = str(exc)
             self._camofox_process = None
 
+    def _start_searxng(self) -> None:
+        command, cwd, detail = self._searxng_command()
+        if not command:
+            self._set_searxng_last_error(detail)
+            return
+        teardown = self._searxng_compose_teardown_command(command, cwd)
+        log_path = self._searxng_runtime_dir() / "logs" / "managed-searxng.log"
+        try:
+            process = self.process_launcher.start(
+                command,
+                cwd=cwd,
+                env=self._searxng_compose_env(),
+                log_path=log_path,
+            )
+            with self._searxng_state_lock:
+                self._searxng_process = process
+                self._searxng_launch_confirmed = False
+                self._searxng_last_started_at = now_ts()
+                self._searxng_last_error = ""
+                self._searxng_compose_teardown = teardown
+                self._searxng_state_generation += 1
+        except Exception as exc:
+            with self._searxng_state_lock:
+                self._searxng_last_error = str(exc)
+                self._searxng_process = None
+                self._searxng_launch_confirmed = False
+                # The deterministic managed project may already exist from an
+                # unclean platform restart even when launching the new Compose
+                # command fails. Keep its down command so stop/restart can
+                # still clean up or retry management of that project.
+                self._searxng_compose_teardown = teardown
+                self._searxng_state_generation += 1
+
+    def _searxng_compose_env(self) -> dict[str, str]:
+        env = _scrubbed_process_env()
+        # The generated Compose file contains the validated literal loopback
+        # publication. Remove similarly named host variables as defense in
+        # depth so neither Compose interpolation nor future image changes can
+        # silently replace that boundary.
+        for key in (
+            "SEARXNG_ENDPOINT",
+            "SEARXNG_PORT",
+            "SEARXNG_BIND_ADDRESS",
+            "UBITECH_SEARXNG_PUBLISH",
+        ):
+            env.pop(key, None)
+        env.update(
+            {
+                "DOCKER_BUILDKIT": env.get("DOCKER_BUILDKIT") or "1",
+                "COMPOSE_DOCKER_CLI_BUILD": env.get("COMPOSE_DOCKER_CLI_BUILD")
+                or "1",
+                "UBITECH_SEARXNG_PUBLISH": self._searxng_loopback_publish(),
+            }
+        )
+        return env
+
+    @staticmethod
+    def _searxng_compose_teardown_command(
+        up_command: list[str],
+        cwd: Path | None,
+    ) -> tuple[list[str], Path | None] | None:
+        if up_command[:2] != ["docker", "compose"]:
+            return None
+        try:
+            up_index = up_command.index("up")
+        except ValueError:
+            return None
+        return (
+            ["docker", *up_command[1:up_index], "down", "--remove-orphans"],
+            cwd,
+        )
+
     def _start_firecrawl(self) -> None:
         command, cwd, detail = self._firecrawl_command()
         if not command:
@@ -1372,6 +1969,13 @@ class PlatformRuntimeManager:
         self._ensure_firecrawl_env()
         env = os.environ.copy()
         teardown = self._firecrawl_compose_teardown_command(command, cwd)
+        if teardown is not None:
+            # Search is a separate platform runtime. Do not let stale host
+            # values reconnect the default managed Firecrawl Compose stack's
+            # optional upstream SearXNG integration. Preserve the environment
+            # contract of an explicitly configured custom command.
+            env.pop("SEARXNG_ENDPOINT", None)
+            env.pop("SEARXNG_PORT", None)
         api_port = str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002)
         env.update({
             "DOCKER_BUILDKIT": env.get("DOCKER_BUILDKIT") or "1",
@@ -1472,9 +2076,19 @@ class PlatformRuntimeManager:
     def _wait_for_runtime(self, name: str, process: ProcessLike | None = None) -> RuntimeStatus:
         # Snapshot the launched process handle so the busy-poll does not need the
         # broad lock held; default to the current handle for direct callers.
-        process_attr = "_camofox_process" if name == "camofox" else "_firecrawl_process"
+        process_attrs = {
+            "camofox": "_camofox_process",
+            "searxng": "_searxng_process",
+            "firecrawl": "_firecrawl_process",
+        }
+        status_fns = {
+            "camofox": self.camofox_status,
+            "searxng": self.searxng_status,
+            "firecrawl": self.firecrawl_status,
+        }
+        process_attr = process_attrs[name]
         proc = process if process is not None else getattr(self, process_attr)
-        status_fn = self.camofox_status if name == "camofox" else self.firecrawl_status
+        status_fn = status_fns[name]
         deadline = time.monotonic() + self._runtime_startup_wait_seconds(name)
         while time.monotonic() < deadline:
             status = status_fn(refresh=True)
@@ -1897,6 +2511,11 @@ class PlatformRuntimeManager:
     def _ensure_firecrawl_env(self) -> Path:
         env_path = self._firecrawl_env_path()
         values = _read_env_file(env_path)
+        changed = False
+        for stale_key in ("SEARXNG_ENDPOINT", "SEARXNG_PORT"):
+            if stale_key in values:
+                values.pop(stale_key, None)
+                changed = True
         port = str(urllib.parse.urlparse(self._effective_firecrawl_api_url()).port or 3002)
         defaults = {
             "PORT": f"127.0.0.1:{port}",
@@ -1904,18 +2523,216 @@ class PlatformRuntimeManager:
             "USE_DB_AUTHENTICATION": "false",
             "BULL_AUTH_KEY": self._firecrawl_bull_auth_key(),
         }
-        changed = False
         for key, value in defaults.items():
             # PORT/HOST are managed security boundaries and must also repair
             # files generated by older releases. Secrets remain stable once
             # materialized.
-            if (key in {"PORT", "HOST"} and values.get(key) != value) or not values.get(key):
+            if (
+                key in {
+                    "PORT",
+                    "HOST",
+                }
+                and values.get(key) != value
+            ) or not values.get(key):
                 values[key] = value
                 changed = True
         if changed or not env_path.exists():
             env_path.parent.mkdir(parents=True, exist_ok=True)
             _write_env_file(env_path, values)
         return env_path
+
+    def _searxng_runtime_dir(self) -> Path:
+        return self.config.runtime_dir / "searxng"
+
+    def _searxng_command(self) -> tuple[list[str], Path | None, str]:
+        runtime_dir = self._searxng_runtime_dir()
+        url_error = self._searxng_loopback_url_error()
+        if url_error:
+            return ([], runtime_dir, url_error)
+        compose_path = self._ensure_searxng_compose()
+        return (
+            [
+                "docker",
+                "compose",
+                "--project-name",
+                self._searxng_compose_project(),
+                "-f",
+                str(compose_path),
+                "up",
+                "--detach",
+                "--wait",
+                "--wait-timeout",
+                str(self._searxng_compose_wait_timeout()),
+                "--no-build",
+                "--pull",
+                "missing",
+            ],
+            runtime_dir,
+            f"platform-managed SearXNG compose stack: {runtime_dir}",
+        )
+
+    def _searxng_compose_wait_timeout(self) -> int:
+        return max(
+            SEARXNG_COMPOSE_WAIT_MIN_SECONDS,
+            math.ceil(self._runtime_startup_wait_seconds("searxng")),
+        )
+
+    def _searxng_compose_project(self) -> str:
+        runtime_key = os.fsencode(str(self._searxng_runtime_dir().resolve()))
+        suffix = hashlib.sha256(runtime_key).hexdigest()[:16]
+        return f"ubitech-searxng-{suffix}"
+
+    def _ensure_searxng_compose(self) -> Path:
+        runtime_dir = ensure_private_directory(self._searxng_runtime_dir())
+        ensure_private_directory(runtime_dir / "logs")
+        config_dir = ensure_private_directory(runtime_dir / "config")
+        cache_dir = ensure_private_directory(runtime_dir / "cache")
+        self._ensure_searxng_config()
+        compose_path = runtime_dir / SEARXNG_COMPOSE_FILE
+        ensure_private_file(compose_path)
+        published_port = self._searxng_loopback_publish()
+        text = "\n".join(
+            (
+                "# Generated by ubitech agent for the managed local runtime.",
+                "# The host publication is a validated literal loopback address.",
+                "services:",
+                "  searxng:",
+                f"    image: {SEARXNG_IMAGE}",
+                "    restart: unless-stopped",
+                "    environment:",
+                '      FORCE_OWNERSHIP: "false"',
+                "    ports:",
+                f"      - {json.dumps(published_port + ':8080')}",
+                "    volumes:",
+                f"      - {json.dumps(str(config_dir) + ':/etc/searxng:ro')}",
+                f"      - {json.dumps(str(cache_dir) + ':/var/cache/searxng')}",
+                "    healthcheck:",
+                "      test:",
+                '        - "CMD"',
+                '        - "wget"',
+                '        - "--quiet"',
+                '        - "--tries=1"',
+                '        - "--spider"',
+                '        - "http://127.0.0.1:8080/healthz"',
+                "      interval: 10s",
+                "      timeout: 3s",
+                "      retries: 12",
+                "      start_period: 20s",
+                "",
+            )
+        )
+        try:
+            if compose_path.read_text(encoding="utf-8") == text:
+                compose_path.chmod(0o600)
+                return compose_path
+        except OSError:
+            pass
+        _write_text_secure(compose_path, text)
+        return compose_path
+
+    def _ensure_searxng_config(self) -> Path:
+        runtime_dir = ensure_private_directory(self._searxng_runtime_dir())
+        config_dir = ensure_private_directory(runtime_dir / "config")
+        ensure_private_directory(runtime_dir / "cache")
+        settings_path = config_dir / "settings.yml"
+        ensure_private_file(settings_path)
+        secret = self._searxng_secret_key(runtime_dir)
+        text = "\n".join(
+            (
+                "# Generated by ubitech agent. Manual changes are overwritten.",
+                "use_default_settings: true",
+                "",
+                "server:",
+                f"  secret_key: {json.dumps(secret)}",
+                "  limiter: false",
+                "  public_instance: false",
+                "  image_proxy: false",
+                "",
+                "search:",
+                "  formats:",
+                "    - json",
+                "",
+            )
+        )
+        try:
+            if settings_path.read_text(encoding="utf-8") == text:
+                settings_path.chmod(0o600)
+                return settings_path
+        except OSError:
+            pass
+        _write_text_secure(settings_path, text)
+        return settings_path
+
+    @staticmethod
+    def _searxng_secret_key(runtime_dir: Path) -> str:
+        path = runtime_dir / "secret-key"
+        ensure_private_file(path)
+        try:
+            current = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            current = ""
+        if len(current) >= 32:
+            return current
+        value = secrets.token_urlsafe(48)
+        _write_text_secure(path, value + "\n")
+        return value
+
+    def searxng_loopback_url(self) -> str:
+        """Return the host-only endpoint exposed by the managed sidecar."""
+
+        return self._effective_searxng_api_url()
+
+    def _effective_searxng_api_url(self) -> str:
+        return str(
+            getattr(self.config, "searxng_api_url", SEARXNG_LOOPBACK_URL)
+            or SEARXNG_LOOPBACK_URL
+        ).strip().rstrip("/")
+
+    def _searxng_loopback_url_error(self, *, managed: bool = True) -> str:
+        url = self._effective_searxng_api_url()
+        error = self._managed_loopback_url_error("SearXNG", url)
+        if error:
+            return error
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+            if port is None:
+                return "Managed SearXNG URL must contain an explicit loopback port"
+            if not 1 <= port <= 65535:
+                return "Managed SearXNG URL loopback port must be between 1 and 65535"
+        except ValueError:
+            return "Managed SearXNG URL must contain a valid loopback port"
+        try:
+            if not ipaddress.ip_address(str(parsed.hostname or "")).is_loopback:
+                return "SearXNG URL must use a literal loopback IP address"
+        except ValueError:
+            return "SearXNG URL must use a literal loopback IP address"
+        if managed and parsed.scheme != "http":
+            return "Managed SearXNG URL must use http on its private loopback listener"
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return (
+                "Managed SearXNG URL must be a loopback base URL without "
+                "credentials, path, query or fragment"
+            )
+        return ""
+
+    def _searxng_loopback_publish(self) -> str:
+        parsed = urllib.parse.urlsplit(self._effective_searxng_api_url())
+        host = str(parsed.hostname or "127.0.0.1").strip("[]")
+        if host.lower() in {"localhost", "localhost.localdomain"}:
+            host = "127.0.0.1"
+        port = parsed.port
+        if port is None or not 1 <= port <= 65535:
+            raise ValueError("Managed SearXNG URL must contain a valid port")
+        if ":" in host:
+            host = f"[{host}]"
+        return f"{host}:{port}"
 
     def _firecrawl_bull_auth_key(self) -> str:
         for key in ("FIRECRAWL_BULL_AUTH_KEY", "BULL_AUTH_KEY"):
@@ -2132,6 +2949,38 @@ class PlatformRuntimeManager:
             lambda payload: payload.get("status") == "ok" or payload.get("message") == "Firecrawl API",
         )
 
+    def _probe_searxng_health(self) -> bool:
+        try:
+            request = urllib.request.Request(
+                self._effective_searxng_api_url().rstrip("/") + "/healthz",
+                headers={"Accept": "text/plain"},
+                method="GET",
+            )
+            opener = self._searxng_health_opener()
+            with opener.open(request, timeout=0.8) as response:
+                if not 200 <= response.status < 300:
+                    return False
+                # Require SearXNG's exact health marker so an unrelated HTTP
+                # process occupying the configured port cannot report this
+                # independent runtime as healthy.
+                body = response.read(256)
+            return body.strip() == b"OK"
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ):
+            return False
+
+    @staticmethod
+    def _searxng_health_opener():
+        # Proxy environment variables must never reroute a loopback health
+        # request, and redirects must not let a process on the configured port
+        # borrow another endpoint's health response.
+        return build_loopback_opener()
+
     @staticmethod
     def _probe_json_health(base_url: str, paths: tuple[str, ...], validator) -> bool:
         base = base_url.rstrip("/")
@@ -2190,6 +3039,9 @@ class PlatformRuntimeManager:
             return self.config.manage_firecrawl
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _managed_searxng_enabled(self) -> bool:
+        return bool(getattr(self.config, "manage_searxng", True))
+
     def _platform_internal_url(self) -> str:
         """Return the direct platform listener used by the managed sidecar.
 
@@ -2212,10 +3064,10 @@ class PlatformRuntimeManager:
     def _runtime_startup_wait_seconds(self, name: str) -> float:
         """Warm-up budget for the heavier managed runtimes.
 
-        Camofox (npx package + browser download) and Firecrawl
-        (``docker compose up --pull missing`` over multi-hundred-MB images) take
-        long enough to need larger defaults than the general runtime startup
-        budget. Per-runtime environment overrides take precedence.
+        Camofox (npx package + browser download), SearXNG and Firecrawl
+        (``docker compose up --pull missing``) take long enough to need larger
+        defaults than the general runtime startup budget. Per-runtime
+        environment overrides take precedence.
         """
         env_key = f"ENTERPRISE_{name.upper()}_STARTUP_WAIT_SECONDS"
         raw = os.environ.get(env_key)
@@ -2250,6 +3102,11 @@ class PlatformRuntimeManager:
 
     def _effective_firecrawl_api_url(self) -> str:
         return (self._runtime_setting(FIRECRAWL_SETTING_API_URL) or self.config.firecrawl_api_url or "http://127.0.0.1:3002").strip().rstrip("/")
+
+    def firecrawl_loopback_url(self) -> str:
+        """Return the effective Firecrawl endpoint used by platform tools."""
+
+        return self._effective_firecrawl_api_url()
 
     def _effective_firecrawl_command(self) -> str:
         return self._runtime_setting(FIRECRAWL_SETTING_COMMAND) or self.config.firecrawl_command

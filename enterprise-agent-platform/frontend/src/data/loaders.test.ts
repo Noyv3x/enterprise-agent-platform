@@ -74,6 +74,7 @@ describe("loadRuntime", () => {
       agent: { name: "agent", state, status_stale: stale },
       cognee: { name: "cognee", state, status_stale: stale },
       camofox: { name: "camofox", state, status_stale: stale },
+      searxng: { name: "searxng", state, status_stale: stale },
       firecrawl: { name: "firecrawl", state, status_stale: stale },
     });
     const fetchMock = vi.fn()
@@ -91,10 +92,12 @@ describe("loadRuntime", () => {
 
     await loadRuntime(store);
     expect(store.getState().runtimes?.agent?.state).toBe("starting");
+    expect(store.getState().runtimes?.searxng?.state).toBe("starting");
 
     await vi.advanceTimersByTimeAsync(1_500);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(store.getState().runtimes?.agent?.state).toBe("running");
+    expect(store.getState().runtimes?.searxng?.state).toBe("running");
 
     clearRuntimeStatusRefresh(store);
     vi.useRealTimers();

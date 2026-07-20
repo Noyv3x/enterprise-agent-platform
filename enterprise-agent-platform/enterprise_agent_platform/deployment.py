@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -33,6 +34,7 @@ from .gateway import (
     read_gateway_state,
     request_gateway_reload,
 )
+from .loopback_http import open_loopback_url
 from .runtimes import PlatformRuntimeManager
 from .secure_fs import ensure_private_directory
 
@@ -43,6 +45,8 @@ DEFAULT_PIP_NETWORK_RETRIES = 8
 DEFAULT_PIP_TIMEOUT_SECONDS = 120
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
+DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS = 300
+FINAL_READINESS_RECHECK_SECONDS = 10
 AUTO_UPDATE_SOURCE_PID_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_PID"
 AUTO_UPDATE_SOURCE_MODE_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"
 MINIMUM_NODE_VERSION = (22, 19)
@@ -749,6 +753,61 @@ class DeploymentManager:
             raise DeploymentError("the refreshed Pi Agent runtime did not become ready")
         if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
             raise DeploymentError("the refreshed managed Camoufox browser did not become ready")
+        searxng_deadline = (
+            time.monotonic() + searxng_ready_timeout_seconds()
+        )
+        if not self._wait_for_searxng_http(
+            host=host,
+            port=port,
+            deadline=searxng_deadline,
+        ):
+            raise DeploymentError("the refreshed managed SearXNG search service did not become ready")
+        final_deadline = time.monotonic() + FINAL_READINESS_RECHECK_SECONDS
+        if not self._wait_for_service_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            raise DeploymentError(
+                "the refreshed platform backend stopped while SearXNG was starting"
+            )
+        if not self._wait_for_agent_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            raise DeploymentError(
+                "the refreshed Pi Agent runtime stopped while SearXNG was starting"
+            )
+        if not self._wait_for_camofox_liveness_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            raise DeploymentError(
+                "the refreshed Camoufox browser stopped while SearXNG was starting"
+            )
+        if not self._wait_for_searxng_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            raise DeploymentError(
+                "the refreshed SearXNG search service stopped during final readiness checks"
+            )
+        final_state = read_gateway_state(self.paths.data_dir)
+        if not (
+            gateway_process_is_live(final_state)
+            and bool((final_state or {}).get("backend_ready"))
+            and int((final_state or {}).get("generation") or 0) > previous_generation
+            and int((final_state or {}).get("exec_generation") or 0)
+            > previous_exec_generation
+            and str((final_state or {}).get("code_signature") or "")
+            == expected_code_signature
+        ):
+            raise DeploymentError(
+                "the refreshed platform gateway stopped while SearXNG was starting"
+            )
 
     def _foreground_update_source_pid(self) -> int | None:
         """Return the authenticated handoff candidate supplied by auto-update."""
@@ -796,6 +855,60 @@ class DeploymentManager:
                 raise DeploymentError("the detached Pi Agent runtime did not become ready")
             if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
                 raise DeploymentError("the detached managed Camoufox browser did not become ready")
+            searxng_deadline = (
+                time.monotonic() + searxng_ready_timeout_seconds()
+            )
+            if not self._wait_for_searxng_http(
+                host=host,
+                port=port,
+                deadline=searxng_deadline,
+            ):
+                raise DeploymentError("the detached managed SearXNG search service did not become ready")
+            final_deadline = time.monotonic() + FINAL_READINESS_RECHECK_SECONDS
+            if not self._wait_for_service_http(
+                host=host,
+                port=port,
+                deadline=final_deadline,
+            ):
+                raise DeploymentError(
+                    "the detached platform backend stopped while SearXNG was starting"
+                )
+            if not self._wait_for_agent_http(
+                host=host,
+                port=port,
+                deadline=final_deadline,
+            ):
+                raise DeploymentError(
+                    "the detached Pi Agent runtime stopped while SearXNG was starting"
+                )
+            if not self._wait_for_camofox_liveness_http(
+                host=host,
+                port=port,
+                deadline=final_deadline,
+            ):
+                raise DeploymentError(
+                    "the detached Camoufox browser stopped while SearXNG was starting"
+                )
+            if not self._wait_for_searxng_http(
+                host=host,
+                port=port,
+                deadline=final_deadline,
+            ):
+                raise DeploymentError(
+                    "the detached SearXNG search service stopped during final readiness checks"
+                )
+            final_state = read_gateway_state(self.paths.data_dir)
+            if (
+                process.poll() is not None
+                or not gateway_process_is_live(final_state)
+                or int((final_state or {}).get("pid") or 0) != process.pid
+                or not bool((final_state or {}).get("backend_ready"))
+                or str((final_state or {}).get("code_signature") or "")
+                != expected_signature
+            ):
+                raise DeploymentError(
+                    "the detached platform gateway stopped while SearXNG was starting"
+                )
         except BaseException:
             self._terminate_detached_gateway(process)
             raise
@@ -1024,8 +1137,72 @@ class DeploymentManager:
             self._raise_service_failed("the Pi Agent runtime health endpoint did not become ready")
         if not self._wait_for_camofox_http(host=host, port=port, deadline=deadline):
             self._raise_service_failed("the managed Camoufox browser capability did not become ready")
+        searxng_deadline = (
+            time.monotonic() + searxng_ready_timeout_seconds()
+        )
+        if not self._wait_for_searxng_http(
+            host=host,
+            port=port,
+            deadline=searxng_deadline,
+        ):
+            self._raise_service_failed("the managed SearXNG search health endpoint did not become ready")
+        final_deadline = time.monotonic() + FINAL_READINESS_RECHECK_SECONDS
+        if not self._wait_for_service_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            self._raise_service_failed(
+                "the platform stopped while the managed SearXNG search service was starting"
+            )
+        if not self._wait_for_agent_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            self._raise_service_failed(
+                "the Pi Agent runtime stopped while the managed SearXNG search service was starting"
+            )
+        if not self._wait_for_camofox_liveness_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            self._raise_service_failed(
+                "the Camoufox browser stopped while the managed SearXNG search service was starting"
+            )
+        if not self._wait_for_searxng_http(
+            host=host,
+            port=port,
+            deadline=final_deadline,
+        ):
+            self._raise_service_failed(
+                "the SearXNG search service stopped during final readiness checks"
+            )
+        final_state = self.runner.run(
+            ["systemctl", "--user", "is-active", self.paths.service_name],
+            timeout=20,
+            check=False,
+        )
+        if final_state.returncode != 0:
+            self._raise_service_failed(
+                "the systemd unit stopped while the managed SearXNG search service was starting"
+            )
 
     def _wait_for_service_http(self, *, host: str, port: int, deadline: float) -> bool:
+        while True:
+            url = self._platform_health_url(
+                host=host,
+                port=port,
+                path="/healthz",
+            )
+            if url and _probe_json_health(url, expected_service="ubitech-agent-platform"):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+    def _platform_health_url(self, *, host: str, port: int, path: str) -> str:
         gateway_state = read_gateway_state(self.paths.data_dir)
         if gateway_process_is_live(gateway_state):
             backend_host = str((gateway_state or {}).get("backend_host") or "")
@@ -1033,31 +1210,20 @@ class DeploymentManager:
                 backend_port = int((gateway_state or {}).get("backend_port") or 0)
             except (TypeError, ValueError):
                 backend_port = 0
-            if not bool((gateway_state or {}).get("backend_ready")) or not backend_host or backend_port <= 0:
-                url = ""
-            else:
-                url = _loopback_http_url(backend_host, backend_port) + "/healthz"
+            if (
+                not bool((gateway_state or {}).get("backend_ready"))
+                or not backend_host
+                or backend_port <= 0
+            ):
+                return ""
+            base_url = _loopback_http_url(backend_host, backend_port)
         else:
             env = runtime_env(self.paths, host=host, port=port)
-            url = _loopback_http_url(
+            base_url = _loopback_http_url(
                 env["ENTERPRISE_PLATFORM_HOST"],
                 int(env["ENTERPRISE_PLATFORM_PORT"]),
-            ) + "/healthz"
-        while True:
-            if url and _probe_json_health(url, expected_service="ubitech-agent-platform"):
-                return True
-            gateway_state = read_gateway_state(self.paths.data_dir)
-            if gateway_process_is_live(gateway_state) and bool((gateway_state or {}).get("backend_ready")):
-                backend_host = str((gateway_state or {}).get("backend_host") or "")
-                try:
-                    backend_port = int((gateway_state or {}).get("backend_port") or 0)
-                except (TypeError, ValueError):
-                    backend_port = 0
-                if backend_host and backend_port > 0:
-                    url = _loopback_http_url(backend_host, backend_port) + "/healthz"
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.5)
+            )
+        return base_url + path
 
     def _wait_for_agent_http(self, *, host: str, port: int, deadline: float) -> bool:
         config = self._platform_config(host=host, port=port)
@@ -1116,6 +1282,64 @@ class DeploymentManager:
                 time.sleep(0.5)
         finally:
             runtimes.close()
+
+    def _wait_for_camofox_liveness_http(
+        self,
+        *,
+        host: str,
+        port: int,
+        deadline: float,
+    ) -> bool:
+        """Recheck the Camoufox API without repeating the expensive browser exercise."""
+
+        config = self._platform_config(host=host, port=port)
+        snapshot = _read_settings_snapshot(config.db_path)
+
+        def setting_provider(key: str) -> str | None:
+            found = snapshot.get(key)
+            return str(found[0]) if found else None
+
+        runtimes = PlatformRuntimeManager(
+            config,
+            lambda _key: "",
+            setting_provider=setting_provider,
+        )
+        try:
+            if not runtimes._managed_camofox_enabled():
+                return True
+            url = _loopback_base_url(runtimes._effective_camofox_url()) + "/health"
+            while True:
+                if _probe_camofox_service_health(url):
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.5)
+        finally:
+            runtimes.close()
+
+    def _wait_for_searxng_http(self, *, host: str, port: int, deadline: float) -> bool:
+        """Wait for platform-confirmed search readiness.
+
+        The platform endpoint verifies both the SearXNG API and, for a managed
+        instance, successful ownership of the generated Compose project. This
+        prevents an older process occupying the configured port from satisfying
+        deployment readiness.
+        """
+
+        while True:
+            health_url = self._platform_health_url(
+                host=host,
+                port=port,
+                path="/healthz/search",
+            )
+            if health_url and _probe_json_health(
+                health_url,
+                expected_service="ubitech-agent-search",
+            ):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
 
     def _raise_service_failed(self, reason: str) -> None:
         tail = self._service_log_tail()
@@ -1187,12 +1411,34 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         effective_port = int(settings.get("platform_port") or port)
     except ValueError:
         effective_port = port
+    raw_manage_searxng = os.getenv("ENTERPRISE_MANAGE_SEARXNG")
+    manage_searxng = (
+        "1"
+        if raw_manage_searxng is None
+        or raw_manage_searxng.strip().lower() in {"1", "true", "yes", "on"}
+        else "0"
+    )
+    searxng_api_url = (
+        os.getenv("ENTERPRISE_SEARXNG_API_URL", "").strip()
+        or "http://127.0.0.1:13003"
+    )
+    searxng_timeout = (
+        os.getenv("ENTERPRISE_SEARXNG_TIMEOUT_SECONDS", "").strip() or "20"
+    )
+    searxng_startup_wait = (
+        os.getenv("ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS", "").strip()
+        or str(DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS)
+    )
     values = {
         "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
         "ENTERPRISE_SERVICE_NAME": paths.service_name,
         "ENTERPRISE_AGENT_RUNTIME_HOME": str(paths.data_dir / "runtimes" / "agent"),
         "ENTERPRISE_COGNEE_REPO": str(paths.cognee_repo),
         "ENTERPRISE_FIRECRAWL_REPO": str(paths.firecrawl_repo),
+        "ENTERPRISE_MANAGE_SEARXNG": manage_searxng,
+        "ENTERPRISE_SEARXNG_API_URL": searxng_api_url,
+        "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": searxng_timeout,
+        "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": searxng_startup_wait,
         "ENTERPRISE_PLATFORM_HOST": effective_host,
         "ENTERPRISE_PLATFORM_PORT": str(effective_port),
         "ENTERPRISE_PUBLIC_BASE_URL": settings.get("platform_public_base_url") or DeploymentManager.public_url(effective_host, effective_port),
@@ -1243,9 +1489,9 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
         f"ExecStart={exec_start}",
         "Restart=on-failure",
         "RestartSec=5",
-        # Give the platform room to bring managed runtimes (Agent/Firecrawl)
-        # up and down; the default 90s stop window can be too short to stop
-        # them gracefully, which would otherwise escalate to SIGKILL.
+        # Give the platform room to bring managed runtimes (Agent, SearXNG,
+        # Firecrawl) up and down; the default 90s stop window can be too short
+        # to stop them gracefully, which would otherwise escalate to SIGKILL.
         f"TimeoutStopSec={service_stop_timeout_seconds()}",
         "",
         "[Install]",
@@ -1490,6 +1736,13 @@ def service_stop_timeout_seconds() -> int:
     )
 
 
+def searxng_ready_timeout_seconds() -> int:
+    return positive_int_env(
+        "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS",
+        DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS,
+    )
+
+
 def _current_username() -> str:
     try:
         return getpass.getuser()
@@ -1611,7 +1864,12 @@ def _probe_json_health(
 ) -> bool:
     try:
         request = urllib.request.Request(url, headers=headers or {}, method="GET")
-        with urllib.request.urlopen(request, timeout=1.0) as response:
+        opener = (
+            open_loopback_url
+            if _url_has_loopback_host(url)
+            else urllib.request.urlopen
+        )
+        with opener(request, timeout=1.0) as response:
             if response.status != 200:
                 return False
             content_type = str(response.headers.get("Content-Type") or "").lower()
@@ -1638,9 +1896,59 @@ def _probe_json_health(
         return False
 
 
+def _probe_camofox_service_health(url: str) -> bool:
+    """Require the exact lightweight Camoufox health marker on loopback."""
+
+    try:
+        if not _url_has_loopback_host(url):
+            return False
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with open_loopback_url(request, timeout=1.0) as response:
+            if response.status != 200:
+                return False
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "application/json" not in content_type:
+                return False
+            body = response.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                return False
+        payload = json.loads(body.decode("utf-8"))
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("ok") is True
+            and payload.get("engine") == "camoufox"
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
+def _url_has_loopback_host(url: str) -> bool:
+    try:
+        hostname = str(urllib.parse.urlsplit(url).hostname or "").rstrip(".").lower()
+        return bool(hostname and ipaddress.ip_address(hostname).is_loopback)
+    except (TypeError, ValueError):
+        return False
 def _loopback_http_url(host: str, port: int) -> str:
     clean_host = str(host or "").strip()
-    if clean_host in {"", "0.0.0.0", "::", "[::]"}:
+    if clean_host.lower() in {
+        "",
+        "0.0.0.0",
+        "::",
+        "[::]",
+        "localhost",
+    }:
         clean_host = "127.0.0.1"
     if ":" in clean_host and not clean_host.startswith("["):
         clean_host = f"[{clean_host}]"
@@ -1652,7 +1960,7 @@ def _loopback_base_url(base_url: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return base_url.rstrip("/")
     hostname = parsed.hostname
-    if hostname in {"0.0.0.0", "::"}:
+    if hostname in {"0.0.0.0", "::", "localhost"}:
         hostname = "127.0.0.1"
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"

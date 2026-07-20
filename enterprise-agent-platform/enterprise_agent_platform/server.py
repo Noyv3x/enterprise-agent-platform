@@ -223,6 +223,29 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._json({"status": "ok", "service": "ubitech-agent-platform"})
                 return
+            if path == "/healthz/search":
+                if method != "GET":
+                    self._json({"error": "method not allowed"}, status=405)
+                    return
+                search_status = self.server.service.runtimes.cached_searxng_status(
+                    max_age_seconds=1.0
+                )
+                if (
+                    search_status.get("stale") is True
+                    or search_status.get("available") is not True
+                ):
+                    self._json(
+                        {
+                            "status": "unavailable",
+                            "service": "ubitech-agent-search",
+                        },
+                        status=503,
+                    )
+                    return
+                self._json(
+                    {"status": "ok", "service": "ubitech-agent-search"}
+                )
+                return
             if path == "/api/platform/update-status":
                 if method != "GET":
                     self._json({"error": "method not allowed"}, status=405)

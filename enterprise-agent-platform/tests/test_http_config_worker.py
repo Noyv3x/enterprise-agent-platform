@@ -64,6 +64,56 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                     {"status": "ok", "service": "ubitech-agent-platform"},
                 )
                 self.assertIn("application/json", response.getheader("Content-Type"))
+
+                service.runtimes.cached_searxng_status = mock.Mock(
+                    return_value={
+                        "available": True,
+                        "stale": False,
+                    }
+                )
+                conn.request("GET", "/healthz/search")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    payload,
+                    {"status": "ok", "service": "ubitech-agent-search"},
+                )
+                service.runtimes.cached_searxng_status.assert_called_once_with(
+                    max_age_seconds=1.0
+                )
+
+                service.runtimes.cached_searxng_status.return_value = {
+                    "available": False,
+                    "stale": False,
+                }
+                conn.request("GET", "/healthz/search")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 503)
+                self.assertEqual(
+                    payload,
+                    {
+                        "status": "unavailable",
+                        "service": "ubitech-agent-search",
+                    },
+                )
+
+                service.runtimes.cached_searxng_status.return_value = {
+                    "available": True,
+                    "stale": True,
+                }
+                conn.request("GET", "/healthz/search")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 503)
+                self.assertEqual(
+                    payload,
+                    {
+                        "status": "unavailable",
+                        "service": "ubitech-agent-search",
+                    },
+                )
             finally:
                 server.shutdown()
                 server.server_close()

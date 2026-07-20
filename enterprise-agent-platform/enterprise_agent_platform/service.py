@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import http.client
 import inspect
 import ipaddress
 import json
@@ -45,6 +46,7 @@ from .internal_config import (
 )
 from .jobs import DurableJob, DurableJobStore
 from .knowledge import KnowledgeBase, format_passive_suggestions
+from .loopback_http import open_loopback_url
 from .memory_security import (
     MAX_MEMORY_CANDIDATE_LENGTH,
     MEMORY_QUOTAS,
@@ -5801,7 +5803,13 @@ class EnterpriseService:
                 **cached[name],
                 **cache_metadata,
             }
-            for name in ("agent", "cognee", "camofox", "firecrawl")
+            for name in (
+                "agent",
+                "cognee",
+                "camofox",
+                "searxng",
+                "firecrawl",
+            )
         }
 
     def agent_runtime_config(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -5934,6 +5942,8 @@ class EnterpriseService:
             status = self.runtimes.restart_agent_runtime()
         elif clean == "camofox":
             status = self.runtimes.restart_camofox()
+        elif clean == "searxng":
+            status = self.runtimes.restart_searxng()
         elif clean == "firecrawl":
             status = self.runtimes.restart_firecrawl()
         elif clean == "cognee":
@@ -5961,6 +5971,12 @@ class EnterpriseService:
                 result = {
                     "runtime": self.runtimes.restart_camofox().to_dict()
                 }
+        elif clean == "searxng":
+            result = {
+                "runtime": self.runtimes.ensure_searxng_ready(
+                    wait=True
+                ).to_dict()
+            }
         elif clean == "firecrawl":
             result = {
                 "runtime": self.runtimes.ensure_firecrawl_ready(
@@ -7397,40 +7413,119 @@ class EnterpriseService:
         )
 
     def _agent_web_tool(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        base_url = self.config.firecrawl_api_url.rstrip("/")
-        headers: dict[str, str] = {}
-        api_key = self.get_secret("FIRECRAWL_API_KEY")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
         if action in {"search", "query"}:
             query = str(arguments.get("query") or "").strip()
             if not query:
                 raise ServiceError(400, "web search query is required")
-            limit = max(1, min(int(arguments.get("limit") or 5), 100))
-            payload = self._runtime_json_request(
-                base_url + "/v1/search",
-                {"query": query, "limit": limit, "scrapeOptions": {"formats": []}},
-                headers=headers,
-                timeout=60,
-            )
-            raw_results = payload.get("data") or payload.get("web") or []
-            if isinstance(raw_results, dict):
-                raw_results = raw_results.get("web") or []
-            results = []
-            for index, item in enumerate(raw_results if isinstance(raw_results, list) else []):
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url") or "")
-                if url:
-                    self._validate_external_url(url)
-                results.append({
-                    "title": str(item.get("title") or ""),
-                    "url": url,
-                    "description": str(item.get("description") or item.get("markdown") or "")[:2000],
-                    "position": index + 1,
-                })
-            return {"web": results}
+            if len(query) > 4096:
+                raise ServiceError(400, "web search query exceeds 4096 characters")
+            try:
+                limit = max(1, min(int(arguments.get("limit") or 5), 100))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "web search limit must be an integer") from exc
+            language = str(arguments.get("language") or "").strip()
+            if language and not re.fullmatch(
+                r"(?:auto|all|[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,8})?)",
+                language,
+                flags=re.IGNORECASE,
+            ):
+                raise ServiceError(400, "web search language must be auto, all, or a language code")
+
+            timeout_budget = float(self.config.searxng_timeout_seconds)
+            deadline = time.monotonic() + timeout_budget
+            results: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
+            partial_results = False
+            for page_number in range(1, 6):
+                remaining_timeout = deadline - time.monotonic()
+                if remaining_timeout <= 0:
+                    raise ServiceError(
+                        502,
+                        "managed web search request failed: request timed out",
+                    )
+                search_url = self._searxng_search_url(
+                    query,
+                    language=language,
+                    page_number=page_number,
+                )
+                try:
+                    payload = self._runtime_json_request(
+                        search_url,
+                        None,
+                        headers={},
+                        timeout=remaining_timeout,
+                        method="GET",
+                        loopback_only=True,
+                    )
+                except ServiceError as exc:
+                    raise ServiceError(
+                        502,
+                        "managed web search request failed",
+                    ) from exc
+
+                raw_results = payload.get("results")
+                if not isinstance(raw_results, list):
+                    raise ServiceError(
+                        502,
+                        "managed web search returned an invalid response: "
+                        "expected a results array",
+                    )
+                partial_results = partial_results or bool(
+                    payload.get("unresponsive_engines") or payload.get("warnings")
+                )
+                if not raw_results:
+                    break
+
+                # Search results are untrusted provider data. Bound the scan
+                # independently of the response-size limit, and skip malformed
+                # or local targets without doing DNS I/O. Actual extraction and
+                # browser navigation still apply the full DNS-aware SSRF check.
+                scan_limit = max(50, min(500, limit * 5))
+                for item in raw_results[:scan_limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or "").strip()
+                    if not url or url in seen_urls:
+                        continue
+                    if not self._safe_search_result_url(url):
+                        continue
+                    seen_urls.add(url)
+                    results.append({
+                        "title": str(item.get("title") or "")[:1000],
+                        "url": url,
+                        "description": str(
+                            item.get("content") or item.get("description") or ""
+                        )[:2000],
+                        "position": len(results) + 1,
+                    })
+                    if len(results) >= limit:
+                        break
+                if len(results) >= limit:
+                    break
+            response: dict[str, Any] = {
+                "web": results,
+                "source": "managed_search",
+            }
+            if partial_results:
+                response["warnings"] = [
+                    "Some managed search sources were unavailable; results may be incomplete."
+                ]
+            return response
         if action in {"extract", "scrape", "read"}:
+            firecrawl_url_getter = getattr(
+                getattr(self, "runtimes", None),
+                "firecrawl_loopback_url",
+                None,
+            )
+            base_url = str(
+                firecrawl_url_getter()
+                if callable(firecrawl_url_getter)
+                else self.config.firecrawl_api_url
+            ).strip().rstrip("/")
+            headers: dict[str, str] = {}
+            api_key = self.get_secret("FIRECRAWL_API_KEY")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             raw_urls = arguments.get("urls")
             if not isinstance(raw_urls, list):
                 raw_urls = [arguments.get("url")]
@@ -7463,6 +7558,130 @@ class EnterpriseService:
                 })
             return {"results": results}
         raise ServiceError(400, "web action must be search or extract")
+
+    def _searxng_search_url(
+        self,
+        query: str,
+        *,
+        language: str = "",
+        page_number: int = 1,
+    ) -> str:
+        """Build the one permitted direct-search endpoint.
+
+        SearXNG is platform-managed and intentionally loopback-only. Keeping
+        this validation next to the request prevents a configuration mistake
+        from turning the Agent gateway into a general-purpose SSRF primitive.
+        """
+
+        searxng_url_getter = getattr(
+            getattr(self, "runtimes", None),
+            "searxng_loopback_url",
+            None,
+        )
+        raw_base_url = str(
+            searxng_url_getter()
+            if callable(searxng_url_getter)
+            else self.config.searxng_api_url
+        ).strip()
+        try:
+            parsed = urllib.parse.urlsplit(raw_base_url)
+            hostname = str(parsed.hostname or "").rstrip(".").lower()
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or not hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError
+            # Accessing ``port`` also validates malformed and out-of-range
+            # values instead of leaving them for urllib to interpret.
+            if parsed.port is None:
+                raise ValueError
+            if not ipaddress.ip_address(hostname).is_loopback:
+                raise ValueError
+        except (ValueError, TypeError) as exc:
+            raise ServiceError(
+                503,
+                "managed web search is unavailable because its endpoint "
+                "configuration is invalid",
+            ) from exc
+
+        params = [
+            ("q", query),
+            ("format", "json"),
+            ("pageno", str(max(1, page_number))),
+            ("categories", "general"),
+        ]
+        if language:
+            params.append(("language", language))
+        return raw_base_url.rstrip("/") + "/search?" + urllib.parse.urlencode(params)
+
+    @staticmethod
+    def _safe_search_result_url(value: str) -> bool:
+        """Validate an unfetched result URL without unbounded DNS resolution."""
+
+        clean = str(value or "").strip()
+        if (
+            not clean
+            or len(clean) > 8192
+            or any(ord(character) < 32 or ord(character) == 127 for character in clean)
+        ):
+            return False
+        try:
+            parsed = urllib.parse.urlsplit(clean)
+            hostname = str(parsed.hostname or "").rstrip(".").lower()
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or not hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                return False
+            # Accessing the property rejects malformed and out-of-range ports.
+            _port = parsed.port
+            sensitive_keys = {
+                "access_token",
+                "api_key",
+                "apikey",
+                "auth",
+                "authorization",
+                "credential",
+                "password",
+                "secret",
+                "token",
+            }
+            if any(
+                key.lower() in sensitive_keys
+                for key, _value in urllib.parse.parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                )
+            ):
+                return False
+            try:
+                return ipaddress.ip_address(hostname).is_global
+            except ValueError:
+                pass
+            if "." not in hostname or hostname.startswith("."):
+                return False
+            if hostname == "localhost" or hostname.endswith(
+                (
+                    ".localhost",
+                    ".internal",
+                    ".lan",
+                    ".local",
+                    ".home",
+                )
+            ):
+                return False
+            return True
+        except (TypeError, ValueError):
+            return False
 
     def browser_preview(
         self,
@@ -8349,6 +8568,7 @@ class EnterpriseService:
         headers: dict[str, str],
         timeout: float,
         method: str = "POST",
+        loopback_only: bool = False,
     ) -> dict[str, Any]:
         request_headers = {"Accept": "application/json", **headers}
         data = None
@@ -8357,7 +8577,8 @@ class EnterpriseService:
             request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            open_request = open_loopback_url if loopback_only else urllib.request.urlopen
+            with open_request(request, timeout=timeout) as response:
                 raw_bytes = response.read(10 * 1024 * 1024 + 1)
                 if len(raw_bytes) > 10 * 1024 * 1024:
                     raise ServiceError(413, "managed tool JSON response exceeds 10 MiB")
@@ -8381,7 +8602,12 @@ class EnterpriseService:
                 status,
                 f"managed tool returned HTTP {exc.code}: {(safe_detail or 'request failed')[:1000]}",
             ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+        ) as exc:
             raise ServiceError(502, f"managed tool request failed: {exc}") from exc
         try:
             payload = json.loads(raw) if raw else {}

@@ -733,12 +733,51 @@ class AutoUpdateManager:
             raise RuntimeError("invalid platform host for auto-update handoff")
         if not 1 <= port <= 65535:
             raise RuntimeError("invalid platform port for auto-update handoff")
+        manage_searxng = getattr(
+            config,
+            "manage_searxng",
+            os.getenv("ENTERPRISE_MANAGE_SEARXNG", "1"),
+        )
+        if isinstance(manage_searxng, str):
+            manage_searxng_enabled = manage_searxng.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        else:
+            manage_searxng_enabled = bool(manage_searxng)
         values = {
             "ENTERPRISE_PLATFORM_DATA": str(data_dir),
             "ENTERPRISE_SERVICE_NAME": service_name,
             "ENTERPRISE_PLATFORM_HOST": host,
             "ENTERPRISE_PLATFORM_PORT": str(port),
             "ENTERPRISE_AUTO_UPDATE_STATE_FILE": str(state_path(data_dir)),
+            "ENTERPRISE_MANAGE_SEARXNG": "1" if manage_searxng_enabled else "0",
+            "ENTERPRISE_SEARXNG_API_URL": (
+                str(
+                    getattr(
+                        config,
+                        "searxng_api_url",
+                        os.getenv("ENTERPRISE_SEARXNG_API_URL", ""),
+                    )
+                ).strip()
+                or "http://127.0.0.1:13003"
+            ),
+            "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": (
+                str(
+                    getattr(
+                        config,
+                        "searxng_timeout_seconds",
+                        os.getenv("ENTERPRISE_SEARXNG_TIMEOUT_SECONDS", ""),
+                    )
+                ).strip()
+                or "20"
+            ),
+            "ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": (
+                os.getenv("ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS", "").strip()
+                or "300"
+            ),
         }
         with self._state_lock:
             if self._status.get("update_id"):

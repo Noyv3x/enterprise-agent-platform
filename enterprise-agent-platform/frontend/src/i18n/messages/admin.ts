@@ -223,8 +223,13 @@ const baseAdminMessages = defineMessages({
   "admin.secrets.set": m("设置", "Set", "設定"),
 
   "admin.runtime.title": m("底层服务", "Underlying services", "底層服務"),
-  "admin.runtime.description": m("Agent 运行时、Cognee、Camofox 与 Firecrawl 的健康状态。", "Health of the Agent runtime, Cognee, Camofox, and Firecrawl.", "Agent 執行環境、Cognee、Camofox 與 Firecrawl 的健康狀態。"),
+  "admin.runtime.description": m(
+    "Agent 运行时、Cognee、Camofox、SearXNG 搜索与 Firecrawl 网页读取服务的健康状态。",
+    "Health of the Agent runtime, Cognee, Camofox, SearXNG search, and Firecrawl web extraction.",
+    "Agent 執行環境、Cognee、Camofox、SearXNG 搜尋與 Firecrawl 網頁讀取服務的健康狀態。",
+  ),
   "admin.runtime.agentName": m("Agent 运行时", "Agent runtime", "Agent 執行環境"),
+  "admin.runtime.searxngName": m("SearXNG 搜索", "SearXNG search", "SearXNG 搜尋"),
   "admin.runtime.loading": m("正在读取运行时状态…", "Loading runtime status…", "正在讀取執行環境狀態…"),
   "admin.runtime.ready": m("就绪", "Ready", "就緒"),
   "admin.runtime.down": m("不可用", "Unavailable", "無法使用"),

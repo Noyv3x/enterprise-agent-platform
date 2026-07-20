@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import secrets
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ class PlatformConfig:
     firecrawl_repo: Path | None = None
     firecrawl_api_url: str = "http://127.0.0.1:3002"
     firecrawl_command: str = ""
+    # Web search talks directly to a private, loopback-only SearXNG instance.
+    # Firecrawl remains responsible only for scraping/extracting result pages.
+    manage_searxng: bool = True
+    searxng_api_url: str = "http://127.0.0.1:13003"
+    searxng_timeout_seconds: float = 20.0
     allow_insecure_bootstrap_password: bool = False
     trust_forwarded_headers: bool = False
     telegram_enabled: bool = False
@@ -114,6 +120,17 @@ class PlatformConfig:
             firecrawl_repo=Path(os.getenv("ENTERPRISE_FIRECRAWL_REPO", _default_repo_path(base, "firecrawl"))).expanduser(),
             firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
+            manage_searxng=_env_bool("ENTERPRISE_MANAGE_SEARXNG", True),
+            searxng_api_url=os.getenv(
+                "ENTERPRISE_SEARXNG_API_URL",
+                "http://127.0.0.1:13003",
+            ).strip().rstrip("/"),
+            searxng_timeout_seconds=_env_float(
+                "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS",
+                20.0,
+                minimum=1.0,
+                maximum=120.0,
+            ),
             allow_insecure_bootstrap_password=_env_bool("ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD", False),
             trust_forwarded_headers=_env_bool("ENTERPRISE_TRUSTED_PROXY", False),
             telegram_enabled=_env_bool("ENTERPRISE_TELEGRAM_ENABLED", False),
@@ -197,6 +214,10 @@ def _env_float(
         value = float(raw.strip())
     except ValueError as exc:
         raise ValueError(f"Invalid value for {name}: {raw!r} (expected a number)") from exc
+    if not math.isfinite(value):
+        raise ValueError(
+            f"Invalid value for {name}: {raw!r} (expected a finite number)"
+        )
     if minimum is not None and value < minimum:
         raise ValueError(f"Invalid value for {name}: {value} (must be >= {minimum})")
     if maximum is not None and value > maximum:

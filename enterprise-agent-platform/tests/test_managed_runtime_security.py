@@ -13,6 +13,7 @@ import time
 import unittest
 import zipfile
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,9 @@ from enterprise_agent_platform.runtimes import (
     FIRECRAWL_RABBITMQ_IMAGE,
     FIRECRAWL_REDIS_IMAGE,
     FIRECRAWL_SERVICE_IMAGES,
+    SEARXNG_COMPOSE_FILE,
+    SEARXNG_IMAGE,
+    SEARXNG_LOOPBACK_PUBLISH,
     PlatformRuntimeManager,
 )
 import enterprise_agent_platform.runtimes as runtime_module
@@ -41,6 +45,34 @@ from test_platform import (
 
 def _no_secret(_key: str) -> str:
     return ""
+
+
+def _start_searxng_health_server(*, redirect: bool):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz" and redirect:
+                self.send_response(302)
+                self.send_header("Location", "/redirect-target")
+                self.end_headers()
+                return
+            if self.path not in {"/healthz", "/redirect-target"}:
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = b"OK\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 
 class _FakeHTTPResponse:
@@ -1050,13 +1082,37 @@ console.log(JSON.stringify(payload));
             self.assertEqual(firecrawl.state, "invalid_config")
             self.assertIn("loopback", firecrawl.error)
 
+            for invalid_url in (
+                "http://0.0.0.0:13003",
+                "http://192.168.1.2:13003",
+                "http://localhost:13003",
+                "http://localhost.localdomain:13003",
+                "https://127.0.0.1:13003",
+                "http://127.0.0.1:0",
+                "http://127.0.0.1:65536",
+            ):
+                searxng = self._manager(
+                    tmp,
+                    config=replace(
+                        make_config(tmp),
+                        manage_searxng=True,
+                        searxng_api_url=invalid_url,
+                    ),
+                ).prepare_searxng()
+                self.assertEqual(searxng.state, "invalid_config")
+                self.assertIn("SearXNG", searxng.error)
+                self.assertIn("loopback", searxng.error)
+
     def test_firecrawl_uses_loopback_publish_and_digest_pins(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             make_fake_firecrawl_repo(tmp / "firecrawl")
             manager = self._manager(tmp)
             env_path = manager._ensure_firecrawl_env()
-            self.assertIn('PORT="127.0.0.1:13002"', env_path.read_text(encoding="utf-8"))
+            env_text = env_path.read_text(encoding="utf-8")
+            self.assertIn('PORT="127.0.0.1:13002"', env_text)
+            self.assertNotIn("SEARXNG_ENDPOINT", env_text)
+            self.assertNotIn("SEARXNG_PORT", env_text)
             override = manager._ensure_firecrawl_compose_override().read_text(encoding="utf-8")
             expected_images = (
                 FIRECRAWL_IMAGE,
@@ -1068,6 +1124,10 @@ console.log(JSON.stringify(payload));
             )
             for service, image in FIRECRAWL_SERVICE_IMAGES:
                 self.assertIn(f"  {service}:\n    image: {image}", override)
+            self.assertNotIn("searxng", override.lower())
+            self.assertNotIn('"0.0.0.0:', override)
+            self.assertNotIn("condition: service_healthy", override)
+            self.assertNotIn("http://127.0.0.1:8080/healthz", override)
             for image in expected_images:
                 repository, digest = image.rsplit("@sha256:", 1)
                 self.assertTrue(repository)
@@ -1079,12 +1139,122 @@ console.log(JSON.stringify(payload));
                 for line in override.splitlines()
                 if line.strip().startswith("image:")
             ]
-            self.assertEqual(len(override_images), len(FIRECRAWL_SERVICE_IMAGES))
+            self.assertEqual(
+                len(override_images),
+                len(FIRECRAWL_SERVICE_IMAGES),
+            )
             for image in override_images:
                 self.assertRegex(image, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 
-    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is required to merge Firecrawl config")
-    def test_firecrawl_merged_compose_uses_only_digest_pinned_images(self):
+    def test_searxng_uses_private_directories_loopback_publish_and_digest_pin(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config = replace(make_config(tmp), manage_searxng=True)
+            manager = self._manager(tmp, config=config)
+            compose_path = manager._ensure_searxng_compose()
+            override = compose_path.read_text(encoding="utf-8")
+
+            searxng_dir = config.runtime_dir / "searxng"
+            config_dir = searxng_dir / "config"
+            settings_path = config_dir / "settings.yml"
+            secret_path = searxng_dir / "secret-key"
+            cache_path = searxng_dir / "cache"
+            self.assertEqual(compose_path, searxng_dir / SEARXNG_COMPOSE_FILE)
+            self.assertEqual(stat.S_IMODE(searxng_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(config_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(compose_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(settings_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(secret_path.stat().st_mode), 0o600)
+            self.assertIn(f"    image: {SEARXNG_IMAGE}", override)
+            self.assertIn(
+                f'"{SEARXNG_LOOPBACK_PUBLISH}:8080"',
+                override,
+            )
+            self.assertNotIn("${", override)
+            self.assertNotIn("0.0.0.0", override)
+            self.assertIn(
+                f'"{config_dir}:/etc/searxng:ro"',
+                override,
+            )
+            self.assertIn(
+                f'"{cache_path}:/var/cache/searxng"',
+                override,
+            )
+            self.assertIn("http://127.0.0.1:8080/healthz", override)
+            self.assertIn("restart: unless-stopped", override)
+            repository, digest = SEARXNG_IMAGE.rsplit("@sha256:", 1)
+            self.assertTrue(repository)
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(
+                all(character in "0123456789abcdef" for character in digest)
+            )
+            settings = settings_path.read_text(encoding="utf-8")
+            self.assertIn("use_default_settings: true", settings)
+            self.assertIn("  public_instance: false", settings)
+            self.assertIn("  image_proxy: false", settings)
+            self.assertIn("  formats:\n    - json", settings)
+            self.assertNotIn("    - html", settings)
+
+    def test_searxng_compose_generation_rejects_existing_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manager = self._manager(
+                tmp,
+                config=replace(make_config(tmp), manage_searxng=True),
+            )
+            compose_path = manager._ensure_searxng_compose()
+            generated = compose_path.read_text(encoding="utf-8")
+            external = tmp / "external-compose.yaml"
+            external.write_text(generated, encoding="utf-8")
+            compose_path.unlink()
+            compose_path.symlink_to(external)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "regular non-symlink file",
+            ):
+                manager._ensure_searxng_compose()
+
+    def test_searxng_launch_scrubs_host_overrides_and_forces_loopback_publish(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            launcher = RecordingLauncher()
+            manager = self._manager(
+                tmp,
+                launcher=launcher,
+                config=replace(make_config(tmp), manage_searxng=True),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SEARXNG_ENDPOINT": "http://attacker.example:8080",
+                    "SEARXNG_PORT": "0.0.0.0:9999",
+                    "SEARXNG_BIND_ADDRESS": "0.0.0.0",
+                    "UBITECH_SEARXNG_PUBLISH": "0.0.0.0:9999",
+                },
+            ):
+                manager._start_searxng()
+
+            self.assertTrue(launcher.calls)
+            launch = launcher.calls[-1]
+            launch_env = launch["env"]
+            self.assertNotIn("SEARXNG_ENDPOINT", launch_env)
+            self.assertNotIn("SEARXNG_PORT", launch_env)
+            self.assertNotIn("SEARXNG_BIND_ADDRESS", launch_env)
+            self.assertEqual(
+                launch_env["UBITECH_SEARXNG_PUBLISH"],
+                SEARXNG_LOOPBACK_PUBLISH,
+            )
+            compose = (
+                manager._searxng_runtime_dir() / SEARXNG_COMPOSE_FILE
+            ).read_text(encoding="utf-8")
+            self.assertIn(f'"{SEARXNG_LOOPBACK_PUBLISH}:8080"', compose)
+            self.assertNotIn("0.0.0.0", compose)
+            self.assertNotIn("9999", compose)
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is required to merge runtime config")
+    def test_firecrawl_and_searxng_compose_projects_are_independent_and_pinned(self):
         compose_version = subprocess.run(
             ["docker", "compose", "version"],
             text=True,
@@ -1101,7 +1271,11 @@ console.log(JSON.stringify(payload));
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            config = replace(make_config(tmp), firecrawl_repo=repository)
+            config = replace(
+                make_config(tmp),
+                firecrawl_repo=repository,
+                manage_searxng=True,
+            )
             manager = self._manager(tmp, config=config)
             env_path = manager._ensure_firecrawl_env()
             override = manager._ensure_firecrawl_compose_override()
@@ -1138,6 +1312,191 @@ console.log(JSON.stringify(payload));
             for service, image in FIRECRAWL_SERVICE_IMAGES:
                 self.assertEqual(services[service]["image"], image)
                 self.assertRegex(image, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+            self.assertNotIn("searxng", services)
+            # Firecrawl's upstream Compose schema currently declares an empty
+            # optional search variable. The platform must not populate it or
+            # add a dependency on the independently managed search runtime.
+            self.assertFalse(
+                (services["api"].get("environment") or {}).get(
+                    "SEARXNG_ENDPOINT"
+                )
+            )
+            self.assertNotIn(
+                "searxng",
+                services["api"].get("depends_on") or {},
+            )
+
+            searxng_compose = manager._ensure_searxng_compose()
+            searxng_result = subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(searxng_compose),
+                    "config",
+                    "--format",
+                    "json",
+                ],
+                cwd=manager._searxng_runtime_dir(),
+                env=manager._searxng_compose_env(),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                searxng_result.returncode,
+                0,
+                searxng_result.stderr,
+            )
+            searxng_services = (
+                json.loads(searxng_result.stdout).get("services") or {}
+            )
+            self.assertEqual(set(searxng_services), {"searxng"})
+            searxng = searxng_services["searxng"]
+            self.assertEqual(searxng["image"], SEARXNG_IMAGE)
+            self.assertRegex(
+                searxng["image"],
+                r"^[^@\s]+@sha256:[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                searxng.get("ports"),
+                [
+                    {
+                        "mode": "ingress",
+                        "target": 8080,
+                        "published": "13003",
+                        "protocol": "tcp",
+                        "host_ip": "127.0.0.1",
+                    }
+                ],
+            )
+            self.assertEqual(
+                searxng["healthcheck"]["test"],
+                [
+                    "CMD",
+                    "wget",
+                    "--quiet",
+                    "--tries=1",
+                    "--spider",
+                    "http://127.0.0.1:8080/healthz",
+                ],
+            )
+            config_dir = manager._searxng_runtime_dir() / "config"
+            mounts = searxng.get("volumes") or []
+            self.assertEqual(len(mounts), 2)
+            mounts_by_target = {mount["target"]: mount for mount in mounts}
+            config_mount = mounts_by_target["/etc/searxng"]
+            self.assertEqual(config_mount["type"], "bind")
+            self.assertEqual(config_mount["source"], str(config_dir))
+            self.assertEqual(
+                config_mount["target"],
+                "/etc/searxng",
+            )
+            self.assertTrue(config_mount["read_only"])
+            cache_mount = mounts_by_target["/var/cache/searxng"]
+            self.assertEqual(cache_mount["type"], "bind")
+            self.assertEqual(
+                cache_mount["source"],
+                str(manager._searxng_runtime_dir() / "cache"),
+            )
+            self.assertFalse(cache_mount.get("read_only", False))
+            self.assertEqual(searxng["restart"], "unless-stopped")
+
+    def test_firecrawl_health_is_independent_of_searxng(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            with (
+                mock.patch.object(
+                    manager,
+                    "_probe_json_health",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    manager,
+                    "_probe_searxng_health",
+                    return_value=False,
+                ) as searxng_probe,
+            ):
+                self.assertTrue(manager._probe_firecrawl_health())
+                searxng_probe.assert_not_called()
+
+    def test_searxng_health_probe_requires_exact_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            response = mock.MagicMock()
+            response.status = 200
+            response.read.return_value = b"OK\n"
+            response.__enter__.return_value = response
+            response.__exit__.return_value = False
+            opener = mock.MagicMock()
+            opener.open.return_value = response
+            with mock.patch.object(
+                manager,
+                "_searxng_health_opener",
+                return_value=opener,
+            ):
+                self.assertTrue(manager._probe_searxng_health())
+            response.read.return_value = b"some other healthy service"
+            with mock.patch.object(
+                manager,
+                "_searxng_health_opener",
+                return_value=opener,
+            ):
+                self.assertFalse(manager._probe_searxng_health())
+
+    def test_searxng_health_probe_bypasses_proxy_environment(self):
+        server, thread = _start_searxng_health_server(redirect=False)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                manager = self._manager(
+                    tmp,
+                    config=replace(
+                        make_config(tmp),
+                        manage_searxng=True,
+                        searxng_api_url=(
+                            f"http://127.0.0.1:{server.server_address[1]}"
+                        ),
+                    ),
+                )
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "HTTP_PROXY": "http://127.0.0.1:1",
+                        "http_proxy": "http://127.0.0.1:1",
+                        "ALL_PROXY": "http://127.0.0.1:1",
+                        "all_proxy": "http://127.0.0.1:1",
+                        "NO_PROXY": "",
+                        "no_proxy": "",
+                    },
+                ):
+                    self.assertTrue(manager._probe_searxng_health())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_searxng_health_probe_rejects_redirects(self):
+        server, thread = _start_searxng_health_server(redirect=True)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                manager = self._manager(
+                    tmp,
+                    config=replace(
+                        make_config(tmp),
+                        manage_searxng=True,
+                        searxng_api_url=(
+                            f"http://127.0.0.1:{server.server_address[1]}"
+                        ),
+                    ),
+                )
+                self.assertFalse(manager._probe_searxng_health())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_managed_health_probe_requires_2xx_and_expected_json_shape(self):
         validator = lambda payload: payload.get("ok") is True and payload.get("engine") == "camoufox"

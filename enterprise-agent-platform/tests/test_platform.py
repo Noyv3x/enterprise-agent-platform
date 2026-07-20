@@ -562,6 +562,7 @@ def make_config(tmp: Path) -> PlatformConfig:
         cognee_dataset="enterprise_knowledge",
         cognee_ingest_background=True,
         cognee_repo=tmp / "cognee",
+        manage_searxng=False,
         firecrawl_repo=tmp / "firecrawl",
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
@@ -3868,6 +3869,7 @@ class PlatformServiceTests(unittest.TestCase):
             config = replace(
                 make_config(tmp),
                 manage_agent_runtime=False,
+                manage_searxng=True,
                 runtime_startup_wait_seconds=0,
                 camofox_command="managed-camofox-test",
             )
@@ -3878,12 +3880,32 @@ class PlatformServiceTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
                 status = service.runtime_status(admin)
                 self.assertEqual(status["camofox"]["state"], "starting")
+                self.assertEqual(status["searxng"]["state"], "starting")
                 self.assertEqual(status["firecrawl"]["state"], "starting")
                 commands = [call["cmd"] for call in launcher.calls]
                 self.assertTrue(any(cmd == ["managed-camofox-test"] for cmd in commands))
                 self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
-                firecrawl_launch = next(call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"])
+                searxng_launch = next(
+                    call
+                    for call in launcher.calls
+                    if call["cmd"][:2] == ["docker", "compose"]
+                    and "ubitech-searxng-" in " ".join(call["cmd"])
+                )
+                firecrawl_launch = next(
+                    call
+                    for call in launcher.calls
+                    if call["cmd"][:2] == ["docker", "compose"]
+                    and "docker-compose.yml" in call["cmd"]
+                )
                 override_path = config.firecrawl_runtime_dir / "docker-compose.ubitech.yaml"
+                self.assertIn(
+                    str(
+                        config.runtime_dir
+                        / "searxng"
+                        / "docker-compose.ubitech.yaml"
+                    ),
+                    searxng_launch["cmd"],
+                )
                 self.assertIn("docker-compose.yml", firecrawl_launch["cmd"])
                 self.assertIn(str(override_path), firecrawl_launch["cmd"])
                 self.assertIn("--no-build", firecrawl_launch["cmd"])
@@ -3899,9 +3921,31 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertNotIn(":latest", override_text)
 
                 service.restart_runtime(admin, "camofox")
+                service.restart_runtime(admin, "searxng")
                 service.restart_runtime(admin, "firecrawl")
                 self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"] == ["managed-camofox-test"]]), 2)
-                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"][:2] == ["docker", "compose"] and "up" in call["cmd"]]), 2)
+                self.assertGreaterEqual(
+                    len(
+                        [
+                            call
+                            for call in launcher.calls
+                            if "ubitech-searxng-" in " ".join(call["cmd"])
+                            and "up" in call["cmd"]
+                        ]
+                    ),
+                    2,
+                )
+                self.assertGreaterEqual(
+                    len(
+                        [
+                            call
+                            for call in launcher.calls
+                            if "docker-compose.yml" in call["cmd"]
+                            and "up" in call["cmd"]
+                        ]
+                    ),
+                    2,
+                )
             finally:
                 service.close()
 
@@ -3921,7 +3965,13 @@ class PlatformServiceTests(unittest.TestCase):
                         "state": "cached",
                         "available": name == "agent",
                     }
-                    for name in ("agent", "cognee", "camofox", "firecrawl")
+                    for name in (
+                        "agent",
+                        "cognee",
+                        "camofox",
+                        "searxng",
+                        "firecrawl",
+                    )
                 }
                 cached_snapshot.update(
                     {"checked_at": 1_784_600_400, "stale": False}
@@ -3948,7 +3998,13 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertEqual(
                     set(status),
-                    {"agent", "cognee", "camofox", "firecrawl"},
+                    {
+                        "agent",
+                        "cognee",
+                        "camofox",
+                        "searxng",
+                        "firecrawl",
+                    },
                 )
                 self.assertEqual(status["agent"]["state"], "cached")
                 self.assertEqual(
@@ -3965,6 +4021,43 @@ class PlatformServiceTests(unittest.TestCase):
                     1_784_600_400,
                 )
                 self.assertEqual(cached_status.call_count, 2)
+            finally:
+                service.close()
+
+    def test_searxng_runtime_actions_route_to_dedicated_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+            )
+            runtime = SimpleNamespace(
+                to_dict=lambda: {
+                    "name": "searxng",
+                    "state": "running",
+                    "available": True,
+                }
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                with (
+                    mock.patch.object(
+                        service.runtimes,
+                        "restart_searxng",
+                        return_value=runtime,
+                    ) as restart,
+                    mock.patch.object(
+                        service.runtimes,
+                        "ensure_searxng_ready",
+                        return_value=runtime,
+                    ) as ensure,
+                ):
+                    restarted = service.restart_runtime(admin, "searxng")
+                    installed = service.install_runtime(admin, "searxng")
+
+                restart.assert_called_once_with()
+                ensure.assert_called_once_with(wait=True)
+                self.assertEqual(restarted["runtime"]["name"], "searxng")
+                self.assertEqual(installed["runtime"]["state"], "running")
             finally:
                 service.close()
 

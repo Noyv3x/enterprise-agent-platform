@@ -209,6 +209,94 @@ class UpdateStateTests(unittest.TestCase):
 
 
 class AutoUpdateQueueTests(unittest.TestCase):
+    def test_deployment_handoff_preserves_disabled_searxng_configuration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".git").mkdir()
+            service = _UpdateService(root / "state")
+            service.config.manage_searxng = False
+            service.config.searxng_api_url = "http://127.0.0.1:14567"
+            service.config.searxng_timeout_seconds = 7.5
+            manager = AutoUpdateManager(service, repo_root=root)
+
+            with mock.patch.dict(
+                "os.environ",
+                {"ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": "420"},
+                clear=False,
+            ):
+                handoff = manager._deployment_handoff()
+
+            self.assertEqual(handoff["ENTERPRISE_MANAGE_SEARXNG"], "0")
+            self.assertEqual(
+                handoff["ENTERPRISE_SEARXNG_API_URL"],
+                "http://127.0.0.1:14567",
+            )
+            self.assertEqual(handoff["ENTERPRISE_SEARXNG_TIMEOUT_SECONDS"], "7.5")
+            self.assertEqual(
+                handoff["ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS"],
+                "420",
+            )
+
+    def test_systemd_update_worker_receives_custom_searxng_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".git").mkdir()
+            (root / "deploy.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            service = _UpdateService(root / "state")
+            service.config.manage_searxng = True
+            service.config.searxng_api_url = "http://127.0.0.1:15432"
+            service.config.searxng_timeout_seconds = 11.25
+            runner = mock.Mock(
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+            )
+            manager = AutoUpdateManager(service, repo_root=root, runner=runner)
+
+            with (
+                mock.patch.dict(
+                    "os.environ",
+                    {"ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS": "510"},
+                    clear=False,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.auto_update.shutil.which",
+                    return_value="/usr/bin/tool",
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.auto_update._running_under_systemd",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.auto_update._user_systemd_available",
+                    return_value=True,
+                ),
+            ):
+                command = manager._launch_update_command("test")
+
+            self.assertIn("--setenv=ENTERPRISE_MANAGE_SEARXNG=1", command)
+            self.assertIn(
+                "--setenv=ENTERPRISE_SEARXNG_API_URL=http://127.0.0.1:15432",
+                command,
+            )
+            self.assertIn(
+                "--setenv=ENTERPRISE_SEARXNG_TIMEOUT_SECONDS=11.25",
+                command,
+            )
+            self.assertIn(
+                "--setenv=ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS=510",
+                command,
+            )
+            runner.assert_called_once_with(
+                command,
+                cwd=root.resolve(),
+                timeout=30,
+                check=False,
+            )
+
     def test_stop_cancels_an_inflight_check_before_handoff(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
