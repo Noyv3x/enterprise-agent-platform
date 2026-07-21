@@ -54,33 +54,35 @@ export function KnowledgeLibraryCard() {
     <div className="knowledge-workspace">
       <section className="card knowledge-browser" aria-label={t("knowledge.library")}>
         <KnowledgeSearchForm />
-        {isSearching ? (
-          <div className="list__note">
-            <span>
-              {t("knowledge.searchResults", {
-                query: search.query,
-                count: (results ?? []).length,
-              })}
-            </span>
-            <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
-              <span>{t("knowledge.showAll")}</span>
-            </button>
-          </div>
-        ) : null}
-        <ResourceStatusView
-          resourceKey={resourceKeys.knowledgeList}
-          hasData={documents.length > 0}
-          onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store))}
-        >
-          <DocumentList
-            items={items}
-            isSearching={isSearching}
-            searchQuery={search.query}
-            loading={false}
-            selectedId={requestedId ?? selectedDocument?.id}
-            onView={handleView}
-          />
-        </ResourceStatusView>
+        <div className="knowledge-browser__content">
+          {isSearching ? (
+            <div className="list__note">
+              <span>
+                {t("knowledge.searchResults", {
+                  query: search.query,
+                  count: (results ?? []).length,
+                })}
+              </span>
+              <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
+                <span>{t("knowledge.showAll")}</span>
+              </button>
+            </div>
+          ) : null}
+          <ResourceStatusView
+            resourceKey={resourceKeys.knowledgeList}
+            hasData={documents.length > 0}
+            onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store))}
+          >
+            <DocumentList
+              items={items}
+              isSearching={isSearching}
+              searchQuery={search.query}
+              loading={false}
+              selectedId={requestedId ?? selectedDocument?.id}
+              onView={handleView}
+            />
+          </ResourceStatusView>
+        </div>
       </section>
       {!isMobile ? <section className="card knowledge-detail" aria-label={t("knowledge.documentRegion")}>
         {requestedId ? (

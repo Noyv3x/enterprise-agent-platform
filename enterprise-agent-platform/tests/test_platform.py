@@ -45,6 +45,7 @@ from enterprise_agent_platform.service import (
     ServiceError,
     UploadedFile,
     _ResizableConcurrencyGate,
+    agent_tool_detail,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
 
@@ -60,6 +61,44 @@ class RecordingAgent:
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
+
+    def model_catalog(self):
+        def model(model_id, *, reasoning=True, image=True):
+            return {
+                "id": model_id,
+                "name": model_id,
+                "reasoning": reasoning,
+                "input": ["text", "image"] if image else ["text"],
+                "context_window": 272000,
+                "max_tokens": 128000,
+            }
+
+        return {
+            "version": 1,
+            "source": "test-runtime",
+            "providers": {
+                "openai-codex": {
+                    "provider": "openai-codex",
+                    "runtime_provider": "openai-codex",
+                    "default_model": "gpt-5.5",
+                    "models": [
+                        model("gpt-5.3-codex-spark", image=False),
+                        model("gpt-5.4"),
+                        model("gpt-5.4-mini"),
+                        model("gpt-5.5"),
+                        model("gpt-5.6-luna"),
+                        model("gpt-5.6-sol"),
+                        model("gpt-5.6-terra"),
+                    ],
+                },
+                "xai-oauth": {
+                    "provider": "xai-oauth",
+                    "runtime_provider": "xai",
+                    "default_model": "grok-4.3",
+                    "models": [model("grok-4.3"), model("grok-4.5")],
+                },
+            },
+        }
 
 
 class NeedsReviewAgent:
@@ -105,6 +144,25 @@ class UsageReportingAgent:
             content=f"agent response to {kwargs['user_message']}",
             session_id=kwargs["session_id"],
             raw={"model": kwargs.get("model"), "usage": usage},
+        )
+
+
+class ContextUsageAgent(RecordingAgent):
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return AgentResult(
+            content=f"agent response to {kwargs['user_message']}",
+            session_id=kwargs["session_id"],
+            raw={
+                "context_usage": {
+                    "used_tokens": 32_000,
+                    "max_tokens": 128_000,
+                    # The platform recomputes this value rather than trusting
+                    # an inconsistent runtime payload.
+                    "percent": 99,
+                    "estimated": False,
+                }
+            },
         )
 
 
@@ -839,6 +897,42 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertFalse(dirty["update_started"])
             self.assertEqual(launched, ["webhook"])
 
+    def test_context_usage_is_saved_for_channel_and_private_agent_replies(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=ContextUsageAgent(),
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.send_channel_message(admin, 1, "@agent channel context")
+                service.wait_for_agent_idle("channel", "1")
+                service.send_private_message(admin, "private context")
+                service.wait_for_agent_idle("private", str(admin["id"]))
+
+                channel_reply = next(
+                    message
+                    for message in reversed(service.list_messages(admin, "channel", "1"))
+                    if message["author_type"] == "agent"
+                )
+                private_reply = next(
+                    message
+                    for message in reversed(
+                        service.list_messages(admin, "private", str(admin["id"]))
+                    )
+                    if message["author_type"] == "agent"
+                )
+                expected = {
+                    "used_tokens": 32_000,
+                    "max_tokens": 128_000,
+                    "percent": 25,
+                    "estimated": False,
+                }
+                self.assertEqual(channel_reply["metadata"]["context_usage"], expected)
+                self.assertEqual(private_reply["metadata"]["context_usage"], expected)
+            finally:
+                service.close()
+
     def test_token_usage_report_tracks_account_scope_provider_and_model(self):
         with tempfile.TemporaryDirectory() as td:
             agent = UsageReportingAgent(
@@ -1093,6 +1187,26 @@ class PlatformServiceTests(unittest.TestCase):
                     {"event": "tool.arguments.delta", "delta": '{"command":"pwd"}'},
                 )
                 self.assertEqual(service.agent_status(admin, "channel", "1")["activity"], [])
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.failed",
+                        "tool_name": "terminal",
+                        "tool_call_id": "preflight-only",
+                        "execution_started": False,
+                    },
+                )
+                self.assertEqual(service.agent_status(admin, "channel", "1")["activity"], [])
+                self.assertEqual(
+                    agent_tool_detail(
+                        {
+                            "tool_name": "terminal",
+                            "preview": "curl --token unapproved-preview-value",
+                        }
+                    ),
+                    "",
+                )
 
                 service._record_agent_progress(
                     "channel",
@@ -1103,8 +1217,8 @@ class PlatformServiceTests(unittest.TestCase):
                         "tool_call_id": "tool-1",
                         "arguments": {
                             "command": (
-                                "pwd && TOKEN=super-secret && "
-                                "cat /home/ubitech/platform/data/workspaces/user-1/secret.txt"
+                                "pwd --logical && TOKEN=super-secret && "
+                                "cat --number /home/ubitech/platform/data/workspaces/user-1/secret.txt"
                             )
                         },
                     },
@@ -1145,8 +1259,154 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(tools[0]["tool_status"], "completed")
                 self.assertEqual(status["activity"][-1]["tool_call_id"], "tool-1")
                 self.assertNotIn("super-secret", tools[0]["detail"])
-                self.assertNotIn("/home/ubitech", tools[0]["detail"])
-                self.assertEqual(tools[0]["detail"], "pwd · cat")
+                self.assertEqual(
+                    tools[0]["detail"],
+                    (
+                        "pwd --logical && TOKEN=••• && "
+                        "cat --number /home/ubitech/platform/data/workspaces/user-1/secret.txt"
+                    ),
+                )
+                self.assertNotIn("--logical", tools[0]["line"])
+                self.assertNotIn("/home/ubitech", tools[0]["line"])
+
+                # The command preview comes from the approved tool.started
+                # arguments, preserves useful flags/paths, and masks OAuth or
+                # environment credentials before live status is persisted.
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "terminal",
+                        "tool_call_id": "tool-secret-command",
+                        "arguments": {
+                            "command": (
+                                "AWS_SECRET_ACCESS_KEY=aws-value curl --fail "
+                                "-H 'Authorization: Bearer oauth-value' "
+                                "'https://example.test/v1?access_token=url-value&format=json'"
+                            )
+                        },
+                    },
+                )
+                status = service.agent_status(admin, "channel", "1")
+                terminal_secret = next(
+                    item
+                    for item in status["activity"]
+                    if item.get("tool_call_id") == "tool-secret-command"
+                )
+                self.assertEqual(
+                    terminal_secret["detail"],
+                    (
+                        "AWS_SECRET_ACCESS_KEY=••• curl --fail "
+                        "-H 'Authorization: •••' "
+                        "'https://example.test/v1?access_token=•••&format=json'"
+                    ),
+                )
+                for secret in ("aws-value", "oauth-value", "url-value"):
+                    self.assertNotIn(secret, terminal_secret["detail"])
+
+                credential_commands = {
+                    "sshpass -p hunter2 ssh host.example": (
+                        "sshpass -p ••• ssh host.example"
+                    ),
+                    r"sshpass -p hunter\ 2 ssh host.example": (
+                        "sshpass -p ••• ssh host.example"
+                    ),
+                    "mysql -uroot -psupersecret app": (
+                        "mysql -uroot -p••• app"
+                    ),
+                    "redis-cli -a redis-secret ping": (
+                        "redis-cli -a ••• ping"
+                    ),
+                    "docker login -u alice -p docker-secret registry.example": (
+                        "docker login -u alice -p ••• registry.example"
+                    ),
+                    "openssl pkcs12 -in cert.p12 -passin pass:cert-secret": (
+                        "openssl pkcs12 -in cert.p12 -passin pass:•••"
+                    ),
+                    "openssl pkcs12 -in cert.p12 -passout 'pass:quoted secret'": (
+                        "openssl pkcs12 -in cert.p12 -passout 'pass:•••'"
+                    ),
+                    "curl --proxy-user proxy:proxy-secret https://example.test": (
+                        "curl --proxy-user ••• https://example.test"
+                    ),
+                    "curl --user api-user:long-secret https://example.test": (
+                        "curl --user ••• https://example.test"
+                    ),
+                    "curl --oauth2-bearer oauth-secret https://example.test": (
+                        "curl --oauth2-bearer ••• https://example.test"
+                    ),
+                    r"curl --password proxy\ password https://example.test": (
+                        "curl --password ••• https://example.test"
+                    ),
+                    "curl -u api-user:curl-secret https://example.test": (
+                        "curl -u ••• https://example.test"
+                    ),
+                    "MYSQL_PWD=mysql-secret mysql -uroot app": (
+                        "MYSQL_PWD=••• mysql -uroot app"
+                    ),
+                    "SSHPASS=hunter2 sshpass -e ssh host": (
+                        "SSHPASS=••• sshpass -e ssh host"
+                    ),
+                    "tool --blob abcdefghijklmnopqrstuvwxyz0123456789/ABCD/EFGHIJKLMNOP": (
+                        "tool --blob •••"
+                    ),
+                    f"tool --blob /{'A' * 63}": "tool --blob •••",
+                    "aws configure set aws_secret_access_key aws-secret": (
+                        "aws configure set aws_secret_access_key •••"
+                    ),
+                    "npm config set //registry.npmjs.org/:_authToken npm-secret": (
+                        "npm config set //registry.npmjs.org/:_authToken •••"
+                    ),
+                    "vault login hvs.vault-secret": "vault login •••",
+                    "smbclient //host/share -U 'alice%smb-secret'": (
+                        "smbclient //host/share -U 'alice%•••'"
+                    ),
+                }
+                for command, expected in credential_commands.items():
+                    detail = agent_tool_detail(
+                        {
+                            "tool_name": "terminal",
+                            "arguments": {"command": command},
+                        }
+                    )
+                    self.assertEqual(detail, expected)
+                self.assertEqual(
+                    agent_tool_detail(
+                        {
+                            "tool_name": "terminal",
+                            "arguments": {
+                                "command": "echo secret release && python -u script.py --port 9000"
+                            },
+                        }
+                    ),
+                    "echo secret release && python -u script.py --port 9000",
+                )
+                ordinary_user_arguments = (
+                    "docker run --user 1000:1000 ubuntu id",
+                    "psql --user alice --dbname app",
+                    "PWD=/home/agent tool --user alice",
+                    "cat ./src/components/readable-long-component-name-for-preview/file.ts",
+                    "cat ../src/components/readable-long-component-name-for-preview/file.ts",
+                    "cat ~/workspaces/readable-long-project-name-for-preview/file.ts",
+                    "cat $HOME/workspaces/readable-long-project-name-for-preview/file.ts",
+                    "cat ${HOME}/workspaces/readable-long-project-name-for-preview/file.ts",
+                    "cat src/components/readable-long-component-name-for-preview/file.ts",
+                    "aws configure set region us-east-1",
+                    "npm config set registry https://registry.npmjs.org",
+                    "vault login -method=oidc",
+                    "smbclient //host/share -U alice",
+                )
+                for command in ordinary_user_arguments:
+                    self.assertEqual(
+                        agent_tool_detail(
+                            {
+                                "tool_name": "terminal",
+                                "arguments": {"command": command},
+                            }
+                        ),
+                        command,
+                    )
 
                 secret_query = (
                     "AWS_SECRET_ACCESS_KEY=aws-value "
@@ -4299,7 +4559,15 @@ class PlatformServiceTests(unittest.TestCase):
                 config = service.agent_runtime_config(admin)["config"]
                 self.assertEqual(
                     config["model_catalog"]["openai-codex"]["models"],
-                    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
+                    [
+                        "gpt-5.3-codex-spark",
+                        "gpt-5.4",
+                        "gpt-5.4-mini",
+                        "gpt-5.5",
+                        "gpt-5.6-luna",
+                        "gpt-5.6-sol",
+                        "gpt-5.6-terra",
+                    ],
                 )
 
                 with self.assertRaises(ServiceError) as ctx:

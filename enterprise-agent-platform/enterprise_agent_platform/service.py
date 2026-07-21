@@ -7,11 +7,11 @@ import http.client
 import inspect
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
 import secrets
-import shlex
 import socket
 import sys
 import threading
@@ -56,6 +56,7 @@ from .memory_security import (
     normalize_memory_tags,
     validate_memory_content,
 )
+from .model_catalog import MODEL_CATALOG_CACHE_SETTING, ModelCatalogManager
 from .oauth_flows import (
     CODEX_OAUTH_CLIENT_ID,
     CODEX_TOKEN_URL,
@@ -448,6 +449,15 @@ class EnterpriseService:
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
         self._auth_lock = threading.RLock()
+        self.model_catalogs = ModelCatalogManager(
+            runtime_loader=self._load_agent_runtime_model_catalog,
+            credential_loader=self._catalog_credential_snapshot,
+            oauth_configured=self._oauth_tokens_configured,
+            credential_revision=self._oauth_credential_revision,
+            http_client=self.oauth_flows.http,
+            cache_loader=lambda: self.get_setting(MODEL_CATALOG_CACHE_SETTING),
+            cache_saver=lambda value: self.set_setting(MODEL_CATALOG_CACHE_SETTING, value),
+        )
         self._login_failures: dict[tuple[str, str], Deque[float]] = {}
         self._login_failures_by_user: dict[str, Deque[float]] = {}
         # Per-user upload timestamps for the sliding-window rate limiter.
@@ -4285,6 +4295,7 @@ class EnterpriseService:
             workspace_path=workspace_path,
         )
         token_usage = self._token_usage_from_agent_result(result, generation)
+        context_usage = extract_context_usage(result.raw)
         with self._conversation_lock:
             # Session persistence, terminal status and message insertion form a
             # single lifecycle boundary against clear/deactivate.
@@ -4307,6 +4318,8 @@ class EnterpriseService:
                 metadata["durable_job_id"] = int(task["_job_id"])
             if token_usage:
                 metadata["token_usage"] = self._public_token_usage(token_usage)
+            if context_usage:
+                metadata["context_usage"] = context_usage
             metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
             message = self._append_message(
                 scope_type="channel",
@@ -4579,6 +4592,7 @@ class EnterpriseService:
             result.content, owner_id=int(scope_id)
         )
         token_usage = self._token_usage_from_agent_result(result, generation)
+        context_usage = extract_context_usage(result.raw)
         with self._conversation_lock:
             self._ensure_agent_task_can_run(task)
             if self._valid_agent_session_id(result.session_id):
@@ -4607,6 +4621,8 @@ class EnterpriseService:
                 )[:2000]
             if token_usage:
                 metadata["token_usage"] = self._public_token_usage(token_usage)
+            if context_usage:
+                metadata["context_usage"] = context_usage
             metadata["agent_work"] = self._agent_work_snapshot(task, state="complete")
             message = self._append_message(
                 scope_type="private",
@@ -5713,7 +5729,7 @@ class EnterpriseService:
                 "id": process_id,
                 "title": _preview_text_head(raw.get("title"), 200),
                 "command": _preview_text_head(
-                    _safe_tool_summary_text(raw.get("command"), limit=4 * 1024),
+                    _safe_terminal_command_preview(raw.get("command")),
                     4 * 1024,
                 ),
                 "cwd": _preview_text_head(raw.get("cwd"), 2 * 1024),
@@ -5900,6 +5916,7 @@ class EnterpriseService:
                 self.runtimes.invalidate_status_cache()
             if self._uses_default_agent_client:
                 self.agent_client = self._new_agent_runtime_client()
+                self.model_catalogs.invalidate_runtime()
             return self.agent_runtime_config(actor)
 
     def cognee_config(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -5940,6 +5957,7 @@ class EnterpriseService:
         clean = name.strip().lower()
         if clean == "agent":
             status = self.runtimes.restart_agent_runtime()
+            self.model_catalogs.invalidate_runtime()
         elif clean == "camofox":
             status = self.runtimes.restart_camofox()
         elif clean == "searxng":
@@ -5959,6 +5977,7 @@ class EnterpriseService:
         clean = name.strip().lower()
         if clean == "agent":
             install_status = self.runtimes.install_agent_runtime(force=True)
+            self.model_catalogs.invalidate_runtime()
             result = {
                 "runtime": install_status.to_dict(),
                 "config": self.runtimes.agent_runtime_config(),
@@ -6053,6 +6072,37 @@ class EnterpriseService:
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         force_refresh = parse_bool(body.get("force_refresh"))
+        access_token, expires_at = self._resolve_oauth_access_token(
+            provider,
+            force_refresh=force_refresh,
+        )
+        info = oauth_provider_info(provider)
+        runtime = self.runtimes.agent_runtime_config()
+        selected_model = (
+            str(runtime.get("model") or "").strip()
+            if normalize_oauth_provider(str(runtime.get("provider") or "")) == provider
+            else ""
+        )
+        return {
+            "provider": provider,
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_at": expires_at or None,
+            "base_url": info["base_url"],
+            "model": selected_model,
+        }
+
+    def _resolve_oauth_access_token(
+        self,
+        provider: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[str, int]:
+        """Return a usable token without consulting the model catalog."""
+
+        provider = normalize_oauth_provider(provider)
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         access_key, refresh_key, expires_key = {
             "openai-codex": (
                 "CODEX_OAUTH_ACCESS_TOKEN",
@@ -6094,15 +6144,14 @@ class EnterpriseService:
                     self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
             if not access_token:
                 raise ServiceError(409, f"{oauth_provider_info(provider)['label']} is not connected")
-        info = oauth_provider_info(provider)
-        return {
-            "provider": provider,
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_at": expires_at or None,
-            "base_url": info["base_url"],
-            "model": self._oauth_model_catalog(provider)["default_model"],
-        }
+        return access_token, expires_at
+
+    def _catalog_credential_snapshot(self, provider: str) -> tuple[str, int]:
+        """Load the token and its revision as one synchronization unit."""
+
+        with self._auth_lock:
+            access_token, _ = self._resolve_oauth_access_token(provider)
+            return access_token, self._oauth_credential_revision(provider)
 
     def _refresh_oauth_access_token(self, provider: str, refresh_token: str) -> dict[str, Any]:
         if provider == "openai-codex":
@@ -6150,10 +6199,12 @@ class EnterpriseService:
             if any(key in secrets_by_key for key in required) and not all(key in secrets_by_key for key in required):
                 label = oauth_provider_info(provider)["label"]
                 raise ServiceError(400, f"{label} import requires both access and refresh tokens")
-            imported_providers.append(provider)
-            for key, value in secrets_by_key.items():
-                self.set_setting(key, value, secret=True)
-                imported_keys.append(key)
+            with self._auth_lock:
+                imported_providers.append(provider)
+                for key, value in secrets_by_key.items():
+                    self.set_setting(key, value, secret=True)
+                    imported_keys.append(key)
+                self.model_catalogs.invalidate_oauth(provider)
         if not imported_keys:
             raise ServiceError(400, "no supported OAuth credentials found in import file")
 
@@ -10175,7 +10226,12 @@ class EnterpriseService:
             raise ServiceError(400, "unsupported secret key")
         if not value:
             raise ServiceError(400, "secret value is required")
-        self.set_setting(clean, value, secret=True)
+        with self._auth_lock:
+            self.set_setting(clean, value, secret=True)
+            for provider, keys in OAUTH_PROVIDER_SECRET_KEYS.items():
+                if clean in keys:
+                    self.model_catalogs.invalidate_oauth(provider)
+                    break
 
     def _active_oauth_provider(self) -> str:
         active_provider = normalize_oauth_provider(
@@ -10234,32 +10290,39 @@ class EnterpriseService:
         self.set_setting(AGENT_SETTING_MODEL, self._default_oauth_model(provider))
 
     def _oauth_model_catalogs(self) -> dict[str, dict[str, Any]]:
-        return {provider: self._oauth_model_catalog(provider) for provider in SUPPORTED_OAUTH_PROVIDERS}
+        return self.model_catalogs.catalogs()
 
     def _oauth_model_catalog(self, provider: str) -> dict[str, Any]:
         provider = normalize_oauth_provider(provider)
-        catalogs = {
-            "openai-codex": {
-                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"],
-                "default_model": "gpt-5.5",
-            },
-            "xai-oauth": {
-                "models": [
-                    "grok-4.3",
-                    "grok-4.20-0309-reasoning",
-                    "grok-4.20-0309-non-reasoning",
-                ],
-                "default_model": "grok-4.3",
-            },
-        }
-        catalog = catalogs.get(provider, {"models": [], "default_model": ""})
-        return {
-            "provider": provider,
-            "models": list(catalog["models"]),
-            "default_model": str(catalog["default_model"]),
-            "source": "agent-runtime",
-            "error": "" if provider in catalogs else "unsupported provider",
-        }
+        return self.model_catalogs.catalog(provider)
+
+    def _load_agent_runtime_model_catalog(self) -> dict[str, Any]:
+        loader = getattr(self.agent_client, "model_catalog", None)
+        if not callable(loader):
+            raise AgentRuntimeError("Agent client does not expose a model catalog")
+        try:
+            return loader()
+        except AgentRuntimeError:
+            if not self._uses_default_agent_client:
+                raise
+            status = self.runtimes.ensure_agent_runtime_ready(wait=True)
+            if not status.available:
+                raise
+            return loader()
+
+    def _oauth_credential_revision(self, provider: str) -> int:
+        keys = OAUTH_PROVIDER_SECRET_KEYS.get(provider, ())
+        if not keys:
+            return 0
+        # A content fingerprint avoids timestamp collisions when credentials
+        # rotate more than once in the same second. It is stable across process
+        # restarts and never leaves this process or contains a recoverable token.
+        with self._auth_lock:
+            material = "\0".join(
+                f"{key}\0{self.get_secret(key)}"
+                for key in keys
+            ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
 
     def _default_oauth_model(self, provider: str) -> str:
         catalog = self._oauth_model_catalog(provider)
@@ -10318,31 +10381,34 @@ class EnterpriseService:
         tokens = flow.pop("tokens", None)
         if not tokens:
             return
-        if provider == "openai-codex":
-            self.set_setting("CODEX_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
-            self.set_setting("CODEX_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
-            expires_key = "CODEX_OAUTH_EXPIRES_AT"
-        elif provider == "xai-oauth":
-            self.set_setting("GROK_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
-            self.set_setting("GROK_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
-            expires_key = "GROK_OAUTH_EXPIRES_AT"
-            id_token = str(tokens.get("id_token", "") or "").strip()
-            if id_token:
-                self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
-        else:
-            return
         try:
             expires_in = max(60, int(tokens.get("expires_in") or 3600))
         except (TypeError, ValueError):
             expires_in = 3600
-        self.set_setting(expires_key, str(now_ts() + expires_in))
+        with self._auth_lock:
+            if provider == "openai-codex":
+                self.set_setting("CODEX_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
+                self.set_setting("CODEX_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+                expires_key = "CODEX_OAUTH_EXPIRES_AT"
+            elif provider == "xai-oauth":
+                self.set_setting("GROK_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
+                self.set_setting("GROK_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
+                expires_key = "GROK_OAUTH_EXPIRES_AT"
+                id_token = str(tokens.get("id_token", "") or "").strip()
+                if id_token:
+                    self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
+            else:
+                return
+            self.set_setting(expires_key, str(now_ts() + expires_in))
+            self.model_catalogs.invalidate_oauth(provider)
         self._select_oauth_provider(provider)
 
     def _oauth_tokens_configured(self, provider: str) -> bool:
-        if provider == "openai-codex":
-            return bool(self.get_secret("CODEX_OAUTH_ACCESS_TOKEN") and self.get_secret("CODEX_OAUTH_REFRESH_TOKEN"))
-        if provider == "xai-oauth":
-            return bool(self.get_secret("GROK_OAUTH_ACCESS_TOKEN") and self.get_secret("GROK_OAUTH_REFRESH_TOKEN"))
+        with self._auth_lock:
+            if provider == "openai-codex":
+                return bool(self.get_secret("CODEX_OAUTH_ACCESS_TOKEN") and self.get_secret("CODEX_OAUTH_REFRESH_TOKEN"))
+            if provider == "xai-oauth":
+                return bool(self.get_secret("GROK_OAUTH_ACCESS_TOKEN") and self.get_secret("GROK_OAUTH_REFRESH_TOKEN"))
         return False
 
     def _oauth_last_refresh(self, provider: str) -> int | None:
@@ -11960,10 +12026,22 @@ class EnterpriseService:
             return
         if event_type not in VISIBLE_TOOL_PROGRESS_EVENTS:
             return
+        if event.get("execution_started") is False:
+            # Runtime preflight failures (invalid arguments, policy blocks,
+            # denied approvals and truncated model tool calls) did not reach a
+            # tool. They may still carry schedule-control metadata, handled by
+            # _record_agent_task_progress before this method, but are not work
+            # records.
+            return
         tool = str(event.get("tool") or event.get("tool_name") or "").strip()
         if not tool:
             return
         detail = agent_tool_detail(event)
+        # Terminal commands can be large (for example heredocs). Keep the
+        # approved, redacted command in ``detail`` only; the human-readable
+        # lifecycle line should stay compact instead of duplicating the full
+        # command in every status snapshot.
+        line_detail = "" if tool.lower() == "terminal" else detail
         tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or event.get("id") or "").strip()
         tool_status = str(event.get("status") or event_type).strip().lower()
         timestamp = now_ts()
@@ -12008,7 +12086,7 @@ class EnterpriseService:
                         "source": "agent",
                         "label": tool,
                         "detail": detail,
-                        "line": agent_progress_line({**event, "tool": tool, "label": detail}),
+                        "line": agent_progress_line({**event, "tool": tool, "label": line_detail}),
                         "tool": tool,
                         "tool_call_id": tool_call_id,
                         "at": timestamp,
@@ -12035,7 +12113,7 @@ class EnterpriseService:
                 self._agent_status[key] = status
                 return
 
-            line = agent_progress_line({**event, "tool": tool, "label": detail})
+            line = agent_progress_line({**event, "tool": tool, "label": line_detail})
             existing = None
             if tool_call_id:
                 for item in reversed(activity):
@@ -13179,6 +13257,36 @@ _USAGE_OUTPUT_KEYS = ("output_tokens", "completion_tokens", "outputTokens", "com
 _USAGE_TOTAL_KEYS = ("total_tokens", "totalTokens")
 
 
+def extract_context_usage(payload: Any) -> dict[str, Any] | None:
+    """Validate the runtime's latest-turn context snapshot for public metadata."""
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("context_usage")
+    if not isinstance(raw, dict):
+        return None
+
+    def token_count(key: str) -> int | None:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)):
+            return None
+        count = int(value)
+        return count if 0 <= count <= 2**53 - 1 else None
+
+    used = token_count("used_tokens")
+    maximum = token_count("max_tokens")
+    if used is None or maximum is None or maximum <= 0:
+        return None
+    percent = (used * 200 + maximum) // (maximum * 2)
+    return {
+        "used_tokens": used,
+        "max_tokens": maximum,
+        "percent": max(0, min(100, percent)),
+        "estimated": raw.get("estimated") is True,
+    }
+
+
 def extract_token_usage(payload: Any) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
 
@@ -13529,7 +13637,10 @@ def agent_tool_detail(event: dict[str, Any]) -> str:
 
     Raw tool arguments are never copied wholesale into message metadata. Only
     a small allowlist of useful fields is considered, and write/patch bodies are
-    intentionally excluded.
+    intentionally excluded. Terminal is the deliberate exception to the old
+    action-only summary: the command that reached ``tool.started`` has already
+    passed Runtime approval and is useful execution context, so retain its
+    structure and parameters after secret redaction.
     """
 
     tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
@@ -13545,14 +13656,21 @@ def agent_tool_detail(event: dict[str, Any]) -> str:
             else ""
         )
         return action or "session_search"
+    if tool == "terminal":
+        # Only the Runtime's actual tool arguments are authoritative here. Do
+        # not fall back to an event label/preview: those strings are not proof
+        # that a command passed approval and was sent to the terminal tool.
+        return (
+            _safe_terminal_command_preview(arguments.get("command"))
+            if isinstance(arguments, dict)
+            else ""
+        )
     explicit = str(event.get("label") or event.get("preview") or "").strip()
     if explicit and explicit.lower() not in {tool, "tool"}:
         return _safe_tool_summary_text(explicit)
     if not isinstance(arguments, dict):
         return ""
 
-    if tool == "terminal":
-        return _safe_terminal_command_summary(arguments.get("command"))
     if tool == "process":
         return _safe_tool_summary_text(arguments.get("action"))
     if tool in {"read_file", "write_file", "patch_file"}:
@@ -13591,29 +13709,23 @@ def _safe_tool_path(value: Any) -> str:
     return clean
 
 
-def _safe_terminal_command_summary(value: Any) -> str:
-    """Expose command actions without persisting their arguments or values."""
+def _safe_terminal_command_preview(value: Any) -> str:
+    """Return the approved command with useful arguments and secrets masked.
 
-    command = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
-    actions: list[str] = []
-    for segment in re.split(r"\s*(?:&&|\|\||[;|])\s*", command):
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            tokens = segment.split()
-        while tokens and (
-            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0])
-            or tokens[0] in {"command", "env", "exec", "nohup", "sudo"}
-        ):
-            tokens.pop(0)
-        if not tokens:
-            continue
-        action = Path(tokens[0]).name.strip()
-        if action and action not in actions:
-            actions.append(action)
-        if len(actions) >= 4:
-            break
-    return " · ".join(actions)
+    The preview mirrors the command-centric Hermes display instead of reducing
+    a call to executable names. It stays bounded because this value is copied
+    into live status and persisted message metadata. Newlines are preserved so
+    compound commands remain readable in the UI.
+    """
+
+    return _redact_terminal_command_credentials(
+        _safe_tool_summary_text(
+            value,
+            limit=4096,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+    )
 
 
 def _safe_tool_url(value: Any) -> str:
@@ -13632,9 +13744,19 @@ def _safe_tool_url(value: Any) -> str:
     return _safe_tool_summary_text(hostname)
 
 
-def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
-    clean = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
-    clean = re.sub(r"\s+", " ", clean).strip()
+def _safe_tool_summary_text(
+    value: Any,
+    *,
+    limit: int = 160,
+    preserve_whitespace: bool = False,
+    redact_paths: bool = True,
+) -> str:
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if preserve_whitespace:
+        clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", raw).strip()
+    else:
+        clean = re.sub(r"[\x00-\x1f\x7f]+", " ", raw)
+        clean = re.sub(r"\s+", " ", clean).strip()
     if not clean:
         return ""
     clean = re.sub(
@@ -13645,10 +13767,42 @@ def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
     # Handle multi-token authentication headers before the generic named-secret
     # matcher. Otherwise the generic rule consumes only ``Bearer``/``Basic`` as
     # the value of ``Authorization`` and leaves the actual credential behind.
-    clean = re.sub(r"(?i)\b(authorization\s*:\s*(?:bearer|basic))\s+\S+", r"\1 •••", clean)
     clean = re.sub(
-        r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|signature|auth(?:orization)?|pat|session(?:[_-]?(?:id|token|key|secret))?)[A-Za-z0-9_.-]*)\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
-        lambda match: f"{match.group(1)}=•••",
+        r"(?i)\b(authorization(?:\s*:\s*|\s+)(?:bearer|basic))\s+\S+",
+        r"\1 •••",
+        clean,
+    )
+
+    def redact_named_secret(match: re.Match[str]) -> str:
+        name = match.group("name")
+        separator = match.group("separator")
+        value = match.group("value")
+        # Special Authorization handling above intentionally retains the auth
+        # scheme. Do not let the generic pass consume ``Bearer``/``Basic`` or
+        # disturb a value that was already replaced.
+        if "•••" in value or (
+            "authorization" in name.lower()
+            and value.strip("\"'").lower() in {"bearer", "basic"}
+        ):
+            return match.group(0)
+        quote = value[0] if value[:1] in {"\"", "'"} else ""
+        return f"{name}{separator}{quote}•••{quote}"
+
+    # These are conventional password environment variables, but ``PWD`` by
+    # itself is the ordinary working-directory variable. Match the exact
+    # credential names instead of broadening the generic secret-name heuristic.
+    clean = re.sub(
+        r"(?i)\b(?P<name>MYSQL_PWD|SSHPASS)\b"
+        r"(?P<separator>\s*=\s*)"
+        r"(?P<value>\"[^\"]*\"|'[^']*'|(?:\\[^\r\n]|[^\s,;&|\"'])+)",
+        redact_named_secret,
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)\b(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|signature|auth(?:orization)?|pat|session(?:[_-]?(?:id|token|key|secret))?)[A-Za-z0-9_.-]*)\b"
+        r"(?P<separator>\s*[:=]\s*)"
+        r"(?P<value>\"[^\"]*\"|'[^']*'|(?:\\[^\r\n]|[^\s,;&|\"'])+)",
+        redact_named_secret,
         clean,
     )
     clean = re.sub(
@@ -13658,7 +13812,7 @@ def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
     )
     clean = re.sub(r"(?i)\b((?:set-)?cookie\s*:)\s*[^\s,;]+", r"\1 •••", clean)
     clean = re.sub(
-        r"(?i)((?<!\S)(?:-u|--user|-b|--cookie)(?:\s*=\s*|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s,;&|]+)",
+        r"(?i)((?<!\S)--cookie(?:\s*=\s*|\s+))(?:\"[^\"]*\"|'[^']*'|(?:\\[^\r\n]|[^\s,;&|])+)",
         r"\1•••",
         clean,
     )
@@ -13674,16 +13828,176 @@ def _safe_tool_summary_text(value: Any, *, limit: int = 160) -> str:
         clean,
         flags=re.IGNORECASE,
     )
-    clean = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "•••", clean)
-    clean = re.sub(r"\b[A-Za-z0-9_+/=-]{48,}\b", "•••", clean)
+    def redact_long_opaque_value(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        # Preserve recognizable filesystem roots used by Agent workspaces and
+        # host tools. A leading slash alone is not enough: it is also a valid
+        # first character of standard Base64 and previously leaked such tokens.
+        path_prefixes = (
+            "/app/", "/code/", "/data/", "/dev/", "/etc/", "/home/",
+            "/media/", "/mnt/", "/opt/", "/proc/", "/project/", "/root/",
+            "/run/", "/srv/", "/sys/", "/tmp/", "/usr/", "/var/",
+            "/workspace/",
+        )
+        relative_roots = (
+            "agent-runtime/", "app/", "apps/", "backend/", "config/", "data/",
+            "docs/", "enterprise-agent-platform/", "frontend/", "lib/", "packages/",
+            "scripts/", "src/", "test/", "tests/", "workspaces/",
+        )
+        prefix = clean[max(0, match.start() - 12):match.start()]
+        explicit_relative = (
+            candidate.startswith("/")
+            and prefix.endswith((".", "..", "~", "$HOME", "${HOME}"))
+        ) or (candidate.startswith("HOME/") and prefix.endswith("$"))
+        recognizable_path = (
+            candidate.startswith(path_prefixes)
+            or candidate.startswith(relative_roots)
+            or explicit_relative
+        )
+        return candidate if recognizable_path else "•••"
+
     clean = re.sub(
-        r"(?<![A-Za-z0-9:])/(?:home|root|tmp|var|opt|srv)/(?:[^\s\"';&|]+/)*([^\s\"';&|/]*)",
-        lambda match: f"…/{match.group(1)}" if match.group(1) else "…",
+        r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{48,}(?![A-Za-z0-9_+/=-])",
+        redact_long_opaque_value,
         clean,
     )
+    clean = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "•••", clean)
+    if redact_paths:
+        clean = re.sub(
+            r"(?<![A-Za-z0-9:])/(?:home|root|tmp|var|opt|srv)/(?:[^\s\"';&|]+/)*([^\s\"';&|/]*)",
+            lambda match: f"…/{match.group(1)}" if match.group(1) else "…",
+            clean,
+        )
     if len(clean) > limit:
         clean = clean[: max(1, limit - 1)].rstrip() + "…"
     return clean
+
+
+def _redact_terminal_command_credentials(command: str) -> str:
+    """Mask shell credential arguments while preserving command structure.
+
+    Short flags are command-specific because a global ``-p`` or ``-u`` rule
+    would hide ordinary ports, Python's unbuffered flag, and other harmless
+    parameters. Long credential flags are unambiguous and can be handled
+    generically.
+    """
+
+    if not command:
+        return ""
+
+    value_pattern = r'(?P<value>"[^"]*"|\'[^\']*\'|(?:\\[^\r\n]|[^\s;&|])+)'
+    contextual_value_pattern = (
+        r'(?P<value>(?!["\']?•••["\']?(?=$|[\s;&|]))'
+        r'(?:"[^"]*"|\'[^\']*\'|(?:\\[^\r\n]|[^\s;&|])+))'
+    )
+
+    def mask_argument(match: re.Match[str]) -> str:
+        value = match.group("value")
+        quote = value[0] if value[:1] in {"\"", "'"} else ""
+        return f"{match.group('prefix')}{quote}•••{quote}"
+
+    def mask_smb_user_password(match: re.Match[str]) -> str:
+        value = match.group("value")
+        quote = value[0] if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"} else ""
+        inner = value[1:-1] if quote else value
+        if "%" not in inner:
+            # ``smbclient -U alice`` carries only a username. It is useful
+            # execution context and is not itself a credential.
+            return match.group(0)
+        username, _password = inner.split("%", 1)
+        return f"{match.group('prefix')}{quote}{username}%•••{quote}"
+
+    # Unambiguously secret long flags used by CLIs and HTTP clients. Keep the
+    # option and original separator/quoting so the preview remains recognizable.
+    # ``--user`` is intentionally not global: Docker, PostgreSQL and many other
+    # tools use it for a harmless execution identity rather than a credential.
+    command = re.sub(
+        r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])--(?:password|passwd|token|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth(?:orization)?|cookie)(?:\s*=\s*|\s+))"
+        + value_pattern,
+        mask_argument,
+        command,
+    )
+
+    # Context-sensitive credential switches. The executable prefix is bounded
+    # to one shell segment so similarly named arguments belonging to another
+    # command remain visible.
+    contextual_argument_patterns = (
+        r"(?P<prefix>\b(?i:sshpass|mysql(?:admin|dump)?|docker\s+login)\b[^\n;&|]*?(?<!\S)-p(?:\s*=\s*|\s+))",
+        r"(?P<prefix>\b(?i:redis-cli)\b[^\n;&|]*?(?<!\S)-a(?:\s*=\s*|\s+))",
+        r"(?P<prefix>\b(?i:curl)\b[^\n;&|]*?(?<!\S)(?:-(?:u|U|b)|--(?:user|proxy-user|oauth2-bearer))(?:\s*=\s*|\s+))",
+        r"(?P<prefix>\b(?i:aws)\b[^\n;&|]*?\b(?i:configure)\s+(?i:set)\s+(?i:aws_secret_access_key)(?:\s*=\s*|\s+))",
+        r"(?P<prefix>\b(?i:npm)\b[^\n;&|]*?\b(?i:config)\s+(?i:set)\s+(?:\"[^\"]*(?i:_authtoken)\"|'[^']*(?i:_authtoken)'|(?:\\[^\r\n]|[^\s;&|])*(?i:_authtoken))(?:\s*=\s*|\s+))",
+    )
+    for prefix_pattern in contextual_argument_patterns:
+        # A single command can carry several credentials (for example curl
+        # with both a cookie and basic auth). The executable-anchored pattern
+        # sees only the first matching flag per pass, so repeat while skipping
+        # values already replaced with the marker.
+        while True:
+            updated, replacements = re.subn(
+                prefix_pattern + contextual_value_pattern,
+                mask_argument,
+                command,
+            )
+            command = updated
+            if replacements == 0:
+                break
+
+    # A positional ``vault login`` value is a token. Method/options begin with
+    # a dash and must remain visible instead of being mistaken for the token.
+    command = re.sub(
+        r"(?P<prefix>\b(?i:vault)\b[^\n;&|]*?\b(?i:login)\s+)(?!-)" + value_pattern,
+        mask_argument,
+        command,
+    )
+
+    # smbclient combines username and password as ``user%password``. Preserve
+    # the non-secret identity while masking only the password portion.
+    smb_separated_prefix = (
+        r"(?P<prefix>\b(?i:smbclient)\b[^\n;&|]*?(?<!\S)(?:-U|--user)(?:\s*=\s*|\s+))"
+    )
+    command = re.sub(
+        smb_separated_prefix + value_pattern,
+        mask_smb_user_password,
+        command,
+    )
+
+    attached_short_patterns = (
+        r"(?P<prefix>\b(?i:sshpass|mysql(?:admin|dump)?|docker\s+login)\b[^\n;&|]*?(?<!\S)-p)",
+        r"(?P<prefix>\b(?i:redis-cli)\b[^\n;&|]*?(?<!\S)-a)",
+        r"(?P<prefix>\b(?i:curl)\b[^\n;&|]*?(?<!\S)-(?:u|U|b))",
+    )
+    for prefix_pattern in attached_short_patterns:
+        while True:
+            updated, replacements = re.subn(
+                prefix_pattern + contextual_value_pattern,
+                mask_argument,
+                command,
+            )
+            command = updated
+            if replacements == 0:
+                break
+    command = re.sub(
+        r"(?P<prefix>\b(?i:smbclient)\b[^\n;&|]*?(?<!\S)-U)" + value_pattern,
+        mask_smb_user_password,
+        command,
+    )
+
+    # OpenSSL password sources encode the secret after ``pass:`` rather than as
+    # a standalone option value.
+    command = re.sub(
+        r"(?P<prefix>\b(?i:openssl)\b[^\n;&|]*?(?<!\S)-pass(?:in|out)(?:\s*=\s*|\s+)pass:)"
+        + value_pattern,
+        mask_argument,
+        command,
+    )
+    command = re.sub(
+        r"(?P<prefix>\b(?i:openssl)\b[^\n;&|]*?(?<!\S)-pass(?:in|out)(?:\s*=\s*|\s+)(?P<quote>[\"'])pass:)"
+        r"(?P<value>[^\"']*)(?P=quote)",
+        lambda match: f"{match.group('prefix')}•••{match.group('quote')}",
+        command,
+    )
+    return command
 
 
 def _preview_plain_text(value: Any) -> str:

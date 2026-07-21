@@ -17,7 +17,7 @@ describe("AgentWorkCard", () => {
 
   afterEach(cleanup);
 
-  it("shows the current step once and keeps anonymous argument deltas out of the log", () => {
+  it("renders structured tool states and a complete terminal command preview", () => {
     const store = createStore(rootReducer, initialAppState);
     const work: AgentStatus = {
       run_id: "run-1",
@@ -32,7 +32,7 @@ describe("AgentWorkCard", () => {
           tool: "terminal",
           tool_call_id: "terminal-1",
           tool_status: "completed",
-          detail: "pwd",
+          detail: "npm test -- --runInBand frontend/src/components/chat/AgentWorkCard.test.tsx",
         },
         {
           source: "agent",
@@ -61,9 +61,19 @@ describe("AgentWorkCard", () => {
       </StoreContext.Provider>,
     );
 
-    expect(screen.getAllByText("✅ Completed File search · config · ./src")).toHaveLength(1);
-    expect(screen.getAllByText("✅ Completed Command · pwd")).toHaveLength(1);
-    expect(screen.getAllByText("✅ Completed Session search · release notes")).toHaveLength(1);
+    expect(screen.getByText("Command")).toBeVisible();
+    expect(screen.getByText("File search")).toBeVisible();
+    expect(screen.getByText("Session search")).toBeVisible();
+    expect(screen.getAllByText("Completed")).toHaveLength(3);
+    const commandPreview = screen.getByLabelText("Terminal command");
+    expect(commandPreview).toHaveTextContent(
+      "npm test -- --runInBand frontend/src/components/chat/AgentWorkCard.test.tsx",
+    );
+    expect(commandPreview).toHaveAttribute("tabindex", "0");
+    commandPreview.focus();
+    expect(commandPreview).toHaveFocus();
+    expect(screen.getByText("Agent is working")).toBeVisible();
+    expect(document.querySelectorAll(".agent-work__item")).toHaveLength(3);
     expect(screen.queryByText(/Using tool/i)).toBeNull();
   });
 });

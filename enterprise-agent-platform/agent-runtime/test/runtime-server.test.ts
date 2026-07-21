@@ -30,6 +30,24 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     assert.equal(healthBody.version, "0.1.0");
     assert.equal(healthBody.pid, process.pid);
     assert.equal(Number.isInteger(healthBody.uptime_seconds), true);
+    const unauthorizedModels = await fetch(`${base}/v1/models`);
+    assert.equal(unauthorizedModels.status, 401);
+    const models = await fetch(`${base}/v1/models`, { headers: { authorization: "Bearer secret" } });
+    assert.equal(models.status, 200);
+    const modelBody = await models.json() as {
+      version: number;
+      source: string;
+      providers: Record<string, { provider: string; default_model: string; models: Array<{ id: string }> }>;
+    };
+    assert.equal(modelBody.version, 1);
+    assert.equal(modelBody.source, "pi-runtime");
+    assert.equal(modelBody.providers["openai-codex"]?.provider, "openai-codex");
+    assert.ok(modelBody.providers["openai-codex"]?.models.some((model) => model.id === "gpt-5.5"));
+    assert.equal(modelBody.providers["xai-oauth"]?.provider, "xai-oauth");
+    const modelsWithQuery = await fetch(`${base}/v1/models?provider=openai-codex`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    assert.equal(modelsWithQuery.status, 400);
     const unauthorized = await fetch(`${base}/v1/runs`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(unauthorized.status, 401);
     const unsafeModel = await fetch(`${base}/v1/runs`, {

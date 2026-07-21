@@ -261,3 +261,114 @@
   .md-code pre { padding: 10px 11px; font-size: 12px; }
   .scroll-latest { bottom: 10px; }
 }
+
+/* Context details: isolated topbar trigger and context-only status dialog. */
+.ctx-details__trigger {
+  min-height: 34px;
+  gap: 6px;
+  padding-inline: 10px;
+  white-space: nowrap;
+}
+
+.ctx-details__trigger svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.ctx-details__dialog {
+  width: min(440px, 100%);
+}
+
+.ctx-details__usage {
+  display: grid;
+  gap: 14px;
+}
+
+.ctx-details__summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ctx-details__summary strong {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: clamp(28px, 8vw, 38px);
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: -0.035em;
+}
+
+.ctx-details__progress {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+}
+
+.ctx-details__progress > span {
+  display: block;
+  min-width: 2px;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 68%, var(--ok)));
+  transition: width var(--t-slow);
+}
+
+.ctx-details__tokens {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-details__note,
+.ctx-details__empty p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.ctx-details__empty {
+  min-height: 130px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  padding: 18px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  text-align: center;
+}
+
+.ctx-details__empty svg {
+  color: var(--faint);
+}
+
+@media (max-width: 520px) {
+  .ctx-details__trigger {
+    width: 44px;
+    min-height: 44px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .ctx-details__dialog {
+    width: 100%;
+  }
+
+  .ctx-details__trigger > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}

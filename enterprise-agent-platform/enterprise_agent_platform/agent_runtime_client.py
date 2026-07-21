@@ -33,6 +33,9 @@ class AgentResult:
 
 
 class AgentClient(Protocol):
+    def model_catalog(self) -> dict[str, Any]:
+        ...
+
     def generate(
         self,
         *,
@@ -469,6 +472,128 @@ class AgentRuntimeClient:
         )
         return result
 
+    def model_catalog(self) -> dict[str, Any]:
+        """Fetch the Runtime-owned trusted model capability catalog."""
+
+        result, _ = self._json_request(
+            "GET",
+            "/v1/models",
+            None,
+            timeout=min(self.timeout_seconds, 10.0),
+            max_response_bytes=512 * 1024,
+        )
+        if type(result.get("version")) is not int or result.get("version") != 1:
+            raise AgentRuntimeProtocolError("Agent runtime model catalog has an unsupported version")
+        providers = result.get("providers")
+        if not isinstance(providers, dict):
+            raise AgentRuntimeProtocolError("Agent runtime model catalog has no providers object")
+        normalized: dict[str, dict[str, Any]] = {}
+        runtime_providers = {
+            "openai-codex": "openai-codex",
+            "xai-oauth": "xai",
+        }
+        for provider, expected_runtime_provider in runtime_providers.items():
+            entry = providers.get(provider)
+            if (
+                not isinstance(entry, dict)
+                or entry.get("provider") != provider
+                or entry.get("runtime_provider") != expected_runtime_provider
+            ):
+                raise AgentRuntimeProtocolError(
+                    f"Agent runtime model catalog has no valid {provider} provider"
+                )
+            raw_models = entry.get("models")
+            if not isinstance(raw_models, list) or not 1 <= len(raw_models) <= 256:
+                raise AgentRuntimeProtocolError(
+                    f"Agent runtime model catalog for {provider} has an invalid models list"
+                )
+            models: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for raw_model in raw_models:
+                if not isinstance(raw_model, dict):
+                    raise AgentRuntimeProtocolError(
+                        f"Agent runtime model catalog for {provider} contains an invalid model"
+                    )
+                raw_model_id = raw_model.get("id")
+                model_id = raw_model_id.strip() if isinstance(raw_model_id, str) else ""
+                if (
+                    not model_id
+                    or len(model_id) > 160
+                    or re.search(r"[\r\n\x00]", model_id)
+                    or model_id in seen
+                ):
+                    raise AgentRuntimeProtocolError(
+                        f"Agent runtime model catalog for {provider} contains an invalid model id"
+                    )
+                raw_name = raw_model.get("name")
+                name = raw_name.strip() if isinstance(raw_name, str) else ""
+                reasoning = raw_model.get("reasoning")
+                inputs = raw_model.get("input")
+                context_window = raw_model.get("context_window")
+                max_tokens = raw_model.get("max_tokens")
+                if (
+                    not name
+                    or len(name) > 200
+                    or re.search(r"[\r\n\x00]", name)
+                    or not isinstance(reasoning, bool)
+                    or not isinstance(inputs, list)
+                    or not inputs
+                    or len(inputs) > 2
+                    or any(
+                        not isinstance(value, str) or value not in {"text", "image"}
+                        for value in inputs
+                    )
+                    or len(set(inputs)) != len(inputs)
+                    or isinstance(context_window, bool)
+                    or not isinstance(context_window, int)
+                    or not 1 <= context_window <= 2**53 - 1
+                    or isinstance(max_tokens, bool)
+                    or not isinstance(max_tokens, int)
+                    or not 1 <= max_tokens <= 2**53 - 1
+                ):
+                    raise AgentRuntimeProtocolError(
+                        f"Agent runtime model catalog for {provider} contains invalid model metadata"
+                    )
+                seen.add(model_id)
+                models.append(
+                    {
+                        "id": model_id,
+                        "name": name,
+                        "reasoning": reasoning,
+                        "input": list(inputs),
+                        "context_window": context_window,
+                        "max_tokens": max_tokens,
+                    }
+                )
+            raw_default_model = entry.get("default_model")
+            default_model = (
+                raw_default_model.strip()
+                if isinstance(raw_default_model, str)
+                else ""
+            )
+            if (
+                raw_default_model is not None
+                and not isinstance(raw_default_model, str)
+            ) or (default_model and default_model not in seen):
+                raise AgentRuntimeProtocolError(
+                    f"Agent runtime model catalog for {provider} has an invalid default model"
+                )
+            normalized[provider] = {
+                "provider": provider,
+                "runtime_provider": expected_runtime_provider,
+                "models": models,
+                "default_model": default_model or (models[0]["id"] if models else ""),
+            }
+        raw_source = result.get("source", "agent-runtime")
+        source = raw_source.strip() if isinstance(raw_source, str) else ""
+        if not source or len(source) > 100 or re.search(r"[\r\n\x00]", source):
+            raise AgentRuntimeProtocolError("Agent runtime model catalog has an invalid source")
+        return {
+            "version": 1,
+            "source": source,
+            "providers": normalized,
+        }
+
     def terminal_previews(
         self,
         scope_key: str,
@@ -822,6 +947,9 @@ class AgentRuntimeClient:
                     raw[key] = [
                         str(value) for value in values if str(value or "").strip()
                     ]
+            context_usage = terminal_payload.get("context_usage")
+            if isinstance(context_usage, dict):
+                raw["context_usage"] = dict(context_usage)
         if terminal_type in _TERMINAL_EVENTS - {"run.completed"}:
             raw["error"] = terminal_error
             raw["terminal_event"] = terminal_type

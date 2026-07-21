@@ -4,7 +4,9 @@ import {
   type AfterToolCallResult,
   type AgentEvent,
   type AgentMessage,
+  type AgentTool,
   type StreamFn,
+  estimateContextTokens,
 } from "@earendil-works/pi-agent-core";
 import type {
   AssistantMessage,
@@ -37,6 +39,7 @@ import {
 } from "./tools.js";
 import type {
   ApprovalDecision,
+  ContextUsage,
   GatewayToolResponse,
   JsonObject,
   JsonValue,
@@ -470,7 +473,12 @@ export class RunCoordinator {
       if (recoveredHistory.repaired > 0) {
         journal.publish("session.repaired", { interrupted_tool_messages: recoveredHistory.repaired });
       }
-      const tools = createTools({
+      let compactionNoticeEntryId: string | undefined;
+      const executionReview = createExecutionReviewState();
+      const ephemeralMessages = new WeakSet<AgentMessage>();
+      const approvedToolCalls = new Set<string>();
+      const startedToolCalls = new Set<string>();
+      const rawTools = createTools({
         runId: record.id,
         request: record.request,
         processes: this.processes,
@@ -484,9 +492,23 @@ export class RunCoordinator {
         markSideEffect: () => { record.sideEffectsStarted = true; },
         delegate: async (prompt, systemPrompt, signal) => await this.delegate(record, prompt, systemPrompt, signal),
       });
-      let compactionNoticeEntryId: string | undefined;
-      const executionReview = createExecutionReviewState();
-      const ephemeralMessages = new WeakSet<AgentMessage>();
+      const tools = rawTools.map((tool): AgentTool => ({
+        ...tool,
+        execute: async (toolCallId, params, signal, onUpdate) => {
+          if (!approvedToolCalls.has(toolCallId)) {
+            throw new Error("Tool execution was not approved by the platform policy");
+          }
+          if (record.controller.signal.aborted || signal?.aborted) throw abortError();
+          startedToolCalls.add(toolCallId);
+          journal.publish("tool.started", {
+            tool_call_id: toolCallId,
+            tool_name: tool.name,
+            arguments: params as JsonObject,
+            execution_started: true,
+          });
+          return await tool.execute(toolCallId, params, signal, onUpdate);
+        },
+      }));
       let agent: Agent | undefined;
       const agentOptions: ConstructorParameters<typeof Agent>[0] = {
         initialState: {
@@ -527,7 +549,7 @@ export class RunCoordinator {
         transformContext: async (messages) => {
           const compatibleMessages = adaptImageContentForModel(messages, modelSupportsImages(resolved.model));
           if (record.controller.signal.aborted || isTerminal(record.status)) return compatibleMessages;
-          if (estimateTokens(compatibleMessages) < resolved.model.contextWindow * this.config.compactionThreshold) {
+          if (estimateContextTokens(compatibleMessages).tokens < resolved.model.contextWindow * this.config.compactionThreshold) {
             return compatibleMessages;
           }
           const compaction = compactContextPlan(compatibleMessages);
@@ -564,6 +586,11 @@ export class RunCoordinator {
           if (record.controller.signal.aborted) {
             return { block: true, reason: "Agent run is no longer active" };
           }
+          const rememberApprovedTool = (): boolean => {
+            if (record.controller.signal.aborted || signal?.aborted) return false;
+            approvedToolCalls.add(toolContext.toolCall.id);
+            return true;
+          };
           const metadata = record.request.metadata;
           const unattendedScheduled = metadata?.trigger === "scheduled" && metadata.unattended === true;
           const policy = await classifyToolCall(
@@ -581,14 +608,22 @@ export class RunCoordinator {
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
-          if (!policy.approvalReason) return undefined;
+          if (!policy.approvalReason) {
+            return rememberApprovedTool()
+              ? undefined
+              : { block: true, reason: "Agent run is no longer active" };
+          }
           const approvalRunId = typeof metadata?.approval_owner_run_id === "string" ? metadata.approval_owner_run_id : record.id;
           const approvalScopeKey = typeof metadata?.approval_scope_key === "string" ? metadata.approval_scope_key : record.request.scope_key;
           const approvalSessionId = typeof metadata?.approval_session_id === "string"
             ? metadata.approval_session_id
             : record.request.session_id;
           if (unattendedScheduled) {
-            if (this.approvals.hasPersistentAlways(approvalScopeKey, toolContext.toolCall.name)) return undefined;
+            if (this.approvals.hasPersistentAlways(approvalScopeKey, toolContext.toolCall.name)) {
+              return rememberApprovedTool()
+                ? undefined
+                : { block: true, reason: "Agent run is no longer active" };
+            }
             const reason = `Unattended scheduled runs require an existing persistent always authorization for the ${toolContext.toolCall.name} tool`;
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
@@ -603,7 +638,10 @@ export class RunCoordinator {
             reason: policy.approvalReason,
             ...(signal ? { signal } : {}),
           });
-          return allowed ? undefined : { block: true, reason: "User denied the operation" };
+          if (!allowed) return { block: true, reason: "User denied the operation" };
+          return rememberApprovedTool()
+            ? undefined
+            : { block: true, reason: "Agent run is no longer active" };
         },
         afterToolCall: async (toolContext, signal) => await this.enrichBrowserVisionResult(
           record,
@@ -625,6 +663,8 @@ export class RunCoordinator {
         sessionEntryIds,
         executionReview,
         ephemeralMessages,
+        approvedToolCalls,
+        startedToolCalls,
       ));
       const prompt = await buildPrompt(record.request, record.controller.signal);
       try {
@@ -642,6 +682,7 @@ export class RunCoordinator {
         agent.state.messages,
         resolved.model.provider,
         resolved.model.id,
+        resolved.model.contextWindow,
         history.length,
         ephemeralMessages,
       );
@@ -656,6 +697,7 @@ export class RunCoordinator {
         session_id: record.request.session_id,
         model: result.model,
         usage: result.usage ?? {},
+        ...(result.context_usage ? { context_usage: result.context_usage } : {}),
         ...inputSummary,
       });
     })();
@@ -708,6 +750,8 @@ export class RunCoordinator {
     sessionEntryIds: WeakMap<AgentMessage, string>,
     executionReview: ExecutionReviewState,
     ephemeralMessages: WeakSet<AgentMessage>,
+    approvedToolCalls: Set<string>,
+    startedToolCalls: Set<string>,
   ): Promise<void> {
     if (isTerminal(record.status)) return;
     const journal = this.journals.get(record.id)!;
@@ -759,16 +803,28 @@ export class RunCoordinator {
       return;
     }
     if (event.type === "tool_execution_start") {
-      journal.publish("tool.started", { tool_call_id: event.toolCallId, tool_name: event.toolName, arguments: event.args as JsonObject });
+      // Pi emits this before argument validation and before beforeToolCall
+      // approval. The authoritative visible start is published by the tool's
+      // execute wrapper at the point execution actually begins.
+      return;
     } else if (event.type === "tool_execution_update") {
-      journal.publish("tool.updated", { tool_call_id: event.toolCallId, tool_name: event.toolName, partial_result: event.partialResult as JsonObject });
+      if (!startedToolCalls.has(event.toolCallId)) return;
+      journal.publish("tool.updated", {
+        tool_call_id: event.toolCallId,
+        tool_name: event.toolName,
+        partial_result: event.partialResult as JsonObject,
+        execution_started: true,
+      });
     } else if (event.type === "tool_execution_end") {
+      approvedToolCalls.delete(event.toolCallId);
+      const executionStarted = startedToolCalls.delete(event.toolCallId);
       const unattendedAuthorizationReason = this.takeUnattendedAuthorizationBlock(record.id, event.toolCallId);
       journal.publish(event.isError ? "tool.failed" : "tool.completed", {
         tool_call_id: event.toolCallId,
         tool_name: event.toolName,
         result: sanitizeToolResultForJournal(event.result) as JsonObject,
         is_error: event.isError,
+        execution_started: executionStarted,
         ...(unattendedAuthorizationReason ? {
           unattended_authorization_required: true,
           reason: unattendedAuthorizationReason,
@@ -1140,6 +1196,7 @@ export class RunCoordinator {
       messages: [],
       model: persisted.result.model,
       ...(persisted.result.usage ? { usage: persisted.result.usage } : {}),
+      ...(persisted.result.context_usage ? { context_usage: persisted.result.context_usage } : {}),
       ...(persisted.result.input_message_ids
         ? { input_message_ids: persisted.result.input_message_ids }
         : {}),
@@ -1200,6 +1257,7 @@ export class RunCoordinator {
         session_id: persisted.session_id,
         model: result.model,
         usage: result.usage ?? {},
+        ...(result.context_usage ? { context_usage: result.context_usage } : {}),
         input_message_ids: result.input_message_ids ?? [],
         unconsumed_input_message_ids: result.unconsumed_input_message_ids ?? [],
       } : {}),
@@ -2102,6 +2160,7 @@ function resultFromMessages(
   messages: AgentMessage[],
   provider: string,
   model: string,
+  contextWindow: number,
   runMessageStart = 0,
   ephemeralMessages?: WeakSet<AgentMessage>,
 ): RunResult {
@@ -2132,6 +2191,7 @@ function resultFromMessages(
       usage.cacheWrite1h = Number(usage.cacheWrite1h || 0) + message.usage.cacheWrite1h;
     }
   }
+  const contextUsage = contextUsageForCompletedTurn(messages, contextWindow);
   return {
     content: assistantText(assistant),
     messages: durableRunResultMessages(
@@ -2139,11 +2199,24 @@ function resultFromMessages(
     ),
     model: { provider, id: model },
     usage: usage as unknown as JsonObject,
+    ...(contextUsage ? { context_usage: contextUsage } : {}),
   };
 }
 
-function estimateTokens(messages: AgentMessage[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4);
+export function contextUsageForCompletedTurn(
+  messages: AgentMessage[],
+  contextWindow: number,
+): ContextUsage | undefined {
+  const maximum = Number.isFinite(contextWindow) ? Math.max(0, Math.round(contextWindow)) : 0;
+  if (maximum <= 0) return undefined;
+  const estimate = estimateContextTokens(messages);
+  const used = Math.max(0, Math.round(estimate.tokens));
+  return {
+    used_tokens: used,
+    max_tokens: maximum,
+    percent: Math.max(0, Math.min(100, Math.round((used / maximum) * 100))),
+    estimated: estimate.usageTokens === 0 || estimate.trailingTokens > 0,
+  };
 }
 
 function inputText(input: RunRequest["input"]): string {

@@ -74,7 +74,12 @@ describe("KnowledgeSearchForm", () => {
     expect(input).toHaveValue("graph agents");
     expect(store.getState().resourceStates["knowledge:search"].status).toBe("ready");
 
-    await user.click(screen.getByRole("button", { name: "Clear search and show all entries" }));
+    const clear = screen.getByRole("button", { name: "Clear search and show all entries" });
+    const control = input.closest(".search-field__control");
+    expect(control).toContainElement(clear);
+    expect(control).not.toContainElement(screen.getByRole("button", { name: "Search" }));
+
+    await user.click(clear);
     expect(store.getState().knowledgeSearch).toEqual({ query: "", results: null });
     expect(input).toHaveValue("");
   });

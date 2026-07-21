@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
+import { productModelCatalogs } from "./model-resolver.js";
 import { RunCoordinator } from "./run-coordinator.js";
 import type { ApprovalDecision, RunInputRequest, RunRequest, RuntimeConfig, RuntimeEvent } from "./types.js";
 import { errorMessage, safeEqual } from "./utils.js";
@@ -63,6 +64,18 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       version: VERSION,
       pid: process.pid,
       uptime_seconds: Math.floor(process.uptime()),
+    });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/models") {
+    if ([...url.searchParams.keys()].length > 0) {
+      throw httpError(400, "Model catalog does not accept query parameters");
+    }
+    json(response, 200, {
+      version: 1,
+      source: "pi-runtime",
+      providers: productModelCatalogs(),
     });
     return;
   }

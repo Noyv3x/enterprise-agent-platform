@@ -9,7 +9,7 @@
 }
 
 .chat-workspace.has-preview {
-  grid-template-columns: minmax(0, 1fr) 52px clamp(380px, 39vw, 600px);
+  grid-template-columns: minmax(0, 1fr) 52px clamp(380px, 39vw, 640px);
 }
 
 .chat-workspace > .chat {
@@ -29,6 +29,8 @@
   padding: 12px 6px;
   border-left: 1px solid var(--line);
   background: color-mix(in srgb, var(--surface) 88%, transparent);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .chat-preview__toggle {
@@ -43,6 +45,10 @@
   color: var(--muted);
   cursor: pointer;
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+
+.chat-preview__toggle:focus-visible {
+  z-index: 1;
 }
 
 .chat-preview__toggle:hover {
@@ -96,11 +102,12 @@
   background: var(--surface);
   box-shadow: -12px 0 30px -24px color-mix(in srgb, var(--ink) 35%, transparent);
   overflow: hidden;
+  contain: layout paint;
 }
 
 .chat-preview__header {
   min-width: 0;
-  min-height: 68px;
+  min-height: 64px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -155,8 +162,11 @@
 .chat-preview__body {
   min-width: 0;
   min-height: 0;
-  padding: 12px;
+  padding: clamp(10px, 1.4vw, 16px);
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  container: preview-body / inline-size;
 }
 
 .preview-toolbar {
@@ -165,6 +175,10 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.preview-toolbar > .btn {
+  flex: 0 0 auto;
 }
 
 .preview-toolbar__status {
@@ -178,6 +192,7 @@
 .preview-updated {
   color: var(--muted);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .preview-empty-card {
@@ -258,7 +273,7 @@
 .browser-preview__screen {
   position: relative;
   min-height: 280px;
-  height: min(55dvh, 620px);
+  height: clamp(280px, 52dvh, 620px);
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -310,7 +325,8 @@
 
 .terminal-preview__workspace {
   min-width: 0;
-  min-height: min(620px, calc(100dvh - 118px));
+  height: clamp(420px, calc(100dvh - 190px), 720px);
+  min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
@@ -335,7 +351,7 @@
 .terminal-preview__tab {
   min-width: 132px;
   max-width: 240px;
-  min-height: 35px;
+  min-height: 38px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -368,7 +384,7 @@
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto minmax(260px, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   color: hsl(214 18% 89%);
 }
 
@@ -426,7 +442,7 @@
 .terminal-preview__output {
   min-width: 0;
   min-height: 0;
-  max-height: min(70dvh, 780px);
+  max-height: none;
   margin: 0;
   padding: 17px 18px 28px;
   overflow: auto;
@@ -448,7 +464,69 @@
 }
 
 .preview-empty-card--terminal {
-  min-height: min(520px, calc(100dvh - 130px));
+  min-height: clamp(300px, calc(100dvh - 220px), 560px);
+}
+
+@container preview-body (max-width: 430px) {
+  .preview-toolbar {
+    display: grid;
+    gap: 9px;
+  }
+
+  .preview-toolbar > .btn {
+    width: 100%;
+  }
+
+  .browser-preview__chrome {
+    height: 38px;
+    padding-inline: 10px;
+    gap: 9px;
+  }
+
+  .browser-preview__lights i {
+    width: 7px;
+    height: 7px;
+  }
+
+  .browser-preview__screen {
+    min-height: 240px;
+  }
+
+  .terminal-preview__tab {
+    min-width: 116px;
+  }
+
+  .terminal-preview__head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .terminal-preview__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .terminal-preview__facts dd {
+    margin-bottom: 5px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .terminal-preview__output {
+    padding-inline: 13px;
+    font-size: 11.5px;
+  }
+}
+
+@media (pointer: coarse) {
+  .chat-preview__rail {
+    width: 52px;
+    padding-inline: 4px;
+  }
+
+  .chat-preview__toggle {
+    width: 44px;
+    height: 44px;
+  }
 }
 
 @media (max-width: 1200px) {
@@ -469,13 +547,13 @@
   .preview-toolbar__status { gap: 5px; }
   .browser-preview__chrome { grid-template-columns: auto minmax(0, 1fr); }
   .browser-preview__screen { height: min(58dvh, 620px); min-height: 280px; }
-  .terminal-preview__workspace { min-height: calc(100dvh - 118px); }
+  .terminal-preview__workspace { height: clamp(400px, calc(100dvh - 176px), 680px); }
   .terminal-preview__head { align-items: flex-start; }
 }
 
 @media (max-width: 520px) {
   .chat-preview__rail {
-    width: 48px;
+    width: 52px;
     padding-inline: 4px;
   }
 

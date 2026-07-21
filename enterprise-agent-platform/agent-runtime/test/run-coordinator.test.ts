@@ -7,6 +7,7 @@ import {
   adaptImageContentForModel,
   appendSkillPolicy,
   availableSkillIndex,
+  contextUsageForCompletedTurn,
   RunCoordinator,
   RunInputConflictError,
   RunValidationError,
@@ -60,6 +61,42 @@ test("available skill policy validates, escapes, and bounds metadata without inj
   assert.match(prompt, /Only the main instructions returned by skill\.load may guide the current task/);
   assert.match(prompt, /skill\.list can discover other skills/);
   assert.match(appendSkillPolicy("base", undefined), /<available_skills>\n\[\]\n<\/available_skills>/);
+});
+
+test("completed-turn context usage prefers provider measurements and reports capacity", () => {
+  const answer = fauxAssistantMessage("done");
+  answer.usage.input = 24_000;
+  answer.usage.output = 8_000;
+  answer.usage.totalTokens = 32_000;
+  assert.deepEqual(contextUsageForCompletedTurn([answer], 128_000), {
+    used_tokens: 32_000,
+    max_tokens: 128_000,
+    percent: 25,
+    estimated: false,
+  });
+});
+
+test("completed-turn context fallback estimates image cost without counting base64 bytes", () => {
+  const answer = fauxAssistantMessage("done");
+  answer.usage.input = 0;
+  answer.usage.output = 0;
+  answer.usage.cacheRead = 0;
+  answer.usage.cacheWrite = 0;
+  answer.usage.totalTokens = 0;
+  const messages: AgentMessage[] = [
+    {
+      role: "user",
+      content: [{ type: "image", data: "A".repeat(1_000_000), mimeType: "image/png" }],
+      timestamp: Date.now(),
+    },
+    answer,
+  ];
+
+  const usage = contextUsageForCompletedTurn(messages, 128_000);
+
+  assert.equal(usage?.estimated, true);
+  assert.ok(Number(usage?.used_tokens) > 0);
+  assert.ok(Number(usage?.used_tokens) < 10_000);
 });
 
 test("RunCoordinator appends skill policy and the sanitized index to root and custom child prompts", async () => {
@@ -165,7 +202,9 @@ test("unattended scheduled skill mutations require existing persistent authoriza
     assert.equal(completed.status, "completed");
     const events = coordinator.getJournal(run.id)?.list() ?? [];
     assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.equal(events.some((event) => event.type === "tool.started"), false);
     const failed = events.find((event) => event.type === "tool.failed");
+    assert.equal(failed?.data.execution_started, false);
     assert.equal(failed?.data.unattended_authorization_required, true);
     assert.match(String(failed?.data.reason), /persistent always authorization for the skill tool/);
   } finally {
@@ -196,12 +235,28 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
     const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find((event) => event.type === "approval.requested"));
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().some((event) => event.type === "tool.started"),
+      false,
+      "a terminal call must not appear to start before approval",
+    );
     const approvalId = String(approval.data.approval_id);
     await coordinator.respondApproval(run.id, approvalId, "once");
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "finished");
-    assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "tool.completed"));
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    const approved = events.find((event) => event.type === "tool.started");
+    assert.deepEqual(approved?.data.arguments, {
+      command: "touch approved.txt && stat approved.txt",
+    });
+    assert.equal(approved?.data.execution_started, true);
+    const approvalResolvedIndex = events.findIndex((event) => event.type === "approval.resolved");
+    assert.notEqual(approvalResolvedIndex, -1);
+    assert.ok(approvalResolvedIndex < events.indexOf(approved!));
+    const toolCompletedIndex = events.findIndex((event) => event.type === "tool.completed");
+    assert.ok(events.indexOf(approved!) < toolCompletedIndex);
+    assert.equal(events[toolCompletedIndex]?.data.execution_started, true);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -649,6 +704,11 @@ test("parallel-mode approval preflight exposes only one pending approval card", 
       2,
     );
     assert.equal(coordinator.approvals.latestForRun(run.id)?.id, second.id);
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().some((event) => event.type === "tool.started"),
+      false,
+      "approved calls remain queued until the complete parallel batch begins execution",
+    );
     await coordinator.respondApproval(run.id, second.id, "once");
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
@@ -764,6 +824,8 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
       completed.result?.usage?.totalTokens,
       billedTurns.reduce((total, usage) => total + Number(usage.totalTokens || 0), 0),
     );
+    assert.ok(Number(completed.result?.context_usage?.used_tokens) > 0);
+    assert.ok(Number(completed.result?.context_usage?.max_tokens) > 0);
     assert.deepEqual(
       events.filter((event) => event.type === "input.injected").map((event) => event.data.message_id),
       ["message-2", "message-3"],
@@ -774,6 +836,7 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
     assert.deepEqual(finalTurns, [1, 2]);
     const completedEvent = events.find((event) => event.type === "run.completed");
     assert.deepEqual(completedEvent?.data.input_message_ids, ["message-2", "message-3"]);
+    assert.deepEqual(completedEvent?.data.context_usage, completed.result?.context_usage);
 
     coordinator.shutdown();
     const restartedFaux = fauxProvider();
@@ -785,6 +848,7 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
     const reused = restarted.createRun(structuredClone(request));
     assert.equal(reused.id, run.id);
     assert.equal(reused.status, "completed");
+    assert.deepEqual(reused.result?.context_usage, completed.result?.context_usage);
     assert.deepEqual(await restarted.submitInput(reused.id, executionEquivalentRetry), {
       run_id: run.id,
       message_id: first.message_id,

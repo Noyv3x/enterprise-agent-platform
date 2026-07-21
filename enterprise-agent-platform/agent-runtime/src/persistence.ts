@@ -61,7 +61,7 @@ export interface PersistentIdempotencyRecord {
   expires_at: number;
   result?: Pick<
     RunResult,
-    "content" | "model" | "usage" | "input_message_ids" | "unconsumed_input_message_ids"
+    "content" | "model" | "usage" | "context_usage" | "input_message_ids" | "unconsumed_input_message_ids"
   >;
   inputs?: Record<string, { fingerprint: string; state: "accepted" | "injected" | "unconsumed" }>;
   error?: string;
@@ -140,6 +140,7 @@ export class IdempotencyStore {
         content: patch.result.content,
         model: patch.result.model,
         ...(patch.result.usage ? { usage: patch.result.usage } : {}),
+        ...(patch.result.context_usage ? { context_usage: patch.result.context_usage } : {}),
         ...(patch.result.input_message_ids
           ? { input_message_ids: patch.result.input_message_ids }
           : {}),

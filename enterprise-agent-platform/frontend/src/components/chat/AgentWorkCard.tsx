@@ -25,6 +25,10 @@ type Work = AgentWork | AgentStatus;
 interface ProcessLineEntry {
   key: string;
   line: string;
+  tool: string;
+  rawTool: string;
+  detail: string;
+  state: "running" | "completed" | "failed";
 }
 
 const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
@@ -136,6 +140,21 @@ function agentStepLine(step: ActivityStep, translate: Translator): string {
   );
 }
 
+function agentStepState(step: ActivityStep): "running" | "completed" | "failed" {
+  const stage = String(step?.stage || "").toLowerCase();
+  const status = String(step?.tool_status || "").toLowerCase();
+  if (status === "failed" || stage.endsWith("failed")) return "failed";
+  if (status === "completed" || stage.endsWith("completed")) return "completed";
+  return "running";
+}
+
+function agentStepStateText(
+  state: "running" | "completed" | "failed",
+  translate: Translator,
+): string {
+  return translate(`chat.activity.state.${state}` as MessageKey);
+}
+
 function agentProcessLineEntries(
   work: Work | null | undefined,
   translate: Translator,
@@ -155,7 +174,15 @@ function agentProcessLineEntries(
     const baseKey = identity || `${stage || "step"}:${String(step?.at || index)}:${line}`;
     const occurrence = keyCounts.get(baseKey) || 0;
     keyCounts.set(baseKey, occurrence + 1);
-    entries.push({ key: occurrence ? `${baseKey}:${occurrence}` : baseKey, line });
+    const rawTool = String(step?.tool || step?.label || translate("chat.activity.toolFallback")).trim();
+    entries.push({
+      key: occurrence ? `${baseKey}:${occurrence}` : baseKey,
+      line,
+      tool: displayToolName(rawTool, translate),
+      rawTool: rawTool.toLowerCase(),
+      detail: String(step?.detail || "").trim(),
+      state: agentStepState(step),
+    });
   }
   return entries;
 }
@@ -191,12 +218,17 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const expanded = stored === undefined ? active : stored;
 
   const processEntries = agentProcessLineEntries(work, t);
-  const current = active ? processEntries[processEntries.length - 1]?.line || text : t("chat.work.completed");
-  const logEntries = processEntries.length
-    ? active
-      ? processEntries.slice(0, -1)
-      : processEntries
-    : [{ key: "empty", line: active ? t("chat.work.waiting") : t("chat.work.noTools") }];
+  const currentEntry = active
+    ? [...processEntries].reverse().find((entry) => entry.state === "running")
+    : undefined;
+  const current = active && currentEntry
+    ? t("chat.activity.currentTool", {
+        tool: currentEntry.tool,
+        status: agentStepStateText(currentEntry.state, t),
+      })
+    : active
+      ? t("chat.status.processing")
+      : t("chat.work.completed");
 
   const onToggle = (event: MouseEvent<HTMLElement>) => {
     event.preventDefault();
@@ -207,15 +239,11 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
     <details className={cx("agent-work", active ? "agent-work--active" : "agent-work--complete")} open={expanded}>
       <summary className="agent-work__summary" onClick={onToggle}>
         {active ? (
-          <div className="typing__dots">
-            <i />
-            <i />
-            <i />
-          </div>
+          <span className="agent-work__live" aria-hidden="true"><i /></span>
         ) : (
-          <div className="agent-work__done">
+          <span className={cx("agent-work__done", work?.state === "error" && "agent-work__done--failed")}>
             <Icon name={work?.state === "error" ? "alert" : "checkCircle"} size={15} />
-          </div>
+          </span>
         )}
         <div className="agent-work__main">
           <span className="agent-work__title">{text}</span>
@@ -226,12 +254,44 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
         {waiting > 0 ? (
           <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
         ) : null}
+        <span className="agent-work__chevron" aria-hidden="true" />
       </summary>
-      {logEntries.length ? (
-        <div className="agent-work__log">
-          {logEntries.map((entry) => (
-            <div className="agent-work__line" key={entry.key}>
-              {entry.line}
+      {processEntries.length ? (
+        <div className="agent-work__log" role="list">
+          {processEntries.map((entry) => (
+            <div
+              className={cx("agent-work__item", `agent-work__item--${entry.state}`)}
+              data-tool={entry.rawTool}
+              key={entry.key}
+              role="listitem"
+            >
+              <span className="agent-work__item-state" aria-hidden="true">
+                {entry.state === "running" ? (
+                  <i />
+                ) : (
+                  <Icon name={entry.state === "failed" ? "alert" : "checkCircle"} size={14} />
+                )}
+              </span>
+              <div className="agent-work__item-main">
+                <div className="agent-work__item-head">
+                  <span className="agent-work__tool">{entry.tool}</span>
+                  <span className="agent-work__item-label">
+                    {agentStepStateText(entry.state, t)}
+                  </span>
+                </div>
+                {entry.detail ? (
+                  entry.rawTool === "terminal" ? (
+                    <div className="agent-work__command">
+                      <span className="agent-work__prompt" aria-hidden="true">$</span>
+                      <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}>
+                        <code>{entry.detail}</code>
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="agent-work__detail">{entry.detail}</div>
+                  )
+                ) : null}
+              </div>
             </div>
           ))}
         </div>

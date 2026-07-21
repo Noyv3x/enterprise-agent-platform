@@ -59,6 +59,47 @@ class _FakeRuntime:
                 if self.path == "/health":
                     self._json(200, {"ok": True, "status": "ready"})
                     return
+                if self.path == "/v1/models":
+                    self._json(
+                        200,
+                        {
+                            "version": 1,
+                            "source": "pi-runtime",
+                            "providers": {
+                                "openai-codex": {
+                                    "provider": "openai-codex",
+                                    "runtime_provider": "openai-codex",
+                                    "default_model": "gpt-5.5",
+                                    "models": [
+                                        {
+                                            "id": "gpt-5.5",
+                                            "name": "GPT-5.5",
+                                            "reasoning": True,
+                                            "input": ["text", "image"],
+                                            "context_window": 272_000,
+                                            "max_tokens": 128_000,
+                                        }
+                                    ],
+                                },
+                                "xai-oauth": {
+                                    "provider": "xai-oauth",
+                                    "runtime_provider": "xai",
+                                    "default_model": "grok-4.3",
+                                    "models": [
+                                        {
+                                            "id": "grok-4.3",
+                                            "name": "Grok 4.3",
+                                            "reasoning": True,
+                                            "input": ["text", "image"],
+                                            "context_window": 1_000_000,
+                                            "max_tokens": 30_000,
+                                        }
+                                    ],
+                                },
+                            },
+                        },
+                    )
+                    return
                 if self.path == "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7":
                     self._json(
                         200,
@@ -352,6 +393,12 @@ class AgentRuntimeClientTests(unittest.TestCase):
                     "session_id": "session-2",
                     "input_message_ids": ["42"],
                     "unconsumed_input_message_ids": [],
+                    "context_usage": {
+                        "used_tokens": 24_000,
+                        "max_tokens": 128_000,
+                        "percent": 19,
+                        "estimated": False,
+                    },
                 },
             ),
         ]
@@ -390,6 +437,15 @@ class AgentRuntimeClientTests(unittest.TestCase):
         )
         self.assertEqual(result.raw["input_message_ids"], ["42"])
         self.assertEqual(result.raw["unconsumed_input_message_ids"], [])
+        self.assertEqual(
+            result.raw["context_usage"],
+            {
+                "used_tokens": 24_000,
+                "max_tokens": 128_000,
+                "percent": 19,
+                "estimated": False,
+            },
+        )
         self.assertEqual([item["event"] for item in progress], ["input.injected"])
 
     def test_unbounded_json_response_uses_an_argumentless_read(self):
@@ -687,6 +743,62 @@ class AgentRuntimeClientTests(unittest.TestCase):
                 "delete_sessions": True,
             },
         )
+
+    def test_model_catalog_uses_bounded_authenticated_runtime_endpoint(self):
+        catalog = self.client.model_catalog()
+
+        self.assertEqual(catalog["version"], 1)
+        self.assertEqual(catalog["source"], "pi-runtime")
+        self.assertEqual(
+            catalog["providers"]["openai-codex"]["models"][0]["id"],
+            "gpt-5.5",
+        )
+        self.assertEqual(
+            catalog["providers"]["xai-oauth"]["default_model"],
+            "grok-4.3",
+        )
+        request = self.runtime.request("GET", "/v1/models")
+        self.assertEqual(request["authorization"], "Bearer runtime-secret")
+
+    def test_model_catalog_rejects_invalid_runtime_capability_metadata(self):
+        valid = self.client.model_catalog()
+        invalid = json.loads(json.dumps(valid))
+        invalid["providers"]["xai-oauth"]["runtime_provider"] = "openai-codex"
+
+        with (
+            mock.patch.object(self.client, "_json_request", return_value=(invalid, {})),
+            self.assertRaisesRegex(AgentRuntimeProtocolError, "no valid xai-oauth provider"),
+        ):
+            self.client.model_catalog()
+
+        invalid = json.loads(json.dumps(valid))
+        del invalid["providers"]["openai-codex"]["models"][0]["context_window"]
+        with (
+            mock.patch.object(self.client, "_json_request", return_value=(invalid, {})),
+            self.assertRaisesRegex(AgentRuntimeProtocolError, "invalid model metadata"),
+        ):
+            self.client.model_catalog()
+
+        for mutate, expected in (
+            (lambda payload: payload.__setitem__("version", True), "unsupported version"),
+            (
+                lambda payload: payload["providers"]["openai-codex"]["models"][0].__setitem__("id", 123),
+                "invalid model id",
+            ),
+            (
+                lambda payload: payload["providers"]["openai-codex"].__setitem__("default_model", 123),
+                "invalid default model",
+            ),
+            (lambda payload: payload.__setitem__("source", 123), "invalid source"),
+        ):
+            with self.subTest(expected=expected):
+                invalid = json.loads(json.dumps(valid))
+                mutate(invalid)
+                with (
+                    mock.patch.object(self.client, "_json_request", return_value=(invalid, {})),
+                    self.assertRaisesRegex(AgentRuntimeProtocolError, expected),
+                ):
+                    self.client.model_catalog()
 
     def test_terminal_previews_use_the_bounded_read_only_scope_endpoint(self):
         result = self.client.terminal_previews("private:7", "life-7")

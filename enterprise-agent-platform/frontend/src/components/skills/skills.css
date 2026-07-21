@@ -2,7 +2,7 @@
   min-width: 0;
   display: grid;
   align-content: start;
-  gap: 14px;
+  gap: 16px;
   padding-bottom: 8px;
 }
 
@@ -44,7 +44,7 @@
 }
 
 .skills-search input {
-  min-height: 34px;
+  min-height: 40px;
   padding-block: 6px;
   padding-left: 34px;
   font-size: 12.5px;
@@ -58,7 +58,7 @@
   min-width: 0;
   display: grid;
   gap: 12px;
-  padding: 12px;
+  padding: 14px;
   border: 1px solid var(--accent-line);
   border-radius: var(--r-lg);
   background: var(--surface);
@@ -84,7 +84,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  font-size: 13.5px;
+  font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -122,13 +122,13 @@
 
 .skill-editor__grid > label > span {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
 }
 
 .skill-editor__grid > label > small {
   color: var(--faint);
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.4;
 }
 
@@ -145,7 +145,7 @@
 .skill-editor__grid .skill-editor__instructions {
   min-height: 210px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.55;
   tab-size: 2;
 }
@@ -167,7 +167,7 @@
   border-radius: var(--r-md);
   background: var(--surface-2);
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 11.5px;
   line-height: 1.45;
 }
 
@@ -192,7 +192,7 @@
   align-items: center;
   gap: 9px;
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
 }
 
@@ -273,7 +273,7 @@
 .skill-card {
   display: grid;
   gap: 10px;
-  padding: 12px;
+  padding: 14px;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--surface-2);
@@ -310,7 +310,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  font-size: 13px;
+  font-size: 13.5px;
   line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -328,13 +328,13 @@
   border-radius: var(--r-pill);
   color: var(--muted);
   background: var(--surface-3);
-  font-size: 9.5px;
+  font-size: 10.5px;
   font-weight: 600;
 }
 
 .skill-card__state.is-enabled {
-  color: var(--success);
-  background: var(--success-soft);
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .skill-card__state.is-preset {
@@ -344,7 +344,7 @@
 
 .skill-card__description {
   color: var(--ink);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.55;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -375,7 +375,7 @@
   background: var(--surface);
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -399,7 +399,7 @@
   gap: 3px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
 }
 
 .skill-card__footer > div:first-child span {
@@ -424,6 +424,91 @@
   gap: 9px;
   color: var(--muted);
   font-size: 12.5px;
+}
+
+@container preview-body (max-width: 430px) {
+  .skills-panel {
+    gap: 12px;
+  }
+
+  .skills-panel > .inline-alert,
+  .skill-editor,
+  .skill-card {
+    padding: 10px;
+  }
+
+  .skills-toolbar > .btn {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .skills-search {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .skills-search > label {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .skills-search > label + .btn:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .skill-editor__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .skill-editor__grid > label,
+  .skill-editor__grid > label:first-child,
+  .skill-editor__wide {
+    grid-column: 1;
+  }
+
+  .skill-editor__actions,
+  .skill-card__actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .skill-editor__actions .btn,
+  .skill-card__actions .btn {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .skill-editor__actions .btn:only-child,
+  .skill-card__actions .btn:only-child {
+    grid-column: 1 / -1;
+  }
+
+  .skill-card__footer {
+    align-items: stretch;
+    display: grid;
+  }
+
+  .skill-card__identity h3 {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (pointer: coarse) {
+  .skill-switch {
+    width: 44px;
+    height: 28px;
+    padding: 3px;
+  }
+
+  .skill-switch > span {
+    width: 20px;
+    height: 20px;
+  }
+
+  .skill-switch.is-on > span {
+    transform: translateX(16px);
+  }
 }
 
 @media (max-width: 520px) {

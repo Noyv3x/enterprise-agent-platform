@@ -11,6 +11,7 @@ from enterprise_agent_platform.oauth_flows import (
     CODEX_DEVICE_TOKEN_URL,
     CODEX_DEVICE_USER_CODE_URL,
     CODEX_TOKEN_URL,
+    MAX_OAUTH_RESPONSE_BYTES,
     MAX_OAUTH_SESSIONS,
     OAuthFlowError,
     OAuthFlowManager,
@@ -93,7 +94,7 @@ class OAuthPollTests(unittest.TestCase):
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-            def read(self):
+            def read(self, _limit=-1):
                 return b'{"ok": true}'
 
         def fake_urlopen(request, timeout):
@@ -112,6 +113,78 @@ class OAuthPollTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["User-agent"], OAUTH_HTTP_USER_AGENT)
         self.assertEqual(captured["headers"]["Content-type"], "application/json")
         self.assertEqual(captured["timeout"], 7.0)
+
+    def test_oauth_http_client_adds_bearer_token_for_model_discovery(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, _limit=-1):
+                return b'{"models": []}'
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                captured["headers"] = dict(request.header_items())
+                captured["timeout"] = timeout
+                return FakeResponse()
+
+        with patch("urllib.request.build_opener", return_value=FakeOpener()) as build_opener:
+            response = OAuthHTTPClient().get_bearer_json(
+                "https://provider.example/models",
+                "access-token",
+                additional_headers={"ChatGPT-Account-Id": "account-123"},
+                timeout=6.0,
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(captured["headers"]["Chatgpt-account-id"], "account-123")
+        self.assertEqual(captured["headers"]["User-agent"], OAUTH_HTTP_USER_AGENT)
+        self.assertEqual(captured["timeout"], 6.0)
+        self.assertEqual(len(build_opener.call_args.args), 1)
+        redirect_handler = build_opener.call_args.args[0]
+        self.assertIsNone(
+            redirect_handler.redirect_request(None, None, 302, "Found", {}, "https://evil.test")
+        )
+        with self.assertRaisesRegex(OAuthFlowError, "access token is invalid"):
+            OAuthHTTPClient().get_bearer_json(
+                "https://provider.example/models",
+                "token\r\ninjected",
+            )
+        with self.assertRaisesRegex(OAuthFlowError, "discovery header is invalid"):
+            OAuthHTTPClient().get_bearer_json(
+                "https://provider.example/models",
+                "access-token",
+                additional_headers={"Authorization": "replacement"},
+            )
+
+    def test_oauth_http_client_rejects_oversized_response(self):
+        class OversizedResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, limit=-1):
+                self.requested_limit = limit
+                return b"x" * limit
+
+        response = OversizedResponse()
+        with patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(OAuthFlowError, "2 MiB limit"):
+                OAuthHTTPClient().get_json("https://provider.example/models")
+
+        self.assertEqual(response.requested_limit, MAX_OAUTH_RESPONSE_BYTES + 1)
 
     def test_codex_flow_uses_platform_http_client(self):
         http_client = _ScriptedOAuthHTTPClient(

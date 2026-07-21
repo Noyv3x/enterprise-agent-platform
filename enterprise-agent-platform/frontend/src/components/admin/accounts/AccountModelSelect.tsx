@@ -67,10 +67,10 @@ export function AccountModelSelect({ value, onChange, coercedRef }: AccountModel
     let helpText: string;
     if (clean && !list.includes(clean)) {
       helpText = t("admin.model.savedUnavailable", { model: clean });
-    } else if (list.length) {
-      helpText = t("admin.model.count", { count: list.length });
     } else if (catalog.error) {
       helpText = t("admin.model.catalogError", { error: catalog.error });
+    } else if (list.length) {
+      helpText = t("admin.model.count", { count: list.length });
     } else {
       helpText = t("admin.model.defaultOnly");
     }

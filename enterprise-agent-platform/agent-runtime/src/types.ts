@@ -100,8 +100,17 @@ export interface RunResult {
   messages: AgentMessage[];
   model: { provider: string; id: string };
   usage?: JsonObject;
+  context_usage?: ContextUsage;
   input_message_ids?: string[];
   unconsumed_input_message_ids?: string[];
+}
+
+/** Context occupied after the latest completed model turn. */
+export interface ContextUsage {
+  used_tokens: number;
+  max_tokens: number;
+  percent: number;
+  estimated: boolean;
 }
 
 export interface RunRecord {

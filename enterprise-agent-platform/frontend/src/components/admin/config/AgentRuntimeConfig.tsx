@@ -62,7 +62,10 @@ function resolveModel(
     };
   }
   const value = models.includes(current) ? current : models.includes(fallback) ? fallback : models[0];
-  return { models, value, disabled: false, hint: t("admin.model.count", { count: models.length }) };
+  const hint = catalog.error
+    ? t("admin.model.catalogError", { error: catalog.error })
+    : t("admin.model.count", { count: models.length });
+  return { models, value, disabled: false, hint };
 }
 
 interface AgentRuntimeFormState {

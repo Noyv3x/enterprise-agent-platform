@@ -43,25 +43,27 @@ export function KnowledgeSearchForm() {
       }}
     >
       <div className="search-field search-field--action">
-        <Icon name="search" />
-        <input
-          placeholder={t("knowledge.searchPlaceholder")}
-          aria-label={t("knowledge.searchLabel")}
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-        />
-        {isSearching ? (
-          <button
-            className="icon-btn search-field__clear"
-            type="button"
-            disabled={resource.status === "loading"}
-            title={t("knowledge.clearSearch")}
-            aria-label={t("knowledge.clearSearchDetail")}
-            onClick={() => clearSearch(store)}
-          >
-            <Icon name="close" size={15} />
-          </button>
-        ) : null}
+        <div className="search-field__control">
+          <Icon name="search" />
+          <input
+            placeholder={t("knowledge.searchPlaceholder")}
+            aria-label={t("knowledge.searchLabel")}
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+          />
+          {isSearching ? (
+            <button
+              className="icon-btn search-field__clear"
+              type="button"
+              disabled={resource.status === "loading"}
+              title={t("knowledge.clearSearch")}
+              aria-label={t("knowledge.clearSearchDetail")}
+              onClick={() => clearSearch(store)}
+            >
+              <Icon name="close" size={15} />
+            </button>
+          ) : null}
+        </div>
         <button className="btn btn--primary btn--sm search-field__submit" type="submit" disabled={!value.trim() || resource.status === "loading"}>
           <span>{resource.status === "loading" ? t("knowledge.searching") : t("knowledge.search")}</span>
         </button>

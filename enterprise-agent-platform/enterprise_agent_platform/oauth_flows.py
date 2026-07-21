@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -20,6 +21,7 @@ CODEX_DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 OAUTH_HTTP_USER_AGENT = "ubitech-agent/0.2"
+MAX_OAUTH_RESPONSE_BYTES = 2 * 1024 * 1024
 
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -63,6 +65,36 @@ class OAuthHTTPClient:
         request = urllib.request.Request(url, headers=_oauth_headers("application/json"), method="GET")
         return self._open(request, timeout=timeout)
 
+    def get_bearer_json(
+        self,
+        url: str,
+        access_token: str,
+        *,
+        additional_headers: dict[str, str] | None = None,
+        timeout: float = 20.0,
+    ) -> OAuthHTTPResponse:
+        clean_token = str(access_token or "").strip()
+        if not clean_token or re.search(r"[\r\n]", clean_token):
+            raise OAuthFlowError(400, "OAuth access token is invalid")
+        headers = _oauth_headers("application/json")
+        headers["Authorization"] = f"Bearer {clean_token}"
+        for raw_name, raw_value in (additional_headers or {}).items():
+            name = str(raw_name or "").strip()
+            value = str(raw_value or "").strip()
+            if (
+                not re.fullmatch(r"[A-Za-z0-9-]{1,64}", name)
+                or name.lower() == "authorization"
+                or not value
+                or re.search(r"[\r\n]", value)
+            ):
+                raise OAuthFlowError(400, "OAuth discovery header is invalid")
+            headers[name] = value
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        # urllib forwards arbitrary request headers across redirects. Model
+        # discovery carries bearer and account-routing credentials, so a 30x
+        # is treated as a provider error instead of following it.
+        return self._open(request, timeout=timeout, follow_redirects=False)
+
     def post_json(self, url: str, body: dict[str, Any], *, timeout: float = 20.0) -> OAuthHTTPResponse:
         request = urllib.request.Request(
             url,
@@ -81,16 +113,39 @@ class OAuthHTTPClient:
         )
         return self._open(request, timeout=timeout)
 
-    def _open(self, request: urllib.request.Request, *, timeout: float) -> OAuthHTTPResponse:
+    def _open(
+        self,
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+        follow_redirects: bool = True,
+    ) -> OAuthHTTPResponse:
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                text = response.read().decode("utf-8")
+            opener = (
+                urllib.request.urlopen
+                if follow_redirects
+                else urllib.request.build_opener(_RejectOAuthRedirects()).open
+            )
+            with opener(request, timeout=timeout) as response:
+                text = _read_oauth_response_text(response)
                 return OAuthHTTPResponse(response.status, _json_object(text), text)
         except urllib.error.HTTPError as exc:
-            text = exc.read().decode("utf-8", errors="replace")
+            text = _read_oauth_response_text(exc)
             return OAuthHTTPResponse(exc.code, _json_object(text), text)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise OAuthFlowError(502, f"OAuth network request failed: {exc}") from exc
+
+
+class _RejectOAuthRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _read_oauth_response_text(response: Any) -> str:
+    payload = response.read(MAX_OAUTH_RESPONSE_BYTES + 1)
+    if len(payload) > MAX_OAUTH_RESPONSE_BYTES:
+        raise OAuthFlowError(502, "OAuth response exceeded the 2 MiB limit")
+    return payload.decode("utf-8", errors="replace")
 
 
 def _oauth_headers(content_type: str) -> dict[str, str]:

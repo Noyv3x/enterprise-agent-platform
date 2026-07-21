@@ -223,6 +223,14 @@ export interface KnowledgeSuggestion {
   score?: number;
 }
 
+/** Context occupied after the Agent's latest completed model turn. */
+export interface ContextUsage {
+  used_tokens: number;
+  max_tokens: number;
+  percent: number;
+  estimated?: boolean;
+}
+
 export interface MessageMetadata {
   local_pending?: boolean;
   streaming?: boolean;
@@ -232,6 +240,7 @@ export interface MessageMetadata {
   reply_to_message_ids?: Id[];
   durable_job_ids?: Id[];
   knowledge_suggestions?: KnowledgeSuggestion[];
+  context_usage?: ContextUsage;
   agent_work?: AgentWork;
   /** Marks the compact source message emitted by a scheduled task run. */
   scheduled_task?: ScheduledTaskMessageMarker;
@@ -650,7 +659,19 @@ export interface SecurityConfigState {
 /* agent runtime config */
 export interface AgentModelCatalog {
   models?: string[];
+  model_details?: Array<{
+    id: string;
+    name?: string;
+    reasoning?: boolean;
+    input?: string[];
+    context_window?: number;
+    max_tokens?: number;
+  }>;
   default_model?: string;
+  source?: string;
+  stale?: boolean;
+  fetched_at?: number | null;
+  oauth_verified_models?: string[];
   error?: string;
 }
 

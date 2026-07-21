@@ -105,7 +105,10 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(view.container.querySelector(".agent-work")).not.toBeNull();
-    expect(screen.getByText(/Using Web search/)).toBeTruthy();
+    expect(screen.getByText("Web search")).toBeVisible();
+    expect(screen.getByText("Web search · Running")).toBeVisible();
+    expect(screen.getByText("Running")).toBeVisible();
+    expect(view.container.querySelector(".agent-work__item--running")).not.toBeNull();
     expect(screen.queryByText(/Unrelated lifecycle row/)).toBeNull();
   });
 

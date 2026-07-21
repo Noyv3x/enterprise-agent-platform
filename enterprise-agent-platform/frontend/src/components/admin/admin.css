@@ -2,10 +2,10 @@
    information architecture does not add another override layer to styles.css. */
 
 .panel__inner.admin-panel {
-  width: min(1180px, 100%);
-  grid-template-columns: 214px minmax(0, 1fr);
+  width: min(var(--content-max), 100%);
+  grid-template-columns: 224px minmax(0, 1fr);
   align-items: start;
-  gap: 24px;
+  gap: clamp(18px, 2.4vw, 28px);
 }
 
 .admin-panel .admin-pager--desktop {
@@ -20,6 +20,10 @@
   background: var(--surface);
   box-shadow: var(--shadow-1);
   backdrop-filter: none;
+  max-height: calc(100dvh - var(--page-block-space) - var(--page-block-space));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .admin-panel .admin-pager__group {
@@ -52,6 +56,11 @@
   border-radius: var(--r-sm);
 }
 
+.admin-panel .admin-pager--desktop .admin-pager__item:focus-visible {
+  position: relative;
+  z-index: 1;
+}
+
 .admin-panel .admin-pager--desktop .admin-pager__item.is-active {
   background: var(--accent-soft);
   box-shadow: none;
@@ -69,11 +78,18 @@
 }
 
 .admin-panel .admin-page {
+  min-width: 0;
   gap: 16px;
+}
+
+.admin-panel .admin-page__content,
+.admin-panel .admin-page__content > * {
+  min-width: 0;
 }
 
 .admin-panel .admin-page__content[inert] {
   opacity: 0.72;
+  transition: opacity var(--t-fast);
 }
 
 .admin-panel .admin-page__head {
@@ -104,6 +120,7 @@
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--surface);
+  box-shadow: var(--shadow-1);
 }
 
 .admin-panel .account-row {
@@ -111,7 +128,7 @@
   grid-template-columns: minmax(190px, 1.3fr) minmax(170px, 1fr) auto auto;
   align-items: center;
   gap: 16px;
-  padding: 11px 12px;
+  padding: 13px 14px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -176,6 +193,7 @@
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .account-drawer {
@@ -184,7 +202,7 @@
 
 .account-drawer__form {
   display: grid;
-  gap: 14px;
+  gap: 16px;
 }
 
 .account-drawer__identity {
@@ -239,6 +257,7 @@
     background: color-mix(in srgb, var(--surface) 94%, transparent);
     box-shadow: var(--shadow-1);
     backdrop-filter: blur(8px);
+    margin-inline: -2px;
   }
 
   .admin-panel .admin-pager-mobile label {
@@ -279,5 +298,63 @@
 
   .admin-panel .account-row__actions .btn {
     flex: 1 1 auto;
+  }
+}
+
+@media (max-width: 520px) {
+  .panel__inner.admin-panel {
+    gap: 14px;
+  }
+
+  .admin-panel .admin-pager-mobile {
+    top: -1px;
+    padding: 7px;
+    border-radius: var(--r-sm);
+  }
+
+  .admin-panel .admin-page {
+    gap: 13px;
+  }
+
+  .admin-panel .admin-page__head {
+    gap: 8px;
+  }
+
+  .admin-panel .admin-page__head p {
+    font-size: 12.5px;
+  }
+
+  .admin-panel .account-row {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 12px;
+  }
+
+  .admin-panel .account-row > .status {
+    justify-self: start;
+  }
+
+  .admin-panel .account-row__identity strong,
+  .admin-panel .account-row__identity span {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .admin-panel .account-row__meta,
+  .admin-panel .account-row__actions {
+    grid-column: 1;
+  }
+
+  .admin-panel .account-row__actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .admin-panel .account-row__actions .btn {
+    width: 100%;
+  }
+
+  .account-drawer__identity {
+    align-items: flex-start;
   }
 }

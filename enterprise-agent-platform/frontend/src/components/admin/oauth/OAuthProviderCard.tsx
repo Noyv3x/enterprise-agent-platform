@@ -70,7 +70,7 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
           <span>{errorText}</span>
         </div>
       ) : null}
-      {!provider.default_model && provider.model_catalog_error ? (
+      {provider.model_catalog_error ? (
         <div className="oauth-error" role="alert">
           <Icon name="alert" size={15} />
           <span>
