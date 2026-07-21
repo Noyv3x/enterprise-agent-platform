@@ -681,7 +681,7 @@ export interface AgentRuntimeConfigValues {
   runtime_home?: string;
   provider?: string;
   model?: string;
-  timeout_seconds?: number | string;
+  idle_timeout_seconds?: number | string;
   max_concurrency?: number | string;
   compaction_threshold?: number | string;
   model_catalog?: Record<string, AgentModelCatalog>;

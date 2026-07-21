@@ -255,11 +255,17 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.client = AgentRuntimeClient(
             self.runtime.base_url,
             "runtime-secret",
-            timeout_seconds=3,
+            request_timeout_seconds=3,
         )
 
     def tearDown(self):
         self.runtime.close()
+
+    def test_transport_timeouts_are_independent_of_agent_run_lifetime(self):
+        client = AgentRuntimeClient(self.runtime.base_url, "runtime-secret")
+
+        self.assertEqual(client.request_timeout_seconds, 30.0)
+        self.assertEqual(client.event_timeout_seconds, 60.0)
 
     def test_generate_posts_run_and_consumes_completion_events(self):
         self.runtime.events = [

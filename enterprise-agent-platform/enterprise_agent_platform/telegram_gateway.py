@@ -18,6 +18,9 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 POLL_TIMEOUT_SECONDS = 30
 SEND_CHUNK_SIZE = 3900
 MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024
+# Production delivery is asynchronous. This bounds the optional synchronous
+# adapter used by direct callers and tests without coupling it to Agent policy.
+SYNC_DELIVERY_WAIT_SECONDS = 300.0
 
 
 class TelegramBotAPI:
@@ -288,7 +291,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
+                timeout=SYNC_DELIVERY_WAIT_SECONDS,
             ) or delivery
         result = delivery.payload.get("result")
         response = dict(result) if isinstance(result, dict) else {"ok": True}
@@ -319,7 +322,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
+                timeout=SYNC_DELIVERY_WAIT_SECONDS,
             ) or delivery
         return {
             **result,
@@ -359,7 +362,7 @@ class TelegramGateway:
         if self._wait_for_response:
             delivery = self.service.wait_for_telegram_delivery(
                 delivery.id,
-                timeout=self.service.config.agent_runtime_timeout_seconds + 30,
+                timeout=SYNC_DELIVERY_WAIT_SECONDS,
             ) or delivery
         agent = self.service.agent_message_replying_to("private", scope_id, user_message_id)
         return {

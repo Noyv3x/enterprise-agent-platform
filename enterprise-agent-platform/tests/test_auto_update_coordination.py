@@ -116,7 +116,7 @@ def _config(data_dir: Path) -> PlatformConfig:
         agent_runtime_home=data_dir / "runtimes" / "agent",
         agent_runtime_model="gpt-5.5",
         agent_runtime_provider="openai-codex",
-        agent_runtime_timeout_seconds=2,
+        agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
 

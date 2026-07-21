@@ -83,6 +83,7 @@ test("terminal forwards an explicit background update policy and defaults to pro
     querySession: async () => null,
     delegate: async () => "",
     markSideEffect: () => undefined,
+    defaultTerminalTimeoutMs: 12_345,
   });
   const terminal = tools.find((tool) => tool.name === "terminal");
   assert.ok(terminal);
@@ -99,7 +100,13 @@ test("terminal forwards an explicit background update policy and defaults to pro
   }, undefined);
   assert.equal(invocations[0]?.background, true);
   assert.equal(invocations[0]?.updateBehavior, undefined);
+  assert.equal(invocations[0]?.timeoutMs, undefined);
   assert.equal(invocations[1]?.updateBehavior, "terminate");
+  assert.equal(invocations[1]?.timeoutMs, undefined);
+  await terminal.execute("foreground-default-timeout", { command: "true" }, undefined);
+  await terminal.execute("foreground-explicit-timeout", { command: "true", timeout_ms: 500 }, undefined);
+  assert.equal(invocations[2]?.timeoutMs, 12_345);
+  assert.equal(invocations[3]?.timeoutMs, 500);
   await assert.rejects(
     terminal.execute("foreground", {
       command: "true",

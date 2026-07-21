@@ -18,7 +18,9 @@ export interface RuntimeConfig {
   maxBodyBytes: number;
   requestBodyTimeoutMs: number;
   compactionThreshold: number;
-  runTimeoutMs: number;
+  runIdleTimeoutMs: number;
+  maxTurnsPerRun: number;
+  terminalTimeoutMs: number;
   cleanupGraceMs: number;
   maxConcurrency: number;
   maxQueuedRuns: number;
@@ -123,7 +125,7 @@ export interface RunRecord {
   result?: RunResult;
   error?: string;
   sideEffectsStarted: boolean;
-  timedOut?: boolean;
+  idleTimedOut?: boolean;
 }
 
 export interface SessionEntry {

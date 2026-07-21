@@ -173,6 +173,12 @@ _PROGRESS_EVENT_TYPES = frozenset(
     }
 )
 
+# Transport liveness only; Agent execution policy belongs to the runtime. The
+# runtime emits SSE heartbeats every 15 seconds, so this read timeout measures a
+# silent/broken connection rather than total task duration.
+AGENT_RUNTIME_REQUEST_TIMEOUT_SECONDS = 30.0
+AGENT_RUNTIME_EVENT_IDLE_TIMEOUT_SECONDS = 60.0
+
 
 class AgentRuntimeClient:
     """Synchronous stdlib client for the platform-owned Node Agent sidecar.
@@ -187,8 +193,8 @@ class AgentRuntimeClient:
         base_url: str,
         bearer_token: str = "",
         *,
-        timeout_seconds: float = 240.0,
-        event_timeout_seconds: float | None = None,
+        request_timeout_seconds: float = AGENT_RUNTIME_REQUEST_TIMEOUT_SECONDS,
+        event_timeout_seconds: float = AGENT_RUNTIME_EVENT_IDLE_TIMEOUT_SECONDS,
         gateway_base_url: str = "",
         gateway_token: str = "",
         default_provider: str = "",
@@ -200,17 +206,17 @@ class AgentRuntimeClient:
             raise ValueError("Agent runtime base_url must be an http(s) URL")
         if parsed.query or parsed.fragment:
             raise ValueError("Agent runtime base_url must not contain a query or fragment")
-        if timeout_seconds <= 0:
-            raise ValueError("Agent runtime timeout_seconds must be positive")
-        if event_timeout_seconds is not None and event_timeout_seconds <= 0:
+        if request_timeout_seconds <= 0:
+            raise ValueError("Agent runtime request_timeout_seconds must be positive")
+        if event_timeout_seconds <= 0:
             raise ValueError("Agent runtime event_timeout_seconds must be positive")
         self._validate_header_value("bearer_token", bearer_token)
         self._validate_header_value("gateway_token", gateway_token)
 
         self.base_url = clean_base
         self.bearer_token = str(bearer_token or "")
-        self.timeout_seconds = float(timeout_seconds)
-        self.event_timeout_seconds = float(event_timeout_seconds or timeout_seconds)
+        self.request_timeout_seconds = float(request_timeout_seconds)
+        self.event_timeout_seconds = float(event_timeout_seconds)
         self.gateway_base_url = str(gateway_base_url or "").strip().rstrip("/")
         self.gateway_token = str(gateway_token or "")
         self.default_provider = str(default_provider or "").strip()
@@ -275,7 +281,7 @@ class AgentRuntimeClient:
         for attempt in range(attempts):
             try:
                 start, headers = self._json_request(
-                    "POST", "/v1/runs", body, timeout=self.timeout_seconds
+                    "POST", "/v1/runs", body, timeout=self.request_timeout_seconds
                 )
                 break
             except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError) as exc:
@@ -377,7 +383,7 @@ class AgentRuntimeClient:
             "POST",
             f"/v1/runs/{urllib.parse.quote(clean_run_id, safe='')}/approval",
             {"approval_id": clean_approval_id, "decision": decision},
-            timeout=self.timeout_seconds,
+            timeout=self.request_timeout_seconds,
         )
         with self._approval_lock:
             if self._pending_approvals.get(clean_run_id) == clean_approval_id:
@@ -410,7 +416,7 @@ class AgentRuntimeClient:
                     "POST",
                     path,
                     body,
-                    timeout=min(self.timeout_seconds, 15.0),
+                    timeout=min(self.request_timeout_seconds, 15.0),
                 )
                 break
             except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError):
@@ -434,7 +440,7 @@ class AgentRuntimeClient:
             "POST",
             f"/v1/runs/{urllib.parse.quote(clean_run_id, safe='')}/cancel",
             {},
-            timeout=min(self.timeout_seconds, 10.0),
+            timeout=min(self.request_timeout_seconds, 10.0),
         )
         with self._approval_lock:
             self._pending_approvals.pop(clean_run_id, None)
@@ -459,7 +465,7 @@ class AgentRuntimeClient:
             "POST",
             "/v1/scopes/cleanup",
             body,
-            timeout=min(self.timeout_seconds, 10.0),
+            timeout=min(self.request_timeout_seconds, 10.0),
         )
         return result
 
@@ -468,7 +474,7 @@ class AgentRuntimeClient:
             "GET",
             "/health",
             None,
-            timeout=min(self.timeout_seconds, 10.0),
+            timeout=min(self.request_timeout_seconds, 10.0),
         )
         return result
 
@@ -479,7 +485,7 @@ class AgentRuntimeClient:
             "GET",
             "/v1/models",
             None,
-            timeout=min(self.timeout_seconds, 10.0),
+            timeout=min(self.request_timeout_seconds, 10.0),
             max_response_bytes=512 * 1024,
         )
         if type(result.get("version")) is not int or result.get("version") != 1:
@@ -622,7 +628,7 @@ class AgentRuntimeClient:
                 "GET",
                 f"/v1/scopes/processes?{query}",
                 None,
-                timeout=min(self.timeout_seconds, 5.0),
+                timeout=min(self.request_timeout_seconds, 5.0),
                 max_response_bytes=2 * 1024 * 1024,
             )
             return result
@@ -689,7 +695,7 @@ class AgentRuntimeClient:
             "GET",
             f"/v1/scopes/process-summary?{query}",
             None,
-            timeout=min(self.timeout_seconds, 5.0),
+            timeout=min(self.request_timeout_seconds, 5.0),
             max_response_bytes=64 * 1024,
         )
         count = result.get("running_terminal_count")
@@ -706,7 +712,7 @@ class AgentRuntimeClient:
             "GET",
             "/v1/processes/update-blockers",
             None,
-            timeout=min(self.timeout_seconds, 5.0),
+            timeout=min(self.request_timeout_seconds, 5.0),
             max_response_bytes=64 * 1024,
         )
         summary: dict[str, int] = {}

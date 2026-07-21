@@ -384,7 +384,7 @@ export type AgentRuntimeConfigResponse = AgentRuntimeConfigState;
 export interface AgentRuntimeConfigUpdateRequest {
   provider: string;
   model: string;
-  timeout_seconds: string;
+  idle_timeout_seconds: string;
   max_concurrency: string;
   compaction_threshold: string;
 }

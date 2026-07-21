@@ -71,7 +71,7 @@ function resolveModel(
 interface AgentRuntimeFormState {
   provider: string;
   modelPreferred: string;
-  timeoutSeconds: string;
+  idleTimeoutSeconds: string;
   maxConcurrency: string;
   compactionThreshold: string;
 }
@@ -82,7 +82,7 @@ function seedForm(config: AgentRuntimeConfigValues): AgentRuntimeFormState {
       ? (config.provider as string)
       : "openai-codex",
     modelPreferred: config.model || "",
-    timeoutSeconds: String(config.timeout_seconds ?? 240),
+    idleTimeoutSeconds: String(config.idle_timeout_seconds ?? 1800),
     maxConcurrency: String(config.max_concurrency ?? 4),
     compactionThreshold: String(config.compaction_threshold ?? 0.8),
   };
@@ -91,6 +91,7 @@ function seedForm(config: AgentRuntimeConfigValues): AgentRuntimeFormState {
 export function AgentRuntimeConfig() {
   const { t } = useI18n();
   const modelHintId = useId();
+  const idleTimeoutHintId = useId();
   const compactionHintId = useId();
   const store = useStoreHandle();
   const saving = useStore((state) =>
@@ -117,7 +118,7 @@ export function AgentRuntimeConfig() {
     void saveAgentRuntimeConfig(store, {
       provider: form.provider,
       model: resolved.value,
-      timeout_seconds: form.timeoutSeconds,
+      idle_timeout_seconds: form.idleTimeoutSeconds,
       max_concurrency: form.maxConcurrency,
       compaction_threshold: form.compactionThreshold,
     });
@@ -182,17 +183,26 @@ export function AgentRuntimeConfig() {
               }
             />
           </Field>
-          <Field label={t("admin.agentRuntime.requestTimeout")}>
-            <input
-              type="number"
-              min="1"
-              max="3600"
-              step="1"
-              value={form.timeoutSeconds}
-              onChange={(event) =>
-                setForm((previous) => ({ ...previous, timeoutSeconds: event.target.value }))
-              }
-            />
+          <Field label={t("admin.agentRuntime.idleTimeout")}>
+            <div className="field-stack">
+              <input
+                type="number"
+                min="0"
+                max="86400"
+                step="1"
+                value={form.idleTimeoutSeconds}
+                aria-describedby={idleTimeoutHintId}
+                onChange={(event) =>
+                  setForm((previous) => ({
+                    ...previous,
+                    idleTimeoutSeconds: event.target.value,
+                  }))
+                }
+              />
+              <div className="field-help" id={idleTimeoutHintId}>
+                {t("admin.agentRuntime.idleTimeoutHint")}
+              </div>
+            </div>
           </Field>
           <Field label={t("admin.agentRuntime.compactionThreshold")}>
             <div className="field-stack">

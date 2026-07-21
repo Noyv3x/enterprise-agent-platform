@@ -35,7 +35,7 @@ from enterprise_agent_platform.runtimes import (
     AGENT_SETTING_MAX_CONCURRENCY,
     AGENT_SETTING_MODEL,
     AGENT_SETTING_PROVIDER,
-    AGENT_SETTING_TIMEOUT,
+    AGENT_SETTING_IDLE_TIMEOUT,
 )
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
@@ -631,7 +631,7 @@ def make_config(tmp: Path) -> PlatformConfig:
         agent_runtime_home=tmp / "runtimes" / "agent",
         agent_runtime_model="gpt-5.5",
         agent_runtime_provider="openai-codex",
-        agent_runtime_timeout_seconds=2,
+        agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
 
@@ -4413,7 +4413,7 @@ class PlatformServiceTests(unittest.TestCase):
                     {
                         "provider": "grok-oauth",
                         "model": "grok-4.3",
-                        "timeout_seconds": 321,
+                        "idle_timeout_seconds": 321,
                         "max_concurrency": 4,
                         "compaction_threshold": 0.75,
                     },
@@ -4421,12 +4421,14 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertEqual(updated["provider"], "xai-oauth")
                 self.assertEqual(updated["model"], "grok-4.3")
-                self.assertEqual(updated["timeout_seconds"], 321)
+                self.assertEqual(updated["idle_timeout_seconds"], 321)
                 self.assertEqual(updated["max_concurrency"], 4)
                 self.assertEqual(updated["compaction_threshold"], 0.75)
                 self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
-                self.assertEqual(service.get_setting(AGENT_SETTING_TIMEOUT), "321.0")
+                self.assertEqual(
+                    service.get_setting(AGENT_SETTING_IDLE_TIMEOUT), "321.0"
+                )
                 self.assertEqual(service.get_setting(AGENT_SETTING_MAX_CONCURRENCY), "4")
                 self.assertEqual(service.get_setting(AGENT_SETTING_COMPACTION_THRESHOLD), "0.75")
                 self.assertEqual(service._agent_run_gate.limit, 4)
@@ -4434,8 +4436,8 @@ class PlatformServiceTests(unittest.TestCase):
                 invalid_updates = (
                     {"provider": "openrouter"},
                     {"model": "not-in-catalog"},
-                    {"timeout_seconds": 0},
-                    {"timeout_seconds": 3601},
+                    {"idle_timeout_seconds": -1},
+                    {"idle_timeout_seconds": 86401},
                     {"max_concurrency": 0},
                     {"max_concurrency": 65},
                     {"compaction_threshold": 0.49},
@@ -4445,6 +4447,14 @@ class PlatformServiceTests(unittest.TestCase):
                     with self.subTest(body=body), self.assertRaises(ServiceError) as ctx:
                         service.update_agent_runtime_config(admin, body)
                     self.assertEqual(ctx.exception.status, 400)
+
+                disabled = service.update_agent_runtime_config(
+                    admin, {"idle_timeout_seconds": 0}
+                )["config"]
+                self.assertEqual(disabled["idle_timeout_seconds"], 0)
+                self.assertEqual(
+                    service.get_setting(AGENT_SETTING_IDLE_TIMEOUT), "0.0"
+                )
 
                 before = {
                     key: service.get_setting(key)

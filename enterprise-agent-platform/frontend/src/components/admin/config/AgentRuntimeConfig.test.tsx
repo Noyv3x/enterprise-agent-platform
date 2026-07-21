@@ -32,7 +32,7 @@ describe("AgentRuntimeConfig", () => {
         config: {
           provider: "openai-codex",
           model: "gpt-5",
-          timeout_seconds: 240,
+          idle_timeout_seconds: 1800,
           max_concurrency: 4,
           compaction_threshold: 0.8,
           model_catalog: {
@@ -64,7 +64,7 @@ describe("AgentRuntimeConfig", () => {
       {
         provider: "openai-codex",
         model: "gpt-5",
-        timeout_seconds: "240",
+        idle_timeout_seconds: "1800",
         max_concurrency: "8",
         compaction_threshold: "0.8",
       },

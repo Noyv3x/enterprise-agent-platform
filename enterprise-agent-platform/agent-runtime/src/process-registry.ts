@@ -90,6 +90,8 @@ export interface RunCommandOptions {
   updateBehavior?: ProcessUpdateBehavior;
   signal?: AbortSignal;
   onUpdate?: (update: { stdout?: string; stderr?: string }) => void;
+  onActivity?: () => void;
+  activityHeartbeatMs?: number;
 }
 
 export class ProcessRegistry {
@@ -132,6 +134,12 @@ export class ProcessRegistry {
     const background = options.background ?? false;
     if (!background && options.updateBehavior !== undefined) {
       throw new Error("updateBehavior is supported only for background processes");
+    }
+    if (
+      options.activityHeartbeatMs !== undefined
+      && (!Number.isSafeInteger(options.activityHeartbeatMs) || options.activityHeartbeatMs <= 0)
+    ) {
+      throw new Error("activityHeartbeatMs must be a positive integer");
     }
     const updateBehavior = options.updateBehavior ?? "wait";
     this.pruneCompleted();
@@ -207,14 +215,30 @@ export class ProcessRegistry {
       });
     });
     let timeout: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    let activityHeartbeat: NodeJS.Timeout | undefined;
     const onAbort = (): void => this.killManaged(managed);
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.timeoutMs && options.timeoutMs > 0) {
-      timeout = setTimeout(() => this.killManaged(managed), options.timeoutMs);
+      timeout = setTimeout(() => {
+        timedOut = true;
+        this.killManaged(managed);
+      }, options.timeoutMs);
       timeout.unref();
+    }
+    if (!background && options.onActivity) {
+      activityHeartbeat = setInterval(() => {
+        try {
+          options.onActivity?.();
+        } catch {
+          // Activity reporting is diagnostic and must never disrupt a command.
+        }
+      }, options.activityHeartbeatMs ?? 10_000);
+      activityHeartbeat.unref();
     }
     completion.finally(() => {
       if (timeout) clearTimeout(timeout);
+      if (activityHeartbeat) clearInterval(activityHeartbeat);
       options.signal?.removeEventListener("abort", onAbort);
     }).catch(() => undefined);
     if (background) {
@@ -223,6 +247,11 @@ export class ProcessRegistry {
     }
     const result = await completion;
     if (options.signal?.aborted) throw abortError();
+    if (timedOut) {
+      const error = new Error(`Terminal command timed out after ${options.timeoutMs} ms`);
+      error.name = "TimeoutError";
+      throw error;
+    }
     return result;
   }
 

@@ -46,7 +46,7 @@ AGENT_SETTING_MANAGED = "agent_runtime_manage"
 AGENT_SETTING_URL = "agent_runtime_url"
 AGENT_SETTING_MODEL = "agent_runtime_model"
 AGENT_SETTING_PROVIDER = "agent_runtime_provider"
-AGENT_SETTING_TIMEOUT = "agent_runtime_timeout_seconds"
+AGENT_SETTING_IDLE_TIMEOUT = "agent_runtime_idle_timeout_seconds"
 AGENT_SETTING_MAX_CONCURRENCY = "agent_runtime_max_concurrency"
 AGENT_SETTING_COMPACTION_THRESHOLD = "agent_runtime_compaction_threshold"
 AGENT_RUNTIME_INSTALL_MARKER = "install.json"
@@ -503,7 +503,7 @@ class PlatformRuntimeManager:
             or self.config.agent_runtime_provider,
             "model": self._runtime_setting(AGENT_SETTING_MODEL)
             or self.config.agent_runtime_model,
-            "timeout_seconds": self._effective_agent_timeout_seconds(),
+            "idle_timeout_seconds": self._effective_agent_idle_timeout_seconds(),
             "max_concurrency": self._effective_agent_max_concurrency(),
             "compaction_threshold": self._effective_compaction_threshold(),
             "source_path": str(self._agent_runtime_source_dir()),
@@ -770,8 +770,8 @@ class PlatformRuntimeManager:
                 "AGENT_PLATFORM_INTERNAL_URL": self._platform_internal_url(),
                 "AGENT_PLATFORM_INTERNAL_TOKEN": self._first_secret("agent_tool_token", "ENTERPRISE_AGENT_TOOL_TOKEN"),
                 "AGENT_RUNTIME_MAX_CONCURRENCY": str(self._effective_agent_max_concurrency()),
-                "AGENT_RUNTIME_RUN_TIMEOUT_MS": str(
-                    max(1, round(self._effective_agent_timeout_seconds() * 1000))
+                "AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS": str(
+                    round(self._effective_agent_idle_timeout_seconds() * 1000)
                 ),
                 "AGENT_RUNTIME_COMPACTION_THRESHOLD": str(self._effective_compaction_threshold()),
                 "CAMOFOX_URL": self._effective_camofox_url(),
@@ -798,12 +798,19 @@ class PlatformRuntimeManager:
     def _effective_agent_runtime_url(self) -> str:
         return (self._runtime_setting(AGENT_SETTING_URL) or self.config.agent_runtime_url).strip().rstrip("/")
 
-    def _effective_agent_timeout_seconds(self) -> float:
-        raw = self._runtime_setting(AGENT_SETTING_TIMEOUT)
+    def _effective_agent_idle_timeout_seconds(self) -> float:
+        raw = self._runtime_setting(AGENT_SETTING_IDLE_TIMEOUT)
         try:
-            return max(1.0, float(raw)) if raw is not None else self.config.agent_runtime_timeout_seconds
-        except ValueError:
-            return self.config.agent_runtime_timeout_seconds
+            value = (
+                float(raw)
+                if raw is not None
+                else self.config.agent_runtime_idle_timeout_seconds
+            )
+            if not math.isfinite(value):
+                raise ValueError
+            return max(0.0, min(86400.0, value))
+        except (TypeError, ValueError):
+            return self.config.agent_runtime_idle_timeout_seconds
 
     def _effective_agent_max_concurrency(self) -> int:
         raw = self._runtime_setting(AGENT_SETTING_MAX_CONCURRENCY)

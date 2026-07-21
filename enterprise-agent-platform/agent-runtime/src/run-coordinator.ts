@@ -80,6 +80,13 @@ interface AcceptedRunInput {
   queued: boolean;
 }
 
+interface RunActivityState {
+  lastActivityAt: number;
+  lastActivity: string;
+  pauseDepth: number;
+  pausedReason?: string;
+}
+
 export class RunCapacityError extends Error {
   readonly statusCode = 429;
 }
@@ -131,6 +138,7 @@ export class RunCoordinator {
   private readonly scopeCleanupFences = new Set<ScopeCleanupFence>();
   private readonly forcedReviewReasons = new Map<string, string>();
   private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, string>>();
+  private readonly runActivities = new Map<string, RunActivityState>();
 
   constructor(options: RunCoordinatorOptions) {
     this.config = options.config;
@@ -208,6 +216,11 @@ export class RunCoordinator {
     const journal = new EventJournal(runId);
     const completion = deferred(record);
     this.runs.set(runId, record);
+    this.runActivities.set(runId, {
+      lastActivityAt: now,
+      lastActivity: "run queued",
+      pauseDepth: 0,
+    });
     this.journals.set(runId, journal);
     this.completions.set(runId, completion);
     this.runInputs.set(runId, new Map());
@@ -271,6 +284,7 @@ export class RunCoordinator {
     ) {
       throw new RunInputConflictError("Run is no longer accepting input");
     }
+    this.touchRunActivity(runId, "preparing new user input");
     const preparation = buildPrompt(
       {
         ...record.request,
@@ -326,6 +340,7 @@ export class RunCoordinator {
         message_id: request.message_id,
         state: "accepted",
       });
+      this.touchRunActivity(runId, "accepted new user input");
       this.flushReadyInputs(record);
       this.persistRunStatus(record);
       return { run_id: runId, message_id: request.message_id, state: "accepted" };
@@ -421,6 +436,59 @@ export class RunCoordinator {
     throw new Error(`Agent scope cleanup is in progress for ${fence.scopeKey} (${lifecycle})`);
   }
 
+  private activityLineage(runId: string): string[] {
+    const lineage: string[] = [];
+    const visited = new Set<string>();
+    let currentId: string | undefined = runId;
+    while (currentId && !visited.has(currentId)) {
+      visited.add(currentId);
+      lineage.push(currentId);
+      if (!this.childRuns.has(currentId)) break;
+      const parentRunId: unknown = this.runs.get(currentId)?.request.metadata?.parent_run_id;
+      currentId = typeof parentRunId === "string" && this.runs.has(parentRunId)
+        ? parentRunId
+        : undefined;
+    }
+    return lineage;
+  }
+
+  private touchRunActivity(runId: string, description: string): void {
+    const now = Date.now();
+    for (const [index, activityRunId] of this.activityLineage(runId).entries()) {
+      const activity = this.runActivities.get(activityRunId);
+      if (!activity) continue;
+      activity.lastActivityAt = now;
+      activity.lastActivity = truncate(
+        index === 0 ? description : `child ${runId}: ${description}`,
+        500,
+      );
+    }
+  }
+
+  private pauseRunIdle(runId: string, reason: string): void {
+    const now = Date.now();
+    for (const activityRunId of this.activityLineage(runId)) {
+      const activity = this.runActivities.get(activityRunId);
+      if (!activity) continue;
+      activity.lastActivityAt = now;
+      activity.lastActivity = truncate(reason, 500);
+      activity.pauseDepth += 1;
+      activity.pausedReason = reason;
+    }
+  }
+
+  private resumeRunIdle(runId: string, description: string): void {
+    const now = Date.now();
+    for (const activityRunId of this.activityLineage(runId)) {
+      const activity = this.runActivities.get(activityRunId);
+      if (!activity) continue;
+      activity.pauseDepth = Math.max(0, activity.pauseDepth - 1);
+      activity.lastActivityAt = now;
+      activity.lastActivity = truncate(description, 500);
+      if (activity.pauseDepth === 0) delete activity.pausedReason;
+    }
+  }
+
   private async execute(record: RunRecord): Promise<void> {
     await this.sessions.withSessionLock(
       sessionIdentity(record.request),
@@ -435,33 +503,53 @@ export class RunCoordinator {
     this.persistRunStatus(record);
     const journal = this.journals.get(record.id)!;
     journal.publish("run.started", { status: "running" });
+    this.touchRunActivity(record.id, "run started");
     const identity = sessionIdentity(record.request);
-    let rejectTimeout!: (error: Error) => void;
-    const timeoutPromise = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
-    const timeout = setTimeout(() => {
-      if (isTerminal(record.status)) return;
-      record.timedOut = true;
-      journal.publish("run.timeout", { timeout_ms: this.config.runTimeoutMs });
-      this.closeInputs(record, "Run timed out before queued input could be injected");
-      record.controller.abort();
-      this.agents.get(record.id)?.abort();
-      this.approvals.cancelRun(record.id);
-      this.processes.killRun(record.id);
-      rejectTimeout(abortError(`Run exceeded hard timeout of ${this.config.runTimeoutMs} ms`));
-    }, this.config.runTimeoutMs);
-    timeout.unref();
+    let rejectIdleTimeout!: (error: Error) => void;
+    const idleTimeoutPromise = new Promise<never>((_resolve, reject) => { rejectIdleTimeout = reject; });
+    let idleTimeoutMessage: string | undefined;
+    let idleWatchdog: NodeJS.Timeout | undefined;
+    if (this.config.runIdleTimeoutMs > 0) {
+      const pollIntervalMs = Math.max(10, Math.min(1_000, Math.ceil(this.config.runIdleTimeoutMs / 4)));
+      idleWatchdog = setInterval(() => {
+        if (record.controller.signal.aborted || isTerminal(record.status) || record.idleTimedOut) return;
+        const activity = this.runActivities.get(record.id);
+        if (!activity || activity.pauseDepth > 0) return;
+        const idleMs = Date.now() - activity.lastActivityAt;
+        if (idleMs < this.config.runIdleTimeoutMs) return;
+        record.idleTimedOut = true;
+        idleTimeoutMessage = `Run was inactive for ${idleMs} ms (idle timeout ${this.config.runIdleTimeoutMs} ms; last activity: ${activity.lastActivity})`;
+        journal.publish("run.idle_timeout", {
+          timeout_ms: this.config.runIdleTimeoutMs,
+          idle_ms: idleMs,
+          last_activity: activity.lastActivity,
+          last_activity_at: new Date(activity.lastActivityAt).toISOString(),
+        });
+        this.closeInputs(record, "Run became inactive before queued input could be injected");
+        record.controller.abort();
+        this.agents.get(record.id)?.abort();
+        this.approvals.cancelRun(record.id);
+        this.processes.killRun(record.id);
+        rejectIdleTimeout(abortError(idleTimeoutMessage));
+      }, pollIntervalMs);
+      idleWatchdog.unref();
+    }
     let rejectAbort!: (error: Error) => void;
     const abortPromise = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
     const abortRun = (): void => rejectAbort(abortError());
     record.controller.signal.addEventListener("abort", abortRun, { once: true });
     if (record.controller.signal.aborted) abortRun();
     const executionTask = (async () => {
+      this.touchRunActivity(record.id, "recalling memory");
       const recalledMemory = await this.recallMemory(record);
+      this.touchRunActivity(record.id, "memory recall completed");
       const resolved = resolveModel(record.request, this.gateway, record.controller.signal);
+      this.touchRunActivity(record.id, "loading session history");
       const loadedHistory = await this.sessions.initializeTracked(
         identity,
         normalizeInitialHistory(record.request.history ?? [], record.request, resolved.model.api, resolved.model.provider),
       );
+      this.touchRunActivity(record.id, "session history loaded");
       const loadedEntryIds = new WeakMap<AgentMessage, string>();
       for (const entry of loadedHistory) loadedEntryIds.set(entry.message, entry.entry_id);
       const recoveredHistory = repairInterruptedHistory(
@@ -491,6 +579,11 @@ export class RunCoordinator {
         ),
         markSideEffect: () => { record.sideEffectsStarted = true; },
         delegate: async (prompt, systemPrompt, signal) => await this.delegate(record, prompt, systemPrompt, signal),
+        defaultTerminalTimeoutMs: this.config.terminalTimeoutMs,
+        ...(this.config.runIdleTimeoutMs > 0 ? {
+          onActivity: (description: string) => this.touchRunActivity(record.id, description),
+          activityHeartbeatMs: Math.max(1, Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3))),
+        } : {}),
       });
       const tools = rawTools.map((tool): AgentTool => ({
         ...tool,
@@ -500,13 +593,18 @@ export class RunCoordinator {
           }
           if (record.controller.signal.aborted || signal?.aborted) throw abortError();
           startedToolCalls.add(toolCallId);
+          this.touchRunActivity(record.id, `tool started: ${tool.name}`);
           journal.publish("tool.started", {
             tool_call_id: toolCallId,
             tool_name: tool.name,
             arguments: params as JsonObject,
             execution_started: true,
           });
-          return await tool.execute(toolCallId, params, signal, onUpdate);
+          try {
+            return await tool.execute(toolCallId, params, signal, onUpdate);
+          } finally {
+            this.touchRunActivity(record.id, `tool settled: ${tool.name}`);
+          }
         },
       }));
       let agent: Agent | undefined;
@@ -556,6 +654,7 @@ export class RunCoordinator {
           const compactedMessages = compaction.messages;
           const omitted = compaction.omitted.length;
           if (omitted > 0) {
+            this.touchRunActivity(record.id, "compacting session context");
             const omittedEntryIds = new Set(recoveredHistory.removedEntryIds);
             for (const message of messages.slice(0, omitted)) {
               if (ephemeralMessages.has(message)) continue;
@@ -579,10 +678,12 @@ export class RunCoordinator {
               archived_entries: omittedEntryIds.size,
             }, [...omittedEntryIds], compactionNoticeEntryId ? [compactionNoticeEntryId] : []);
             compactionNoticeEntryId = rewrittenEntryIds[0];
+            this.touchRunActivity(record.id, "session context compacted");
           }
           return compactedMessages;
         },
         beforeToolCall: async (toolContext, signal) => {
+          this.touchRunActivity(record.id, `checking tool policy: ${toolContext.toolCall.name}`);
           if (record.controller.signal.aborted) {
             return { block: true, reason: "Agent run is no longer active" };
           }
@@ -628,16 +729,22 @@ export class RunCoordinator {
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
-          const allowed = await this.approvals.request({
-            runId: approvalRunId,
-            scopeKey: approvalScopeKey,
-            lifecycleId: record.request.lifecycle_id,
-            sessionId: approvalSessionId,
-            toolName: toolContext.toolCall.name,
-            arguments: toolContext.args,
-            reason: policy.approvalReason,
-            ...(signal ? { signal } : {}),
-          });
+          this.pauseRunIdle(record.id, `waiting for approval: ${toolContext.toolCall.name}`);
+          let allowed: boolean;
+          try {
+            allowed = await this.approvals.request({
+              runId: approvalRunId,
+              scopeKey: approvalScopeKey,
+              lifecycleId: record.request.lifecycle_id,
+              sessionId: approvalSessionId,
+              toolName: toolContext.toolCall.name,
+              arguments: toolContext.args,
+              reason: policy.approvalReason,
+              ...(signal ? { signal } : {}),
+            });
+          } finally {
+            this.resumeRunIdle(record.id, `approval wait settled: ${toolContext.toolCall.name}`);
+          }
           if (!allowed) return { block: true, reason: "User denied the operation" };
           return rememberApprovedTool()
             ? undefined
@@ -666,7 +773,9 @@ export class RunCoordinator {
         approvedToolCalls,
         startedToolCalls,
       ));
+      this.touchRunActivity(record.id, "building model prompt");
       const prompt = await buildPrompt(record.request, record.controller.signal);
+      this.touchRunActivity(record.id, "starting model turn");
       try {
         if (record.controller.signal.aborted) throw abortError();
         await agent.prompt(prompt);
@@ -702,12 +811,12 @@ export class RunCoordinator {
       });
     })();
     try {
-      await Promise.race([executionTask, timeoutPromise, abortPromise]);
+      await Promise.race([executionTask, idleTimeoutPromise, abortPromise]);
     } catch (error) {
-      // The timeout branch aborts every operation but Promise.race does not
-      // cancel its losing promise. Give cooperative providers and tools a
-      // bounded cleanup window, then finish fail-closed instead of allowing one
-      // uncooperative stream to occupy a session/concurrency slot forever.
+      // Cancellation and inactivity timeout abort every operation, but
+      // Promise.race does not cancel its losing promise. Give cooperative
+      // providers and tools a bounded cleanup window, then finish fail-closed
+      // instead of allowing one uncooperative stream to occupy a slot forever.
       const cleanupConfirmed = await Promise.race([
         executionTask.then(() => true, () => true),
         new Promise<boolean>((resolve) => setTimeout(
@@ -721,11 +830,11 @@ export class RunCoordinator {
       const aborted = record.controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
       const status: RunRecord["status"] = !cleanupConfirmed
         ? "needs_review"
-        : (record.timedOut || aborted)
+        : (record.idleTimedOut || aborted)
         ? record.sideEffectsStarted ? "needs_review" : "cancelled"
         : record.sideEffectsStarted ? "needs_review" : "failed";
-      const baseMessage = record.timedOut
-        ? `Run exceeded hard timeout of ${this.config.runTimeoutMs} ms`
+      const baseMessage = record.idleTimedOut
+        ? idleTimeoutMessage || `Run exceeded inactivity timeout of ${this.config.runIdleTimeoutMs} ms`
         : aborted ? "Run cancelled" : errorMessage(error);
       const message = cleanupConfirmed
         ? baseMessage
@@ -734,13 +843,14 @@ export class RunCoordinator {
       await this.sessions.appendRun(identity, { run_id: record.id, status, error: message }).catch(() => undefined);
       this.finish(record, status, message);
     } finally {
-      clearTimeout(timeout);
+      if (idleWatchdog) clearInterval(idleWatchdog);
       record.controller.signal.removeEventListener("abort", abortRun);
       this.agents.delete(record.id);
       this.forcedReviewReasons.delete(record.id);
       this.unattendedAuthorizationBlocks.delete(record.id);
       this.approvals.cancelRun(record.id);
       if (!record.result) this.processes.killRun(record.id);
+      this.runActivities.delete(record.id);
     }
   }
 
@@ -754,9 +864,21 @@ export class RunCoordinator {
     startedToolCalls: Set<string>,
   ): Promise<void> {
     if (isTerminal(record.status)) return;
+    if (event.type === "tool_execution_update" && !startedToolCalls.has(event.toolCallId)) return;
+    this.touchRunActivity(record.id, describeAgentActivity(event));
     const journal = this.journals.get(record.id)!;
     if (event.type === "turn_start") {
-      this.turnIndexes.set(record.id, (this.turnIndexes.get(record.id) ?? 0) + 1);
+      const turnIndex = (this.turnIndexes.get(record.id) ?? 0) + 1;
+      this.turnIndexes.set(record.id, turnIndex);
+      if (turnIndex > this.config.maxTurnsPerRun) {
+        const message = `Run reached the model turn limit of ${this.config.maxTurnsPerRun}; model request ${turnIndex} was not started`;
+        journal.publish("run.turn_limit", {
+          max_turns: this.config.maxTurnsPerRun,
+          completed_turns: turnIndex - 1,
+          blocked_turn: turnIndex,
+        });
+        throw new Error(message);
+      }
       return;
     }
     if (event.type === "message_start" && event.message.role === "user") {
@@ -808,7 +930,6 @@ export class RunCoordinator {
       // execute wrapper at the point execution actually begins.
       return;
     } else if (event.type === "tool_execution_update") {
-      if (!startedToolCalls.has(event.toolCallId)) return;
       journal.publish("tool.updated", {
         tool_call_id: event.toolCallId,
         tool_name: event.toolName,
@@ -994,6 +1115,7 @@ export class RunCoordinator {
       );
       for await (const _event of responseStream) {
         if (auxiliaryController.signal.aborted) throw abortError();
+        this.touchRunActivity(record.id, "receiving auxiliary browser vision response");
       }
       const response = await responseStream.result();
       if (response.stopReason === "error" || response.stopReason === "aborted") {
@@ -1074,6 +1196,7 @@ export class RunCoordinator {
       journal.publish("tool.failed", forwarded);
     });
     journal.publish("delegation.started", { child_run_id: child.id, depth: depth + 1 });
+    this.touchRunActivity(parent.id, `delegated run started: ${child.id}`);
     const onAbort = (): void => { this.cancel(child.id); };
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -1095,6 +1218,7 @@ export class RunCoordinator {
         throw new Error(completed.error || `Child run ${completed.status}`);
       }
       journal.publish("delegation.completed", { child_run_id: child.id, content: completed.result.content });
+      this.touchRunActivity(parent.id, `delegated run completed: ${child.id}`);
       return completed.result.content;
     } finally {
       unsubscribeChildJournal?.();
@@ -1138,6 +1262,7 @@ export class RunCoordinator {
       ...this.inputSummary(record.id),
       ...data,
     });
+    this.runActivities.delete(record.id);
     this.completions.get(record.id)?.resolve(record);
     this.scheduleRetention(record, Date.now() + this.config.runRetentionMs);
   }
@@ -1152,6 +1277,7 @@ export class RunCoordinator {
       this.runInputs.delete(record.id);
       this.acceptingInputs.delete(record.id);
       this.turnIndexes.delete(record.id);
+      this.runActivities.delete(record.id);
       const idempotencyKey = runIdempotencyKey(record.request);
       if (idempotencyKey && this.idempotencyIndex.get(idempotencyKey) === record.id) {
         this.idempotencyIndex.delete(idempotencyKey);
@@ -1405,6 +1531,31 @@ function boundedSessionInteger(
     throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`);
   }
   return parsed;
+}
+
+function describeAgentActivity(event: AgentEvent): string {
+  switch (event.type) {
+    case "agent_start":
+      return "agent loop started";
+    case "agent_end":
+      return "agent loop completed";
+    case "turn_start":
+      return "model turn started";
+    case "turn_end":
+      return "model turn completed";
+    case "message_start":
+      return `${event.message.role} message started`;
+    case "message_update":
+      return `model response activity: ${event.assistantMessageEvent.type}`;
+    case "message_end":
+      return `${event.message.role} message completed`;
+    case "tool_execution_start":
+      return `tool requested: ${event.toolName}`;
+    case "tool_execution_update":
+      return `tool progress: ${event.toolName}`;
+    case "tool_execution_end":
+      return `tool completed: ${event.toolName}`;
+  }
 }
 
 function sessionMessageSummary(message: AgentMessage, index: number): Record<string, JsonValue> {

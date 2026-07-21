@@ -74,7 +74,7 @@ from .runtimes import (
     AGENT_SETTING_MAX_CONCURRENCY,
     AGENT_SETTING_MODEL,
     AGENT_SETTING_PROVIDER,
-    AGENT_SETTING_TIMEOUT,
+    AGENT_SETTING_IDLE_TIMEOUT,
     PlatformRuntimeManager,
 )
 from .schedules import (
@@ -536,9 +536,6 @@ class EnterpriseService:
         return AgentRuntimeClient(
             str(runtime.get("runtime_url") or self.config.agent_runtime_url),
             runtime_token,
-            timeout_seconds=float(
-                runtime.get("timeout_seconds") or self.config.agent_runtime_timeout_seconds
-            ),
             gateway_base_url=f"http://{internal_host}:{self.config.port}",
             gateway_token=self.get_secret("agent_tool_token"),
             default_provider=str(
@@ -1412,7 +1409,9 @@ class EnterpriseService:
         defaults = {
             AGENT_SETTING_PROVIDER: self.config.agent_runtime_provider,
             AGENT_SETTING_MODEL: self.config.agent_runtime_model,
-            AGENT_SETTING_TIMEOUT: str(self.config.agent_runtime_timeout_seconds),
+            AGENT_SETTING_IDLE_TIMEOUT: str(
+                self.config.agent_runtime_idle_timeout_seconds
+            ),
             AGENT_SETTING_MAX_CONCURRENCY: str(MAX_CONCURRENT_AGENT_RUNS),
             AGENT_SETTING_COMPACTION_THRESHOLD: "0.8",
         }
@@ -5865,14 +5864,19 @@ class EnterpriseService:
                 )
             elif provider:
                 updates[AGENT_SETTING_MODEL] = self._default_oauth_model(provider)
-            if "timeout_seconds" in body:
+            if "idle_timeout_seconds" in body:
                 try:
-                    timeout = float(body.get("timeout_seconds"))
+                    idle_timeout = float(body.get("idle_timeout_seconds"))
                 except (TypeError, ValueError) as exc:
-                    raise ServiceError(400, "timeout_seconds must be a number") from exc
-                if not 1 <= timeout <= 3600:
-                    raise ServiceError(400, "timeout_seconds must be between 1 and 3600")
-                updates[AGENT_SETTING_TIMEOUT] = str(timeout)
+                    raise ServiceError(
+                        400, "idle_timeout_seconds must be a number"
+                    ) from exc
+                if not math.isfinite(idle_timeout) or not 0 <= idle_timeout <= 86400:
+                    raise ServiceError(
+                        400,
+                        "idle_timeout_seconds must be between 0 and 86400",
+                    )
+                updates[AGENT_SETTING_IDLE_TIMEOUT] = str(idle_timeout)
             if "max_concurrency" in body:
                 try:
                     concurrency = int(body.get("max_concurrency"))

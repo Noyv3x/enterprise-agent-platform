@@ -16,6 +16,9 @@ export interface ToolFactoryContext {
   querySession: (action: string, arguments_: JsonObject, signal?: AbortSignal) => Promise<JsonValue>;
   delegate: (prompt: string, systemPrompt: string | undefined, signal?: AbortSignal) => Promise<string>;
   markSideEffect: () => void;
+  defaultTerminalTimeoutMs?: number;
+  onActivity?: (description: string) => void;
+  activityHeartbeatMs?: number;
 }
 
 function textResult(content: string, details: JsonValue = null): AgentToolResult<JsonValue> {
@@ -86,7 +89,7 @@ const terminalSchema = Type.Object({
   timeout_ms: Type.Optional(Type.Integer({
     minimum: 100,
     maximum: 3_600_000,
-    description: "Command timeout in milliseconds. Foreground commands return as soon as they finish.",
+    description: "Command-specific timeout in milliseconds, independent of the run inactivity watchdog. Foreground commands return as soon as they finish.",
   })),
   background: Type.Optional(Type.Boolean({
     description: "Start a long-lived process and return its process id immediately.",
@@ -571,12 +574,20 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         cwd,
         background,
         onUpdate(update) {
+          if (!background) context.onActivity?.("terminal command produced output");
           const output = update.stdout ?? update.stderr ?? "";
           onUpdate?.(textResult(output, update));
         },
       };
+      if (!background && context.onActivity) {
+        options.onActivity = () => context.onActivity?.("terminal command still running");
+        if (context.activityHeartbeatMs !== undefined) {
+          options.activityHeartbeatMs = context.activityHeartbeatMs;
+        }
+      }
       if (signal) options.signal = signal;
-      if (params.timeout_ms !== undefined) options.timeoutMs = params.timeout_ms;
+      const timeoutMs = params.timeout_ms ?? (background ? undefined : context.defaultTerminalTimeoutMs ?? 180_000);
+      if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
       if (params.update_behavior !== undefined) options.updateBehavior = params.update_behavior;
       const result = await context.processes.run(options);
       return textResult(

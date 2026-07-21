@@ -30,6 +30,29 @@ test("ProcessRegistry stops an aborted process group", async () => {
   }
 });
 
+test("ProcessRegistry reports a foreground command deadline as a timeout error", async () => {
+  const workspace = await temporaryDirectory("agent-process-timeout-");
+  try {
+    const registry = new ProcessRegistry();
+    await assert.rejects(
+      registry.run({
+        runId: "run",
+        scopeKey: "scope",
+        command: "sleep 30",
+        cwd: workspace,
+        timeoutMs: 30,
+      }),
+      (error: unknown) => error instanceof Error
+        && error.name === "TimeoutError"
+        && /timed out after 30 ms/.test(error.message),
+    );
+    const [process] = registry.list("scope");
+    assert.equal(process?.status, "cancelled");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("ProcessRegistry does not expose runtime or conventionally named secrets", async () => {
   const workspace = await temporaryDirectory("agent-process-env-");
   try {

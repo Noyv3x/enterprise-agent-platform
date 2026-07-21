@@ -20,7 +20,9 @@ Environment variables:
 - `AGENT_RUNTIME_PORT`: bind port; defaults to `8766`.
 - `AGENT_RUNTIME_TOKEN` or `AGENT_RUNTIME_TOKEN_FILE`: bearer credential for every endpoint, including health.
 - `AGENT_PLATFORM_INTERNAL_URL` and `AGENT_PLATFORM_INTERNAL_TOKEN`: default private platform gateway used by auth and managed tools.
-- `AGENT_RUNTIME_RUN_TIMEOUT_MS`: hard top-level and child run lifetime; defaults to 240,000 ms. Timeout aborts the model, approval waits, gateway requests, and process group.
+- `AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS`: maximum run inactivity; defaults to 1,800,000 ms (30 minutes), and `0` disables it. Model and tool progress, new input, and internal runtime stages refresh the deadline. Approval waits pause it, and child-run activity refreshes its parent. Inactivity aborts the model, gateway requests, and process group without imposing a wall-clock limit on active work.
+- `AGENT_RUNTIME_MAX_TURNS`: maximum model requests within one run; defaults to 90, with a range of 1–1,000. The limit cannot be disabled because actively looping model/tool work continually refreshes the inactivity watchdog. A run may finish normally on its final allowed response; if another model request would be required, the runtime emits `run.turn_limit` and stops before sending it.
+- `AGENT_RUNTIME_TERMINAL_TIMEOUT_MS`: default foreground terminal-command deadline; defaults to 180,000 ms (3 minutes), range 100–3,600,000 ms. A tool call's explicit `timeout_ms` overrides it; background commands do not inherit it.
 - `AGENT_RUNTIME_MAX_CONCURRENCY`: fair FIFO top-level run concurrency from 1 to 64; defaults to 8. Delegated child runs share their parent's execution slot.
 - `AGENT_RUNTIME_MAX_QUEUED_RUNS`: maximum waiting top-level runs; defaults to 256. New runs receive HTTP 429 when the queue is full.
 - `AGENT_RUNTIME_REQUEST_BODY_TIMEOUT_MS`: total deadline for receiving a JSON request body; defaults to 15,000 ms.
@@ -90,5 +92,7 @@ Managed memory and knowledge tools adapt to the protected `/api/agent/tools/...`
 Memory gateway ownership is derived from a positive integer `metadata.actor.id` after tool arguments are merged. Model-provided `owner_user_id`, including values nested in batch operations, cannot override runtime context. Mutations receive trusted run/message provenance and `source_type=tool`; committed memory content accepted by `store` and `replace` is limited to 4,000 characters. A top-level interactive private Agent may submit an idempotent pending `memory.propose` candidate for stable user facts or Agent rules without a write-approval card; proposals are not committed memory and are not recalled until accepted by the platform.
 
 Relative file and command working-directory paths default to the Agent workspace. Resolved paths outside the workspace require approval, including traversal and symlink aliases. All host commands and file mutations require approval. Direct file-tool writes to protected system trees (`/etc`, `/boot`, `/proc`, `/sys`, `/dev`), process credential/memory reads under `/proc`, and Docker socket access are blocked; command-text blocking is defense in depth rather than an OS sandbox.
+
+Foreground terminal commands send an internal activity heartbeat while their process remains alive, so a quiet but healthy command does not trip the run inactivity watchdog. A model-supplied `timeout_ms` remains the command's independent deadline; background commands return immediately and do not keep a completed Agent run active.
 
 Host commands inherit ordinary process settings such as `PATH`, but the runtime removes environment variables whose names identify secrets, tokens, passwords, API keys, credentials, or private keys before spawning the command.

@@ -50,3 +50,39 @@ test("run cleanup grace defaults to five seconds and requires a positive integer
     );
   }
 });
+
+test("run inactivity timeout defaults to thirty minutes and accepts zero to disable it", () => {
+  assert.equal(loadConfig({}).runIdleTimeoutMs, 30 * 60_000);
+  assert.equal(loadConfig({ AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS: "0" }).runIdleTimeoutMs, 0);
+  assert.equal(loadConfig({ AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS: "2500" }).runIdleTimeoutMs, 2_500);
+  for (const value of ["-1", "86400001", "1.5", "later"]) {
+    assert.throws(
+      () => loadConfig({ AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS: value }),
+      /Expected an integer between 0 and 86400000/,
+    );
+  }
+});
+
+test("model turn limit defaults to ninety and enforces a bounded positive range", () => {
+  assert.equal(loadConfig({}).maxTurnsPerRun, 90);
+  assert.equal(loadConfig({ AGENT_RUNTIME_MAX_TURNS: "1" }).maxTurnsPerRun, 1);
+  assert.equal(loadConfig({ AGENT_RUNTIME_MAX_TURNS: "1000" }).maxTurnsPerRun, 1_000);
+  for (const value of ["0", "1001", "1.5", "unlimited"]) {
+    assert.throws(
+      () => loadConfig({ AGENT_RUNTIME_MAX_TURNS: value }),
+      /Expected an integer between 1 and 1000/,
+    );
+  }
+});
+
+test("foreground terminal timeout defaults to three minutes and stays within the tool schema range", () => {
+  assert.equal(loadConfig({}).terminalTimeoutMs, 180_000);
+  assert.equal(loadConfig({ AGENT_RUNTIME_TERMINAL_TIMEOUT_MS: "100" }).terminalTimeoutMs, 100);
+  assert.equal(loadConfig({ AGENT_RUNTIME_TERMINAL_TIMEOUT_MS: "3600000" }).terminalTimeoutMs, 3_600_000);
+  for (const value of ["0", "99", "3600001", "1.5", "later"]) {
+    assert.throws(
+      () => loadConfig({ AGENT_RUNTIME_TERMINAL_TIMEOUT_MS: value }),
+      /Expected an integer between 100 and 3600000/,
+    );
+  }
+});

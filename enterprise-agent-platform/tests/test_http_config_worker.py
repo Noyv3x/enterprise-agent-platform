@@ -335,6 +335,39 @@ class ConfigFromEnvTests(unittest.TestCase):
             else:
                 os.environ["ENTERPRISE_PLATFORM_PORT"] = previous
 
+    def test_agent_idle_timeout_defaults_to_thirty_minutes_and_allows_disable(self):
+        key = "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS"
+        previous = os.environ.pop(key, None)
+        try:
+            self.assertEqual(
+                PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
+                1800.0,
+            )
+            os.environ[key] = "0"
+            self.assertEqual(
+                PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
+                0.0,
+            )
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+    def test_agent_idle_timeout_rejects_values_above_one_day(self):
+        key = "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS"
+        previous = os.environ.get(key)
+        os.environ[key] = "86401"
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                PlatformConfig.from_env(Path("/tmp"))
+            self.assertIn(key, str(ctx.exception))
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
 
 class AgentWorkerRecoveryTests(unittest.TestCase):
     def test_generation_failure_surfaces_last_error_and_worker_recovers(self):

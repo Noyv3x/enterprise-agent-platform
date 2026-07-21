@@ -61,7 +61,7 @@ class PlatformConfig:
     agent_runtime_home: Path | None = None
     agent_runtime_model: str = "gpt-5.5"
     agent_runtime_provider: str = "openai-codex"
-    agent_runtime_timeout_seconds: float = 240.0
+    agent_runtime_idle_timeout_seconds: float = 1800.0
 
     @property
     def db_path(self) -> Path:
@@ -156,8 +156,11 @@ class PlatformConfig:
             agent_runtime_provider=os.getenv(
                 "ENTERPRISE_AGENT_RUNTIME_PROVIDER", "openai-codex"
             ).strip().lower() or "openai-codex",
-            agent_runtime_timeout_seconds=_env_float(
-                "ENTERPRISE_AGENT_RUNTIME_TIMEOUT_SECONDS", 240.0, minimum=1.0
+            agent_runtime_idle_timeout_seconds=_env_float(
+                "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS",
+                1800.0,
+                minimum=0.0,
+                maximum=86400.0,
             ),
         )
 
