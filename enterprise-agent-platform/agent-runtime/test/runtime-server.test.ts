@@ -7,6 +7,18 @@ import { RunCoordinator } from "../src/run-coordinator.js";
 import { createRuntimeServer } from "../src/server.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
+test("runtime refuses to start with an empty configured bearer token", async () => {
+  const home = await temporaryDirectory("agent-server-empty-token-");
+  try {
+    assert.throws(
+      () => createRuntimeServer(testConfig(home, { bearerToken: "" })),
+      /bearer token must be non-empty/,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("runtime serves authenticated run creation and replayable SSE", async () => {
   const home = await temporaryDirectory("agent-server-");
   const workspace = await temporaryDirectory("agent-workspace-");

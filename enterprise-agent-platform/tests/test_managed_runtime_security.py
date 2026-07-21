@@ -34,6 +34,8 @@ from enterprise_agent_platform.runtimes import (
     PlatformRuntimeManager,
 )
 import enterprise_agent_platform.runtimes as runtime_module
+from enterprise_agent_platform.agent_runtime_client import AgentRuntimeConnectionError
+from enterprise_agent_platform.service import EnterpriseService
 
 from test_platform import (
     RecordingCommandRunner,
@@ -110,7 +112,7 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
                 return _FakeHTTPResponse(200, {"ok": True})
 
             with mock.patch(
-                "enterprise_agent_platform.runtimes.urllib.request.urlopen",
+                "enterprise_agent_platform.runtimes.open_loopback_url",
                 side_effect=open_request,
             ):
                 self.assertTrue(manager._probe_agent_health())
@@ -1104,6 +1106,182 @@ console.log(JSON.stringify(payload));
                 self.assertIn("SearXNG", searxng.error)
                 self.assertIn("loopback", searxng.error)
 
+    def test_managed_endpoints_and_all_searxng_endpoints_require_numeric_loopback(self):
+        loopback_invalid_urls = (
+            "https://runtime.example:8766",
+            "http://localhost:8766",
+            "http://user:secret@127.0.0.1:8766",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:8766/api",
+            "http://127.0.0.1:8766?target=remote",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for url in loopback_invalid_urls:
+                for service_name, config in (
+                    (
+                        "agent",
+                        replace(
+                            make_config(tmp),
+                            manage_agent_runtime=True,
+                            agent_runtime_url=url,
+                        ),
+                    ),
+                    (
+                        "firecrawl",
+                        replace(
+                            make_config(tmp),
+                            manage_firecrawl=True,
+                            firecrawl_api_url=url,
+                        ),
+                    ),
+                    (
+                        "camoufox",
+                        replace(
+                            make_config(tmp),
+                            manage_camofox=True,
+                            camofox_url=url,
+                        ),
+                    ),
+                ):
+                    with self.subTest(service=service_name, url=url):
+                        manager = self._manager(tmp, config=config)
+                        status = {
+                            "agent": manager.prepare_agent_runtime,
+                            "firecrawl": manager.prepare_firecrawl,
+                            "camoufox": lambda: manager.camofox_status(refresh=True),
+                        }[service_name]()
+                        self.assertEqual(status.state, "invalid_config")
+                        self.assertIn("numeric loopback", status.error)
+
+                for managed in (False, True):
+                    with self.subTest(service="searxng", managed=managed, url=url):
+                        manager = self._manager(
+                            tmp,
+                            config=replace(
+                                make_config(tmp),
+                                manage_searxng=managed,
+                                searxng_api_url=url,
+                            ),
+                        )
+                        with mock.patch.object(manager, "_probe_searxng_health") as probe:
+                            status = manager.prepare_searxng()
+                        self.assertEqual(status.state, "invalid_config")
+                        self.assertIn("loopback", status.error)
+                        probe.assert_not_called()
+
+    def test_external_agent_and_firecrawl_accept_trusted_http_endpoints(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manager = self._manager(
+                tmp,
+                config=replace(
+                    make_config(tmp),
+                    manage_agent_runtime=False,
+                    agent_runtime_url="https://runtime.example:8766/agent-api",
+                    manage_firecrawl=False,
+                    firecrawl_api_url="https://firecrawl.example:3002/api",
+                ),
+            )
+            with (
+                mock.patch.object(manager, "_probe_agent_health", return_value=True),
+                mock.patch.object(manager, "_probe_firecrawl_health", return_value=True),
+            ):
+                self.assertTrue(manager.prepare_agent_runtime().available)
+                self.assertTrue(manager.prepare_firecrawl().available)
+
+    def test_external_agent_and_firecrawl_reject_embedded_credentials_and_non_base_urls(self):
+        invalid_urls = (
+            "ftp://service.example:8766",
+            "http://user:secret@service.example:8766",
+            "http://service.example:0",
+            "http://service.example:8766?target=remote",
+            "http://service.example:8766#fragment",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for url in invalid_urls:
+                for service_name, config, probe_name in (
+                    (
+                        "agent",
+                        replace(
+                            make_config(tmp),
+                            manage_agent_runtime=False,
+                            agent_runtime_url=url,
+                        ),
+                        "_probe_agent_health",
+                    ),
+                    (
+                        "firecrawl",
+                        replace(
+                            make_config(tmp),
+                            manage_firecrawl=False,
+                            firecrawl_api_url=url,
+                        ),
+                        "_probe_firecrawl_health",
+                    ),
+                ):
+                    with self.subTest(service=service_name, url=url):
+                        manager = self._manager(tmp, config=config)
+                        with mock.patch.object(manager, probe_name) as probe:
+                            status = (
+                                manager.prepare_agent_runtime()
+                                if service_name == "agent"
+                                else manager.prepare_firecrawl()
+                            )
+                        self.assertEqual(status.state, "invalid_config")
+                        self.assertIn("credential-free HTTP", status.error)
+                        probe.assert_not_called()
+
+    def test_disabled_camoufox_never_probes_an_external_endpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manager = self._manager(
+                tmp,
+                config=replace(
+                    make_config(tmp),
+                    manage_camofox=False,
+                    camofox_url="https://browser.example:9377",
+                ),
+            )
+            with mock.patch.object(manager, "_probe_camofox_health") as probe:
+                status = manager.camofox_status(refresh=True)
+            self.assertFalse(status.available)
+            self.assertFalse(status.managed)
+            self.assertIn("external mode is unsupported", status.detail)
+            probe.assert_not_called()
+
+    def test_invalid_managed_agent_endpoint_does_not_start_or_use_transport(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config = replace(
+                make_config(tmp),
+                manage_agent_runtime=True,
+                agent_runtime_url="https://runtime.example:8766",
+                manage_camofox=False,
+                manage_firecrawl=False,
+                manage_searxng=False,
+            )
+            service = EnterpriseService(config, autostart_runtime=False)
+            try:
+                status = service.runtimes.agent_runtime_status(refresh=True)
+                self.assertEqual(status.state, "invalid_config")
+                self.assertIn("numeric loopback", status.error)
+                with (
+                    mock.patch(
+                        "enterprise_agent_platform.agent_runtime_client.open_trusted_service_url"
+                    ) as trusted_transport,
+                    mock.patch(
+                        "enterprise_agent_platform.agent_runtime_client.open_loopback_url"
+                    ) as loopback_transport,
+                    self.assertRaises(AgentRuntimeConnectionError),
+                ):
+                    service.agent_client.health()
+                trusted_transport.assert_not_called()
+                loopback_transport.assert_not_called()
+            finally:
+                service.close()
+
     def test_firecrawl_uses_loopback_publish_and_digest_pins(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1430,19 +1608,17 @@ console.log(JSON.stringify(payload));
             response.read.return_value = b"OK\n"
             response.__enter__.return_value = response
             response.__exit__.return_value = False
-            opener = mock.MagicMock()
-            opener.open.return_value = response
             with mock.patch.object(
-                manager,
-                "_searxng_health_opener",
-                return_value=opener,
+                runtime_module,
+                "open_loopback_url",
+                return_value=response,
             ):
                 self.assertTrue(manager._probe_searxng_health())
             response.read.return_value = b"some other healthy service"
             with mock.patch.object(
-                manager,
-                "_searxng_health_opener",
-                return_value=opener,
+                runtime_module,
+                "open_loopback_url",
+                return_value=response,
             ):
                 self.assertFalse(manager._probe_searxng_health())
 
@@ -1502,21 +1678,21 @@ console.log(JSON.stringify(payload));
     def test_managed_health_probe_requires_2xx_and_expected_json_shape(self):
         validator = lambda payload: payload.get("ok") is True and payload.get("engine") == "camoufox"
         with mock.patch(
-            "enterprise_agent_platform.runtimes.urllib.request.urlopen",
+            "enterprise_agent_platform.runtimes.open_loopback_url",
             return_value=_FakeHTTPResponse(404, {"ok": True, "engine": "camoufox"}),
         ):
             self.assertFalse(
                 PlatformRuntimeManager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
             )
         with mock.patch(
-            "enterprise_agent_platform.runtimes.urllib.request.urlopen",
+            "enterprise_agent_platform.runtimes.open_loopback_url",
             return_value=_FakeHTTPResponse(200, {"status": "some unrelated service"}),
         ):
             self.assertFalse(
                 PlatformRuntimeManager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
             )
         with mock.patch(
-            "enterprise_agent_platform.runtimes.urllib.request.urlopen",
+            "enterprise_agent_platform.runtimes.open_loopback_url",
             return_value=_FakeHTTPResponse(200, {"ok": True, "engine": "camoufox"}),
         ):
             self.assertTrue(

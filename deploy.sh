@@ -48,6 +48,52 @@ python_bootstrap_checked() {
   "$PYTHON_BIN" -m enterprise_agent_platform.deployment bootstrap --root "$ROOT" --mode "$mode" "$@"
 }
 
+check_documentation() {
+  "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check
+}
+
+check_documentation_change() {
+  local base="$1"
+  local head="$2"
+  "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check-change --base "$base" --head "$head"
+}
+
+# Select a committed change set for the local test gate. A branch that is
+# ahead of its upstream is checked from their merge-base; a synchronized
+# branch (or a checkout without an upstream) falls back to the newest commit
+# so a clean worktree cannot hide a previously committed code-only change.
+documentation_test_base() {
+  local head upstream merge_base parent
+  head="$(git -C "$ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+  upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [[ -n "$head" && -n "$upstream" ]]; then
+    merge_base="$(git -C "$ROOT" merge-base HEAD "$upstream" 2>/dev/null || true)"
+    if [[ -n "$merge_base" && "$merge_base" != "$head" ]] \
+      && ! git -C "$ROOT" diff --quiet "$merge_base" "$head" --; then
+      printf '%s\n' "$merge_base"
+      return 0
+    fi
+  fi
+
+  parent="$(git -C "$ROOT" rev-parse --verify HEAD^ 2>/dev/null || true)"
+  if [[ -n "$parent" ]]; then
+    printf '%s\n' "$parent"
+  else
+    # check-change treats an all-zero base as a first-rollout bootstrap while
+    # still applying all current-tree checks.
+    printf '%040d\n' 0
+  fi
+}
+
+check_documentation_checkout() {
+  local recent_base
+  recent_base="$(documentation_test_base)"
+  check_documentation
+  check_documentation_change "$recent_base" HEAD
+  check_documentation_change HEAD INDEX
+  check_documentation_change HEAD WORKTREE
+}
+
 require_node_runtime() {
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
     echo "Node.js 22.19 or newer and npm are required." >&2
@@ -394,6 +440,12 @@ case "$cmd" in
         exit 1
       fi
     fi
+    if ! check_documentation \
+      || ! check_documentation_change "$PREV_SHA" HEAD; then
+      echo "Updated source failed the canonical documentation gate; rolling back." >&2
+      recover_failed_update
+      exit 1
+    fi
     if ! python_bootstrap_checked auto "$@"; then
       recover_failed_update
       exit 1
@@ -407,18 +459,22 @@ case "$cmd" in
     ;;
   deploy|up)
     shift || true
+    check_documentation_checkout
     python_bootstrap auto "$@"
     ;;
   service)
     shift || true
+    check_documentation_checkout
     python_bootstrap service "$@"
     ;;
   foreground|run)
     shift || true
+    check_documentation_checkout
     python_bootstrap foreground "$@"
     ;;
   prepare)
     shift || true
+    check_documentation_checkout
     python_bootstrap prepare "$@"
     ;;
   start|stop|restart|status)
@@ -435,6 +491,11 @@ case "$cmd" in
     ;;
   test)
     shift || true
+    recent_base="$(documentation_test_base)"
+    check_documentation
+    check_documentation_change "$recent_base" HEAD
+    check_documentation_change HEAD INDEX
+    check_documentation_change HEAD WORKTREE
     cd "$PLATFORM_DIR"
     "$PYTHON_BIN" -m unittest discover -s tests "$@"
     "$PYTHON_BIN" -m compileall enterprise_agent_platform tests
@@ -444,8 +505,14 @@ case "$cmd" in
     npm run check
     npm test
     npm run build
+    cd "$PLATFORM_DIR/frontend"
+    npm ci
+    npm run check
+    npm test
+    npm run build
     ;;
   *)
+    check_documentation_checkout
     python_bootstrap auto "$@"
     ;;
 esac

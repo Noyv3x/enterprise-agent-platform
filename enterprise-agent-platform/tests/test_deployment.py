@@ -142,6 +142,25 @@ def make_fake_deploy_python(base: Path) -> Path:
     executable = base / "fake-python"
     executable.write_text(
         """#!/bin/sh
+case "${1:-}" in
+  */scripts/docs_sync.py)
+    root="${1%/scripts/docs_sync.py}"
+    version="$(tr -d '\\n' < "$root/version.txt")"
+    mode="${2:-}"
+    if [ -n "${FAKE_DOCS_LOG:-}" ]; then
+      printf '%s:%s' "$version" "$mode" >> "$FAKE_DOCS_LOG"
+      shift 2
+      for argument in "$@"; do
+        printf ':%s' "$argument" >> "$FAKE_DOCS_LOG"
+      done
+      printf '\\n' >> "$FAKE_DOCS_LOG"
+    fi
+    if [ "${FAKE_FAIL_DOCS_MODE:-}" = "$mode" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+esac
 root=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--root" ]; then
@@ -1455,6 +1474,252 @@ class DeploymentTests(unittest.TestCase):
         syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    def test_ordinary_deploy_modes_check_docs_and_changes_before_bootstrap(self):
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy2(source_script, root / "deploy.sh")
+            fake_python = root / "fake-python"
+            fake_python.write_text(
+                """#!/bin/sh
+case "${1:-}" in
+  */scripts/docs_sync.py)
+    printf 'docs:%s\\n' "${2:-}" >> "$FAKE_DEPLOY_EVENTS"
+    if [ "${2:-}" = "check-change" ]; then
+      exit "${FAKE_DOCS_CHANGE_EXIT:-${FAKE_DOCS_EXIT:-0}}"
+    fi
+    exit "${FAKE_DOCS_EXIT:-0}"
+    ;;
+esac
+mode=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--mode' ]; then
+    mode="$argument"
+    break
+  fi
+  previous="$argument"
+done
+printf 'bootstrap:%s\\n' "$mode" >> "$FAKE_DEPLOY_EVENTS"
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            for command, expected_mode in (
+                ("deploy", "auto"),
+                ("up", "auto"),
+                ("service", "service"),
+                ("foreground", "foreground"),
+                ("prepare", "prepare"),
+            ):
+                with self.subTest(command=command):
+                    event_log = root / f"{command}.log"
+                    env = os.environ.copy()
+                    env.update(
+                        {
+                            "PYTHON_BIN": str(fake_python),
+                            "FAKE_DEPLOY_EVENTS": str(event_log),
+                        }
+                    )
+                    result = subprocess.run(
+                        ["bash", str(root / "deploy.sh"), command],
+                        cwd=root,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        event_log.read_text(encoding="utf-8").splitlines(),
+                        [
+                            "docs:check",
+                            "docs:check-change",
+                            "docs:check-change",
+                            "docs:check-change",
+                            f"bootstrap:{expected_mode}",
+                        ],
+                    )
+
+            failed_log = root / "failed-docs.log"
+            failed_env = os.environ.copy()
+            failed_env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_EVENTS": str(failed_log),
+                    "FAKE_DOCS_EXIT": "1",
+                }
+            )
+            failed = subprocess.run(
+                ["bash", str(root / "deploy.sh"), "deploy"],
+                cwd=root,
+                env=failed_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(
+                failed_log.read_text(encoding="utf-8").splitlines(),
+                ["docs:check"],
+            )
+
+            failed_change_log = root / "failed-docs-change.log"
+            failed_change_env = os.environ.copy()
+            failed_change_env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_EVENTS": str(failed_change_log),
+                    "FAKE_DOCS_CHANGE_EXIT": "1",
+                }
+            )
+            failed_change = subprocess.run(
+                ["bash", str(root / "deploy.sh"), "deploy"],
+                cwd=root,
+                env=failed_change_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(failed_change.returncode, 0)
+            self.assertEqual(
+                failed_change_log.read_text(encoding="utf-8").splitlines(),
+                ["docs:check", "docs:check-change"],
+            )
+
+    def test_deploy_test_checks_commits_worktree_runtime_and_frontend(self):
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "checkout"
+            root.mkdir()
+            shutil.copy2(source_script, root / "deploy.sh")
+            (root / "scripts").mkdir()
+            (root / "scripts" / "docs_sync.py").write_text("# fake\n", encoding="utf-8")
+            platform = root / "enterprise-agent-platform"
+            runtime = platform / "agent-runtime"
+            frontend = platform / "frontend"
+            runtime.mkdir(parents=True)
+            frontend.mkdir()
+            (runtime / "package.json").write_text("{}\n", encoding="utf-8")
+            (frontend / "package.json").write_text("{}\n", encoding="utf-8")
+            tracked = root / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=root, check=True)
+            upstream_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+
+            remote = base / "remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=root, check=True)
+            subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=root, check=True)
+
+            for index in (1, 2):
+                tracked.write_text(f"local-{index}\n", encoding="utf-8")
+                subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-q", "-m", f"local {index}"], cwd=root, check=True)
+            parent_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^"], cwd=root, text=True
+            ).strip()
+
+            tools = base / "tools"
+            tools.mkdir()
+            python_log = base / "python.log"
+            npm_log = base / "npm.log"
+            fake_python = tools / "python"
+            fake_python.write_text(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> \"$FAKE_PYTHON_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_node = tools / "node"
+            fake_node.write_text("#!/bin/sh\nprintf '22.19.0\\n'\n", encoding="utf-8")
+            fake_npm = tools / "npm"
+            fake_npm.write_text(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> \"$FAKE_NPM_LOG\"\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_python, fake_node, fake_npm):
+                executable.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{tools}{os.pathsep}{env.get('PATH', '')}",
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_PYTHON_LOG": str(python_log),
+                    "FAKE_NPM_LOG": str(npm_log),
+                }
+            )
+
+            def run_test_and_assert_base(expected_base: str) -> None:
+                python_log.unlink(missing_ok=True)
+                npm_log.unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["bash", str(root / "deploy.sh"), "test"],
+                    cwd=root,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                python_calls = python_log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    python_calls[:4],
+                    [
+                        f"{root}|{root / 'scripts' / 'docs_sync.py'} check",
+                        f"{root}|{root / 'scripts' / 'docs_sync.py'} check-change --base {expected_base} --head HEAD",
+                        f"{root}|{root / 'scripts' / 'docs_sync.py'} check-change --base HEAD --head INDEX",
+                        f"{root}|{root / 'scripts' / 'docs_sync.py'} check-change --base HEAD --head WORKTREE",
+                    ],
+                )
+                self.assertEqual(
+                    python_calls[4:],
+                    [
+                        f"{platform}|-m unittest discover -s tests",
+                        f"{platform}|-m compileall enterprise_agent_platform tests",
+                    ],
+                )
+                self.assertEqual(
+                    npm_log.read_text(encoding="utf-8").splitlines(),
+                    [
+                        f"{runtime}|ci",
+                        f"{runtime}|run check",
+                        f"{runtime}|test",
+                        f"{runtime}|run build",
+                        f"{frontend}|ci",
+                        f"{frontend}|run check",
+                        f"{frontend}|test",
+                        f"{frontend}|run build",
+                    ],
+                )
+
+            # A branch ahead of upstream uses their merge-base, covering the
+            # complete unpublished series rather than only the tip commit.
+            run_test_and_assert_base(upstream_sha)
+
+            # Once upstream is synchronized there is no merge-base diff, so
+            # the gate must still inspect HEAD^..HEAD on a clean worktree.
+            subprocess.run(["git", "push", "-q", "origin", "main"], cwd=root, check=True)
+            run_test_and_assert_base(parent_sha)
+
     def test_deploy_script_prefers_managed_node_before_runtime_check(self):
         source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
         with tempfile.TemporaryDirectory() as td:
@@ -1469,11 +1734,30 @@ class DeploymentTests(unittest.TestCase):
             )
             (managed_bin / "npm").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_python = root / "python"
-            fake_python.write_text("#!/bin/sh\nnode --version >/dev/null\n", encoding="utf-8")
+            event_log = root / "deploy-events.txt"
+            fake_python.write_text(
+                """#!/bin/sh
+case "${1:-}" in
+  */scripts/docs_sync.py)
+    printf 'docs:%s\\n' "${2:-}" >> "$FAKE_DEPLOY_EVENTS"
+    exit 0
+    ;;
+esac
+printf 'bootstrap\\n' >> "$FAKE_DEPLOY_EVENTS"
+node --version >/dev/null
+""",
+                encoding="utf-8",
+            )
             for executable in (managed_bin / "node", managed_bin / "npm", fake_python):
                 executable.chmod(0o755)
             env = os.environ.copy()
-            env.update({"PYTHON_BIN": str(fake_python), "FAKE_NODE_MARKER": str(marker)})
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_NODE_MARKER": str(marker),
+                    "FAKE_DEPLOY_EVENTS": str(event_log),
+                }
+            )
 
             result = subprocess.run(
                 ["bash", str(root / "deploy.sh"), "prepare"],
@@ -1487,6 +1771,16 @@ class DeploymentTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "managed\n")
+            self.assertEqual(
+                event_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "docs:check",
+                    "docs:check-change",
+                    "docs:check-change",
+                    "docs:check-change",
+                    "bootstrap",
+                ],
+            )
 
     def test_deploy_update_refuses_a_second_concurrent_update(self):
         if not shutil.which("git") or not shutil.which("flock"):
@@ -1592,14 +1886,16 @@ class DeploymentTests(unittest.TestCase):
         source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            checkout, _, new_sha = make_update_checkout(base, source_script)
+            checkout, old_sha, new_sha = make_update_checkout(base, source_script)
             fake_python = make_fake_deploy_python(base)
             deploy_log = base / "deploy.log"
+            docs_log = base / "docs.log"
             env = os.environ.copy()
             env.update(
                 {
                     "PYTHON_BIN": str(fake_python),
                     "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "FAKE_DOCS_LOG": str(docs_log),
                 }
             )
 
@@ -1620,6 +1916,66 @@ class DeploymentTests(unittest.TestCase):
             )
             self.assertEqual((checkout / "version.txt").read_text(encoding="utf-8"), "new\n")
             self.assertEqual(deploy_log.read_text(encoding="utf-8").splitlines(), ["new"])
+            self.assertEqual(
+                docs_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "new:check",
+                    f"new:check-change:--base:{old_sha}:--head:HEAD",
+                ],
+            )
+
+    def test_failed_update_documentation_gate_uses_existing_rollback(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout, old_sha, _ = make_update_checkout(base, source_script)
+            fake_python = make_fake_deploy_python(base)
+            deploy_log = base / "deploy.log"
+            docs_log = base / "docs.log"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "FAKE_DOCS_LOG": str(docs_log),
+                    "FAKE_FAIL_DOCS_MODE": "check-change",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(checkout / "deploy.sh"), "update"],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("failed the canonical documentation gate", result.stderr)
+            self.assertIn(f"Rolled back to {old_sha}", result.stderr)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                old_sha,
+            )
+            self.assertEqual(
+                docs_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "new:check",
+                    f"new:check-change:--base:{old_sha}:--head:HEAD",
+                ],
+            )
+            # The new version never bootstraps; rollback redeploys only the
+            # previously known-good revision, which may predate docs/domains.
+            self.assertEqual(
+                deploy_log.read_text(encoding="utf-8").splitlines(),
+                ["old"],
+            )
 
     def test_failed_update_shell_rollback_restores_preupdate_commit(self):
         if not shutil.which("git") or not shutil.which("flock"):

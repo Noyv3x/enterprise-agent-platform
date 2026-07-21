@@ -175,6 +175,36 @@ class BrowserPreviewServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_disabled_camoufox_preview_does_not_use_legacy_key_or_remote_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                service.agent_scopes.ensure_private_scope(actor["id"])
+                key_path = service.config.runtime_dir / "camofox" / "access-key"
+                key_path.parent.mkdir(parents=True, exist_ok=True)
+                key_path.write_text("x" * 48, encoding="utf-8")
+                service.runtimes._managed_camofox_enabled = lambda: False
+                service.runtimes._effective_camofox_url = (
+                    lambda: "https://browser.example:9377"
+                )
+
+                with mock.patch.object(
+                    service,
+                    "_runtime_json_request",
+                ) as runtime_request:
+                    preview = service.browser_preview(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                    )
+
+                self.assertFalse(preview["active"])
+                self.assertEqual(preview["reason"], "browser_unavailable")
+                runtime_request.assert_not_called()
+            finally:
+                service.close()
+
     def test_etag_includes_public_metadata_not_only_pixel_bytes(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))

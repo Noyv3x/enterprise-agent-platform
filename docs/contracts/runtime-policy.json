@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "policy": "runtime-policy",
+  "run_idle_timeout": {
+    "default_seconds": 1800,
+    "minimum_seconds": 0,
+    "maximum_seconds": 86400,
+    "platform_environment_variable": "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS",
+    "runtime_environment_variable": "AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS",
+    "semantics": "The run has no ordinary wall-clock deadline. Sustained model, tool, input, memory, session, or child-run activity refreshes the idle deadline; zero disables this idle guard."
+  },
+  "max_turns_per_run": {
+    "default": 90,
+    "minimum": 1,
+    "maximum": 1000,
+    "runtime_environment_variable": "AGENT_RUNTIME_MAX_TURNS",
+    "semantics": "Each run has an independent cap on model turns so an active tool loop cannot continue without bound."
+  },
+  "terminal_timeout": {
+    "default_milliseconds": 180000,
+    "minimum_milliseconds": 100,
+    "maximum_milliseconds": 3600000,
+    "runtime_environment_variable": "AGENT_RUNTIME_TERMINAL_TIMEOUT_MS",
+    "semantics": "Foreground terminal commands have an independent execution timeout. An explicit timeout_ms overrides the default; background commands do not inherit it."
+  }
+}

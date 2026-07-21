@@ -1,0 +1,259 @@
+{
+  "version": 1,
+  "legacy_top_level_files": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "coverage": {
+    "code_include": [
+      ".gitmodules",
+      "cognee",
+      "firecrawl",
+      ".github/**/*.yml",
+      ".github/**/*.yaml",
+      "deploy.sh",
+      "scripts/**",
+      "enterprise-agent-platform/pyproject.toml",
+      "enterprise-agent-platform/enterprise_agent_platform/**/*.py",
+      "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
+      "enterprise-agent-platform/agent-runtime/package.json",
+      "enterprise-agent-platform/agent-runtime/package-lock.json",
+      "enterprise-agent-platform/agent-runtime/tsconfig.json",
+      "enterprise-agent-platform/agent-runtime/src/**/*.ts",
+      "enterprise-agent-platform/camofox-runtime/package.json",
+      "enterprise-agent-platform/camofox-runtime/package-lock.json",
+      "enterprise-agent-platform/camofox-runtime/*.cjs",
+      "enterprise-agent-platform/frontend/package.json",
+      "enterprise-agent-platform/frontend/package-lock.json",
+      "enterprise-agent-platform/frontend/tsconfig*.json",
+      "enterprise-agent-platform/frontend/vite.config.ts",
+      "enterprise-agent-platform/frontend/index.html",
+      "enterprise-agent-platform/frontend/public/**",
+      "enterprise-agent-platform/frontend/scripts/**/*.mjs",
+      "enterprise-agent-platform/frontend/src/**/*.css",
+      "enterprise-agent-platform/frontend/src/**/*.ts",
+      "enterprise-agent-platform/frontend/src/**/*.tsx"
+    ],
+    "code_exclude": [
+      "enterprise-agent-platform/enterprise_agent_platform/static/**",
+      "enterprise-agent-platform/frontend/scripts/*.test.mjs",
+      "enterprise-agent-platform/frontend/src/**/*.test.ts",
+      "enterprise-agent-platform/frontend/src/**/*.test.tsx"
+    ],
+    "document_include": [
+      "docs/design/*.md",
+      "docs/reference/*.md",
+      "docs/operations/*.md",
+      "docs/development/*.md",
+      "docs/contracts/*.json",
+      "docs/domains.json"
+    ],
+    "document_exclude": []
+  },
+  "domains": [
+    {
+      "id": "documentation-governance",
+      "documents": [
+        "docs/development/documentation-workflow.md",
+        "docs/domains.json"
+      ],
+      "code": [
+        "scripts/**"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_docs_sync.py"
+      ]
+    },
+    {
+      "id": "repository-development",
+      "documents": [
+        "docs/development/repository.md",
+        "docs/development/testing.md"
+      ],
+      "code": [
+        ".gitmodules",
+        ".github/**"
+      ],
+      "tests": []
+    },
+    {
+      "id": "deployment",
+      "documents": [
+        "docs/operations/deployment.md",
+        "docs/operations/auto-update.md"
+      ],
+      "code": [
+        "deploy.sh",
+        "enterprise-agent-platform/enterprise_agent_platform/deployment.py",
+        "enterprise-agent-platform/enterprise_agent_platform/auto_update.py",
+        "enterprise-agent-platform/enterprise_agent_platform/update_state.py",
+        "enterprise-agent-platform/enterprise_agent_platform/gateway.py",
+        "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_deployment.py",
+        "enterprise-agent-platform/tests/test_auto_update_coordination.py",
+        "enterprise-agent-platform/tests/test_update_state.py"
+      ]
+    },
+    {
+      "id": "data-memory-sessions",
+      "documents": [
+        "docs/design/data-memory-sessions.md",
+        "docs/reference/data-layout.md"
+      ],
+      "code": [
+        "enterprise-agent-platform/enterprise_agent_platform/db.py",
+        "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
+        "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",
+        "enterprise-agent-platform/enterprise_agent_platform/memory_security.py",
+        "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/agent-runtime/src/session-store.ts",
+        "enterprise-agent-platform/agent-runtime/src/platform-gateway.ts"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_memory_session_search.py",
+        "enterprise-agent-platform/tests/test_knowledge_db.py",
+        "enterprise-agent-platform/agent-runtime/test/session-*.test.ts"
+      ]
+    },
+    {
+      "id": "security-and-trust",
+      "documents": [
+        "docs/design/security-and-trust.md"
+      ],
+      "code": [
+        "enterprise-agent-platform/enterprise_agent_platform/auth.py",
+        "enterprise-agent-platform/enterprise_agent_platform/oauth_flows.py",
+        "enterprise-agent-platform/enterprise_agent_platform/secure_fs.py",
+        "enterprise-agent-platform/enterprise_agent_platform/loopback_http.py",
+        "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py",
+        "enterprise-agent-platform/enterprise_agent_platform/gateway.py",
+        "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/agent-runtime/src/approval-broker.ts",
+        "enterprise-agent-platform/agent-runtime/src/config.ts",
+        "enterprise-agent-platform/agent-runtime/src/model-resolver.ts",
+        "enterprise-agent-platform/agent-runtime/src/platform-gateway.ts",
+        "enterprise-agent-platform/agent-runtime/src/process-registry.ts",
+        "enterprise-agent-platform/agent-runtime/src/server.ts",
+        "enterprise-agent-platform/agent-runtime/src/tools.ts"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_security_hardening.py",
+        "enterprise-agent-platform/tests/test_secure_fs.py",
+        "enterprise-agent-platform/tests/test_oauth_more.py",
+        "enterprise-agent-platform/tests/test_agent_scopes.py",
+        "enterprise-agent-platform/agent-runtime/test/approval-broker.test.ts",
+        "enterprise-agent-platform/agent-runtime/test/model-resolver.test.ts"
+      ]
+    },
+    {
+      "id": "integrations",
+      "documents": [
+        "docs/design/integrations.md"
+      ],
+      "code": [
+        "cognee",
+        "firecrawl",
+        "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/telegram_gateway.py",
+        "enterprise-agent-platform/enterprise_agent_platform/schedules.py",
+        "enterprise-agent-platform/enterprise_agent_platform/skills.py",
+        "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
+        "enterprise-agent-platform/camofox-runtime/**"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_schedules.py",
+        "enterprise-agent-platform/tests/test_skills.py",
+        "enterprise-agent-platform/tests/test_skill_integration.py",
+        "enterprise-agent-platform/tests/test_searxng_search.py",
+        "enterprise-agent-platform/tests/test_telegram_gateway_lifecycle.py",
+        "enterprise-agent-platform/tests/test_camofox_e2e.py"
+      ]
+    },
+    {
+      "id": "frontend",
+      "documents": [
+        "docs/design/frontend.md"
+      ],
+      "code": [
+        "enterprise-agent-platform/frontend/**",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py"
+      ],
+      "tests": [
+        "enterprise-agent-platform/frontend/src/**/*.test.ts",
+        "enterprise-agent-platform/frontend/src/**/*.test.tsx",
+        "enterprise-agent-platform/frontend/scripts/*.test.mjs"
+      ]
+    },
+    {
+      "id": "agent-runtime",
+      "documents": [
+        "docs/design/agent-runtime.md",
+        "docs/reference/runtime-api.md"
+      ],
+      "code": [
+        "enterprise-agent-platform/agent-runtime/**",
+        "enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py",
+        "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
+        "enterprise-agent-platform/enterprise_agent_platform/server.py",
+        "enterprise-agent-platform/enterprise_agent_platform/service.py"
+      ],
+      "tests": [
+        "enterprise-agent-platform/agent-runtime/test/*.test.ts"
+      ]
+    },
+    {
+      "id": "platform",
+      "documents": [
+        "docs/design/product.md",
+        "docs/design/system-architecture.md",
+        "docs/reference/configuration.md"
+      ],
+      "code": [
+        "enterprise-agent-platform/pyproject.toml",
+        "enterprise-agent-platform/enterprise_agent_platform/**/*.py"
+      ],
+      "tests": [
+        "enterprise-agent-platform/tests/test_platform.py",
+        "enterprise-agent-platform/tests/test_gateway.py",
+        "enterprise-agent-platform/tests/test_http_config_worker.py"
+      ]
+    }
+  ],
+  "contracts": [
+    {
+      "id": "runtime-policy",
+      "source": "docs/contracts/runtime-policy.json",
+      "domains": [
+        "platform",
+        "agent-runtime",
+        "frontend"
+      ],
+      "targets": [
+        {
+          "path": "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py",
+          "format": "python-runtime-policy"
+        },
+        {
+          "path": "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts",
+          "format": "typescript-runtime-policy"
+        },
+        {
+          "path": "enterprise-agent-platform/frontend/src/design-contract.generated.ts",
+          "format": "typescript-runtime-policy"
+        }
+      ]
+    }
+  ]
+}

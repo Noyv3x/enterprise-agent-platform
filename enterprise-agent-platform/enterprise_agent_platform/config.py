@@ -6,6 +6,13 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
+from .design_contract_generated import (
+    RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
+    RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
+)
+
 OAUTH_SECRET_KEYS = (
     "CODEX_OAUTH_ACCESS_TOKEN",
     "CODEX_OAUTH_REFRESH_TOKEN",
@@ -61,7 +68,9 @@ class PlatformConfig:
     agent_runtime_home: Path | None = None
     agent_runtime_model: str = "gpt-5.5"
     agent_runtime_provider: str = "openai-codex"
-    agent_runtime_idle_timeout_seconds: float = 1800.0
+    agent_runtime_idle_timeout_seconds: float = float(
+        RUN_IDLE_TIMEOUT_DEFAULT_SECONDS
+    )
 
     @property
     def db_path(self) -> Path:
@@ -157,10 +166,10 @@ class PlatformConfig:
                 "ENTERPRISE_AGENT_RUNTIME_PROVIDER", "openai-codex"
             ).strip().lower() or "openai-codex",
             agent_runtime_idle_timeout_seconds=_env_float(
-                "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS",
-                1800.0,
-                minimum=0.0,
-                maximum=86400.0,
+                RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
+                float(RUN_IDLE_TIMEOUT_DEFAULT_SECONDS),
+                minimum=float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
+                maximum=float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS),
             ),
         )
 

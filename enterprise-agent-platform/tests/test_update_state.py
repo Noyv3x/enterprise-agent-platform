@@ -88,6 +88,12 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "enterprise_agent_platform.update_state" 
   fi
   exit 0
 fi
+case "${1:-}" in
+  */scripts/docs_sync.py)
+    printf 'docs:%s\n' "${2:-}" >> "$FAKE_DEPLOY_LOG"
+    exit 0
+    ;;
+esac
 root=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--root" ]; then
@@ -304,7 +310,10 @@ class DeployStateProtocolTests(unittest.TestCase):
                 subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(),
                 new_sha,
             )
-            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["deploy:new"])
+            self.assertEqual(
+                log.read_text(encoding="utf-8").splitlines(),
+                ["docs:check", "docs:check-change", "deploy:new"],
+            )
 
     def test_state_failure_after_source_move_rolls_back_before_exit(self):
         with tempfile.TemporaryDirectory() as td:

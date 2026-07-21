@@ -8,7 +8,10 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from enterprise_agent_platform.loopback_http import open_loopback_url
+from enterprise_agent_platform.loopback_http import (
+    open_loopback_url,
+    open_trusted_service_url,
+)
 
 
 class _LoopbackHandler(http.server.BaseHTTPRequestHandler):
@@ -74,11 +77,22 @@ class LoopbackHTTPTests(unittest.TestCase):
             open_loopback_url(request, timeout=2)
         self.assertEqual(raised.exception.code, 302)
 
+    def test_trusted_service_request_rejects_redirects(self):
+        request = urllib.request.Request(
+            self.base_url + "/redirect",
+            headers={"Authorization": "Bearer must-not-be-forwarded"},
+            method="GET",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            open_trusted_service_url(request, timeout=2)
+        self.assertEqual(raised.exception.code, 302)
+
     def test_loopback_request_rejects_public_and_hostname_targets(self):
         for url in (
             "https://example.com/search",
             f"http://localhost:{self.server.server_port}/ok",
             f"http://user:secret@127.0.0.1:{self.server.server_port}/ok",
+            "http://127.0.0.1:0/ok",
         ):
             with self.subTest(url=url), self.assertRaisesRegex(
                 ValueError,

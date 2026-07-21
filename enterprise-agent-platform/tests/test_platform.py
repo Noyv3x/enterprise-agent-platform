@@ -4086,7 +4086,7 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_oauth_secret_keys_are_admin_configurable_but_not_model_env(self):
+    def test_supported_platform_secret_keys_are_admin_configurable_but_not_model_env(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
@@ -4098,11 +4098,24 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIn("GROK_OAUTH_ACCESS_TOKEN", keys)
                 self.assertIn("GROK_OAUTH_REFRESH_TOKEN", keys)
                 self.assertIn("GROK_OAUTH_ID_TOKEN", keys)
+                self.assertIn("FIRECRAWL_API_KEY", keys)
                 self.assertNotIn("OPENAI_API_KEY", keys)
                 self.assertNotIn("XAI_API_KEY", keys)
                 self.assertNotIn("XAI_OAUTH_REFRESH_TOKEN", keys)
 
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                service.set_secret(admin, "FIRECRAWL_API_KEY", "firecrawl-secret")
+                self.assertEqual(
+                    service.get_secret("FIRECRAWL_API_KEY"),
+                    "firecrawl-secret",
+                )
+                firecrawl_item = next(
+                    item
+                    for item in service.list_secrets(admin)
+                    if item["key"] == "FIRECRAWL_API_KEY"
+                )
+                self.assertTrue(firecrawl_item["configured"])
+                self.assertNotEqual(firecrawl_item["masked"], "firecrawl-secret")
                 self.assertNotIn("CODEX_OAUTH_ACCESS_TOKEN", service.model_secret_env())
                 with self.assertRaises(ServiceError):
                     service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")

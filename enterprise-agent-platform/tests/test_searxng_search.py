@@ -589,7 +589,15 @@ class SearXNGSearchTests(unittest.TestCase):
         service._validate_external_url = lambda _url: None
         calls: list[dict[str, object]] = []
 
-        def request(url, body, *, headers, timeout, method="POST"):
+        def request(
+            url,
+            body,
+            *,
+            headers,
+            timeout,
+            method="POST",
+            loopback_only=True,
+        ):
             calls.append(
                 {
                     "url": url,
@@ -597,6 +605,7 @@ class SearXNGSearchTests(unittest.TestCase):
                     "headers": headers,
                     "timeout": timeout,
                     "method": method,
+                    "loopback_only": loopback_only,
                 }
             )
             return {
@@ -618,6 +627,7 @@ class SearXNGSearchTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["url"], "http://127.0.0.1:13002/v1/scrape")
         self.assertEqual(calls[0]["method"], "POST")
+        self.assertTrue(calls[0]["loopback_only"])
         self.assertEqual(
             calls[0]["headers"],
             {"Authorization": "Bearer firecrawl-key"},
@@ -633,7 +643,15 @@ class SearXNGSearchTests(unittest.TestCase):
         service._validate_external_url = lambda _url: None
         calls: list[str] = []
 
-        def request(url, _body, *, headers, timeout, method="POST"):
+        def request(
+            url,
+            _body,
+            *,
+            headers,
+            timeout,
+            method="POST",
+            loopback_only=True,
+        ):
             calls.append(url)
             return {"data": {"markdown": "Extracted"}}
 
@@ -644,6 +662,29 @@ class SearXNGSearchTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, ["http://127.0.0.1:14566/v1/scrape"])
+
+    def test_external_firecrawl_uses_trusted_no_redirect_transport(self):
+        response = _HTTPResponse({"data": {"markdown": "Extracted"}})
+        with (
+            mock.patch(
+                "enterprise_agent_platform.service.open_trusted_service_url",
+                return_value=response,
+            ) as trusted_open,
+            mock.patch(
+                "enterprise_agent_platform.service.open_loopback_url",
+            ) as loopback_open,
+        ):
+            payload = EnterpriseService._runtime_json_request(
+                "https://firecrawl.example:3002/v1/scrape",
+                {"url": "https://example.test/page"},
+                headers={"Authorization": "Bearer firecrawl-key"},
+                timeout=60,
+                loopback_only=False,
+            )
+
+        self.assertEqual(payload["data"]["markdown"], "Extracted")
+        trusted_open.assert_called_once()
+        loopback_open.assert_not_called()
 
 
 if __name__ == "__main__":

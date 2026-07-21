@@ -1,0 +1,103 @@
+# 测试与验证
+
+本文定义每类变更的最低验证范围。架构与源码边界见[仓库开发指南](repository.md)。
+
+## 顶层检查
+
+从仓库根执行：
+
+```bash
+./deploy.sh test
+```
+
+该命令先分别校验文档树、最近提交、暂存快照与完整工作区内的文档/代码双向同步，再运行 Python `unittest`、Python compileall，并分别在 Agent Runtime 和前端执行锁定依赖安装、类型检查、测试和构建。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。
+
+## Python 平台
+
+```bash
+cd enterprise-agent-platform
+python3 -m unittest discover -s tests
+python3 -m compileall enterprise_agent_platform tests
+```
+
+Python 测试位于 `tests/test_*.py`。新增路由、配置、数据库迁移、权限、任务恢复、自动更新或托管服务行为时，应测试成功、拒绝、重启恢复和竞态边界。
+
+SQLite 测试使用临时数据目录，不共享开发数据库。OAuth、Telegram、Cognee、Firecrawl、SearXNG、Camoufox 和 Git 操作优先使用确定性 fake；没有显式凭据和服务时，不把真实网络集成作为单元测试前提。
+
+## Agent Runtime
+
+```bash
+cd enterprise-agent-platform/agent-runtime
+npm ci
+npm run check
+npm test
+npm run build
+```
+
+Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
+
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。
+
+## 前端
+
+```bash
+cd enterprise-agent-platform/frontend
+npm ci
+npm run check
+npm test
+npm run build
+```
+
+前端使用 Vitest、Testing Library 和 jsdom。组件测试应尽量使用真实 Provider、真实 Store 和 typed data action；不要用 selector mock 掩盖 `useSyncExternalStore` 引用稳定性问题。
+
+关键回归范围包括：
+
+- 登录、401 会话失效和账号切换取消；
+- 空数组/对象 selector 的稳定 snapshot；
+- SSE 与轮询竞态、频道切换和迟到响应；
+- 工作记录仅在工具调用时出现，最终输出时自动折叠；
+- 审批、失败发送恢复和连续短消息；
+- 浏览器首帧加载与终端预览可用性；
+- 手机动态视口、长代码/表格和 Composer 不扩大页面；
+- 三种 locale 的 key 完整性；
+- 更新维护页在 Store/登录失败时仍可接管。
+
+`npm run build` 是前端变更验证的一部分，并会更新受版本控制的静态资源。测试通过但未构建 static 仍视为未完成。
+
+## 安全测试
+
+涉及安全边界时至少加入负例：
+
+- 未登录、权限不足、停用/被吊销 session；
+- Cookie 写请求缺 Origin/Referer 或跨源；
+- 路径 traversal、符号链接、受保护目录和 Docker socket；
+- 内网/回环/云元数据 URL 与重定向；
+- owner/scope/provider/browser identity 参数注入；
+- 超大 body、附件、工具输出或搜索响应；
+- 未审批工具、伪造 approval id、无人值守授权绕过；
+- dirty tree、非 fast-forward 和 rollback 覆盖竞态。
+
+## 部署与冒烟
+
+高风险 deployment、Gateway、Runtime packaging 或 static 发布变更还应在临时数据目录执行 prepare/foreground 冒烟，检查：
+
+- `/healthz` 和搜索健康；
+- Gateway backend generation 切换；
+- Runtime bearer 和 `/v1/models`；
+- 登录、普通 API、SSE 与附件；
+- 托管服务启动/停止不会遗留错误进程或 Compose stack；
+- 更新期间维护页阻断，完成后恢复。
+
+部署等待和 deadline 不写在本文，由对应部署配置与测试约束；不得误用 Agent Runtime 的空闲或 terminal 契约代替部署策略。
+
+## 文档同步检查
+
+每次提交都应运行仓库提供的 docs 校验，验证：
+
+- Markdown 相对链接存在；
+- docs domain 与代码路径映射完整；
+- 受管代码变化同时包含对应规范变化；
+- 机器可读契约和消费者测试一致，生成目标是普通且不可执行的文件；
+- 已弃用的根规则文件没有重新出现。
+
+历史审计、文档索引与 ADR 等未映射为当前代码域规范的文件可以独立修改。已登记为代码域真相源的设计、参考、运维与开发文档，以及所有受管生产代码，不设绕过双向同步门禁的 docs-only/code-only 例外。

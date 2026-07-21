@@ -3,6 +3,11 @@ import { mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from 
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { Type, type ImageContent, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import {
+  TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
+  TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS,
+  TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
+} from "./design-contract.generated.js";
 import type { JsonObject, JsonValue, RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
 import { ProcessRegistry } from "./process-registry.js";
@@ -87,8 +92,8 @@ const terminalSchema = Type.Object({
     description: "Working directory. Relative paths use the Agent workspace; absolute host paths go through approval.",
   })),
   timeout_ms: Type.Optional(Type.Integer({
-    minimum: 100,
-    maximum: 3_600_000,
+    minimum: TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
+    maximum: TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS,
     description: "Command-specific timeout in milliseconds, independent of the run inactivity watchdog. Foreground commands return as soon as they finish.",
   })),
   background: Type.Optional(Type.Boolean({
@@ -586,7 +591,8 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         }
       }
       if (signal) options.signal = signal;
-      const timeoutMs = params.timeout_ms ?? (background ? undefined : context.defaultTerminalTimeoutMs ?? 180_000);
+      const timeoutMs = params.timeout_ms
+        ?? (background ? undefined : context.defaultTerminalTimeoutMs ?? TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS);
       if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
       if (params.update_behavior !== undefined) options.updateBehavior = params.update_behavior;
       const result = await context.processes.run(options);

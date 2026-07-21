@@ -15,6 +15,12 @@ from unittest import mock
 from enterprise_agent_platform import internal_config as internal_config_module
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.agent_runtime_client import AgentResult
+from enterprise_agent_platform.design_contract_generated import (
+    RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
+    RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
+)
 from enterprise_agent_platform.internal_config import (
     read_env_file,
     update_env_file,
@@ -335,18 +341,18 @@ class ConfigFromEnvTests(unittest.TestCase):
             else:
                 os.environ["ENTERPRISE_PLATFORM_PORT"] = previous
 
-    def test_agent_idle_timeout_defaults_to_thirty_minutes_and_allows_disable(self):
-        key = "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS"
+    def test_agent_idle_timeout_uses_contract_default_and_allows_contract_minimum(self):
+        key = RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE
         previous = os.environ.pop(key, None)
         try:
             self.assertEqual(
                 PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
-                1800.0,
+                float(RUN_IDLE_TIMEOUT_DEFAULT_SECONDS),
             )
-            os.environ[key] = "0"
+            os.environ[key] = str(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS)
             self.assertEqual(
                 PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
-                0.0,
+                float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
             )
         finally:
             if previous is None:
@@ -354,10 +360,10 @@ class ConfigFromEnvTests(unittest.TestCase):
             else:
                 os.environ[key] = previous
 
-    def test_agent_idle_timeout_rejects_values_above_one_day(self):
-        key = "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS"
+    def test_agent_idle_timeout_rejects_values_above_contract_maximum(self):
+        key = RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE
         previous = os.environ.get(key)
-        os.environ[key] = "86401"
+        os.environ[key] = str(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS + 1)
         try:
             with self.assertRaises(ValueError) as ctx:
                 PlatformConfig.from_env(Path("/tmp"))

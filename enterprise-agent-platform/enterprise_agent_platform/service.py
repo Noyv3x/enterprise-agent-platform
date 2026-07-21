@@ -32,6 +32,10 @@ from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .db import Database, decode_json, encode_json, now_ts
+from .design_contract_generated import (
+    RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+)
 from .agent_runtime_client import (
     AgentClient,
     AgentResult,
@@ -46,7 +50,12 @@ from .internal_config import (
 )
 from .jobs import DurableJob, DurableJobStore
 from .knowledge import KnowledgeBase, format_passive_suggestions
-from .loopback_http import open_loopback_url
+from .loopback_http import (
+    open_loopback_url,
+    open_trusted_service_url,
+    validate_http_base_url,
+    validate_loopback_url,
+)
 from .memory_security import (
     MAX_MEMORY_CANDIDATE_LENGTH,
     MEMORY_QUOTAS,
@@ -533,16 +542,31 @@ class EnterpriseService:
             internal_host = "127.0.0.1"
         if ":" in internal_host and not internal_host.startswith("["):
             internal_host = f"[{internal_host}]"
-        return AgentRuntimeClient(
-            str(runtime.get("runtime_url") or self.config.agent_runtime_url),
-            runtime_token,
-            gateway_base_url=f"http://{internal_host}:{self.config.port}",
-            gateway_token=self.get_secret("agent_tool_token"),
-            default_provider=str(
+        runtime_url = str(
+            runtime.get("runtime_url") or self.config.agent_runtime_url
+        )
+        client_kwargs = {
+            "gateway_base_url": f"http://{internal_host}:{self.config.port}",
+            "gateway_token": self.get_secret("agent_tool_token"),
+            "default_provider": str(
                 runtime.get("provider") or self.config.agent_runtime_provider
             ),
-            default_model=str(runtime.get("model") or self.config.agent_runtime_model),
-        )
+            "default_model": str(
+                runtime.get("model") or self.config.agent_runtime_model
+            ),
+            "require_loopback": bool(runtime.get("managed")),
+        }
+        try:
+            return AgentRuntimeClient(runtime_url, runtime_token, **client_kwargs)
+        except ValueError as exc:
+            # Runtime status retains the operator-supplied URL and reports
+            # invalid_config. Keep the rest of the platform available while a
+            # fail-closed client guarantees no request can reach that endpoint.
+            return AgentRuntimeClient.unavailable(
+                f"Agent runtime endpoint configuration is invalid: {exc}",
+                runtime_token,
+                **client_kwargs,
+            )
 
     def close(self) -> None:
         with self._close_lock:
@@ -5871,10 +5895,16 @@ class EnterpriseService:
                     raise ServiceError(
                         400, "idle_timeout_seconds must be a number"
                     ) from exc
-                if not math.isfinite(idle_timeout) or not 0 <= idle_timeout <= 86400:
+                if not math.isfinite(idle_timeout) or not (
+                    RUN_IDLE_TIMEOUT_MINIMUM_SECONDS
+                    <= idle_timeout
+                    <= RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS
+                ):
                     raise ServiceError(
                         400,
-                        "idle_timeout_seconds must be between 0 and 86400",
+                        "idle_timeout_seconds must be between "
+                        f"{RUN_IDLE_TIMEOUT_MINIMUM_SECONDS} and "
+                        f"{RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS}",
                     )
                 updates[AGENT_SETTING_IDLE_TIMEOUT] = str(idle_timeout)
             if "max_concurrency" in body:
@@ -7510,7 +7540,6 @@ class EnterpriseService:
                         headers={},
                         timeout=remaining_timeout,
                         method="GET",
-                        loopback_only=True,
                     )
                 except ServiceError as exc:
                     raise ServiceError(
@@ -7572,11 +7601,48 @@ class EnterpriseService:
                 "firecrawl_loopback_url",
                 None,
             )
-            base_url = str(
-                firecrawl_url_getter()
-                if callable(firecrawl_url_getter)
-                else self.config.firecrawl_api_url
-            ).strip().rstrip("/")
+            try:
+                base_url = str(
+                    firecrawl_url_getter()
+                    if callable(firecrawl_url_getter)
+                    else self.config.firecrawl_api_url
+                ).strip().rstrip("/")
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(
+                    503,
+                    "managed web extraction is unavailable because its "
+                    "endpoint configuration is invalid",
+                ) from exc
+            try:
+                validate_http_base_url(base_url)
+                validate_loopback_url(base_url, base_url=True)
+                firecrawl_loopback = True
+            except ValueError:
+                try:
+                    validate_http_base_url(base_url)
+                except ValueError as exc:
+                    raise ServiceError(
+                        503,
+                        "managed web extraction is unavailable because its "
+                        "endpoint configuration is invalid",
+                    ) from exc
+                firecrawl_loopback = False
+            managed_firecrawl_getter = getattr(
+                getattr(self, "runtimes", None),
+                "_managed_firecrawl_enabled",
+                None,
+            )
+            managed_firecrawl = (
+                bool(managed_firecrawl_getter())
+                if callable(managed_firecrawl_getter)
+                else bool(self.config.manage_firecrawl)
+            )
+            if managed_firecrawl and not firecrawl_loopback:
+                raise ServiceError(
+                    503,
+                    "managed web extraction is unavailable because its "
+                    "endpoint configuration is invalid",
+                )
             headers: dict[str, str] = {}
             api_key = self.get_secret("FIRECRAWL_API_KEY")
             if api_key:
@@ -7596,6 +7662,7 @@ class EnterpriseService:
                     {"url": url, "formats": ["markdown", "html"]},
                     headers=headers,
                     timeout=60,
+                    loopback_only=firecrawl_loopback,
                 )
                 data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
                 metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
@@ -7796,6 +7863,8 @@ class EnterpriseService:
         candidate_scope_keys = candidate_scope_keys[:MAX_BROWSER_PREVIEW_FAMILY_SCOPES]
 
         try:
+            if not self.runtimes._managed_camofox_enabled():
+                return self._browser_preview_idle("browser_unavailable")
             base_url = self.runtimes._effective_camofox_url().rstrip("/")
             access_key = self._browser_preview_existing_access_key()
             if not access_key:
@@ -8116,6 +8185,8 @@ class EnterpriseService:
         # Unlike the Agent tool path, preview must not create runtime state. Do
         # not call _camofox_access_key(), which generates the key file when it is
         # absent; only consume a configured or already-materialized credential.
+        if not self.runtimes._managed_camofox_enabled():
+            return ""
         try:
             value = self.runtimes._first_secret(
                 "CAMOFOX_ACCESS_KEY",
@@ -8623,7 +8694,7 @@ class EnterpriseService:
         headers: dict[str, str],
         timeout: float,
         method: str = "POST",
-        loopback_only: bool = False,
+        loopback_only: bool = True,
     ) -> dict[str, Any]:
         request_headers = {"Accept": "application/json", **headers}
         data = None
@@ -8632,7 +8703,11 @@ class EnterpriseService:
             request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
-            open_request = open_loopback_url if loopback_only else urllib.request.urlopen
+            open_request = (
+                open_loopback_url
+                if loopback_only
+                else open_trusted_service_url
+            )
             with open_request(request, timeout=timeout) as response:
                 raw_bytes = response.read(10 * 1024 * 1024 + 1)
                 if len(raw_bytes) > 10 * 1024 * 1024:
@@ -8662,6 +8737,7 @@ class EnterpriseService:
             http.client.HTTPException,
             TimeoutError,
             OSError,
+            ValueError,
         ) as exc:
             raise ServiceError(502, f"managed tool request failed: {exc}") from exc
         try:
@@ -8685,7 +8761,7 @@ class EnterpriseService:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_loopback_url(request, timeout=timeout) as response:
                 mime_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
                 if mime_type not in allowed_content_types:
                     raise ServiceError(502, f"managed browser returned unsupported content type: {mime_type or 'missing'}")
@@ -8694,7 +8770,7 @@ class EnterpriseService:
             detail = exc.read(4096).decode("utf-8", errors="replace")
             status = exc.code if 400 <= exc.code < 500 else 502
             raise ServiceError(status, f"managed browser returned HTTP {exc.code}: {detail[:500]}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise ServiceError(502, f"managed browser request failed: {exc}") from exc
         if len(payload) > max_bytes:
             raise ServiceError(413, f"managed browser image exceeds {max_bytes // (1024 * 1024)} MiB")
@@ -10197,7 +10273,10 @@ class EnterpriseService:
         rows = self.db.query("SELECT key, value, updated_at FROM settings WHERE secret = 1 ORDER BY key")
         found = {row["key"]: row for row in rows}
         items = []
-        known_keys = set(OAUTH_SECRET_KEYS) | {"agent_tool_token"}
+        known_keys = set(OAUTH_SECRET_KEYS) | {
+            "FIRECRAWL_API_KEY",
+            "agent_tool_token",
+        }
         for key in sorted(known_keys):
             value = found.get(key, {}).get("value") or os.getenv(key, "")
             items.append({
@@ -10225,7 +10304,7 @@ class EnterpriseService:
         clean = raw_key.upper()
         if not re.fullmatch(r"[A-Z0-9_]{2,80}", clean):
             raise ServiceError(400, "invalid secret key")
-        allowed_keys = set(OAUTH_SECRET_KEYS)
+        allowed_keys = set(OAUTH_SECRET_KEYS) | {"FIRECRAWL_API_KEY"}
         if clean not in allowed_keys:
             raise ServiceError(400, "unsupported secret key")
         if not value:

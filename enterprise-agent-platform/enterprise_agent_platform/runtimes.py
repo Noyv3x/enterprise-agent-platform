@@ -38,7 +38,17 @@ except ImportError:  # pragma: no cover - managed Camoufox currently targets Lin
 
 from .config import PlatformConfig
 from .db import now_ts
-from .loopback_http import build_loopback_opener
+from .design_contract_generated import (
+    RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+    RUN_IDLE_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE,
+)
+from .loopback_http import (
+    open_loopback_url,
+    open_trusted_service_url,
+    validate_http_base_url,
+    validate_loopback_url,
+)
 from .secure_fs import ensure_private_directory, ensure_private_file
 
 
@@ -142,16 +152,6 @@ def invalidates_runtime_status_cache(method):
             self.invalidate_status_cache()
 
     return wrapped
-
-
-def _is_loopback_host(host: str) -> bool:
-    clean = str(host or "").strip().strip("[]").lower()
-    if clean in {"localhost", "localhost.localdomain"}:
-        return True
-    try:
-        return ipaddress.ip_address(clean).is_loopback
-    except ValueError:
-        return False
 
 
 class ProcessLike(Protocol):
@@ -516,7 +516,28 @@ class PlatformRuntimeManager:
         ensure_private_directory(home / "logs")
         ensure_private_directory(home / "sessions")
         ensure_private_directory(home / "memory")
-        if not self._managed_agent_runtime_enabled():
+        managed = self._managed_agent_runtime_enabled()
+        url_error = (
+            self._managed_loopback_url_error(
+                "Agent runtime", self._effective_agent_runtime_url()
+            )
+            if managed
+            else self._trusted_http_url_error(
+                "Agent runtime", self._effective_agent_runtime_url()
+            )
+        )
+        if url_error:
+            self._agent_last_error = url_error
+            return RuntimeStatus(
+                "agent",
+                managed,
+                False,
+                "invalid_config",
+                url=self._effective_agent_runtime_url(),
+                path=str(home),
+                error=url_error,
+            )
+        if not managed:
             available = self._probe_agent_health()
             return RuntimeStatus(
                 "agent",
@@ -526,20 +547,6 @@ class PlatformRuntimeManager:
                 url=self._effective_agent_runtime_url(),
                 path=str(home),
                 error="" if available else "external Agent runtime is unavailable",
-            )
-        url_error = self._managed_loopback_url_error(
-            "Agent runtime", self._effective_agent_runtime_url()
-        )
-        if url_error:
-            self._agent_last_error = url_error
-            return RuntimeStatus(
-                "agent",
-                True,
-                False,
-                "invalid_config",
-                url=self._effective_agent_runtime_url(),
-                path=str(home),
-                error=url_error,
             )
         source = self._agent_runtime_source_dir()
         app = self._agent_runtime_app_dir()
@@ -647,6 +654,8 @@ class PlatformRuntimeManager:
                 current = self.agent_runtime_status(refresh=True)
                 if current.available or current.state == "invalid_config":
                     return current
+                if not self._managed_agent_runtime_enabled():
+                    return current
                 if self._managed_agent_runtime_enabled() and not (self._agent_runtime_app_dir() / "dist" / "src" / "server.js").is_file():
                     installed = self.install_agent_runtime(force=False)
                     if not installed.available:
@@ -685,22 +694,27 @@ class PlatformRuntimeManager:
 
     def agent_runtime_status(self, *, refresh: bool = True) -> RuntimeStatus:
         managed = self._managed_agent_runtime_enabled()
-        if managed:
-            url_error = self._managed_loopback_url_error(
+        url_error = (
+            self._managed_loopback_url_error(
                 "Agent runtime", self._effective_agent_runtime_url()
             )
-            if url_error:
-                self._agent_last_error = url_error
-                return RuntimeStatus(
-                    "agent",
-                    True,
-                    False,
-                    "invalid_config",
-                    url=self._effective_agent_runtime_url(),
-                    path=str(self.config.managed_agent_runtime_home),
-                    error=url_error,
-                    source=str(self._agent_runtime_source_dir()),
-                )
+            if managed
+            else self._trusted_http_url_error(
+                "Agent runtime", self._effective_agent_runtime_url()
+            )
+        )
+        if url_error:
+            self._agent_last_error = url_error
+            return RuntimeStatus(
+                "agent",
+                managed,
+                False,
+                "invalid_config",
+                url=self._effective_agent_runtime_url(),
+                path=str(self.config.managed_agent_runtime_home),
+                error=url_error,
+                source=str(self._agent_runtime_source_dir()) if managed else "external",
+            )
         pid, running, returncode = self._process_state(self._agent_process)
         healthy = self._probe_agent_health() if refresh else running
         if healthy:
@@ -770,7 +784,7 @@ class PlatformRuntimeManager:
                 "AGENT_PLATFORM_INTERNAL_URL": self._platform_internal_url(),
                 "AGENT_PLATFORM_INTERNAL_TOKEN": self._first_secret("agent_tool_token", "ENTERPRISE_AGENT_TOOL_TOKEN"),
                 "AGENT_RUNTIME_MAX_CONCURRENCY": str(self._effective_agent_max_concurrency()),
-                "AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS": str(
+                RUN_IDLE_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE: str(
                     round(self._effective_agent_idle_timeout_seconds() * 1000)
                 ),
                 "AGENT_RUNTIME_COMPACTION_THRESHOLD": str(self._effective_compaction_threshold()),
@@ -786,7 +800,14 @@ class PlatformRuntimeManager:
                 self._effective_agent_runtime_url().rstrip("/") + "/health",
                 headers={"Authorization": f"Bearer {self._agent_runtime_token()}"},
             )
-            with urllib.request.urlopen(request, timeout=1.0) as response:
+            open_request = (
+                open_loopback_url
+                if self._uses_loopback_transport(
+                    self._effective_agent_runtime_url()
+                )
+                else open_trusted_service_url
+            )
+            with open_request(request, timeout=1.0) as response:
                 return 200 <= response.status < 300
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return False
@@ -808,7 +829,10 @@ class PlatformRuntimeManager:
             )
             if not math.isfinite(value):
                 raise ValueError
-            return max(0.0, min(86400.0, value))
+            return max(
+                float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
+                min(float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS), value),
+            )
         except (TypeError, ValueError):
             return self.config.agent_runtime_idle_timeout_seconds
 
@@ -958,7 +982,13 @@ class PlatformRuntimeManager:
 
     def prepare_camofox(self) -> RuntimeStatus:
         if not self._managed_camofox_enabled():
-            return RuntimeStatus("camofox", False, False, "external", "managed Camofox disabled")
+            return RuntimeStatus(
+                "camofox",
+                False,
+                False,
+                "external",
+                "Camoufox browser capability is disabled; external mode is unsupported",
+            )
         runtime_dir = self.config.runtime_dir / "camofox"
         (runtime_dir / "logs").mkdir(parents=True, exist_ok=True)
         for directory in (
@@ -1196,8 +1226,29 @@ class PlatformRuntimeManager:
 
     def camofox_status(self, *, refresh: bool = True) -> RuntimeStatus:
         if not self._managed_camofox_enabled():
-            return RuntimeStatus("camofox", False, False, "external", "managed Camofox disabled")
+            return RuntimeStatus(
+                "camofox",
+                False,
+                False,
+                "external",
+                "Camoufox browser capability is disabled; external mode is unsupported",
+            )
         runtime_dir = self.config.runtime_dir / "camofox"
+        url_error = self._managed_loopback_url_error(
+            "Camoufox", self._effective_camofox_url()
+        )
+        if url_error:
+            self._camofox_last_error = url_error
+            return RuntimeStatus(
+                "camofox",
+                True,
+                False,
+                "invalid_config",
+                path=str(runtime_dir),
+                url=self._effective_camofox_url(),
+                error=url_error,
+                source=self._camofox_source_label(),
+            )
         pid, process_running, returncode = self._process_state(self._camofox_process)
         healthy = self._probe_camofox_health() if refresh else False
         if healthy:
@@ -1478,18 +1529,26 @@ class PlatformRuntimeManager:
 
     def searxng_status(self, *, refresh: bool = True) -> RuntimeStatus:
         runtime_dir = self._searxng_runtime_dir()
-        if not self._managed_searxng_enabled():
-            url_error = self._searxng_loopback_url_error(managed=False)
-            healthy = not url_error and (
-                self._probe_searxng_health() if refresh else False
+        managed = self._managed_searxng_enabled()
+        url_error = self._searxng_loopback_url_error(managed=managed)
+        if url_error:
+            self._set_searxng_last_error(url_error)
+            return RuntimeStatus(
+                "searxng",
+                managed,
+                False,
+                "invalid_config",
+                path=str(runtime_dir),
+                url=self._effective_searxng_api_url(),
+                error=url_error,
+                source=SEARXNG_IMAGE if managed else "external",
             )
+        if not managed:
+            healthy = self._probe_searxng_health() if refresh else False
             error = (
-                url_error
-                or (
-                    "External SearXNG search API is not reachable"
-                    if refresh and not healthy
-                    else ""
-                )
+                "External SearXNG search API is not reachable"
+                if refresh and not healthy
+                else ""
             )
             return RuntimeStatus(
                 "searxng",
@@ -1652,7 +1711,7 @@ class PlatformRuntimeManager:
 
     def prepare_firecrawl(self) -> RuntimeStatus:
         if not self._managed_firecrawl_enabled():
-            return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
+            return self.firecrawl_status(refresh=True)
         ensure_private_directory(self.config.firecrawl_runtime_dir)
         ensure_private_directory(self.config.firecrawl_runtime_dir / "logs")
         url_error = self._managed_loopback_url_error("Firecrawl", self._effective_firecrawl_api_url())
@@ -1690,7 +1749,7 @@ class PlatformRuntimeManager:
         try:
             with self._lock:
                 if not self._managed_firecrawl_enabled():
-                    return self.firecrawl_status(refresh=False)
+                    return self.firecrawl_status(refresh=True)
                 prepared = self.prepare_firecrawl()
                 if not prepared.available:
                     return prepared
@@ -1769,8 +1828,41 @@ class PlatformRuntimeManager:
         return 90.0
 
     def firecrawl_status(self, *, refresh: bool = True) -> RuntimeStatus:
-        if not self._managed_firecrawl_enabled():
-            return RuntimeStatus("firecrawl", False, False, "external", "managed Firecrawl disabled")
+        managed = self._managed_firecrawl_enabled()
+        url_error = (
+            self._managed_loopback_url_error(
+                "Firecrawl", self._effective_firecrawl_api_url()
+            )
+            if managed
+            else self._trusted_http_url_error(
+                "Firecrawl", self._effective_firecrawl_api_url()
+            )
+        )
+        if url_error:
+            self._firecrawl_last_error = url_error
+            return RuntimeStatus(
+                "firecrawl",
+                managed,
+                False,
+                "invalid_config",
+                path=str(self.config.firecrawl_runtime_dir),
+                url=self._effective_firecrawl_api_url(),
+                error=url_error,
+                source="" if managed else "external",
+            )
+        if not managed:
+            healthy = self._probe_firecrawl_health() if refresh else False
+            return RuntimeStatus(
+                "firecrawl",
+                False,
+                healthy,
+                "running" if healthy else "external",
+                "External Firecrawl API is reachable" if healthy else "External Firecrawl API is not managed by the platform",
+                path=str(self.config.firecrawl_runtime_dir),
+                url=self._effective_firecrawl_api_url(),
+                error="" if healthy or not refresh else "External Firecrawl API is not reachable",
+                source="external",
+            )
         pid, process_running, returncode = self._process_state(self._firecrawl_process)
         command, cwd, detail = self._firecrawl_command()
         healthy = self._probe_firecrawl_health() if refresh else False
@@ -1841,6 +1933,12 @@ class PlatformRuntimeManager:
         self.stop_searxng()
 
     def _start_camofox(self) -> None:
+        url_error = self._managed_loopback_url_error(
+            "Camoufox", self._effective_camofox_url()
+        )
+        if url_error:
+            self._camofox_last_error = url_error
+            return
         command, cwd, detail = self._camofox_command()
         if not command:
             self._camofox_last_error = detail
@@ -1967,6 +2065,12 @@ class PlatformRuntimeManager:
         )
 
     def _start_firecrawl(self) -> None:
+        url_error = self._managed_loopback_url_error(
+            "Firecrawl", self._effective_firecrawl_api_url()
+        )
+        if url_error:
+            self._firecrawl_last_error = url_error
+            return
         command, cwd, detail = self._firecrawl_command()
         if not command:
             self._firecrawl_last_error = detail
@@ -2511,8 +2615,9 @@ class PlatformRuntimeManager:
     def _firecrawl_env_path(self) -> Path:
         # Keep the managed Firecrawl .env (which carries a generated
         # BULL_AUTH_KEY secret) under the platform data directory rather than
-        # inside the firecrawl submodule working tree, per AGENTS.md guidance to
-        # keep managed runtime state out of the repo.
+        # inside the Firecrawl submodule working tree. The repository boundary
+        # in docs/development/repository.md keeps managed state out of upstream
+        # source trees.
         return self.config.firecrawl_runtime_dir / ".env"
 
     def _ensure_firecrawl_env(self) -> Path:
@@ -2687,7 +2792,13 @@ class PlatformRuntimeManager:
     def searxng_loopback_url(self) -> str:
         """Return the host-only endpoint exposed by the managed sidecar."""
 
-        return self._effective_searxng_api_url()
+        url = self._effective_searxng_api_url()
+        error = self._searxng_loopback_url_error(
+            managed=self._managed_searxng_enabled()
+        )
+        if error:
+            raise ValueError(error)
+        return url
 
     def _effective_searxng_api_url(self) -> str:
         return str(
@@ -2773,14 +2884,29 @@ class PlatformRuntimeManager:
     @staticmethod
     def _managed_loopback_url_error(name: str, url: str) -> str:
         try:
-            parsed = urllib.parse.urlparse(url)
+            validate_loopback_url(url, base_url=True)
         except ValueError:
-            parsed = None
-        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return f"Managed {name} URL must be an http(s) loopback URL"
-        if not _is_loopback_host(parsed.hostname):
-            return f"Managed {name} must listen on a loopback address"
+            return (
+                f"{name} URL must be a credential-free numeric loopback "
+                "base URL"
+            )
         return ""
+
+    @staticmethod
+    def _trusted_http_url_error(name: str, url: str) -> str:
+        try:
+            validate_http_base_url(url)
+        except ValueError:
+            return f"{name} URL must be a credential-free HTTP(S) base URL"
+        return ""
+
+    @staticmethod
+    def _uses_loopback_transport(url: str) -> bool:
+        try:
+            validate_loopback_url(url, base_url=True)
+            return True
+        except ValueError:
+            return False
 
     def _probe_camofox_health(self) -> bool:
         payload = self._camofox_json_request("/health", method="GET", authenticated=False)
@@ -2916,7 +3042,7 @@ class PlatformRuntimeManager:
                 headers=headers,
                 method=method,
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_loopback_url(request, timeout=timeout) as response:
                 if not 200 <= response.status < 300:
                     return None
                 raw = response.read(512 * 1024)
@@ -2938,7 +3064,7 @@ class PlatformRuntimeManager:
             headers={"Authorization": f"Bearer {self._camofox_access_key()}"},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_loopback_url(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"HTTP {response.status}")
             content_type = str(response.headers.get("Content-Type") or "").lower()
@@ -2963,8 +3089,7 @@ class PlatformRuntimeManager:
                 headers={"Accept": "text/plain"},
                 method="GET",
             )
-            opener = self._searxng_health_opener()
-            with opener.open(request, timeout=0.8) as response:
+            with open_loopback_url(request, timeout=0.8) as response:
                 if not 200 <= response.status < 300:
                     return False
                 # Require SearXNG's exact health marker so an unrelated HTTP
@@ -2982,13 +3107,6 @@ class PlatformRuntimeManager:
             return False
 
     @staticmethod
-    def _searxng_health_opener():
-        # Proxy environment variables must never reroute a loopback health
-        # request, and redirects must not let a process on the configured port
-        # borrow another endpoint's health response.
-        return build_loopback_opener()
-
-    @staticmethod
     def _probe_json_health(base_url: str, paths: tuple[str, ...], validator) -> bool:
         base = base_url.rstrip("/")
         if not base:
@@ -2996,7 +3114,12 @@ class PlatformRuntimeManager:
         for path in paths:
             try:
                 request = urllib.request.Request(f"{base}{path}", method="GET")
-                with urllib.request.urlopen(request, timeout=0.8) as response:
+                open_request = (
+                    open_loopback_url
+                    if PlatformRuntimeManager._uses_loopback_transport(base)
+                    else open_trusted_service_url
+                )
+                with open_request(request, timeout=0.8) as response:
                     if not 200 <= response.status < 300:
                         continue
                     raw = response.read(64 * 1024)
@@ -3111,9 +3234,17 @@ class PlatformRuntimeManager:
         return (self._runtime_setting(FIRECRAWL_SETTING_API_URL) or self.config.firecrawl_api_url or "http://127.0.0.1:3002").strip().rstrip("/")
 
     def firecrawl_loopback_url(self) -> str:
-        """Return the effective Firecrawl endpoint used by platform tools."""
+        """Return the validated Firecrawl service endpoint used by tools."""
 
-        return self._effective_firecrawl_api_url()
+        url = self._effective_firecrawl_api_url()
+        error = (
+            self._managed_loopback_url_error("Firecrawl", url)
+            if self._managed_firecrawl_enabled()
+            else self._trusted_http_url_error("Firecrawl", url)
+        )
+        if error:
+            raise ValueError(error)
+        return url
 
     def _effective_firecrawl_command(self) -> str:
         return self._runtime_setting(FIRECRAWL_SETTING_COMMAND) or self.config.firecrawl_command

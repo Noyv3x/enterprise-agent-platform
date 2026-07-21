@@ -256,11 +256,11 @@ class AgentScopeManager:
                 self._scope_cache[scope_key] = updated_scope
 
     def rotate_session(self, scope_key: str) -> AgentExecutionScope:
-        """Start a fresh Agent conversation while preserving its workspace.
+        """Explicitly start a fresh Agent lifecycle while preserving its workspace.
 
-        Administrative chat clearing is a lifecycle boundary, not only a UI
-        row deletion. A random suffix prevents the runtime from reopening the prior
-        transcript/memory snapshot if the same logical Agent is used again.
+        Product-message hiding and administrative chat clearing do not call this
+        method. Callers that intentionally reset Runtime context use a random
+        suffix so the prior transcript cannot be reopened accidentally.
         """
 
         row = self.db.query_one(

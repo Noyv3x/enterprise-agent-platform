@@ -267,6 +267,51 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(client.request_timeout_seconds, 30.0)
         self.assertEqual(client.event_timeout_seconds, 60.0)
 
+    def test_runtime_endpoint_accepts_trusted_http_but_rejects_embedded_credentials(self):
+        for url in (
+            "https://runtime.example:8766",
+            "http://localhost:8766",
+            "https://runtime.example:8766/agent-api",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    AgentRuntimeClient(url, "runtime-secret").base_url,
+                    url,
+                )
+
+        for url in (
+            "ftp://runtime.example:8766",
+            "http://user:secret@127.0.0.1:8766",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:8766?target=remote",
+            "http://127.0.0.1:8766#fragment",
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(
+                ValueError,
+                "credential-free HTTP",
+            ):
+                AgentRuntimeClient(url, "runtime-secret")
+
+    def test_external_runtime_transport_rejects_redirects_before_forwarding_auth(self):
+        client = AgentRuntimeClient(
+            "https://runtime.example:8766",
+            "runtime-secret",
+        )
+        response = mock.MagicMock()
+        request = mock.MagicMock()
+        with (
+            mock.patch(
+                "enterprise_agent_platform.agent_runtime_client.open_trusted_service_url",
+                return_value=response,
+            ) as trusted_open,
+            mock.patch(
+                "enterprise_agent_platform.agent_runtime_client.open_loopback_url",
+            ) as loopback_open,
+        ):
+            self.assertIs(client._open(request, timeout=2), response)
+        trusted_open.assert_called_once_with(request, timeout=2)
+        loopback_open.assert_not_called()
+
     def test_generate_posts_run_and_consumes_completion_events(self):
         self.runtime.events = [
             _event(1, "run.started", {"status": "running"}),

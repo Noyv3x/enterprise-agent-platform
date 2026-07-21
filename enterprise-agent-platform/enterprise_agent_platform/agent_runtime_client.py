@@ -12,6 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Protocol
 
+from .loopback_http import (
+    open_loopback_url,
+    open_trusted_service_url,
+    validate_http_base_url,
+    validate_loopback_url,
+)
+
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
 AgentContentCallback = Callable[..., None]
@@ -199,13 +206,24 @@ class AgentRuntimeClient:
         gateway_token: str = "",
         default_provider: str = "",
         default_model: str = "",
+        require_loopback: bool = False,
     ):
         clean_base = str(base_url or "").strip().rstrip("/")
-        parsed = urllib.parse.urlparse(clean_base)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("Agent runtime base_url must be an http(s) URL")
-        if parsed.query or parsed.fragment:
-            raise ValueError("Agent runtime base_url must not contain a query or fragment")
+        try:
+            if require_loopback:
+                validate_loopback_url(clean_base, base_url=True)
+            else:
+                validate_http_base_url(clean_base)
+        except ValueError as exc:
+            raise ValueError(
+                (
+                    "Agent runtime base_url must be a credential-free numeric "
+                    "loopback base URL"
+                    if require_loopback
+                    else "Agent runtime base_url must be a credential-free "
+                    "HTTP(S) base URL"
+                )
+            ) from exc
         if request_timeout_seconds <= 0:
             raise ValueError("Agent runtime request_timeout_seconds must be positive")
         if event_timeout_seconds <= 0:
@@ -221,8 +239,27 @@ class AgentRuntimeClient:
         self.gateway_token = str(gateway_token or "")
         self.default_provider = str(default_provider or "").strip()
         self.default_model = str(default_model or "").strip()
+        try:
+            validate_loopback_url(clean_base, base_url=True)
+            self._loopback_transport = True
+        except ValueError:
+            self._loopback_transport = False
+        self._unavailable_reason = ""
         self._approval_lock = threading.Lock()
         self._pending_approvals: dict[str, str] = {}
+
+    @classmethod
+    def unavailable(
+        cls,
+        reason: str,
+        bearer_token: str = "",
+        **kwargs: Any,
+    ) -> "AgentRuntimeClient":
+        """Create a client that fails closed without attempting any network I/O."""
+
+        client = cls("http://127.0.0.1:1", bearer_token, **kwargs)
+        client._unavailable_reason = str(reason or "Agent runtime is unavailable")
+        return client
 
     def generate(
         self,
@@ -1043,8 +1080,15 @@ class AgentRuntimeClient:
         return parsed, headers
 
     def _open(self, request: urllib.request.Request, *, timeout: float) -> Any:
+        if self._unavailable_reason:
+            raise AgentRuntimeConnectionError(self._unavailable_reason)
         try:
-            return urllib.request.urlopen(request, timeout=timeout)
+            open_request = (
+                open_loopback_url
+                if self._loopback_transport
+                else open_trusted_service_url
+            )
+            return open_request(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             try:
                 response_body = exc.read(65536).decode("utf-8", errors="replace")
@@ -1064,6 +1108,15 @@ class AgentRuntimeClient:
         except (socket.timeout, TimeoutError) as exc:
             raise AgentRuntimeTimeoutError(
                 f"Agent runtime request timed out after {timeout:g} seconds"
+            ) from exc
+        except ValueError as exc:
+            raise AgentRuntimeProtocolError(
+                (
+                    "Agent runtime request URL left the numeric loopback boundary"
+                    if self._loopback_transport
+                    else "Agent runtime request URL is not a valid trusted "
+                    "HTTP(S) endpoint"
+                )
             ) from exc
         except OSError as exc:
             raise AgentRuntimeConnectionError(f"Unable to reach Agent runtime: {exc}") from exc

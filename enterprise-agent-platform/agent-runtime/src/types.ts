@@ -8,7 +8,7 @@ export interface RuntimeConfig {
   home: string;
   host: string;
   port: number;
-  bearerToken?: string;
+  bearerToken: string;
   platformUrl?: string;
   platformToken?: string;
   approvalTimeoutMs: number;

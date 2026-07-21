@@ -1,5 +1,19 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  MAX_TURNS_PER_RUN_DEFAULT,
+  MAX_TURNS_PER_RUN_MAXIMUM,
+  MAX_TURNS_PER_RUN_MINIMUM,
+  MAX_TURNS_PER_RUN_RUNTIME_ENVIRONMENT_VARIABLE,
+  RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
+  RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+  RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+  RUN_IDLE_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE,
+  TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
+  TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS,
+  TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
+  TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE,
+} from "./design-contract.generated.js";
 import type { RuntimeConfig } from "./types.js";
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -11,10 +25,15 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function loadToken(env: NodeJS.ProcessEnv): string | undefined {
+function loadToken(env: NodeJS.ProcessEnv): string {
   if (env.AGENT_RUNTIME_TOKEN?.trim()) return env.AGENT_RUNTIME_TOKEN.trim();
-  if (!env.AGENT_RUNTIME_TOKEN_FILE?.trim()) return undefined;
-  return readFileSync(env.AGENT_RUNTIME_TOKEN_FILE, "utf8").trim() || undefined;
+  if (env.AGENT_RUNTIME_TOKEN_FILE?.trim()) {
+    const token = readFileSync(env.AGENT_RUNTIME_TOKEN_FILE.trim(), "utf8").trim();
+    if (token) return token;
+  }
+  throw new Error(
+    "Agent Runtime bearer token is required; set AGENT_RUNTIME_TOKEN or AGENT_RUNTIME_TOKEN_FILE to a non-empty value",
+  );
 }
 
 function fraction(value: string | undefined, fallback: number): number {
@@ -35,10 +54,12 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+  const bearerToken = loadToken(env);
   const config: RuntimeConfig = {
     home: resolve(env.AGENT_RUNTIME_HOME || "data/runtimes/agent"),
     host: env.AGENT_RUNTIME_HOST || "127.0.0.1",
     port: positiveInteger(env.AGENT_RUNTIME_PORT, 8766),
+    bearerToken,
     approvalTimeoutMs: positiveInteger(env.AGENT_RUNTIME_APPROVAL_TIMEOUT_MS, 15 * 60_000),
     runRetentionMs: positiveInteger(env.AGENT_RUNTIME_RUN_RETENTION_MS, 60 * 60_000),
     maxDelegationDepth: positiveInteger(env.AGENT_RUNTIME_MAX_DELEGATION_DEPTH, 2),
@@ -47,26 +68,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     requestBodyTimeoutMs: positiveInteger(env.AGENT_RUNTIME_REQUEST_BODY_TIMEOUT_MS, 15_000),
     compactionThreshold: fraction(env.AGENT_RUNTIME_COMPACTION_THRESHOLD, 0.8),
     runIdleTimeoutMs: boundedInteger(
-      env.AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS,
-      30 * 60_000,
-      0,
-      24 * 60 * 60_000,
+      env[RUN_IDLE_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE],
+      RUN_IDLE_TIMEOUT_DEFAULT_SECONDS * 1_000,
+      RUN_IDLE_TIMEOUT_MINIMUM_SECONDS * 1_000,
+      RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS * 1_000,
     ),
-    maxTurnsPerRun: boundedInteger(env.AGENT_RUNTIME_MAX_TURNS, 90, 1, 1_000),
+    maxTurnsPerRun: boundedInteger(
+      env[MAX_TURNS_PER_RUN_RUNTIME_ENVIRONMENT_VARIABLE],
+      MAX_TURNS_PER_RUN_DEFAULT,
+      MAX_TURNS_PER_RUN_MINIMUM,
+      MAX_TURNS_PER_RUN_MAXIMUM,
+    ),
     terminalTimeoutMs: boundedInteger(
-      env.AGENT_RUNTIME_TERMINAL_TIMEOUT_MS,
-      180_000,
-      100,
-      3_600_000,
+      env[TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE],
+      TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
+      TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
+      TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS,
     ),
     cleanupGraceMs: positiveInteger(env.AGENT_RUNTIME_CLEANUP_GRACE_MS, 5_000),
     maxConcurrency: boundedInteger(env.AGENT_RUNTIME_MAX_CONCURRENCY, 8, 1, 64),
     maxQueuedRuns: boundedInteger(env.AGENT_RUNTIME_MAX_QUEUED_RUNS, 256, 1, 10_000),
   };
-  const bearerToken = loadToken(env);
   const platformUrl = env.AGENT_PLATFORM_INTERNAL_URL?.replace(/\/$/, "");
   const platformToken = env.AGENT_PLATFORM_INTERNAL_TOKEN?.trim();
-  if (bearerToken) config.bearerToken = bearerToken;
   if (platformUrl) config.platformUrl = platformUrl;
   if (platformToken) config.platformToken = platformToken;
   return config;

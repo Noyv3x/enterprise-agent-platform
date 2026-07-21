@@ -1,5 +1,10 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { saveAgentRuntimeConfig } from "../../../data/adminActions";
+import {
+  RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
+  RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
+  RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
+} from "../../../design-contract.generated";
 import { useI18n, type Translator } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type {
@@ -82,7 +87,9 @@ function seedForm(config: AgentRuntimeConfigValues): AgentRuntimeFormState {
       ? (config.provider as string)
       : "openai-codex",
     modelPreferred: config.model || "",
-    idleTimeoutSeconds: String(config.idle_timeout_seconds ?? 1800),
+    idleTimeoutSeconds: String(
+      config.idle_timeout_seconds ?? RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
+    ),
     maxConcurrency: String(config.max_concurrency ?? 4),
     compactionThreshold: String(config.compaction_threshold ?? 0.8),
   };
@@ -187,8 +194,8 @@ export function AgentRuntimeConfig() {
             <div className="field-stack">
               <input
                 type="number"
-                min="0"
-                max="86400"
+                min={RUN_IDLE_TIMEOUT_MINIMUM_SECONDS}
+                max={RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS}
                 step="1"
                 value={form.idleTimeoutSeconds}
                 aria-describedby={idleTimeoutHintId}

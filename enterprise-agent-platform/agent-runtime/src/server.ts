@@ -18,7 +18,11 @@ export interface RuntimeServer {
   close(): Promise<void>;
 }
 
-export function createRuntimeServer(config: RuntimeConfig, coordinator = new RunCoordinator({ config })): RuntimeServer {
+export function createRuntimeServer(config: RuntimeConfig, providedCoordinator?: RunCoordinator): RuntimeServer {
+  if (!config.bearerToken.trim()) {
+    throw new Error("Agent Runtime bearer token must be non-empty");
+  }
+  const coordinator = providedCoordinator ?? new RunCoordinator({ config });
   const server = createServer((request, response) => {
     void route(config, coordinator, request, response).catch((error) => {
       if (closesConnection(error)) {
@@ -256,7 +260,6 @@ function streamEvents(response: ServerResponse, journal: NonNullable<ReturnType<
 }
 
 function authorize(config: RuntimeConfig, request: IncomingMessage): void {
-  if (!config.bearerToken) return;
   const authorization = request.headers.authorization || "";
   const supplied = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
   if (!supplied || !safeEqual(supplied, config.bearerToken)) throw httpError(401, "Unauthorized");
