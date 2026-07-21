@@ -3,16 +3,18 @@
 
    Per-run open/closed memory lives in the store (expandedAgentRuns) keyed by runId:
    active runs default open, completed runs default closed, and once the user
-   toggles, the choice persists (TOGGLE_AGENT_RUN). The card subscribes to ONLY its
-   own run's flag, so a toggle re-renders just this disclosure even though the
-   parent <MessageBubble> is memoized. The native <details> toggle is suppressed
-   (controlled `open`) but Enter/Space on the summary still fire the click → toggle,
-   preserving keyboard operability.
+   toggles, the choice persists (TOGGLE_AGENT_RUN). When the final response starts,
+   the live card collapses once so the answer can take focus; that automatic state
+   is deliberately local so a later steered turn can expand the work record again.
+   The card subscribes to ONLY its own run's flag, so a toggle re-renders just this
+   disclosure even though the parent <MessageBubble> is memoized. The native
+   <details> toggle is suppressed (controlled `open`) but Enter/Space on the summary
+   still fire the click → toggle, preserving keyboard operability.
 
    The step formatters are exported so <MessageList>/<MessageBubble> can decide
    whether a run has tool-call steps without duplicating the logic. */
 
-import type { MouseEvent } from "react";
+import { useLayoutEffect, useState, type MouseEvent } from "react";
 import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
@@ -203,7 +205,15 @@ function agentWorkTitle(work: Work | null | undefined, translate: Translator): s
   return translate("chat.work.view");
 }
 
-export function AgentWorkCard({ work, active }: { work: Work; active: boolean }) {
+export function AgentWorkCard({
+  work,
+  active,
+  finalOutputStarted = false,
+}: {
+  work: Work;
+  active: boolean;
+  finalOutputStarted?: boolean;
+}) {
   const dispatch = useDispatch();
   const { t } = useI18n();
 
@@ -215,7 +225,18 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   // undefined = no stored preference → default open iff active (legacy hasStored
   // / expanded rule). Subscribing to the single flag keeps re-renders scoped.
   const stored = useStore((state) => state.expandedAgentRuns[runId]);
-  const expanded = stored === undefined ? active : stored;
+  const [autoCollapsed, setAutoCollapsed] = useState(finalOutputStarted);
+
+  // Collapse in a layout effect so the first response token and the collapsed
+  // disclosure are painted together. Keeping this separate from `stored` means
+  // an injected follow-up (output clears, same run continues) expands by default,
+  // while a user can still reopen the card after the one-time collapse.
+  useLayoutEffect(() => {
+    setAutoCollapsed(finalOutputStarted);
+  }, [runId, finalOutputStarted]);
+
+  const preferredExpanded = stored === undefined ? active : stored;
+  const expanded = !autoCollapsed && preferredExpanded;
 
   const processEntries = agentProcessLineEntries(work, t);
   const currentEntry = active
@@ -232,7 +253,9 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
 
   const onToggle = (event: MouseEvent<HTMLElement>) => {
     event.preventDefault();
-    dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: !expanded } });
+    const nextExpanded = !expanded;
+    if (nextExpanded && autoCollapsed) setAutoCollapsed(false);
+    dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: nextExpanded } });
   };
 
   return (

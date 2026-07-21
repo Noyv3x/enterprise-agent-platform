@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
@@ -75,5 +75,48 @@ describe("AgentWorkCard", () => {
     expect(screen.getByText("Agent is working")).toBeVisible();
     expect(document.querySelectorAll(".agent-work__item")).toHaveLength(3);
     expect(screen.queryByText(/Using tool/i)).toBeNull();
+  });
+
+  it("auto-collapses once and still allows the user to reopen it", () => {
+    const store = createStore(rootReducer, initialAppState);
+    const work: AgentStatus = {
+      run_id: "run-collapse",
+      state: "replying",
+      activity: [
+        {
+          stage: "tool",
+          tool: "web",
+          tool_call_id: "web-1",
+          tool_status: "completed",
+        },
+      ],
+    };
+    const renderCard = (finalOutputStarted: boolean) => (
+      <StoreContext.Provider value={store}>
+        <I18nProvider>
+          <AgentWorkCard
+            work={work}
+            active={true}
+            finalOutputStarted={finalOutputStarted}
+          />
+        </I18nProvider>
+      </StoreContext.Provider>
+    );
+    const view = render(renderCard(false));
+    const details = () => view.container.querySelector("details");
+
+    expect(details()).toHaveAttribute("open");
+    view.rerender(renderCard(true));
+    expect(details()).not.toHaveAttribute("open");
+
+    fireEvent.click(view.container.querySelector("summary")!);
+    expect(details()).toHaveAttribute("open");
+    view.rerender(renderCard(true));
+    expect(details()).toHaveAttribute("open");
+
+    view.rerender(renderCard(false));
+    expect(details()).toHaveAttribute("open");
+    view.rerender(renderCard(true));
+    expect(details()).not.toHaveAttribute("open");
   });
 });

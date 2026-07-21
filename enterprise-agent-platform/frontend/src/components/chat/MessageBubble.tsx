@@ -54,10 +54,10 @@ function MessageBubbleImpl({ message }: { message: Message }) {
           streaming={streaming}
           action={message.content ? <CopyButton value={message.content} kind="message" /> : null}
         />
+        {showWorkCard && agentWork ? <AgentWorkCard work={agentWork} active={false} /> : null}
         {message.content ? <MessageBody content={message.content} /> : null}
         {attachments.length ? <MessageAttachments attachments={attachments} /> : null}
         {suggestions.length ? <KnowledgeSuggestions suggestions={suggestions} /> : null}
-        {showWorkCard && agentWork ? <AgentWorkCard work={agentWork} active={false} /> : null}
       </div>
     </article>
   );

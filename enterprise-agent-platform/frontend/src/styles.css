@@ -855,8 +855,7 @@ select {
 .typing__dots i:nth-child(2) { animation-delay: 0.2s; }
 .typing__dots i:nth-child(3) { animation-delay: 0.4s; }
 .msg--activity { max-width: 100%; }
-.msg__suggest + .agent-work,
-.msg__body + .agent-work {
+.agent-work + .msg__body {
   margin-top: 10px;
 }
 .agent-work {
