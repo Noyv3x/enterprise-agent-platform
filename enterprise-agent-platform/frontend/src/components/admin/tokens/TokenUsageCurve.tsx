@@ -26,41 +26,50 @@ export function TokenUsageCurve({ rows }: { rows: TokenDailyUsageRow[] }) {
           {daily.length ? `${daily[0].label} - ${daily[daily.length - 1].label}` : ""}
         </span>
       </div>
-      <svg
-        className="token-curve__svg"
-        viewBox={`0 0 ${width} ${height}`}
-        role="img"
+      <div
+        className="token-curve__viewport"
+        role="region"
         aria-label={t("admin.tokens.curve.ariaLabel")}
-        preserveAspectRatio="xMidYMid meet"
+        tabIndex={0}
       >
-        <line
-          className="token-curve__axis"
-          x1={padX}
-          y1={height - padY}
-          x2={width - padX}
-          y2={height - padY}
-        />
-        {areaPath ? <path className="token-curve__area" d={areaPath} /> : null}
-        {linePath ? <path className="token-curve__line" d={linePath} /> : null}
-        {points.map((point, index) => (
-          <circle
-            key={index}
-            className="token-curve__point"
-            cx={point.x.toFixed(1)}
-            cy={point.y.toFixed(1)}
-            r={4}
+        <div className="token-curve__plot">
+          <svg
+            className="token-curve__svg"
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label={t("admin.tokens.curve.ariaLabel")}
+            preserveAspectRatio="xMidYMid meet"
           >
-            <title>{t("admin.tokens.curve.point", { date: point.label, count: formatNumber(point.total_tokens) })}</title>
-          </circle>
-        ))}
-      </svg>
-      <div className="token-curve__labels">
-        {daily.map((row, index) => (
-          <div className="token-curve__label" key={index}>
-            <span>{row.label}</span>
-            <strong>{formatCompactNumber(row.total_tokens)}</strong>
+            <line
+              className="token-curve__axis"
+              x1={padX}
+              y1={height - padY}
+              x2={width - padX}
+              y2={height - padY}
+            />
+            {areaPath ? <path className="token-curve__area" d={areaPath} /> : null}
+            {linePath ? <path className="token-curve__line" d={linePath} /> : null}
+            {points.map((point, index) => (
+              <circle
+                key={index}
+                className="token-curve__point"
+                cx={point.x.toFixed(1)}
+                cy={point.y.toFixed(1)}
+                r={4}
+              >
+                <title>{t("admin.tokens.curve.point", { date: point.label, count: formatNumber(point.total_tokens) })}</title>
+              </circle>
+            ))}
+          </svg>
+          <div className="token-curve__labels">
+            {daily.map((row, index) => (
+              <div className="token-curve__label" key={index}>
+                <span>{row.label}</span>
+                <strong>{formatCompactNumber(row.total_tokens)}</strong>
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
       </div>
     </div>
   );

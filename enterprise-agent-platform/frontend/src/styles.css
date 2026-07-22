@@ -1606,6 +1606,17 @@ select {
   color: var(--muted);
   font-size: 12px;
 }
+.token-curve__viewport {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-gutter: stable;
+}
+.token-curve__plot {
+  width: 100%;
+  min-width: 520px;
+}
 .token-curve__svg {
   width: 100%;
   height: auto;

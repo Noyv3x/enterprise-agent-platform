@@ -130,7 +130,7 @@ export function TelegramAdminConfig() {
           </div>
           <div className="field--full field-stack">
             <span className="field-help">{t("admin.telegram.webhookUrl")}</span>
-            <code className="mono">{webhookUrl}</code>
+            <code className="mono config-value">{webhookUrl}</code>
           </div>
         </div>
         <div className="form-actions">
