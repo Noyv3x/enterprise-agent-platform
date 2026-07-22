@@ -12,6 +12,7 @@ from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
     RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
 )
+from .upstream_sources_generated import UPSTREAM_SOURCES
 
 OAUTH_SECRET_KEYS = (
     "CODEX_OAUTH_ACCESS_TOKEN",
@@ -104,6 +105,32 @@ class PlatformConfig:
         port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
         token_secret = os.getenv("ENTERPRISE_SESSION_SECRET") or secrets.token_urlsafe(32)
+        manage_cognee = _env_bool("ENTERPRISE_MANAGE_COGNEE", True)
+        manage_firecrawl = _env_bool("ENTERPRISE_MANAGE_FIRECRAWL", True)
+        managed_cognee_repo = (
+            data_dir
+            / "runtimes"
+            / "cognee"
+            / "source"
+            / str(UPSTREAM_SOURCES["cognee"]["revision"])
+        )
+        managed_firecrawl_repo = (
+            data_dir
+            / "runtimes"
+            / "firecrawl"
+            / "source"
+            / str(UPSTREAM_SOURCES["firecrawl"]["revision"])
+        )
+        cognee_repo = managed_cognee_repo
+        firecrawl_repo = managed_firecrawl_repo
+        if not manage_cognee:
+            cognee_repo = Path(
+                os.getenv("ENTERPRISE_COGNEE_REPO", managed_cognee_repo)
+            ).expanduser()
+        if not manage_firecrawl:
+            firecrawl_repo = Path(
+                os.getenv("ENTERPRISE_FIRECRAWL_REPO", managed_firecrawl_repo)
+            ).expanduser()
         return cls(
             data_dir=data_dir,
             host=host,
@@ -116,17 +143,15 @@ class PlatformConfig:
             cognee_dataset=os.getenv("ENTERPRISE_COGNEE_DATASET", "enterprise_knowledge"),
             cognee_ingest_background=os.getenv("ENTERPRISE_COGNEE_INGEST_BACKGROUND", "1").strip().lower()
             in {"1", "true", "yes", "on"},
-            cognee_repo=Path(os.getenv("ENTERPRISE_COGNEE_REPO", _default_repo_path(base, "cognee"))).expanduser(),
-            manage_cognee=os.getenv("ENTERPRISE_MANAGE_COGNEE", "1").strip().lower()
-            in {"1", "true", "yes", "on"},
+            cognee_repo=cognee_repo,
+            manage_cognee=manage_cognee,
             runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
             manage_camofox=os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
             in {"1", "true", "yes", "on"},
             camofox_url=os.getenv("ENTERPRISE_CAMOFOX_URL", "http://127.0.0.1:9377").strip().rstrip("/"),
             camofox_command=os.getenv("ENTERPRISE_CAMOFOX_COMMAND", "").strip(),
-            manage_firecrawl=os.getenv("ENTERPRISE_MANAGE_FIRECRAWL", "1").strip().lower()
-            in {"1", "true", "yes", "on"},
-            firecrawl_repo=Path(os.getenv("ENTERPRISE_FIRECRAWL_REPO", _default_repo_path(base, "firecrawl"))).expanduser(),
+            manage_firecrawl=manage_firecrawl,
+            firecrawl_repo=firecrawl_repo,
             firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
             manage_searxng=_env_bool("ENTERPRISE_MANAGE_SEARXNG", True),
@@ -172,16 +197,6 @@ class PlatformConfig:
                 maximum=float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS),
             ),
         )
-
-
-def _default_repo_path(base: Path, name: str) -> Path:
-    in_base = base / name
-    if in_base.exists():
-        return in_base
-    in_parent = base.parent / name
-    if in_parent.exists():
-        return in_parent
-    return in_base
 
 
 def _env_bool(name: str, default: bool) -> bool:

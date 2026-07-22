@@ -25,6 +25,11 @@ enterprise-agent-platform/.env
 workspaces/
 logs/
 
+# Legacy upstream checkouts left behind when the former gitlinks are removed.
+# Managed copies live under ENTERPRISE_PLATFORM_DATA/runtimes instead.
+/cognee/
+/firecrawl/
+
 # Secrets and local overrides
 .env
 .env.*

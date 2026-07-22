@@ -109,6 +109,38 @@ class RuntimeStartupWaitTests(unittest.TestCase):
                 os.environ.pop("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", None)
                 os.environ.pop("ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS", None)
 
+    def test_successful_firecrawl_compose_exit_keeps_waiting_for_http(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_firecrawl_repo(tmp / "firecrawl")
+            launcher = mock.MagicMock()
+            launcher.start.return_value = ExitedProcess(returncode=0)
+            _, manager = _make_manager(tmp, wait=1, launcher=launcher)
+            try:
+                with (
+                    mock.patch.object(
+                        manager,
+                        "_runtime_startup_wait_seconds",
+                        return_value=1.0,
+                    ),
+                    mock.patch.object(
+                        manager,
+                        "_probe_firecrawl_health",
+                        side_effect=[False, True],
+                    ) as health,
+                    mock.patch(
+                        "enterprise_agent_platform.runtimes.time.sleep"
+                    ),
+                ):
+                    status = manager.ensure_firecrawl_ready(wait=True)
+
+                self.assertTrue(status.available)
+                self.assertEqual(status.state, "running")
+                self.assertEqual(health.call_count, 2)
+                self.assertTrue(manager._firecrawl_launch_confirmed)
+            finally:
+                manager.close()
+
 
 class AgentRuntimeProcessEnvTests(unittest.TestCase):
     def test_process_env_is_scoped_to_managed_runtime_and_never_contains_refresh_tokens(self):
@@ -153,6 +185,31 @@ class FirecrawlEnvLocationTests(unittest.TestCase):
             manager._ensure_firecrawl_env()
             self.assertFalse((config.firecrawl_runtime_dir / "searxng").exists())
             self.assertFalse((repo / "searxng").exists())
+
+    def test_managed_sources_ignore_legacy_database_repo_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            config = replace(
+                make_config(tmp),
+                cognee_repo=tmp / "managed-cognee",
+                firecrawl_repo=tmp / "managed-firecrawl",
+                manage_cognee=True,
+                manage_firecrawl=True,
+            )
+            settings = {
+                "cognee_repo": str(tmp / "legacy-cognee"),
+                "firecrawl_repo": str(tmp / "legacy-firecrawl"),
+            }
+            manager = PlatformRuntimeManager(
+                config,
+                _no_secret,
+                process_launcher=RecordingLauncher(),
+                command_runner=RecordingCommandRunner(),
+                setting_provider=settings.get,
+            )
+
+            self.assertEqual(manager._effective_cognee_repo(), config.cognee_repo)
+            self.assertEqual(manager._effective_firecrawl_repo(), config.firecrawl_repo)
 
     def test_prepare_firecrawl_materializes_env_in_runtime_dir(self):
         with tempfile.TemporaryDirectory() as td:
@@ -948,6 +1005,40 @@ class SearXNGComposeLifecycleTests(unittest.TestCase):
 
 
 class FirecrawlComposeTeardownTests(unittest.TestCase):
+    def test_healthy_existing_stack_is_reconciled_before_health_is_trusted(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_firecrawl_repo(tmp / "firecrawl")
+            launcher = RecordingLauncher()
+            _, manager = _make_manager(tmp, wait=0, launcher=launcher)
+            try:
+                with mock.patch.object(
+                    manager,
+                    "_probe_firecrawl_health",
+                    return_value=True,
+                ):
+                    reconciling = manager.ensure_firecrawl_ready(wait=False)
+                    self.assertEqual(reconciling.state, "starting")
+                    self.assertFalse(reconciling.available)
+                    self.assertEqual(len(launcher.calls), 1)
+                    up_command = launcher.calls[0]["cmd"]
+                    self.assertIn("--project-name", up_command)
+                    self.assertEqual(
+                        up_command[up_command.index("--project-name") + 1],
+                        "firecrawl",
+                    )
+                    self.assertIn("--detach", up_command)
+                    self.assertIn("--wait", up_command)
+                    self.assertIsNotNone(manager._firecrawl_compose_teardown)
+
+                    launcher.processes[0].running = False
+                    owned = manager.firecrawl_status(refresh=True)
+                self.assertTrue(owned.available)
+                self.assertEqual(owned.state, "running")
+                self.assertTrue(manager._firecrawl_launch_confirmed)
+            finally:
+                manager.close()
+
     def test_stop_runs_compose_down_for_managed_stack(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -986,6 +1077,31 @@ class FirecrawlComposeTeardownTests(unittest.TestCase):
                 os.environ.pop("ENTERPRISE_FIRECRAWL_STARTUP_WAIT_SECONDS", None)
                 if manager is not None:
                     manager.close()
+
+    def test_failed_firecrawl_teardown_keeps_ownership_for_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            make_fake_firecrawl_repo(tmp / "firecrawl")
+            launcher = RecordingLauncher()
+            runner = RecordingCommandRunner()
+            _, manager = _make_manager(
+                tmp,
+                wait=0,
+                launcher=launcher,
+                runner=runner,
+            )
+            manager.ensure_firecrawl_ready(wait=False)
+            runner.run = mock.Mock(side_effect=TimeoutError("simulated down timeout"))
+
+            failed = manager.stop_firecrawl()
+            self.assertEqual(failed.state, "error")
+            self.assertIn("simulated down timeout", failed.error)
+            self.assertIsNotNone(manager._firecrawl_compose_teardown)
+
+            runner.run = mock.Mock(return_value=mock.Mock(returncode=0))
+            recovered = manager.stop_firecrawl()
+            self.assertEqual(recovered.state, "prepared")
+            self.assertIsNone(manager._firecrawl_compose_teardown)
 
     def test_user_command_firecrawl_is_not_compose_torn_down(self):
         with tempfile.TemporaryDirectory() as td:

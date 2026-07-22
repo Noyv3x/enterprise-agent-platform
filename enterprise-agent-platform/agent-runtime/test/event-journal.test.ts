@@ -27,6 +27,21 @@ test("EventJournal retains only the newest configured event count", () => {
   assert.deepEqual(journal.list().map((event) => event.sequence), [3, 4, 5]);
 });
 
+test("EventJournal never exposes internal approval keys", () => {
+  const journal = new EventJournal("run_internal");
+  const event = journal.publish("approval.requested", {
+    approval_id: "approval-visible",
+    approval_key: "v2:terminal:must-not-leak",
+    nested: {
+      approvalKey: "v2:browser:must-not-leak",
+      visible: true,
+    },
+  });
+  assert.equal(event.data.approval_id, "approval-visible");
+  assert.doesNotMatch(JSON.stringify(event.data), /must-not-leak|approval_key|approvalKey/);
+  assert.equal((event.data.nested as { visible?: boolean }).visible, true);
+});
+
 test("EventJournal bounds retained bytes and marks an oversized event", () => {
   const maxBytes = 512;
   const journal = new EventJournal("run_bounded_bytes", { maxEvents: 10, maxBytes });

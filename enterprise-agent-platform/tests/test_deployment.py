@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -15,10 +17,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from enterprise_agent_platform.cognee_bridge import CogneeBridge
+from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.deployment import (
     DeploymentError,
     DeploymentManager,
     DeploymentPaths,
+    UpstreamSourceSpec,
     _camofox_system_dependency_problems,
     _existing_service_data_dir,
     _probe_json_health,
@@ -115,6 +120,41 @@ def make_deploy_root(root: Path) -> None:
     (root / "firecrawl" / "docker-compose.yaml").write_text("services:\n  api:\n    image: firecrawl\n", encoding="utf-8")
 
 
+def bypass_managed_upstreams(manager: DeploymentManager) -> None:
+    manager.ensure_managed_sources = mock.Mock()
+    manager.ensure_cognee_dependencies = mock.Mock()
+
+
+def write_platform_settings(data_dir: Path, values: dict[str, str]) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(data_dir / "platform.db")
+    try:
+        connection.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, secret INTEGER NOT NULL DEFAULT 0)"
+        )
+        connection.executemany(
+            "INSERT INTO settings (key, value, secret) VALUES (?, ?, 0)",
+            tuple(values.items()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def make_git_source(path: Path, required: tuple[str, ...]) -> str:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "source@example.invalid"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Source Test"], cwd=path, check=True)
+    for relative in required:
+        target = path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"fixture for {relative}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--all"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "source"], cwd=path, check=True)
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=path, text=True).strip()
+
+
 
 def make_update_checkout(base: Path, source_script: Path) -> tuple[Path, str, str]:
     upstream = base / "upstream"
@@ -188,6 +228,433 @@ exit 0
     return executable
 
 class DeploymentTests(unittest.TestCase):
+    def test_managed_cognee_real_import_keeps_source_clean_and_reusable(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            root = tmp / "checkout"
+            data = tmp / "state"
+            seed = tmp / "cognee-source"
+            package = seed / "cognee"
+            package.mkdir(parents=True)
+            (seed / "pyproject.toml").write_text(
+                "[project]\nname = 'cognee'\nversion = '1.0.0'\n",
+                encoding="utf-8",
+            )
+            (package / "__init__.py").write_text(
+                "IMPORT_ORIGIN = 'managed-source'\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "--quiet"], cwd=seed, check=True)
+            subprocess.run(
+                ["git", "add", "--all"], cwd=seed, check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Source Test",
+                    "-c",
+                    "user.email=source@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "source",
+                ],
+                cwd=seed,
+                check=True,
+            )
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=seed, text=True
+            ).strip()
+            target = data / "runtimes" / "cognee" / "source" / revision
+            target.parent.mkdir(parents=True)
+            seed.rename(target)
+
+            installed = tmp / "site-packages"
+            installed_package = installed / "cognee"
+            installed_package.mkdir(parents=True)
+            (installed_package / "__init__.py").write_text(
+                "IMPORT_ORIGIN = 'verified-install'\n",
+                encoding="utf-8",
+            )
+            config = SimpleNamespace(
+                manage_cognee=True,
+                cognee_repo=target,
+                knowledge_backend="hybrid",
+                cognee_dataset="test",
+                cognee_ingest_background=False,
+            )
+            runtime = SimpleNamespace(
+                cognee_runtime_config=lambda: {
+                    "manage_cognee": True,
+                    "repo_path": str(target),
+                }
+            )
+            bridge = CogneeBridge(config, lambda _key: "", runtime)
+
+            original_path = list(sys.path)
+            saved_modules = {
+                name: module
+                for name, module in sys.modules.items()
+                if name == "cognee" or name.startswith("cognee.")
+            }
+            for name in saved_modules:
+                sys.modules.pop(name, None)
+            sys.path.insert(0, str(installed))
+            try:
+                imported = bridge._import_cognee()
+                self.assertEqual(imported.IMPORT_ORIGIN, "verified-install")
+                self.assertNotIn(str(target), sys.path)
+                self.assertFalse(any(target.rglob("__pycache__")))
+
+                spec = UpstreamSourceSpec(
+                    name="cognee",
+                    repository_url="https://example.invalid/cognee.git",
+                    revision=revision,
+                    required_paths=("pyproject.toml", "cognee/__init__.py"),
+                )
+                manager = DeploymentManager(
+                    DeploymentPaths.from_root(root, data_dir=data)
+                )
+                self.assertEqual(manager._ensure_managed_source(spec), target)
+            finally:
+                sys.path[:] = original_path
+                for name in list(sys.modules):
+                    if name == "cognee" or name.startswith("cognee."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved_modules)
+
+    def test_external_cognee_repo_remains_importable_when_management_is_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            external = tmp / "external"
+            package = external / "cognee"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text(
+                "IMPORT_ORIGIN = 'external-repo'\n",
+                encoding="utf-8",
+            )
+            config = SimpleNamespace(
+                manage_cognee=False,
+                cognee_repo=external,
+                knowledge_backend="hybrid",
+                cognee_dataset="test",
+                cognee_ingest_background=False,
+            )
+            runtime = SimpleNamespace(
+                cognee_runtime_config=lambda: {
+                    "manage_cognee": False,
+                    "repo_path": str(external),
+                },
+                ensure_cognee_ready=lambda: SimpleNamespace(
+                    managed=False,
+                    available=False,
+                    error="",
+                ),
+            )
+            bridge = CogneeBridge(config, lambda _key: "", runtime)
+
+            original_path = list(sys.path)
+            saved_modules = {
+                name: module
+                for name, module in sys.modules.items()
+                if name == "cognee" or name.startswith("cognee.")
+            }
+            for name in saved_modules:
+                sys.modules.pop(name, None)
+            try:
+                status = bridge.status()
+                self.assertTrue(status.available)
+                self.assertEqual(bridge._module.IMPORT_ORIGIN, "external-repo")
+                self.assertEqual(sys.path[0], str(external))
+            finally:
+                sys.path[:] = original_path
+                for name in list(sys.modules):
+                    if name == "cognee" or name.startswith("cognee."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved_modules)
+
+    def test_managed_config_ignores_repo_environment_overrides(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "state"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_PLATFORM_DATA": str(data),
+                    "ENTERPRISE_MANAGE_COGNEE": "1",
+                    "ENTERPRISE_MANAGE_FIRECRAWL": "1",
+                    "ENTERPRISE_COGNEE_REPO": str(root / "legacy-cognee"),
+                    "ENTERPRISE_FIRECRAWL_REPO": str(root / "legacy-firecrawl"),
+                },
+                clear=False,
+            ):
+                managed = PlatformConfig.from_env(root)
+            paths = DeploymentPaths.from_root(root, data_dir=data)
+            self.assertEqual(managed.cognee_repo, paths.cognee_repo)
+            self.assertEqual(managed.firecrawl_repo, paths.firecrawl_repo)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_PLATFORM_DATA": str(data),
+                    "ENTERPRISE_MANAGE_COGNEE": "0",
+                    "ENTERPRISE_MANAGE_FIRECRAWL": "0",
+                    "ENTERPRISE_COGNEE_REPO": str(root / "external-cognee"),
+                    "ENTERPRISE_FIRECRAWL_REPO": str(root / "external-firecrawl"),
+                },
+                clear=False,
+            ):
+                external = PlatformConfig.from_env(root)
+            self.assertEqual(external.cognee_repo, root / "external-cognee")
+            self.assertEqual(external.firecrawl_repo, root / "external-firecrawl")
+
+    def test_platform_config_preserves_external_repo_paths_when_management_is_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            external_cognee = root / "external-cognee"
+            external_firecrawl = root / "external-firecrawl"
+            manager = DeploymentManager(paths)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
+                    "ENTERPRISE_MANAGE_COGNEE": "0",
+                    "ENTERPRISE_COGNEE_REPO": str(external_cognee),
+                    "ENTERPRISE_MANAGE_FIRECRAWL": "0",
+                    "ENTERPRISE_FIRECRAWL_REPO": str(external_firecrawl),
+                },
+                clear=False,
+            ):
+                config = manager._platform_config(host="127.0.0.1", port=8765)
+
+            self.assertFalse(config.manage_cognee)
+            self.assertFalse(config.manage_firecrawl)
+            self.assertEqual(config.cognee_repo, external_cognee)
+            self.assertEqual(config.firecrawl_repo, external_firecrawl)
+
+    def test_empty_managed_source_selection_needs_no_git_or_download(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(Path(td)),
+                runner=RecordingDeployRunner(),
+            )
+            manager._ensure_managed_source = mock.Mock()
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment.shutil.which",
+                side_effect=AssertionError("disabled integrations must not probe git"),
+            ):
+                manager.ensure_managed_sources(())
+
+            manager._ensure_managed_source.assert_not_called()
+
+    def test_managed_source_uses_clean_legacy_checkout_as_seed_without_deleting_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            required = ("pyproject.toml", "cognee/__init__.py")
+            revision = make_git_source(root / "cognee", required)
+            spec = UpstreamSourceSpec(
+                name="cognee",
+                repository_url="https://example.invalid/cognee.git",
+                revision=revision,
+                required_paths=required,
+            )
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            manager = DeploymentManager(paths)
+
+            target = manager._ensure_managed_source(spec)
+
+            self.assertEqual(target, root / "state" / "runtimes" / "cognee" / "source" / revision)
+            self.assertTrue((root / "cognee").is_dir())
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=root / "cognee",
+                    text=True,
+                ).strip(),
+                revision,
+            )
+            self.assertEqual(
+                subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=target, text=True).strip(),
+                revision,
+            )
+
+            class NoNetworkRunner(RecordingDeployRunner):
+                def run(self, cmd, **kwargs):
+                    if "fetch" in cmd:
+                        raise AssertionError("validated source reuse must not fetch")
+                    return super().run(cmd, **kwargs)
+
+            offline = DeploymentManager(paths, runner=NoNetworkRunner())
+            self.assertEqual(offline._ensure_managed_source(spec), target)
+
+    def test_dirty_or_unknown_legacy_checkout_is_never_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            required = ("docker-compose.yaml",)
+            legacy_revision = make_git_source(root / "firecrawl", required)
+            (root / "firecrawl" / ".env").write_text("SECRET=value\n", encoding="utf-8")
+            spec = UpstreamSourceSpec(
+                name="firecrawl",
+                repository_url="https://example.invalid/firecrawl.git",
+                revision=legacy_revision,
+                required_paths=required,
+            )
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            target = root / "state" / "runtimes" / "firecrawl" / "source" / legacy_revision
+            target.parent.mkdir(parents=True)
+            subprocess.run(["git", "clone", "--quiet", str(root / "firecrawl"), str(target)], check=True)
+            manager = DeploymentManager(paths)
+
+            self.assertEqual(manager._ensure_managed_source(spec), target)
+            self.assertTrue((root / "firecrawl" / ".env").is_file())
+
+    def test_managed_source_rejects_wrong_revision_and_required_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            revision = make_git_source(root / "repository", ("required.txt",))
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            manager = DeploymentManager(paths)
+            wrong = UpstreamSourceSpec(
+                name="cognee",
+                repository_url="https://example.invalid/cognee.git",
+                revision="0" * 40,
+                required_paths=("required.txt",),
+            )
+            with self.assertRaisesRegex(DeploymentError, "revision mismatch"):
+                manager._validate_managed_source(root / "repository", wrong)
+
+            (root / "repository" / "required.txt").unlink()
+            (root / "repository" / "required.txt").symlink_to("outside")
+            linked = UpstreamSourceSpec(
+                name="cognee",
+                repository_url="https://example.invalid/cognee.git",
+                revision=revision,
+                required_paths=("required.txt",),
+            )
+            with self.assertRaisesRegex(DeploymentError, "modified|regular file"):
+                manager._validate_managed_source(root / "repository", linked)
+
+    def test_managed_firecrawl_source_requires_exact_compose_service_inventory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "firecrawl-source"
+            source.mkdir()
+            (source / "docker-compose.yaml").write_text(
+                "services:\n  api:\n    image: example/api\n  redis:\n    image: redis\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "--quiet"], cwd=source, check=True)
+            subprocess.run(["git", "add", "docker-compose.yaml"], cwd=source, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "compose",
+                ],
+                cwd=source,
+                check=True,
+            )
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=source, text=True
+            ).strip()
+            manager = DeploymentManager(
+                DeploymentPaths.from_root(root, data_dir=root / "state")
+            )
+            valid = UpstreamSourceSpec(
+                name="firecrawl",
+                repository_url="https://example.invalid/firecrawl.git",
+                revision=revision,
+                required_paths=("docker-compose.yaml",),
+                compose_services=("api", "redis"),
+            )
+            manager._validate_managed_source(source, valid)
+
+            mismatched = replace(valid, compose_services=("api",))
+            with self.assertRaisesRegex(DeploymentError, "Compose services mismatch"):
+                manager._validate_managed_source(source, mismatched)
+
+    def test_cognee_dependencies_are_installed_once_and_verified_for_offline_reuse(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            required = ("pyproject.toml", "cognee/__init__.py")
+            source = root / "managed-cognee"
+            revision = make_git_source(source, required)
+            spec = UpstreamSourceSpec(
+                name="cognee",
+                repository_url="https://example.invalid/cognee.git",
+                revision=revision,
+                required_paths=required,
+            )
+            paths = replace(
+                DeploymentPaths.from_root(root, data_dir=root / "state"),
+                cognee_repo=source,
+            )
+            paths.venv_python.parent.mkdir(parents=True)
+            paths.venv_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            class CogneeInstallRunner(RecordingDeployRunner):
+                installed = False
+
+                def run(self, cmd, *, cwd=None, env=None, timeout=None, check=True):
+                    result = super().run(
+                        cmd,
+                        cwd=cwd,
+                        env=env,
+                        timeout=timeout,
+                        check=check,
+                    )
+                    if cmd[-1:] == [str(source)] and "pip" in cmd:
+                        self.installed = True
+                    if "-c" in cmd and "direct_url.json" in cmd[-1]:
+                        return subprocess.CompletedProcess(cmd, 0 if self.installed else 1)
+                    return result
+
+            runner = CogneeInstallRunner()
+            manager = DeploymentManager(paths, runner=runner)
+
+            with mock.patch(
+                "enterprise_agent_platform.deployment.upstream_source_specs",
+                return_value=(spec,),
+            ):
+                manager.ensure_cognee_dependencies()
+                manager.ensure_cognee_dependencies()
+
+            installs = [
+                call
+                for call in runner.calls
+                if call["cmd"][-1:] == [str(source)] and "pip" in call["cmd"]
+            ]
+            self.assertEqual(len(installs), 1)
+            self.assertNotIn("--force-reinstall", installs[0]["cmd"])
+            self.assertNotIn("--no-build-isolation", installs[0]["cmd"])
+            marker = root / "state" / "runtimes" / "cognee" / "python-install.json"
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["revision"], revision)
+            marker.unlink()
+            with mock.patch(
+                "enterprise_agent_platform.deployment.upstream_source_specs",
+                return_value=(spec,),
+            ):
+                manager.ensure_cognee_dependencies()
+            self.assertTrue(marker.is_file())
+            installs = [
+                call
+                for call in runner.calls
+                if call["cmd"][-1:] == [str(source)] and "pip" in call["cmd"]
+            ]
+            self.assertEqual(len(installs), 1)
+            probes = [call for call in runner.calls if "-c" in call["cmd"]]
+            self.assertTrue(probes)
+            self.assertEqual(probes[-1]["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+
     def test_node_runtime_requires_node_and_npm_at_supported_version(self):
         with tempfile.TemporaryDirectory() as td:
             manager = DeploymentManager(DeploymentPaths.from_root(Path(td)), runner=RecordingDeployRunner())
@@ -234,7 +701,7 @@ class DeploymentTests(unittest.TestCase):
 
             manager.install_managed_node.assert_called_once_with()
 
-    def test_bootstrap_prepare_initializes_submodules_and_platform_venv(self):
+    def test_bootstrap_prepare_initializes_managed_sources_and_platform_venv(self):
         if not shutil.which("git"):
             self.skipTest("git is not available")
         with tempfile.TemporaryDirectory() as td:
@@ -244,12 +711,14 @@ class DeploymentTests(unittest.TestCase):
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
 
             commands = [call["cmd"] for call in runner.calls]
             self.assertEqual(result.mode, "prepare")
-            self.assertEqual(commands[0], ["git", "submodule", "update", "--init", "--recursive"])
+            manager.ensure_managed_sources.assert_called_once_with(("cognee", "firecrawl"))
+            manager.ensure_cognee_dependencies.assert_called_once_with()
             self.assertIn([sys.executable, "-c", "import ensurepip"], commands)
             self.assertIn([sys.executable, "-m", "venv", str(root / ".venv")], commands)
             self.assertIn([str(paths.venv_python), "-m", "pip", "--version"], commands)
@@ -287,6 +756,106 @@ class DeploymentTests(unittest.TestCase):
                 commands,
             )
 
+    def test_bootstrap_only_prepares_enabled_upstream_sources(self):
+        cases = (
+            ("1", "0", ("cognee",), True),
+            ("0", "1", ("firecrawl",), False),
+            ("0", "0", (), False),
+        )
+        for manage_cognee, manage_firecrawl, expected, install_cognee in cases:
+            with self.subTest(
+                manage_cognee=manage_cognee,
+                manage_firecrawl=manage_firecrawl,
+            ), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+                manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+                manager.ensure_python_version = mock.Mock()
+                manager.ensure_node_version = mock.Mock()
+                manager.ensure_layout = mock.Mock()
+                manager.ensure_managed_sources = mock.Mock()
+                manager.ensure_platform_venv = mock.Mock()
+                manager.ensure_cognee_dependencies = mock.Mock()
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
+                        "ENTERPRISE_MANAGE_COGNEE": manage_cognee,
+                        "ENTERPRISE_MANAGE_FIRECRAWL": manage_firecrawl,
+                    },
+                    clear=False,
+                ):
+                    result = manager.bootstrap(
+                        host="127.0.0.1",
+                        port=8765,
+                        mode="prepare",
+                        prepare_runtime=False,
+                    )
+
+                self.assertEqual(result.mode, "prepare")
+                manager.ensure_managed_sources.assert_called_once_with(expected)
+                if install_cognee:
+                    manager.ensure_cognee_dependencies.assert_called_once_with()
+                else:
+                    manager.ensure_cognee_dependencies.assert_not_called()
+
+    def test_bootstrap_managed_sources_use_persisted_settings_before_environment(self):
+        cases = (
+            (
+                "persisted disabled with environment unset",
+                {"cognee_manage": "0", "firecrawl_manage": "0"},
+                {},
+                (),
+                False,
+            ),
+            (
+                "persisted enabled overrides disabled environment",
+                {"cognee_manage": "1", "firecrawl_manage": "1"},
+                {
+                    "ENTERPRISE_MANAGE_COGNEE": "0",
+                    "ENTERPRISE_MANAGE_FIRECRAWL": "0",
+                },
+                ("cognee", "firecrawl"),
+                True,
+            ),
+            (
+                "first deployment defaults to managed",
+                None,
+                {},
+                ("cognee", "firecrawl"),
+                True,
+            ),
+        )
+        for label, persisted, environment, expected, install_cognee in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+                if persisted is not None:
+                    write_platform_settings(paths.data_dir, persisted)
+                manager = DeploymentManager(paths, runner=RecordingDeployRunner())
+                manager.ensure_python_version = mock.Mock()
+                manager.ensure_node_version = mock.Mock()
+                manager.ensure_layout = mock.Mock()
+                manager.ensure_managed_sources = mock.Mock()
+                manager.ensure_platform_venv = mock.Mock()
+                manager.ensure_cognee_dependencies = mock.Mock()
+
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    result = manager.bootstrap(
+                        host="127.0.0.1",
+                        port=8765,
+                        mode="prepare",
+                        prepare_runtime=False,
+                    )
+
+                self.assertEqual(result.mode, "prepare")
+                manager.ensure_managed_sources.assert_called_once_with(expected)
+                if install_cognee:
+                    manager.ensure_cognee_dependencies.assert_called_once_with()
+                else:
+                    manager.ensure_cognee_dependencies.assert_not_called()
+
     def test_platform_pip_install_retries_transient_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -295,6 +864,7 @@ class DeploymentTests(unittest.TestCase):
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
 
             with mock.patch.dict(os.environ, {"ENTERPRISE_PIP_INSTALL_ATTEMPTS": "2"}):
                 result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
@@ -314,6 +884,7 @@ class DeploymentTests(unittest.TestCase):
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
 
             def fake_which(name):
                 if name in {"apt-get", "git", "sudo"}:
@@ -355,6 +926,7 @@ class DeploymentTests(unittest.TestCase):
             runner = BrokenExistingVenvRunner()
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
 
             result = manager.bootstrap(host="127.0.0.1", port=8765, mode="prepare", prepare_runtime=False)
 
@@ -372,6 +944,7 @@ class DeploymentTests(unittest.TestCase):
             paths = DeploymentPaths.from_root(root)
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
 
             with mock.patch.dict(os.environ, {"ENTERPRISE_DEPLOY_AUTO_APT": "0"}):
                 with self.assertRaises(DeploymentError) as ctx:
@@ -404,7 +977,8 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(f"ENTERPRISE_AGENT_RUNTIME_HOME={root / 'state' / 'runtimes' / 'agent'}", unit)
             self.assertIn(str(paths.managed_node_current / "bin"), unit)
             self.assertIn(f"ENTERPRISE_SERVICE_NAME={paths.service_name}", unit)
-            self.assertIn(f"ENTERPRISE_COGNEE_REPO={root / 'cognee'}", unit)
+            self.assertIn(f"ENTERPRISE_COGNEE_REPO={paths.cognee_repo}", unit)
+            self.assertIn(f"ENTERPRISE_FIRECRAWL_REPO={paths.firecrawl_repo}", unit)
             self.assertIn("ENTERPRISE_MANAGE_SEARXNG=0", unit)
             self.assertIn("ENTERPRISE_SEARXNG_API_URL=http://127.0.0.1:14567", unit)
             self.assertIn("ENTERPRISE_SEARXNG_TIMEOUT_SECONDS=37.5", unit)
@@ -422,6 +996,7 @@ class DeploymentTests(unittest.TestCase):
             paths = replace(DeploymentPaths.from_root(root), service_dir=root / "systemd-user")
             manager = DeploymentManager(paths, runner=runner)
             manager.ensure_node_version = mock.Mock()
+            bypass_managed_upstreams(manager)
             manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
             manager.wait_for_service_ready = mock.Mock()
 
@@ -503,9 +1078,9 @@ class DeploymentTests(unittest.TestCase):
                 "ensure_python_version",
                 "ensure_node_version",
                 "ensure_layout",
-                "ensure_submodules",
-                "ensure_source_repos",
+                "ensure_managed_sources",
                 "ensure_platform_venv",
+                "ensure_cognee_dependencies",
             ):
                 setattr(manager, name, mock.Mock())
             manager.prepare_agent_runtime_artifact = mock.Mock(return_value={})
@@ -584,9 +1159,9 @@ class DeploymentTests(unittest.TestCase):
                     manager.ensure_python_version = mock.Mock()
                     manager.ensure_node_version = mock.Mock()
                     manager.ensure_layout = mock.Mock()
-                    manager.ensure_submodules = mock.Mock()
-                    manager.ensure_source_repos = mock.Mock()
+                    manager.ensure_managed_sources = mock.Mock()
                     manager.ensure_platform_venv = mock.Mock()
+                    manager.ensure_cognee_dependencies = mock.Mock()
                     manager.user_systemd_available = mock.Mock(return_value=True)
                     sequence = mock.Mock()
                     sequence.restart.return_value = paths.service_path
@@ -618,9 +1193,9 @@ class DeploymentTests(unittest.TestCase):
             manager.ensure_python_version = mock.Mock()
             manager.ensure_node_version = mock.Mock()
             manager.ensure_layout = mock.Mock()
-            manager.ensure_submodules = mock.Mock()
-            manager.ensure_source_repos = mock.Mock()
+            manager.ensure_managed_sources = mock.Mock()
             manager.ensure_platform_venv = mock.Mock()
+            manager.ensure_cognee_dependencies = mock.Mock()
             sequence = mock.Mock()
             manager.prepare_agent_runtime_artifact = sequence.prepare
             manager.run_foreground = sequence.start
@@ -1396,7 +1971,7 @@ class DeploymentTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_runtime_env_exposes_adjacent_sources(self):
+    def test_runtime_env_exposes_managed_sources(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths = DeploymentPaths.from_root(root)
@@ -1413,8 +1988,10 @@ class DeploymentTests(unittest.TestCase):
                 env = runtime_env(paths, host="127.0.0.1", port=9999)
 
             self.assertEqual(env["ENTERPRISE_AGENT_RUNTIME_HOME"], str(paths.data_dir / "runtimes" / "agent"))
-            self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(root / "cognee"))
-            self.assertEqual(env["ENTERPRISE_FIRECRAWL_REPO"], str(root / "firecrawl"))
+            self.assertEqual(env["ENTERPRISE_MANAGE_COGNEE"], "1")
+            self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(paths.cognee_repo))
+            self.assertEqual(env["ENTERPRISE_MANAGE_FIRECRAWL"], "1")
+            self.assertEqual(env["ENTERPRISE_FIRECRAWL_REPO"], str(paths.firecrawl_repo))
             self.assertEqual(env["ENTERPRISE_MANAGE_SEARXNG"], "0")
             self.assertEqual(
                 env["ENTERPRISE_SEARXNG_API_URL"],
@@ -1423,6 +2000,118 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(env["ENTERPRISE_SEARXNG_TIMEOUT_SECONDS"], "7.5")
             self.assertEqual(env["ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS"], "420")
             self.assertEqual(env["ENTERPRISE_PLATFORM_PORT"], "9999")
+
+    def test_runtime_env_preserves_disabled_external_repositories(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+            external_cognee = root / "external-cognee"
+            external_firecrawl = root / "external-firecrawl"
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_MANAGE_COGNEE": "0",
+                    "ENTERPRISE_COGNEE_REPO": str(external_cognee),
+                    "ENTERPRISE_MANAGE_FIRECRAWL": "0",
+                    "ENTERPRISE_FIRECRAWL_REPO": str(external_firecrawl),
+                },
+                clear=False,
+            ):
+                env = runtime_env(paths, host="127.0.0.1", port=8765)
+
+            self.assertEqual(env["ENTERPRISE_MANAGE_COGNEE"], "0")
+            self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(external_cognee))
+            self.assertEqual(env["ENTERPRISE_MANAGE_FIRECRAWL"], "0")
+            self.assertEqual(
+                env["ENTERPRISE_FIRECRAWL_REPO"], str(external_firecrawl)
+            )
+
+    def test_runtime_env_managed_sources_use_persisted_settings_before_environment(self):
+        cases = (
+            (
+                "persisted enabled pins managed repositories",
+                "1",
+                "0",
+                True,
+            ),
+            (
+                "persisted disabled preserves external repositories",
+                "0",
+                "1",
+                False,
+            ),
+        )
+        for label, persisted, environment, expected_managed in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                paths = DeploymentPaths.from_root(root, data_dir=root / "state")
+                external_cognee = root / "external-cognee"
+                external_firecrawl = root / "external-firecrawl"
+                write_platform_settings(
+                    paths.data_dir,
+                    {
+                        "cognee_manage": persisted,
+                        "firecrawl_manage": persisted,
+                    },
+                )
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_MANAGE_COGNEE": environment,
+                        "ENTERPRISE_COGNEE_REPO": str(external_cognee),
+                        "ENTERPRISE_MANAGE_FIRECRAWL": environment,
+                        "ENTERPRISE_FIRECRAWL_REPO": str(external_firecrawl),
+                    },
+                    clear=True,
+                ):
+                    env = runtime_env(paths, host="127.0.0.1", port=8765)
+
+                expected_cognee = paths.cognee_repo if expected_managed else external_cognee
+                expected_firecrawl = (
+                    paths.firecrawl_repo if expected_managed else external_firecrawl
+                )
+                self.assertEqual(
+                    env["ENTERPRISE_MANAGE_COGNEE"],
+                    "1" if expected_managed else "0",
+                )
+                self.assertEqual(env["ENTERPRISE_COGNEE_REPO"], str(expected_cognee))
+                self.assertEqual(
+                    env["ENTERPRISE_MANAGE_FIRECRAWL"],
+                    "1" if expected_managed else "0",
+                )
+                self.assertEqual(
+                    env["ENTERPRISE_FIRECRAWL_REPO"], str(expected_firecrawl)
+                )
+
+                with mock.patch.dict(os.environ, env, clear=True):
+                    config = PlatformConfig.from_env(root)
+
+                self.assertEqual(config.manage_cognee, expected_managed)
+                self.assertEqual(config.cognee_repo, expected_cognee)
+                self.assertEqual(config.manage_firecrawl, expected_managed)
+                self.assertEqual(config.firecrawl_repo, expected_firecrawl)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_MANAGE_COGNEE": environment,
+                        "ENTERPRISE_COGNEE_REPO": str(external_cognee),
+                        "ENTERPRISE_MANAGE_FIRECRAWL": environment,
+                        "ENTERPRISE_FIRECRAWL_REPO": str(external_firecrawl),
+                    },
+                    clear=True,
+                ):
+                    deployment_config = DeploymentManager(
+                        paths,
+                        runner=RecordingDeployRunner(),
+                    )._platform_config(host="127.0.0.1", port=8765)
+
+                self.assertEqual(deployment_config.manage_cognee, expected_managed)
+                self.assertEqual(deployment_config.cognee_repo, expected_cognee)
+                self.assertEqual(deployment_config.manage_firecrawl, expected_managed)
+                self.assertEqual(deployment_config.firecrawl_repo, expected_firecrawl)
 
     def test_runtime_env_normalizes_empty_searxng_values_consistently(self):
         with tempfile.TemporaryDirectory() as td:

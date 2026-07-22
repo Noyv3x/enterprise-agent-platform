@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import unicodedata
 from typing import Iterable
+
+from .prompt_security import prompt_threat_reasons
 
 
 MAX_MEMORY_CONTENT_LENGTH = 4_000
@@ -13,41 +14,6 @@ MEMORY_QUOTAS: dict[str, tuple[int, int]] = {
     "memory": (200, 100_000),
     "user": (20, 8_000),
 }
-
-_INJECTION_PATTERNS = (
-    re.compile(
-        r"\b(?:ignore|disregard|forget|override|bypass)\b.{0,80}"
-        r"\b(?:previous|prior|system|developer|instruction|prompt|policy|rules?)\b",
-        re.IGNORECASE | re.DOTALL,
-    ),
-    re.compile(
-        r"\b(?:reveal|show|print|leak|repeat)\b.{0,60}"
-        r"\b(?:system|developer)\s+(?:prompt|message|instruction)",
-        re.IGNORECASE | re.DOTALL,
-    ),
-    re.compile(r"\byou\s+are\s+now\b", re.IGNORECASE),
-    re.compile(
-        r"(?:忽略|无视|無視|忘记|忘記|覆盖|覆蓋|绕过|繞過).{0,40}"
-        r"(?:之前|此前|系统|系統|开发者|開發者|指令|提示词|提示詞|规则|規則)",
-        re.DOTALL,
-    ),
-    re.compile(
-        r"(?:显示|顯示|打印|列印|泄露|洩露|复述|復述).{0,30}"
-        r"(?:系统|系統|开发者|開發者)(?:提示词|提示詞|消息|訊息|指令)",
-        re.DOTALL,
-    ),
-    re.compile(r"(?:从|從)(?:现在|現在)起.{0,12}(?:你是|扮演)", re.DOTALL),
-)
-
-_ROLE_MARKER = re.compile(
-    r"(?:^|\n)\s*(?:system|developer|assistant)\s*(?:prompt|message)?\s*:",
-    re.IGNORECASE,
-)
-_RESERVED_TAG = re.compile(
-    r"</?(?:system|developer|assistant|memory-context|recalled-memory|recalled_memory)\b",
-    re.IGNORECASE,
-)
-
 
 def normalize_memory_content(content: str) -> str:
     """Return the stable representation used for deduplication."""
@@ -84,21 +50,7 @@ def memory_injection_reasons(content: str) -> list[str]:
     language. Ordinary preferences and facts should remain valid memories.
     """
 
-    value = unicodedata.normalize("NFKC", str(content or ""))
-    reasons: list[str] = []
-    if _RESERVED_TAG.search(value):
-        reasons.append("reserved_prompt_tag")
-    if _ROLE_MARKER.search(value):
-        reasons.append("role_boundary")
-    if any(pattern.search(value) for pattern in _INJECTION_PATTERNS):
-        reasons.append("instruction_override")
-    if any(
-        unicodedata.category(char) == "Cf"
-        and char not in {"\u200c", "\u200d"}
-        for char in value
-    ):
-        reasons.append("invisible_control")
-    return reasons
+    return prompt_threat_reasons(content)
 
 
 def validate_memory_content(

@@ -1,6 +1,0 @@
-[submodule "cognee"]
-	path = cognee
-	url = https://github.com/topoteretes/cognee.git
-[submodule "firecrawl"]
-	path = firecrawl
-	url = https://github.com/firecrawl/firecrawl.git

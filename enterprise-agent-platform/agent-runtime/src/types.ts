@@ -135,10 +135,19 @@ export interface SessionEntry {
   scope_key: string;
   lifecycle_id: string;
   session_id: string;
+  /** Runtime-owned marker; absent on legacy/imported model content. */
+  model_content_security_version?: number;
   payload: JsonValue | AgentMessage;
 }
 
 export type ApprovalDecision = "once" | "session" | "always" | "deny";
+export type ApprovalResolution = ApprovalDecision | "timeout" | "cancelled" | "notification_failed";
+export type ApprovalOutcome = "approved" | "denied" | "timeout" | "cancelled" | "notification_failed";
+
+export interface ApprovalResult {
+  allowed: boolean;
+  outcome: ApprovalOutcome;
+}
 
 export interface ApprovalRequest {
   id: string;
@@ -147,8 +156,12 @@ export interface ApprovalRequest {
   lifecycle_id: string;
   session_id: string;
   tool_name: string;
+  approval_key: string;
+  /** Display-safe arguments only. Original execution arguments never enter the approval journal. */
   arguments: unknown;
   reason: string;
+  allow_session: boolean;
+  allow_permanent: boolean;
   created_at: string;
 }
 

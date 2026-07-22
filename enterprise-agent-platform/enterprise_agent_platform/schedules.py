@@ -6,6 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .db import Database, now_ts
+from .prompt_security import prompt_threat_reasons
 
 
 MAX_SCHEDULES_PER_USER = 50
@@ -16,6 +17,21 @@ MAX_INTERVAL_SECONDS = 366 * 24 * 60 * 60
 RUN_STATUSES = frozenset(
     {"queued", "running", "succeeded", "failed", "needs_review", "blocked", "skipped", "cancelled"}
 )
+
+
+def validate_schedule_prompt(value: Any) -> str:
+    """Validate durable instructions both when stored and before execution."""
+
+    prompt = str(value or "").strip()
+    if not prompt or len(prompt) > MAX_SCHEDULE_PROMPT_LENGTH:
+        raise ValueError(
+            f"schedule prompt must contain 1 to {MAX_SCHEDULE_PROMPT_LENGTH} characters"
+        )
+    if prompt_threat_reasons(prompt):
+        raise ValueError(
+            "schedule prompt resembles prompt-injection or credential-exfiltration commands"
+        )
+    return prompt
 
 
 def rfc3339_utc(timestamp: int | float | None) -> str | None:

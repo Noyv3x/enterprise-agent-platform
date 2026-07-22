@@ -53,7 +53,11 @@ class CogneeBridge:
         try:
             if self.runtime_manager is not None:
                 runtime = self.runtime_manager.ensure_cognee_ready()
-                if not runtime.available:
+                # A managed bridge must only import the distribution that the
+                # deploy step installed and verified.  In explicit external
+                # mode the runtime manager does not own preparation, so let the
+                # bridge try the operator-provided repository instead.
+                if runtime.managed and not runtime.available:
                     self._status = CogneeStatus(False, backend, runtime.error)
                     self._status_checked_at = now
                     return self._status
@@ -150,9 +154,17 @@ class CogneeBridge:
         return normalized
 
     def _import_cognee(self):
-        repo = self._repo()
-        if repo.exists() and str(repo) not in sys.path:
-            sys.path.insert(0, str(repo))
+        runtime_config = self._runtime_config()
+        managed_value = runtime_config.get("manage_cognee")
+        managed = (
+            self.config.manage_cognee
+            if managed_value is None
+            else _as_bool(managed_value)
+        )
+        if not managed:
+            repo = self._repo(runtime_config)
+            if repo.exists() and str(repo) not in sys.path:
+                sys.path.insert(0, str(repo))
         import cognee  # type: ignore
 
         return cognee
@@ -177,10 +189,10 @@ class CogneeBridge:
     def _dataset(self) -> str:
         return str(self._runtime_config().get("dataset") or self.config.cognee_dataset)
 
-    def _repo(self):
+    def _repo(self, runtime_config: dict[str, Any] | None = None):
         from pathlib import Path
 
-        value = self._runtime_config().get("repo_path")
+        value = (runtime_config or self._runtime_config()).get("repo_path")
         return Path(str(value)).expanduser() if value else self.config.cognee_repo
 
     def _ingest_background(self) -> bool:
@@ -203,6 +215,12 @@ def stringify_cognee_result(item: Any) -> str:
         if value:
             return str(value)
     return str(item)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def compact_repr(value: Any, limit: int = 800) -> str:

@@ -1,6 +1,7 @@
 import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { redactCommandForApproval, redactToolArgumentsForJournal } from "./approval-policy.js";
 import type { JsonValue, SessionEntry } from "./types.js";
 import { id, nowIso, scopeOwns, stableHash } from "./utils.js";
 
@@ -13,11 +14,13 @@ export interface SessionIdentity {
 export interface TrackedSessionMessage {
   entry_id: string;
   message: AgentMessage;
+  model_content_security_version?: number;
 }
 
 export interface CompactedSessionMessage {
   entry_id?: string;
   message: AgentMessage;
+  model_content_security_version?: number;
 }
 
 interface SessionApprovalEntry {
@@ -26,10 +29,12 @@ interface SessionApprovalEntry {
   timestamp: string;
   session_id?: string;
   tool_name?: string;
+  approval_key?: string;
 }
 
 const MAX_SESSION_JOURNAL_BYTES = 64 * 1024 * 1024;
 const MAX_SESSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
+export const CURRENT_MODEL_CONTENT_SECURITY_VERSION = 1;
 
 export class SessionStore {
   private readonly sessionsRoot: string;
@@ -73,7 +78,13 @@ export class SessionStore {
         if (entries.some((entry) => entry.type === "header")) {
           return entries
             .filter((entry) => entry.type === "message")
-            .map((entry) => ({ entry_id: entry.id, message: entry.payload as AgentMessage }));
+            .map((entry) => ({
+              entry_id: entry.id,
+              message: entry.payload as AgentMessage,
+              ...(entry.model_content_security_version !== undefined
+                ? { model_content_security_version: entry.model_content_security_version }
+                : {}),
+            }));
         }
         await mkdir(dirname(file), { recursive: true, mode: 0o700 });
         await this.writeScopeManifest(identity.scope_key);
@@ -172,8 +183,19 @@ export class SessionStore {
     return entries;
   }
 
-  async appendMessage(identity: SessionIdentity, message: AgentMessage): Promise<string> {
-    return (await this.append(identity, "message", durableSessionMessage(message))).id;
+  async appendMessage(
+    identity: SessionIdentity,
+    message: AgentMessage,
+    modelContentSecurityVersion?: number,
+  ): Promise<string> {
+    return (
+      await this.append(
+        identity,
+        "message",
+        durableSessionMessage(message),
+        modelContentSecurityVersion,
+      )
+    ).id;
   }
 
   async appendRun(identity: SessionIdentity, payload: JsonValue): Promise<void> {
@@ -236,7 +258,12 @@ export class SessionStore {
       );
       const compactedMessages = messages.map((message): SessionEntry => {
         if (!message.entry_id) {
-          return this.entry(identity, "message", durableSessionMessage(message.message));
+          return this.entry(
+            identity,
+            "message",
+            durableSessionMessage(message.message),
+            message.model_content_security_version,
+          );
         }
         const currentEntry = currentById.get(message.entry_id)!;
         return {
@@ -244,6 +271,9 @@ export class SessionStore {
           type: "message",
           timestamp: currentEntry.timestamp,
           ...identity,
+          ...(message.model_content_security_version !== undefined
+            ? { model_content_security_version: message.model_content_security_version }
+            : {}),
           payload: durableSessionMessage(message.message),
         };
       });
@@ -272,7 +302,10 @@ export class SessionStore {
       const known = new Set((await this.readArchiveEntries(identity)).map((entry) => entry.id));
       for (const entry of entries) {
         if (known.has(entry.id)) continue;
-        await this.appendRaw(file, entry);
+        const durableEntry = entry.type === "message"
+          ? { ...entry, payload: durableSessionMessage(entry.payload as AgentMessage) }
+          : entry;
+        await this.appendRaw(file, durableEntry);
         known.add(entry.id);
       }
     });
@@ -304,17 +337,21 @@ export class SessionStore {
     }
   }
 
-  async hasSessionApproval(identity: SessionIdentity, toolName: string): Promise<boolean> {
+  async hasSessionApproval(identity: SessionIdentity, approvalKey: string): Promise<boolean> {
     const entries = await this.readApprovalEntries(identity);
     const grants = new Set<string>();
     for (const entry of entries) {
       if (entry.type === "clear") grants.clear();
-      else if (entry.session_id && entry.tool_name) grants.add(`${entry.session_id}\0${entry.tool_name}`);
+      // Legacy entries contain only tool_name and are intentionally ignored:
+      // those grants were too broad to map safely to a concrete v2 object.
+      else if (entry.session_id && entry.approval_key?.startsWith("v2:")) {
+        grants.add(`${entry.session_id}\0${entry.approval_key}`);
+      }
     }
-    return grants.has(`${identity.session_id}\0${toolName}`);
+    return grants.has(`${identity.session_id}\0${approvalKey}`);
   }
 
-  async appendSessionApproval(identity: SessionIdentity, toolName: string): Promise<void> {
+  async appendSessionApproval(identity: SessionIdentity, approvalKey: string, toolName: string): Promise<void> {
     const file = this.approvalPath(identity);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
     await this.appendRaw(file, {
@@ -323,6 +360,7 @@ export class SessionStore {
       timestamp: nowIso(),
       session_id: identity.session_id,
       tool_name: toolName,
+      approval_key: approvalKey,
     } satisfies SessionApprovalEntry);
   }
 
@@ -353,19 +391,34 @@ export class SessionStore {
     identity: SessionIdentity,
     type: SessionEntry["type"],
     payload: JsonValue | AgentMessage,
+    modelContentSecurityVersion?: number,
   ): Promise<SessionEntry> {
     const file = this.path(identity);
     return await this.withQueue(this.mutationQueues, file, async () => {
       await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-      const entry = this.entry(identity, type, payload);
+      const entry = this.entry(identity, type, payload, modelContentSecurityVersion);
       await this.appendRaw(file, entry);
       await this.writeManifest(identity);
       return entry;
     });
   }
 
-  private entry(identity: SessionIdentity, type: SessionEntry["type"], payload: JsonValue | AgentMessage): SessionEntry {
-    return { id: id("entry"), type, timestamp: nowIso(), ...identity, payload };
+  private entry(
+    identity: SessionIdentity,
+    type: SessionEntry["type"],
+    payload: JsonValue | AgentMessage,
+    modelContentSecurityVersion?: number,
+  ): SessionEntry {
+    return {
+      id: id("entry"),
+      type,
+      timestamp: nowIso(),
+      ...identity,
+      ...(modelContentSecurityVersion !== undefined
+        ? { model_content_security_version: modelContentSecurityVersion }
+        : {}),
+      payload,
+    };
   }
 
   private async readApprovalEntries(identity: Pick<SessionIdentity, "scope_key" | "lifecycle_id">): Promise<SessionApprovalEntry[]> {
@@ -543,6 +596,20 @@ function durableSessionMessage(message: AgentMessage): AgentMessage {
         : block),
     };
   }
+  if (message.role === "assistant") {
+    return {
+      ...message,
+      content: message.content.map((block) => block.type === "toolCall"
+        ? {
+            ...block,
+            arguments: redactToolArgumentsForJournal(
+              block.name,
+              objectValue(block.arguments),
+            ),
+          }
+        : block),
+    };
+  }
   if (message.role !== "toolResult") return message;
   return {
     ...message,
@@ -556,7 +623,22 @@ function durableSessionMessage(message: AgentMessage): AgentMessage {
   };
 }
 
-function durableToolDetails(value: unknown): unknown {
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function durableToolDetails(value: unknown, fieldName?: string): unknown {
+  if (fieldName === "command") {
+    return typeof value === "string" ? redactCommandForApproval(value) : "[redacted]";
+  }
+  if (/token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|authorization/i.test(fieldName ?? "")) {
+    return "[redacted]";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
   if (Array.isArray(value)) return value.map((item) => durableToolDetails(item));
   if (!value || typeof value !== "object") return value;
   const source = value as Record<string, unknown>;
@@ -566,7 +648,7 @@ function durableToolDetails(value: unknown): unknown {
   const sanitized: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(source)) {
     if (hasData && key === "data") continue;
-    sanitized[key] = durableToolDetails(item);
+    sanitized[key] = durableToolDetails(item, key);
   }
   if (hasData) {
     if (!(typeof sanitized.bytes === "number" && Number.isFinite(sanitized.bytes))) {

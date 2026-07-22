@@ -174,6 +174,34 @@ test("ProcessRegistry protects background work from updates unless explicitly te
   }
 });
 
+test("ProcessRegistry never exposes raw commands through tool-facing snapshots", async () => {
+  const workspace = await temporaryDirectory("agent-process-snapshot-redaction-");
+  const registry = new ProcessRegistry();
+  const secret = "snapshot-client-secret";
+  try {
+    const started = await registry.run({
+      runId: "run",
+      scopeKey: "private:1",
+      lifecycleId: "life",
+      command: `bash -c 'sshpass -p ${secret} true'`,
+      cwd: workspace,
+      background: true,
+    });
+    const snapshots = [
+      started,
+      ...registry.list("private:1", "life"),
+      registry.get("private:1", started.id, "life"),
+    ];
+    const serialized = JSON.stringify(snapshots);
+    assert.doesNotMatch(serialized, new RegExp(secret));
+    assert.match(serialized, /redacted credential/);
+  } finally {
+    registry.killScope("private:1", "life");
+    await registry.waitForScopeExit("private:1", "life", 5_000);
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("ProcessRegistry exposes a bounded control-free root and delegate preview without internal identifiers", async () => {
   const workspace = await temporaryDirectory("agent-process-preview-");
   const registry = new ProcessRegistry();
@@ -182,7 +210,7 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
       runId: "internal-root-run",
       scopeKey: "private:7",
       lifecycleId: "life-7",
-      command: "TOKEN=root-secret printf '\\033]0;host-title\\007\\033[31mroot-output\\033[0m\\001' # https://example.test/?token=url-secret&api_key=query-secret&session_id=session-url-secret&auth_token=auth-url-secret&cookie=cookie-url-secret curl -u user:pass --cookie session=cookie-secret -H 'Authorization: Bearer bearer-secret' -H 'Cookie: sid=first-cookie-secret; theme=second-cookie-secret' github_pat_abcdefghijklmnopqrstuvwxyz glpat-abcdefghijklmnopqrstuvwxyz",
+      command: "TOKEN=root-secret printf '\\033]0;host-title\\007\\033[31mroot-output\\033[0m\\001' # https://example.test/?token=url-secret&api_key=query-secret&session_id=session-url-secret&auth_token=auth-url-secret&cookie=cookie-url-secret curl -u user:pass --cookie session=cookie-secret -H 'Authorization: Bearer bearer-secret' -H 'Cookie: sid=first-cookie-secret; theme=second-cookie-secret' -HX-API-Key:compact-header-secret --header=Proxy-Authorization:proxy-header-secret github_pat_abcdefghijklmnopqrstuvwxyz glpat-abcdefghijklmnopqrstuvwxyz left\u202eright",
       cwd: workspace,
     });
     const delegate = await registry.run({
@@ -241,12 +269,15 @@ test("ProcessRegistry exposes a bounded control-free root and delegate preview w
       "bearer-secret",
       "first-cookie-secret",
       "second-cookie-secret",
+      "compact-header-secret",
+      "proxy-header-secret",
       "github_pat_abcdefghijklmnopqrstuvwxyz",
       "glpat-abcdefghijklmnopqrstuvwxyz",
     ]) {
       assert.doesNotMatch(rootPreview.command, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
     assert.match(rootPreview.command, /\[redacted\]/);
+    assert.doesNotMatch(rootPreview.command, /\u202e/);
     assert.doesNotMatch(preview.find((process) => process.id === delegate.id)!.command, /delegate-secret/);
   } finally {
     registry.killScope("private:7", "life-7");

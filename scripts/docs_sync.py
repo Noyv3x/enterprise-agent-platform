@@ -51,15 +51,19 @@ REQUIRED_RUNTIME_POLICY_TARGETS = {
     "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts": "typescript-runtime-policy",
     "enterprise-agent-platform/frontend/src/design-contract.generated.ts": "typescript-runtime-policy",
 }
+REQUIRED_UPSTREAM_SOURCES_SOURCE = "docs/contracts/upstream-sources.json"
+REQUIRED_UPSTREAM_SOURCES_DOMAINS = frozenset({"integrations", "platform"})
+REQUIRED_UPSTREAM_SOURCES_TARGETS = {
+    "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py": "python-upstream-sources",
+}
 REQUIRED_OWNED_CODE_PROBES = {
-    ".gitmodules": frozenset({"repository-development"}),
-    "cognee": frozenset({"integrations"}),
-    "firecrawl": frozenset({"integrations"}),
+    ".gitignore": frozenset({"repository-development"}),
     ".github/workflows/quality.yml": frozenset({"repository-development"}),
     "deploy.sh": frozenset({"deployment"}),
     "scripts/docs_sync.py": frozenset({"documentation-governance"}),
     "scripts/release.sh": frozenset({"documentation-governance"}),
     "enterprise-agent-platform/pyproject.toml": frozenset({"platform"}),
+    "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py": frozenset({"integrations"}),
     "enterprise-agent-platform/enterprise_agent_platform/service.py": frozenset({"platform"}),
     "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": frozenset({"integrations"}),
     "enterprise-agent-platform/agent-runtime/package-lock.json": frozenset({"agent-runtime"}),
@@ -383,7 +387,11 @@ def load_manifest(root: Path) -> Manifest:
             target_format = target_raw.get("format")
             if not isinstance(target_path, str) or not target_path:
                 raise DocsSyncError(f"{target_label}.path must be a non-empty string")
-            if target_format not in {"python-runtime-policy", "typescript-runtime-policy"}:
+            if target_format not in {
+                "python-runtime-policy",
+                "typescript-runtime-policy",
+                "python-upstream-sources",
+            }:
                 raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
             _reject_symlink_chain(root, target_path, f"{target_label}.path")
             targets.append(ContractTarget(path=target_path, format=target_format))
@@ -455,6 +463,31 @@ def load_manifest(root: Path) -> Manifest:
     runtime_targets = {target.path: target.format for target in runtime_contract.targets}
     if len(runtime_targets) != len(runtime_contract.targets) or runtime_targets != REQUIRED_RUNTIME_POLICY_TARGETS:
         raise DocsSyncError("runtime-policy targets and formats must match the required platform, runtime, and frontend targets")
+
+    upstream_contracts = [
+        contract for contract in manifest.contracts if contract.identifier == "upstream-sources"
+    ]
+    if len(upstream_contracts) != 1:
+        raise DocsSyncError("manifest must define exactly one upstream-sources contract")
+    upstream_contract = upstream_contracts[0]
+    if upstream_contract.source != REQUIRED_UPSTREAM_SOURCES_SOURCE:
+        raise DocsSyncError(
+            f"upstream-sources source must be {REQUIRED_UPSTREAM_SOURCES_SOURCE}"
+        )
+    if set(upstream_contract.domains) != REQUIRED_UPSTREAM_SOURCES_DOMAINS:
+        raise DocsSyncError(
+            "upstream-sources domains must be exactly: integrations, platform"
+        )
+    upstream_targets = {
+        target.path: target.format for target in upstream_contract.targets
+    }
+    if (
+        len(upstream_targets) != len(upstream_contract.targets)
+        or upstream_targets != REQUIRED_UPSTREAM_SOURCES_TARGETS
+    ):
+        raise DocsSyncError(
+            "upstream-sources targets and formats must match the required Python target"
+        )
 
     for contract in manifest.contracts:
         if not _is_covered_document(manifest, contract.source):
@@ -995,17 +1028,115 @@ export const TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE = {_typescript_string
 '''
 
 
+def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
+    contract = _expect_object(raw, label)
+    _reject_unknown_keys(contract, {"schema_version", "sources"}, label)
+    if contract.get("schema_version") != 1:
+        raise DocsSyncError(f"{label}.schema_version must be 1")
+    sources = _expect_object(contract.get("sources"), f"{label}.sources")
+    if set(sources) != {"cognee", "firecrawl"}:
+        raise DocsSyncError(
+            f"{label}.sources must contain exactly cognee and firecrawl"
+        )
+    for name in sorted(sources):
+        source_label = f"{label}.sources.{name}"
+        source = _expect_object(sources[name], source_label)
+        _reject_unknown_keys(
+            source,
+            {"repository_url", "revision", "required_paths", "compose_services"},
+            source_label,
+        )
+        repository_url = source.get("repository_url")
+        if not isinstance(repository_url, str):
+            raise DocsSyncError(f"{source_label}.repository_url must be a string")
+        parsed = urlsplit(repository_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise DocsSyncError(
+                f"{source_label}.repository_url must be a credential-free HTTPS URL"
+            )
+        revision = source.get("revision")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise DocsSyncError(
+                f"{source_label}.revision must be a lowercase 40-character commit SHA"
+            )
+        required_paths = _expect_string_list(
+            source.get("required_paths"), f"{source_label}.required_paths"
+        )
+        if len(set(required_paths)) != len(required_paths):
+            raise DocsSyncError(f"{source_label}.required_paths must be unique")
+        for required in required_paths:
+            path = PurePosixPath(required)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
+            ):
+                raise DocsSyncError(
+                    f"{source_label}.required_paths contains an unsafe path: {required}"
+                )
+        compose_services = source.get("compose_services")
+        if name == "firecrawl":
+            services = _expect_string_list(
+                compose_services,
+                f"{source_label}.compose_services",
+            )
+            if tuple(sorted(services)) != services:
+                raise DocsSyncError(
+                    f"{source_label}.compose_services must be sorted"
+                )
+            for service in services:
+                if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", service):
+                    raise DocsSyncError(
+                        f"{source_label}.compose_services contains an invalid service: {service}"
+                    )
+        elif compose_services is not None:
+            raise DocsSyncError(
+                f"{source_label}.compose_services is only valid for firecrawl"
+            )
+    return contract
+
+
+def _render_python_upstream_sources(contract: dict[str, Any], source: str) -> str:
+    serialized = json.dumps(
+        contract["sources"],
+        ensure_ascii=False,
+        indent=4,
+        sort_keys=True,
+    )
+    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
+from __future__ import annotations
+
+UPSTREAM_SOURCE_SCHEMA_VERSION = {contract["schema_version"]}
+
+UPSTREAM_SOURCES = {serialized}
+'''
+
+
 def render_contract(root: Path, contract: Contract) -> dict[str, str]:
     raw = _read_json(_safe_path(root, contract.source), f"contract {contract.identifier}")
-    if contract.identifier != "runtime-policy":
+    if contract.identifier == "runtime-policy":
+        parsed = _validate_runtime_contract(raw, f"contract {contract.identifier}")
+    elif contract.identifier == "upstream-sources":
+        parsed = _validate_upstream_sources_contract(
+            raw, f"contract {contract.identifier}"
+        )
+    else:
         raise DocsSyncError(f"unsupported contract id: {contract.identifier}")
-    parsed = _validate_runtime_contract(raw, f"contract {contract.identifier}")
     rendered: dict[str, str] = {}
     for target in contract.targets:
         if target.format == "python-runtime-policy":
             content = _render_python_runtime_policy(parsed, contract.source)
         elif target.format == "typescript-runtime-policy":
             content = _render_typescript_runtime_policy(parsed, contract.source)
+        elif target.format == "python-upstream-sources":
+            content = _render_python_upstream_sources(parsed, contract.source)
         else:  # Protected by manifest validation; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content

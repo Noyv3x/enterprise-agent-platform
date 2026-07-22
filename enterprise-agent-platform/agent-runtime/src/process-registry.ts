@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir } from "node:fs/promises";
+import { redactCommandForApproval } from "./approval-policy.js";
 import { id, abortError, errorMessage, scopeOwns, throwIfAborted, truncate } from "./utils.js";
 
 export type ProcessUpdateBehavior = "wait" | "terminate";
@@ -480,7 +481,13 @@ export class ProcessRegistry {
       previewUpdatedAt: _previewUpdatedAt,
       ...snapshot
     } = process;
-    return { ...snapshot };
+    return {
+      ...snapshot,
+      // Every snapshot can become model-visible or durable through terminal
+      // and process tool results. Keep the executable closure private and
+      // expose only the shared presentation-safe command copy.
+      command: redactCommandForApproval(snapshot.command),
+    };
   }
 
   private previewSnapshot(process: ManagedProcess, index: number): ProcessPreview {
@@ -553,41 +560,7 @@ function previewRevisionKey(scopeKey: string, lifecycleId: string): string {
 }
 
 function redactPreviewCommand(value: string): string {
-  const sensitiveName = "[A-Za-z0-9_.-]*(?:token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|auth|pat|session(?:[_-]?(?:id|key|token|secret))?)[A-Za-z0-9_.-]*";
-  let command = stripTerminalControls(value);
-  // Header values commonly contain semicolon-separated cookies. Redact the
-  // complete quoted header before token-oriented rules can expose a later
-  // cookie whose name itself does not look sensitive.
-  command = command.replace(
-    /(["'])((?:authorization|(?:set-)?cookie)\s*:)[\s\S]*?\1/gi,
-    "$1$2 [redacted]$1",
-  );
-  command = command.replace(
-    new RegExp(`\\b(${sensitiveName})\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s;|&]+)`, "gi"),
-    "$1=[redacted]",
-  );
-  command = command.replace(
-    /(--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|private[-_]?key|credential|cookie|auth|pat|session))(?:\s*=\s*|\s+)(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
-    "$1 [redacted]",
-  );
-  command = command.replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^\s'";|&]+/gi, "$1[redacted]");
-  command = command.replace(/((?:set-)?cookie\s*:\s*)[^\s'";|&]+/gi, "$1[redacted]");
-  command = command.replace(
-    /((?:^|\s)(?:-u|--user)(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
-    "$1[redacted]",
-  );
-  command = command.replace(
-    /((?:^|\s)(?:-b|--cookie)(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi,
-    "$1[redacted]",
-  );
-  command = command.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, "$1[redacted]@");
-  command = command.replace(
-    new RegExp(`([?&](?:${sensitiveName})=)[^&#\\s'";|]+`, "gi"),
-    "$1[redacted]",
-  );
-  command = command.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g, "[redacted]");
-  command = command.replace(/\b(?:github_pat_|gh[pousr]_|glpat-|sk-)[A-Za-z0-9_-]{16,}\b/gi, "[redacted]");
-  return utf8Tail(command, PREVIEW_COMMAND_BYTES).value;
+  return utf8Tail(redactCommandForApproval(value), PREVIEW_COMMAND_BYTES).value;
 }
 
 function boundedPlainText(value: string, maxBytes: number): { value: string; truncated: boolean } {

@@ -61,7 +61,7 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 
 `session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有规范私人 Agent 与频道主 Agent 可以使用，响应有统一字符预算。
 
-知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，记忆属于 Agent 或用户，不能互相冒充来源。
+知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，记忆属于 Agent 或用户，不能互相冒充来源。可选 Cognee 增强在托管模式下必须使用部署已验证的 Python 安装；用于安装和版本校验的固定 source checkout 不是运行时导入路径，不得因知识查询或摄取生成字节码缓存而变脏。
 
 ## 技能数据
 

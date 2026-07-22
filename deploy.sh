@@ -212,7 +212,7 @@ update_repo() {
     PREV_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   fi
 
-  git -C "$ROOT" fetch --recurse-submodules "$remote" || return 1
+  git -C "$ROOT" fetch "$remote" || return 1
   if [[ -n "$target_branch" ]]; then
     git -C "$ROOT" merge --ff-only "$remote/$target_branch" || return 1
   elif [[ -n "$upstream" && "$remote" == "${upstream%%/*}" ]]; then
@@ -224,10 +224,9 @@ update_repo() {
     return 1
   fi
   UPDATE_SOURCE_MOVED=1
-  git -C "$ROOT" submodule update --init --recursive || return 1
 }
 
-# Revert the working tree (and submodules) to the pre-update revision and
+# Revert the working tree to the pre-update revision and
 # redeploy the known-good code so the service is restored to a working state.
 rollback_update() {
   if [[ -z "$PREV_SHA" ]]; then
@@ -255,10 +254,6 @@ rollback_update() {
     echo "Automatic rollback was refused because concurrent local changes could not be preserved." >&2
     return 1
   fi
-  if ! git -C "$ROOT" submodule update --init --recursive; then
-    echo "Previous source was selected, but submodules could not be restored without force." >&2
-    return 1
-  fi
   # Reinstall and restart from the restored revision so the live service runs
   # known-good code again. If even this fails, surface manual recovery steps.
   if python_bootstrap_checked auto "$@"; then
@@ -266,7 +261,7 @@ rollback_update() {
     return 0
   else
     echo "Rollback redeploy failed. Recover manually with:" >&2
-    echo "  git -C \"$ROOT\" reset --keep ${PREV_SHA} && git -C \"$ROOT\" submodule update --init --recursive && ./deploy.sh" >&2
+    echo "  git -C \"$ROOT\" reset --keep ${PREV_SHA} && ./deploy.sh" >&2
   fi
   return 1
 }

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .prompt_security import prompt_threat_reasons
 from .secure_fs import ensure_private_directory
 
 
@@ -1092,7 +1093,10 @@ class SkillStore:
         *,
         include_instructions: bool,
     ) -> dict[str, Any]:
-        document = self._read_document(skill_dir)
+        document = self._read_document(
+            skill_dir,
+            check_instruction_threats=include_instructions,
+        )
         sidecar = self._read_sidecar(skill_dir, expected_id=skill_dir.name)
         linked = self._scan_linked_files(skill_dir)
         record: dict[str, Any] = {
@@ -1202,7 +1206,10 @@ class SkillStore:
         include_instructions: bool,
     ) -> dict[str, Any]:
         self._validate_bundled_package_root(skill_dir)
-        document = self._read_document(skill_dir)
+        document = self._read_document(
+            skill_dir,
+            check_instruction_threats=include_instructions,
+        )
         linked = self._scan_linked_files(
             skill_dir,
             allowed_root_entries={
@@ -1289,7 +1296,12 @@ class SkillStore:
                 label=f"bundled Skill metadata {metadata_name}",
             )
 
-    def _read_document(self, skill_dir: Path) -> dict[str, Any]:
+    def _read_document(
+        self,
+        skill_dir: Path,
+        *,
+        check_instruction_threats: bool = True,
+    ) -> dict[str, Any]:
         text, _ = _read_private_text(
             skill_dir / "SKILL.md",
             max_bytes=_MAX_SKILL_DOCUMENT_BYTES,
@@ -1298,7 +1310,10 @@ class SkillStore:
         )
         try:
             parsed = _parse_skill_document(text)
-            return _validated_document(**parsed)
+            return _validated_document(
+                **parsed,
+                check_instruction_threats=check_instruction_threats,
+            )
         except SkillStoreError as exc:
             if exc.status >= 500:
                 raise
@@ -1482,7 +1497,7 @@ class SkillStore:
         # Reading package metadata verifies the document/sidecar UTF-8,
         # sidecar identity, support file types/quotas, and absence of symlinks
         # without loading every supporting payload.
-        self._read_record(skill_dir, include_instructions=True)
+        self._read_record(skill_dir, include_instructions=False)
 
     def _ensure_unique_name(
         self,
@@ -1495,7 +1510,10 @@ class SkillStore:
         for skill_dir in skill_dirs:
             if skill_dir.name == exclude_id:
                 continue
-            existing = self._read_document(skill_dir)
+            existing = self._read_document(
+                skill_dir,
+                check_instruction_threats=False,
+            )
             if str(existing["name"]).casefold() == desired:
                 raise SkillStoreError(
                     409,
@@ -1767,6 +1785,7 @@ def _validated_document(
     version: Any,
     category: Any,
     tags: Sequence[str] | None,
+    check_instruction_threats: bool = True,
 ) -> dict[str, Any]:
     normalized_name = _validate_scalar(name, "name", max_chars=MAX_NAME_CHARS)
     normalized_description = _validate_scalar(
@@ -1810,6 +1829,12 @@ def _validated_document(
             413,
             f"instructions may contain at most {MAX_INSTRUCTIONS_BYTES} bytes",
             code="skill_size_exceeded",
+        )
+    if check_instruction_threats and prompt_threat_reasons(instructions):
+        raise SkillStoreError(
+            400,
+            "instructions resemble prompt-injection or credential-exfiltration commands",
+            code="unsafe_skill_instructions",
         )
     return {
         "name": normalized_name,

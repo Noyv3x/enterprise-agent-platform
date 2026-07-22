@@ -66,10 +66,9 @@ jobs:
       run:
         working-directory: enterprise-agent-platform
     steps:
-      - name: Check out source and submodules
+      - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          submodules: recursive
           persist-credentials: false
 
       - name: Set up Python
@@ -93,6 +92,25 @@ jobs:
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
 
+      - name: Verify fetchable managed upstream sources
+        shell: bash
+        run: |
+          data_dir="$(mktemp -d)"
+          trap 'rm -rf "$data_dir"' EXIT
+          python - "$data_dir" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from enterprise_agent_platform.deployment import DeploymentManager, DeploymentPaths
+
+          repository_root = Path.cwd().parent.resolve()
+          paths = DeploymentPaths.from_root(
+              repository_root,
+              data_dir=Path(sys.argv[1]).resolve(),
+          )
+          DeploymentManager(paths).ensure_managed_sources(("cognee", "firecrawl"))
+          PY
+
   frontend:
     name: Node 24
     runs-on: ubuntu-latest
@@ -101,10 +119,9 @@ jobs:
       run:
         working-directory: enterprise-agent-platform/frontend
     steps:
-      - name: Check out source and submodules
+      - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          submodules: recursive
           persist-credentials: false
 
       - name: Set up Node.js
@@ -149,10 +166,9 @@ jobs:
       run:
         working-directory: enterprise-agent-platform/agent-runtime
     steps:
-      - name: Check out source and submodules
+      - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          submodules: recursive
           persist-credentials: false
 
       - name: Set up Node.js

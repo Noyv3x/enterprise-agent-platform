@@ -5,7 +5,7 @@ ubitech agent 的设计、架构、运维与开发规范统一收录在 [canonic
 ## 快速开始
 
 ```bash
-git clone --recurse-submodules https://github.com/Noyv3x/enterprise-agent-platform.git
+git clone https://github.com/Noyv3x/enterprise-agent-platform.git
 cd enterprise-agent-platform
 ./deploy.sh
 ```

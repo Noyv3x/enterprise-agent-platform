@@ -14,41 +14,75 @@ import { dirname, join } from "node:path";
 import type { JsonObject, RunResult, RunStatus } from "./types.js";
 import { id, nowIso, stableHash } from "./utils.js";
 
+interface AlwaysGrant {
+  scope_key: string;
+  approval_key: string;
+  tool_name: string;
+  created_at: string;
+}
+
 interface AlwaysGrantFile {
-  version: 1;
-  grants: Array<{ scope_key: string; tool_name: string; created_at: string }>;
+  version: 2;
+  grants: AlwaysGrant[];
 }
 
 export class AlwaysApprovalStore {
   private readonly file: string;
-  private readonly grants = new Map<string, { scope_key: string; tool_name: string; created_at: string }>();
+  private readonly grants = new Map<string, AlwaysGrant>();
 
   constructor(home: string) {
     this.file = join(home, "approvals", "always.json");
-    const stored = readJsonFile<AlwaysGrantFile>(this.file, { version: 1, grants: [] });
-    for (const grant of stored.grants) {
-      if (grant.scope_key && grant.tool_name) this.grants.set(this.key(grant.scope_key, grant.tool_name), grant);
+    const stored = readJsonFile<unknown>(this.file, { version: 2, grants: [] });
+    if (isAlwaysGrantFile(stored)) {
+      for (const grant of stored.grants) {
+        this.grants.set(this.key(grant.scope_key, grant.approval_key), grant);
+      }
+    } else if (existsSync(this.file)) {
+      // Version 1 grants were keyed only by tool name. Carrying a broad
+      // `terminal` grant forward would silently authorize unrelated commands,
+      // so replace legacy/invalid state with an empty v2 store.
+      this.flush();
     }
   }
 
-  has(scopeKey: string, toolName: string): boolean {
-    return this.grants.has(this.key(scopeKey, toolName));
+  has(scopeKey: string, approvalKey: string): boolean {
+    return this.grants.has(this.key(scopeKey, approvalKey));
   }
 
-  grant(scopeKey: string, toolName: string): void {
-    const key = this.key(scopeKey, toolName);
+  grant(scopeKey: string, approvalKey: string, toolName: string): void {
+    const key = this.key(scopeKey, approvalKey);
     if (this.grants.has(key)) return;
-    this.grants.set(key, { scope_key: scopeKey, tool_name: toolName, created_at: nowIso() });
+    this.grants.set(key, {
+      scope_key: scopeKey,
+      approval_key: approvalKey,
+      tool_name: toolName,
+      created_at: nowIso(),
+    });
     this.flush();
   }
 
   private flush(): void {
-    writeJsonAtomic(this.file, { version: 1, grants: [...this.grants.values()] } satisfies AlwaysGrantFile);
+    writeJsonAtomic(this.file, { version: 2, grants: [...this.grants.values()] } satisfies AlwaysGrantFile);
   }
 
-  private key(scopeKey: string, toolName: string): string {
-    return `${scopeKey}\0${toolName}`;
+  private key(scopeKey: string, approvalKey: string): string {
+    return `${scopeKey}\0${approvalKey}`;
   }
+}
+
+function isAlwaysGrantFile(value: unknown): value is AlwaysGrantFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { version?: unknown; grants?: unknown };
+  return candidate.version === 2
+    && Array.isArray(candidate.grants)
+    && candidate.grants.every((grant) => {
+      if (!grant || typeof grant !== "object" || Array.isArray(grant)) return false;
+      const item = grant as Record<string, unknown>;
+      return typeof item.scope_key === "string" && item.scope_key.length > 0
+        && typeof item.approval_key === "string" && item.approval_key.startsWith("v2:")
+        && typeof item.tool_name === "string" && item.tool_name.length > 0
+        && typeof item.created_at === "string";
+    });
 }
 
 export interface PersistentIdempotencyRecord {

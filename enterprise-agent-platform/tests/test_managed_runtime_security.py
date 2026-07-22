@@ -1303,6 +1303,14 @@ console.log(JSON.stringify(payload));
             )
             for service, image in FIRECRAWL_SERVICE_IMAGES:
                 self.assertIn(f"  {service}:\n    image: {image}", override)
+            self.assertIn(
+                "  api:\n"
+                f"    image: {FIRECRAWL_IMAGE}\n"
+                "    depends_on:\n"
+                "      foundationdb-init:\n"
+                "        condition: service_completed_successfully",
+                override,
+            )
             self.assertNotIn("searxng", override.lower())
             self.assertNotIn('"0.0.0.0:', override)
             self.assertNotIn("condition: service_healthy", override)
@@ -1324,6 +1332,96 @@ console.log(JSON.stringify(payload));
             )
             for image in override_images:
                 self.assertRegex(image, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+
+            contracted_services = tuple(
+                runtime_module.UPSTREAM_SOURCES["firecrawl"]["compose_services"]
+            )
+            self.assertEqual(
+                contracted_services,
+                tuple(sorted(service for service, _image in FIRECRAWL_SERVICE_IMAGES)),
+            )
+
+    def test_canonical_managed_firecrawl_source_is_revalidated_before_use(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            revision = runtime_module.UPSTREAM_SOURCES["firecrawl"]["revision"]
+            services = runtime_module.UPSTREAM_SOURCES["firecrawl"]["compose_services"]
+            repo = tmp / "runtimes" / "firecrawl" / "source" / revision
+            repo.mkdir(parents=True)
+            (repo / "docker-compose.yaml").write_text(
+                "services:\n"
+                + "".join(
+                    f"  {service}:\n    image: example/{service}\n"
+                    for service in services
+                ),
+                encoding="utf-8",
+            )
+            config = replace(make_config(tmp), firecrawl_repo=repo)
+            manager = self._manager(tmp, config=config)
+
+            def clean_git(command, **_kwargs):
+                stdout = revision + "\n" if "rev-parse" in command else ""
+                return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.subprocess.run",
+                side_effect=clean_git,
+            ):
+                self.assertEqual(manager._managed_firecrawl_source_error(), "")
+                status = manager.prepare_firecrawl()
+            self.assertTrue(status.available)
+            command, cwd, _detail = manager._firecrawl_command()
+            self.assertEqual(cwd, repo)
+            self.assertIn("docker-compose.yaml", command)
+
+            (repo / "docker-compose.yaml").write_text(
+                (repo / "docker-compose.yaml").read_text(encoding="utf-8")
+                + "  unexpected-service:\n    image: example/unexpected\n",
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.subprocess.run",
+                side_effect=clean_git,
+            ):
+                rejected = manager.prepare_firecrawl()
+            self.assertEqual(rejected.state, "invalid_source")
+            self.assertIn("services do not match", rejected.error)
+
+    def test_canonical_managed_firecrawl_dirty_source_never_starts(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            revision = runtime_module.UPSTREAM_SOURCES["firecrawl"]["revision"]
+            services = runtime_module.UPSTREAM_SOURCES["firecrawl"]["compose_services"]
+            repo = tmp / "runtimes" / "firecrawl" / "source" / revision
+            repo.mkdir(parents=True)
+            (repo / "docker-compose.yaml").write_text(
+                "services:\n"
+                + "".join(f"  {service}:\n" for service in services),
+                encoding="utf-8",
+            )
+            launcher = RecordingLauncher()
+            manager = self._manager(
+                tmp,
+                config=replace(make_config(tmp), firecrawl_repo=repo),
+                launcher=launcher,
+            )
+
+            def dirty_git(command, **_kwargs):
+                stdout = (
+                    revision + "\n"
+                    if "rev-parse" in command
+                    else "?? docker-compose.yml\n"
+                )
+                return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.subprocess.run",
+                side_effect=dirty_git,
+            ):
+                status = manager.ensure_firecrawl_ready(wait=False)
+            self.assertEqual(status.state, "invalid_source")
+            self.assertIn("modified", status.error)
+            self.assertFalse(launcher.calls)
 
     def test_searxng_uses_private_directories_loopback_publish_and_digest_pin(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1446,7 +1544,7 @@ console.log(JSON.stringify(payload));
         repository = Path(__file__).resolve().parents[2] / "firecrawl"
         compose_file = repository / "docker-compose.yaml"
         if not compose_file.is_file():
-            self.skipTest("Firecrawl submodule compose file is unavailable")
+            self.skipTest("Firecrawl managed source compose file is unavailable")
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -1491,6 +1589,10 @@ console.log(JSON.stringify(payload));
             for service, image in FIRECRAWL_SERVICE_IMAGES:
                 self.assertEqual(services[service]["image"], image)
                 self.assertRegex(image, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                services["api"]["depends_on"]["foundationdb-init"]["condition"],
+                "service_completed_successfully",
+            )
             self.assertNotIn("searxng", services)
             # Firecrawl's upstream Compose schema currently declares an empty
             # optional search variable. The platform must not populate it or

@@ -610,7 +610,7 @@ class AutoUpdateManager:
         branch = _safe_git_name(branch or "main", "branch")
         dirty_summary = self._git_stdout(["git", "status", "--porcelain"])
         current = self._git_stdout(["git", "rev-parse", "HEAD"])
-        self._git(["git", "fetch", "--quiet", "--recurse-submodules", remote, branch], timeout=120)
+        self._git(["git", "fetch", "--quiet", remote, branch], timeout=120)
         remote_ref = f"{remote}/{branch}"
         remote_revision = self._git_stdout(["git", "rev-parse", remote_ref])
         if current == remote_revision:

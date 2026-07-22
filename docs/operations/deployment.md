@@ -6,7 +6,7 @@
 
 - Python 3.11 或更高版本；
 - Node.js 22.19 或更高版本及 npm；
-- Git 与 submodule 支持；
+- Git；
 - 启用托管 SearXNG/Firecrawl 时需要支持 `docker compose up --wait` 的 Docker Compose；
 - Linux 托管 Camoufox 需要部署脚本列出的图形和字体依赖。
 
@@ -23,7 +23,7 @@
 首次部署执行以下工作：
 
 1. 验证 canonical 文档、生成契约、最近提交与工作区的双向同步、Python、Node、仓库和目录；
-2. 初始化 Cognee 与 Firecrawl submodule；
+2. 按上游源码契约把 Cognee 与 Firecrawl 的精确 revision 原子准备到平台数据目录；
 3. 创建根 `.venv` 并安装 Python package；
 4. 按 lockfile 构建并原子发布 Agent Runtime；
 5. 准备 Camoufox、SearXNG、Firecrawl 和 Cognee 的受管状态；
@@ -89,17 +89,23 @@ npm run build
 
 冷启动可能下载大型镜像和浏览器资产。管理界面中的 starting/prepared 状态不等于失败；等待边界由部署和托管服务配置及测试约束。
 
-## Submodule 边界
+## 上游源码准备
 
-部署可以执行 `git submodule update --init --recursive`，但不得在 Cognee 或 Firecrawl 子仓库创建产品提交。更新 pinned revision 只能由明确的依赖升级变更完成。
+本仓库没有 Git submodule。部署从 [`upstream-sources.json`](../contracts/upstream-sources.json) 读取固定 HTTPS 仓库地址、40 位 commit 和必需路径，在 `$DATA/runtimes/<name>/source/<revision>/` 下通过私有 staging checkout 准备；只接受实际 HEAD 与契约完全相等且必需路径有效的结果，再用同文件系统 rename 发布。并发部署由数据目录锁串行化，已验证的相同 revision 源码可离线复用，状态查询不联网。该离线承诺不包括 Cognee 首次 Python 依赖安装；在下次升级 Cognee revision 前，必须引入平台锁定的依赖集或按 revision 隔离的可回滚环境。
 
-平台生成的 Firecrawl env/override 和 SearXNG 配置必须位于数据目录，使根工作树和 submodule 在正常运行后保持干净。
+发布门禁必须在空数据目录中对两个契约 commit 执行真实浅拉取和同一套本地验证；只做 SHA 字符串校验或在源不存在时 skip 不构成发布验证。Firecrawl 还必须在无根目录 checkout 的 clean CI 中验证契约服务清单与全部 digest override 一致。
+
+首次从旧 submodule 版本升级时，根目录可能残留 Git 已无法删除的旧 checkout。根路径被忽略以保持更新工作树 clean；部署只在确认旧 checkout 无本地修改且 HEAD 等于当前源码契约时，才可把它作为离线 Git object 来源。无论新受管源是否已经发布，平台都绝不自动删除、移动或改写根目录遗留 checkout；运维确认不再需要后才可手工清理。
+
+源码准备、Cognee 依赖安装和生成的服务运行环境必须共用同一个有效 managed 开关。已有 `$DATA/platform.db` 中的 `cognee_manage` 或 `firecrawl_manage` 设置时，持久化值优先于对应的 `ENTERPRISE_MANAGE_COGNEE` 或 `ENTERPRISE_MANAGE_FIRECRAWL` 环境变量，与业务运行时的判定保持一致；只有数据库不存在或没有对应设置时才回退环境变量。首次部署在两处都无值时默认开启托管。有效开启时，生成环境必须把 managed 开关写为 `1` 并把 repo 固定为数据目录中的契约 revision，不得被遗留的外置环境变量绕过；有效关闭时，bootstrap 不得为它拉取固定源码或安装依赖，生成环境才保留运维提供的外置 repo 路径。
+
+平台生成的 Firecrawl env/override 和 SearXNG 配置必须位于数据目录，使产品工作树在正常运行后保持干净。Cognee 的依赖在 prepare 阶段从固定 source 安装到平台受管 Python 环境；缺依赖必须使部署失败，不能延迟到摄取任务。业务进程只从该环境导入托管 Cognee，不直接导入或写入按 revision 发布的 source checkout，以保证同 revision 可在下次部署和回滚中继续通过干净性校验。
 
 ## 手工更新与回滚
 
-`./deploy.sh update` 只在整个仓库没有 staged、unstaged 或 untracked 变化时工作。它获取仓库锁、记录当前 HEAD、执行 fast-forward、同步 submodule，并在启动目标版本前验证其 canonical 文档、生成契约和本次代码/文档双向变化。目标版本未通过门禁时按部署失败处理并走同一回滚路径。
+`./deploy.sh update` 只在整个仓库没有 staged、unstaged 或 untracked 变化时工作。它获取仓库锁、记录当前 HEAD、执行 fast-forward，并在启动目标版本前验证其 canonical 文档、生成契约和本次代码/文档双向变化。目标版本未通过门禁时按部署失败处理并走同一回滚路径。上游 source 在 bootstrap 中按目标代码的契约另行准备，不参与产品仓库 fast-forward。
 
-新版本部署失败时，脚本先再次确认没有并发产生的本地变化，再使用 `git reset --keep` 恢复旧 HEAD、恢复 submodule 并重新部署旧版本。它绝不以 `reset --hard` 覆盖未知本地工作。
+新版本部署失败时，脚本先再次确认没有并发产生的本地变化，再使用 `git reset --keep` 恢复旧 HEAD 并重新部署旧版本。按 revision 分目录保留的受管 source 允许旧版本复用其精确源；它绝不以 `reset --hard` 覆盖未知本地工作或清理未知遗留目录。
 
 ## 验证
 

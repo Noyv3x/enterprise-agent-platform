@@ -50,6 +50,11 @@ from .loopback_http import (
     validate_loopback_url,
 )
 from .secure_fs import ensure_private_directory, ensure_private_file
+from .upstream_source_validation import (
+    UpstreamSourceValidationError,
+    parse_compose_service_names,
+)
+from .upstream_sources_generated import UPSTREAM_SOURCES
 
 
 AGENT_SETTING_MANAGED = "agent_runtime_manage"
@@ -138,6 +143,8 @@ FIRECRAWL_SERVICE_IMAGES = (
     ("foundationdb", FIRECRAWL_FOUNDATIONDB_IMAGE),
     ("foundationdb-init", FIRECRAWL_FOUNDATIONDB_IMAGE),
 )
+FIRECRAWL_COMPOSE_PROJECT = "firecrawl"
+FIRECRAWL_COMPOSE_WAIT_MIN_SECONDS = 120
 
 
 def invalidates_runtime_status_cache(method):
@@ -254,6 +261,18 @@ class _SearXNGStateSnapshot:
     last_started_at: int | None
 
 
+@dataclass(frozen=True)
+class _FirecrawlStateSnapshot:
+    generation: int
+    pid: int | None
+    process_running: bool
+    returncode: int | None
+    launch_confirmed: bool
+    teardown_owned: bool
+    last_error: str
+    last_started_at: int | None
+
+
 class PlatformRuntimeManager:
     """Prepare and supervise the runtimes owned by the platform."""
 
@@ -277,12 +296,15 @@ class PlatformRuntimeManager:
         self._searxng_compose_capability_lock = threading.Lock()
         self._searxng_compose_capability_checked_at = 0.0
         self._searxng_compose_capability_error = ""
+        self._firecrawl_state_lock = threading.RLock()
+        self._firecrawl_state_generation = 0
         self._agent_process: ProcessLike | None = None
         self._camofox_process: ProcessLike | None = None
         self._searxng_process: ProcessLike | None = None
         self._firecrawl_process: ProcessLike | None = None
         self._searxng_compose_teardown: tuple[list[str], Path | None] | None = None
         self._searxng_launch_confirmed = False
+        self._firecrawl_launch_confirmed = False
         # When Firecrawl was launched via the managed `docker compose up` stack,
         # remember the (compose argv, cwd) needed to tear it down so stop/close
         # can run `docker compose down` instead of orphaning the containers.
@@ -914,9 +936,7 @@ class PlatformRuntimeManager:
         try:
             self._seed_cognee_env()
             repo = self._effective_cognee_repo()
-            if repo.exists() and str(repo) not in sys.path:
-                sys.path.insert(0, str(repo))
-            available = repo.exists() or _module_importable("cognee")
+            available = repo.exists() and _module_importable("cognee")
             if not available:
                 self._cognee_last_error = f"Cognee repository/package not found at {repo}"
                 return RuntimeStatus(
@@ -957,7 +977,7 @@ class PlatformRuntimeManager:
         if not self._managed_cognee_enabled():
             return RuntimeStatus("cognee", False, False, "external", "managed Cognee disabled")
         repo = self._effective_cognee_repo()
-        available = repo.exists() or str(repo) in sys.path or _module_importable("cognee")
+        available = repo.exists() and _module_importable("cognee")
         if not available:
             error = self._cognee_last_error or f"Cognee repository/package not found at {repo}"
             return RuntimeStatus(
@@ -1726,6 +1746,18 @@ class PlatformRuntimeManager:
                 url=self._effective_firecrawl_api_url(),
                 error=url_error,
             )
+        source_error = self._managed_firecrawl_source_error()
+        if source_error:
+            self._firecrawl_last_error = source_error
+            return RuntimeStatus(
+                "firecrawl",
+                True,
+                False,
+                "invalid_source",
+                path=str(self._effective_firecrawl_repo()),
+                url=self._effective_firecrawl_api_url(),
+                error=source_error,
+            )
         command, cwd, detail = self._firecrawl_command()
         available = bool(command)
         if available and cwd is not None:
@@ -1747,24 +1779,29 @@ class PlatformRuntimeManager:
     def ensure_firecrawl_ready(self, *, wait: bool = True) -> RuntimeStatus:
         started = False
         try:
+            if not self._managed_firecrawl_enabled():
+                return self.firecrawl_status(refresh=True)
             with self._lock:
-                if not self._managed_firecrawl_enabled():
-                    return self.firecrawl_status(refresh=True)
                 prepared = self.prepare_firecrawl()
                 if not prepared.available:
                     return prepared
-                current = self.firecrawl_status(refresh=True)
-                if current.available:
-                    return current
-                if self._firecrawl_process is None or self._firecrawl_process.poll() is not None:
+                with self._firecrawl_state_lock:
+                    process = self._firecrawl_process
+                    tracked_process_running = (
+                        process is not None and process.poll() is None
+                    )
+                    launch_confirmed = self._firecrawl_launch_confirmed
+                if not tracked_process_running and not launch_confirmed:
+                    # A healthy port may belong to containers left by the
+                    # previous backend. Re-run the stable Compose project and
+                    # wait for it to confirm the current pinned configuration
+                    # before accepting endpoint health.
                     started = True
                     self.invalidate_status_cache()
                     self._start_firecrawl()
-                started_process = self._firecrawl_process
+                with self._firecrawl_state_lock:
+                    started_process = self._firecrawl_process
                 should_wait = wait
-            # Release the broad lock before the (now much larger) cold-start wait so
-            # status polls, other runtime startup paths, and shutdown stay
-            # responsive while docker pulls the multi-hundred-MB images.
             if should_wait:
                 return self._wait_for_runtime("firecrawl", started_process)
             return self.firecrawl_status(refresh=True)
@@ -1775,17 +1812,30 @@ class PlatformRuntimeManager:
     @invalidates_runtime_status_cache
     def restart_firecrawl(self) -> RuntimeStatus:
         with self._lock:
-            self.stop_firecrawl()
-        # ensure_firecrawl_ready manages the lock itself and releases it across
-        # the cold-start wait, so do not hold the broad lock around it here.
+            stopped = self.stop_firecrawl()
+            with self._firecrawl_state_lock:
+                teardown_pending = self._firecrawl_compose_teardown is not None
+            if teardown_pending:
+                return stopped
         return self.ensure_firecrawl_ready(wait=True)
 
     @invalidates_runtime_status_cache
     def stop_firecrawl(self) -> RuntimeStatus:
         with self._lock:
+            self._stop_firecrawl_compose_up_process()
             self._teardown_firecrawl_compose()
-            self._stop_process("_firecrawl_process")
             return self.firecrawl_status(refresh=False)
+
+    def _stop_firecrawl_compose_up_process(self) -> None:
+        with self._firecrawl_state_lock:
+            process = self._firecrawl_process
+            changed = process is not None or self._firecrawl_launch_confirmed
+            self._firecrawl_process = None
+            self._firecrawl_launch_confirmed = False
+            if changed:
+                self._firecrawl_state_generation += 1
+        if process is not None:
+            self._terminate_process(process, timeout=12)
 
     def _teardown_firecrawl_compose(self) -> None:
         """Tear down the managed Firecrawl compose stack before dropping the CLI.
@@ -1796,7 +1846,8 @@ class PlatformRuntimeManager:
         volumes. Run `docker compose down --remove-orphans` first so the stack is
         actually stopped and removed.
         """
-        teardown = self._firecrawl_compose_teardown
+        with self._firecrawl_state_lock:
+            teardown = self._firecrawl_compose_teardown
         if teardown is None:
             return
         down_command, cwd = teardown
@@ -1805,17 +1856,33 @@ class PlatformRuntimeManager:
         env["DOCKER_BUILDKIT"] = env.get("DOCKER_BUILDKIT") or "1"
         env["COMPOSE_DOCKER_CLI_BUILD"] = env.get("COMPOSE_DOCKER_CLI_BUILD") or "1"
         try:
-            self.command_runner.run(
+            result = self.command_runner.run(
                 down_command,
                 cwd=cwd,
                 env=env,
                 log_path=log_path,
                 timeout=self._firecrawl_compose_down_timeout(),
             )
+            if result.returncode != 0:
+                with self._firecrawl_state_lock:
+                    self._firecrawl_last_error = (
+                        "Firecrawl compose teardown failed with exit code "
+                        f"{result.returncode}; see {log_path}"
+                    )
+                    self._firecrawl_state_generation += 1
+                return
         except Exception as exc:
-            self._firecrawl_last_error = f"Firecrawl compose teardown failed: {exc}"
-        finally:
+            with self._firecrawl_state_lock:
+                self._firecrawl_last_error = f"Firecrawl compose teardown failed: {exc}"
+                self._firecrawl_state_generation += 1
+            return
+        with self._firecrawl_state_lock:
+            if self._firecrawl_compose_teardown != teardown:
+                return
+            self._firecrawl_last_error = ""
             self._firecrawl_compose_teardown = None
+            self._firecrawl_launch_confirmed = False
+            self._firecrawl_state_generation += 1
 
     @staticmethod
     def _firecrawl_compose_down_timeout() -> float:
@@ -1863,52 +1930,127 @@ class PlatformRuntimeManager:
                 error="" if healthy or not refresh else "External Firecrawl API is not reachable",
                 source="external",
             )
-        pid, process_running, returncode = self._process_state(self._firecrawl_process)
         command, cwd, detail = self._firecrawl_command()
-        healthy = self._probe_firecrawl_health() if refresh else False
-        if healthy:
+        snapshot = self._firecrawl_state_snapshot()
+        healthy = False
+        if refresh:
+            for _attempt in range(2):
+                probed_healthy = self._probe_firecrawl_health()
+                latest = self._firecrawl_state_snapshot()
+                if latest == snapshot:
+                    healthy = probed_healthy
+                    snapshot = latest
+                    break
+                snapshot = latest
+        return self._firecrawl_status_from_snapshot(
+            snapshot,
+            healthy=healthy,
+            command=command,
+            cwd=cwd,
+            detail=detail,
+        )
+
+    def _firecrawl_state_snapshot(self) -> _FirecrawlStateSnapshot:
+        with self._firecrawl_state_lock:
+            pid, process_running, returncode = self._process_state(
+                self._firecrawl_process
+            )
+            if returncode == 0 and self._firecrawl_compose_teardown is not None:
+                # ``compose up --detach --wait`` returns zero only after the
+                # stable project has reconciled the current pinned config.
+                self._firecrawl_launch_confirmed = True
+                self._firecrawl_process = None
+                self._firecrawl_last_error = ""
+                self._firecrawl_state_generation += 1
+                pid = None
+                process_running = False
+                returncode = None
+            return _FirecrawlStateSnapshot(
+                generation=self._firecrawl_state_generation,
+                pid=pid,
+                process_running=process_running,
+                returncode=returncode,
+                launch_confirmed=self._firecrawl_launch_confirmed,
+                teardown_owned=self._firecrawl_compose_teardown is not None,
+                last_error=self._firecrawl_last_error,
+                last_started_at=self._firecrawl_last_started_at,
+            )
+
+    def _firecrawl_status_from_snapshot(
+        self,
+        snapshot: _FirecrawlStateSnapshot,
+        *,
+        healthy: bool,
+        command: list[str],
+        cwd: Path | None,
+        detail: str,
+    ) -> RuntimeStatus:
+        exited = self._process_exit_error(
+            "Firecrawl",
+            snapshot.returncode,
+            self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log",
+        )
+        ownership_error = exited or (
+            snapshot.last_error if not snapshot.process_running else ""
+        )
+        if healthy and snapshot.launch_confirmed and not ownership_error:
             return RuntimeStatus(
                 "firecrawl",
                 True,
                 True,
                 "running",
-                "Self-hosted Firecrawl API is reachable",
-                pid=pid,
+                "Self-hosted Firecrawl API is reachable and owned by the managed Compose project",
+                pid=snapshot.pid,
                 url=self._effective_firecrawl_api_url(),
                 path=str(cwd or self.config.firecrawl_runtime_dir),
-                last_started_at=self._firecrawl_last_started_at,
+                last_started_at=snapshot.last_started_at,
                 source=str(cwd or ""),
             )
-        if process_running:
+        if ownership_error:
+            return RuntimeStatus(
+                "firecrawl",
+                True,
+                False,
+                "error",
+                ownership_error,
+                pid=snapshot.pid,
+                url=self._effective_firecrawl_api_url(),
+                path=str(cwd or self.config.firecrawl_runtime_dir),
+                error=ownership_error,
+                last_started_at=snapshot.last_started_at,
+                source=str(cwd or ""),
+            )
+        if snapshot.process_running or snapshot.launch_confirmed:
             return RuntimeStatus(
                 "firecrawl",
                 True,
                 False,
                 "starting",
-                "Firecrawl process is running; API health check is not ready yet "
-                "(first launch pulls the Docker images and may take several minutes)",
-                pid=pid,
+                (
+                    "Firecrawl Compose project is ready; API health check is not ready yet"
+                    if snapshot.launch_confirmed
+                    else "Firecrawl Compose project is reconciling pinned images and configuration"
+                ),
+                pid=snapshot.pid,
                 url=self._effective_firecrawl_api_url(),
                 path=str(cwd or self.config.firecrawl_runtime_dir),
-                error=self._firecrawl_last_error,
-                last_started_at=self._firecrawl_last_started_at,
+                last_started_at=snapshot.last_started_at,
                 source=str(cwd or ""),
             )
-        exited = self._process_exit_error("Firecrawl", returncode, self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log")
-        state = "error" if exited else ("prepared" if command else "missing")
-        runtime_detail = exited or ("Firecrawl is prepared but not running" if command else detail)
-        error = exited or (self._firecrawl_last_error if command else detail)
+        state = "prepared" if command else "missing"
+        runtime_detail = "Firecrawl is prepared but not running" if command else detail
+        error = snapshot.last_error if command else detail
         return RuntimeStatus(
             "firecrawl",
             True,
             False,
             state,
             runtime_detail,
-            pid=pid,
+            pid=snapshot.pid,
             url=self._effective_firecrawl_api_url(),
             path=str(cwd or self.config.firecrawl_runtime_dir),
             error=error,
-            last_started_at=self._firecrawl_last_started_at,
+            last_started_at=snapshot.last_started_at,
             source=str(cwd or ""),
         )
 
@@ -2071,6 +2213,10 @@ class PlatformRuntimeManager:
         if url_error:
             self._firecrawl_last_error = url_error
             return
+        source_error = self._managed_firecrawl_source_error()
+        if source_error:
+            self._firecrawl_last_error = source_error
+            return
         command, cwd, detail = self._firecrawl_command()
         if not command:
             self._firecrawl_last_error = detail
@@ -2100,14 +2246,29 @@ class PlatformRuntimeManager:
         })
         log_path = self.config.firecrawl_runtime_dir / "logs" / "managed-firecrawl.log"
         try:
-            self._firecrawl_process = self.process_launcher.start(command, cwd=cwd, env=env, log_path=log_path)
-            self._firecrawl_last_started_at = now_ts()
-            self._firecrawl_last_error = ""
-            self._firecrawl_compose_teardown = teardown
+            process = self.process_launcher.start(
+                command,
+                cwd=cwd,
+                env=env,
+                log_path=log_path,
+            )
+            with self._firecrawl_state_lock:
+                self._firecrawl_process = process
+                self._firecrawl_launch_confirmed = False
+                self._firecrawl_last_started_at = now_ts()
+                self._firecrawl_last_error = ""
+                self._firecrawl_compose_teardown = teardown
+                self._firecrawl_state_generation += 1
         except Exception as exc:
-            self._firecrawl_last_error = str(exc)
-            self._firecrawl_process = None
-            self._firecrawl_compose_teardown = None
+            with self._firecrawl_state_lock:
+                self._firecrawl_last_error = str(exc)
+                self._firecrawl_process = None
+                self._firecrawl_launch_confirmed = False
+                # The stable project may exist from an earlier backend even
+                # when this launch client fails. Preserve its deterministic
+                # down command so stop/restart can still clean it up.
+                self._firecrawl_compose_teardown = teardown
+                self._firecrawl_state_generation += 1
 
     def _firecrawl_compose_teardown_command(
         self, up_command: list[str], cwd: Path | None
@@ -2205,7 +2366,15 @@ class PlatformRuntimeManager:
             status = status_fn(refresh=True)
             if status.available:
                 return status
-            if proc is None or proc.poll() is not None:
+            if proc is None:
+                return status
+            returncode = proc.poll()
+            # Compose `up --detach --wait` is a short-lived readiness client.
+            # A zero exit confirms the project configuration, while the API
+            # can still need a brief warm-up before its HTTP probe succeeds.
+            # Only an unsuccessful launcher exit proves that waiting cannot
+            # make this startup healthy.
+            if returncode is not None and returncode != 0:
                 return status
             time.sleep(0.25)
         return status_fn(refresh=True)
@@ -2559,13 +2728,19 @@ class PlatformRuntimeManager:
             return (shlex.split(configured), repo if repo.exists() else None, configured)
         if not repo.exists():
             return ([], repo, f"Firecrawl source not found: {repo}")
-        compose_file = self._firecrawl_compose_file(repo)
+        compose_file = (
+            repo / "docker-compose.yaml"
+            if self._managed_firecrawl_enabled()
+            else self._firecrawl_compose_file(repo)
+        )
+        if not compose_file.is_file() or compose_file.is_symlink():
+            compose_file = None
         if compose_file is None:
             return ([], repo, f"Firecrawl repository is missing a Docker Compose file: {repo}")
         override = self._ensure_firecrawl_compose_override()
         # Source the managed .env from the platform data dir instead of letting
         # compose pick up repo/.env, so the generated secret never lands in the
-        # submodule working tree. The file is materialized by prepare_firecrawl /
+        # managed upstream checkout. The file is materialized by prepare_firecrawl /
         # _start_firecrawl; building the argv stays side-effect free for status
         # polls (which also call this helper).
         env_file = self._firecrawl_env_path()
@@ -2573,6 +2748,8 @@ class PlatformRuntimeManager:
             [
                 "docker",
                 "compose",
+                "--project-name",
+                FIRECRAWL_COMPOSE_PROJECT,
                 "--env-file",
                 str(env_file),
                 "-f",
@@ -2580,6 +2757,10 @@ class PlatformRuntimeManager:
                 "-f",
                 str(override),
                 "up",
+                "--detach",
+                "--wait",
+                "--wait-timeout",
+                str(self._firecrawl_compose_wait_timeout()),
                 "--no-build",
                 "--pull",
                 "missing",
@@ -2587,6 +2768,93 @@ class PlatformRuntimeManager:
             repo,
             f"self-hosted Firecrawl compose stack: {repo}",
         )
+
+    def _firecrawl_compose_wait_timeout(self) -> int:
+        return max(
+            FIRECRAWL_COMPOSE_WAIT_MIN_SECONDS,
+            math.ceil(self._runtime_startup_wait_seconds("firecrawl")),
+        )
+
+    def _managed_firecrawl_source_error(self) -> str:
+        """Revalidate the deployment-managed source before prepare and start.
+
+        Unit-level/custom ``PlatformConfig`` objects may still name a
+        non-canonical repository for compatibility. Standard deployment paths
+        are canonical and receive the full immutable-revision check here.
+        """
+
+        if self._effective_firecrawl_command():
+            return ""
+        raw = UPSTREAM_SOURCES.get("firecrawl")
+        if not isinstance(raw, dict):
+            return "managed Firecrawl source contract is missing"
+        revision = str(raw.get("revision") or "")
+        expected_services_raw = raw.get("compose_services")
+        if not re.fullmatch(r"[0-9a-f]{40}", revision) or not isinstance(
+            expected_services_raw, list
+        ):
+            return "managed Firecrawl source contract is invalid"
+        expected_services = tuple(str(value) for value in expected_services_raw)
+        image_services = tuple(sorted(service for service, _image in FIRECRAWL_SERVICE_IMAGES))
+        if expected_services != image_services:
+            return "managed Firecrawl image overrides do not cover the contracted services"
+
+        repo = self._effective_firecrawl_repo()
+        canonical = self.config.firecrawl_runtime_dir / "source" / revision
+        if repo.absolute() != canonical.absolute():
+            # Non-canonical paths are supported only by direct/custom config
+            # construction. They are not deployment-managed source caches.
+            return ""
+        try:
+            metadata = repo.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                return "managed Firecrawl source must be a real directory"
+            if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+                return "managed Firecrawl source has an unexpected owner"
+        except OSError as exc:
+            return f"managed Firecrawl source cannot be inspected: {exc}"
+
+        git_env = os.environ.copy()
+        git_env["GIT_OPTIONAL_LOCKS"] = "0"
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=repo,
+                env=git_env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if head.returncode != 0 or head.stdout.strip() != revision:
+                return "managed Firecrawl source revision does not match its contract"
+            status_result = subprocess.run(
+                [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+                cwd=repo,
+                env=git_env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if status_result.returncode != 0 or status_result.stdout.strip():
+                return "managed Firecrawl source is modified"
+            actual_services = parse_compose_service_names(
+                repo / "docker-compose.yaml"
+            )
+        except (OSError, subprocess.SubprocessError, UpstreamSourceValidationError) as exc:
+            return f"managed Firecrawl source validation failed: {exc}"
+        if actual_services != expected_services:
+            return (
+                "managed Firecrawl Compose services do not match the source contract"
+            )
+        return ""
 
     @staticmethod
     def _firecrawl_compose_file(repo: Path) -> Path | None:
@@ -2605,6 +2873,18 @@ class PlatformRuntimeManager:
         ]
         for service, image in FIRECRAWL_SERVICE_IMAGES:
             lines.extend((f"  {service}:", f"    image: {image}"))
+            if service == "api":
+                # The upstream initializer is intentionally a one-shot
+                # container.  Declaring it as a successful-completion
+                # dependency makes Compose's global `up --wait` use completion
+                # semantics instead of treating its clean exit as a crash.
+                lines.extend(
+                    (
+                        "    depends_on:",
+                        "      foundationdb-init:",
+                        "        condition: service_completed_successfully",
+                    )
+                )
         lines.append("")
         text = "\n".join(lines)
         override.parent.mkdir(parents=True, exist_ok=True)
@@ -2615,7 +2895,7 @@ class PlatformRuntimeManager:
     def _firecrawl_env_path(self) -> Path:
         # Keep the managed Firecrawl .env (which carries a generated
         # BULL_AUTH_KEY secret) under the platform data directory rather than
-        # inside the Firecrawl submodule working tree. The repository boundary
+        # inside the managed Firecrawl source checkout. The repository boundary
         # in docs/development/repository.md keeps managed state out of upstream
         # source trees.
         return self.config.firecrawl_runtime_dir / ".env"
@@ -3223,9 +3503,13 @@ class PlatformRuntimeManager:
         return self._runtime_setting(CAMOFOX_SETTING_COMMAND) or self.config.camofox_command
 
     def _effective_firecrawl_repo(self) -> Path:
-        value = self._runtime_setting(FIRECRAWL_SETTING_REPO)
-        if value:
-            return Path(value).expanduser()
+        # Managed source paths are fixed by the canonical upstream contract.
+        # Legacy database rows must not redirect a managed runtime back into
+        # the former repository-root checkout.
+        if not self._managed_firecrawl_enabled():
+            value = self._runtime_setting(FIRECRAWL_SETTING_REPO)
+            if value:
+                return Path(value).expanduser()
         if self.config.firecrawl_repo is not None:
             return self.config.firecrawl_repo
         return self.config.data_dir.parent / "firecrawl"
@@ -3250,8 +3534,11 @@ class PlatformRuntimeManager:
         return self._runtime_setting(FIRECRAWL_SETTING_COMMAND) or self.config.firecrawl_command
 
     def _effective_cognee_repo(self) -> Path:
-        value = self._runtime_setting(COGNEE_SETTING_REPO)
-        return Path(value).expanduser() if value else self.config.cognee_repo
+        if not self._managed_cognee_enabled():
+            value = self._runtime_setting(COGNEE_SETTING_REPO)
+            if value:
+                return Path(value).expanduser()
+        return self.config.cognee_repo
 
     def _effective_cognee_backend(self) -> str:
         value = (self._runtime_setting(COGNEE_SETTING_BACKEND) or self.config.knowledge_backend).strip().lower()

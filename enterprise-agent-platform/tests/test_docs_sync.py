@@ -58,9 +58,7 @@ class DocsSyncTests(unittest.TestCase):
             "legacy_top_level_files": ["AGENTS.md", "CLAUDE.md"],
             "coverage": {
                 "code_include": [
-                    ".gitmodules",
-                    "cognee",
-                    "firecrawl",
+                    ".gitignore",
                     ".github/**",
                     "deploy.sh",
                     "scripts/**",
@@ -93,7 +91,7 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "id": "repository-development",
                     "documents": ["docs/design/repository.md"],
-                    "code": [".gitmodules", ".github/**"],
+                    "code": [".gitignore", ".github/**"],
                     "tests": [],
                 },
                 {
@@ -106,8 +104,7 @@ class DocsSyncTests(unittest.TestCase):
                     "id": "integrations",
                     "documents": ["docs/design/integrations.md"],
                     "code": [
-                        "cognee",
-                        "firecrawl",
+                        "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
                         "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
                         "enterprise-agent-platform/camofox-runtime/**",
                     ],
@@ -137,6 +134,17 @@ class DocsSyncTests(unittest.TestCase):
                 },
             ],
             "contracts": [
+                {
+                    "id": "upstream-sources",
+                    "source": "docs/contracts/upstream-sources.json",
+                    "domains": ["integrations", "platform"],
+                    "targets": [
+                        {
+                            "path": "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
+                            "format": "python-upstream-sources",
+                        }
+                    ],
+                },
                 {
                     "id": "runtime-policy",
                     "source": "docs/contracts/runtime-policy.json",
@@ -196,10 +204,38 @@ class DocsSyncTests(unittest.TestCase):
             if domain["id"] == identifier
         )
 
+    @staticmethod
+    def manifest_contract(manifest: dict[str, object], identifier: str) -> dict[str, object]:
+        return next(
+            contract
+            for contract in manifest["contracts"]  # type: ignore[index]
+            if contract["id"] == identifier
+        )
+
     def write_fixture(self, manifest: dict[str, object] | None = None) -> None:
         files: dict[str, str] = {
             "docs/domains.json": json.dumps(manifest or self.manifest(), indent=2) + "\n",
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
+            "docs/contracts/upstream-sources.json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "sources": {
+                        "cognee": {
+                            "repository_url": "https://example.invalid/cognee.git",
+                            "revision": "1" * 40,
+                            "required_paths": ["pyproject.toml", "cognee/__init__.py"],
+                        },
+                        "firecrawl": {
+                            "repository_url": "https://example.invalid/firecrawl.git",
+                            "revision": "2" * 40,
+                            "required_paths": ["docker-compose.yaml"],
+                            "compose_services": ["api", "redis"],
+                        },
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
             "docs/design/feature.md": "# Feature\n\nThe current feature design.\n",
             "docs/design/governance.md": "# Governance\n\nThe documentation policy.\n",
             "docs/design/repository.md": "# Repository\n\nThe repository policy.\n",
@@ -211,12 +247,10 @@ class DocsSyncTests(unittest.TestCase):
             "README.md": "# Project\n\n[Docs](docs/README.md)\n",
             "enterprise-agent-platform/README.md": "# Platform\n\n[Docs](../docs/README.md)\n",
             "enterprise-agent-platform/agent-runtime/README.md": "# Runtime\n\n[Docs](../../docs/README.md)\n",
-            ".gitmodules": "# fixture\n",
+            ".gitignore": "data/\n/cognee/\n/firecrawl/\n",
             ".github/workflows/quality.yml": "name: fixture\n",
             "deploy.sh": "#!/usr/bin/env bash\n",
             "scripts/policy.py": "POLICY = True\n",
-            "cognee": "fixture gitlink marker\n",
-            "firecrawl": "fixture gitlink marker\n",
             "enterprise-agent-platform/pyproject.toml": "[project]\nname = 'fixture'\nversion = '0'\n",
             "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": "HELPER = True\n",
             "enterprise-agent-platform/camofox-runtime/patch-runtime.cjs": "module.exports = {};\n",
@@ -481,15 +515,9 @@ class DocsSyncTests(unittest.TestCase):
         )
         self.assertIn("generated contract target is stale", result.stderr)
 
-    def test_index_snapshot_preserves_gitlink_inventory(self) -> None:
+    def test_index_snapshot_tolerates_legacy_gitlink_outside_owned_tree(self) -> None:
         base = self.ready_repository()
         self.git("update-index", "--add", "--cacheinfo", "160000", base, "cognee")
-        integrations = self.root / "docs/design/integrations.md"
-        integrations.write_text(
-            "# Integrations\n\nCognee is represented by a Git submodule.\n",
-            encoding="utf-8",
-        )
-        self.git("add", "docs/design/integrations.md")
 
         self.run_command(
             "check-change",
@@ -805,12 +833,12 @@ class DocsSyncTests(unittest.TestCase):
     def test_manifest_requires_minimum_owned_coverage(self) -> None:
         self.initialize_git()
         manifest = self.manifest()
-        manifest["coverage"]["code_include"].remove("cognee")  # type: ignore[index]
+        manifest["coverage"]["code_include"].remove(".gitignore")  # type: ignore[index]
         self.write_fixture(manifest)
 
         result = self.run_command("sync", expect=1)
         self.assertIn("coverage must include owned production probes", result.stderr)
-        self.assertIn("cognee", result.stderr)
+        self.assertIn(".gitignore", result.stderr)
 
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
@@ -836,7 +864,7 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("documents must stay under docs/", outside_docs.stderr)
 
         manifest = self.manifest()
-        manifest["contracts"][0]["source"] = "docs/runtime-policy.json"  # type: ignore[index]
+        self.manifest_contract(manifest, "runtime-policy")["source"] = "docs/runtime-policy.json"
         self.write_fixture(manifest)
         outside_contracts = self.run_command("sync", expect=1)
         self.assertIn("source must stay under docs/contracts/", outside_contracts.stderr)
@@ -882,16 +910,42 @@ class DocsSyncTests(unittest.TestCase):
     def test_runtime_policy_domains_and_targets_are_fixed(self) -> None:
         self.initialize_git()
         manifest = self.manifest()
-        manifest["contracts"][0]["domains"] = ["platform", "agent-runtime"]  # type: ignore[index]
+        self.manifest_contract(manifest, "runtime-policy")["domains"] = ["platform", "agent-runtime"]
         self.write_fixture(manifest)
         domains = self.run_command("sync", expect=1)
         self.assertIn("runtime-policy domains must be exactly", domains.stderr)
 
         manifest = self.manifest()
-        manifest["contracts"][0]["targets"][0]["path"] = "src/generated.py"  # type: ignore[index]
+        self.manifest_contract(manifest, "runtime-policy")["targets"][0]["path"] = "src/generated.py"  # type: ignore[index]
         self.write_fixture(manifest)
         targets = self.run_command("sync", expect=1)
         self.assertIn("runtime-policy targets and formats must match", targets.stderr)
+
+    def test_upstream_source_contract_rejects_floating_or_credentialed_sources(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/upstream-sources.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["sources"]["cognee"]["revision"] = "main"
+        path.write_text(json.dumps(contract), encoding="utf-8")
+        floating = self.run_command("sync", expect=1)
+        self.assertIn("40-character commit SHA", floating.stderr)
+
+        contract["sources"]["cognee"]["revision"] = "1" * 40
+        contract["sources"]["firecrawl"]["repository_url"] = (
+            "https://token@example.invalid/firecrawl.git"
+        )
+        path.write_text(json.dumps(contract), encoding="utf-8")
+        credentialed = self.run_command("sync", expect=1)
+        self.assertIn("credential-free HTTPS URL", credentialed.stderr)
+
+        contract["sources"]["firecrawl"]["repository_url"] = (
+            "https://example.invalid/firecrawl.git"
+        )
+        contract["sources"]["firecrawl"]["compose_services"] = ["redis", "api"]
+        path.write_text(json.dumps(contract), encoding="utf-8")
+        unsorted = self.run_command("sync", expect=1)
+        self.assertIn("compose_services must be sorted", unsorted.stderr)
 
     def test_each_code_and_test_pattern_must_match_a_real_corresponding_file(self) -> None:
         self.initialize_git()

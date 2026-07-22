@@ -35,8 +35,17 @@ from .gateway import (
     request_gateway_reload,
 )
 from .loopback_http import open_loopback_url
-from .runtimes import PlatformRuntimeManager
+from .runtimes import (
+    COGNEE_SETTING_MANAGED,
+    FIRECRAWL_SETTING_MANAGED,
+    PlatformRuntimeManager,
+)
 from .secure_fs import ensure_private_directory
+from .upstream_source_validation import (
+    UpstreamSourceValidationError,
+    parse_compose_service_names,
+)
+from .upstream_sources_generated import UPSTREAM_SOURCES
 
 
 DEFAULT_SERVICE_NAME = "enterprise-agent-platform.service"
@@ -46,6 +55,8 @@ DEFAULT_PIP_TIMEOUT_SECONDS = 120
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
 DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS = 300
+DEFAULT_UPSTREAM_SOURCE_FETCH_TIMEOUT_SECONDS = 1800
+DEFAULT_COGNEE_INSTALL_TIMEOUT_SECONDS = 3600
 FINAL_READINESS_RECHECK_SECONDS = 10
 AUTO_UPDATE_SOURCE_PID_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_PID"
 AUTO_UPDATE_SOURCE_MODE_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"
@@ -113,6 +124,84 @@ class ExistingServiceDeployment:
     data_dir: Path | None
 
 
+@dataclass(frozen=True)
+class UpstreamSourceSpec:
+    name: str
+    repository_url: str
+    revision: str
+    required_paths: tuple[str, ...]
+    compose_services: tuple[str, ...] = ()
+
+
+def upstream_source_specs() -> tuple[UpstreamSourceSpec, ...]:
+    specs: list[UpstreamSourceSpec] = []
+    for name in ("cognee", "firecrawl"):
+        raw = UPSTREAM_SOURCES.get(name)
+        if not isinstance(raw, dict):
+            raise DeploymentError(f"managed upstream source contract is missing {name}")
+        repository_url = str(raw.get("repository_url") or "")
+        revision = str(raw.get("revision") or "")
+        required = raw.get("required_paths")
+        parsed = urllib.parse.urlsplit(repository_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise DeploymentError(f"managed upstream source URL is invalid for {name}")
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise DeploymentError(f"managed upstream source revision is invalid for {name}")
+        if not isinstance(required, list) or not required:
+            raise DeploymentError(f"managed upstream source paths are missing for {name}")
+        required_paths: list[str] = []
+        for value in required:
+            if not isinstance(value, str):
+                raise DeploymentError(f"managed upstream source path is invalid for {name}")
+            path = PurePosixPath(value)
+            if path.is_absolute() or not path.parts or any(
+                part in {"", ".", ".."} for part in path.parts
+            ):
+                raise DeploymentError(f"managed upstream source path is unsafe for {name}")
+            required_paths.append(value)
+        raw_compose_services = raw.get("compose_services")
+        compose_services: tuple[str, ...] = ()
+        if name == "firecrawl":
+            if not isinstance(raw_compose_services, list) or not raw_compose_services:
+                raise DeploymentError(
+                    "managed upstream source compose services are missing for firecrawl"
+                )
+            if any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                for value in raw_compose_services
+            ):
+                raise DeploymentError(
+                    "managed upstream source compose services are invalid for firecrawl"
+                )
+            if raw_compose_services != sorted(set(raw_compose_services)):
+                raise DeploymentError(
+                    "managed upstream source compose services must be unique and sorted"
+                )
+            compose_services = tuple(raw_compose_services)
+        elif raw_compose_services is not None:
+            raise DeploymentError(
+                f"managed upstream source compose services are unsupported for {name}"
+            )
+        specs.append(
+            UpstreamSourceSpec(
+                name=name,
+                repository_url=repository_url,
+                revision=revision,
+                required_paths=tuple(required_paths),
+                compose_services=compose_services,
+            )
+        )
+    return tuple(specs)
+
+
 class CommandRunner(Protocol):
     def run(
         self,
@@ -165,14 +254,16 @@ class DeploymentPaths:
     def from_root(cls, root: Path, *, data_dir: Path | None = None, service_name: str = DEFAULT_SERVICE_NAME) -> "DeploymentPaths":
         clean_root = root.expanduser().resolve()
         clean_service_name = _validate_service_name(service_name)
+        clean_data_dir = (data_dir or clean_root / "enterprise-agent-platform" / "data").expanduser().resolve()
+        specs = {spec.name: spec for spec in upstream_source_specs()}
         return cls(
             root=clean_root,
             platform_dir=clean_root / "enterprise-agent-platform",
             agent_runtime_dir=clean_root / "enterprise-agent-platform" / "agent-runtime",
-            cognee_repo=clean_root / "cognee",
-            firecrawl_repo=clean_root / "firecrawl",
+            cognee_repo=clean_data_dir / "runtimes" / "cognee" / "source" / specs["cognee"].revision,
+            firecrawl_repo=clean_data_dir / "runtimes" / "firecrawl" / "source" / specs["firecrawl"].revision,
             venv_dir=clean_root / ".venv",
-            data_dir=(data_dir or clean_root / "enterprise-agent-platform" / "data").expanduser().resolve(),
+            data_dir=clean_data_dir,
             service_dir=Path(os.getenv("XDG_CONFIG_HOME", "~/.config")).expanduser() / "systemd" / "user",
             service_name=clean_service_name,
         )
@@ -222,16 +313,35 @@ class DeploymentManager:
         host: str,
         port: int,
         mode: str = "auto",
-        skip_submodules: bool = False,
         prepare_runtime: bool = True,
     ) -> DeploymentResult:
         self.ensure_python_version()
         self.ensure_node_version()
         self.ensure_layout()
-        if not skip_submodules:
-            self.ensure_submodules()
-        self.ensure_source_repos()
+        startup_config = PlatformConfig.from_env(self.paths.root)
+        settings = _read_settings_snapshot(self.paths.data_dir / "platform.db")
+        manage_cognee = _effective_managed_setting(
+            settings,
+            COGNEE_SETTING_MANAGED,
+            fallback=startup_config.manage_cognee,
+        )
+        manage_firecrawl = _effective_managed_setting(
+            settings,
+            FIRECRAWL_SETTING_MANAGED,
+            fallback=startup_config.manage_firecrawl,
+        )
+        managed_sources = tuple(
+            name
+            for name, enabled in (
+                ("cognee", manage_cognee),
+                ("firecrawl", manage_firecrawl),
+            )
+            if enabled
+        )
+        self.ensure_managed_sources(managed_sources)
         self.ensure_platform_venv()
+        if manage_cognee:
+            self.ensure_cognee_dependencies()
 
         if mode == "prepare":
             if prepare_runtime:
@@ -464,24 +574,277 @@ class DeploymentManager:
                 f"Agent runtime source not found: {self.paths.agent_runtime_dir}"
             )
 
-    def ensure_submodules(self) -> None:
-        if not (self.paths.root / ".git").exists():
+    def ensure_managed_sources(self, names: tuple[str, ...] | None = None) -> None:
+        specs = upstream_source_specs()
+        selected = {spec.name for spec in specs} if names is None else set(names)
+        known = {spec.name for spec in specs}
+        unknown = selected - known
+        if unknown:
+            raise DeploymentError(
+                "unknown managed upstream source: " + ", ".join(sorted(unknown))
+            )
+        if not selected:
             return
         if not shutil.which("git"):
-            raise DeploymentError("git is required to initialize submodules")
-        self.runner.run(["git", "submodule", "update", "--init", "--recursive"], cwd=self.paths.root, timeout=1800)
+            raise DeploymentError("git is required to prepare managed upstream sources")
+        runtimes = self.paths.data_dir / "runtimes"
+        self._ensure_private_runtime_directories(runtimes)
+        lock_path = runtimes / ".upstream-sources.lock"
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            for spec in specs:
+                if spec.name in selected:
+                    self._ensure_managed_source(spec)
+        finally:
+            os.close(descriptor)
 
-    def ensure_source_repos(self) -> None:
-        missing = []
-        if not (self.paths.cognee_repo / "pyproject.toml").exists():
-            missing.append(str(self.paths.cognee_repo))
-        if not any(
-            (self.paths.firecrawl_repo / name).exists()
-            for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+    def _ensure_managed_source(self, spec: UpstreamSourceSpec) -> Path:
+        source_root = self.paths.data_dir / "runtimes" / spec.name / "source"
+        self._ensure_private_runtime_directories(source_root)
+        target = source_root / spec.revision
+        legacy = self.paths.root / spec.name
+        legacy_usable = self._legacy_source_is_pristine(legacy, spec)
+
+        if os.path.lexists(target):
+            self._validate_managed_source(target, spec)
+            return target
+
+        staging = source_root / f".staging-{spec.revision[:12]}-{uuid.uuid4().hex}"
+        try:
+            staging.mkdir(mode=0o700)
+            self.runner.run(["git", "init", "--quiet"], cwd=staging, timeout=60)
+            self.runner.run(
+                ["git", "remote", "add", "origin", spec.repository_url],
+                cwd=staging,
+                timeout=60,
+            )
+            fetch_source = str(legacy) if legacy_usable else spec.repository_url
+            self.runner.run(
+                [
+                    "git",
+                    "fetch",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    "--no-tags",
+                    fetch_source,
+                    spec.revision,
+                ],
+                cwd=staging,
+                timeout=positive_int_env(
+                    "ENTERPRISE_UPSTREAM_SOURCE_FETCH_TIMEOUT_SECONDS",
+                    DEFAULT_UPSTREAM_SOURCE_FETCH_TIMEOUT_SECONDS,
+                ),
+            )
+            self.runner.run(
+                ["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                cwd=staging,
+                timeout=300,
+            )
+            self._validate_managed_source(staging, spec)
+            try:
+                staging.rename(target)
+            except FileExistsError:
+                self._validate_managed_source(target, spec)
+            _fsync_directory(source_root)
+        except DeploymentError:
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DeploymentError(
+                f"managed upstream source preparation failed for {spec.name}: {exc}"
+            ) from exc
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        self._validate_managed_source(target, spec)
+        return target
+
+    def _validate_managed_source(self, path: Path, spec: UpstreamSourceSpec) -> None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise DeploymentError(f"managed upstream source is missing: {path}") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise DeploymentError(f"managed upstream source must be a real directory: {path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise DeploymentError(f"managed upstream source has an unexpected owner: {path}")
+        head = _git_query_stdout(path, ["rev-parse", "--verify", "HEAD"])
+        if head != spec.revision:
+            raise DeploymentError(
+                f"managed upstream source revision mismatch for {spec.name}: "
+                f"expected {spec.revision}, found {head or 'unknown'}"
+            )
+        dirty = _git_query_stdout(
+            path,
+            [
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )
+        if dirty:
+            raise DeploymentError(f"managed upstream source is modified: {path}")
+        resolved_root = path.resolve()
+        for relative in spec.required_paths:
+            required = path.joinpath(*PurePosixPath(relative).parts)
+            try:
+                required_metadata = required.lstat()
+                resolved = required.resolve(strict=True)
+            except (FileNotFoundError, OSError) as exc:
+                raise DeploymentError(
+                    f"managed upstream source {spec.name} is missing required path: {relative}"
+                ) from exc
+            if stat.S_ISLNK(required_metadata.st_mode) or not stat.S_ISREG(
+                required_metadata.st_mode
+            ):
+                raise DeploymentError(
+                    f"managed upstream source {spec.name} required path is not a regular file: {relative}"
+                )
+            if resolved_root not in resolved.parents:
+                raise DeploymentError(
+                    f"managed upstream source {spec.name} required path escapes its root: {relative}"
+                )
+        if spec.compose_services:
+            compose_file = path / "docker-compose.yaml"
+            try:
+                actual_services = parse_compose_service_names(compose_file)
+            except UpstreamSourceValidationError as exc:
+                raise DeploymentError(str(exc)) from exc
+            if actual_services != spec.compose_services:
+                raise DeploymentError(
+                    f"managed upstream source {spec.name} Compose services mismatch: "
+                    f"expected {', '.join(spec.compose_services)}, "
+                    f"found {', '.join(actual_services) or 'none'}"
+                )
+
+    def _legacy_source_is_pristine(
+        self, path: Path, spec: UpstreamSourceSpec
+    ) -> bool:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return False
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            return False
+        try:
+            head = _git_query_stdout(path, ["rev-parse", "--verify", "HEAD"])
+            if head != spec.revision:
+                return False
+            status = _git_query_stdout(
+                path,
+                [
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+            )
+        except DeploymentError:
+            return False
+        return status == ""
+
+    def ensure_cognee_dependencies(self) -> None:
+        spec = next(spec for spec in upstream_source_specs() if spec.name == "cognee")
+        source = self.paths.cognee_repo
+        self._validate_managed_source(source, spec)
+        marker = self.paths.data_dir / "runtimes" / "cognee" / "python-install.json"
+        if self._cognee_install_is_current(source, spec, marker):
+            return
+        # Older deployments may already have installed this exact path without
+        # the revision marker. Verify the distribution's direct_url metadata
+        # and adopt it without requiring network access.
+        if self._verify_cognee_install(source):
+            self._write_cognee_install_marker(source, spec, marker)
+            return
+        self.run_pip_install(
+            [str(source)],
+            timeout=positive_int_env(
+                "ENTERPRISE_COGNEE_INSTALL_TIMEOUT_SECONDS",
+                DEFAULT_COGNEE_INSTALL_TIMEOUT_SECONDS,
+            ),
+        )
+        if not self._verify_cognee_install(source):
+            raise DeploymentError(
+                "Cognee dependencies were installed, but the pinned source cannot be imported"
+            )
+        self._write_cognee_install_marker(source, spec, marker)
+
+    def _write_cognee_install_marker(
+        self,
+        source: Path,
+        spec: UpstreamSourceSpec,
+        marker: Path,
+    ) -> None:
+        _write_json_atomic(
+            marker,
+            {
+                "revision": spec.revision,
+                "source": str(source),
+                "python": str(self.paths.venv_python),
+            },
+        )
+
+    def _cognee_install_is_current(
+        self,
+        source: Path,
+        spec: UpstreamSourceSpec,
+        marker: Path,
+    ) -> bool:
+        try:
+            marker_metadata = marker.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(marker_metadata.st_mode) or not stat.S_ISREG(
+            marker_metadata.st_mode
         ):
-            missing.append(str(self.paths.firecrawl_repo))
-        if missing:
-            raise DeploymentError("required adjacent source repositories are missing: " + ", ".join(missing))
+            return False
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        if not isinstance(value, dict) or value != {
+            "revision": spec.revision,
+            "source": str(source),
+            "python": str(self.paths.venv_python),
+        }:
+            return False
+        return self._verify_cognee_install(source)
+
+    def _verify_cognee_install(self, source: Path) -> bool:
+        if not self.paths.venv_python.is_file():
+            return False
+        check = self.runner.run(
+            [str(self.paths.venv_python), "-m", "pip", "check"],
+            cwd=self.paths.root,
+            timeout=120,
+            check=False,
+        )
+        if check.returncode != 0:
+            return False
+        probe = (
+            "import importlib.metadata, json, pathlib; import cognee; "
+            "required=('add','cognify','search','SearchType'); "
+            "dist=importlib.metadata.distribution('cognee'); "
+            "direct=json.loads(dist.read_text('direct_url.json') or '{}'); "
+            f"expected=pathlib.Path({str(source)!r}).resolve().as_uri(); "
+            "raise SystemExit(0 if direct.get('url') == expected and "
+            "all(hasattr(cognee, name) for name in required) else 1)"
+        )
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = self.runner.run(
+            [str(self.paths.venv_python), "-c", probe],
+            cwd=self.paths.root,
+            env=env,
+            timeout=120,
+            check=False,
+        )
+        return result.returncode == 0
 
     def ensure_platform_venv(self) -> None:
         if not self.paths.venv_python.exists():
@@ -683,6 +1046,8 @@ class DeploymentManager:
         effective_port = int(env_values["ENTERPRISE_PLATFORM_PORT"])
         public_base_url = env_values["ENTERPRISE_PUBLIC_BASE_URL"].rstrip("/")
         config = PlatformConfig.from_env(self.paths.root)
+        manage_cognee = env_values["ENTERPRISE_MANAGE_COGNEE"] == "1"
+        manage_firecrawl = env_values["ENTERPRISE_MANAGE_FIRECRAWL"] == "1"
         return replace(
             config,
             data_dir=self.paths.data_dir,
@@ -691,8 +1056,10 @@ class DeploymentManager:
             public_base_url=public_base_url,
             trust_forwarded_headers=env_values.get("ENTERPRISE_TRUSTED_PROXY", "").strip().lower() in {"1", "true", "yes", "on"},
             token_ttl_seconds=int(env_values.get("ENTERPRISE_SESSION_TTL_SECONDS") or config.token_ttl_seconds),
-            cognee_repo=self.paths.cognee_repo,
-            firecrawl_repo=self.paths.firecrawl_repo,
+            manage_cognee=manage_cognee,
+            cognee_repo=Path(env_values["ENTERPRISE_COGNEE_REPO"]),
+            manage_firecrawl=manage_firecrawl,
+            firecrawl_repo=Path(env_values["ENTERPRISE_FIRECRAWL_REPO"]),
             agent_runtime_home=self.paths.data_dir / "runtimes" / "agent",
         )
 
@@ -1405,7 +1772,11 @@ class DeploymentManager:
 
 
 def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, str]:
-    settings = _deployment_platform_settings(paths.data_dir)
+    settings_snapshot = _read_settings_snapshot(paths.data_dir / "platform.db")
+    settings = _deployment_platform_settings(
+        paths.data_dir,
+        snapshot=settings_snapshot,
+    )
     effective_host = settings.get("platform_host") or host
     try:
         effective_port = int(settings.get("platform_port") or port)
@@ -1429,12 +1800,32 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         os.getenv("ENTERPRISE_SEARXNG_STARTUP_WAIT_SECONDS", "").strip()
         or str(DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS)
     )
+    manage_cognee = _effective_managed_setting(
+        settings_snapshot,
+        COGNEE_SETTING_MANAGED,
+        fallback=_env_bool("ENTERPRISE_MANAGE_COGNEE", True),
+    )
+    manage_firecrawl = _effective_managed_setting(
+        settings_snapshot,
+        FIRECRAWL_SETTING_MANAGED,
+        fallback=_env_bool("ENTERPRISE_MANAGE_FIRECRAWL", True),
+    )
+    cognee_repo = str(paths.cognee_repo)
+    firecrawl_repo = str(paths.firecrawl_repo)
+    if not manage_cognee:
+        cognee_repo = os.getenv("ENTERPRISE_COGNEE_REPO", "").strip() or cognee_repo
+    if not manage_firecrawl:
+        firecrawl_repo = (
+            os.getenv("ENTERPRISE_FIRECRAWL_REPO", "").strip() or firecrawl_repo
+        )
     values = {
         "ENTERPRISE_PLATFORM_DATA": str(paths.data_dir),
         "ENTERPRISE_SERVICE_NAME": paths.service_name,
         "ENTERPRISE_AGENT_RUNTIME_HOME": str(paths.data_dir / "runtimes" / "agent"),
-        "ENTERPRISE_COGNEE_REPO": str(paths.cognee_repo),
-        "ENTERPRISE_FIRECRAWL_REPO": str(paths.firecrawl_repo),
+        "ENTERPRISE_MANAGE_COGNEE": "1" if manage_cognee else "0",
+        "ENTERPRISE_COGNEE_REPO": cognee_repo,
+        "ENTERPRISE_MANAGE_FIRECRAWL": "1" if manage_firecrawl else "0",
+        "ENTERPRISE_FIRECRAWL_REPO": firecrawl_repo,
         "ENTERPRISE_MANAGE_SEARXNG": manage_searxng,
         "ENTERPRISE_SEARXNG_API_URL": searxng_api_url,
         "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": searxng_timeout,
@@ -1501,10 +1892,12 @@ def user_service_unit(paths: DeploymentPaths, *, host: str, port: int) -> str:
     return "\n".join(lines)
 
 
-def _deployment_platform_settings(data_dir: Path) -> dict[str, str]:
+def _deployment_platform_settings(
+    data_dir: Path,
+    *,
+    snapshot: dict[str, tuple[str, bool]] | None = None,
+) -> dict[str, str]:
     db_path = data_dir / "platform.db"
-    if not db_path.exists():
-        return {}
     keys = {
         "platform_host",
         "platform_port",
@@ -1512,6 +1905,14 @@ def _deployment_platform_settings(data_dir: Path) -> dict[str, str]:
         "platform_trusted_proxy",
         "platform_session_ttl_seconds",
     }
+    if snapshot is not None:
+        return {
+            key: str(snapshot[key][0])
+            for key in keys
+            if key in snapshot
+        }
+    if not db_path.exists():
+        return {}
     try:
         conn = sqlite3.connect(str(db_path))
         try:
@@ -1544,6 +1945,23 @@ def _read_settings_snapshot(db_path: Path) -> dict[str, tuple[str, bool]]:
         for key, value, secret in rows
         if key is not None and value is not None
     }
+
+
+def _effective_managed_setting(
+    settings: dict[str, tuple[str, bool]],
+    key: str,
+    *,
+    fallback: bool,
+) -> bool:
+    """Apply the runtime's persisted-setting-over-environment precedence."""
+
+    found = settings.get(key)
+    value = str(found[0]) if found else None
+    # PlatformRuntimeManager._runtime_setting treats an empty persisted value
+    # as absent before its managed flag methods apply the same truthy tokens.
+    if value in {None, ""}:
+        return bool(fallback)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def venv_package_hint(python_executable: str, venv_dir: Path, *, existing_broken: bool = False) -> str:
@@ -1764,6 +2182,43 @@ def _capture_command_stdout(cmd: list[str], *, timeout: float = 20.0) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return result.stdout or ""
+
+
+def _git_query_stdout(cwd: Path, arguments: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeploymentError(f"could not inspect Git source at {cwd}: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise DeploymentError(
+            f"could not inspect Git source at {cwd}: {detail or result.returncode}"
+        )
+    return (result.stdout or "").strip()
+
+
+def _write_json_atomic(path: Path, value: dict[str, str]) -> None:
+    ensure_private_directory(path.parent)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _download_file_bounded(
@@ -2014,7 +2469,6 @@ def add_bootstrap_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data", default=os.getenv("ENTERPRISE_PLATFORM_DATA") or None)
     parser.add_argument("--mode", choices=("auto", "service", "foreground", "prepare"), default=os.getenv("ENTERPRISE_DEPLOY_MODE", "auto"))
     parser.add_argument("--service-name", default=os.getenv("ENTERPRISE_SERVICE_NAME") or None)
-    parser.add_argument("--skip-submodules", action="store_true")
     parser.add_argument("--skip-runtime-prepare", action="store_true")
 
 
@@ -2035,7 +2489,6 @@ def bootstrap_from_args(args: argparse.Namespace) -> DeploymentResult:
         host=args.host,
         port=args.port,
         mode=args.mode,
-        skip_submodules=args.skip_submodules,
         prepare_runtime=not args.skip_runtime_prepare,
     )
     if result.service_started:

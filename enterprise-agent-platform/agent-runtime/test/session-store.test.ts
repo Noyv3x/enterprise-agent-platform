@@ -3,7 +3,11 @@ import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promis
 import { dirname } from "node:path";
 import test from "node:test";
 import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
-import { SessionStore } from "../src/session-store.js";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import {
+  CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+  SessionStore,
+} from "../src/session-store.js";
 import { temporaryDirectory } from "./helpers.js";
 
 test("SessionStore seeds once and isolates sessions", async () => {
@@ -72,6 +76,52 @@ test("SessionStore reads an existing journal with unknown header metadata withou
     const replacementSeed: UserMessage = { role: "user", content: "must-not-reseed", timestamp: 2 };
     assert.deepEqual(await store.initialize(identity, [replacementSeed]), [message]);
     assert.equal(await readFile(journal, "utf8"), original);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore distinguishes legacy/imported messages from runtime-secured messages", async () => {
+  const home = await temporaryDirectory("agent-session-content-security-version-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const legacy: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: "legacy-web-call",
+      toolName: "web",
+      content: [{ type: "text", text: "legacy search result" }],
+      details: null,
+      isError: false,
+      timestamp: 1,
+    };
+    const current: ToolResultMessage = {
+      ...legacy,
+      toolCallId: "current-web-call",
+      content: [{ type: "text", text: "current framed search result" }],
+      timestamp: 2,
+    };
+    const [legacyTracked] = await store.initializeTracked(identity, [legacy]);
+    const currentEntryId = await store.appendMessage(
+      identity,
+      current,
+      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+    );
+    const beforeReload = await readFile(store.path(identity), "utf8");
+
+    const reloaded = await store.initializeTracked(identity);
+
+    assert.equal(legacyTracked?.model_content_security_version, undefined);
+    assert.equal(reloaded.find((entry) => entry.entry_id === legacyTracked?.entry_id)?.model_content_security_version, undefined);
+    assert.equal(
+      reloaded.find((entry) => entry.entry_id === currentEntryId)?.model_content_security_version,
+      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+    );
+    assert.equal(
+      await readFile(store.path(identity), "utf8"),
+      beforeReload,
+      "loading version metadata must not rewrite legacy JSONL",
+    );
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -348,6 +398,12 @@ test("SessionStore keeps live tool images out of durable journals", async () => 
         screenshot: { data: encoded, mimeType: "image/png" },
         nested: [{ type: "image", data: encoded, mimeType: "image/webp", bytes: 2 * 1024 * 1024 }],
         safe: { data: "ordinary structured data", mimeType: "text/plain" },
+        process: {
+          command: `API_TOKEN=ghp_${"S".repeat(36)} printf ok`,
+          authorization: "Bearer secret-value",
+        },
+        tokens: ["array-secret-value"],
+        api_key: { value: "object-secret-value" },
       },
       isError: false,
       timestamp: 1,
@@ -370,6 +426,9 @@ test("SessionStore keeps live tool images out of durable journals", async () => 
           screenshot: { data?: string; mimeType: string; bytes: number; omitted: boolean };
           nested: Array<{ data?: string; type: string; mimeType: string; bytes: number; omitted: boolean }>;
           safe: { data: string; mimeType: string };
+          process: { command: string; authorization: string };
+          tokens: string;
+          api_key: string;
         }
       : undefined;
     assert.equal(persistedDetails?.screenshot.data, undefined);
@@ -382,14 +441,25 @@ test("SessionStore keeps live tool images out of durable journals", async () => 
     assert.equal(persistedDetails?.nested[0]?.bytes, 2 * 1024 * 1024);
     assert.equal(persistedDetails?.nested[0]?.omitted, true);
     assert.equal(persistedDetails?.safe.data, "ordinary structured data");
+    assert.match(persistedDetails?.process.command ?? "", /API_TOKEN=\[redacted\]/);
+    assert.equal(persistedDetails?.process.authorization, "[redacted]");
+    assert.equal(persistedDetails?.tokens, "[redacted]");
+    assert.equal(persistedDetails?.api_key, "[redacted]");
     const liveDetails = result.details as {
       screenshot: { data: string };
       nested: Array<{ data: string }>;
+      tokens: string[];
+      api_key: { value: string };
     };
     assert.equal(liveDetails.screenshot.data, encoded, "persistence must not mutate live details");
     assert.equal(liveDetails.nested[0]?.data, encoded, "nested live details must remain unchanged");
+    assert.deepEqual(liveDetails.tokens, ["array-secret-value"]);
+    assert.deepEqual(liveDetails.api_key, { value: "object-secret-value" });
     const raw = await readFile(store.path(identity), "utf8");
     assert.doesNotMatch(raw, new RegExp(encoded.slice(0, 100)));
+    assert.doesNotMatch(raw, /ghp_S{20}/);
+    assert.doesNotMatch(raw, /secret-value/);
+    assert.doesNotMatch(raw, /array-secret-value|object-secret-value/);
     assert.ok(Buffer.byteLength(raw) < 10_000, `durable journal unexpectedly used ${Buffer.byteLength(raw)} bytes`);
 
     await store.rewriteCompacted(identity, [{ entry_id: resultEntryId, message: result }], {
@@ -398,7 +468,71 @@ test("SessionStore keeps live tool images out of durable journals", async () => 
     });
     const compactedRaw = await readFile(store.path(identity), "utf8");
     assert.doesNotMatch(compactedRaw, new RegExp(encoded.slice(0, 100)));
+    assert.doesNotMatch(compactedRaw, /ghp_S{20}/);
+    assert.doesNotMatch(compactedRaw, /secret-value/);
+    assert.doesNotMatch(compactedRaw, /array-secret-value|object-secret-value/);
     assert.ok(Buffer.byteLength(compactedRaw) < 10_000);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore redacts assistant tool-call payloads in journals and archives", async () => {
+  const home = await temporaryDirectory("agent-session-tool-arguments-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const token = `ghp_${"S".repeat(36)}`;
+    const headerSecret = "compact-header-secret";
+    const processSecret = "process-header-secret";
+    const typedText = "unstructured private browser form value";
+    const terminalMessage = fauxAssistantMessage(fauxToolCall("terminal", {
+      command: `API_TOKEN=${token} curl -HAuthorization:${headerSecret} left\u202eright`,
+      cwd: ".",
+    }), { stopReason: "toolUse" });
+    const processMessage = fauxAssistantMessage(fauxToolCall("process", {
+      action: "write",
+      process_id: "shell",
+      input: `curl --header=X-API-Key:${processSecret} left\u2066right\n`,
+    }), { stopReason: "toolUse" });
+    const browserMessage = fauxAssistantMessage(fauxToolCall("browser", {
+      action: "type",
+      arguments: { tab_id: "tab", ref: "e1", text: typedText },
+    }), { stopReason: "toolUse" });
+    const tracked = await store.initializeTracked(identity, [terminalMessage, processMessage, browserMessage]);
+    const retained: UserMessage = { role: "user", content: "retain", timestamp: 3 };
+    const retainedEntryId = await store.appendMessage(identity, retained);
+
+    const journal = await readFile(store.path(identity), "utf8");
+    assert.doesNotMatch(journal, new RegExp(token));
+    assert.doesNotMatch(journal, new RegExp(headerSecret));
+    assert.doesNotMatch(journal, new RegExp(processSecret));
+    assert.doesNotMatch(journal, /[\u202e\u2066]/u);
+    assert.doesNotMatch(journal, new RegExp(typedText));
+    assert.match(journal, /\[redacted\]/);
+    assert.match(journal, /input omitted/);
+    assert.match(
+      JSON.stringify(terminalMessage),
+      new RegExp(token),
+      "durable redaction must not mutate the live assistant message",
+    );
+    assert.match(JSON.stringify(processMessage), new RegExp(processSecret));
+    assert.match(JSON.stringify(browserMessage), new RegExp(typedText));
+
+    await store.rewriteCompacted(
+      identity,
+      [{ entry_id: retainedEntryId, message: retained }],
+      { omitted_messages: 3, retained_messages: 1 },
+      tracked.map((entry) => entry.entry_id),
+    );
+    const archive = await readFile(store.archivePath(identity), "utf8");
+    assert.doesNotMatch(archive, new RegExp(token));
+    assert.doesNotMatch(archive, new RegExp(headerSecret));
+    assert.doesNotMatch(archive, new RegExp(processSecret));
+    assert.doesNotMatch(archive, /[\u202e\u2066]/u);
+    assert.doesNotMatch(archive, new RegExp(typedText));
+    assert.match(archive, /\[redacted\]/);
+    assert.match(archive, /input omitted/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

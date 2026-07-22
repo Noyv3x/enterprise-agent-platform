@@ -47,16 +47,16 @@
 ### 知识与托管工具
 
 - `ENTERPRISE_KB_BACKEND`：`local`、`hybrid` 或 `cognee`。
-- `ENTERPRISE_COGNEE_REPO`、`ENTERPRISE_COGNEE_DATASET`、`ENTERPRISE_COGNEE_INGEST_BACKGROUND`、`ENTERPRISE_MANAGE_COGNEE`。
+- `ENTERPRISE_COGNEE_REPO`、`ENTERPRISE_COGNEE_DATASET`、`ENTERPRISE_COGNEE_INGEST_BACKGROUND`、`ENTERPRISE_MANAGE_COGNEE`。开关默认开启；没有持久化覆盖时，设为 `0` 的 foreground/外部进程管理启动不会下载 Cognee 源码或安装其依赖，并保留外置 repo 路径。
 - `ENTERPRISE_MANAGE_CAMOFOX`、`ENTERPRISE_CAMOFOX_URL`、`ENTERPRISE_CAMOFOX_COMMAND`。
-- `ENTERPRISE_MANAGE_FIRECRAWL`、`ENTERPRISE_FIRECRAWL_REPO`、`ENTERPRISE_FIRECRAWL_API_URL`、`ENTERPRISE_FIRECRAWL_COMMAND`。
+- `ENTERPRISE_MANAGE_FIRECRAWL`、`ENTERPRISE_FIRECRAWL_REPO`、`ENTERPRISE_FIRECRAWL_API_URL`、`ENTERPRISE_FIRECRAWL_COMMAND`。开关默认开启；没有持久化覆盖时，设为 `0` 的 foreground/外部进程管理启动不会下载 Firecrawl 源码，并保留外置 repo 路径。
 - `FIRECRAWL_API_KEY`：外置 Firecrawl 的可选 bearer secret。标准 service 部署从平台 secret store 读取；环境变量是 foreground 或外部进程管理方式的回退。
 - `ENTERPRISE_MANAGE_SEARXNG`、`ENTERPRISE_SEARXNG_API_URL`。
 - `ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS` 以及 SearXNG/Compose 的部署等待配置。
 
 托管 endpoint 必须使用无内嵌凭据的数值回环地址；外置 SearXNG 仍受同一约束。外置 Agent Runtime 与 Firecrawl 可以使用无内嵌凭据的 HTTP(S) base URL，并分别通过 Runtime bearer 与 Firecrawl API key 认证；Camoufox 关闭托管后浏览器能力不可用。服务启动等待由部署配置解析，并由托管服务测试覆盖，不属于 Runtime 跨层契约。
 
-外置 Firecrawl 的 managed 开关、URL 和 command 与外置 Runtime 一样，只是 foreground/外部进程管理模式的兼容配置；当前标准 `./deploy.sh service` 与管理界面使用托管 Firecrawl，不提供切换入口。`FIRECRAWL_API_KEY` 可以先保存在平台 secret store，供上述外置模式读取。
+外置 Cognee/Firecrawl 的 managed 开关与 repo，以及 Firecrawl 的 URL 和 command，与外置 Runtime 一样，只是 foreground/外部进程管理模式的兼容配置。有对应数据库设置时，`cognee_manage` 和 `firecrawl_manage` 优先于环境变量；有效关闭时，bootstrap、生成的运行环境和平台配置必须贯穿显式外置 repo；有效开启时，生成的 managed 开关和 repo 必须固定为托管值，不能被遗留的外置环境变量覆盖。当前标准 `./deploy.sh service` 与管理界面使用默认开启的托管模式，不提供切换入口。`FIRECRAWL_API_KEY` 可以先保存在平台 secret store，供上述外置模式读取。
 
 ### Telegram 与自动更新
 
@@ -99,7 +99,7 @@ public URL、trusted proxy 和 session TTL 可立即影响请求处理；host/po
 
 ### 集成设置
 
-Cognee 的 backend、dataset 和内部配置由对应管理入口持久化。Runtime manager 保留读取既有 Camoufox/Firecrawl managed、repo、endpoint 和 command 设置的能力，但当前产品管理界面不写这些键。Telegram 和自动更新保存各自 enabled、polling/interval、remote/branch 等字段。
+Cognee 的 backend、dataset 和内部配置由对应管理入口持久化。托管 Cognee/Firecrawl 的 source 路径由部署根据 canonical 源码契约决定；旧数据库中的 `cognee_repo`、`firecrawl_repo` 不得覆盖托管路径。Runtime manager 保留读取既有 Camoufox/Firecrawl managed、endpoint 和 command 设置的外置兼容能力，但当前产品管理界面不写这些键。Telegram 和自动更新保存各自 enabled、polling/interval、remote/branch 等字段。
 
 有效设置通常是“数据库非空值，否则 `PlatformConfig` 启动基线”。每个新增字段必须在实现和本参考中明确自己的回退方式，不得假设这一规则自动适用。
 

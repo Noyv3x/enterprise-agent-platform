@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "cognee": {
+      "repository_url": "https://github.com/topoteretes/cognee.git",
+      "revision": "252f2c3efb184533a0955e31e83a28ea7db9813d",
+      "required_paths": [
+        "pyproject.toml",
+        "cognee/__init__.py"
+      ]
+    },
+    "firecrawl": {
+      "repository_url": "https://github.com/firecrawl/firecrawl.git",
+      "revision": "9b8225fac843a5f3832a68d7e26024fd4844bd94",
+      "required_paths": [
+        "docker-compose.yaml"
+      ],
+      "compose_services": [
+        "api",
+        "foundationdb",
+        "foundationdb-init",
+        "nuq-postgres",
+        "playwright-service",
+        "rabbitmq",
+        "redis"
+      ]
+    }
+  }
+}

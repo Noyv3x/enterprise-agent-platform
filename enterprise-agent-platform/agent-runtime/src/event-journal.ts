@@ -130,10 +130,21 @@ function addBoundedString(event: RuntimeEvent, key: string, value: string, maxBy
 
 function cloneData(data: JsonObject): JsonObject {
   try {
-    return JSON.parse(JSON.stringify(data)) as JsonObject;
+    return omitInternalApprovalKeys(JSON.parse(JSON.stringify(data))) as JsonObject;
   } catch {
     return { truncated: true, error: "Event payload was not JSON-serializable" };
   }
+}
+
+function omitInternalApprovalKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => omitInternalApprovalKeys(item));
+  if (!value || typeof value !== "object") return value;
+  const sanitized: JsonObject = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "approval_key" || key === "approvalKey") continue;
+    sanitized[key] = omitInternalApprovalKeys(item);
+  }
+  return sanitized;
 }
 
 function serializedBytes(value: unknown): number {

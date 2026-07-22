@@ -6,9 +6,7 @@
   ],
   "coverage": {
     "code_include": [
-      ".gitmodules",
-      "cognee",
-      "firecrawl",
+      ".gitignore",
       ".github/**/*.yml",
       ".github/**/*.yaml",
       "deploy.sh",
@@ -71,7 +69,7 @@
         "docs/development/testing.md"
       ],
       "code": [
-        ".gitmodules",
+        ".gitignore",
         ".github/**"
       ],
       "tests": []
@@ -157,11 +155,11 @@
     {
       "id": "integrations",
       "documents": [
-        "docs/design/integrations.md"
+        "docs/design/integrations.md",
+        "docs/contracts/upstream-sources.json"
       ],
       "code": [
-        "cognee",
-        "firecrawl",
+        "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
@@ -232,6 +230,20 @@
     }
   ],
   "contracts": [
+    {
+      "id": "upstream-sources",
+      "source": "docs/contracts/upstream-sources.json",
+      "domains": [
+        "integrations",
+        "platform"
+      ],
+      "targets": [
+        {
+          "path": "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
+          "format": "python-upstream-sources"
+        }
+      ]
+    },
     {
       "id": "runtime-policy",
       "source": "docs/contracts/runtime-policy.json",

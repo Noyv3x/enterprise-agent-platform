@@ -4,6 +4,7 @@ import test from "node:test";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { RunCoordinator } from "../src/run-coordinator.js";
+import { classifyToolCall } from "../src/tools.js";
 import type { RunRequest } from "../src/types.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
@@ -29,8 +30,9 @@ test("RunCoordinator starts top-level runs in FIFO order at the concurrency limi
       return fauxAssistantMessage("third complete");
     },
   ]);
+  const config = testConfig(home, { maxConcurrency: 1 });
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
+    config,
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -173,8 +175,9 @@ test("a delegated child that needs review forces the parent to needs_review", as
     async () => { throw new Error("child provider failed"); },
     fauxAssistantMessage("parent tried to recover"),
   ]);
+  const config = testConfig(home, { maxConcurrency: 1 });
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
+    config,
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -190,11 +193,18 @@ test("a delegated child that needs review forces the parent to needs_review", as
     assert.equal(completed.sideEffectsStarted, true);
     assert.match(completed.error || "", /child provider failed/);
     await access(`${workspace}/child-marker`);
+    const policy = await classifyToolCall(
+      "terminal",
+      { command: "touch child-marker && stat child-marker" },
+      workspace,
+      config.terminalTimeoutMs,
+    );
+    assert.ok(policy.approvalKey);
     assert.equal(await coordinator.sessions.hasSessionApproval({
       scope_key: parent.request.scope_key,
       lifecycle_id: parent.request.lifecycle_id,
       session_id: parent.request.session_id,
-    }, "terminal"), true);
+    }, policy.approvalKey), true);
     assert.ok(coordinator.getJournal(parent.id)?.list().some((event) => event.type === "delegation.failed"));
   } finally {
     coordinator.shutdown();

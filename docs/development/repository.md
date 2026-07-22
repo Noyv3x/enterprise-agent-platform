@@ -14,8 +14,7 @@
 │   ├── agent-runtime/             # 平台自有 Node Runtime
 │   ├── camofox-runtime/           # 平台自有浏览器补丁/安装描述
 │   └── tests/                     # Python unittest
-├── cognee/                       # 上游 submodule
-└── firecrawl/                    # 上游 submodule
+└── scripts/                       # 文档同步与仓库工具
 ```
 
 运行数据库、日志、OAuth token、附件、workspace、生成的托管配置和 Runtime 状态位于平台数据目录，不属于仓库。
@@ -26,14 +25,14 @@
 
 如果文档与实现不一致，默认视为实现尚未同步，而不是直接把文档改成现状。确需改变设计时，应在同一个变更中先明确新设计、必要时新增 ADR，然后同步实现。
 
-## 上游 submodule
+## 上游源码
 
-Cognee 与 Firecrawl 可只读检查，但常规平台任务不得：
+Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。它们的官方 URL 和精确 revision 只在 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义，由部署下载到平台数据目录。常规平台任务不得：
 
-- 在 submodule 中创建提交、分支或 PR；
-- 推送上游仓库；
-- 改变 pinned revision；
-- 把平台生成配置写入 submodule 工作树。
+- 在受管源码缓存中实现产品修改、创建提交、分支或 PR；
+- 从受管缓存推送上游；
+- 绕过源码契约跟随 branch/tag；
+- 把平台生成配置写入源码 checkout。
 
 集成行为应改在 Python adapter、Runtime 或平台生成配置。确实必须修改上游时，先取得目标 fork、branch 和发布方式的明确授权。
 
@@ -67,7 +66,7 @@ Cognee 与 Firecrawl 可只读检查，但常规平台任务不得：
 
 提交前检查：
 
-- `git status --short` 中没有意外运行数据或 submodule 修改；
+- `git status --short` 中没有意外运行数据或生成源码；
 - 文档映射和相对链接通过；
 - 相关 component test/check/build 通过；
 - 前端变化已包含重新生成 static；
