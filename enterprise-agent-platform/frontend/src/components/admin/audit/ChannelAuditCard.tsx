@@ -5,7 +5,8 @@
    cascades reloads. The two tool inputs are local state, cleared on a confirmed
    submit. */
 
-import { useState } from "react";
+import { Button, Form, Input, Select } from "antd";
+import { useId, useState } from "react";
 import {
   clearChannelMessages,
   deleteChannelMessage,
@@ -19,9 +20,9 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { UseConfirm } from "../../../hooks/useConfirm";
 import type { Id } from "../../../types";
 import { CardHead } from "../../common/CardHead";
-import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
 import { AuditMessageRow } from "./AuditMessageRow";
+import { AdminCard } from "../AdminCard";
 import { useI18n } from "../../../i18n";
 
 export interface ChannelAuditCardProps {
@@ -31,6 +32,8 @@ export interface ChannelAuditCardProps {
 
 export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) {
   const { t } = useI18n();
+  const formId = useId();
+  const fieldId = (name: string) => `${formId}-${name}`;
   const store = useStoreHandle();
   const channels = useStore((state) => state.channels);
   const channelMessages = useStore((state) => state.messageAudit.channelMessages);
@@ -41,8 +44,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
   const [messageId, setMessageId] = useState("");
   const [beforeTime, setBeforeTime] = useState("");
 
-  const handleDeleteId = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleDeleteId = () => {
     const id = Number(messageId);
     if (!id) {
       toast(t("admin.audit.missingMessageId.detail"), { title: t("admin.audit.missingMessageId.title") });
@@ -55,8 +57,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
     })();
   };
 
-  const handleDeleteBefore = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleDeleteBefore = () => {
     const ts = unixFromDatetimeLocal(beforeTime);
     if (!ts) {
       toast(t("admin.audit.missingTime.detail"), { title: t("admin.audit.missingTime.title") });
@@ -84,7 +85,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
   };
 
   return (
-    <section className="card audit-card">
+    <AdminCard className="audit-card">
       <CardHead
         title={t("admin.audit.channel.title")}
         icon="message"
@@ -92,35 +93,45 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
           channel ? t("admin.audit.channel.messageCount", { channel: channel.name, count: channelTotal || 0 }) : t("admin.audit.channel.selectHint")
         }
         extra={
-          <button
-            className="btn btn--sm"
-            type="button"
+          <Button
+            className="btn--sm"
+            size="small"
+            icon={<Icon name="refresh" size={14} />}
             disabled={busy || !channelId}
             onClick={() => void refreshAuditChannel(store, channelId)}
           >
-            <Icon name="refresh" size={14} />
-            <span>{t("admin.common.refresh")}</span>
-          </button>
+            {t("admin.common.refresh")}
+          </Button>
         }
       />
       {channels.length ? (
-        <Field label={t("admin.audit.channel.label")}>
-          <select
+        <Form.Item
+          className="field"
+          label={t("admin.audit.channel.label")}
+          htmlFor={fieldId("channel")}
+        >
+          <Select
+            id={fieldId("channel")}
+            aria-label={t("admin.audit.channel.label")}
+            style={{ width: "100%" }}
             value={channelId}
-            onChange={(event) => void selectAuditChannel(store, String(event.target.value || ""))}
-          >
-            {channels.map((item) => (
-              <option key={String(item.id)} value={String(item.id)}>
-                {`#${item.name}`}
-              </option>
-            ))}
-          </select>
-        </Field>
+            options={channels.map((item) => ({
+              value: String(item.id),
+              label: `#${item.name}`,
+            }))}
+            onChange={(value) => void selectAuditChannel(store, String(value || ""))}
+          />
+        </Form.Item>
       ) : null}
       <div className="audit-tools">
-        <form className="audit-tool" onSubmit={handleDeleteId}>
-          <Field label={t("admin.audit.exactDelete")}>
-            <input
+        <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteId}>
+          <Form.Item
+            className="field"
+            label={t("admin.audit.exactDelete")}
+            htmlFor={fieldId("message-id")}
+          >
+            <Input
+              id={fieldId("message-id")}
               type="number"
               min="1"
               step="1"
@@ -128,39 +139,51 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
               value={messageId}
               onChange={(event) => setMessageId(event.target.value)}
             />
-          </Field>
-          <button className="btn btn--danger" type="submit" disabled={busy || !channelId}>
-            <Icon name="trash" size={15} />
-            <span>{t("admin.audit.deleteId")}</span>
-          </button>
-        </form>
-        <form className="audit-tool" onSubmit={handleDeleteBefore}>
-          <Field label={t("admin.audit.deleteBeforeLabel")}>
-            <input
+          </Form.Item>
+          <Button
+            danger
+            htmlType="submit"
+            icon={<Icon name="trash" size={15} />}
+            disabled={busy || !channelId}
+          >
+            {t("admin.audit.deleteId")}
+          </Button>
+        </Form>
+        <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteBefore}>
+          <Form.Item
+            className="field"
+            label={t("admin.audit.deleteBeforeLabel")}
+            htmlFor={fieldId("before-time")}
+          >
+            <Input
+              id={fieldId("before-time")}
               type="datetime-local"
               value={beforeTime}
               onChange={(event) => setBeforeTime(event.target.value)}
             />
-          </Field>
-          <button className="btn btn--danger" type="submit" disabled={busy || !channelId}>
-            <Icon name="trash" size={15} />
-            <span>{t("admin.audit.deleteBefore")}</span>
-          </button>
-        </form>
+          </Form.Item>
+          <Button
+            danger
+            htmlType="submit"
+            icon={<Icon name="trash" size={15} />}
+            disabled={busy || !channelId}
+          >
+            {t("admin.audit.deleteBefore")}
+          </Button>
+        </Form>
         <div className="audit-tool audit-tool--compact">
           <span className="field">
             <span>{t("admin.audit.clearAll")}</span>
             <span className="muted">{t("admin.audit.channel.clearHint")}</span>
           </span>
-          <button
-            className="btn btn--danger"
-            type="button"
+          <Button
+            danger
+            icon={<Icon name="trash" size={15} />}
             disabled={busy || !channelId}
             onClick={handleClear}
           >
-            <Icon name="trash" size={15} />
-            <span>{t("admin.audit.channel.clear")}</span>
-          </button>
+            {t("admin.audit.channel.clear")}
+          </Button>
         </div>
       </div>
       <div className="audit-list">
@@ -177,6 +200,6 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
           <div className="muted">{t(channel ? "admin.audit.channel.empty" : "admin.audit.channel.none")}</div>
         )}
       </div>
-    </section>
+    </AdminCard>
   );
 }

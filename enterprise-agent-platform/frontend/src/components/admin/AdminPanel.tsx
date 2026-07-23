@@ -2,7 +2,7 @@
    legacy-app.js:1342-1361). Permission-gated (isAdmin), then pager + active page
    header + content. ContentRouter renders this at the admin placeholder. */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useResourceState } from "../../hooks/useResourceState";
 import { hasAdminPageData, ensureAdminPageResource, refreshAdminPageResource } from "../../data/adminResources";
@@ -16,6 +16,7 @@ import { AdminPageContent } from "./AdminPageContent";
 import { AdminPageHeader } from "./AdminPageHeader";
 import { AdminPager } from "./AdminPager";
 import { useI18n } from "../../i18n";
+import { AntDesignProvider } from "../ui/AntDesignProvider";
 
 export function AdminPanel() {
   const { t } = useI18n();
@@ -30,10 +31,15 @@ export function AdminPanel() {
   const mutationPending = useStore((state) =>
     state.pendingOperations.some((key) => key.startsWith("admin:")),
   );
+  const [accountCreateOpen, setAccountCreateOpen] = useState(false);
 
   useEffect(() => {
     if (isAdmin) void ensureAdminPageResource(store, page.id);
   }, [isAdmin, page.id, store]);
+
+  useEffect(() => {
+    if (page.id !== "accounts") setAccountCreateOpen(false);
+  }, [page.id]);
 
   if (!isAdmin) {
     return (
@@ -46,31 +52,41 @@ export function AdminPanel() {
   }
 
   return (
-    <div className="panel">
-      <div className="panel__inner admin-panel">
-        <AdminPager activeId={page.id} />
-        <div className={cx("admin-page", `admin-page--${page.id}`)}>
-          <AdminPageHeader
-            page={page}
-            refreshing={resource.status === "loading"}
-            onRefresh={() => void refreshAdminPageResource(store, page.id)}
-            refreshDisabled={mutationPending}
-          />
-          <div
-            className="admin-page__content"
-            inert={resource.status === "loading" && dataPresent}
-            aria-busy={resource.status === "loading" || mutationPending}
+    <AntDesignProvider>
+      <div className="panel eap-admin-shell">
+        <div className="eap-admin-layout">
+          <AdminPager activeId={page.id} />
+          <section
+            className={cx("eap-admin-page", `eap-admin-page--${page.id}`)}
+            aria-labelledby={`admin-page-${page.id}-title`}
           >
-            <ResourceStatusView
-              resourceKey={resourceKey}
-              hasData={dataPresent || resource.updatedAt !== null}
-              onRetry={() => void refreshAdminPageResource(store, page.id)}
+            <AdminPageHeader
+              page={page}
+              refreshing={resource.status === "loading"}
+              onRefresh={() => void refreshAdminPageResource(store, page.id)}
+              refreshDisabled={mutationPending}
+              onCreateAccount={page.id === "accounts" ? () => setAccountCreateOpen(true) : undefined}
+            />
+            <div
+              className="eap-admin-page__content"
+              inert={resource.status === "loading" && dataPresent}
+              aria-busy={resource.status === "loading" || mutationPending}
             >
-              <AdminPageContent pageId={page.id} />
-            </ResourceStatusView>
-          </div>
+              <ResourceStatusView
+                resourceKey={resourceKey}
+                hasData={dataPresent || resource.updatedAt !== null}
+                onRetry={() => void refreshAdminPageResource(store, page.id)}
+              >
+                <AdminPageContent
+                  pageId={page.id}
+                  accountCreateOpen={accountCreateOpen}
+                  onCloseAccountCreate={() => setAccountCreateOpen(false)}
+                />
+              </ResourceStatusView>
+            </div>
+          </section>
         </div>
       </div>
-    </div>
+    </AntDesignProvider>
   );
 }

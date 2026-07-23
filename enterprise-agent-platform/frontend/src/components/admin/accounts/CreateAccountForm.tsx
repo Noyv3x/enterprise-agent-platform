@@ -3,13 +3,12 @@
    exact JSON body; on success resets fields to defaults (member / medium / empty),
    reloads users, toasts. */
 
+import { Button, Form, Input, Space } from "antd";
 import { useId, useRef, useState } from "react";
 import { createAccount } from "../../../data/adminActions";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { PermissionGroup } from "../../../types";
-import { Field } from "../../common/Field";
 import { Drawer } from "../../common/Drawer";
-import { LoadingButton } from "../../common/LoadingButton";
 import { useConfirm } from "../../../hooks/useConfirm";
 import { AccountModelSelect } from "./AccountModelSelect";
 import { PermissionGroupSelect } from "./PermissionGroupSelect";
@@ -38,6 +37,7 @@ export function CreateAccountForm({
   const [thinkingDepth, setThinkingDepth] = useState("medium");
   const modelCoerced = useRef("");
   const formId = useId();
+  const fieldId = (name: string) => `${formId}-${name}`;
   const { confirm, dialog } = useConfirm();
 
   const dirty = !!(
@@ -66,8 +66,7 @@ export function CreateAccountForm({
     onClose();
   };
 
-  const handleSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleSubmit = () => {
     void createAccount(
       store,
       {
@@ -93,71 +92,74 @@ export function CreateAccountForm({
         onClose={() => void requestClose()}
         title={t("admin.accounts.create")}
         description={t("admin.accounts.createDescription")}
-        className="account-drawer"
+        className="account-drawer eap-admin-account-drawer"
         footer={(
-          <>
-            <button className="btn btn--ghost" type="button" onClick={() => void requestClose()}>
+          <Space>
+            <Button type="text" onClick={() => void requestClose()}>
               {t("admin.common.cancel")}
-            </button>
-            <LoadingButton
-              variant="primary"
-              type="submit"
+            </Button>
+            <Button
+              type="primary"
+              htmlType="submit"
               form={formId}
               loading={creating}
-              loadingLabel={t("admin.common.saving")}
               disabled={!dirty || !username.trim() || !password}
-            >{t("admin.accounts.create")}</LoadingButton>
-          </>
+            >{t("admin.accounts.create")}</Button>
+          </Space>
         )}
       >
-        <form id={formId} className="account-drawer__form" onSubmit={handleSubmit}>
-          <Field label={t("admin.accounts.username")}>
-            <input
+        <Form id={formId} className="eap-admin-account-form" layout="vertical" requiredMark={false} onFinish={handleSubmit}>
+          <Form.Item label={t("admin.accounts.username")} htmlFor={fieldId("username")} required>
+            <Input
+              id={fieldId("username")}
               placeholder={t("admin.accounts.usernamePlaceholder")}
               autoComplete="off"
               required
               value={username}
               onChange={(event) => setUsername(event.target.value)}
             />
-          </Field>
-          <Field label={t("admin.accounts.displayName")}>
-            <input
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.displayName")} htmlFor={fieldId("display-name")}>
+            <Input
+              id={fieldId("display-name")}
               placeholder={t("admin.accounts.displayName")}
               value={displayName}
               onChange={(event) => setDisplayName(event.target.value)}
             />
-          </Field>
-          <Field label={t("admin.accounts.initialPassword")}>
-            <input
-              type="password"
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.initialPassword")} htmlFor={fieldId("password")} required>
+            <Input.Password
+              id={fieldId("password")}
               autoComplete="new-password"
               required
               placeholder={t("admin.accounts.initialPassword")}
               value={password}
               onChange={(event) => setPassword(event.target.value)}
             />
-          </Field>
-          <Field label={t("admin.accounts.position")}>
-            <input
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.position")} htmlFor={fieldId("position")}>
+            <Input
+              id={fieldId("position")}
               placeholder={t("admin.accounts.positionPlaceholder")}
               value={position}
               onChange={(event) => setPosition(event.target.value)}
             />
-          </Field>
-          <Field label={t("admin.accounts.permissionGroup")}>
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.permissionGroup")} htmlFor={fieldId("permission-group")}>
             <PermissionGroupSelect
+              id={fieldId("permission-group")}
               groups={groups}
               value={permissionGroup}
               onChange={setPermissionGroup}
             />
-          </Field>
-          <Field label={t("admin.accounts.model")}>
-            <AccountModelSelect value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
-          </Field>
-          <Field label={t("admin.accounts.thinkingDepth")}>
-            <ThinkingDepthSelect value={thinkingDepth} onChange={setThinkingDepth} />
-          </Field>
-        </form>
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.model")} htmlFor={fieldId("model")}>
+            <AccountModelSelect id={fieldId("model")} value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.thinkingDepth")} htmlFor={fieldId("thinking-depth")}>
+            <ThinkingDepthSelect id={fieldId("thinking-depth")} value={thinkingDepth} onChange={setThinkingDepth} />
+          </Form.Item>
+        </Form>
       </Drawer>
       {dialog}
     </>

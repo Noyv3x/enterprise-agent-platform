@@ -1,119 +1,354 @@
-/* Administration-specific layout. Kept next to the feature so the grouped
-   information architecture does not add another override layer to styles.css. */
+/* Ant Design-backed administration workspace. Product layout classes stay
+   separate from library internals; legacy selectors below only bridge admin
+   pages that have not yet migrated their field controls. */
 
-.panel__inner.admin-panel {
-  width: min(var(--content-max), 100%);
-  grid-template-columns: 240px minmax(0, 1fr);
-  align-items: start;
-  gap: clamp(18px, 2.4vw, 28px);
-}
-
-.admin-panel .admin-pager--desktop {
-  position: sticky;
-  top: 16px;
-  display: grid;
-  align-items: stretch;
-  gap: 18px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  box-shadow: var(--shadow-1);
-  backdrop-filter: none;
-  max-height: calc(100dvh - 64px - var(--page-block-space) - var(--page-block-space));
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-}
-
-.admin-panel .admin-pager__group {
-  display: grid;
-  gap: 5px;
+.eap-component-root {
+  width: 100%;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
+  background: transparent;
+  color: var(--ink);
 }
 
-.admin-panel .admin-pager__group-label {
-  padding: 0 9px;
+/* The legacy shell gives every native field a 40px minimum height. Ant Design
+   owns the geometry of its generated inputs, so keep that rule from stretching
+   search inputs inside Select and compact form controls. */
+.eap-component-root :where(.eap-input, .eap-select-input),
+.eap-admin-account-drawer :where(.eap-input, .eap-select-input) {
+  min-height: 0;
+}
+
+.panel.eap-admin-shell {
+  container: eap-admin-shell / inline-size;
+  padding: clamp(18px, 2.2vw, 28px);
+  background: var(--bg);
+}
+
+.eap-admin-layout {
+  display: grid;
+  grid-template-columns: 216px minmax(840px, 1fr);
+  align-items: start;
+  gap: 24px;
+  width: min(1280px, 100%);
+  min-width: 0;
+  margin: 0 auto;
+}
+
+.eap-admin-nav {
+  position: sticky;
+  top: 0;
+  min-width: 0;
+  max-height: calc(100dvh - 64px - 48px);
+  overflow-y: auto;
+  padding: 4px 12px 12px 0;
+  border-right: 1px solid var(--line);
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.eap-admin-nav .eap-menu {
+  border-inline-end: 0;
+  background: transparent;
+}
+
+.eap-admin-nav .eap-menu-item-group-title {
+  padding: 12px 12px 5px;
   color: var(--faint);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.06em;
-  line-height: 24px;
+  letter-spacing: 0.055em;
+  line-height: 18px;
   text-transform: uppercase;
 }
 
-.admin-panel .admin-pager__group-items {
-  display: grid;
-  gap: 2px;
-}
-
-.admin-panel .admin-pager--desktop .admin-pager__item {
-  width: 100%;
+.eap-admin-nav__item-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   min-width: 0;
-  min-height: 38px;
-  padding: 0 9px;
-  border: 0;
-  border-radius: var(--r-sm);
 }
 
-.admin-panel .admin-pager--desktop .admin-pager__item:focus-visible {
-  position: relative;
-  z-index: 1;
-}
-
-.admin-panel .admin-pager--desktop .admin-pager__item.is-active {
-  background: var(--accent-soft);
-  box-shadow: none;
-  color: var(--accent-soft-ink);
-}
-
-.admin-panel .admin-pager--desktop .admin-pager__item > span:not(.admin-pager__badge) {
+.eap-admin-nav__item-label > span:first-child {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.admin-panel .admin-pager-mobile {
+.eap-admin-nav__badge {
+  flex: 0 0 auto;
+}
+
+.eap-admin-nav__badge .eap-badge-count {
+  color: var(--muted);
+  background: var(--surface-2);
+  box-shadow: 0 0 0 1px var(--line) inset;
+  font-size: 10px;
+}
+
+.eap-admin-page-switcher {
   display: none;
 }
 
-.admin-panel .admin-page {
-  min-width: 0;
-  gap: 16px;
-  container: admin-page / inline-size;
-}
-
-.admin-panel .admin-page__content,
-.admin-panel .admin-page__content > * {
+.eap-admin-page {
+  container: eap-admin-page / inline-size;
+  display: grid;
+  gap: 20px;
   min-width: 0;
 }
 
-.admin-panel .admin-page__content[inert] {
-  opacity: 0.72;
-  transition: opacity var(--t-fast);
-}
-
-.admin-panel .admin-page__head {
+.eap-admin-page-header {
+  display: flex;
   align-items: flex-start;
-  padding: 4px 0 2px;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+  padding: 2px 0 4px;
 }
 
-.admin-panel .admin-page__head h2 {
+.eap-admin-page-header__copy {
+  min-width: 0;
+}
+
+.eap-admin-page-header__copy .eap-typography {
   margin: 0;
-  font-size: 22px;
-  font-weight: 600;
 }
 
-.admin-panel .admin-page__head p {
-  margin-top: 5px;
+.eap-admin-page-header__copy h2.eap-typography {
+  color: var(--ink);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+}
+
+.eap-admin-page-header__copy .eap-typography-secondary {
+  margin-top: 4px;
   max-width: 720px;
   font-size: 13px;
   line-height: 1.55;
 }
 
-/* Form controls share a global text-input contract, but intrinsic controls
-   must retain their own geometry. The label remains the large touch target. */
-.admin-panel .check-row input[type="checkbox"] {
+.eap-admin-page-header__actions {
+  flex: 0 0 auto;
+}
+
+.eap-admin-page__content,
+.eap-admin-page__content > * {
+  min-width: 0;
+}
+
+.eap-admin-page__content {
+  display: grid;
+  gap: 16px;
+}
+
+.eap-admin-page__content[inert] {
+  opacity: 0.68;
+  transition: opacity var(--t-fast);
+}
+
+.eap-admin-page-loading {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  color: var(--muted);
+}
+
+/* Shared Ant Card wrapper used by the remaining administration sections. */
+.eap-admin-card {
+  min-width: 0;
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.eap-admin-card .card__head {
+  align-items: flex-start;
+}
+
+.eap-admin-card .card__title {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.eap-admin-card .card__desc {
+  margin-top: 3px;
+  line-height: 1.5;
+}
+
+.eap-admin-card form {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* Accounts: one data surface instead of Card > list Card > row Card. */
+.eap-admin-accounts {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.eap-admin-accounts__meta {
+  display: flex;
+  align-items: center;
+  min-height: 42px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-2) 55%, var(--surface));
+  font-size: 12px;
+}
+
+.eap-admin-account-table {
+  min-width: 0;
+}
+
+.eap-admin-account-table .eap-table {
+  border-radius: 0;
+}
+
+.eap-admin-usage-table {
+  min-width: 0;
+  background: var(--surface);
+}
+
+.eap-admin-account-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.eap-admin-account-identity > div:last-child {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.eap-admin-account-identity .eap-typography {
+  display: block;
+  min-width: 0;
+}
+
+.eap-admin-account-model {
+  display: block;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.eap-admin-account-permission {
+  color: var(--accent-soft-ink);
+  background: var(--accent-soft);
+}
+
+.eap-admin-account-actions {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.eap-admin-account-actions .eap-btn-text {
+  font-weight: 500;
+}
+
+.eap-admin-account-list {
+  display: none;
+}
+
+.eap-admin-account-mobile-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.eap-admin-account-mobile-row:last-child {
+  border-bottom: 0;
+}
+
+.eap-admin-account-mobile-row__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.eap-admin-account-mobile-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.eap-admin-account-mobile-row__meta .eap-admin-account-model {
+  flex: 1;
+  min-width: 0;
+}
+
+.eap-admin-account-mobile-row > .eap-admin-account-actions {
+  grid-column: 2;
+  grid-row: 2;
+  justify-self: end;
+}
+
+.eap-admin-account-mobile-row__head {
+  grid-column: 1 / -1;
+}
+
+.eap-admin-account-mobile-row__meta {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.account-drawer.eap-admin-account-drawer {
+  width: min(520px, 100vw);
+}
+
+.eap-admin-account-form .eap-select,
+.eap-admin-model-select .eap-select {
+  width: 100%;
+}
+
+.eap-admin-account-form {
+  display: grid;
+  gap: 14px;
+}
+
+.eap-admin-account-form__identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.eap-admin-account-form__identity > div:last-child {
+  display: grid;
+  min-width: 0;
+}
+
+.eap-admin-model-select {
+  display: grid;
+  gap: 5px;
+}
+
+.eap-admin-model-select > .eap-typography {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* Transitional layout bridge for administration pages whose business forms
+   still rely on native controls (notably changed-only environment collectors). */
+.eap-admin-page .check-row input[type="checkbox"] {
   width: 18px;
   height: 18px;
   min-width: 18px;
@@ -122,37 +357,37 @@
   padding: 0;
 }
 
-.admin-panel .btn.btn--sm {
+.eap-admin-page .btn.btn--sm {
   min-height: 34px;
   padding-block: 0;
 }
 
-.admin-panel .config-form {
-  width: min(820px, 100%);
+.eap-admin-page .config-form {
+  width: min(840px, 100%);
   max-width: none;
 }
 
-.admin-panel .config-grid,
-.admin-panel .settings-form__grid,
-.admin-panel .account-create__grid,
-.admin-panel .account-row__grid,
-.admin-panel .config-group__body,
-.admin-panel .oauth-grid {
+.eap-admin-page .config-grid,
+.eap-admin-page .settings-form__grid,
+.eap-admin-page .account-create__grid,
+.eap-admin-page .account-row__grid,
+.eap-admin-page .config-group__body,
+.eap-admin-page .oauth-grid {
   align-items: start;
 }
 
-.admin-panel .field,
-.admin-panel .config-field,
-.admin-panel .oauth-card {
+.eap-admin-page .field,
+.eap-admin-page .config-field,
+.eap-admin-page .oauth-card {
   align-content: start;
 }
 
-.admin-panel .check-row {
+.eap-admin-page .check-row {
   align-items: flex-start;
 }
 
-.admin-panel .field-stack > code,
-.admin-panel .config-value {
+.eap-admin-page .field-stack > code,
+.eap-admin-page .config-value {
   display: block;
   min-width: 0;
   max-width: 100%;
@@ -160,310 +395,55 @@
   word-break: break-word;
 }
 
-.admin-panel .metric-grid {
+.eap-admin-page .metric-grid {
   grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr));
 }
 
-.admin-panel .token-usage__columns {
+.eap-admin-page .token-usage__columns {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.admin-panel .metric-tile strong {
+.eap-admin-page .metric-tile strong {
   font-size: clamp(17px, 2cqi, 21px);
   font-variant-numeric: tabular-nums;
 }
 
-.admin-panel .oauth-code {
+.eap-admin-page .oauth-code {
   font-size: clamp(19px, 3.2cqi, 24px);
   overflow-wrap: anywhere;
 }
 
-.admin-panel .secret-row form input {
-  height: 36px;
-  min-height: 36px;
+.eap-admin-page .secret-row form .eap-input {
+  height: auto;
+  min-height: 0;
 }
 
-.admin-panel .audit-message {
+.eap-admin-page .audit-message {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
-.admin-panel .audit-tool {
+.eap-admin-page .audit-tool {
   grid-template-rows: minmax(0, 1fr) auto;
   align-content: stretch;
 }
 
-.admin-panel .audit-tool .field {
+.eap-admin-page .audit-tool .field {
   align-content: start;
 }
 
-.admin-panel .account-admin {
-  gap: 12px;
-}
-
-.admin-panel .account-list {
-  gap: 0;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  box-shadow: var(--shadow-1);
-}
-
-.admin-panel .account-row {
-  display: grid;
-  grid-template-columns: minmax(190px, 1.3fr) minmax(170px, 1fr) max-content max-content;
-  align-items: center;
-  gap: 16px;
-  padding: 13px 14px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-
-.admin-panel .account-row + .account-row {
-  border-top: 1px solid var(--line);
-}
-
-.admin-panel .account-row:hover {
-  background: var(--surface-2);
-}
-
-.admin-panel .account-row__identity {
-  min-width: 0;
-}
-
-.admin-panel .account-row__identity > div:last-child,
-.account-drawer__identity > div:last-child {
-  display: grid;
-  min-width: 0;
-  line-height: 1.3;
-}
-
-.admin-panel .account-row__identity strong,
-.account-drawer__identity strong {
-  overflow: hidden;
-  font-size: 13.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.admin-panel .account-row__identity span,
-.account-drawer__identity span {
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.admin-panel .account-row__meta {
-  display: flex;
-  min-width: 0;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.admin-panel .account-row__meta span {
-  max-width: 100%;
-  overflow: hidden;
-  padding: 3px 7px;
-  border-radius: var(--r-pill);
-  background: var(--surface-3);
-  color: var(--muted);
-  font-size: 11.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.admin-panel .account-row > .status {
-  width: max-content;
-  min-width: max-content;
-  max-width: none;
-  justify-self: end;
-}
-
-.admin-panel .account-row__actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.account-drawer {
-  width: min(520px, 100vw);
-}
-
-.account-drawer__form {
-  display: grid;
-  gap: 16px;
-}
-
-.account-drawer__identity {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-
-/* The page is nested inside both the application and administration
-   navigation. Component columns therefore respond to the actual page width,
-   not merely to the browser viewport. */
-@container admin-page (max-width: 820px) {
-  .admin-panel .oauth-card__head {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-}
-
-@container admin-page (max-width: 760px) {
-  .admin-panel .config-grid,
-  .admin-panel .settings-form__grid,
-  .admin-panel .account-create__grid,
-  .admin-panel .account-row__grid,
-  .admin-panel .audit-tools,
-  .admin-panel .audit-private {
+/* The secondary menu is allowed only when its own content container can keep
+   at least 840px for the page. This deliberately does not use viewport width. */
+@container eap-admin-shell (max-width: 1079px) {
+  .eap-admin-layout {
     grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
   }
 
-  .admin-panel .card__head {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .admin-panel .card__head > :last-child {
-    max-width: 100%;
-  }
-
-  .admin-panel .account-row {
-    grid-template-columns: minmax(0, 1fr) max-content;
-  }
-
-  .admin-panel .account-row__meta {
-    grid-column: 1;
-    grid-row: 2;
-  }
-
-  .admin-panel .account-row > .status {
-    justify-self: end;
-  }
-
-  .admin-panel .account-row__actions {
-    grid-column: 2;
-    grid-row: 2;
-  }
-
-  .admin-panel .token-usage__filters,
-  .admin-panel .oauth-transfer,
-  .admin-panel .oauth-actions,
-  .admin-panel .runtime-row__actions,
-  .admin-panel .form-actions {
-    justify-content: flex-start;
-  }
-
-  .admin-panel .runtime-row {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .admin-panel .runtime-row__actions {
-    width: 100%;
-  }
-
-  .admin-panel .security-status__row {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .admin-panel .security-status__row .status {
-    max-width: 100%;
-  }
-}
-
-@container admin-page (max-width: 520px) {
-  .admin-panel .admin-page__head,
-  .admin-panel .card__head {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .admin-panel .admin-page__head .page-header__actions,
-  .admin-panel .card__head > :last-child,
-  .admin-panel .oauth-transfer,
-  .admin-panel .oauth-actions,
-  .admin-panel .form-actions {
-    width: 100%;
-  }
-
-  .admin-panel .admin-page__head .btn:only-child,
-  .admin-panel .card__head > .btn,
-  .admin-panel .oauth-transfer .btn,
-  .admin-panel .oauth-actions .btn {
-    width: 100%;
-  }
-
-  .admin-panel .metric-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .admin-panel .account-row,
-  .admin-panel .secret-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .admin-panel .account-row {
-    gap: 10px;
-    padding: 12px;
-  }
-
-  .admin-panel .account-row > .status {
-    justify-self: start;
-  }
-
-  .admin-panel .account-row__identity strong,
-  .admin-panel .account-row__identity span {
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .admin-panel .account-row__meta,
-  .admin-panel .account-row__actions {
-    grid-column: 1;
-    grid-row: auto;
-  }
-
-  .admin-panel .account-row__actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    width: 100%;
-  }
-
-  .admin-panel .account-row__actions .btn {
-    width: 100%;
-  }
-
-  .admin-panel .secret-row form {
-    flex-wrap: wrap;
-  }
-
-  .admin-panel .secret-row form input {
-    flex: 1 1 180px;
-  }
-}
-
-@media (max-width: 1360px) {
-  .panel__inner.admin-panel {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 14px;
-  }
-
-  .admin-panel .admin-pager--desktop {
+  .eap-admin-nav {
     display: none;
   }
 
-  .admin-panel .admin-pager-mobile {
+  .eap-admin-page-switcher {
     position: sticky;
     top: 0;
     z-index: var(--z-sticky);
@@ -471,76 +451,170 @@
     grid-template-columns: auto minmax(220px, 360px);
     align-items: center;
     justify-content: start;
-    gap: 8px 12px;
-    padding: 8px;
+    gap: 10px;
+    min-width: 0;
+    padding: 8px 10px;
     border: 1px solid var(--line);
-    border-radius: var(--r-md);
+    border-radius: 10px;
     background: color-mix(in srgb, var(--surface) 94%, transparent);
     box-shadow: var(--shadow-1);
-    backdrop-filter: blur(8px);
+    backdrop-filter: blur(10px);
   }
 
-  .admin-panel .admin-pager-mobile label {
+  .eap-admin-page-switcher label {
     color: var(--muted);
-    font-size: 11px;
-    font-weight: 650;
+    font-size: 12px;
+    font-weight: 600;
     white-space: nowrap;
   }
 
-  .admin-panel .admin-pager-mobile select {
+  .eap-admin-page-switcher .eap-select {
     width: 100%;
-    min-height: 42px;
   }
 }
 
-@media (max-width: 800px) {
-  .admin-panel .admin-pager-mobile {
+@container eap-admin-page (max-width: 820px) {
+  .eap-admin-page .config-grid,
+  .eap-admin-page .settings-form__grid,
+  .eap-admin-page .account-create__grid,
+  .eap-admin-page .account-row__grid,
+  .eap-admin-page .audit-tools,
+  .eap-admin-page .audit-private {
     grid-template-columns: minmax(0, 1fr);
-    gap: 5px;
-    margin-inline: -2px;
   }
 
-  .admin-panel .admin-page__head h2 {
-    font-size: 20px;
+  .eap-admin-page .card__head,
+  .eap-admin-page .oauth-card__head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .eap-admin-page .card__head > :last-child {
+    max-width: 100%;
+  }
+
+  .eap-admin-page .token-usage__filters,
+  .eap-admin-page .oauth-transfer,
+  .eap-admin-page .oauth-actions,
+  .eap-admin-page .runtime-row__actions,
+  .eap-admin-page .form-actions {
+    justify-content: flex-start;
+  }
+
+  .eap-admin-page .runtime-row,
+  .eap-admin-page .security-status__row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .eap-admin-page .runtime-row__actions {
+    width: 100%;
+  }
+}
+
+@container eap-admin-page (max-width: 839px) {
+  .eap-admin-account-table {
+    display: none;
+  }
+
+  .eap-admin-account-list {
+    display: grid;
+  }
+}
+
+@container eap-admin-page (max-width: 560px) {
+  .eap-admin-page-header {
+    display: grid;
+    gap: 12px;
+  }
+
+  .eap-admin-page-header--refresh-only {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+
+  .eap-admin-page-header__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .eap-admin-page-header--refresh-only .eap-admin-page-header__actions {
+    width: auto;
+  }
+
+  .eap-admin-page-header__actions .eap-btn-primary {
+    flex: 1;
+  }
+
+  .eap-admin-page .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .eap-admin-page .secret-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .eap-admin-page .secret-row form {
+    flex-wrap: wrap;
+  }
+
+  .eap-admin-page .secret-row form input {
+    flex: 1 1 180px;
+  }
+}
+
+@container eap-admin-shell (max-width: 560px) {
+  .eap-admin-page-switcher {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    padding: 6px;
+  }
+
+  .eap-admin-page-switcher label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 }
 
 @media (max-width: 520px) {
-  .panel__inner.admin-panel {
+  .panel.eap-admin-shell {
+    padding-block: 12px max(28px, env(safe-area-inset-bottom));
+    padding-inline: max(10px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right));
+  }
+
+  .eap-admin-card {
+    --eap-admin-card-body-padding: 14px;
+  }
+
+  .eap-admin-layout {
     gap: 14px;
   }
 
-  .admin-panel .admin-pager-mobile {
-    top: -1px;
-    padding: 7px;
-    border-radius: var(--r-sm);
+  .eap-admin-page {
+    gap: 16px;
   }
 
-  .admin-panel .admin-page {
-    gap: 13px;
+  .eap-admin-page-header__copy h2.eap-typography {
+    font-size: 21px;
   }
 
-  .admin-panel .admin-page__head {
-    gap: 8px;
-  }
-
-  .admin-panel .admin-page__head p {
-    font-size: 12.5px;
-  }
-
-  .account-drawer__identity {
-    align-items: flex-start;
-  }
-}
-
-@media (max-width: 360px) {
-  .admin-panel .account-row__actions {
-    grid-template-columns: minmax(0, 1fr);
+  .account-drawer.eap-admin-account-drawer {
+    width: 100vw;
   }
 }
 
 @media (pointer: coarse) {
-  .admin-panel .btn.btn--sm {
+  .eap-admin-shell .eap-btn {
+    min-height: 44px;
+  }
+
+  .eap-admin-page .btn.btn--sm {
     min-height: 44px;
     padding-block: 7px;
   }

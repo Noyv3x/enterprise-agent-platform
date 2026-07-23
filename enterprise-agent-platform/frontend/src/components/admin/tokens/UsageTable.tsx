@@ -1,10 +1,12 @@
-/* <UsageTable/> — a generic responsive native table (legacy renderUsageTable,
-   legacy-app.js:1755-1765). Its wrapper scrolls horizontally on small screens;
-   native th/td semantics keep headers associated with cells for assistive tech. */
+/* <UsageTable/> — a generic responsive Ant table (legacy renderUsageTable,
+   legacy-app.js:1755-1765). Its labelled wrapper keeps wide analytics data in
+   its own scroll region while Ant owns column semantics and empty state. */
 
+import { Table, type TableProps } from "antd";
 import { Children, Fragment, isValidElement, type ReactNode } from "react";
 import type { IconName } from "../../../types";
 import { CardHead } from "../../common/CardHead";
+import { AdminCard } from "../AdminCard";
 
 export interface UsageTableProps<T> {
   title: string;
@@ -29,6 +31,11 @@ function flattenCells(node: ReactNode): ReactNode[] {
   return cells;
 }
 
+interface UsageTableRecord {
+  key: number;
+  cells: ReactNode[];
+}
+
 export function UsageTable<T>({
   title,
   desc,
@@ -38,33 +45,31 @@ export function UsageTable<T>({
   renderRow,
   emptyText,
 }: UsageTableProps<T>) {
+  const dataSource: UsageTableRecord[] = rows.map((row, index) => ({
+    key: index,
+    cells: flattenCells(renderRow(row)),
+  }));
+  const columns: TableProps<UsageTableRecord>["columns"] = headers.map((header, index) => ({
+    title: header,
+    key: `${header}-${index}`,
+    render: (_, record) => record.cells[index] ?? null,
+  }));
+
   return (
-    <section className="card usage-card">
+    <AdminCard className="usage-card">
       <CardHead title={title} icon={icon} desc={desc} />
-      {rows.length ? (
-        <div className="usage-table-wrap" role="region" aria-label={title} tabIndex={0}>
-          <table className="usage-table" aria-label={title}>
-            <thead>
-              <tr className="usage-table__row usage-table__head">
-                {headers.map((header, index) => (
-                  <th scope="col" key={`${header}-${index}`}>{header}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, index) => (
-                <tr className="usage-table__row" key={index}>
-                  {flattenCells(renderRow(row)).map((cell, cellIndex) => (
-                    <td key={cellIndex}>{cell}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div className="muted">{emptyText}</div>
-      )}
-    </section>
+      <div className="usage-table-wrap" role="region" aria-label={title} tabIndex={0}>
+        <Table<UsageTableRecord>
+          className="eap-admin-usage-table"
+          aria-label={title}
+          columns={columns}
+          dataSource={dataSource}
+          pagination={false}
+          size="middle"
+          scroll={{ x: "max-content" }}
+          locale={{ emptyText: <span className="muted">{emptyText}</span> }}
+        />
+      </div>
+    </AdminCard>
   );
 }

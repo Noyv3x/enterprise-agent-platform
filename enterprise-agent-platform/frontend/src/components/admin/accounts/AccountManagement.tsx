@@ -1,44 +1,112 @@
-/* <AccountManagement/> — the account-admin card: create form + account list
-   (legacy renderAccountManagement, legacy-app.js:1425-1481). Falls back to
-   FALLBACK_PERMISSION_GROUPS when no groups are loaded. */
-
-import { FALLBACK_PERMISSION_GROUPS } from "../../../lib/constants";
-import { useState } from "react";
-import { useStore } from "../../../store/useStore";
-import { CardHead } from "../../common/CardHead";
-import { Icon } from "../../common/Icon";
-import { AccountRow } from "./AccountRow";
-import { CreateAccountForm } from "./CreateAccountForm";
+import { Table, Typography, type TableProps } from "antd";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useI18n } from "../../../i18n";
+import { FALLBACK_PERMISSION_GROUPS } from "../../../lib/constants";
+import { useStore } from "../../../store/useStore";
+import type { User } from "../../../types";
+import { CreateAccountForm } from "./CreateAccountForm";
+import {
+  AccountActions,
+  AccountIdentity,
+  AccountMobileRow,
+  AccountModelPolicy,
+  AccountPermission,
+  AccountStatus,
+} from "./AccountRow";
 
-export function AccountManagement() {
+/** Structured account data: compact table on wide containers, list on phones. */
+export function AccountManagement({
+  createOpen,
+  onCloseCreate,
+}: {
+  createOpen: boolean;
+  onCloseCreate: () => void;
+}) {
   const { t } = useI18n();
-  const [createOpen, setCreateOpen] = useState(false);
   const permissionGroups = useStore((state) => state.permissionGroups);
   const users = useStore((state) => state.users);
+  const containerRef = useRef<HTMLElement>(null);
+  const [layout, setLayout] = useState<"table" | "list" | "both">("table");
   const groups = permissionGroups.length ? permissionGroups : FALLBACK_PERMISSION_GROUPS;
 
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    if (typeof ResizeObserver === "undefined") {
+      setLayout("both");
+      return;
+    }
+    const update = (width: number) => {
+      if (width > 0) setLayout(width < 840 ? "list" : "table");
+    };
+    update(container.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => update(entry.contentRect.width));
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+  const columns: TableProps<User>["columns"] = [
+    {
+      title: t("admin.accounts.column.account"),
+      key: "account",
+      render: (_, user) => <AccountIdentity user={user} />,
+    },
+    {
+      title: t("admin.accounts.column.permission"),
+      key: "permission",
+      width: 150,
+      render: (_, user) => <AccountPermission user={user} />,
+    },
+    {
+      title: t("admin.accounts.column.model"),
+      key: "model",
+      width: 220,
+      render: (_, user) => <AccountModelPolicy user={user} />,
+    },
+    {
+      title: t("admin.accounts.column.status"),
+      key: "status",
+      width: 118,
+      render: (_, user) => <AccountStatus user={user} />,
+    },
+    {
+      title: t("admin.accounts.column.actions"),
+      key: "actions",
+      width: 158,
+      align: "right",
+      render: (_, user) => <AccountActions user={user} groups={groups} />,
+    },
+  ];
+
   return (
-    <section className="card account-admin">
-      <CardHead
-        title={t("admin.accounts.title")}
-        icon="users"
-        desc={t("admin.accounts.listDescription")}
-        extra={(
-          <button className="btn btn--primary btn--sm" type="button" onClick={() => setCreateOpen(true)}>
-            <Icon name="plus" size={16} />
-            <span>{t("admin.accounts.create")}</span>
-          </button>
-        )}
-      />
-      <CreateAccountForm groups={groups} open={createOpen} onClose={() => setCreateOpen(false)} />
-      <div className="account-list">
-        {users.length ? (
-          users.map((user) => <AccountRow key={String(user.id)} user={user} groups={groups} />)
-        ) : (
-          <div className="muted">{t("admin.accounts.empty")}</div>
-        )}
+    <section ref={containerRef} className="eap-admin-accounts" aria-label={t("admin.accounts.title")}>
+      <div className="eap-admin-accounts__meta">
+        <Typography.Text type="secondary">
+          {t("admin.accounts.count", { count: users.length })}
+        </Typography.Text>
       </div>
+      {layout !== "list" ? (
+        <Table<User>
+          className="eap-admin-account-table"
+          columns={columns}
+          dataSource={users}
+          rowKey={(user) => String(user.id)}
+          pagination={false}
+          size="middle"
+          tableLayout="fixed"
+          scroll={{ x: 820 }}
+          locale={{ emptyText: t("admin.accounts.empty") }}
+        />
+      ) : null}
+      {layout !== "table" ? (
+        <div className="eap-admin-account-list">
+          {users.length ? (
+            users.map((user) => <AccountMobileRow key={String(user.id)} user={user} groups={groups} />)
+          ) : (
+            <Typography.Text type="secondary">{t("admin.accounts.empty")}</Typography.Text>
+          )}
+        </div>
+      ) : null}
+      <CreateAccountForm groups={groups} open={createOpen} onClose={onCloseCreate} />
     </section>
   );
 }

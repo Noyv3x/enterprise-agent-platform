@@ -2,9 +2,11 @@
    secrets (managed by the OAuth card). Legacy renderSecretsSettings,
    legacy-app.js:2643-2666. */
 
+import { Empty } from "antd";
 import { useStore } from "../../../store/useStore";
 import { isOAuthSecret } from "../../../utils/oauth";
 import { CardHead } from "../../common/CardHead";
+import { AdminCard } from "../AdminCard";
 import { SecretRow } from "./SecretRow";
 import { useI18n } from "../../../i18n";
 
@@ -14,7 +16,7 @@ export function SecretsSettings() {
   const rows = secrets.filter((secret) => !isOAuthSecret(secret.key));
 
   return (
-    <section className="card">
+    <AdminCard>
       <CardHead
         title={t("admin.secrets.title")}
         icon="key"
@@ -27,8 +29,12 @@ export function SecretsSettings() {
           ))}
         </div>
       ) : (
-        <div className="muted">{t("admin.secrets.none")}</div>
+        <Empty
+          className="muted"
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={t("admin.secrets.none")}
+        />
       )}
-    </section>
+    </AdminCard>
   );
 }

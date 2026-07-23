@@ -1,7 +1,17 @@
-/* Compact account summary with an on-demand editor. Keeping forms out of the
-   list makes large directories scannable and prevents unrelated fields from
-   competing for attention. */
-
+import {
+  Avatar,
+  Badge,
+  Button,
+  Dropdown,
+  Form,
+  Input,
+  Space,
+  Switch,
+  Tag,
+  Tooltip,
+  Typography,
+  type MenuProps,
+} from "antd";
 import { useId, useRef, useState } from "react";
 import { impersonateAccount, updateAccount } from "../../../data/adminActions";
 import { useConfirm } from "../../../hooks/useConfirm";
@@ -10,10 +20,7 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { PermissionGroup, User } from "../../../types";
 import { initials } from "../../../utils/format";
 import { Drawer } from "../../common/Drawer";
-import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
-import { LoadingButton } from "../../common/LoadingButton";
-import { StatusBadge } from "../../common/StatusBadge";
 import { AccountModelSelect } from "./AccountModelSelect";
 import { PermissionGroupSelect, permissionGroupLabel } from "./PermissionGroupSelect";
 import { ThinkingDepthSelect } from "./ThinkingDepthSelect";
@@ -39,6 +46,7 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
   const [password, setPassword] = useState("");
   const modelCoerced = useRef(user.model_name || "");
   const formId = useId();
+  const fieldId = (name: string) => `${formId}-${name}`;
   const { confirm, dialog } = useConfirm();
   const selfDisabled = user.id === currentUserId;
 
@@ -60,8 +68,7 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
     onClose();
   };
 
-  const handleSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleSubmit = () => {
     void updateAccount(
       store,
       user.id,
@@ -86,75 +93,120 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
         onClose={() => void requestClose()}
         title={t("admin.accounts.editTitle", { username: user.username })}
         description={t("admin.accounts.editDescription")}
-        className="account-drawer"
+        className="account-drawer eap-admin-account-drawer"
         footer={(
-          <>
-            <button className="btn btn--ghost" type="button" onClick={() => void requestClose()}>
+          <Space>
+            <Button type="text" onClick={() => void requestClose()}>
               {t("admin.common.cancel")}
-            </button>
-            <LoadingButton
-              variant="primary"
-              type="submit"
+            </Button>
+            <Button
+              type="primary"
+              htmlType="submit"
               form={formId}
               loading={saving}
-              loadingLabel={t("admin.common.saving")}
               disabled={!dirty}
-            >{t("admin.accounts.save")}</LoadingButton>
-          </>
+            >
+              {t("admin.accounts.save")}
+            </Button>
+          </Space>
         )}
       >
-        <form id={formId} className="account-drawer__form" onSubmit={handleSubmit}>
-          <div className="account-drawer__identity">
-            <div className="avatar">{initials(user.display_name || user.username)}</div>
+        <Form id={formId} className="eap-admin-account-form" layout="vertical" requiredMark={false} onFinish={handleSubmit}>
+          <div className="eap-admin-account-form__identity">
+            <Avatar size={40}>{initials(user.display_name || user.username)}</Avatar>
             <div>
-              <strong>{user.username}</strong>
-              <span>{permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label)}</span>
+              <Typography.Text strong>{user.username}</Typography.Text>
+              <Typography.Text type="secondary">
+                {permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label)}
+              </Typography.Text>
             </div>
           </div>
-          <Field label={t("admin.accounts.displayName")}>
-            <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
-          </Field>
-          <Field label={t("admin.accounts.position")}>
-            <input value={position} onChange={(event) => setPosition(event.target.value)} />
-          </Field>
-          <Field label={t("admin.accounts.permissionGroup")}>
-            <PermissionGroupSelect groups={groups} value={permissionGroup} onChange={setPermissionGroup} />
-          </Field>
-          <Field label={t("admin.accounts.model")}>
-            <AccountModelSelect value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
-          </Field>
-          <Field label={t("admin.accounts.thinkingDepth")}>
-            <ThinkingDepthSelect value={thinkingDepth} onChange={setThinkingDepth} />
-          </Field>
-          <Field label={t("admin.accounts.resetPassword")}>
-            <input
-              type="password"
+          <Form.Item label={t("admin.accounts.displayName")} htmlFor={fieldId("display-name")}>
+            <Input id={fieldId("display-name")} value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.position")} htmlFor={fieldId("position")}>
+            <Input id={fieldId("position")} value={position} onChange={(event) => setPosition(event.target.value)} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.permissionGroup")} htmlFor={fieldId("permission-group")}>
+            <PermissionGroupSelect id={fieldId("permission-group")} groups={groups} value={permissionGroup} onChange={setPermissionGroup} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.model")} htmlFor={fieldId("model")}>
+            <AccountModelSelect id={fieldId("model")} value={modelName} onChange={setModelName} coercedRef={modelCoerced} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.thinkingDepth")} htmlFor={fieldId("thinking-depth")}>
+            <ThinkingDepthSelect id={fieldId("thinking-depth")} value={thinkingDepth} onChange={setThinkingDepth} />
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.resetPassword")} htmlFor={fieldId("password")}>
+            <Input.Password
+              id={fieldId("password")}
               autoComplete="new-password"
               placeholder={t("admin.common.leaveBlank")}
               value={password}
               onChange={(event) => setPassword(event.target.value)}
             />
-          </Field>
-          <label className="check-row">
-            <input
-              type="checkbox"
+          </Form.Item>
+          <Form.Item label={t("admin.accounts.enabled")} htmlFor={fieldId("enabled")} extra={t("admin.accounts.disabledHint")}>
+            <Switch
+              id={fieldId("enabled")}
+              aria-label={t("admin.accounts.enabled")}
               checked={active}
               disabled={selfDisabled}
-              onChange={(event) => setActive(event.target.checked)}
+              onChange={setActive}
             />
-            <div className="check-row__text">
-              <strong>{t("admin.accounts.enabled")}</strong>
-              <span>{t("admin.accounts.disabledHint")}</span>
-            </div>
-          </label>
-        </form>
+          </Form.Item>
+        </Form>
       </Drawer>
       {dialog}
     </>
   );
 }
 
-export function AccountRow({ user, groups }: { user: User; groups: PermissionGroup[] }) {
+export function AccountIdentity({ user }: { user: User }) {
+  return (
+    <div className="eap-admin-account-identity">
+      <Avatar size={36}>{initials(user.display_name || user.username)}</Avatar>
+      <div>
+        <Typography.Text strong ellipsis>{user.display_name || user.username}</Typography.Text>
+        <Typography.Text type="secondary" ellipsis>
+          @{user.username}{user.position ? ` · ${user.position}` : ""}
+        </Typography.Text>
+      </div>
+    </div>
+  );
+}
+
+export function AccountPermission({ user }: { user: User }) {
+  const { t } = useI18n();
+  return (
+    <Tag className="eap-admin-account-permission" variant="filled">
+      {permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label)}
+    </Tag>
+  );
+}
+
+export function AccountModelPolicy({ user }: { user: User }) {
+  const { t } = useI18n();
+  const model = user.model_name || t("admin.model.systemDefault");
+  return (
+    <Tooltip title={model}>
+      <Typography.Text className="eap-admin-account-model" type={user.model_name ? undefined : "secondary"} ellipsis>
+        {model}
+      </Typography.Text>
+    </Tooltip>
+  );
+}
+
+export function AccountStatus({ user }: { user: User }) {
+  const { t } = useI18n();
+  return (
+    <Badge
+      status={user.active ? "success" : "default"}
+      text={t(user.active ? "admin.common.active" : "admin.common.disabled")}
+    />
+  );
+}
+
+export function AccountActions({ user, groups }: { user: User; groups: PermissionGroup[] }) {
   const { t } = useI18n();
   const store = useStoreHandle();
   const impersonating = useStore((state) => state.pendingOperations.includes(`admin:accounts:impersonate:${user.id}`));
@@ -162,7 +214,8 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
   const [editOpen, setEditOpen] = useState(false);
   const { confirm, dialog } = useConfirm();
   const selfDisabled = user.id === currentUserId;
-  const groupLabel = permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label);
+  const canImpersonate = !selfDisabled && !!user.active;
+  const impersonateDisabled = impersonating || !canImpersonate;
 
   const handleImpersonate = async () => {
     const ok = await confirm(
@@ -174,40 +227,47 @@ export function AccountRow({ user, groups }: { user: User; groups: PermissionGro
     );
     if (ok) await impersonateAccount(store, user.id);
   };
-
+  const menuItems: MenuProps["items"] = [{
+    key: "impersonate",
+    label: t("admin.accounts.impersonate"),
+    disabled: impersonateDisabled,
+  }];
   return (
-    <article className="account-row">
-      <div className="account-row__identity">
-        <div className="avatar">{initials(user.display_name || user.username)}</div>
-        <div>
-          <strong>{user.display_name || user.username}</strong>
-          <span>@{user.username}{user.position ? ` · ${user.position}` : ""}</span>
-        </div>
-      </div>
-      <div className="account-row__meta">
-        <span>{groupLabel}</span>
-        <span>{user.model_name || t("admin.model.systemDefault")}</span>
-      </div>
-      <StatusBadge ok={!!user.active} label={t(user.active ? "admin.common.active" : "admin.common.disabled")} />
-      <div className="account-row__actions">
-        <button
-          className="btn btn--ghost btn--sm"
-          type="button"
-          disabled={impersonating || selfDisabled || !user.active}
-          onClick={() => void handleImpersonate()}
-          title={selfDisabled ? t("admin.accounts.impersonateCurrent") : user.active ? t("admin.accounts.impersonateTitle") : t("admin.accounts.impersonateDisabled")}
-        >
-          {t("admin.accounts.impersonate")}
-        </button>
-        <button className="btn btn--ghost btn--sm" type="button" onClick={() => setEditOpen(true)}>
-          <Icon name="settings" size={15} />
+    <>
+      <Space className="eap-admin-account-actions" size={4}>
+        <Button type="text" size="small" icon={<Icon name="settings" size={15} />} onClick={() => setEditOpen(true)}>
           {t("admin.accounts.edit")}
-        </button>
-      </div>
-      {editOpen ? (
-        <AccountEditor user={user} groups={groups} open onClose={() => setEditOpen(false)} />
-      ) : null}
+        </Button>
+        {canImpersonate ? (
+          <Dropdown
+            menu={{ items: menuItems, onClick: ({ key }) => key === "impersonate" && void handleImpersonate() }}
+            placement="bottomRight"
+            trigger={["click"]}
+          >
+            <Button type="text" size="small" loading={impersonating}>
+              {t("admin.accounts.more")}
+            </Button>
+          </Dropdown>
+        ) : null}
+      </Space>
+      {editOpen ? <AccountEditor user={user} groups={groups} open onClose={() => setEditOpen(false)} /> : null}
       {dialog}
+    </>
+  );
+}
+
+export function AccountMobileRow({ user, groups }: { user: User; groups: PermissionGroup[] }) {
+  return (
+    <article className="eap-admin-account-mobile-row">
+      <div className="eap-admin-account-mobile-row__head">
+        <AccountIdentity user={user} />
+        <AccountStatus user={user} />
+      </div>
+      <div className="eap-admin-account-mobile-row__meta">
+        <AccountPermission user={user} />
+        <AccountModelPolicy user={user} />
+      </div>
+      <AccountActions user={user} groups={groups} />
     </article>
   );
 }

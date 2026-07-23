@@ -13,12 +13,12 @@
    If the diff is empty the submit is a no-op (onSubmit is not called). */
 
 import { useState } from "react";
+import { Button } from "antd";
 import { useStore } from "../../store/useStore";
 import type { ConfigFieldDescriptor } from "../../types";
 import { ConfigFieldControl, type ConfigAttr } from "./ConfigFieldControl";
 import { useI18n } from "../../i18n";
 import { CONFIG_FIELD_GROUP_KEYS, CONFIG_FIELD_LABEL_KEYS } from "../../i18n/messages/admin";
-import { LoadingButton } from "./LoadingButton";
 
 export interface ConfigFormProps {
   fields: ConfigFieldDescriptor[];
@@ -126,15 +126,15 @@ export function ConfigForm({
         ))}
       </div>
       <div className="form-actions">
-        <LoadingButton
-          variant="primary"
-          type="submit"
-          disabled={!dirty}
+        <Button
+          type="primary"
+          htmlType="submit"
+          disabled={!dirty || loading}
           loading={loading}
-          loadingLabel={loadingLabel || t("admin.common.saving")}
+          aria-label={loading ? loadingLabel || t("admin.common.saving") : buttonText}
         >
-          {buttonText}
-        </LoadingButton>
+          {loading ? loadingLabel || t("admin.common.saving") : buttonText}
+        </Button>
       </div>
     </form>
   );

@@ -5,7 +5,8 @@
    without overwriting an in-progress form draft. The "立即检查" button is gated
    on the LIVE config.enabled (not the form draft). */
 
-import { useEffect, useState } from "react";
+import { Button, Input, Switch } from "antd";
+import { useEffect, useId, useState } from "react";
 import { checkAutoUpdateNow, saveAutoUpdateConfig } from "../../../data/adminActions";
 import { loadAutoUpdateConfig } from "../../../data/loaders";
 import { useStore, useStoreHandle } from "../../../store/useStore";
@@ -14,9 +15,9 @@ import type { AutoUpdateConfigValues, AutoUpdateStatus } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
-import { LoadingButton } from "../../common/LoadingButton";
 import { StatusBadge } from "../../common/StatusBadge";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
+import { AdminCard } from "../AdminCard";
 import { useI18n } from "../../../i18n";
 
 function updateTriggerLabel(t: ReturnType<typeof useI18n>["t"], trigger: string | undefined): string {
@@ -79,6 +80,12 @@ function seedForm(config: AutoUpdateConfigValues): AutoUpdateFormState {
 
 export function AutoUpdateConfig() {
   const { t } = useI18n();
+  const enabledLabelId = useId();
+  const enabledHintId = useId();
+  const intervalId = useId();
+  const remoteId = useId();
+  const branchId = useId();
+  const webhookSecretId = useId();
   const store = useStoreHandle();
   const saving = useStore((state) => state.pendingOperations.includes("admin:updates:save"));
   const checking = useStore((state) => state.pendingOperations.includes("admin:updates:check"));
@@ -162,7 +169,7 @@ export function AutoUpdateConfig() {
   };
 
   return (
-    <section className="card config-form">
+    <AdminCard className="config-form">
       <CardHead
         title={t("admin.updates.title")}
         icon="refresh"
@@ -171,19 +178,22 @@ export function AutoUpdateConfig() {
       />
       <form onSubmit={handleSubmit}>
         <div className="config-grid">
-          <label className="check-row">
-            <input
-              type="checkbox"
+          <div className="check-row">
+            <Switch
               checked={form.enabled}
-              onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))}
+              aria-labelledby={enabledLabelId}
+              aria-describedby={enabledHintId}
+              onChange={(checked) => setForm((prev) => ({ ...prev, enabled: checked }))}
             />
             <div className="check-row__text">
-              <strong>{t("admin.updates.enableWatcher")}</strong>
-              <span>{t("admin.updates.enableWatcherHint")}</span>
+              <strong id={enabledLabelId}>{t("admin.updates.enableWatcher")}</strong>
+              <span id={enabledHintId}>{t("admin.updates.enableWatcherHint")}</span>
             </div>
-          </label>
+          </div>
           <Field label={t("admin.updates.interval")}>
-            <input
+            <Input
+              id={intervalId}
+              aria-label={t("admin.updates.interval")}
               type="number"
               min="5"
               max="3600"
@@ -193,14 +203,18 @@ export function AutoUpdateConfig() {
             />
           </Field>
           <Field label={t("admin.updates.remote")}>
-            <input
+            <Input
+              id={remoteId}
+              aria-label={t("admin.updates.remote")}
               value={form.remote}
               placeholder={t("admin.updates.remotePlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, remote: event.target.value }))}
             />
           </Field>
           <Field label={t("admin.updates.branch")}>
-            <input
+            <Input
+              id={branchId}
+              aria-label={t("admin.updates.branch")}
               value={form.branch}
               placeholder={t("admin.updates.branchPlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, branch: event.target.value }))}
@@ -208,8 +222,9 @@ export function AutoUpdateConfig() {
           </Field>
           <div className="field--full">
             <Field label={t("admin.updates.webhookSecret")}>
-              <input
-                type="password"
+              <Input.Password
+                id={webhookSecretId}
+                aria-label={t("admin.updates.webhookSecret")}
                 autoComplete="off"
                 placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.updates.secretPlaceholder")}
                 value={form.webhookSecret}
@@ -225,25 +240,23 @@ export function AutoUpdateConfig() {
           </div>
         </div>
         <div className="form-actions">
-          <LoadingButton
-            variant="primary"
-            type="submit"
+          <Button
+            type="primary"
+            htmlType="submit"
             disabled={!dirty}
             loading={saving}
-            loadingLabel={t("admin.common.saving")}
           >
-            {t("admin.updates.save")}
-          </LoadingButton>
-          <LoadingButton
-            type="button"
+            {t(saving ? "admin.common.saving" : "admin.updates.save")}
+          </Button>
+          <Button
+            htmlType="button"
             disabled={!config.enabled}
             loading={checking}
-            loadingLabel={t("admin.common.checking")}
+            icon={checking ? undefined : <Icon name="refresh" size={15} />}
             onClick={() => void checkAutoUpdateNow(store)}
           >
-            <Icon name="refresh" size={15} />
-            <span>{t("admin.updates.checkNow")}</span>
-          </LoadingButton>
+            {t(checking ? "admin.common.checking" : "admin.updates.checkNow")}
+          </Button>
         </div>
       </form>
       <div className="metric-grid metric-grid--compact">
@@ -263,6 +276,6 @@ export function AutoUpdateConfig() {
       ) : null}
       {status.last_error ? <div className="notice notice--warn">{status.last_error}</div> : null}
       {status.dirty_summary ? <pre className="config-preview">{status.dirty_summary}</pre> : null}
-    </section>
+    </AdminCard>
   );
 }

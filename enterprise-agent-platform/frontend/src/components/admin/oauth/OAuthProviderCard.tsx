@@ -4,6 +4,7 @@
    call site so reconciliation never carries one provider's flow/textarea into
    another's slot. */
 
+import { Alert, Badge, Button, Tag, Typography } from "antd";
 import { startOAuthVerification } from "../../../data/adminActions";
 import { cx } from "../../../lib/cx";
 import { useStore, useStoreHandle } from "../../../store/useStore";
@@ -11,8 +12,6 @@ import { formatTimestamp } from "../../../utils/format";
 import { oauthProviderErrorText } from "../../../utils/oauth";
 import type { OAuthProvider } from "../../../types";
 import { Icon } from "../../common/Icon";
-import { StatusBadge } from "../../common/StatusBadge";
-import { LoadingButton } from "../../common/LoadingButton";
 import { CodexOAuthFlow } from "./CodexOAuthFlow";
 import { GrokOAuthFlow } from "./GrokOAuthFlow";
 import { useI18n, type Translator } from "../../../i18n";
@@ -49,48 +48,52 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
             ) : null}
           </div>
         </div>
-        <StatusBadge ok={!!provider.configured} label={t(provider.configured ? "admin.oauth.verified" : "admin.oauth.unverified")} />
+        <Badge
+          status={provider.configured ? "success" : "default"}
+          text={t(provider.configured ? "admin.oauth.verified" : "admin.oauth.unverified")}
+        />
       </div>
       <div className="oauth-meta">
         {provider.active ? (
-          <span className="chip">
-            <span className="dot" />
+          <Tag className="chip" color="processing" variant="filled">
             {t("admin.oauth.active")}
-          </span>
+          </Tag>
         ) : null}
         {provider.last_refresh ? (
-          <span className="muted" style={{ fontSize: "12px" }}>
+          <Typography.Text className="muted" type="secondary" style={{ fontSize: "12px" }}>
             {t("admin.oauth.updatedAt", { time: formatTimestamp(provider.last_refresh) })}
-          </span>
+          </Typography.Text>
         ) : null}
       </div>
       {errorText ? (
-        <div className="oauth-error" role="alert">
-          <Icon name="alert" size={15} />
-          <span>{errorText}</span>
-        </div>
+        <Alert className="oauth-error" type="error" showIcon message={errorText} />
       ) : null}
       {provider.model_catalog_error ? (
-        <div className="oauth-error" role="alert">
-          <Icon name="alert" size={15} />
-          <span>
-            {provider.model_catalog_error
-              ? t("admin.oauth.catalogError", { error: provider.model_catalog_error })
-              : t("admin.oauth.catalogUnavailable")}
-          </span>
-        </div>
+        <Alert
+          className="oauth-error"
+          type="error"
+          showIcon
+          message={provider.model_catalog_error
+            ? t("admin.oauth.catalogError", { error: provider.model_catalog_error })
+            : t("admin.oauth.catalogUnavailable")}
+        />
       ) : null}
       <div className="oauth-actions">
-        <LoadingButton
+        <Button
           className="btn--sm"
-          variant={provider.configured ? "default" : "primary"}
+          type={provider.configured ? "default" : "primary"}
+          size="small"
           loading={verifying}
-          loadingLabel={t("admin.common.verifying")}
+          aria-label={t(verifying
+            ? "admin.common.verifying"
+            : provider.configured
+              ? "admin.oauth.reverify"
+              : "admin.oauth.startVerification")}
           onClick={() => void startOAuthVerification(store, provider.id)}
+          icon={<Icon name="shield" size={14} />}
         >
-          <Icon name="shield" size={14} />
-          <span>{t(provider.configured ? "admin.oauth.reverify" : "admin.oauth.startVerification")}</span>
-        </LoadingButton>
+          {t(provider.configured ? "admin.oauth.reverify" : "admin.oauth.startVerification")}
+        </Button>
       </div>
       {flow?.kind === "device_code" ? <CodexOAuthFlow providerId={provider.id} flow={flow} /> : null}
       {flow?.kind === "manual_callback" ? (

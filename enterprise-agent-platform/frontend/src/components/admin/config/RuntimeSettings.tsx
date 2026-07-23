@@ -1,13 +1,13 @@
 /* Managed-runtime health board with per-row restart or refresh actions. */
 
+import { Badge, Button } from "antd";
 import { restartRuntime } from "../../../data/adminActions";
 import { cx } from "../../../lib/cx";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { RuntimeRow } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Icon } from "../../common/Icon";
-import { LoadingButton } from "../../common/LoadingButton";
-import { StatusBadge } from "../../common/StatusBadge";
+import { AdminCard } from "../AdminCard";
 import { useI18n, type Translator } from "../../../i18n";
 
 function runtimeStateLabel(t: Translator, state: string | undefined, available: boolean): string {
@@ -58,9 +58,10 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
           <span className="runtime-row__name">
             {runtimeNameLabel(t, runtime.name)}
           </span>
-          <StatusBadge
-            ok={!!runtime.available}
-            label={runtimeStateLabel(t, runtime.state, !!runtime.available)}
+          <Badge
+            className="status"
+            status={runtime.available ? "success" : "warning"}
+            text={runtimeStateLabel(t, runtime.state, !!runtime.available)}
           />
         </div>
         <div className="runtime-row__detail">
@@ -68,15 +69,15 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
         </div>
       </div>
       <div className="runtime-row__actions">
-        <LoadingButton
+        <Button
           className="btn--sm"
           loading={restarting}
-          loadingLabel={restartLoadingLabel}
+          size="small"
+          icon={<Icon name="refresh" size={14} />}
           onClick={() => void restartRuntime(store, runtime.name)}
         >
-          <Icon name="refresh" size={14} />
-          <span>{restartLabel}</span>
-        </LoadingButton>
+          {restarting ? restartLoadingLabel : restartLabel}
+        </Button>
       </div>
     </div>
   );
@@ -87,7 +88,7 @@ export function RuntimeSettings() {
   const runtimes = useStore((state) => state.runtimes);
 
   return (
-    <section className="card">
+    <AdminCard>
       <CardHead
         title={t("admin.runtime.title")}
         icon="server"
@@ -102,6 +103,6 @@ export function RuntimeSettings() {
           <div className="muted">{t("admin.runtime.loading")}</div>
         )}
       </div>
-    </section>
+    </AdminCard>
   );
 }

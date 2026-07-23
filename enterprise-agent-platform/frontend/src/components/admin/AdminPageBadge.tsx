@@ -9,6 +9,7 @@ import { isOAuthSecret } from "../../utils/oauth";
 import { useStore } from "../../store/useStore";
 import type { AdminPageId, AppState } from "../../types";
 import { useI18n } from "../../i18n";
+import { Badge } from "antd";
 
 export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): number | string {
   const security = state.securityConfig?.config || {};
@@ -54,8 +55,10 @@ export function AdminPageBadge({ pageId }: { pageId: AdminPageId }) {
   const value = useStore((state) => adminPageBadgeValue(state, pageId));
   if (!value) return null;
   return (
-    <span className="admin-pager__badge">
-      {value === "enabled" ? t("admin.common.enabledShort") : String(value)}
-    </span>
+    <Badge
+      className="eap-admin-nav__badge"
+      count={value === "enabled" ? t("admin.common.enabledShort") : String(value)}
+      size="small"
+    />
   );
 }

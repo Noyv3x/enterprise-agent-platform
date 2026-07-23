@@ -1913,6 +1913,8 @@ select {
 }
 .status .dot { width: 7px; height: 7px; }
 .status--ok { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.status--ok .status__label { color: var(--ok); }
+.status--warn .status__label { color: var(--warn); }
 .status--warn { color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dot); flex: 0 0 auto; position: relative; }

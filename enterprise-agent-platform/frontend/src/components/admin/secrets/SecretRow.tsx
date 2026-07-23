@@ -5,12 +5,12 @@
    only this secret's operation. The aria-label ties the key name to the
    unlabeled password input. */
 
+import { Button, Form, Input } from "antd";
 import { useState } from "react";
 import { setSecret } from "../../../data/adminActions";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { Secret } from "../../../types";
 import { Icon } from "../../common/Icon";
-import { LoadingButton } from "../../common/LoadingButton";
 import { useI18n } from "../../../i18n";
 
 export function SecretRow({ secret }: { secret: Secret }) {
@@ -21,8 +21,7 @@ export function SecretRow({ secret }: { secret: Secret }) {
   );
   const [value, setValue] = useState("");
 
-  const handleSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleSubmit = () => {
     void setSecret(store, secret.key, value, () => setValue(""));
   };
 
@@ -33,25 +32,26 @@ export function SecretRow({ secret }: { secret: Secret }) {
         <span className="secret-row__name">{secret.key}</span>
       </div>
       <span className="secret-row__val">{secret.configured ? secret.masked : t("admin.secrets.emptyValue")}</span>
-      <form onSubmit={handleSubmit}>
-        <input
-          type="password"
+      <Form onFinish={handleSubmit}>
+        <Input.Password
           autoComplete="off"
           aria-label={secret.key}
           placeholder={secret.configured ? secret.masked : t("admin.common.notConfigured")}
           value={value}
+          visibilityToggle={false}
           onChange={(event) => setValue(event.target.value)}
         />
-        <LoadingButton
+        <Button
           className="btn--sm"
-          type="submit"
+          htmlType="submit"
+          size="small"
           disabled={!value}
           loading={setting}
-          loadingLabel={t("admin.common.setting")}
+          aria-label={t(setting ? "admin.common.setting" : "admin.secrets.set")}
         >
           {t("admin.secrets.set")}
-        </LoadingButton>
-      </form>
+        </Button>
+      </Form>
     </div>
   );
 }

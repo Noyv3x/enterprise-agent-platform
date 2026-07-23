@@ -3,6 +3,7 @@
    hrefs/srcs through safeUrl). The trash button shows only when deletable. */
 
 import { cx } from "../../../lib/cx";
+import { Button, Tooltip } from "antd";
 import { formatTimestamp } from "../../../utils/format";
 import type { Message } from "../../../types";
 import { Icon } from "../../common/Icon";
@@ -37,15 +38,16 @@ export function AuditMessageRow({ message, deletable = false, onDelete }: AuditM
       ) : null}
       {deletable ? (
         <div className="audit-message__actions">
-          <button
-            className="icon-btn"
-            type="button"
-            title={t("admin.audit.deleteMessage")}
-            aria-label={t("admin.audit.deleteMessage")}
-            onClick={() => onDelete?.()}
-          >
-            <Icon name="trash" size={16} />
-          </button>
+          <Tooltip title={t("admin.audit.deleteMessage")}>
+            <Button
+              type="text"
+              danger
+              size="small"
+              icon={<Icon name="trash" size={16} />}
+              aria-label={t("admin.audit.deleteMessage")}
+              onClick={() => onDelete?.()}
+            />
+          </Tooltip>
         </div>
       ) : null}
     </article>

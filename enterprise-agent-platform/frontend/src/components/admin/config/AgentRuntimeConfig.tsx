@@ -1,3 +1,4 @@
+import { Button, Input, Select } from "antd";
 import { useEffect, useId, useMemo, useState } from "react";
 import { saveAgentRuntimeConfig } from "../../../data/adminActions";
 import {
@@ -15,7 +16,7 @@ import type {
 } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { Field } from "../../common/Field";
-import { LoadingButton } from "../../common/LoadingButton";
+import { AdminCard } from "../AdminCard";
 
 const AGENT_PROVIDERS = ["openai-codex", "xai-oauth"];
 
@@ -97,8 +98,13 @@ function seedForm(config: AgentRuntimeConfigValues): AgentRuntimeFormState {
 
 export function AgentRuntimeConfig() {
   const { t } = useI18n();
+  const providerId = useId();
+  const modelId = useId();
   const modelHintId = useId();
+  const maxConcurrencyId = useId();
+  const idleTimeoutId = useId();
   const idleTimeoutHintId = useId();
+  const compactionId = useId();
   const compactionHintId = useId();
   const store = useStoreHandle();
   const saving = useStore((state) =>
@@ -132,7 +138,7 @@ export function AgentRuntimeConfig() {
   };
 
   return (
-    <section className="card config-form">
+    <AdminCard className="config-form">
       <CardHead
         title={t("admin.agentRuntime.title")}
         icon="settings"
@@ -141,45 +147,45 @@ export function AgentRuntimeConfig() {
       <form onSubmit={handleSubmit}>
         <div className="config-grid">
           <Field label={t("admin.agentRuntime.provider")}>
-            <select
+            <Select
+              id={providerId}
+              aria-label={t("admin.agentRuntime.provider")}
               value={form.provider}
-              onChange={(event) =>
+              options={[
+                { value: "openai-codex", label: t("admin.oauth.provider.codex") },
+                { value: "xai-oauth", label: t("admin.oauth.provider.grok") },
+              ]}
+              onChange={(value) =>
                 setForm((previous) => ({
                   ...previous,
-                  provider: event.target.value,
+                  provider: value,
                   modelPreferred: "",
                 }))
               }
-            >
-              <option value="openai-codex">{t("admin.oauth.provider.codex")}</option>
-              <option value="xai-oauth">{t("admin.oauth.provider.grok")}</option>
-            </select>
+            />
           </Field>
           <Field label={t("admin.agentRuntime.model")}>
             <div className="field-stack">
-              <select
+              <Select
+                id={modelId}
+                aria-label={t("admin.agentRuntime.model")}
                 value={resolved.value}
                 disabled={resolved.disabled}
                 aria-describedby={modelHintId}
-                onChange={(event) =>
-                  setForm((previous) => ({ ...previous, modelPreferred: event.target.value }))
+                options={resolved.disabled
+                  ? [{ value: "", label: t("admin.agentRuntime.modelUnavailable") }]
+                  : resolved.models.map((model) => ({ value: model, label: model }))}
+                onChange={(value) =>
+                  setForm((previous) => ({ ...previous, modelPreferred: value }))
                 }
-              >
-                {resolved.disabled ? (
-                  <option value="">{t("admin.agentRuntime.modelUnavailable")}</option>
-                ) : (
-                  resolved.models.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))
-                )}
-              </select>
+              />
               <div className="field-help" id={modelHintId}>{resolved.hint}</div>
             </div>
           </Field>
           <Field label={t("admin.agentRuntime.maxConcurrency")}>
-            <input
+            <Input
+              id={maxConcurrencyId}
+              aria-label={t("admin.agentRuntime.maxConcurrency")}
               type="number"
               min="1"
               max="64"
@@ -192,7 +198,9 @@ export function AgentRuntimeConfig() {
           </Field>
           <Field label={t("admin.agentRuntime.idleTimeout")}>
             <div className="field-stack">
-              <input
+              <Input
+                id={idleTimeoutId}
+                aria-label={t("admin.agentRuntime.idleTimeout")}
                 type="number"
                 min={RUN_IDLE_TIMEOUT_MINIMUM_SECONDS}
                 max={RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS}
@@ -213,7 +221,9 @@ export function AgentRuntimeConfig() {
           </Field>
           <Field label={t("admin.agentRuntime.compactionThreshold")}>
             <div className="field-stack">
-              <input
+              <Input
+                id={compactionId}
+                aria-label={t("admin.agentRuntime.compactionThreshold")}
                 type="number"
                 min="0.5"
                 max="0.95"
@@ -234,17 +244,16 @@ export function AgentRuntimeConfig() {
           </Field>
         </div>
         <div className="form-actions">
-          <LoadingButton
-            variant="primary"
-            type="submit"
+          <Button
+            type="primary"
+            htmlType="submit"
             disabled={!dirty}
             loading={saving}
-            loadingLabel={t("admin.common.saving")}
           >
-            {t("admin.agentRuntime.save")}
-          </LoadingButton>
+            {t(saving ? "admin.common.saving" : "admin.agentRuntime.save")}
+          </Button>
         </div>
       </form>
-    </section>
+    </AdminCard>
   );
 }

@@ -3,6 +3,7 @@
    days filter + refresh, 8 metric tiles, the 7-day SVG curve, and 4 usage tables
    (by account, detail, by scope, by model). */
 
+import { Button, Form, Select } from "antd";
 import { changeTokenUsageDays, refreshTokenUsage } from "../../../data/adminActions";
 import { formatNumber, formatTimestamp } from "../../../utils/format";
 import { oauthProviderLabel } from "../../../utils/oauth";
@@ -14,10 +15,9 @@ import type {
   TokenScopeRow,
 } from "../../../types";
 import { CardHead } from "../../common/CardHead";
-import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
-import { LoadingButton } from "../../common/LoadingButton";
 import { UsageMetricTile } from "../../common/UsageMetricTile";
+import { AdminCard } from "../AdminCard";
 import { TokenUsageCurve } from "./TokenUsageCurve";
 import { UsageTable } from "./UsageTable";
 import { useI18n } from "../../../i18n";
@@ -78,7 +78,7 @@ export function TokenUsageMonitoring() {
 
   return (
     <div className="token-usage">
-      <section className="card token-usage__overview">
+      <AdminCard className="token-usage__overview">
         <CardHead
           title={t("admin.tokens.overview.title")}
           icon="barChart"
@@ -89,30 +89,38 @@ export function TokenUsageMonitoring() {
           }
           extra={
             <div className="token-usage__filters">
-              <Field label={t("admin.tokens.timeRange")}>
-                <select
+              <Form.Item
+                className="field"
+                label={t("admin.tokens.timeRange")}
+                htmlFor="token-usage-days"
+                style={{ marginBottom: 0 }}
+              >
+                <Select
+                  id="token-usage-days"
                   value={daysValue}
                   disabled={changingRange}
+                  loading={changingRange}
                   aria-busy={changingRange || undefined}
-                  onChange={(event) =>
-                    void changeTokenUsageDays(store, Number(event.target.value) || 30)
+                  options={DAY_RANGES.map((value) => ({
+                    value: String(value),
+                    label: t("admin.tokens.days", { count: value }),
+                  }))}
+                  onChange={(value) =>
+                    void changeTokenUsageDays(store, Number(value) || 30)
                   }
-                >
-                  {DAY_RANGES.map((value) => (
-                    <option key={value} value={value}>{t("admin.tokens.days", { count: value })}</option>
-                  ))}
-                </select>
-              </Field>
-              <LoadingButton
+                />
+              </Form.Item>
+              <Button
                 className="btn--sm"
-                type="button"
+                htmlType="button"
+                size="small"
                 loading={refreshing}
-                loadingLabel={t("resource.refreshing")}
+                aria-label={t(refreshing ? "resource.refreshing" : "admin.common.refresh")}
                 onClick={() => void refreshTokenUsage(store)}
+                icon={<Icon name="refresh" size={14} />}
               >
-                <Icon name="refresh" size={14} />
-                <span>{t("admin.common.refresh")}</span>
-              </LoadingButton>
+                {t("admin.common.refresh")}
+              </Button>
             </div>
           }
         />
@@ -131,7 +139,7 @@ export function TokenUsageMonitoring() {
           />
         </div>
         <TokenUsageCurve rows={dailyUsage} />
-      </section>
+      </AdminCard>
 
       <UsageTable<TokenAccountRow>
         title={t("admin.tokens.byAccount.title")}

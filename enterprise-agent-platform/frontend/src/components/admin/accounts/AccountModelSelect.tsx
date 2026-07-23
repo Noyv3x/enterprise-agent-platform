@@ -14,6 +14,7 @@ import { useEffect, useMemo, type MutableRefObject } from "react";
 import { useStore } from "../../../store/useStore";
 import type { AgentModelCatalog, AgentRuntimeConfigState, OAuthProvidersState } from "../../../types";
 import { useI18n } from "../../../i18n";
+import { Select, Typography } from "antd";
 
 const AGENT_PROVIDERS = ["openai-codex", "xai-oauth"];
 
@@ -46,13 +47,14 @@ function agentModelCatalog(
 }
 
 export interface AccountModelSelectProps {
+  id?: string;
   value: string;
   onChange: (value: string) => void;
   /** Mirror of the catalog-coerced effective value, read by the form on submit. */
   coercedRef?: MutableRefObject<string>;
 }
 
-export function AccountModelSelect({ value, onChange, coercedRef }: AccountModelSelectProps) {
+export function AccountModelSelect({ id, value, onChange, coercedRef }: AccountModelSelectProps) {
   const { t } = useI18n();
   const runtimeConfig = useStore((state) => state.agentRuntimeConfig);
   const oauthProviders = useStore((state) => state.oauthProviders);
@@ -86,16 +88,18 @@ export function AccountModelSelect({ value, onChange, coercedRef }: AccountModel
   }, [coercedRef, selectValue]);
 
   return (
-    <div className="field-stack">
-      <select value={selectValue} onChange={(event) => onChange(event.target.value)}>
-        <option value="">{t("admin.model.defaultOption", { model: defaultModel })}</option>
-        {models.map((model) => (
-          <option key={model} value={model}>
-            {model}
-          </option>
-        ))}
-      </select>
-      <div className="field-help">{help}</div>
+    <div className="eap-admin-model-select">
+      <Select
+        id={id}
+        styles={{ input: { minHeight: 0 } }}
+        value={selectValue}
+        onChange={onChange}
+        options={[
+          { value: "", label: t("admin.model.defaultOption", { model: defaultModel }) },
+          ...models.map((model) => ({ value: model, label: model })),
+        ]}
+      />
+      <Typography.Text type="secondary">{help}</Typography.Text>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { ConfigFieldDescriptor } from "../../../types";
 import { CardHead } from "../../common/CardHead";
 import { ConfigForm } from "../../common/ConfigForm";
+import { AdminCard } from "../AdminCard";
 import { useI18n } from "../../../i18n";
 
 function fieldsSignature(fields: ConfigFieldDescriptor[]): string {
@@ -25,7 +26,7 @@ export function CogneeInternalConfig() {
   const envFields = internal.env || [];
 
   return (
-    <section className="card config-software">
+    <AdminCard className="config-software">
       <CardHead title={t("admin.config.cogneeInternal.title")} icon="settings" desc={internal.env_path || "Cognee .env"} />
       <ConfigForm
         key={`env:${fieldsSignature(envFields)}`}
@@ -36,6 +37,6 @@ export function CogneeInternalConfig() {
         operationKey="admin:cognee:save"
         loadingLabel={t("admin.common.saving")}
       />
-    </section>
+    </AdminCard>
   );
 }

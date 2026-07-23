@@ -16,10 +16,10 @@ export function CardHead({ title, icon, desc, extra }: CardHeadProps) {
   return (
     <div className="card__head">
       <div>
-        <div className="card__title">
+        <h3 className="card__title">
           {icon ? <Icon name={icon} /> : null}
           <span>{title}</span>
-        </div>
+        </h3>
         {desc ? <div className="card__desc">{desc}</div> : null}
       </div>
       {extra ?? null}

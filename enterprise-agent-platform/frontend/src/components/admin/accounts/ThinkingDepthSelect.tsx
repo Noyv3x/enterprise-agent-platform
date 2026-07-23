@@ -3,6 +3,7 @@
 
 import { THINKING_DEPTH_OPTIONS } from "../../../lib/constants";
 import { useI18n } from "../../../i18n";
+import { Select } from "antd";
 
 const THINKING_DEPTH_KEYS = {
   none: "admin.thinkingDepth.none",
@@ -14,19 +15,21 @@ const THINKING_DEPTH_KEYS = {
 } as const;
 
 export interface ThinkingDepthSelectProps {
+  id?: string;
   value: string;
   onChange: (value: string) => void;
 }
 
-export function ThinkingDepthSelect({ value, onChange }: ThinkingDepthSelectProps) {
+export function ThinkingDepthSelect({ id, value, onChange }: ThinkingDepthSelectProps) {
   const { t } = useI18n();
-  return (
-    <select value={value} onChange={(event) => onChange(event.target.value)}>
-      {THINKING_DEPTH_OPTIONS.map(([optionValue]) => (
-        <option key={optionValue} value={optionValue}>
-          {t(THINKING_DEPTH_KEYS[optionValue as keyof typeof THINKING_DEPTH_KEYS])}
-        </option>
-      ))}
-    </select>
-  );
+  return <Select
+    id={id}
+    styles={{ input: { minHeight: 0 } }}
+    value={value}
+    onChange={onChange}
+    options={THINKING_DEPTH_OPTIONS.map(([optionValue]) => ({
+      value: optionValue,
+      label: t(THINKING_DEPTH_KEYS[optionValue as keyof typeof THINKING_DEPTH_KEYS]),
+    }))}
+  />;
 }

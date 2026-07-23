@@ -2,18 +2,16 @@
    of users who linked their Telegram (legacy renderTelegramAdminConfig,
    legacy-app.js:2274-2362). Two secret fields (bot_token / webhook_secret) are
    never seeded (empty = keep) and clear via the post-save re-seed
-   (loadTelegramConfig replaces telegramConfig). The linked-user list uses native
-   table semantics and the shared responsive table wrapper. */
+   (loadTelegramConfig replaces telegramConfig). */
 
-import { useEffect, useState } from "react";
+import { Badge, Button, Form, Input, Switch, Table, type TableProps } from "antd";
+import { useEffect, useId, useState } from "react";
 import { saveTelegramConfig } from "../../../data/adminActions";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import { formatTime } from "../../../utils/format";
-import type { TelegramConfigValues } from "../../../types";
+import type { TelegramConfigValues, TelegramLinkedUser } from "../../../types";
 import { CardHead } from "../../common/CardHead";
-import { Field } from "../../common/Field";
-import { StatusBadge } from "../../common/StatusBadge";
-import { LoadingButton } from "../../common/LoadingButton";
+import { AdminCard } from "../AdminCard";
 import { useI18n } from "../../../i18n";
 
 interface TelegramFormState {
@@ -36,6 +34,8 @@ function seedForm(config: TelegramConfigValues): TelegramFormState {
 
 export function TelegramAdminConfig() {
   const { t } = useI18n();
+  const formId = useId();
+  const fieldId = (name: string) => `${formId}-${name}`;
   const store = useStoreHandle();
   const saving = useStore((state) => state.pendingOperations.includes("admin:telegram:save"));
   const telegramConfig = useStore((state) => state.telegramConfig);
@@ -51,8 +51,7 @@ export function TelegramAdminConfig() {
 
   const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(telegramConfig?.config || {}));
 
-  const handleSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleSubmit = () => {
     void saveTelegramConfig(store, {
       enabled: form.enabled,
       polling: form.polling,
@@ -62,124 +61,150 @@ export function TelegramAdminConfig() {
     });
   };
 
+  const linkedColumns: TableProps<TelegramLinkedUser>["columns"] = [
+    {
+      title: t("admin.telegram.platformUser"),
+      key: "platform-user",
+      render: (_, item) => item.display_name || item.username,
+    },
+    {
+      title: t("admin.accounts.username"),
+      dataIndex: "username",
+      key: "username",
+    },
+    {
+      title: t("admin.telegram.telegramId"),
+      dataIndex: "external_id",
+      key: "external-id",
+      render: (value) => <span className="mono">{value}</span>,
+    },
+    {
+      title: t("admin.telegram.telegramUsername"),
+      dataIndex: "telegram_username",
+      key: "telegram-username",
+      render: (value) => value ? `@${value}` : "-",
+    },
+    {
+      title: t("admin.telegram.updatedAt"),
+      dataIndex: "updated_at",
+      key: "updated-at",
+      render: (value) => formatTime(Number(value) || undefined),
+    },
+  ];
+
   return (
-    <section className="card config-form">
+    <AdminCard className="config-form">
       <CardHead
         title={t("admin.telegram.title")}
         icon="message"
         desc={t("admin.telegram.description")}
         extra={
-          <StatusBadge
-            ok={!!config.enabled && !!config.bot_token_configured}
-            label={t(config.enabled ? "admin.common.enabled" : "admin.common.disabled")}
+          <Badge
+            className="status"
+            status={config.enabled && config.bot_token_configured ? "success" : "warning"}
+            text={t(config.enabled ? "admin.common.enabled" : "admin.common.disabled")}
           />
         }
       />
-      <form onSubmit={handleSubmit}>
+      <Form layout="vertical" requiredMark={false} onFinish={handleSubmit}>
         <div className="config-grid">
-          <label className="check-row">
-            <input
-              type="checkbox"
+          <div className="check-row">
+            <Switch
+              id={fieldId("enabled")}
+              aria-labelledby={fieldId("enabled-label")}
               checked={form.enabled}
-              onChange={(event) => setForm((prev) => ({ ...prev, enabled: event.target.checked }))}
+              onChange={(enabled) => setForm((prev) => ({ ...prev, enabled }))}
             />
-            <div className="check-row__text">
+            <div id={fieldId("enabled-label")} className="check-row__text">
               <strong>{t("admin.telegram.enable")}</strong>
               <span>{t("admin.telegram.enableHint")}</span>
             </div>
-          </label>
-          <label className="check-row">
-            <input
-              type="checkbox"
+          </div>
+          <div className="check-row">
+            <Switch
+              id={fieldId("polling")}
+              aria-labelledby={fieldId("polling-label")}
               checked={form.polling}
-              onChange={(event) => setForm((prev) => ({ ...prev, polling: event.target.checked }))}
+              onChange={(polling) => setForm((prev) => ({ ...prev, polling }))}
             />
-            <div className="check-row__text">
+            <div id={fieldId("polling-label")} className="check-row__text">
               <strong>{t("admin.telegram.longPolling")}</strong>
               <span>{t("admin.telegram.longPollingHint")}</span>
             </div>
-          </label>
-          <Field label={t("admin.telegram.botUsername")}>
-            <input
+          </div>
+          <Form.Item
+            className="field"
+            label={t("admin.telegram.botUsername")}
+            htmlFor={fieldId("bot-username")}
+          >
+            <Input
+              id={fieldId("bot-username")}
               value={form.botUsername}
               placeholder={t("admin.telegram.botUsernamePlaceholder")}
               onChange={(event) => setForm((prev) => ({ ...prev, botUsername: event.target.value }))}
             />
-          </Field>
-          <Field label={t("admin.telegram.botToken")}>
-            <input
-              type="password"
+          </Form.Item>
+          <Form.Item
+            className="field"
+            label={t("admin.telegram.botToken")}
+            htmlFor={fieldId("bot-token")}
+          >
+            <Input.Password
+              id={fieldId("bot-token")}
               autoComplete="off"
-                placeholder={config.bot_token_configured ? t("admin.common.keepUnchanged") : "BotFather token"}
+              placeholder={config.bot_token_configured ? t("admin.common.keepUnchanged") : "BotFather token"}
               value={form.botToken}
               onChange={(event) => setForm((prev) => ({ ...prev, botToken: event.target.value }))}
             />
-          </Field>
-          <div className="field--full">
-            <Field label={t("admin.telegram.webhookSecret")}>
-              <input
-                type="password"
-                autoComplete="off"
-                placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.telegram.secretPlaceholder")}
-                value={form.webhookSecret}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, webhookSecret: event.target.value }))
-                }
-              />
-            </Field>
-          </div>
+          </Form.Item>
+          <Form.Item
+            className="field field--full"
+            label={t("admin.telegram.webhookSecret")}
+            htmlFor={fieldId("webhook-secret")}
+          >
+            <Input.Password
+              id={fieldId("webhook-secret")}
+              autoComplete="off"
+              placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.telegram.secretPlaceholder")}
+              value={form.webhookSecret}
+              onChange={(event) =>
+                setForm((prev) => ({ ...prev, webhookSecret: event.target.value }))
+              }
+            />
+          </Form.Item>
           <div className="field--full field-stack">
             <span className="field-help">{t("admin.telegram.webhookUrl")}</span>
             <code className="mono config-value">{webhookUrl}</code>
           </div>
         </div>
         <div className="form-actions">
-          <LoadingButton
-            variant="primary"
-            type="submit"
+          <Button
+            type="primary"
+            htmlType="submit"
             disabled={!dirty}
             loading={saving}
-            loadingLabel={t("admin.common.saving")}
           >
-            {t("admin.telegram.save")}
-          </LoadingButton>
+            {saving ? t("admin.common.saving") : t("admin.telegram.save")}
+          </Button>
         </div>
-      </form>
+      </Form>
       <div
         className="usage-table-wrap usage-table-wrap--spaced"
         role="region"
         aria-label={t("admin.telegram.linkedAria")}
         tabIndex={0}
       >
-        <table className="usage-table" aria-label={t("admin.telegram.linkedAria")}>
-          <thead>
-            <tr className="usage-table__row usage-table__head">
-              <th scope="col">{t("admin.telegram.platformUser")}</th>
-              <th scope="col">{t("admin.accounts.username")}</th>
-              <th scope="col">{t("admin.telegram.telegramId")}</th>
-              <th scope="col">{t("admin.telegram.telegramUsername")}</th>
-              <th scope="col">{t("admin.telegram.updatedAt")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {linked.length ? (
-              linked.map((item, index) => (
-                <tr className="usage-table__row" key={`${item.external_id ?? ""}-${index}`}>
-                  <td>{item.display_name || item.username}</td>
-                  <td>{item.username}</td>
-                  <td className="mono">{item.external_id}</td>
-                  <td>{item.telegram_username ? `@${item.telegram_username}` : "-"}</td>
-                  <td>{formatTime(Number(item.updated_at) || undefined)}</td>
-                </tr>
-              ))
-            ) : (
-              <tr className="usage-table__row">
-                <td colSpan={5} className="muted">{t("admin.telegram.empty")}</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <Table<TelegramLinkedUser>
+          className="eap-admin-usage-table"
+          columns={linkedColumns}
+          dataSource={linked}
+          rowKey={(item, index) => `${item.external_id ?? ""}-${index ?? ""}`}
+          pagination={false}
+          size="middle"
+          scroll={{ x: 720 }}
+          locale={{ emptyText: t("admin.telegram.empty") }}
+        />
       </div>
-    </section>
+    </AdminCard>
   );
 }
