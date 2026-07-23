@@ -7,14 +7,14 @@
    the live card collapses once so the answer can take focus; that automatic state
    is deliberately local so a later steered turn can expand the work record again.
    The card subscribes to ONLY its own run's flag, so a toggle re-renders just this
-   disclosure even though the parent <MessageBubble> is memoized. The native
-   <details> toggle is suppressed (controlled `open`) but Enter/Space on the summary
-   still fire the click → toggle, preserving keyboard operability.
+   disclosure even though the parent <MessageBubble> is memoized. Ant Design's
+   controlled Collapse supplies the keyboard-operable disclosure surface.
 
    The step formatters are exported so <MessageList>/<MessageBubble> can decide
    whether a run has tool-call steps without duplicating the logic. */
 
-import { useLayoutEffect, useState, type MouseEvent } from "react";
+import { useLayoutEffect, useState } from "react";
+import { Collapse } from "antd";
 import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
@@ -251,16 +251,14 @@ export function AgentWorkCard({
       ? t("chat.status.processing")
       : t("chat.work.completed");
 
-  const onToggle = (event: MouseEvent<HTMLElement>) => {
-    event.preventDefault();
-    const nextExpanded = !expanded;
+  const onToggle = (keys: string | string[]) => {
+    const nextExpanded = (Array.isArray(keys) ? keys : [keys]).includes("process");
     if (nextExpanded && autoCollapsed) setAutoCollapsed(false);
     dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: nextExpanded } });
   };
 
-  return (
-    <details className={cx("agent-work", active ? "agent-work--active" : "agent-work--complete")} open={expanded}>
-      <summary className="agent-work__summary" onClick={onToggle}>
+  const header = (
+    <div className="agent-work__summary">
         {active ? (
           <span className="agent-work__live" aria-hidden="true"><i /></span>
         ) : (
@@ -278,47 +276,71 @@ export function AgentWorkCard({
           <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
         ) : null}
         <span className="agent-work__chevron" aria-hidden="true" />
-      </summary>
-      {processEntries.length ? (
-        <div className="agent-work__log" role="list">
-          {processEntries.map((entry) => (
-            <div
-              className={cx("agent-work__item", `agent-work__item--${entry.state}`)}
-              data-tool={entry.rawTool}
-              key={entry.key}
-              role="listitem"
-            >
-              <span className="agent-work__item-state" aria-hidden="true">
-                {entry.state === "running" ? (
-                  <i />
-                ) : (
-                  <Icon name={entry.state === "failed" ? "alert" : "checkCircle"} size={14} />
-                )}
+    </div>
+  );
+  const log = processEntries.length ? (
+    <div className="agent-work__log" role="list">
+      {processEntries.map((entry) => (
+        <div
+          className={cx("agent-work__item", `agent-work__item--${entry.state}`)}
+          data-tool={entry.rawTool}
+          key={entry.key}
+          role="listitem"
+        >
+          <span className="agent-work__item-state" aria-hidden="true">
+            {entry.state === "running" ? (
+              <i />
+            ) : (
+              <Icon name={entry.state === "failed" ? "alert" : "checkCircle"} size={14} />
+            )}
+          </span>
+          <div className="agent-work__item-main">
+            <div className="agent-work__item-head">
+              <span className="agent-work__tool">{entry.tool}</span>
+              <span className="agent-work__item-label">
+                {agentStepStateText(entry.state, t)}
               </span>
-              <div className="agent-work__item-main">
-                <div className="agent-work__item-head">
-                  <span className="agent-work__tool">{entry.tool}</span>
-                  <span className="agent-work__item-label">
-                    {agentStepStateText(entry.state, t)}
-                  </span>
-                </div>
-                {entry.detail ? (
-                  entry.rawTool === "terminal" ? (
-                    <div className="agent-work__command">
-                      <span className="agent-work__prompt" aria-hidden="true">$</span>
-                      <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}>
-                        <code>{entry.detail}</code>
-                      </pre>
-                    </div>
-                  ) : (
-                    <div className="agent-work__detail">{entry.detail}</div>
-                  )
-                ) : null}
-              </div>
             </div>
-          ))}
+            {entry.detail ? (
+              entry.rawTool === "terminal" ? (
+                <div className="agent-work__command">
+                  <span className="agent-work__prompt" aria-hidden="true">$</span>
+                  <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}>
+                    <code>{entry.detail}</code>
+                  </pre>
+                </div>
+              ) : (
+                <div className="agent-work__detail">{entry.detail}</div>
+              )
+            ) : null}
+          </div>
         </div>
-      ) : null}
-    </details>
+      ))}
+    </div>
+  ) : null;
+
+  return (
+    <Collapse
+      className={cx(
+        "agent-work",
+        active ? "agent-work--active" : "agent-work--complete",
+        expanded && "agent-work--expanded",
+      )}
+      activeKey={expanded ? ["process"] : []}
+      bordered={false}
+      ghost
+      classNames={{
+        header: "agent-work__collapse-header",
+        title: "agent-work__collapse-title",
+        body: "agent-work__collapse-body",
+      }}
+      onChange={onToggle}
+      items={[{
+        key: "process",
+        label: header,
+        children: log,
+        showArrow: false,
+      }]}
+    />
   );
 }

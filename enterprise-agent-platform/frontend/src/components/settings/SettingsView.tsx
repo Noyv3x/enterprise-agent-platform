@@ -1,14 +1,25 @@
-import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
+import {
+  Alert,
+  AutoComplete,
+  Avatar,
+  Button,
+  Card,
+  Form,
+  Input,
+  Space,
+  Tag,
+  Typography,
+} from "antd";
+import { useEffect, useId, useMemo, useState } from "react";
 import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
 import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { initials } from "../../utils/format";
-import { CardHead } from "../common/CardHead";
 import { EmptyState } from "../common/EmptyState";
-import { Field } from "../common/Field";
-import { LoadingButton } from "../common/LoadingButton";
+import { Icon } from "../common/Icon";
 import { PageHeader } from "../common/PageHeader";
+import "./settings.css";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -36,7 +47,7 @@ export function SettingsView() {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordError, setPasswordError] = useState<"mismatch" | "too-short" | "">("");
-  const timezoneListId = useId();
+  const formId = useId();
   const timezoneHintId = useId();
   const timezones = useMemo(() => timezoneOptions(timezone), [timezone]);
 
@@ -73,8 +84,7 @@ export function SettingsView() {
     timezone !== (user.timezone || "");
   const passwordDirty = !!(currentPassword || newPassword || confirmPassword);
 
-  const handleProfileSubmit = (event: FormEvent) => {
-    event.preventDefault();
+  const handleProfileSubmit = () => {
     void updateCurrentUser(store, {
       display_name: displayName,
       position,
@@ -82,8 +92,7 @@ export function SettingsView() {
     });
   };
 
-  const handlePasswordSubmit = (event: FormEvent) => {
-    event.preventDefault();
+  const handlePasswordSubmit = () => {
     if (newPassword !== confirmPassword) {
       setPasswordError("mismatch");
       return;
@@ -114,117 +123,139 @@ export function SettingsView() {
           title={t("nav.settings")}
           description={t("account.settingsDescription")}
         />
-        <section className="account-identity" aria-label={t("account.identitySummary")}>
-          <div className="avatar account-identity__avatar">
+        <Card
+          className="account-identity"
+          classNames={{ body: "account-identity__body" }}
+          aria-label={t("account.identitySummary")}
+        >
+          <Avatar className="account-identity__avatar" size={44}>
             {initials(user.display_name || user.username)}
-          </div>
+          </Avatar>
           <div className="account-identity__main">
-            <strong>{user.display_name || user.username}</strong>
-            <span>@{user.username}</span>
+            <Typography.Text strong>{user.display_name || user.username}</Typography.Text>
+            <Typography.Text type="secondary">@{user.username}</Typography.Text>
           </div>
           <div className="account-identity__meta">
-            <span>{permissionLabel}</span>
-            {user.position ? <span>{user.position}</span> : null}
+            <Tag color="blue">{permissionLabel}</Tag>
+            {user.position ? <Typography.Text type="secondary">{user.position}</Typography.Text> : null}
           </div>
-        </section>
-        <section className="card settings-card">
-          <CardHead title={t("account.profile")} icon="settings" />
-          <form onSubmit={handleProfileSubmit}>
+        </Card>
+        <Card
+          className="settings-card"
+          classNames={{ body: "settings-card__body" }}
+          title={<Space><Icon name="settings" />{t("account.profile")}</Space>}
+        >
+          <Form layout="vertical" onFinish={handleProfileSubmit} requiredMark="optional">
             <div className="settings-form__grid">
-              <Field label={t("account.displayName")}>
-                <input
+              <Form.Item label={t("account.displayName")} htmlFor={`${formId}-display-name`}>
+                <Input
+                  id={`${formId}-display-name`}
+                  aria-label={t("account.displayName")}
                   autoComplete="name"
                   value={displayName}
                   onChange={(event) => setDisplayName(event.target.value)}
                 />
-              </Field>
-              <Field label={t("account.position")}>
-                <input
+              </Form.Item>
+              <Form.Item label={t("account.position")} htmlFor={`${formId}-position`}>
+                <Input
+                  id={`${formId}-position`}
+                  aria-label={t("account.position")}
                   autoComplete="organization-title"
                   placeholder={t("account.position")}
                   value={position}
                   onChange={(event) => setPosition(event.target.value)}
                 />
-              </Field>
-              <Field label={t("account.timezone")}>
+              </Form.Item>
+              <Form.Item
+                label={t("account.timezone")}
+                htmlFor={`${formId}-timezone`}
+                required
+              >
                 <div className="field-stack">
-                  <input
-                    required
-                    list={timezoneListId}
+                  <AutoComplete
+                    id={`${formId}-timezone`}
+                    aria-label={t("account.timezone")}
+                    options={timezones.map((item) => ({ value: item }))}
+                    showSearch
+                    virtual
                     value={timezone}
                     aria-describedby={timezoneHintId}
-                    onChange={(event) => setTimezone(event.target.value)}
+                    onChange={setTimezone}
                   />
-                  <datalist id={timezoneListId}>
-                    {timezones.map((item) => <option key={item} value={item} />)}
-                  </datalist>
                   <div className="field-help" id={timezoneHintId}>{t("account.timezoneHint")}</div>
                 </div>
-              </Field>
+              </Form.Item>
             </div>
             <div className="form-actions">
-              <LoadingButton
-                type="submit"
-                variant="primary"
+              <Button
+                htmlType="submit"
+                type="primary"
                 loading={profilePending}
-                loadingLabel={t("account.saving")}
                 disabled={!profileDirty || !timezone.trim()}
               >
-                {t("account.saveProfile")}
-              </LoadingButton>
+                {profilePending ? t("account.saving") : t("account.saveProfile")}
+              </Button>
             </div>
-          </form>
-        </section>
+          </Form>
+        </Card>
 
-        <section className="card settings-card">
-          <CardHead title={t("account.changePassword")} icon="key" />
-          <form onSubmit={handlePasswordSubmit}>
+        <Card
+          className="settings-card"
+          classNames={{ body: "settings-card__body" }}
+          title={<Space><Icon name="key" />{t("account.changePassword")}</Space>}
+        >
+          <Form layout="vertical" onFinish={handlePasswordSubmit} requiredMark="optional">
             <div className="settings-form__grid">
-              <Field label={t("account.currentPassword")}>
-                <input
-                  type="password"
+              <Form.Item label={t("account.currentPassword")} htmlFor={`${formId}-current-password`}>
+                <Input.Password
+                  id={`${formId}-current-password`}
+                  aria-label={t("account.currentPassword")}
                   autoComplete="current-password"
                   value={currentPassword}
                   onChange={(event) => setCurrentPassword(event.target.value)}
                 />
-              </Field>
-              <Field label={t("account.newPassword")}>
-                <input
-                  type="password"
+              </Form.Item>
+              <Form.Item label={t("account.newPassword")} htmlFor={`${formId}-new-password`}>
+                <Input.Password
+                  id={`${formId}-new-password`}
+                  aria-label={t("account.newPassword")}
                   autoComplete="new-password"
                   value={newPassword}
                   onChange={(event) => setNewPassword(event.target.value)}
                 />
-              </Field>
-              <Field label={t("account.confirmPassword")}>
-                <input
-                  type="password"
+              </Form.Item>
+              <Form.Item label={t("account.confirmPassword")} htmlFor={`${formId}-confirm-password`}>
+                <Input.Password
+                  id={`${formId}-confirm-password`}
+                  aria-label={t("account.confirmPassword")}
                   autoComplete="new-password"
                   value={confirmPassword}
                   onChange={(event) => setConfirmPassword(event.target.value)}
                 />
-              </Field>
+              </Form.Item>
             </div>
-            <div className="error settings-error" role="alert">
-              {passwordError === "mismatch"
-                ? t("account.passwordMismatch")
-                : passwordError === "too-short"
-                  ? t("account.passwordMinLength", { count: MIN_PASSWORD_LENGTH })
-                  : ""}
-            </div>
+            {passwordError ? (
+              <Alert
+                className="settings-error"
+                type="error"
+                showIcon
+                title={passwordError === "mismatch"
+                  ? t("account.passwordMismatch")
+                  : t("account.passwordMinLength", { count: MIN_PASSWORD_LENGTH })}
+              />
+            ) : null}
             <div className="form-actions">
-              <LoadingButton
-                type="submit"
-                variant="primary"
+              <Button
+                htmlType="submit"
+                type="primary"
                 loading={passwordPending}
-                loadingLabel={t("account.updatingPassword")}
                 disabled={!passwordDirty}
               >
-                {t("account.updatePassword")}
-              </LoadingButton>
+                {passwordPending ? t("account.updatingPassword") : t("account.updatePassword")}
+              </Button>
             </div>
-          </form>
-        </section>
+          </Form>
+        </Card>
       </div>
     </div>
   );

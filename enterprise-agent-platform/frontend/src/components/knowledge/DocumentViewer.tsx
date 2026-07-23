@@ -5,6 +5,7 @@
    This was impossible under the legacy full-teardown render and is the main a11y
    win for this view. The panel is an inline region, not a modal. */
 
+import { Button, Tooltip, Typography } from "antd";
 import { useEffect, useRef } from "react";
 import { useI18n } from "../../i18n";
 import type { FullDocument } from "../../types";
@@ -21,33 +22,35 @@ export interface DocumentViewerProps {
 
 export function DocumentViewer({ document: doc, onClose, showClose = true }: DocumentViewerProps) {
   const { t } = useI18n();
-  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const viewerRef = useRef<HTMLDivElement | null>(null);
 
   // Focus handoff on open. The restore-to-trigger on close lives in the parent's
   // onClose (it owns the reference to the button that opened the viewer).
   useEffect(() => {
-    closeRef.current?.focus();
+    viewerRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, []);
 
   return (
     <div
-      className="doc-viewer"
+      className="knowledge-document-viewer"
       id={DOC_VIEWER_ID}
+      ref={viewerRef}
       role="region"
       aria-label={t("knowledge.documentRegion")}
     >
-      <div className="doc-viewer__bar">
-        <span className="eyebrow">{doc.title || t("knowledge.untitledDocument")}</span>
-        {showClose ? <button
-          ref={closeRef}
-          className="icon-btn"
-          type="button"
-          title={t("common.close")}
-          aria-label={t("knowledge.closeDocument")}
-          onClick={onClose}
-        >
-          <Icon name="close" size={16} />
-        </button> : null}
+      <div className="knowledge-document-viewer__bar">
+        <Typography.Text strong>{doc.title || t("knowledge.untitledDocument")}</Typography.Text>
+        {showClose ? (
+          <Tooltip title={t("common.close")}>
+            <Button
+              type="text"
+              shape="circle"
+              aria-label={t("knowledge.closeDocument")}
+              icon={<Icon name="close" size={16} />}
+              onClick={onClose}
+            />
+          </Tooltip>
+        ) : null}
       </div>
       <pre>{doc.content}</pre>
     </div>

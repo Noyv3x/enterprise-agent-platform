@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Button } from "antd";
 import { useI18n } from "../../i18n";
 import { Brand } from "./Brand";
 import { LanguageSelect } from "./LanguageSelect";
@@ -39,9 +40,9 @@ function ErrorFallback() {
           <Brand />
           <h1 id="app-error-title">{t("errorBoundary.title")}</h1>
           <p className="muted">{t("errorBoundary.detail")}</p>
-          <button className="btn btn--primary btn--lg" type="button" onClick={() => location.reload()}>
+          <Button type="primary" size="large" onClick={() => location.reload()}>
             {t("common.reload")}
-          </button>
+          </Button>
         </section>
       </div>
     </main>

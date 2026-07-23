@@ -26,14 +26,15 @@ export function AccountManagement({
   const permissionGroups = useStore((state) => state.permissionGroups);
   const users = useStore((state) => state.users);
   const containerRef = useRef<HTMLElement>(null);
-  const [layout, setLayout] = useState<"table" | "list" | "both">("table");
+  const [layout, setLayout] = useState<"table" | "list">("table");
   const groups = permissionGroups.length ? permissionGroups : FALLBACK_PERMISSION_GROUPS;
 
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     if (typeof ResizeObserver === "undefined") {
-      setLayout("both");
+      const width = container.getBoundingClientRect().width;
+      setLayout((width > 0 ? width < 840 : window.matchMedia("(max-width: 1100px)").matches) ? "list" : "table");
       return;
     }
     const update = (width: number) => {
@@ -84,7 +85,7 @@ export function AccountManagement({
           {t("admin.accounts.count", { count: users.length })}
         </Typography.Text>
       </div>
-      {layout !== "list" ? (
+      {layout === "table" ? (
         <Table<User>
           className="eap-admin-account-table"
           columns={columns}
@@ -97,7 +98,7 @@ export function AccountManagement({
           locale={{ emptyText: t("admin.accounts.empty") }}
         />
       ) : null}
-      {layout !== "table" ? (
+      {layout === "list" ? (
         <div className="eap-admin-account-list">
           {users.length ? (
             users.map((user) => <AccountMobileRow key={String(user.id)} user={user} groups={groups} />)

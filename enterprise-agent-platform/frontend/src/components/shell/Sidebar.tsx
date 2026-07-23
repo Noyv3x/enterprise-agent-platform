@@ -4,17 +4,22 @@
    focusable nor announced — recomputed across the 800px breakpoint by the
    caller's useMediaQuery. */
 
+import { Badge, Menu } from "antd";
+import { navigateToView } from "../../data/chatActions";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useI18n } from "../../i18n";
-import { useStore } from "../../store/useStore";
+import { useStore, useStoreHandle } from "../../store/useStore";
+import { cx } from "../../lib/cx";
 import { Brand } from "../common/Brand";
+import { Icon } from "../common/Icon";
 import { ChannelCreateForm } from "./ChannelCreateForm";
 import { ChannelList } from "./ChannelList";
-import { NavItem } from "./NavItem";
 import { SidebarFoot } from "./SidebarFoot";
 import { WorkspaceNav } from "./WorkspaceNav";
+import { preloadRoute } from "./routePreload";
 
-export function Sidebar({ hidden }: { hidden: boolean }) {
+export function Sidebar({ showBrand = true }: { showBrand?: boolean }) {
+  const store = useStoreHandle();
   const { t } = useI18n();
   const channelCount = useStore((state) => state.channels.length);
   const activeView = useStore((state) => state.activeView);
@@ -23,19 +28,21 @@ export function Sidebar({ hidden }: { hidden: boolean }) {
 
   return (
     <aside
-      className="sidebar"
+      className={cx("sidebar", !showBrand && "sidebar--drawer")}
       id="app-sidebar"
-      inert={hidden}
-      aria-hidden={hidden ? "true" : undefined}
     >
-      <div className="sidebar__head">
-        <Brand />
-      </div>
+      {showBrand ? <div className="sidebar__head"><Brand /></div> : null}
       <div className="sidebar__scroll">
         <div>
           <div className="section-label">
             <span>{t("nav.channels")}</span>
-            <span className="nav__badge">{channelCount}</span>
+            <Badge
+              className="nav__badge"
+              classNames={{ indicator: "nav__badge-indicator" }}
+              count={channelCount}
+              showZero
+              size="small"
+            />
           </div>
           <ChannelList />
           {canManageChannels ? <ChannelCreateForm /> : null}
@@ -48,11 +55,30 @@ export function Sidebar({ hidden }: { hidden: boolean }) {
           <div className="sidebar__tools">
             <div className="section-label">{t("shell.tools")}</div>
             <nav className="nav" aria-label={t("shell.tools")}>
-              <NavItem
-                view="admin"
-                label={t("nav.admin")}
-                icon="shield"
-                active={activeView === "admin"}
+              <Menu
+                className="shell-menu"
+                mode="inline"
+                selectable
+                selectedKeys={activeView === "admin" ? ["admin"] : []}
+                classNames={{
+                  item: "shell-menu__item",
+                  itemIcon: "shell-menu__icon",
+                  itemContent: "shell-menu__content",
+                }}
+                items={[{
+                  key: "admin",
+                  icon: <Icon name="shield" />,
+                  label: (
+                    <span
+                      className="shell-menu__label"
+                      onPointerEnter={() => preloadRoute("admin")}
+                      onTouchStart={() => preloadRoute("admin")}
+                    >
+                      {t("nav.admin")}
+                    </span>
+                  ),
+                }]}
+                onClick={() => void navigateToView(store, "admin")}
               />
             </nav>
           </div>

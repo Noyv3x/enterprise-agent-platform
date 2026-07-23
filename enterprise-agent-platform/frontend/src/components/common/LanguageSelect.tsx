@@ -1,3 +1,4 @@
+import { Select } from "antd";
 import { SUPPORTED_LOCALES, useI18n, type Locale } from "../../i18n";
 
 export const LOCALE_NAMES: Record<Locale, string> = {
@@ -9,18 +10,14 @@ export const LOCALE_NAMES: Record<Locale, string> = {
 export function LanguageSelect() {
   const { locale, setLocale, t } = useI18n();
   return (
-    <select
+    <Select
       className="language-select"
       aria-label={t("language.label")}
       title={t("language.label")}
       value={locale}
-      onChange={(event) => setLocale(event.target.value as Locale)}
-    >
-      {SUPPORTED_LOCALES.map((item) => (
-        <option key={item} value={item}>
-          {LOCALE_NAMES[item]}
-        </option>
-      ))}
-    </select>
+      onChange={(value) => setLocale(value as Locale)}
+      options={SUPPORTED_LOCALES.map((item) => ({ value: item, label: LOCALE_NAMES[item] }))}
+      popupMatchSelectWidth={false}
+    />
   );
 }

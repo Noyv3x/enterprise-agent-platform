@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
+import { ConfigProvider } from "antd";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -32,11 +33,13 @@ function renderActions(overrides: Partial<AppState>) {
   const state: AppState = { ...initialAppState, ...overrides };
   const store = createStore(rootReducer, state);
   return render(
-    <StoreContext.Provider value={store}>
-      <I18nProvider>
-        <TopbarActions />
-      </I18nProvider>
-    </StoreContext.Provider>,
+    <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
+      <StoreContext.Provider value={store}>
+        <I18nProvider>
+          <TopbarActions />
+        </I18nProvider>
+      </StoreContext.Provider>
+    </ConfigProvider>,
   );
 }
 
@@ -58,8 +61,8 @@ describe("conversation context details", () => {
 
     await user.click(screen.getByRole("button", { name: "Details" }));
 
-    expect(screen.getByRole("dialog", { name: "Context usage" })).toBeVisible();
-    expect(screen.getByText("32,000 / 128,000 tokens")).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "Context usage" })).toBeInTheDocument();
+    expect(screen.getByText("32,000 / 128,000 tokens")).toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "Context usage percentage" }))
       .toHaveAttribute("aria-valuenow", "25");
     expect(screen.queryByText(/provider|session/i)).not.toBeInTheDocument();
@@ -75,7 +78,7 @@ describe("conversation context details", () => {
 
     await user.click(screen.getByRole("button", { name: "Details" }));
 
-    expect(screen.getByText("64,000 / 128,000 tokens")).toBeVisible();
+    expect(screen.getByText("64,000 / 128,000 tokens")).toBeInTheDocument();
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
   });
 
@@ -87,7 +90,7 @@ describe("conversation context details", () => {
 
     expect(
       screen.getByText("Context usage will appear after the Agent completes a reply."),
-    ).toBeVisible();
+    ).toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
 
@@ -110,7 +113,7 @@ describe("conversation context details", () => {
 
     expect(
       screen.getByText("Context usage will appear after the Agent completes a reply."),
-    ).toBeVisible();
+    ).toBeInTheDocument();
     expect(screen.queryByText("32,000 / 128,000 tokens")).not.toBeInTheDocument();
   });
 

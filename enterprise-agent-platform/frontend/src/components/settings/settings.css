@@ -1,0 +1,111 @@
+.settings-panel {
+  width: min(920px, 100%);
+}
+
+.account-identity {
+  padding: 0;
+}
+
+.account-identity__body {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.account-identity__avatar {
+  flex: 0 0 auto;
+  background: var(--brand);
+}
+
+.account-identity__main,
+.account-identity__meta {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.account-identity__main > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-identity__meta {
+  justify-items: end;
+}
+
+.account-identity__meta .eap-tag {
+  margin-inline-end: 0;
+}
+
+.settings-card {
+  padding: 0;
+}
+
+.settings-card__body {
+  min-width: 0;
+}
+
+.settings-form__grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.settings-card .eap-form-item {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.settings-card .field-stack {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.settings-card .field-help {
+  max-width: 62ch;
+  min-height: 16px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.settings-card .form-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 16px;
+}
+
+.settings-error {
+  margin-top: 16px;
+}
+
+@media (max-width: 800px) {
+  .account-identity__body {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .account-identity__meta {
+    grid-column: 2;
+    justify-items: start;
+  }
+
+  .settings-card .form-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .settings-form__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-card .form-actions > .eap-btn {
+    width: 100%;
+  }
+}

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
+import { ConfigProvider } from "antd";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
@@ -15,7 +16,15 @@ function mount(ui: React.ReactNode) {
   const appRoot = document.createElement("div");
   appRoot.id = "react-root";
   document.body.append(appRoot);
-  return { appRoot, ...render(<I18nProvider>{ui}</I18nProvider>, { container: appRoot }) };
+  return {
+    appRoot,
+    ...render(
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
+        <I18nProvider>{ui}</I18nProvider>
+      </ConfigProvider>,
+      { container: appRoot },
+    ),
+  };
 }
 
 function DialogHarness() {
@@ -46,18 +55,20 @@ function NestedHarness() {
 }
 
 describe("Dialog", () => {
-  it("makes the application inert, closes on Escape, and restores focus", async () => {
+  it("closes on Escape and restores focus to the opener", async () => {
     const user = userEvent.setup();
-    const { appRoot } = mount(<DialogHarness />);
+    mount(<DialogHarness />);
     const trigger = screen.getByRole("button", { name: "Open" });
 
     await user.click(trigger);
-    expect(screen.getByRole("dialog", { name: "Preferences" })).toBeInTheDocument();
-    expect(appRoot).toHaveAttribute("inert");
+    const dialog = screen.getByRole("dialog", { name: "Preferences" });
+    expect(dialog).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.tab();
+    expect(trigger).not.toHaveFocus();
 
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(appRoot).not.toHaveAttribute("inert");
     expect(trigger).toHaveFocus();
   });
 
@@ -66,16 +77,14 @@ describe("Dialog", () => {
     mount(<NestedHarness />);
     await user.click(screen.getByRole("button", { name: "Discard" }));
 
-    const modals = [...document.querySelectorAll<HTMLElement>(".modal")];
-    expect(modals).toHaveLength(2);
-    expect(modals[0]).toHaveAttribute("inert");
-    expect(modals[0]).toHaveAttribute("aria-hidden", "true");
-    expect(modals[1]).not.toHaveAttribute("inert");
+    expect(screen.getAllByRole("dialog")).toHaveLength(2);
+    expect(screen.getByText("Discard changes")).toBeInTheDocument();
 
     await user.keyboard("{Escape}");
-    expect(screen.getByRole("dialog", { name: "Account" })).toBeInTheDocument();
-    expect(screen.queryByRole("dialog", { name: "Discard changes" })).not.toBeInTheDocument();
-    expect(document.querySelector(".modal")).not.toHaveAttribute("inert");
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.getByText("Account")).toBeInTheDocument();
+    expect(screen.queryByText("Discard changes")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Discard" })).toHaveFocus();
 
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();

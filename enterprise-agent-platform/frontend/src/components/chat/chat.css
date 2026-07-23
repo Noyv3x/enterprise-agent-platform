@@ -8,8 +8,8 @@
   gap: 14px;
 }
 
-.telegram-link-dialog .notice {
-  margin-top: 0;
+.telegram-link-dialog .telegram-link__notice {
+  margin: 0;
 }
 
 .message-pane {
@@ -46,12 +46,19 @@
   transform: translateX(-50%);
 }
 
-.scroll-latest:hover {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+.scroll-latest.scroll-latest {
+  border-color: var(--accent-line);
+  background: var(--surface);
+  color: var(--accent-soft-ink);
 }
 
-.scroll-latest > span:first-child {
+.scroll-latest.scroll-latest:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-ink);
+}
+
+.scroll-latest__icon {
   font-family: var(--font-mono);
   font-size: 16px;
   line-height: 1;
@@ -81,9 +88,15 @@
   cursor: pointer;
 }
 
-.chat-copy:hover,
-.chat-copy:focus-visible,
-.chat-copy.is-copied {
+.chat-copy.chat-copy {
+  border-color: transparent;
+  background: transparent;
+  color: var(--faint);
+}
+
+.chat-copy.chat-copy:hover,
+.chat-copy.chat-copy:focus-visible,
+.chat-copy.chat-copy.is-copied {
   border-color: var(--line);
   background: var(--surface-2);
   color: var(--ink);
@@ -132,6 +145,100 @@
   .scheduled-message-marker__content strong { max-width: 120px; }
 }
 .chat-copy__icon { font-family: var(--font-mono); font-size: 13px; }
+
+.msg__pending.msg__pending {
+  margin: 0;
+  padding-inline: 6px;
+  border-color: var(--line);
+  line-height: 19px;
+  font-size: 10.5px;
+}
+
+.msg__suggest .chip.chip {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 7px;
+  border-color: var(--accent-line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--accent-soft-ink);
+  line-height: 22px;
+}
+
+.composer__attach.composer__attach,
+.composer__send.composer__send {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.composer__attach.composer__attach {
+  color: var(--muted);
+}
+
+.composer__attach.composer__attach:hover {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+
+.composer__send.composer__send {
+  background: var(--accent-solid);
+  color: var(--on-accent);
+}
+
+.composer-file__remove.composer-file__remove {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--muted);
+}
+
+.failed-send__restore {
+  flex: none;
+}
+
+.agent-approval__action {
+  min-width: 0;
+}
+
+.agent-work.agent-work {
+  padding: 0;
+  color: var(--ink);
+}
+
+.agent-work.agent-work.agent-work--active {
+  background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent-line) 86%, var(--line));
+}
+
+.agent-work.agent-work.agent-work--complete {
+  background: var(--surface);
+  border-color: var(--line);
+}
+
+.agent-work__collapse-header {
+  padding: 0 !important;
+  color: inherit !important;
+}
+
+.agent-work__collapse-title {
+  min-width: 0;
+  display: block;
+}
+
+.agent-work__collapse-body {
+  background: transparent;
+  color: inherit;
+  padding: 0 !important;
+}
+
+.agent-work--expanded .agent-work__chevron {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
 
 .msg__body {
   min-width: 0;
@@ -256,7 +363,7 @@
 
 @media (max-width: 520px) {
   .msg__meta { min-height: 32px; }
-  .chat-copy--message > span:last-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .chat-copy--message .chat-copy__label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .chat-copy--message { width: 44px; padding: 0; }
   .md-code pre { padding: 10px 11px; font-size: 12px; }
   .scroll-latest { bottom: 10px; }
@@ -303,6 +410,16 @@
 }
 
 .ctx-details__progress {
+  line-height: 1;
+}
+
+.ctx-details__progress-body {
+  display: block;
+  padding: 0;
+  margin: 0;
+}
+
+.ctx-details__progress-rail {
   height: 10px;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -310,12 +427,9 @@
   background: var(--surface-2);
 }
 
-.ctx-details__progress > span {
-  display: block;
+.ctx-details__progress-track {
   min-width: 2px;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 68%, var(--ok)));
+  height: 100% !important;
   transition: width var(--t-slow);
 }
 
@@ -327,7 +441,7 @@
 }
 
 .ctx-details__note,
-.ctx-details__empty p {
+.ctx-details__empty-description {
   margin: 0;
   color: var(--muted);
   font-size: 12.5px;
@@ -347,6 +461,11 @@
   text-align: center;
 }
 
+.ctx-details__empty-image {
+  height: auto;
+  margin: 0;
+}
+
 .ctx-details__empty svg {
   color: var(--faint);
 }
@@ -363,7 +482,7 @@
     width: 100%;
   }
 
-  .ctx-details__trigger > span {
+  .ctx-details__trigger .ctx-details__label {
     position: absolute;
     width: 1px;
     height: 1px;

@@ -1,8 +1,11 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  test: {
+    setupFiles: "./src/test/setup.ts",
+  },
   base: "/",
   build: {
     // Direct `vite build` is deliberately safe: it can only replace this local

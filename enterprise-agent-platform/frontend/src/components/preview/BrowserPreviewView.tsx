@@ -1,3 +1,4 @@
+import { Button, Spin, Tag } from "antd";
 import { intlLocale, useI18n } from "../../i18n";
 import type { AgentPreviewScope } from "../../types";
 import { EmptyState } from "../common/EmptyState";
@@ -29,13 +30,14 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
       <header className="preview-toolbar">
         <div className="preview-toolbar__status">
           <PreviewStatus connection={state.connection} idle={state.activity === "idle"} />
-          <span className="status"><Icon name="shield" size={12} />{t("preview.readOnly")}</span>
+          <Tag className="preview-readonly" icon={<Icon name="shield" size={12} />}>
+            {t("preview.readOnly")}
+          </Tag>
           {lastUpdate ? <span className="preview-updated">{t("preview.updatedAt", { time: lastUpdate })}</span> : null}
         </div>
-        <button className="btn btn--sm" type="button" onClick={refresh}>
-          <Icon name="refresh" size={14} />
+        <Button className="preview-toolbar__action" size="small" icon={<Icon name="refresh" size={14} />} onClick={refresh}>
           <span>{t("preview.refresh")}</span>
-        </button>
+        </Button>
       </header>
       {state.error ? (
         <InlineAlert variant="warning">{state.error || t("preview.loadFailed")}</InlineAlert>
@@ -63,14 +65,12 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
             />
           ) : (
             <div
-              className="empty browser-preview__loading"
+              className="browser-preview__loading"
               role="status"
               aria-live="polite"
               aria-busy="true"
             >
-              <div className="empty__icon">
-                <Icon name="refresh" size={26} cls="spin" />
-              </div>
+              <Spin size="large" />
               <h3>{t("browserPreview.loadingFrame")}</h3>
               <p>{t("browserPreview.loadingFrameDetail")}</p>
             </div>

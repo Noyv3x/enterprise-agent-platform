@@ -1,17 +1,19 @@
-/* <EmptyState icon title text/> — empty-state placeholder
-   (legacy emptyState(iconName, title, text), legacy-app.js:358-364). */
-
+import { Empty, Typography } from "antd";
 import type { IconName } from "../../types";
 import { Icon } from "./Icon";
 
 export function EmptyState({ icon, title, text }: { icon: IconName; title: string; text: string }) {
   return (
-    <div className="empty">
-      <div className="empty__icon">
-        <Icon name={icon} size={26} />
-      </div>
-      <h3>{title}</h3>
-      <p>{text}</p>
-    </div>
+    <Empty
+      className="eap-empty-state"
+      classNames={{ image: "eap-empty-state__image", description: "eap-empty-state__description" }}
+      image={<span className="eap-empty-state__icon"><Icon name={icon} size={26} /></span>}
+      description={(
+        <span className="eap-empty-state__copy">
+          <Typography.Title level={3}>{title}</Typography.Title>
+          <Typography.Text type="secondary">{text}</Typography.Text>
+        </span>
+      )}
+    />
   );
 }

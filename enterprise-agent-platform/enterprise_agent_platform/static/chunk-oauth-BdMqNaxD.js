@@ -1,0 +1,1 @@
+import{i as e}from"./chunk-i18n-BE4Xbq0q.js";function t(e){return e.includes(`_OAUTH_`)}function n(t){let n=t?.last_auth_error;if(!n||typeof n!=`object`)return``;let r=String(n.message||n.detail||n.code||``).trim();return r?n.relogin_required?e(`oauth.reloginRequired`,{message:r}):r:``}function r(e,t){return(t||[]).find(t=>t.id===e)?.label||e||``}export{n,r,t};

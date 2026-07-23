@@ -94,7 +94,6 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
         }
         extra={
           <Button
-            className="btn--sm"
             size="small"
             icon={<Icon name="refresh" size={14} />}
             disabled={busy || !channelId}
@@ -106,7 +105,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
       />
       {channels.length ? (
         <Form.Item
-          className="field"
+          className="eap-field"
           label={t("admin.audit.channel.label")}
           htmlFor={fieldId("channel")}
         >
@@ -126,7 +125,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
       <div className="audit-tools">
         <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteId}>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.audit.exactDelete")}
             htmlFor={fieldId("message-id")}
           >
@@ -151,7 +150,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
         </Form>
         <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteBefore}>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.audit.deleteBeforeLabel")}
             htmlFor={fieldId("before-time")}
           >
@@ -172,7 +171,7 @@ export function ChannelAuditCard({ confirm, channelId }: ChannelAuditCardProps) 
           </Button>
         </Form>
         <div className="audit-tool audit-tool--compact">
-          <span className="field">
+          <span className="audit-tool__copy">
             <span>{t("admin.audit.clearAll")}</span>
             <span className="muted">{t("admin.audit.channel.clearHint")}</span>
           </span>

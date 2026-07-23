@@ -1,23 +1,5 @@
 /* Ant Design-backed administration workspace. Product layout classes stay
-   separate from library internals; legacy selectors below only bridge admin
-   pages that have not yet migrated their field controls. */
-
-.eap-component-root {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  background: transparent;
-  color: var(--ink);
-}
-
-/* The legacy shell gives every native field a 40px minimum height. Ant Design
-   owns the geometry of its generated inputs, so keep that rule from stretching
-   search inputs inside Select and compact form controls. */
-.eap-component-root :where(.eap-input, .eap-select-input),
-.eap-admin-account-drawer :where(.eap-input, .eap-select-input) {
-  min-height: 0;
-}
+   separate from library internals. */
 
 .panel.eap-admin-shell {
   container: eap-admin-shell / inline-size;
@@ -346,37 +328,18 @@
   line-height: 1.4;
 }
 
-/* Transitional layout bridge for administration pages whose business forms
-   still rely on native controls (notably changed-only environment collectors). */
-.eap-admin-page .check-row input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  min-width: 18px;
-  min-height: 18px;
-  margin: 2px 0 0;
-  padding: 0;
-}
-
-.eap-admin-page .btn.btn--sm {
-  min-height: 34px;
-  padding-block: 0;
-}
-
 .eap-admin-page .config-form {
   width: min(840px, 100%);
   max-width: none;
 }
 
 .eap-admin-page .config-grid,
-.eap-admin-page .settings-form__grid,
-.eap-admin-page .account-create__grid,
-.eap-admin-page .account-row__grid,
 .eap-admin-page .config-group__body,
 .eap-admin-page .oauth-grid {
   align-items: start;
 }
 
-.eap-admin-page .field,
+.eap-admin-page .eap-field,
 .eap-admin-page .config-field,
 .eap-admin-page .oauth-card {
   align-content: start;
@@ -427,7 +390,7 @@
   align-content: stretch;
 }
 
-.eap-admin-page .audit-tool .field {
+.eap-admin-page .audit-tool .eap-field {
   align-content: start;
 }
 
@@ -475,9 +438,6 @@
 
 @container eap-admin-page (max-width: 820px) {
   .eap-admin-page .config-grid,
-  .eap-admin-page .settings-form__grid,
-  .eap-admin-page .account-create__grid,
-  .eap-admin-page .account-row__grid,
   .eap-admin-page .audit-tools,
   .eap-admin-page .audit-private {
     grid-template-columns: minmax(0, 1fr);
@@ -614,8 +574,4 @@
     min-height: 44px;
   }
 
-  .eap-admin-page .btn.btn--sm {
-    min-height: 44px;
-    padding-block: 7px;
-  }
 }

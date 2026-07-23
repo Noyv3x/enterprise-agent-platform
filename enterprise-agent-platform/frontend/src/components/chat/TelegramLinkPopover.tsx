@@ -5,6 +5,7 @@
    only pending status/expiry; a focused poll discovers the completed link. */
 
 import { useEffect, useState } from "react";
+import { Alert, Button } from "antd";
 import { loadPrivateTelegram } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
 import { useI18n } from "../../i18n";
@@ -62,7 +63,9 @@ export function TelegramLinkPopover() {
   const { locale, t } = useI18n();
 
   const pendingOperations = useStore((state) => state.pendingOperations);
-  const busy = pendingOperations.includes("telegram:link") || pendingOperations.includes("telegram:unlink");
+  const linkBusy = pendingOperations.includes("telegram:link");
+  const unlinkBusy = pendingOperations.includes("telegram:unlink");
+  const busy = linkBusy || unlinkBusy;
   const telegram = useStore((state) => state.privateTelegram);
   const gateway = telegram?.gateway || {};
   const link = telegram?.link || {};
@@ -211,12 +214,12 @@ export function TelegramLinkPopover() {
               <strong>{link.telegram_username ? `@${link.telegram_username}` : t("chat.telegram.accountFallback")}</strong>
               <span>{`ID ${link.telegram_user_id}`}</span>
             </div>
-            <button className="btn btn--danger btn--sm" type="button" disabled={busy} onClick={onUnbind}>
+            <Button danger size="small" disabled={busy} loading={unlinkBusy} onClick={onUnbind}>
               {t("chat.telegram.unbind")}
-            </button>
+            </Button>
           </div>
         ) : view === "disabled" ? (
-          <div className="notice notice--warn">{t("chat.telegram.disabledNotice")}</div>
+          <Alert className="telegram-link__notice" type="warning" showIcon title={t("chat.telegram.disabledNotice")} />
         ) : (
           <>
             <p className="telegram-link__instructions">
@@ -230,9 +233,9 @@ export function TelegramLinkPopover() {
                 </div>
                 <div className="telegram-challenge__command">
                   <code>{command}</code>
-                  <button className="btn btn--sm" type="button" onClick={onCopy}>
+                  <Button size="small" onClick={onCopy}>
                     {copied ? t("chat.telegram.copied") : t("chat.telegram.copyCommand")}
-                  </button>
+                  </Button>
                 </div>
                 <div className="telegram-challenge__expiry">
                   <span>{relativeExpiry}</span>
@@ -245,21 +248,30 @@ export function TelegramLinkPopover() {
                 </span>
               </div>
             ) : pendingActive ? (
-              <div className="notice notice--warn">
-                {t("chat.telegram.pendingHidden")}
-              </div>
+              <Alert
+                className="telegram-link__notice"
+                type="warning"
+                showIcon
+                title={t("chat.telegram.pendingHidden")}
+              />
             ) : timing.expired ? (
-              <div className="notice notice--warn">{t("chat.telegram.expiredNotice")}</div>
+              <Alert
+                className="telegram-link__notice"
+                type="warning"
+                showIcon
+                title={t("chat.telegram.expiredNotice")}
+              />
             ) : null}
             <div className="telegram-link__actions">
-              <button
-                className="btn btn--primary btn--sm"
-                type="button"
+              <Button
+                type="primary"
+                size="small"
                 disabled={busy}
+                loading={linkBusy}
                 onClick={() => void onGenerate()}
               >
                 {pending ? t("chat.telegram.regenerate") : t("chat.telegram.generate")}
-              </button>
+              </Button>
             </div>
           </>
         )}

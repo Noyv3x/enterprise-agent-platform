@@ -1,7 +1,7 @@
 import { ConfigProvider, theme as antTheme } from "antd";
-import enUS from "antd/locale/en_US";
-import zhCN from "antd/locale/zh_CN";
-import zhTW from "antd/locale/zh_TW";
+import enUS from "antd/es/locale/en_US";
+import zhCN from "antd/es/locale/zh_CN";
+import zhTW from "antd/es/locale/zh_TW";
 import { useMemo, type ReactNode } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useTheme } from "../../hooks/useTheme";

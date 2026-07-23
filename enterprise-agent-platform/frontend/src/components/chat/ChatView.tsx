@@ -19,6 +19,7 @@ import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";
+import "./chat.css";
 
 export function ChatView({ mode }: { mode: ChatMode }) {
   const { t } = useI18n();

@@ -4,6 +4,7 @@
 
 import { formatFileSize } from "../../utils/format";
 import { useI18n } from "../../i18n";
+import { Button, Tooltip } from "antd";
 import { Icon } from "../common/Icon";
 
 export function ComposerFiles({
@@ -23,15 +24,17 @@ export function ComposerFiles({
           </span>
           <span className="composer-file__name">{file.name || t("chat.attachment")}</span>
           <span className="composer-file__size">{formatFileSize(file.size || 0)}</span>
-          <button
-            className="icon-btn composer-file__remove"
-            type="button"
-            title={t("chat.attach.remove")}
-            aria-label={t("chat.attach.removeAttachment")}
-            onClick={() => onRemove(index)}
-          >
-            <Icon name="close" size={14} />
-          </button>
+          <Tooltip title={t("chat.attach.remove")}>
+            <Button
+              className="composer-file__remove"
+              type="text"
+              shape="circle"
+              size="small"
+              aria-label={t("chat.attach.removeAttachment")}
+              icon={<Icon name="close" size={14} />}
+              onClick={() => onRemove(index)}
+            />
+          </Tooltip>
         </div>
       ))}
     </div>

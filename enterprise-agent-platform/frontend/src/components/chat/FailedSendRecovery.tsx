@@ -1,5 +1,6 @@
 import { useI18n } from "../../i18n";
 import type { FailedSend } from "../../types";
+import { Button, Tooltip } from "antd";
 import { Icon } from "../common/Icon";
 
 function summary(send: FailedSend, fallback: string): string {
@@ -35,15 +36,11 @@ export function FailedSendRecovery({
             : ""}
         </span>
       </div>
-      <button
-        className="btn btn--sm"
-        type="button"
-        disabled={blocked}
-        title={blocked ? t("chat.failedSend.restoreBlocked") : undefined}
-        onClick={onRestore}
-      >
-        {t("chat.failedSend.restore")}
-      </button>
+      <Tooltip title={blocked ? t("chat.failedSend.restoreBlocked") : undefined}>
+        <Button className="failed-send__restore" size="small" disabled={blocked} onClick={onRestore}>
+          {t("chat.failedSend.restore")}
+        </Button>
+      </Tooltip>
     </section>
   );
 }

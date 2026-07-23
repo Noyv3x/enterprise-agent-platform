@@ -90,7 +90,7 @@ export function TokenUsageMonitoring() {
           extra={
             <div className="token-usage__filters">
               <Form.Item
-                className="field"
+                className="eap-field"
                 label={t("admin.tokens.timeRange")}
                 htmlFor="token-usage-days"
                 style={{ marginBottom: 0 }}
@@ -111,7 +111,6 @@ export function TokenUsageMonitoring() {
                 />
               </Form.Item>
               <Button
-                className="btn--sm"
                 htmlType="button"
                 size="small"
                 loading={refreshing}

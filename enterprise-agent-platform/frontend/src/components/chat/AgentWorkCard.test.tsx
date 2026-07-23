@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
+import { ConfigProvider } from "antd";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -54,11 +55,13 @@ describe("AgentWorkCard", () => {
     };
 
     render(
-      <StoreContext.Provider value={store}>
-        <I18nProvider>
-          <AgentWorkCard work={work} active={true} />
-        </I18nProvider>
-      </StoreContext.Provider>,
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
+        <StoreContext.Provider value={store}>
+          <I18nProvider>
+            <AgentWorkCard work={work} active={true} />
+          </I18nProvider>
+        </StoreContext.Provider>
+      </ConfigProvider>,
     );
 
     expect(screen.getByText("Command")).toBeVisible();
@@ -92,31 +95,33 @@ describe("AgentWorkCard", () => {
       ],
     };
     const renderCard = (finalOutputStarted: boolean) => (
-      <StoreContext.Provider value={store}>
-        <I18nProvider>
-          <AgentWorkCard
-            work={work}
-            active={true}
-            finalOutputStarted={finalOutputStarted}
-          />
-        </I18nProvider>
-      </StoreContext.Provider>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
+        <StoreContext.Provider value={store}>
+          <I18nProvider>
+            <AgentWorkCard
+              work={work}
+              active={true}
+              finalOutputStarted={finalOutputStarted}
+            />
+          </I18nProvider>
+        </StoreContext.Provider>
+      </ConfigProvider>
     );
     const view = render(renderCard(false));
-    const details = () => view.container.querySelector("details");
+    const disclosure = () => view.container.querySelector("[role=button]");
 
-    expect(details()).toHaveAttribute("open");
+    expect(disclosure()).toHaveAttribute("aria-expanded", "true");
     view.rerender(renderCard(true));
-    expect(details()).not.toHaveAttribute("open");
+    expect(disclosure()).toHaveAttribute("aria-expanded", "false");
 
-    fireEvent.click(view.container.querySelector("summary")!);
-    expect(details()).toHaveAttribute("open");
+    fireEvent.click(disclosure()!);
+    expect(disclosure()).toHaveAttribute("aria-expanded", "true");
     view.rerender(renderCard(true));
-    expect(details()).toHaveAttribute("open");
+    expect(disclosure()).toHaveAttribute("aria-expanded", "true");
 
     view.rerender(renderCard(false));
-    expect(details()).toHaveAttribute("open");
+    expect(disclosure()).toHaveAttribute("aria-expanded", "true");
     view.rerender(renderCard(true));
-    expect(details()).not.toHaveAttribute("open");
+    expect(disclosure()).toHaveAttribute("aria-expanded", "false");
   });
 });

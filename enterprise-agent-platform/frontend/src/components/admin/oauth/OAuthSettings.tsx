@@ -29,7 +29,6 @@ export function OAuthSettings() {
         extra={
           <div className="oauth-transfer">
             <Button
-              className="btn--sm"
               htmlType="button"
               size="small"
               loading={exporting}
@@ -50,7 +49,6 @@ export function OAuthSettings() {
               }}
             >
               <Button
-                className="btn--sm"
                 htmlType="button"
                 size="small"
                 loading={importing}

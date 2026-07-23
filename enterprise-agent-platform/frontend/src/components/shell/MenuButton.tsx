@@ -3,6 +3,7 @@
    drawer state; aria-controls ties it to the sidebar. Opening focus-moves into
    the drawer via the AppShell open/close effect. */
 
+import { Button, Tooltip } from "antd";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
 import { Icon } from "../common/Icon";
@@ -12,15 +13,16 @@ export function MenuButton() {
   const { t } = useI18n();
   const sidebarOpen = useStore((state) => state.sidebarOpen);
   return (
-    <button
-      className="icon-btn menu-btn"
-      title={t("nav.menu.open")}
-      aria-label={t("nav.menu.open")}
-      aria-expanded={sidebarOpen}
-      aria-controls="app-sidebar"
-      onClick={() => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: true })}
-    >
-      <Icon name="menu" />
-    </button>
+    <Tooltip title={t("nav.menu.open")}>
+      <Button
+        className="menu-btn"
+        type="text"
+        icon={<Icon name="menu" />}
+        aria-label={t("nav.menu.open")}
+        aria-expanded={sidebarOpen}
+        aria-controls="app-sidebar"
+        onClick={() => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: true })}
+      />
+    </Tooltip>
   );
 }

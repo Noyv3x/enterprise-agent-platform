@@ -55,7 +55,6 @@ export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlow
       />
       <div className="oauth-actions">
         <Button
-          className="btn--sm"
           type="primary"
           size="small"
           disabled={!callbackValue.trim()}

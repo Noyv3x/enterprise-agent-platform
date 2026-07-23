@@ -4,7 +4,8 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentSchedule, AgentScheduleRun } from "../../types";
 import { ScheduledTasksPanel } from "./ScheduledTasksPanel";
 
@@ -69,7 +70,7 @@ function deferred<T>() {
 }
 
 function renderPanel() {
-  return render(<I18nProvider><ScheduledTasksPanel /></I18nProvider>);
+  return render(<TestUiProviders><ScheduledTasksPanel /></TestUiProviders>);
 }
 
 describe("ScheduledTasksPanel", () => {
@@ -188,7 +189,7 @@ describe("ScheduledTasksPanel", () => {
     dialog = screen.getByRole("dialog", { name: "Delete scheduled task?" });
     expect(within(dialog).getByText(
       "Deleting “Morning brief” stops future scheduled triggers and cannot be undone. Runs that are already queued or in progress may still complete.",
-    )).toBeVisible();
+    )).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Delete" }));
     expect(mocks.deleteAgentSchedule).toHaveBeenCalledWith(9);
     expect(screen.queryByRole("heading", { name: "Morning brief" })).not.toBeInTheDocument();

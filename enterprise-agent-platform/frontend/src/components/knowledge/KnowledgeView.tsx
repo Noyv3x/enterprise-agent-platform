@@ -4,6 +4,7 @@
    sidebar nav handler (navigateToView → loadDocuments) exactly as in legacy, so
    this view does not fetch on mount — it renders whatever the store holds. */
 
+import { Button, Space, Tag } from "antd";
 import { useState } from "react";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useConfirm } from "../../hooks/useConfirm";
@@ -14,6 +15,7 @@ import { Icon } from "../common/Icon";
 import { PageHeader } from "../common/PageHeader";
 import { KnowledgeCreateCard } from "./KnowledgeCreateCard";
 import { KnowledgeLibraryCard } from "./KnowledgeLibraryCard";
+import "./knowledge.css";
 
 export function KnowledgeView() {
   const canManage = usePermissions().has("manage_knowledge");
@@ -43,15 +45,23 @@ export function KnowledgeView() {
           title={t("knowledge.library")}
           description={t("knowledge.pageDescription")}
           actions={
-            <div className="page-header__action-row">
-              <span className="status">{t("knowledge.documentCount", { count })}</span>
+            <Space className="knowledge-header-actions" wrap>
+              <Tag
+                className="knowledge-count"
+                icon={<Icon name="doc" size={13} />}
+              >
+                {t("knowledge.documentCount", { count })}
+              </Tag>
               {canManage ? (
-                <button className="btn btn--primary" type="button" onClick={() => setCreateOpen(true)}>
-                  <Icon name="plus" size={16} />
-                  <span>{t("knowledge.createTitle")}</span>
-                </button>
+                <Button
+                  type="primary"
+                  icon={<Icon name="plus" size={16} />}
+                  onClick={() => setCreateOpen(true)}
+                >
+                  {t("knowledge.createTitle")}
+                </Button>
               ) : null}
-            </div>
+            </Space>
           }
         />
         <KnowledgeLibraryCard />

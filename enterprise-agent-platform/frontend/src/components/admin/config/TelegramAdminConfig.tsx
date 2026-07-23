@@ -133,7 +133,7 @@ export function TelegramAdminConfig() {
             </div>
           </div>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.telegram.botUsername")}
             htmlFor={fieldId("bot-username")}
           >
@@ -145,7 +145,7 @@ export function TelegramAdminConfig() {
             />
           </Form.Item>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.telegram.botToken")}
             htmlFor={fieldId("bot-token")}
           >
@@ -158,7 +158,7 @@ export function TelegramAdminConfig() {
             />
           </Form.Item>
           <Form.Item
-            className="field field--full"
+            className="eap-field field--full"
             label={t("admin.telegram.webhookSecret")}
             htmlFor={fieldId("webhook-secret")}
           >

@@ -1,9 +1,9 @@
 /* <PrivateTelegramTrigger/> — the topbar Telegram action shown only on the
    private view (legacy renderPrivateTelegramAction, legacy-app.js:538-559).
-   Toggles privateTelegramExpanded; .is-active when expanded, .is-linked (green
-   dot via CSS) when a Telegram user is bound. aria-controls ties to the popover
-   id the private-agent spec (Phase 4a) renders. */
+   Toggles privateTelegramExpanded; the active button and Ant badge communicate
+   expanded and linked state. aria-controls ties to the link dialog. */
 
+import { Badge, Button, Tooltip } from "antd";
 import { cx } from "../../lib/cx";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
@@ -25,18 +25,20 @@ export function PrivateTelegramTrigger() {
     : t("nav.telegram.disabled");
 
   return (
-    <button
-      className={cx("icon-btn", "private-telegram-trigger", expanded && "is-active", linked && "is-linked")}
-      type="button"
-      title={title}
-      aria-label={t("nav.telegram.settings")}
-      aria-expanded={expanded}
-      aria-controls="private-telegram-popover"
-      onClick={() =>
-        store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: !expanded })
-      }
-    >
-      <Icon name="message" />
-    </button>
+    <Tooltip title={title}>
+      <Badge dot={linked} status="success" offset={[-5, 5]}>
+        <Button
+          className={cx("private-telegram-trigger", expanded && "is-active")}
+          type="text"
+          icon={<Icon name="message" />}
+          aria-label={t("nav.telegram.settings")}
+          aria-expanded={expanded}
+          aria-controls="private-telegram-popover"
+          onClick={() =>
+            store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: !expanded })
+          }
+        />
+      </Badge>
+    </Tooltip>
   );
 }

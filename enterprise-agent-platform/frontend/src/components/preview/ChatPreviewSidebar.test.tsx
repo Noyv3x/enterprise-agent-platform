@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -212,6 +212,21 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.getByRole("complementary", { name: "Live browser preview" })).toBeVisible();
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
     expect(mocks.browserRender).toHaveBeenCalled();
+  });
+
+  it("closes with Escape and restores focus to the preview trigger", async () => {
+    mocks.availability.browserActive = true;
+    const user = userEvent.setup();
+    renderSidebar();
+    const browserButton = screen.getByRole("button", { name: "Open browser preview" });
+
+    await user.click(browserButton);
+    expect(screen.getByRole("complementary", { name: "Live browser preview" })).toBeVisible();
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitFor(() => expect(browserButton).toHaveFocus());
   });
 
   it("keeps scheduled tasks and live previews mutually exclusive", async () => {

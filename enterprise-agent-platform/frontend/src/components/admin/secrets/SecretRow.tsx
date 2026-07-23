@@ -42,7 +42,6 @@ export function SecretRow({ secret }: { secret: Secret }) {
           onChange={(event) => setValue(event.target.value)}
         />
         <Button
-          className="btn--sm"
           htmlType="submit"
           size="small"
           disabled={!value}

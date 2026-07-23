@@ -1,6 +1,6 @@
+import { Skeleton as AntSkeleton } from "antd";
 import type { CSSProperties } from "react";
 import { useI18n } from "../../i18n";
-import { cx } from "../../lib/cx";
 
 export interface SkeletonProps {
   width?: CSSProperties["width"];
@@ -8,13 +8,15 @@ export interface SkeletonProps {
   className?: string;
   label?: string;
 }
+
 export function Skeleton({ width = "100%", height = 14, className, label }: SkeletonProps) {
   const { t } = useI18n();
   return (
-    <span
-      className={cx("skeleton", className)}
-      style={{ width, height }}
-      role="status"
+    <AntSkeleton.Input
+      active
+      block
+      className={className}
+      style={{ width, height, minWidth: 0 }}
       aria-label={label ?? t("common.loading")}
     />
   );

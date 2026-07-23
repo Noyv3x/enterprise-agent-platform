@@ -4,6 +4,7 @@
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
 import type { ReactNode } from "react";
+import { Tag } from "antd";
 
 function formatMessageTime(value: number | null | undefined, locale: string): string {
   if (!value) return "";
@@ -39,8 +40,8 @@ export function MessageMeta({
   return (
     <div className="msg__meta">
       <span className="msg__name">{authorName(message, isUser, t)}</span>
-      {pending ? <span className="msg__pending">{t("chat.message.sending")}</span> : null}
-      {streaming ? <span className="msg__pending">{t("chat.message.generating")}</span> : null}
+      {pending ? <Tag className="msg__pending">{t("chat.message.sending")}</Tag> : null}
+      {streaming ? <Tag className="msg__pending" color="processing">{t("chat.message.generating")}</Tag> : null}
       <span className="msg__time">{formatMessageTime(message.created_at, locale)}</span>
       {action}
     </div>

@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Badge, Button, Tooltip } from "antd";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { AgentPreviewScope } from "../../types";
@@ -7,6 +8,7 @@ import { Spinner } from "../common/Spinner";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 import { TerminalPreviewView } from "./TerminalPreviewView";
 import { usePreviewAvailability } from "./usePreviewAvailability";
+import "./preview.css";
 
 const ScheduledTasksPanel = lazy(() =>
   import("../scheduled-tasks/ScheduledTasksPanel").then((module) => ({
@@ -190,76 +192,92 @@ export function ChatPreviewSidebar({
       {hasPreviews ? (
         <nav className="chat-preview__rail" aria-label={t("preview.sidebarLabel")}>
           {memoryActive ? (
-            <button
-              ref={memoryButton}
-              className={cx("chat-preview__toggle", visiblePreview === "memory" && "is-active")}
-              type="button"
-              aria-label={t("memory.open")}
-              aria-controls="chat-side-panel"
-              aria-expanded={visiblePreview === "memory"}
-              title={t("memory.open")}
-              onClick={() => setOpenPreview((current) => current === "memory" ? null : "memory")}
-            >
-              <Icon name="library" size={19} />
-            </button>
+            <Tooltip title={t("memory.open")} placement="left">
+              <Button
+                ref={memoryButton}
+                className={cx("chat-preview__toggle", visiblePreview === "memory" && "is-active")}
+                type="text"
+                shape="circle"
+                aria-label={t("memory.open")}
+                aria-controls="chat-side-panel"
+                aria-expanded={visiblePreview === "memory"}
+                icon={<Icon name="library" size={19} />}
+                onClick={() => setOpenPreview((current) => current === "memory" ? null : "memory")}
+              />
+            </Tooltip>
           ) : null}
           {skillsActive ? (
-            <button
-              ref={skillsButton}
-              className={cx("chat-preview__toggle", visiblePreview === "skills" && "is-active")}
-              type="button"
-              aria-label={t("skills.open")}
-              aria-controls="chat-side-panel"
-              aria-expanded={visiblePreview === "skills"}
-              title={t("skills.open")}
-              onClick={() => setOpenPreview((current) => current === "skills" ? null : "skills")}
-            >
-              <Icon name="sparkles" size={19} />
-            </button>
+            <Tooltip title={t("skills.open")} placement="left">
+              <Button
+                ref={skillsButton}
+                className={cx("chat-preview__toggle", visiblePreview === "skills" && "is-active")}
+                type="text"
+                shape="circle"
+                aria-label={t("skills.open")}
+                aria-controls="chat-side-panel"
+                aria-expanded={visiblePreview === "skills"}
+                icon={<Icon name="sparkles" size={19} />}
+                onClick={() => setOpenPreview((current) => current === "skills" ? null : "skills")}
+              />
+            </Tooltip>
           ) : null}
           {tasksActive ? (
-            <button
-              ref={tasksButton}
-              className={cx("chat-preview__toggle", visiblePreview === "tasks" && "is-active")}
-              type="button"
-              aria-label={t("scheduledTasks.open")}
-              aria-controls="chat-side-panel"
-              aria-expanded={visiblePreview === "tasks"}
-              title={t("scheduledTasks.open")}
-              onClick={() => setOpenPreview((current) => current === "tasks" ? null : "tasks")}
-            >
-              <Icon name="calendar" size={19} />
-            </button>
+            <Tooltip title={t("scheduledTasks.open")} placement="left">
+              <Button
+                ref={tasksButton}
+                className={cx("chat-preview__toggle", visiblePreview === "tasks" && "is-active")}
+                type="text"
+                shape="circle"
+                aria-label={t("scheduledTasks.open")}
+                aria-controls="chat-side-panel"
+                aria-expanded={visiblePreview === "tasks"}
+                icon={<Icon name="calendar" size={19} />}
+                onClick={() => setOpenPreview((current) => current === "tasks" ? null : "tasks")}
+              />
+            </Tooltip>
           ) : null}
           {browserActive ? (
-            <button
-              ref={browserButton}
-              className={cx("chat-preview__toggle", visiblePreview === "browser" && "is-active")}
-              type="button"
-              aria-label={t("preview.openBrowser")}
-              aria-controls="chat-side-panel"
-              aria-expanded={visiblePreview === "browser"}
-              title={t("preview.openBrowser")}
-              onClick={() => setOpenPreview((current) => current === "browser" ? null : "browser")}
-            >
-              <Icon name="browser" size={19} />
-              <span className="dot dot--pulse" aria-hidden="true" />
-            </button>
+            <Tooltip title={t("preview.openBrowser")} placement="left">
+              <Button
+                ref={browserButton}
+                className={cx("chat-preview__toggle", visiblePreview === "browser" && "is-active")}
+                type="text"
+                shape="circle"
+                aria-label={t("preview.openBrowser")}
+                aria-controls="chat-side-panel"
+                aria-expanded={visiblePreview === "browser"}
+                icon={(
+                  <Badge className="chat-preview__live-badge" classNames={{ indicator: "chat-preview__live-indicator" }} dot>
+                    <Icon name="browser" size={19} />
+                  </Badge>
+                )}
+                onClick={() => setOpenPreview((current) => current === "browser" ? null : "browser")}
+              />
+            </Tooltip>
           ) : null}
           {terminalActive ? (
-            <button
-              ref={terminalButton}
-              className={cx("chat-preview__toggle", visiblePreview === "terminal" && "is-active")}
-              type="button"
-              aria-label={t("preview.openTerminals", { count: terminalCount })}
-              aria-controls="chat-side-panel"
-              aria-expanded={visiblePreview === "terminal"}
-              title={t("preview.openTerminals", { count: terminalCount })}
-              onClick={() => setOpenPreview((current) => current === "terminal" ? null : "terminal")}
-            >
-              <Icon name="terminal" size={19} />
-              <span className="chat-preview__count" aria-hidden="true">{terminalCount}</span>
-            </button>
+            <Tooltip title={t("preview.openTerminals", { count: terminalCount })} placement="left">
+              <Button
+                ref={terminalButton}
+                className={cx("chat-preview__toggle", visiblePreview === "terminal" && "is-active")}
+                type="text"
+                shape="circle"
+                aria-label={t("preview.openTerminals", { count: terminalCount })}
+                aria-controls="chat-side-panel"
+                aria-expanded={visiblePreview === "terminal"}
+                icon={(
+                  <Badge
+                    className="chat-preview__terminal-badge"
+                    classNames={{ indicator: "chat-preview__terminal-indicator" }}
+                    count={terminalCount}
+                    size="small"
+                  >
+                    <Icon name="terminal" size={19} />
+                  </Badge>
+                )}
+                onClick={() => setOpenPreview((current) => current === "terminal" ? null : "terminal")}
+              />
+            </Tooltip>
           ) : null}
         </nav>
       ) : null}
@@ -277,15 +295,16 @@ export function ChatPreviewSidebar({
                 <small>{drawerDescription}</small>
               </span>
             </div>
-            <button
-              className="icon-btn"
-              type="button"
-              aria-label={t("preview.close")}
-              title={t("preview.close")}
-              onClick={closePreview}
-            >
-              <Icon name="close" />
-            </button>
+            <Tooltip title={t("preview.close")}>
+              <Button
+                className="chat-preview__close"
+                type="text"
+                shape="circle"
+                aria-label={t("preview.close")}
+                icon={<Icon name="close" />}
+                onClick={closePreview}
+              />
+            </Tooltip>
           </header>
           <div className="chat-preview__body">{drawer}</div>
         </aside>

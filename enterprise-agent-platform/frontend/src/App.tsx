@@ -9,20 +9,23 @@ import { I18nProvider } from "./i18n";
 import { ThemeProvider } from "./context/ThemeContext";
 import { ToastProvider } from "./context/ToastContext";
 import { StoreProvider } from "./store/StoreProvider";
+import { AntDesignProvider } from "./components/ui/AntDesignProvider";
 
 export default function App() {
   return (
     <I18nProvider>
       <ThemeProvider>
-        <UpdateGate>
-          <ErrorBoundary>
-            <ToastProvider>
-              <StoreProvider>
-                <AppGate />
-              </StoreProvider>
-            </ToastProvider>
-          </ErrorBoundary>
-        </UpdateGate>
+        <AntDesignProvider>
+          <UpdateGate>
+            <ErrorBoundary>
+              <ToastProvider>
+                <StoreProvider>
+                  <AppGate />
+                </StoreProvider>
+              </ToastProvider>
+            </ErrorBoundary>
+          </UpdateGate>
+        </AntDesignProvider>
       </ThemeProvider>
     </I18nProvider>
   );

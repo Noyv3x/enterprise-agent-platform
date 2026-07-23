@@ -1,5 +1,5 @@
 import { useI18n } from "../../i18n";
-import { cx } from "../../lib/cx";
+import { Button, Space } from "antd";
 import { Dialog } from "./Dialog";
 
 export interface ConfirmDialogProps {
@@ -29,23 +29,23 @@ export function ConfirmDialog({
       onClose={onCancel}
       title={title || t("chat.confirm.label")}
       showCloseButton={false}
-      className="modal__panel--confirm"
+      className="eap-confirm-dialog"
       footer={
-        <>
-          <button className="btn" type="button" onClick={onCancel}>
+        <Space>
+          <Button onClick={onCancel}>
             {cancelText ?? t("chat.confirm.cancel")}
-          </button>
-          <button
-            className={cx("btn", danger ? "btn--danger" : "btn--primary")}
-            type="button"
+          </Button>
+          <Button
+            type="primary"
+            danger={danger}
             onClick={onConfirm}
           >
             {confirmText ?? t("chat.confirm.confirm")}
-          </button>
-        </>
+          </Button>
+        </Space>
       }
     >
-      <p className="modal__message">{message}</p>
+      <p className="eap-confirm-dialog__message">{message}</p>
     </Dialog>
   );
 }

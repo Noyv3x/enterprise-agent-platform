@@ -79,6 +79,7 @@ describe("Composer store subscriptions", () => {
         "placeholder",
         `${mode} placeholder`,
       );
+      expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute("type", "submit");
       expect(screen.queryByRole("status")).not.toBeInTheDocument();
     },
   );

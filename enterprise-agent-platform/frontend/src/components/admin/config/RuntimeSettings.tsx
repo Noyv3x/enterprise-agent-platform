@@ -70,7 +70,6 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
       </div>
       <div className="runtime-row__actions">
         <Button
-          className="btn--sm"
           loading={restarting}
           size="small"
           icon={<Icon name="refresh" size={14} />}

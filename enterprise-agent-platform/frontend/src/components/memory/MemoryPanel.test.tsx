@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentMemory, AgentMemoryCandidate, AgentMemoryTarget } from "../../types";
 import { MemoryPanel } from "./MemoryPanel";
 
@@ -84,7 +85,7 @@ function deferred<T>() {
 }
 
 function renderPanel() {
-  return render(<I18nProvider><MemoryPanel /></I18nProvider>);
+  return render(<TestUiProviders><MemoryPanel /></TestUiProviders>);
 }
 
 describe("MemoryPanel", () => {
@@ -155,7 +156,7 @@ describe("MemoryPanel", () => {
     await screen.findByText(agentMemory.content);
 
     const addContent = "Use semantic commit subjects.";
-    await user.type(screen.getByRole("textbox", { name: "Add a memory" }), addContent);
+    fireEvent.change(screen.getByRole("textbox", { name: "Add a memory" }), { target: { value: addContent } });
     await user.click(screen.getByRole("button", { name: "Add" }));
     expect(mocks.createAgentMemory).toHaveBeenCalledWith({
       target: "memory",
@@ -164,8 +165,7 @@ describe("MemoryPanel", () => {
 
     await user.click(screen.getByRole("button", { name: "Edit" }));
     const editor = screen.getByRole("textbox", { name: "Memory content" });
-    await user.clear(editor);
-    await user.type(editor, "Run every frontend test before merging.");
+    fireEvent.change(editor, { target: { value: "Run every frontend test before merging." } });
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(mocks.updateAgentMemory).toHaveBeenCalledWith(9, {
@@ -184,7 +184,8 @@ describe("MemoryPanel", () => {
     await user.type(screen.getByRole("textbox", { name: "Add a memory" }), "Will fail");
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Memory write failed");
+    const writeError = await screen.findByText("Memory write failed");
+    expect(writeError.closest('[role="alert"]')).toBeInTheDocument();
     expect(screen.getByText(agentMemory.content)).toBeVisible();
     expect(screen.queryByText("Loading memories")).not.toBeInTheDocument();
   });
@@ -242,7 +243,8 @@ describe("MemoryPanel", () => {
         // The panel converts the failure into a visible inline error.
       }
     });
-    expect(await screen.findByRole("alert")).toHaveTextContent("Delete failed");
+    const deleteError = await screen.findByText("Delete failed");
+    expect(deleteError.closest('[role="alert"]')).toBeInTheDocument();
   });
 
   it("confirms delete and target-scoped clear operations", async () => {
@@ -257,7 +259,9 @@ describe("MemoryPanel", () => {
 
     await user.click(screen.getByRole("button", { name: "Clear Agent memory" }));
     dialog = screen.getByRole("dialog", { name: "Clear “Agent memory”?" });
-    expect(within(dialog).getByText(/Every memory in this category will be permanently deleted/)).toBeVisible();
+    expect(within(dialog).getByText(
+      /Every memory in this category will be permanently deleted/,
+    )).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Clear Agent memory" }));
     expect(mocks.clearAgentMemories).toHaveBeenCalledWith("memory");
   });

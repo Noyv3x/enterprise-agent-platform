@@ -43,7 +43,6 @@ export function CodexOAuthFlow({ providerId, flow }: CodexOAuthFlowProps) {
       <div className="oauth-code">{flow.user_code}</div>
       <div className="oauth-actions">
         <Button
-          className="btn--sm"
           size="small"
           loading={checking}
           aria-label={t(checking ? "admin.common.checking" : "admin.oauth.checkStatus")}

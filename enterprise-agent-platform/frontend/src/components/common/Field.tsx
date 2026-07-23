@@ -1,14 +1,11 @@
-/* <Field label>{control}</Field> — a labeled control (legacy field(label, control),
-   legacy-app.js:331-333). The <label> wraps the control for implicit a11y
-   association, exactly as the legacy markup. */
-
+import { Form } from "antd";
 import type { ReactNode } from "react";
 
+/** Compact vertical field composition backed by Ant Design Form.Item. */
 export function Field({ label, children }: { label: ReactNode; children: ReactNode }) {
   return (
-    <label className="field">
-      <span>{label}</span>
+    <Form.Item className="eap-field" label={label} layout="vertical" colon={false}>
       {children}
-    </label>
+    </Form.Item>
   );
 }

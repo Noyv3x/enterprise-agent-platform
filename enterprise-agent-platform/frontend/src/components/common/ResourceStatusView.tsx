@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Button } from "antd";
 import { useResourceState } from "../../hooks/useResourceState";
 import { useI18n } from "../../i18n";
 import { InlineAlert } from "./InlineAlert";
@@ -39,7 +40,7 @@ export function ResourceStatusView({
         <InlineAlert
           variant="error"
           title={t("resource.loadFailed")}
-          action={<button className="btn btn--sm" type="button" onClick={onRetry}>{t("resource.retry")}</button>}
+          action={<Button size="small" onClick={onRetry}>{t("resource.retry")}</Button>}
         >
           {resource.error}
         </InlineAlert>

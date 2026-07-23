@@ -132,7 +132,8 @@ describe("MessageList Agent work records", () => {
     };
     const view = renderMessageList(initialStatus);
 
-    expect(view.container.querySelector(".agent-work")).toHaveAttribute("open");
+    expect(view.container.querySelector(".agent-work [role=button]"))
+      .toHaveAttribute("aria-expanded", "true");
 
     act(() => {
       view.store.dispatch({
@@ -155,7 +156,8 @@ describe("MessageList Agent work records", () => {
 
     const workRecord = view.container.querySelector(".agent-work");
     const finalAnswer = screen.getByText("Final answer has started");
-    expect(workRecord).not.toHaveAttribute("open");
+    expect(workRecord?.querySelector("[role=button]"))
+      .toHaveAttribute("aria-expanded", "false");
     expect(
       workRecord!.compareDocumentPosition(finalAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -184,7 +186,8 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(screen.getByText("I will look that up first.")).toBeVisible();
-    expect(view.container.querySelector(".agent-work")).toHaveAttribute("open");
+    expect(view.container.querySelector(".agent-work [role=button]"))
+      .toHaveAttribute("aria-expanded", "true");
   });
 
   it("does not collapse work for a whitespace-only live buffer", () => {
@@ -207,7 +210,8 @@ describe("MessageList Agent work records", () => {
       ],
     });
 
-    expect(view.container.querySelector(".agent-work")).toHaveAttribute("open");
+    expect(view.container.querySelector(".agent-work [role=button]"))
+      .toHaveAttribute("aria-expanded", "true");
   });
 
   it("keeps a completed work record above its persisted final response", () => {

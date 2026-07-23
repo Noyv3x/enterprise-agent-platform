@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Badge, Button, Tabs, Tag } from "antd";
 import { useI18n, intlLocale } from "../../i18n";
-import { cx } from "../../lib/cx";
 import type { AgentPreviewScope, TerminalPreviewProcess } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
@@ -79,103 +79,88 @@ export function TerminalPreviewView({ scope }: { scope: AgentPreviewScope }) {
   };
   const capturedAt = previewTime(process?.updated_at || state.capturedAt || state.checkedAt, intlLocale(locale));
   const idle = !state.loading && runningProcesses.length === 0;
-  const selectedIndex = process ? Math.max(0, runningProcesses.indexOf(process)) : 0;
-
-  const moveTabFocus = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    const tabs = Array.from(
-      event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') || [],
-    );
-    const currentIndex = tabs.indexOf(event.currentTarget);
-    let nextIndex: number | null = null;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-      nextIndex = (currentIndex + 1) % tabs.length;
-    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
-    } else if (event.key === "Home") {
-      nextIndex = 0;
-    } else if (event.key === "End") {
-      nextIndex = tabs.length - 1;
-    }
-    if (nextIndex == null || !tabs[nextIndex]) return;
-    event.preventDefault();
-    tabs[nextIndex].focus();
-    tabs[nextIndex].click();
-  };
+  const terminalPanel = process ? (
+    <article
+      className="terminal-preview__terminal"
+      aria-label={terminalTitle(
+        process,
+        t("terminalPreview.terminal", { number: Math.max(1, runningProcesses.indexOf(process) + 1) }),
+      )}
+    >
+      <header className="terminal-preview__head">
+        <div>
+          <strong>{terminalTitle(
+            process,
+            t("terminalPreview.terminal", { number: Math.max(1, runningProcesses.indexOf(process) + 1) }),
+          )}</strong>
+          <span className="terminal-preview__state is-running">{t("terminalPreview.running")}</span>
+        </div>
+        {process.truncated ? <Tag color="warning">{t("terminalPreview.truncated")}</Tag> : null}
+      </header>
+      {process.cwd || process.command ? (
+        <dl className="terminal-preview__facts">
+          {process.cwd ? <><dt>{t("terminalPreview.cwd")}</dt><dd>{process.cwd}</dd></> : null}
+          {process.command ? <><dt>{t("terminalPreview.command")}</dt><dd>{process.command}</dd></> : null}
+        </dl>
+      ) : null}
+      <pre
+        ref={terminalRef}
+        className="terminal-preview__output"
+        aria-label={t("terminalPreview.output")}
+        tabIndex={0}
+        onScroll={(event) => {
+          const target = event.currentTarget;
+          followOutput.current = target.scrollHeight - target.scrollTop - target.clientHeight < 32;
+        }}
+      >{output || t("terminalPreview.emptyOutput")}</pre>
+    </article>
+  ) : null;
 
   return (
     <section className="terminal-preview" aria-label={t("terminalPreview.title")}>
       <header className="preview-toolbar">
         <div className="preview-toolbar__status">
           <PreviewStatus connection={state.connection} idle={idle} />
-          <span className="status"><Icon name="shield" size={12} />{t("preview.readOnly")}</span>
+          <Tag className="preview-readonly" icon={<Icon name="shield" size={12} />}>
+            {t("preview.readOnly")}
+          </Tag>
           <span className="preview-updated">{t("terminalPreview.count", { count: runningProcesses.length })}</span>
           {capturedAt ? <span className="preview-updated">{t("preview.updatedAt", { time: capturedAt })}</span> : null}
         </div>
-        <button className="btn btn--sm" type="button" onClick={refresh}>
-          <Icon name="refresh" size={14} />
+        <Button className="preview-toolbar__action" size="small" icon={<Icon name="refresh" size={14} />} onClick={refresh}>
           <span>{t("preview.refresh")}</span>
-        </button>
+        </Button>
       </header>
       {state.error ? (
         <InlineAlert variant="warning">{state.error || t("preview.loadFailed")}</InlineAlert>
       ) : null}
       {process ? (
         <div className="terminal-preview__workspace">
-          <div className="terminal-preview__tabs" role="tablist" aria-label={t("terminalPreview.title")}>
-            {runningProcesses.map((item, index) => {
-              const active = item.id === process.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  role="tab"
-                  id={`terminal-preview-tab-${index}`}
-                  aria-controls="terminal-preview-panel"
-                  aria-selected={active}
-                  tabIndex={active ? 0 : -1}
-                  className={cx("terminal-preview__tab", active && "is-active")}
-                  onClick={() => selectProcess(item.id)}
-                  onKeyDown={moveTabFocus}
-                >
-                  <span className="dot dot--pulse" />
+          <Tabs
+            className="terminal-preview__tabs"
+            classNames={{
+              header: "terminal-preview__tabs-header",
+              item: "terminal-preview__tabs-item",
+              indicator: "terminal-preview__tabs-indicator",
+              body: "terminal-preview__tabs-body",
+              content: "terminal-preview__tabs-content",
+            }}
+            activeKey={process.id}
+            animated={false}
+            tabBarGutter={3}
+            aria-label={t("terminalPreview.title")}
+            onChange={selectProcess}
+            items={runningProcesses.map((item, index) => ({
+              key: item.id,
+              label: (
+                <span className="terminal-preview__tab-label">
+                  <Badge color="hsl(145 46% 62%)" />
                   <span>{terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 }))}</span>
-                </button>
-              );
-            })}
-          </div>
-          <article
-            className="terminal-preview__terminal"
-            id="terminal-preview-panel"
-            role="tabpanel"
-            aria-labelledby={`terminal-preview-tab-${selectedIndex}`}
-          >
-            <header className="terminal-preview__head">
-              <div>
-                <strong>{terminalTitle(
-                  process,
-                  t("terminalPreview.terminal", { number: Math.max(1, runningProcesses.indexOf(process) + 1) }),
-                )}</strong>
-                <span className="terminal-preview__state is-running">{t("terminalPreview.running")}</span>
-              </div>
-              {process.truncated ? <span className="status status--warn">{t("terminalPreview.truncated")}</span> : null}
-            </header>
-            {process.cwd || process.command ? (
-              <dl className="terminal-preview__facts">
-                {process.cwd ? <><dt>{t("terminalPreview.cwd")}</dt><dd>{process.cwd}</dd></> : null}
-                {process.command ? <><dt>{t("terminalPreview.command")}</dt><dd>{process.command}</dd></> : null}
-              </dl>
-            ) : null}
-            <pre
-              ref={terminalRef}
-              className="terminal-preview__output"
-              aria-label={t("terminalPreview.output")}
-              tabIndex={0}
-              onScroll={(event) => {
-                const target = event.currentTarget;
-                followOutput.current = target.scrollHeight - target.scrollTop - target.clientHeight < 32;
-              }}
-            >{output || t("terminalPreview.emptyOutput")}</pre>
-          </article>
+                </span>
+              ),
+              children: item.id === process.id ? terminalPanel : null,
+            }))}
+          />
         </div>
       ) : (
         <div className="preview-empty-card preview-empty-card--terminal">

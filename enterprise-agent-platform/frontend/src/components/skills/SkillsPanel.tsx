@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { Button, Card, Form, Input, Space, Switch, Tag, Typography } from "antd";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "../../context/ToastContext";
 import {
   createAgentSkill,
@@ -19,6 +20,9 @@ import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
 import { InlineAlert } from "../common/InlineAlert";
 import { Spinner } from "../common/Spinner";
+import "./skills.css";
+
+const { TextArea } = Input;
 
 interface SkillDraft {
   name: string;
@@ -110,7 +114,7 @@ interface SkillCardProps {
   canManage: boolean;
   locale: string;
   onToggle: () => void;
-  onEdit: (trigger: HTMLButtonElement) => void;
+  onEdit: (trigger: HTMLElement) => void;
   onDelete: () => void;
 }
 
@@ -131,84 +135,85 @@ function SkillCard({
 
   return (
     <article className={cx("skill-card", !skill.enabled && "is-disabled")}>
-      <header className="skill-card__head">
-        <div className="skill-card__identity">
-          <span className="skill-card__icon"><Icon name="sparkles" size={15} /></span>
-          <div>
-            <h3>{skill.name}</h3>
-            <div className="skill-card__states">
-              <span className={cx("skill-card__state", skill.enabled ? "is-enabled" : "is-disabled")}>
-                {t(skill.enabled ? "skills.enabled" : "skills.disabled")}
-              </span>
-              {readOnly ? <span className="skill-card__state is-preset">{t("skills.preset")}</span> : null}
+      <Card className="skill-card__surface" classNames={{ body: "skill-card__body" }} size="small">
+        <header className="skill-card__head">
+          <div className="skill-card__identity">
+            <span className="skill-card__icon"><Icon name="sparkles" size={15} /></span>
+            <div>
+              <Typography.Title level={3}>{skill.name}</Typography.Title>
+              <Space className="skill-card__states" size={5} wrap>
+                <Tag color={skill.enabled ? "success" : "default"}>
+                  {t(skill.enabled ? "skills.enabled" : "skills.disabled")}
+                </Tag>
+                {readOnly ? <Tag color="blue">{t("skills.preset")}</Tag> : null}
+              </Space>
             </div>
           </div>
-        </div>
-        {canManage && !readOnly ? (
-          <button
-            className={cx("skill-switch", skill.enabled && "is-on")}
-            type="button"
-            role="switch"
-            aria-checked={skill.enabled}
-            aria-label={`${toggleLabel} ${skill.name}`}
-            title={`${toggleLabel} ${skill.name}`}
-            disabled={busy}
-            onClick={onToggle}
-          >
-            <span />
-          </button>
+          {canManage && !readOnly ? (
+            <Switch
+              checked={skill.enabled}
+              aria-label={`${toggleLabel} ${skill.name}`}
+              title={`${toggleLabel} ${skill.name}`}
+              disabled={busy}
+              loading={busy}
+              onChange={onToggle}
+            />
+          ) : null}
+        </header>
+
+        <Typography.Paragraph className="skill-card__description">{skill.description}</Typography.Paragraph>
+
+        {(skill.category || skill.version) ? (
+          <Space className="skill-card__meta" size={5} wrap>
+            {skill.category ? <Tag>{skill.category}</Tag> : null}
+            {skill.version ? <Tag>v{skill.version}</Tag> : null}
+          </Space>
         ) : null}
-      </header>
 
-      <p className="skill-card__description">{skill.description}</p>
+        {(skill.tags || []).length ? (
+          <Space className="skill-card__tags" size={5} wrap aria-label={t("skills.form.tags")}>
+            {(skill.tags || []).map((tag) => <Tag key={tag}>{tag}</Tag>)}
+          </Space>
+        ) : null}
 
-      {(skill.category || skill.version) ? (
-        <div className="skill-card__meta">
-          {skill.category ? <span>{skill.category}</span> : null}
-          {skill.version ? <span>v{skill.version}</span> : null}
-        </div>
-      ) : null}
-
-      {(skill.tags || []).length ? (
-        <ul className="skill-card__tags" aria-label={t("skills.form.tags")}>
-          {(skill.tags || []).map((tag) => <li key={tag}>{tag}</li>)}
-        </ul>
-      ) : null}
-
-      <footer className="skill-card__footer">
-        <div>
-          <span>{t("skills.attachments", { count: linkedFileCount })}</span>
-          {updated ? <span>{t("skills.updatedAt", { time: updated })}</span> : null}
-        </div>
-        {readOnly ? (
-          <div className="skill-card__actions">
-            <button
-              className="btn btn--sm"
-              type="button"
+        <footer className="skill-card__footer">
+          <div>
+            <Typography.Text type="secondary">{t("skills.attachments", { count: linkedFileCount })}</Typography.Text>
+            {updated ? <Typography.Text type="secondary">{t("skills.updatedAt", { time: updated })}</Typography.Text> : null}
+          </div>
+          {readOnly ? (
+            <Space className="skill-card__actions">
+              <Button
+                size="small"
               aria-label={t("skills.viewNamed", { name: skill.name })}
               disabled={busy}
               onClick={(event) => onEdit(event.currentTarget)}
             >
               {t("skills.view")}
-            </button>
-          </div>
-        ) : canManage ? (
-          <div className="skill-card__actions">
-            <button
-              className="btn btn--sm"
-              type="button"
-              disabled={busy}
-              onClick={(event) => onEdit(event.currentTarget)}
-            >
-              {t("skills.edit")}
-            </button>
-            <button className="btn btn--sm btn--danger" type="button" disabled={busy} onClick={onDelete}>
-              <Icon name="trash" size={13} />
-              {t("skills.delete")}
-            </button>
-          </div>
-        ) : null}
-      </footer>
+              </Button>
+            </Space>
+          ) : canManage ? (
+            <Space className="skill-card__actions" wrap>
+              <Button
+                size="small"
+                disabled={busy}
+                onClick={(event) => onEdit(event.currentTarget)}
+              >
+                {t("skills.edit")}
+              </Button>
+              <Button
+                size="small"
+                danger
+                icon={<Icon name="trash" size={13} />}
+                disabled={busy}
+                onClick={onDelete}
+              >
+                {t("skills.delete")}
+              </Button>
+            </Space>
+          ) : null}
+        </footer>
+      </Card>
     </article>
   );
 }
@@ -224,7 +229,7 @@ function SkillEditorForm({
   busy: boolean;
   onChange: (next: SkillDraft) => void;
   onCancel: () => void;
-  onSubmit: (event: FormEvent) => void;
+  onSubmit: () => void;
 }) {
   const { t } = useI18n();
   const { draft } = editor;
@@ -249,7 +254,7 @@ function SkillEditorForm({
   }, [editor, readOnly]);
 
   return (
-    <form className="skill-editor" onSubmit={onSubmit}>
+    <Form className="skill-editor" layout="vertical" onFinish={onSubmit}>
       <header className="skill-editor__head">
         <div>
           <span className="skill-editor__icon"><Icon name="sparkles" size={16} /></span>
@@ -261,24 +266,23 @@ function SkillEditorForm({
                 : "skills.editTitle",
           )}</h3>
         </div>
-        <button
-          className="icon-btn"
-          type="button"
+        <Button
+          type="text"
+          shape="circle"
           aria-label={t(readOnly ? "skills.close" : "skills.cancel")}
           title={t(readOnly ? "skills.close" : "skills.cancel")}
           disabled={busy}
           onClick={onCancel}
+          icon={<Icon name="close" size={15} />}
         >
-          <Icon name="close" size={15} />
-        </button>
+        </Button>
       </header>
 
       <div className="skill-editor__grid">
-        <label>
-          <span>{t("skills.form.name")}</span>
-          <input
+        <Form.Item label={t("skills.form.name")} required>
+          <Input
+            aria-label={t("skills.form.name")}
             autoFocus={!readOnly}
-            required
             value={draft.name}
             maxLength={64}
             disabled={busy}
@@ -286,10 +290,10 @@ function SkillEditorForm({
             placeholder={t("skills.form.namePlaceholder")}
             onChange={(event) => update("name", event.target.value)}
           />
-        </label>
-        <label>
-          <span>{t("skills.form.category")}</span>
-          <input
+        </Form.Item>
+        <Form.Item label={t("skills.form.category")}>
+          <Input
+            aria-label={t("skills.form.category")}
             value={draft.category}
             maxLength={64}
             disabled={busy}
@@ -297,10 +301,10 @@ function SkillEditorForm({
             placeholder={t("skills.form.categoryPlaceholder")}
             onChange={(event) => update("category", event.target.value)}
           />
-        </label>
-        <label>
-          <span>{t("skills.form.version")}</span>
-          <input
+        </Form.Item>
+        <Form.Item label={t("skills.form.version")}>
+          <Input
+            aria-label={t("skills.form.version")}
             value={draft.version}
             maxLength={32}
             disabled={busy}
@@ -308,11 +312,10 @@ function SkillEditorForm({
             placeholder={t("skills.form.versionPlaceholder")}
             onChange={(event) => update("version", event.target.value)}
           />
-        </label>
-        <label className="skill-editor__wide">
-          <span>{t("skills.form.description")}</span>
-          <input
-            required
+        </Form.Item>
+        <Form.Item className="skill-editor__wide" label={t("skills.form.description")} required>
+          <Input
+            aria-label={t("skills.form.description")}
             value={draft.description}
             maxLength={1024}
             disabled={busy}
@@ -320,10 +323,14 @@ function SkillEditorForm({
             placeholder={t("skills.form.descriptionPlaceholder")}
             onChange={(event) => update("description", event.target.value)}
           />
-        </label>
-        <label className="skill-editor__wide">
-          <span>{t("skills.form.tags")}</span>
-          <input
+        </Form.Item>
+        <Form.Item
+          className="skill-editor__wide"
+          label={t("skills.form.tags")}
+          extra={t("skills.form.tagsHint")}
+        >
+          <Input
+            aria-label={t("skills.form.tags")}
             value={draft.tags}
             maxLength={1320}
             disabled={busy}
@@ -331,13 +338,16 @@ function SkillEditorForm({
             placeholder={t("skills.form.tagsPlaceholder")}
             onChange={(event) => update("tags", event.target.value)}
           />
-          <small>{t("skills.form.tagsHint")}</small>
-        </label>
-        <label className="skill-editor__wide">
-          <span>{t("skills.form.instructions")}</span>
-          <textarea
+        </Form.Item>
+        <Form.Item
+          className="skill-editor__wide"
+          label={t("skills.form.instructions")}
+          required
+          extra={t("skills.form.instructionsHint")}
+        >
+          <TextArea
             className="skill-editor__instructions"
-            required
+            aria-label={t("skills.form.instructions")}
             value={draft.instructions}
             maxLength={65_536}
             spellCheck
@@ -345,9 +355,9 @@ function SkillEditorForm({
             readOnly={readOnly}
             placeholder={t("skills.form.instructionsPlaceholder")}
             onChange={(event) => update("instructions", event.target.value)}
+            autoSize={{ minRows: 10, maxRows: 22 }}
           />
-          <small>{t("skills.form.instructionsHint")}</small>
-        </label>
+        </Form.Item>
       </div>
 
       {editor.linkedFileCount > 0 ? (
@@ -364,33 +374,27 @@ function SkillEditorForm({
         <InlineAlert variant="info">{t("skills.presetHint")}</InlineAlert>
       ) : readOnly ? null : (
         <label className="skill-editor__enabled">
-          <button
-            className={cx("skill-switch", draft.enabled && "is-on")}
-            type="button"
-            role="switch"
-            aria-checked={draft.enabled}
+          <Switch
+            checked={draft.enabled}
             aria-label={t("skills.form.enabled")}
             disabled={busy}
-            onClick={() => update("enabled", !draft.enabled)}
-          >
-            <span />
-          </button>
+            onChange={(checked) => update("enabled", checked)}
+          />
           <span>{t("skills.form.enabled")}</span>
         </label>
       )}
 
       <footer className="skill-editor__actions">
-        <button className="btn" type="button" disabled={busy} onClick={onCancel}>
+        <Button disabled={busy} onClick={onCancel}>
           {t(readOnly ? "skills.close" : "skills.cancel")}
-        </button>
+        </Button>
         {!readOnly ? (
-          <button className="btn btn--primary" type="submit" disabled={busy || !requiredReady}>
-            {busy ? <Spinner size={14} /> : null}
+          <Button type="primary" htmlType="submit" loading={busy} disabled={!requiredReady}>
             {t("skills.save")}
-          </button>
+          </Button>
         ) : null}
       </footer>
-    </form>
+    </Form>
   );
 }
 
@@ -417,7 +421,7 @@ export function SkillsPanel({
   const detailRequestVersion = useRef(0);
   const busyRef = useRef(false);
   const canManageRef = useRef(canManage);
-  const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const detailTriggerRef = useRef<HTMLElement | null>(null);
   const scopeRef = useRef(scope);
   const queryRef = useRef(query);
   const scopeKey = `${scope.scope_type}:${scope.scope_id}`;
@@ -560,7 +564,7 @@ export function SkillsPanel({
     setMutationError("");
   };
 
-  const openEdit = async (skill: AgentSkill, trigger: HTMLButtonElement) => {
+  const openEdit = async (skill: AgentSkill, trigger: HTMLElement) => {
     const listReadOnly = skill.read_only === true || skill.source === "bundled";
     if ((!canManageRef.current && !listReadOnly) || busyRef.current) return;
     detailTriggerRef.current = trigger;
@@ -614,8 +618,7 @@ export function SkillsPanel({
     }
   };
 
-  const saveEditor = async (event: FormEvent) => {
-    event.preventDefault();
+  const saveEditor = async () => {
     if (!canManage || !editor || editor.mode === "view") return;
     const payload = payloadFromDraft(editor.draft);
     if (!payload.name || !payload.description || !payload.instructions) {
@@ -677,50 +680,43 @@ export function SkillsPanel({
       </InlineAlert>
 
       <div className="skills-toolbar">
-        <form
+        <Form
           className="skills-search"
           role="search"
           aria-label={t("skills.searchLabel")}
-          onSubmit={(event) => {
-            event.preventDefault();
+          onFinish={() => {
             const nextQuery = queryDraft.trim();
             queryRef.current = nextQuery;
             setQuery(nextQuery);
           }}
         >
-          <label>
-            <span className="visually-hidden">{t("skills.searchLabel")}</span>
-            <Icon name="search" size={15} />
-            <input
-              type="search"
-              value={queryDraft}
-              maxLength={4000}
-              placeholder={t("skills.searchPlaceholder")}
-              onChange={(event) => setQueryDraft(event.target.value)}
-            />
-          </label>
+          <Input
+            type="search"
+            aria-label={t("skills.searchLabel")}
+            prefix={<Icon name="search" size={15} />}
+            value={queryDraft}
+            maxLength={4000}
+            placeholder={t("skills.searchPlaceholder")}
+            onChange={(event) => setQueryDraft(event.target.value)}
+          />
           {query ? (
-            <button
-              className="btn btn--sm"
-              type="button"
+            <Button
               aria-label={t("skills.clearSearch")}
               title={t("skills.clearSearch")}
+              icon={<Icon name="close" size={14} />}
               onClick={() => {
                 queryRef.current = "";
                 setQuery("");
                 setQueryDraft("");
               }}
-            >
-              <Icon name="close" size={14} />
-            </button>
+            />
           ) : null}
-          <button className="btn btn--sm" type="submit">{t("skills.search")}</button>
-        </form>
+          <Button htmlType="submit">{t("skills.search")}</Button>
+        </Form>
         {canManage ? (
-          <button className="btn btn--primary" type="button" disabled={!!busyKey} onClick={openCreate}>
-            <Icon name="plus" size={14} />
+          <Button type="primary" disabled={!!busyKey} onClick={openCreate} icon={<Icon name="plus" size={14} />}>
             {t("skills.create")}
-          </button>
+          </Button>
         ) : null}
       </div>
 
@@ -737,7 +733,7 @@ export function SkillsPanel({
             setMutationError("");
             if (trigger?.isConnected) trigger.focus();
           }}
-          onSubmit={(event) => void saveEditor(event)}
+          onSubmit={() => void saveEditor()}
         />
       ) : null}
 
@@ -752,25 +748,24 @@ export function SkillsPanel({
         ) : (
           <span>{t("skills.count", { count: skills.length })}</span>
         )}
-        <button
-          className="btn btn--sm"
-          type="button"
+        <Button
+          size="small"
           disabled={!!busyKey}
           title={t("skills.refresh")}
+          icon={<Icon name="refresh" size={14} />}
           onClick={() => void refreshSkills()}
         >
-          <Icon name="refresh" size={14} />
           {t("skills.refresh")}
-        </button>
+        </Button>
       </div>
 
       {loadError ? (
         <InlineAlert
           variant="error"
           action={(
-            <button className="btn btn--sm" type="button" onClick={() => void refreshSkills()}>
+            <Button size="small" onClick={() => void refreshSkills()}>
               {t("common.retry")}
-            </button>
+            </Button>
           )}
         >
           {loadError || t("skills.loadFailed")}

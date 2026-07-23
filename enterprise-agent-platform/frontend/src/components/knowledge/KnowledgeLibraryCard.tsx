@@ -3,6 +3,7 @@
    the doc-view trigger reference so closing the viewer restores focus to the
    exact "查看正文" button that opened it (the focus handoff on close). */
 
+import { Button, Card } from "antd";
 import { useMemo, useRef, useState } from "react";
 import { clearSearch, loadDocuments, openDocument } from "../../data/knowledgeActions";
 import { resourceKeys, runResourceLoad } from "../../data/resourceState";
@@ -52,57 +53,71 @@ export function KnowledgeLibraryCard() {
 
   return (
     <div className="knowledge-workspace">
-      <section className="card knowledge-browser" aria-label={t("knowledge.library")}>
-        <KnowledgeSearchForm />
-        <div className="knowledge-browser__content">
-          {isSearching ? (
-            <div className="list__note">
-              <span>
-                {t("knowledge.searchResults", {
-                  query: search.query,
-                  count: (results ?? []).length,
-                })}
-              </span>
-              <button className="btn btn--sm" type="button" onClick={() => clearSearch(store)}>
-                <span>{t("knowledge.showAll")}</span>
-              </button>
-            </div>
-          ) : null}
-          <ResourceStatusView
-            resourceKey={resourceKeys.knowledgeList}
-            hasData={documents.length > 0}
-            onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store))}
-          >
-            <DocumentList
-              items={items}
-              isSearching={isSearching}
-              searchQuery={search.query}
-              loading={false}
-              selectedId={requestedId ?? selectedDocument?.id}
-              onView={handleView}
-            />
-          </ResourceStatusView>
-        </div>
-      </section>
-      {!isMobile ? <section className="card knowledge-detail" aria-label={t("knowledge.documentRegion")}>
-        {requestedId ? (
-          <ResourceStatusView
-            resourceKey={resourceKeys.knowledgeDocument(requestedId)}
-            hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
-            onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
-          >
-            {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
-              <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} />
+      <section className="knowledge-browser-region" aria-label={t("knowledge.library")}>
+        <Card
+          className="knowledge-browser"
+          classNames={{ body: "knowledge-browser__body" }}
+          variant="outlined"
+        >
+          <KnowledgeSearchForm />
+          <div className="knowledge-browser__content">
+            {isSearching ? (
+              <div className="list__note">
+                <span>
+                  {t("knowledge.searchResults", {
+                    query: search.query,
+                    count: (results ?? []).length,
+                  })}
+                </span>
+                <Button size="small" onClick={() => clearSearch(store)}>
+                  {t("knowledge.showAll")}
+                </Button>
+              </div>
             ) : null}
-          </ResourceStatusView>
-        ) : (
-          <EmptyState
-            icon="doc"
-            title={t("knowledge.selectDocument")}
-            text={t("knowledge.selectDocumentDetail")}
-          />
-        )}
-      </section> : null}
+            <ResourceStatusView
+              resourceKey={resourceKeys.knowledgeList}
+              hasData={documents.length > 0}
+              onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeList, () => loadDocuments(store))}
+            >
+              <DocumentList
+                items={items}
+                isSearching={isSearching}
+                searchQuery={search.query}
+                loading={false}
+                selectedId={requestedId ?? selectedDocument?.id}
+                onView={handleView}
+              />
+            </ResourceStatusView>
+          </div>
+        </Card>
+      </section>
+      {!isMobile ? (
+        <section className="knowledge-detail-region" aria-label={t("knowledge.documentRegion")}>
+          <Card
+            className="knowledge-detail"
+            classNames={{ body: "knowledge-detail__body" }}
+            variant="outlined"
+          >
+            {requestedId ? (
+              <ResourceStatusView
+                resourceKey={resourceKeys.knowledgeDocument(requestedId)}
+                hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
+                onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
+              >
+                {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
+                  <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} />
+                ) : null}
+              </ResourceStatusView>
+            ) : (
+              <EmptyState
+                icon="doc"
+                title={t("knowledge.selectDocument")}
+                text={t("knowledge.selectDocumentDetail")}
+              />
+            )}
+          </Card>
+        </section>
+      ) : null}
       <Drawer
         open={isMobile && requestedId != null}
         onClose={handleCloseViewer}

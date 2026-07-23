@@ -1,200 +1,223 @@
-.scheduled-tasks {
-  min-width: 0;
+.scheduled-tasks,
+.schedule-list,
+.schedule-history {
   display: grid;
   align-content: start;
   gap: 14px;
+  min-width: 0;
 }
 
 .schedule-panel__toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
   min-height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+}
+
+.schedule-panel__toolbar > .eap-typography:first-child {
+  grid-column: 1 / 3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-panel__toolbar > .eap-typography:first-child + .eap-btn {
+  grid-column: 3;
+}
+
+.schedule-panel__toolbar > .eap-btn + .eap-typography {
+  grid-column: 2;
+  text-align: center;
+}
+
+.schedule-panel__toolbar > .eap-typography:first-child {
   color: var(--muted);
   font-size: 12.5px;
 }
 
-.schedule-panel__toolbar > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .schedule-panel__loading {
-  min-height: 220px;
   display: grid;
   place-content: center;
   justify-items: center;
   gap: 10px;
+  min-height: 220px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-lg);
   color: var(--muted);
   font-size: 13px;
 }
 
-.schedule-list,
-.schedule-history {
-  min-width: 0;
-  display: grid;
-  gap: 12px;
+.schedule-list {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr));
 }
 
-.schedule-card {
+.schedule-card,
+.schedule-card__surface.eap-card {
   min-width: 0;
-  display: grid;
-  gap: 10px;
-  padding: 15px;
-  border: 1px solid var(--line);
+  height: 100%;
+}
+
+.schedule-card__surface.eap-card {
+  border-color: var(--line);
   border-radius: var(--r-lg);
-  background: var(--surface-2);
+  background: var(--surface);
+  box-shadow: none;
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+.schedule-card__surface.eap-card:hover {
+  border-color: var(--accent-line);
   box-shadow: var(--shadow-1);
+  transform: translateY(-1px);
+}
+
+.schedule-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-width: 0;
+  padding: 16px !important;
 }
 
 .schedule-card__head,
-.schedule-card__head > div {
-  min-width: 0;
+.schedule-card__head > div,
+.schedule-card__actions,
+.schedule-run__head {
   display: flex;
   align-items: center;
   gap: 9px;
+  min-width: 0;
 }
 
-.schedule-card__head { justify-content: space-between; }
+.schedule-card__head,
+.schedule-run__head {
+  justify-content: space-between;
+}
 
-.schedule-card__head h3 {
-  min-width: 0;
-  margin: 0;
+.schedule-card__head > div {
+  flex-wrap: wrap;
+}
+
+.schedule-card__head h3.eap-typography {
   overflow: hidden;
+  margin: 0;
   color: var(--ink);
-  font-size: 14.5px;
+  font-size: 15px;
+  line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.schedule-card__id,
-.schedule-run__id {
+.schedule-card__id.eap-tag,
+.schedule-run__id.eap-tag {
   flex: none;
+  margin: 0;
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: 10.5px;
 }
 
-.schedule-status,
-.schedule-run__status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex: none;
+.schedule-status .eap-badge-status-text,
+.schedule-run__status .eap-badge-status-text {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.schedule-status.is-running .eap-badge-status-dot,
+.schedule-run__status.is-running .eap-badge-status-dot {
+  animation: schedule-pulse 1.7s ease-out infinite;
+}
+
+@keyframes schedule-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 36%, transparent); }
+  50% { box-shadow: 0 0 0 4px transparent; }
+}
+
+.schedule-card__prompt.eap-typography {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.schedule-card__facts.eap-descriptions {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.schedule-card__facts .eap-descriptions-view {
+  width: 100%;
+}
+
+.schedule-card__facts .eap-descriptions-row > th,
+.schedule-card__facts .eap-descriptions-row > td {
+  padding-bottom: 2px;
+}
+
+.schedule-card__facts .eap-descriptions-item-label {
   color: var(--muted);
   font-size: 11px;
 }
 
-.schedule-status .dot,
-.schedule-run__status .dot { width: 7px; height: 7px; }
-.schedule-status.is-ok,
-.schedule-run__status.is-ok { color: var(--ok); }
-.schedule-status.is-warn,
-.schedule-run__status.is-warn { color: var(--warn); }
-.schedule-run__status.is-error { color: var(--danger); }
-
-.schedule-card__prompt {
-  display: -webkit-box;
-  margin: 0;
-  overflow: hidden;
-  color: var(--ink);
-  font-size: 13px;
-  line-height: 1.55;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.schedule-card__facts {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 8px;
-  margin: 0;
-}
-
-.schedule-card__facts > div {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-  padding: 8px 9px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-}
-
-.schedule-card__facts dt {
-  color: var(--muted);
-  font-size: 10.5px;
-}
-
-.schedule-card__facts dd {
-  min-width: 0;
-  margin: 0;
-  overflow: hidden;
+.schedule-card__facts .eap-descriptions-item-content {
   color: var(--ink);
   font-size: 12px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .schedule-card__meta {
   min-width: 0;
-  display: grid;
-  gap: 3px;
-  color: var(--muted);
+}
+
+.schedule-card__meta .eap-typography {
   font-size: 11.5px;
   line-height: 1.45;
 }
 
 .schedule-card__actions {
-  display: flex;
-  align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  padding-top: 2px;
+  margin-top: auto;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
 }
 
-.schedule-card__actions .btn { min-width: 0; }
-
 .schedule-runs {
-  min-width: 0;
   display: grid;
   gap: 8px;
+  min-width: 0;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .schedule-run {
-  min-width: 0;
   display: grid;
-  gap: 7px;
-  padding: 11px 12px;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--surface);
 }
 
-.schedule-run__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
 .schedule-run__times {
   display: grid;
   gap: 2px;
-  color: var(--muted);
+  min-width: 0;
+}
+
+.schedule-run__times .eap-typography {
   font-size: 11px;
 }
 
-.schedule-run__error {
+.schedule-run__error.eap-typography {
   margin: 0;
-  padding: 7px 8px;
+  padding: 8px 10px;
   border-radius: var(--r-sm);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
@@ -210,38 +233,18 @@
   padding: 8px;
 }
 
-.schedule-panel__load-more { justify-self: center; }
+.schedule-panel__load-more {
+  justify-self: center;
+}
 
-@container preview-body (max-width: 430px) {
-  .scheduled-tasks {
-    gap: 12px;
-  }
-
-  .schedule-panel__toolbar {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .schedule-card {
-    padding: 12px;
-  }
-
+@container preview-body (max-width: 470px) {
   .schedule-card__head {
     align-items: flex-start;
-    flex-wrap: wrap;
   }
 
-  .schedule-card__head > div {
-    flex: 1 1 180px;
-  }
-
-  .schedule-card__head h3 {
+  .schedule-card__head h3.eap-typography {
     white-space: normal;
     overflow-wrap: anywhere;
-  }
-
-  .schedule-card__facts {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .schedule-card__actions {
@@ -249,13 +252,21 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .schedule-card__actions .btn {
+  .schedule-card__actions .eap-btn {
     width: 100%;
   }
 }
 
 @media (max-width: 520px) {
-  .schedule-card { padding: 12px; }
-  .schedule-card__facts { grid-template-columns: 1fr; }
-  .schedule-card__actions .btn { flex: 1 1 auto; }
+  .schedule-card__body {
+    padding: 13px !important;
+  }
+
+  .schedule-panel__toolbar {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .schedule-card__actions .eap-btn {
+    flex: 1 1 auto;
+  }
 }

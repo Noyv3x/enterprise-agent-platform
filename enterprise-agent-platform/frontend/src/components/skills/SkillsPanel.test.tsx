@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentPreviewScope, AgentSkill } from "../../types";
 import { SkillsPanel } from "./SkillsPanel";
 
@@ -75,9 +76,9 @@ function renderPanel(
   canManage = true,
 ) {
   return render(
-    <I18nProvider>
+    <TestUiProviders>
       <SkillsPanel scope={scope} canManage={canManage} />
-    </I18nProvider>,
+    </TestUiProviders>,
   );
 }
 
@@ -126,20 +127,20 @@ describe("SkillsPanel", () => {
     await screen.findByText(reviewSkill.description);
 
     await user.click(screen.getByRole("button", { name: "New Skill" }));
-    await user.type(screen.getByRole("textbox", { name: "Name" }), "summarize-research");
-    await user.type(
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "summarize-research" } });
+    fireEvent.change(
       screen.getByRole("textbox", { name: "Description" }),
-      "Summarize research with citations.",
+      { target: { value: "Summarize research with citations." } },
     );
-    await user.type(screen.getByRole("textbox", { name: "Category" }), "research");
-    await user.type(screen.getByRole("textbox", { name: "Version" }), "0.1.0");
-    await user.type(
+    fireEvent.change(screen.getByRole("textbox", { name: "Category" }), { target: { value: "research" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Version" }), { target: { value: "0.1.0" } });
+    fireEvent.change(
       screen.getByRole("textbox", { name: /^Tags/ }),
-      "research, citations, research",
+      { target: { value: "research, citations, research" } },
     );
-    await user.type(
+    fireEvent.change(
       screen.getByRole("textbox", { name: /^Markdown instructions/ }),
-      "# Procedure\n\nCollect and verify sources.",
+      { target: { value: "# Procedure\n\nCollect and verify sources." } },
     );
     await user.click(screen.getByRole("button", { name: "Save" }));
 
@@ -258,9 +259,9 @@ describe("SkillsPanel", () => {
     expect(detailSignal!.aborted).toBe(false);
 
     view.rerender(
-      <I18nProvider>
+      <TestUiProviders>
         <SkillsPanel scope={privateScope} canManage={false} />
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     expect(detailSignal!.aborted).toBe(true);
 
@@ -328,7 +329,8 @@ describe("SkillsPanel", () => {
 
     await user.click(screen.getByRole("switch", { name: "Disable review-code" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Skill update failed");
+    const mutationError = await screen.findByText("Skill update failed");
+    expect(mutationError.closest('[role="alert"]')).toBeInTheDocument();
     expect(screen.getByText(reviewSkill.description)).toBeVisible();
   });
 
@@ -360,9 +362,9 @@ describe("SkillsPanel", () => {
 
     const view = renderPanel();
     view.rerender(
-      <I18nProvider>
+      <TestUiProviders>
         <SkillsPanel scope={channelScope} />
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     expect(await screen.findByRole("heading", { name: "channel-skill" })).toBeVisible();

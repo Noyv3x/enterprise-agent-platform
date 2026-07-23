@@ -96,7 +96,6 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
         desc={t("admin.audit.private.userCount", { count: conversations.filter((item) => (item.message_count || 0) > 0).length })}
         extra={
           <Button
-            className="btn--sm"
             size="small"
             icon={<Icon name="refresh" size={14} />}
             disabled={busy}
@@ -109,7 +108,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
       <div className="audit-tools">
         <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteId}>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.audit.exactDelete")}
             htmlFor={fieldId("message-id")}
           >
@@ -134,7 +133,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
         </Form>
         <Form className="audit-tool" layout="vertical" requiredMark={false} onFinish={handleDeleteBefore}>
           <Form.Item
-            className="field"
+            className="eap-field"
             label={t("admin.audit.deleteBeforeLabel")}
             htmlFor={fieldId("before-time")}
           >
@@ -155,7 +154,7 @@ export function PrivateAuditCard({ confirm }: PrivateAuditCardProps) {
           </Button>
         </Form>
         <div className="audit-tool audit-tool--compact">
-          <span className="field">
+          <span className="audit-tool__copy">
             <span>{t("admin.audit.clearAll")}</span>
             <span className="muted">{t("admin.audit.private.clearHint")}</span>
           </span>

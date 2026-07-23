@@ -4,11 +4,11 @@
    shown only for the initial library load (the legacy "知识库为空" flash that
    §7 flags as a migration opportunity); search keeps the prior list visible. */
 
+import { List, Spin } from "antd";
 import type { ReactNode } from "react";
 import { useI18n } from "../../i18n";
 import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
 import { EmptyState } from "../common/EmptyState";
-import { Spinner } from "../common/Spinner";
 import { DocumentCard } from "./DocumentCard";
 
 export interface DocumentListProps {
@@ -32,22 +32,28 @@ export function DocumentList({
   let body: ReactNode;
   if (loading) {
     body = (
-      <div className="empty">
-        <div className="empty__icon">
-          <Spinner size={26} />
-        </div>
+      <div className="knowledge-list__loading" role="status">
+        <Spin size="large" />
         <p>{t("knowledge.loading")}</p>
       </div>
     );
   } else if (items.length) {
-    body = items.map((doc) => (
-      <DocumentCard
-        key={String(doc.id)}
-        doc={doc}
-        selected={selectedId != null && String(selectedId) === String(doc.id)}
-        onView={onView}
+    body = (
+      <List
+        className="knowledge-list"
+        split={false}
+        dataSource={[...items]}
+        renderItem={(doc) => (
+          <List.Item className="knowledge-list__item" key={String(doc.id)}>
+            <DocumentCard
+              doc={doc}
+              selected={selectedId != null && String(selectedId) === String(doc.id)}
+              onView={onView}
+            />
+          </List.Item>
+        )}
       />
-    ));
+    );
   } else if (isSearching) {
     body = (
       <EmptyState
@@ -65,5 +71,5 @@ export function DocumentList({
       />
     );
   }
-  return <div className="list">{body}</div>;
+  return <div className="knowledge-list-region">{body}</div>;
 }

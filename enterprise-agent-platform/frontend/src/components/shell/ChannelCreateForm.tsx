@@ -2,6 +2,7 @@
    (legacy-app.js:471-482). The empty guard trims, but the POST body sends the
    RAW (untrimmed) input value verbatim — preserve this to avoid backend drift. */
 
+import { Button, Form, Input } from "antd";
 import { useState } from "react";
 import { api } from "../../lib/api";
 import { endpoints } from "../../lib/endpoints";
@@ -18,10 +19,9 @@ export function ChannelCreateForm() {
   const [name, setName] = useState("");
 
   return (
-    <form
+    <Form
       className="channel-create"
-      onSubmit={(event) => {
-        event.preventDefault();
+      onFinish={() => {
         if (!name.trim()) return; // guard trims, payload does not
         void runBusy(store, "channel:create", async () => {
           await api(endpoints.createChannel.path(), {
@@ -33,22 +33,22 @@ export function ChannelCreateForm() {
         });
       }}
     >
-      <input
+      <Input
+        name="channel-name"
         placeholder={t("nav.channel.createPlaceholder")}
         aria-label={t("nav.channel.createPlaceholder")}
         value={name}
         disabled={creating}
         onChange={(event) => setName(event.target.value)}
       />
-      <button
-        className="icon-btn channel-create__submit"
-        type="submit"
-        title={t("nav.channel.create")}
+      <Button
+        className="channel-create__submit"
+        htmlType="submit"
+        icon={<Icon name="plus" size={16} />}
+        loading={creating}
         aria-label={t("nav.channel.create")}
         disabled={creating || !name.trim()}
-      >
-        <Icon name="plus" size={16} />
-      </button>
-    </form>
+      />
+    </Form>
   );
 }

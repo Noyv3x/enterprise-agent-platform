@@ -1,3 +1,4 @@
+import { Alert, Button, Card, Form, Input, Space, Tabs, Tag, Typography } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   approveAgentMemoryCandidate,
@@ -20,6 +21,9 @@ import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
 import { InlineAlert } from "../common/InlineAlert";
 import { Spinner } from "../common/Spinner";
+import "./memory.css";
+
+const { TextArea } = Input;
 
 type Confirmation =
   | { kind: "delete"; memory: AgentMemory }
@@ -76,65 +80,75 @@ function MemoryCard({
   const updated = memoryTime(memory.updated_at, locale);
   return (
     <article className={cx("memory-card", editing && "is-editing", memory.blocked && "is-blocked")}>
-      {editing ? (
-        <label className="memory-card__editor">
-          <span>{t("memory.contentLabel")}</span>
-          <textarea
-            autoFocus
-            value={editContent}
-            maxLength={4000}
-            disabled={busy}
-            onChange={(event) => onEditContent(event.target.value)}
+      <Card className="memory-card__surface" classNames={{ body: "memory-card__body" }} size="small">
+        {editing ? (
+          <Form.Item className="memory-card__editor" label={t("memory.contentLabel")}>
+            <TextArea
+              autoFocus
+              aria-label={t("memory.contentLabel")}
+              value={editContent}
+              maxLength={4000}
+              disabled={busy}
+              autoSize={{ minRows: 3, maxRows: 10 }}
+              onChange={(event) => onEditContent(event.target.value)}
+            />
+          </Form.Item>
+        ) : (
+          <Typography.Paragraph className="memory-card__content">{memory.content}</Typography.Paragraph>
+        )}
+        {memory.blocked ? (
+          <Alert
+            className="memory-card__blocked"
+            type="warning"
+            showIcon
+            title={t("memory.blockedTitle")}
+            description={t("memory.blockedMessage")}
           />
-        </label>
-      ) : (
-        <p className="memory-card__content">{memory.content}</p>
-      )}
-      {memory.blocked ? (
-        <div className="memory-card__blocked" role="note">
-          <Icon name="shield" size={13} />
-          <span>
-            <strong>{t("memory.blockedTitle")}</strong>
-            {t("memory.blockedMessage")}
-          </span>
-        </div>
-      ) : null}
-      {(memory.tags || []).length ? (
-        <ul className="memory-card__tags" aria-label={t("memory.tags")}>
-          {(memory.tags || []).map((tag) => <li key={tag}>{tag}</li>)}
-        </ul>
-      ) : null}
-      <footer className="memory-card__footer">
-        <span>{updated ? t("memory.updatedAt", { time: updated }) : `#${memory.id}`}</span>
-        <div className="memory-card__actions">
-          {editing ? (
-            <>
-              <button className="btn btn--sm" type="button" disabled={busy} onClick={onCancelEdit}>
-                {t("memory.cancel")}
-              </button>
-              <button
-                className="btn btn--sm btn--primary"
-                type="button"
-                disabled={busy || !editContent.trim()}
-                onClick={onSave}
-              >
-                {busy ? <Spinner size={13} /> : null}
-                {t("memory.save")}
-              </button>
-            </>
-          ) : (
-            <>
-              <button className="btn btn--sm" type="button" disabled={busy} onClick={onStartEdit}>
-                {t("memory.edit")}
-              </button>
-              <button className="btn btn--sm btn--danger" type="button" disabled={busy} onClick={onDelete}>
-                <Icon name="trash" size={13} />
-                {t("memory.delete")}
-              </button>
-            </>
-          )}
-        </div>
-      </footer>
+        ) : null}
+        {(memory.tags || []).length ? (
+          <Space className="memory-card__tags" wrap aria-label={t("memory.tags")}>
+            {(memory.tags || []).map((tag) => <Tag key={tag}>{tag}</Tag>)}
+          </Space>
+        ) : null}
+        <footer className="memory-card__footer">
+          <Typography.Text type="secondary">
+            {updated ? t("memory.updatedAt", { time: updated }) : `#${memory.id}`}
+          </Typography.Text>
+          <Space className="memory-card__actions" wrap>
+            {editing ? (
+              <>
+                <Button size="small" disabled={busy} onClick={onCancelEdit}>
+                  {t("memory.cancel")}
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={busy}
+                  disabled={!editContent.trim()}
+                  onClick={onSave}
+                >
+                  {t("memory.save")}
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button size="small" disabled={busy} onClick={onStartEdit}>
+                  {t("memory.edit")}
+                </Button>
+                <Button
+                  size="small"
+                  danger
+                  icon={<Icon name="trash" size={13} />}
+                  disabled={busy}
+                  onClick={onDelete}
+                >
+                  {t("memory.delete")}
+                </Button>
+              </>
+            )}
+          </Space>
+        </footer>
+      </Card>
     </article>
   );
 }
@@ -156,23 +170,27 @@ function PendingCandidateCard({
   const created = memoryTime(candidate.created_at, locale);
   return (
     <article className="memory-candidate">
-      <header>
-        <span className="memory-candidate__target">
-          <Icon name={candidate.target === "user" ? "users" : "bot"} size={13} />
-          {targetLabel(candidate.target, t)}
-        </span>
-        {created ? <time>{created}</time> : null}
-      </header>
-      <p>{candidate.content}</p>
-      <footer>
-        <button className="btn btn--sm" type="button" disabled={busy} onClick={onIgnore}>
-          {t("memory.ignore")}
-        </button>
-        <button className="btn btn--sm btn--primary" type="button" disabled={busy} onClick={onApprove}>
-          {busy ? <Spinner size={13} /> : null}
-          {t("memory.approve")}
-        </button>
-      </footer>
+      <Card className="memory-candidate__surface" classNames={{ body: "memory-candidate__body" }} size="small">
+        <header>
+          <Tag
+            className="memory-candidate__target"
+            icon={<Icon name={candidate.target === "user" ? "users" : "bot"} size={13} />}
+            color="blue"
+          >
+            {targetLabel(candidate.target, t)}
+          </Tag>
+          {created ? <Typography.Text type="secondary"><time>{created}</time></Typography.Text> : null}
+        </header>
+        <Typography.Paragraph>{candidate.content}</Typography.Paragraph>
+        <footer>
+          <Button size="small" disabled={busy} onClick={onIgnore}>
+            {t("memory.ignore")}
+          </Button>
+          <Button size="small" type="primary" loading={busy} onClick={onApprove}>
+            {t("memory.approve")}
+          </Button>
+        </footer>
+      </Card>
     </article>
   );
 }
@@ -429,6 +447,159 @@ export function MemoryPanel() {
       ? t("memory.emptyDetail.user")
       : t("memory.emptyDetail.agent");
 
+  const memoryTabPanel = (
+    <div className="memory-tab-panel">
+      <Typography.Paragraph className="memory-target-hint">{activeHint}</Typography.Paragraph>
+
+      <Form
+        className="memory-search"
+        role="search"
+        aria-label={t("memory.searchLabel")}
+        onFinish={() => {
+          const nextQuery = queryDraft.trim();
+          queryRef.current = nextQuery;
+          setQuery(nextQuery);
+        }}
+      >
+        <Input
+          className="memory-search__input"
+          type="search"
+          prefix={<Icon name="search" size={15} />}
+          suffix={query ? (
+            <Button
+              type="text"
+              size="small"
+              shape="circle"
+              aria-label={t("memory.clearSearch")}
+              title={t("memory.clearSearch")}
+              icon={<Icon name="close" size={14} />}
+              onClick={() => {
+                queryRef.current = "";
+                setQuery("");
+                setQueryDraft("");
+              }}
+            />
+          ) : null}
+          value={queryDraft}
+          maxLength={4000}
+          aria-label={t("memory.searchLabel")}
+          placeholder={t("memory.searchPlaceholder")}
+          onChange={(event) => setQueryDraft(event.target.value)}
+        />
+        <Button htmlType="submit">{t("memory.search")}</Button>
+      </Form>
+
+      <Form
+        className="memory-add"
+        layout="vertical"
+        onFinish={() => void addMemory()}
+      >
+        <Form.Item label={t("memory.addTitle")}>
+          <TextArea
+            value={newContent}
+            maxLength={4000}
+            disabled={!!busyKey}
+            autoSize={{ minRows: 3, maxRows: 10 }}
+            aria-label={t("memory.addTitle")}
+            placeholder={t(target === "user" ? "memory.addPlaceholder.user" : "memory.addPlaceholder.agent")}
+            onChange={(event) => setNewContent(event.target.value)}
+          />
+        </Form.Item>
+        <Button
+          type="primary"
+          htmlType="submit"
+          loading={busyKey === "create"}
+          icon={busyKey === "create" ? undefined : <Icon name="plus" size={14} />}
+          disabled={!!busyKey || !newContent.trim()}
+        >
+          {t("memory.add")}
+        </Button>
+      </Form>
+
+      {mutationError ? <InlineAlert variant="error">{mutationError}</InlineAlert> : null}
+
+      <div className="memory-toolbar">
+        <Typography.Text type="secondary">{t("memory.count", { count: memories.length })}</Typography.Text>
+        <Space wrap>
+          <Button
+            size="small"
+            disabled={!!busyKey}
+            title={t("memory.refresh")}
+            icon={<Icon name="refresh" size={14} />}
+            onClick={() => {
+              void refreshMemories();
+              void refreshCandidates();
+            }}
+          >
+            {t("memory.refresh")}
+          </Button>
+          <Button
+            size="small"
+            disabled={!!busyKey}
+            icon={<Icon name="download" size={14} />}
+            onClick={() => void exportMemories()}
+          >
+            {t("memory.export")}
+          </Button>
+          <Button
+            size="small"
+            danger
+            disabled={!!busyKey}
+            icon={<Icon name="trash" size={14} />}
+            onClick={() => setConfirmation({ kind: "clear", target })}
+          >
+            {clearLabel}
+          </Button>
+        </Space>
+      </div>
+
+      {loadError ? (
+        <InlineAlert
+          variant="error"
+          action={<Button size="small" onClick={() => void refreshMemories()}>{t("common.retry")}</Button>}
+        >
+          {loadError || t("memory.loadFailed")}
+        </InlineAlert>
+      ) : loading ? (
+        <div className="memory-loading" role="status">
+          <Spinner size={20} />
+          <span>{t("memory.loading")}</span>
+        </div>
+      ) : memories.length ? (
+        <div className="memory-list">
+          {memories.map((memory) => (
+            <MemoryCard
+              key={memory.id}
+              memory={memory}
+              busy={!!busyKey}
+              editing={editingId === memory.id}
+              editContent={editingId === memory.id ? editContent : ""}
+              locale={intl}
+              onEditContent={setEditContent}
+              onStartEdit={() => {
+                setEditingId(memory.id);
+                setEditContent(memory.content);
+                setMutationError("");
+              }}
+              onCancelEdit={() => {
+                setEditingId(null);
+                setEditContent("");
+              }}
+              onSave={() => void saveMemory(memory)}
+              onDelete={() => setConfirmation({ kind: "delete", memory })}
+            />
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          icon={query ? "search" : target === "user" ? "users" : "bot"}
+          title={emptyTitle}
+          text={emptyDetail}
+        />
+      )}
+    </div>
+  );
+
   return (
     <section className="memory-panel" aria-label={t("memory.title")}>
       <InlineAlert variant="warning" title={t("memory.chatNoticeTitle")}>
@@ -442,16 +613,12 @@ export function MemoryPanel() {
               <h3 id="memory-pending-title">{t("memory.pendingTitle")}</h3>
               <p>{t("memory.pendingDescription")}</p>
             </div>
-            {!candidatesLoading ? <span>{t("memory.pendingCount", { count: candidates.length })}</span> : null}
+            {!candidatesLoading ? <Tag>{t("memory.pendingCount", { count: candidates.length })}</Tag> : null}
           </header>
           {candidatesError ? (
             <InlineAlert
               variant="error"
-              action={(
-                <button className="btn btn--sm" type="button" onClick={() => void refreshCandidates()}>
-                  {t("common.retry")}
-                </button>
-              )}
+              action={<Button size="small" onClick={() => void refreshCandidates()}>{t("common.retry")}</Button>}
             >
               {candidatesError || t("memory.pendingLoadFailed")}
             </InlineAlert>
@@ -477,179 +644,29 @@ export function MemoryPanel() {
         </section>
       ) : null}
 
-      <div className="memory-tabs" role="tablist" aria-label={t("memory.title")}>
-        {(["memory", "user"] as const).map((item) => (
-          <button
-            key={item}
-            id={`memory-tab-${item}`}
-            type="button"
-            role="tab"
-            aria-selected={target === item}
-            aria-controls="memory-tab-panel"
-            className={cx("memory-tab", target === item && "is-active")}
-            onClick={() => switchTarget(item)}
-          >
-            <Icon name={item === "user" ? "users" : "bot"} size={16} />
-            <span>{targetLabel(item, t)}</span>
-          </button>
-        ))}
-      </div>
-
-      <div
-        className="memory-tab-panel"
-        id="memory-tab-panel"
-        role="tabpanel"
-        aria-labelledby={`memory-tab-${target}`}
-      >
-        <p className="memory-target-hint">{activeHint}</p>
-
-        <form
-          className="memory-search"
-          role="search"
-          aria-label={t("memory.searchLabel")}
-          onSubmit={(event) => {
-            event.preventDefault();
-            const nextQuery = queryDraft.trim();
-            queryRef.current = nextQuery;
-            setQuery(nextQuery);
-          }}
-        >
-          <label>
-            <span className="visually-hidden">{t("memory.searchLabel")}</span>
-            <Icon name="search" size={15} />
-            <input
-              type="search"
-              value={queryDraft}
-              maxLength={4000}
-              placeholder={t("memory.searchPlaceholder")}
-              onChange={(event) => setQueryDraft(event.target.value)}
-            />
-          </label>
-          {query ? (
-            <button
-              className="btn btn--sm"
-              type="button"
-              aria-label={t("memory.clearSearch")}
-              title={t("memory.clearSearch")}
-              onClick={() => {
-                queryRef.current = "";
-                setQuery("");
-                setQueryDraft("");
-              }}
-            >
-              <Icon name="close" size={14} />
-            </button>
-          ) : null}
-          <button className="btn btn--sm" type="submit">{t("memory.search")}</button>
-        </form>
-
-        <form
-          className="memory-add"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void addMemory();
-          }}
-        >
-          <label>
-            <span>{t("memory.addTitle")}</span>
-            <textarea
-              value={newContent}
-              maxLength={4000}
-              disabled={!!busyKey}
-              placeholder={t(target === "user" ? "memory.addPlaceholder.user" : "memory.addPlaceholder.agent")}
-              onChange={(event) => setNewContent(event.target.value)}
-            />
-          </label>
-          <button className="btn btn--primary" type="submit" disabled={!!busyKey || !newContent.trim()}>
-            {busyKey === "create" ? <Spinner size={14} /> : <Icon name="plus" size={14} />}
-            {t("memory.add")}
-          </button>
-        </form>
-
-        {mutationError ? <InlineAlert variant="error">{mutationError}</InlineAlert> : null}
-
-        <div className="memory-toolbar">
-          <span>{t("memory.count", { count: memories.length })}</span>
-          <div>
-            <button
-              className="btn btn--sm"
-              type="button"
-              disabled={!!busyKey}
-              title={t("memory.refresh")}
-              onClick={() => {
-                void refreshMemories();
-                void refreshCandidates();
-              }}
-            >
-              <Icon name="refresh" size={14} />
-              <span>{t("memory.refresh")}</span>
-            </button>
-            <button
-              className="btn btn--sm"
-              type="button"
-              disabled={!!busyKey}
-              onClick={() => void exportMemories()}
-            >
-              <Icon name="download" size={14} />
-              <span>{t("memory.export")}</span>
-            </button>
-            <button
-              className="btn btn--sm btn--danger"
-              type="button"
-              disabled={!!busyKey}
-              onClick={() => setConfirmation({ kind: "clear", target })}
-            >
-              <Icon name="trash" size={14} />
-              <span>{clearLabel}</span>
-            </button>
-          </div>
-        </div>
-
-        {loadError ? (
-          <InlineAlert
-            variant="error"
-            action={(
-              <button className="btn btn--sm" type="button" onClick={() => void refreshMemories()}>
-                {t("common.retry")}
-              </button>
-            )}
-          >
-            {loadError || t("memory.loadFailed")}
-          </InlineAlert>
-        ) : loading ? (
-          <div className="memory-loading" role="status">
-            <Spinner size={20} />
-            <span>{t("memory.loading")}</span>
-          </div>
-        ) : memories.length ? (
-          <div className="memory-list">
-            {memories.map((memory) => (
-              <MemoryCard
-                key={memory.id}
-                memory={memory}
-                busy={!!busyKey}
-                editing={editingId === memory.id}
-                editContent={editingId === memory.id ? editContent : ""}
-                locale={intl}
-                onEditContent={setEditContent}
-                onStartEdit={() => {
-                  setEditingId(memory.id);
-                  setEditContent(memory.content);
-                  setMutationError("");
-                }}
-                onCancelEdit={() => {
-                  setEditingId(null);
-                  setEditContent("");
-                }}
-                onSave={() => void saveMemory(memory)}
-                onDelete={() => setConfirmation({ kind: "delete", memory })}
-              />
-            ))}
-          </div>
-        ) : (
-          <EmptyState icon={query ? "search" : target === "user" ? "users" : "bot"} title={emptyTitle} text={emptyDetail} />
-        )}
-      </div>
+      <Tabs
+        className="memory-tabs"
+        classNames={{
+          header: "memory-tabs__header",
+          item: "memory-tabs__item",
+          indicator: "memory-tabs__indicator",
+          body: "memory-tabs__body",
+          content: "memory-tabs__content",
+        }}
+        activeKey={target}
+        destroyOnHidden
+        onChange={(key) => switchTarget(key as AgentMemoryTarget)}
+        items={(["memory", "user"] as const).map((item) => ({
+          key: item,
+          label: (
+            <Space size={7}>
+              <Icon name={item === "user" ? "users" : "bot"} size={16} />
+              {targetLabel(item, t)}
+            </Space>
+          ),
+          children: item === target ? memoryTabPanel : null,
+        }))}
+      />
 
       {confirmation?.kind === "delete" ? (
         <ConfirmDialog

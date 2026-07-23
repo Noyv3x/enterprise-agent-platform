@@ -1,17 +1,13 @@
-/* <LoginView/> — the unauthenticated split login screen (legacy renderLogin,
-   legacy-app.js:367-404). Controlled username/password; submit runs through
-   runBusy(login). Pre-login errors are shown INLINE in the .error[role=alert]
-   box (runBusy only toasts once a user is present), preserving the legacy
-   toast-vs-inline duality. The button shows a spinner + "正在登录…" while busy. */
+/* The established split-screen login treatment is product-owned; Ant Design
+   supplies form controls, validation semantics, loading, and inline feedback. */
 
+import { Alert, Button, Form, Input } from "antd";
 import { useState } from "react";
 import { login, runBusy } from "../../data/sessionActions";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
 import { Brand } from "../common/Brand";
-import { Field } from "../common/Field";
 import { LanguageSelect } from "../common/LanguageSelect";
-import { Spinner } from "../common/Spinner";
 
 export function LoginView() {
   const store = useStoreHandle();
@@ -31,14 +27,17 @@ export function LoginView() {
           <div className="auth__locale"><LanguageSelect /></div>
           <Brand />
           <h1>{t("auth.login")}</h1>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
+          <Form
+            className="auth__form"
+            layout="vertical"
+            requiredMark={false}
+            onFinish={() => {
               void runBusy(store, "auth:login", () => login(store, username, password));
             }}
           >
-            <Field label={t("auth.username")}>
-              <input
+            <Form.Item className="auth__field" label={t("auth.username")} htmlFor="login-username" required>
+              <Input
+                id="login-username"
                 name="username"
                 autoComplete="username"
                 required
@@ -47,12 +46,13 @@ export function LoginView() {
                 aria-describedby={error ? "login-error" : undefined}
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
+                classNames={{ root: "auth-input__root", input: "auth-input__control" }}
               />
-            </Field>
-            <Field label={t("auth.password")}>
-              <input
+            </Form.Item>
+            <Form.Item className="auth__field" label={t("auth.password")} htmlFor="login-password" required>
+              <Input.Password
+                id="login-password"
                 name="password"
-                type="password"
                 autoComplete="current-password"
                 required
                 placeholder={t("auth.password")}
@@ -60,16 +60,24 @@ export function LoginView() {
                 aria-describedby={error ? "login-error" : undefined}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
+                classNames={{ root: "auth-input__root", input: "auth-input__control" }}
               />
-            </Field>
-            <button className="btn btn--primary btn--lg btn--block" type="submit" disabled={busy}>
-              {busy ? <Spinner size={18} /> : null}
-              <span>{busy ? t("auth.loggingIn") : t("auth.login")}</span>
-            </button>
-            <div className="error" id="login-error" role="alert">
-              {error}
-            </div>
-          </form>
+            </Form.Item>
+            <Button
+              className="auth__submit"
+              type="primary"
+              size="large"
+              htmlType="submit"
+              block
+              loading={busy}
+              disabled={busy}
+            >
+              {busy ? t("auth.loggingIn") : t("auth.login")}
+            </Button>
+            {error ? (
+              <Alert className="auth__error" id="login-error" type="error" showIcon title={error} />
+            ) : null}
+          </Form>
         </section>
       </div>
     </main>

@@ -16,7 +16,7 @@ import { AdminPageContent } from "./AdminPageContent";
 import { AdminPageHeader } from "./AdminPageHeader";
 import { AdminPager } from "./AdminPager";
 import { useI18n } from "../../i18n";
-import { AntDesignProvider } from "../ui/AntDesignProvider";
+import "./admin.css";
 
 export function AdminPanel() {
   const { t } = useI18n();
@@ -52,41 +52,39 @@ export function AdminPanel() {
   }
 
   return (
-    <AntDesignProvider>
-      <div className="panel eap-admin-shell">
-        <div className="eap-admin-layout">
-          <AdminPager activeId={page.id} />
-          <section
-            className={cx("eap-admin-page", `eap-admin-page--${page.id}`)}
-            aria-labelledby={`admin-page-${page.id}-title`}
+    <div className="panel eap-admin-shell">
+      <div className="eap-admin-layout">
+        <AdminPager activeId={page.id} />
+        <section
+          className={cx("eap-admin-page", `eap-admin-page--${page.id}`)}
+          aria-labelledby={`admin-page-${page.id}-title`}
+        >
+          <AdminPageHeader
+            page={page}
+            refreshing={resource.status === "loading"}
+            onRefresh={() => void refreshAdminPageResource(store, page.id)}
+            refreshDisabled={mutationPending}
+            onCreateAccount={page.id === "accounts" ? () => setAccountCreateOpen(true) : undefined}
+          />
+          <div
+            className="eap-admin-page__content"
+            inert={resource.status === "loading" && dataPresent}
+            aria-busy={resource.status === "loading" || mutationPending}
           >
-            <AdminPageHeader
-              page={page}
-              refreshing={resource.status === "loading"}
-              onRefresh={() => void refreshAdminPageResource(store, page.id)}
-              refreshDisabled={mutationPending}
-              onCreateAccount={page.id === "accounts" ? () => setAccountCreateOpen(true) : undefined}
-            />
-            <div
-              className="eap-admin-page__content"
-              inert={resource.status === "loading" && dataPresent}
-              aria-busy={resource.status === "loading" || mutationPending}
+            <ResourceStatusView
+              resourceKey={resourceKey}
+              hasData={dataPresent || resource.updatedAt !== null}
+              onRetry={() => void refreshAdminPageResource(store, page.id)}
             >
-              <ResourceStatusView
-                resourceKey={resourceKey}
-                hasData={dataPresent || resource.updatedAt !== null}
-                onRetry={() => void refreshAdminPageResource(store, page.id)}
-              >
-                <AdminPageContent
-                  pageId={page.id}
-                  accountCreateOpen={accountCreateOpen}
-                  onCloseAccountCreate={() => setAccountCreateOpen(false)}
-                />
-              </ResourceStatusView>
-            </div>
-          </section>
-        </div>
+              <AdminPageContent
+                pageId={page.id}
+                accountCreateOpen={accountCreateOpen}
+                onCloseAccountCreate={() => setAccountCreateOpen(false)}
+              />
+            </ResourceStatusView>
+          </div>
+        </section>
       </div>
-    </AntDesignProvider>
+    </div>
   );
 }

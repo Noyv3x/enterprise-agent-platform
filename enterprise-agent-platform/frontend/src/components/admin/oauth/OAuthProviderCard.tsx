@@ -66,21 +66,20 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
         ) : null}
       </div>
       {errorText ? (
-        <Alert className="oauth-error" type="error" showIcon message={errorText} />
+        <Alert className="oauth-error" type="error" showIcon title={errorText} />
       ) : null}
       {provider.model_catalog_error ? (
         <Alert
           className="oauth-error"
           type="error"
           showIcon
-          message={provider.model_catalog_error
+          title={provider.model_catalog_error
             ? t("admin.oauth.catalogError", { error: provider.model_catalog_error })
             : t("admin.oauth.catalogUnavailable")}
         />
       ) : null}
       <div className="oauth-actions">
         <Button
-          className="btn--sm"
           type={provider.configured ? "default" : "primary"}
           size="small"
           loading={verifying}

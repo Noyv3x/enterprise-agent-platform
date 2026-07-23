@@ -1,0 +1,1 @@
+import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{r as t}from"./chunk-format-BnOJ1SAV.js";var n=e();function r({label:e,value:r,suffix:i=``}){return(0,n.jsxs)(`div`,{className:`metric-tile`,children:[(0,n.jsx)(`span`,{children:e}),(0,n.jsx)(`strong`,{children:typeof r==`string`?r:t(r)}),i?(0,n.jsx)(`small`,{children:i}):null]})}export{r as t};

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Button } from "antd";
 import { respondAgentApproval } from "../../data/chatActions";
 import { useI18n, type MessageKey } from "../../i18n";
 import { useStoreHandle } from "../../store/useStore";
@@ -64,16 +65,19 @@ export function AgentApprovalPrompt({
         {command ? <pre className="agent-approval__command">{command}</pre> : null}
         <div className="agent-approval__actions">
           {APPROVAL_ACTIONS.filter((action) => choices.has(action.choice)).map((action) => (
-            <button
-              className={action.primary ? "btn btn--primary btn--sm" : "btn btn--sm"}
+            <Button
+              className="agent-approval__action"
+              type={action.primary ? "primary" : "default"}
+              danger={action.choice === "deny"}
+              size="small"
               disabled={!!submitting}
+              loading={submitting === action.choice}
               key={action.choice}
+              icon={<Icon name={action.icon} size={14} />}
               onClick={() => void submit(action.choice)}
-              type="button"
             >
-              <Icon name={action.icon} size={14} />
               <span>{submitting === action.choice ? t("chat.approval.submitting") : t(action.labelKey)}</span>
-            </button>
+            </Button>
           ))}
         </div>
       </section>

@@ -5,6 +5,7 @@
    eliminates the legacy value-flash quirk (spec §7) while a clear/post-create
    reset still empties the input via the sync effect below. */
 
+import { Button, Form, Input, Tooltip } from "antd";
 import { useEffect, useState } from "react";
 import { clearSearch, searchKnowledge } from "../../data/knowledgeActions";
 import { resourceKeys, runResourceLoad } from "../../data/resourceState";
@@ -31,9 +32,9 @@ export function KnowledgeSearchForm() {
   }, [search.query]);
 
   return (
-    <form
-      onSubmit={(event) => {
-        event.preventDefault();
+    <Form
+      className="knowledge-search"
+      onFinish={() => {
         const query = value.trim();
         if (!query) {
           clearSearch(store);
@@ -42,37 +43,47 @@ export function KnowledgeSearchForm() {
         void runResourceLoad(store, resourceKeys.knowledgeSearch, () => searchKnowledge(store, query));
       }}
     >
-      <div className="search-field search-field--action">
-        <div className="search-field__control">
-          <Icon name="search" />
-          <input
+      <div className="knowledge-search__row">
+        <div className="knowledge-search__control">
+          <Input
+            className="knowledge-search__input"
+            prefix={<Icon name="search" />}
+            suffix={isSearching ? (
+              <Tooltip title={t("knowledge.clearSearch")}>
+                <Button
+                  type="text"
+                  size="small"
+                  shape="circle"
+                  className="knowledge-search__clear"
+                  disabled={resource.status === "loading"}
+                  aria-label={t("knowledge.clearSearchDetail")}
+                  icon={<Icon name="close" size={15} />}
+                  onClick={() => clearSearch(store)}
+                />
+              </Tooltip>
+            ) : null}
             placeholder={t("knowledge.searchPlaceholder")}
             aria-label={t("knowledge.searchLabel")}
             value={value}
             onChange={(event) => setValue(event.target.value)}
           />
-          {isSearching ? (
-            <button
-              className="icon-btn search-field__clear"
-              type="button"
-              disabled={resource.status === "loading"}
-              title={t("knowledge.clearSearch")}
-              aria-label={t("knowledge.clearSearchDetail")}
-              onClick={() => clearSearch(store)}
-            >
-              <Icon name="close" size={15} />
-            </button>
-          ) : null}
         </div>
-        <button className="btn btn--primary btn--sm search-field__submit" type="submit" disabled={!value.trim() || resource.status === "loading"}>
-          <span>{resource.status === "loading" ? t("knowledge.searching") : t("knowledge.search")}</span>
-        </button>
+        <Button
+          className="knowledge-search__submit"
+          type="primary"
+          htmlType="submit"
+          loading={resource.status === "loading"}
+          disabled={resource.status === "loading" || !value.trim()}
+          aria-label={resource.status === "loading" ? t("knowledge.searching") : t("knowledge.search")}
+        >
+          {resource.status === "loading" ? t("knowledge.searching") : t("knowledge.search")}
+        </Button>
       </div>
       {resource.status === "error" ? (
         <InlineAlert variant="error" title={t("resource.loadFailed")}>
           {resource.error}
         </InlineAlert>
       ) : null}
-    </form>
+    </Form>
   );
 }

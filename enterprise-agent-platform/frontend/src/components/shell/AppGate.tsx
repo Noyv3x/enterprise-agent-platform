@@ -1,15 +1,14 @@
 /* <AppGate> — the boot gate. Runs boot() exactly once (a useRef guard makes it
    StrictMode-double-mount safe), registers the api 401 hook → handleSessionExpired,
-   renders <ToastViewport/>, and switches between <LoginView/> and <AppShell/>
-   based on the store user.
+   switches between <LoginView/> and <AppShell/> based on the store user.
 
    The SSE/poll visibility + pagehide lifecycle is NOT here: it lives in the
    useRealtime / usePolling hooks mounted by <AppShell/> (only while a user is
    present), matching the legacy "stop polling/stream when logged out" behavior. */
 
-import { useEffect, useRef, useState } from "react";
+import { Button } from "antd";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { registerSessionExpiredHandler } from "../../lib/api";
-import { ToastViewport } from "../../context/ToastContext";
 import { boot, handleSessionExpired } from "../../data/sessionActions";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
@@ -17,12 +16,53 @@ import { LoginView } from "../auth/LoginView";
 import { Brand } from "../common/Brand";
 import { LanguageSelect } from "../common/LanguageSelect";
 import { Spinner } from "../common/Spinner";
-import { AppShell } from "./AppShell";
+
+const AppShell = lazy(() => import("./AppShell").then((module) => ({ default: module.AppShell })));
+
+function BootScreen({
+  status = "loading",
+  onRetry,
+}: {
+  status?: "loading" | "error";
+  onRetry?: () => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <main className="auth auth--login">
+      <aside className="auth__aside">
+        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
+      </aside>
+      <div className="auth__main">
+        <section
+          className="auth__card boot-status"
+          role={status === "error" ? "alert" : "status"}
+          aria-live="polite"
+        >
+          <div className="auth__locale"><LanguageSelect /></div>
+          <Brand />
+          <h1>{status === "error" ? t("boot.failed") : t("boot.connecting")}</h1>
+          {status === "error" ? (
+            <>
+              <p className="muted">{t("boot.failedDetail")}</p>
+              <Button type="primary" size="large" onClick={onRetry}>
+                {t("common.retry")}
+              </Button>
+            </>
+          ) : (
+            <div className="boot-status__loading">
+              <Spinner size={20} />
+              <span>{t("boot.restoringSession")}</span>
+            </div>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}
 
 export function AppGate() {
   const store = useStoreHandle();
   const user = useStore((state) => state.user);
-  const { t } = useI18n();
   const [attempt, setAttempt] = useState(0);
   const [bootStatus, setBootStatus] = useState<"loading" | "ready" | "error">("loading");
   const bootAttempt = useRef(-1);
@@ -49,52 +89,19 @@ export function AppGate() {
 
   if (bootStatus !== "ready") {
     return (
-      <>
-        <ToastViewport />
-        <main className="auth auth--login">
-          <aside className="auth__aside">
-            <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
-          </aside>
-          <div className="auth__main">
-            <section
-              className="auth__card boot-status"
-              role={bootStatus === "error" ? "alert" : "status"}
-              aria-live="polite"
-            >
-              <div className="auth__locale"><LanguageSelect /></div>
-              <Brand />
-              <h1>{bootStatus === "error" ? t("boot.failed") : t("boot.connecting")}</h1>
-              {bootStatus === "error" ? (
-                <>
-                  <p className="muted">{t("boot.failedDetail")}</p>
-                  <button
-                    className="btn btn--primary btn--lg"
-                    type="button"
-                    onClick={() => {
-                      setBootStatus("loading");
-                      setAttempt((value) => value + 1);
-                    }}
-                  >
-                    {t("common.retry")}
-                  </button>
-                </>
-              ) : (
-                <div className="boot-status__loading">
-                  <Spinner size={20} />
-                  <span>{t("boot.restoringSession")}</span>
-                </div>
-              )}
-            </section>
-          </div>
-        </main>
-      </>
+      <BootScreen
+        status={bootStatus}
+        onRetry={() => {
+          setBootStatus("loading");
+          setAttempt((value) => value + 1);
+        }}
+      />
     );
   }
 
-  return (
-    <>
-      <ToastViewport />
-      {user ? <AppShell /> : <LoginView />}
-    </>
-  );
+  return user ? (
+    <Suspense fallback={<BootScreen />}>
+      <AppShell />
+    </Suspense>
+  ) : <LoginView />;
 }

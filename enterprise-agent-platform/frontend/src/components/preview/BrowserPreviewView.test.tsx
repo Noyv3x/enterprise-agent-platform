@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { BrowserPreviewView } from "./BrowserPreviewView";
@@ -93,5 +94,19 @@ describe("BrowserPreviewView", () => {
     );
     expect(screen.getByText("Refresh failed")).toBeVisible();
     expect(screen.queryByText("Browser is not running")).not.toBeInTheDocument();
+  });
+
+  it("refreshes on demand without making the live frame interactive", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    const user = userEvent.setup();
+    renderPreview();
+
+    await user.click(screen.getByRole("button", { name: "Refresh now" }));
+
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("img", { name: "Latest Agent browser frame" })).toHaveAttribute("draggable", "false");
+    expect(screen.getByText("Read only")).toBeVisible();
   });
 });

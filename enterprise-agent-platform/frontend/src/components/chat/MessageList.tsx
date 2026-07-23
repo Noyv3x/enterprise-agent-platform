@@ -9,6 +9,7 @@
    keystroke never re-renders it. */
 
 import { useRef, type ReactNode } from "react";
+import { Button } from "antd";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
 import { useI18n, type Translator } from "../../i18n";
 import { agentStatusFor, hasPermission, isAgentActive, scopeTypeFor } from "../../store/selectors";
@@ -241,14 +242,14 @@ export function MessageList({
         {body}
       </div>
       {!atBottom ? (
-        <button type="button" className="scroll-latest" onClick={scrollToBottom}>
-          <span aria-hidden="true">↓</span>
-          <span>
+        <Button className="scroll-latest" onClick={scrollToBottom}>
+          <span className="scroll-latest__icon" aria-hidden="true">↓</span>
+          <span className="scroll-latest__label">
             {unreadCount
               ? t("chat.scroll.newMessages", { count: unreadCount })
               : t("chat.scroll.toBottom")}
           </span>
-        </button>
+        </Button>
       ) : null}
     </div>
   );

@@ -62,7 +62,7 @@ describe("KnowledgeSearchForm", () => {
     );
     expect(store.getState().knowledgeSearch).toEqual({ query: "", results: null });
     expect(store.getState().resourceStates["knowledge:search"].status).toBe("loading");
-    expect(screen.getByRole("button", { name: "Searching…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Searching/ })).toBeDisabled();
 
     resolveFetch(response({ results: [{ id: 4, title: "Graph agents" }] }));
     await waitFor(() => {
@@ -75,7 +75,7 @@ describe("KnowledgeSearchForm", () => {
     expect(store.getState().resourceStates["knowledge:search"].status).toBe("ready");
 
     const clear = screen.getByRole("button", { name: "Clear search and show all entries" });
-    const control = input.closest(".search-field__control");
+    const control = input.closest(".knowledge-search__control");
     expect(control).toContainElement(clear);
     expect(control).not.toContainElement(screen.getByRole("button", { name: "Search" }));
 

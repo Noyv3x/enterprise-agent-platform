@@ -3,6 +3,7 @@
    whose id is non-numeric (Cognee graph hits): the by-id route is numeric-only,
    so calling it would 404 — disabling it is the documented improvement (spec §7). */
 
+import { Button, Card } from "antd";
 import { isNumericDocumentId } from "../../data/knowledgeActions";
 import { useI18n } from "../../i18n";
 import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
@@ -21,29 +22,32 @@ export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
   const { t } = useI18n();
   const canView = isNumericDocumentId(doc.id);
   return (
-    <div className="doc-card">
-      <div className="doc-card__title">
+    <Card
+      className={`knowledge-document-card${selected ? " is-selected" : ""}`}
+      classNames={{ body: "knowledge-document-card__body" }}
+      size="small"
+    >
+      <div className="knowledge-document-card__title">
         <Icon name="doc" />
         <span>{doc.title}</span>
       </div>
-      {doc.summary ? <div className="doc-card__summary">{doc.summary}</div> : null}
-      <div className="doc-card__meta">
+      {doc.summary ? <div className="knowledge-document-card__summary">{doc.summary}</div> : null}
+      <div className="knowledge-document-card__meta">
         {doc.source ? <span>{doc.source}</span> : null}
         {"updated_at" in doc && doc.updated_at ? <time>{formatTimestamp(doc.updated_at)}</time> : null}
       </div>
-      <div className="doc-card__actions">
-        <button
-          className="btn btn--sm"
-          type="button"
+      <div className="knowledge-document-card__actions">
+        <Button
+          size="small"
+          icon={<Icon name="doc" size={14} />}
           disabled={!canView}
           aria-controls={DOC_VIEWER_ID}
           aria-expanded={selected}
-          onClick={(event) => onView(doc.id, event.currentTarget)}
+          onClick={(event) => onView(doc.id, event.currentTarget as HTMLButtonElement)}
         >
-          <Icon name="doc" size={14} />
-          <span>{t("knowledge.viewDocument")}</span>
-        </button>
+          {t("knowledge.viewDocument")}
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Button, Empty, Progress } from "antd";
 import { useI18n } from "../../i18n";
 import type { ContextUsage, Message } from "../../types";
 import { formatNumber } from "../../utils/format";
@@ -33,18 +34,18 @@ export function ContextDetailsDialog({ messages }: { messages: readonly Message[
 
   return (
     <>
-      <button
-        className="btn btn--sm ctx-details__trigger"
-        type="button"
+      <Button
+        className="ctx-details__trigger"
+        size="small"
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls="context-details-dialog"
         title={t("chat.context.button")}
+        icon={<Icon name="barChart" size={15} />}
         onClick={() => setOpen(true)}
       >
-        <Icon name="barChart" size={15} />
-        <span>{t("chat.context.button")}</span>
-      </button>
+        <span className="ctx-details__label">{t("chat.context.button")}</span>
+      </Button>
       <Dialog
         id="context-details-dialog"
         open={open}
@@ -59,16 +60,23 @@ export function ContextDetailsDialog({ messages }: { messages: readonly Message[
               <span>{t("chat.context.used")}</span>
               <strong>{t("chat.context.percent", { percent: usage.percent })}</strong>
             </div>
-            <div
+            <Progress
               className="ctx-details__progress"
-              role="progressbar"
+              classNames={{
+                body: "ctx-details__progress-body",
+                rail: "ctx-details__progress-rail",
+                track: "ctx-details__progress-track",
+              }}
+              percent={usage.percent}
+              showInfo={false}
+              size={["100%", 10]}
+              strokeColor={{
+                from: "var(--accent)",
+                to: "color-mix(in srgb, var(--accent) 68%, var(--ok))",
+              }}
+              railColor="var(--surface-2)"
               aria-label={t("chat.context.progressLabel")}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={usage.percent}
-            >
-              <span style={{ width: `${usage.percent}%` }} />
-            </div>
+            />
             <div className="ctx-details__tokens">
               {t("chat.context.tokens", {
                 used: formatNumber(usage.used_tokens),
@@ -80,10 +88,15 @@ export function ContextDetailsDialog({ messages }: { messages: readonly Message[
             ) : null}
           </section>
         ) : (
-          <div className="ctx-details__empty">
-            <Icon name="barChart" size={22} />
-            <p>{t("chat.context.unavailable")}</p>
-          </div>
+          <Empty
+            className="ctx-details__empty"
+            classNames={{
+              image: "ctx-details__empty-image",
+              description: "ctx-details__empty-description",
+            }}
+            image={<Icon name="barChart" size={22} />}
+            description={t("chat.context.unavailable")}
+          />
         )}
       </Dialog>
     </>

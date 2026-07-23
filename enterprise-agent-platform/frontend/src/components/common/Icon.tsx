@@ -1,7 +1,5 @@
-/* <Icon/> — the React port of legacy icon(name, {size, cls, strokeWidth})
-   (legacy-app.js:196-213). Renders an inline SVG from the ICONS registry,
-   preserving viewBox, currentColor stroke, default stroke-width 1.7, and
-   aria-hidden. SVG attribute data is spread directly (JSX supports SVG). */
+/* Product icon renderer. All icons have an explicit default size so SVGs never
+   fall back to the browser's 300 x 150 replaced-element dimensions. */
 
 import type { IconName } from "../../types";
 import { ICONS } from "./icons";
@@ -14,7 +12,7 @@ export interface IconProps {
   strokeWidth?: number;
 }
 
-export function Icon({ name, size, cls, strokeWidth }: IconProps) {
+export function Icon({ name, size = 18, cls, strokeWidth }: IconProps) {
   return (
     <svg
       viewBox="0 0 24 24"

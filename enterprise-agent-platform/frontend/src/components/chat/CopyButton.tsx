@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Button, Tooltip } from "antd";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { copyText } from "../../utils/clipboard";
@@ -27,19 +28,21 @@ export function CopyButton({ value, kind }: { value: string; kind: "message" | "
           : t("chat.copy.message");
 
   return (
-    <button
-      type="button"
-      className={cx("chat-copy", `chat-copy--${kind}`, state !== "idle" && `is-${state}`)}
-      aria-label={label}
-      title={label}
-      onClick={async () => {
-        if (resetTimer.current) clearTimeout(resetTimer.current);
-        setState((await copyText(value)) ? "copied" : "failed");
-        resetTimer.current = setTimeout(() => setState("idle"), 2_000);
-      }}
-    >
-      <span className="chat-copy__icon" aria-hidden="true">⧉</span>
-      <span aria-live="polite">{label}</span>
-    </button>
+    <Tooltip title={label}>
+      <Button
+        type="text"
+        size="small"
+        className={cx("chat-copy", `chat-copy--${kind}`, state !== "idle" && `is-${state}`)}
+        aria-label={label}
+        icon={<span className="chat-copy__icon" aria-hidden="true">⧉</span>}
+        onClick={async () => {
+          if (resetTimer.current) clearTimeout(resetTimer.current);
+          setState((await copyText(value)) ? "copied" : "failed");
+          resetTimer.current = setTimeout(() => setState("idle"), 2_000);
+        }}
+      >
+        <span className="chat-copy__label" aria-live="polite">{label}</span>
+      </Button>
+    </Tooltip>
   );
 }

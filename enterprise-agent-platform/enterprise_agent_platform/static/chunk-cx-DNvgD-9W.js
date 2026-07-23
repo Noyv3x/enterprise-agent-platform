@@ -1,0 +1,1 @@
+function e(...t){let n=[];for(let r of t)if(r)if(Array.isArray(r)){let t=e(...r);t&&n.push(t)}else n.push(String(r));return n.join(` `)}export{e as t};
