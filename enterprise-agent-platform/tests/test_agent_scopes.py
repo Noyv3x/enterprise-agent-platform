@@ -62,6 +62,15 @@ class AgentScopeSessionTests(unittest.TestCase):
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE agent_scope_sessions (
+                    scope_key TEXT NOT NULL REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                CREATE INDEX idx_agent_scope_sessions_lookup
+                    ON agent_scope_sessions(scope_key, lifecycle_id, session_id);
                 CREATE TABLE agent_runtime_scope_sessions (
                     scope_key TEXT NOT NULL REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
                     lifecycle_id TEXT NOT NULL,
@@ -76,6 +85,9 @@ class AgentScopeSessionTests(unittest.TestCase):
                 INSERT INTO agent_runtime_scopes VALUES(
                     'private:1', 'legacy-runtime', 'legacy-runtime-life', 1, 1
                 );
+                INSERT INTO agent_scope_sessions VALUES
+                    ('private:1', 'retired-life', 'retired-session-1', 1),
+                    ('private:1', 'retired-life', 'retired-session-2', 2);
                 INSERT INTO agent_runtime_scope_sessions VALUES(
                     'private:1', 'legacy-runtime-life', 'legacy-runtime', 1
                 );
@@ -104,9 +116,62 @@ class AgentScopeSessionTests(unittest.TestCase):
                     ),
                     1,
                 )
+                self.assertIsNone(
+                    db.query_one(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_scope_sessions'"
+                    )
+                )
+                self.assertEqual(
+                    db.query_one(
+                        "SELECT session_id, lifecycle_id "
+                        "FROM agent_runtime_scopes WHERE scope_key = 'private:1'"
+                    ),
+                    {
+                        "session_id": "legacy-runtime",
+                        "lifecycle_id": "legacy-runtime-life",
+                    },
+                )
                 self.assertFalse(db.query("PRAGMA foreign_key_check"))
+                sandbox_id = scope.sandbox_id
             finally:
                 db.close()
+
+            reopened = Database(config.db_path)
+            try:
+                self.assertEqual(
+                    reopened.scalar(
+                        "SELECT sandbox_id FROM agent_scopes "
+                        "WHERE scope_key = 'private:1'"
+                    ),
+                    sandbox_id,
+                )
+                self.assertEqual(
+                    reopened.scalar(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ),
+                    1,
+                )
+                self.assertFalse(reopened.query("PRAGMA foreign_key_check"))
+            finally:
+                reopened.close()
+
+            with mock.patch(
+                "enterprise_agent_platform.db.DATABASE_SCHEMA_VERSION",
+                DATABASE_SCHEMA_VERSION + 1,
+            ):
+                future_reopen = Database(config.db_path)
+            try:
+                self.assertEqual(
+                    future_reopen.scalar(
+                        "SELECT COUNT(*) FROM schema_migrations "
+                        "WHERE name = 'agent-scopes-container-sandbox-v2'"
+                    ),
+                    1,
+                )
+            finally:
+                future_reopen.close()
 
     def test_legacy_scope_migration_rolls_back_on_foreign_key_violation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -136,6 +201,14 @@ class AgentScopeSessionTests(unittest.TestCase):
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE agent_scope_sessions (
+                    scope_key TEXT NOT NULL
+                        REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
                 CREATE TABLE agent_runtime_scope_sessions (
                     scope_key TEXT NOT NULL
                         REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
@@ -144,6 +217,13 @@ class AgentScopeSessionTests(unittest.TestCase):
                     created_at INTEGER NOT NULL,
                     PRIMARY KEY(scope_key, lifecycle_id, session_id)
                 );
+                INSERT INTO agent_scopes VALUES(
+                    'private:1', 'private', '1', 'legacy-meta', 'legacy-meta-life',
+                    '/old/source/data/workspaces/user-1', 'host', 1, 1
+                );
+                INSERT INTO agent_scope_sessions VALUES
+                    ('private:1', 'legacy-meta-life', 'retired-session-1', 1),
+                    ('private:1', 'legacy-meta-life', 'retired-session-2', 2);
                 INSERT INTO agent_runtime_scopes VALUES(
                     'private:missing', 'orphan', 'orphan-life', 1, 1
                 );
@@ -181,8 +261,345 @@ class AgentScopeSessionTests(unittest.TestCase):
                     ).fetchone()[0],
                     1,
                 )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT lifecycle_id, session_id, created_at "
+                        "FROM agent_scope_sessions ORDER BY created_at"
+                    ).fetchall(),
+                    [
+                        ("legacy-meta-life", "retired-session-1", 1),
+                        ("legacy-meta-life", "retired-session-2", 2),
+                    ],
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "PRAGMA foreign_key_list(agent_scope_sessions)"
+                    ).fetchone()[2],
+                    "agent_scopes",
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ).fetchone()[0],
+                    0,
+                )
             finally:
                 verification.close()
+
+    def test_new_schema_version_removes_empty_retired_scope_session_table(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    applied_at INTEGER NOT NULL
+                );
+                INSERT INTO schema_migrations VALUES(
+                    2026072401, 'agent-scopes-container-sandbox', 1
+                );
+                CREATE TABLE agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    sandbox_id TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'sandbox'
+                        CHECK(execution_backend = 'sandbox'),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE TABLE agent_runtime_scopes (
+                    scope_key TEXT PRIMARY KEY
+                        REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE agent_runtime_scope_sessions (
+                    scope_key TEXT NOT NULL
+                        REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                CREATE TABLE agent_scope_sessions (
+                    scope_key TEXT NOT NULL
+                        REFERENCES agent_scopes_legacy(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                INSERT INTO agent_scopes VALUES(
+                    'private:1', 'private', '1', 'metadata-session',
+                    'metadata-life', 'user-1', 'agent-stable', 'sandbox', 1, 1
+                );
+                INSERT INTO agent_runtime_scopes VALUES(
+                    'private:1', 'runtime-session', 'runtime-life', 1, 1
+                );
+                INSERT INTO agent_runtime_scope_sessions VALUES(
+                    'private:1', 'runtime-life', 'runtime-session', 1
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            db = Database(config.db_path)
+            try:
+                self.assertIsNone(
+                    db.query_one(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_scope_sessions'"
+                    )
+                )
+                self.assertEqual(
+                    db.query_one(
+                        "SELECT session_id, lifecycle_id "
+                        "FROM agent_runtime_scopes WHERE scope_key = 'private:1'"
+                    ),
+                    {"session_id": "runtime-session", "lifecycle_id": "runtime-life"},
+                )
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ),
+                    1,
+                )
+                self.assertFalse(db.query("PRAGMA foreign_key_check"))
+            finally:
+                db.close()
+
+            reopened = Database(config.db_path)
+            try:
+                self.assertEqual(
+                    reopened.scalar(
+                        "SELECT sandbox_id FROM agent_scopes "
+                        "WHERE scope_key = 'private:1'"
+                    ),
+                    "agent-stable",
+                )
+                self.assertEqual(
+                    reopened.scalar(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ),
+                    1,
+                )
+            finally:
+                reopened.close()
+
+    def test_scope_migration_rejects_unknown_foreign_key_dependents(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'host'
+                        CHECK(execution_backend = 'host'),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE TABLE unexpected_scope_child (
+                    scope_key TEXT PRIMARY KEY
+                        REFERENCES agent_scopes(scope_key) ON DELETE CASCADE
+                );
+                INSERT INTO agent_scopes VALUES(
+                    'private:1', 'private', '1', 'legacy-meta', 'legacy-life',
+                    '/old/source/data/workspaces/user-1', 'host', 1, 1
+                );
+                INSERT INTO unexpected_scope_child VALUES('private:1');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "unsupported agent_scopes dependents: unexpected_scope_child",
+            ):
+                Database(config.db_path)
+
+            verification = sqlite3.connect(config.db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in verification.execute(
+                        "PRAGMA table_info(agent_scopes)"
+                    ).fetchall()
+                }
+                self.assertNotIn("sandbox_id", columns)
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT scope_key FROM unexpected_scope_child"
+                    ).fetchall(),
+                    [("private:1",)],
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                verification.close()
+
+    def test_scope_migration_rejects_children_of_retired_session_table(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'host'
+                        CHECK(execution_backend = 'host'),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE TABLE agent_scope_sessions (
+                    scope_key TEXT NOT NULL
+                        REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                CREATE TABLE unexpected_retired_child (
+                    scope_key TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    FOREIGN KEY(scope_key, lifecycle_id, session_id)
+                        REFERENCES agent_scope_sessions(
+                            scope_key, lifecycle_id, session_id
+                        ) ON DELETE CASCADE
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "unsupported agent_scope_sessions dependents: "
+                "unexpected_retired_child",
+            ):
+                Database(config.db_path)
+
+            verification = sqlite3.connect(config.db_path)
+            try:
+                tables = {
+                    row[0]
+                    for row in verification.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                self.assertIn("agent_scope_sessions", tables)
+                self.assertIn("unexpected_retired_child", tables)
+                self.assertNotIn("agent_scopes_legacy", tables)
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                verification.close()
+
+    def test_scope_migration_rejects_a_conflicting_version_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                f"""
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    applied_at INTEGER NOT NULL
+                );
+                INSERT INTO schema_migrations VALUES(
+                    {DATABASE_SCHEMA_VERSION}, 'unexpected-migration', 1
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "is owned by 'unexpected-migration'",
+            ):
+                Database(config.db_path)
+
+            verification = sqlite3.connect(config.db_path)
+            try:
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT name FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ).fetchone()[0],
+                    "unexpected-migration",
+                )
+            finally:
+                verification.close()
+
+    def test_foreign_key_schema_validation_matches_sqlite_identifier_case(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE "MixedParent" (id INTEGER PRIMARY KEY);
+                CREATE TABLE "MixedChild" (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES mixedparent(id)
+                );
+                INSERT INTO "MixedParent" VALUES(1);
+                INSERT INTO "MixedChild" VALUES(1, 1);
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            db = Database(config.db_path)
+            try:
+                self.assertFalse(db.query("PRAGMA foreign_key_check"))
+                self.assertEqual(
+                    db.scalar('SELECT parent_id FROM "MixedChild" WHERE id = 1'),
+                    1,
+                )
+            finally:
+                db.close()
 
     def test_repeated_ensure_uses_read_only_scope_fast_path(self):
         with tempfile.TemporaryDirectory() as td:

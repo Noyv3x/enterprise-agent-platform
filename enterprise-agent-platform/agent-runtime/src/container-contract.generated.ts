@@ -1,7 +1,7 @@
 // Generated from docs/contracts/container-platform.json by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = 1 as const;
 export const RELEASE_CHANNEL = "main" as const;
-export const DATABASE_SCHEMA_VERSION = 2026072401 as const;
+export const DATABASE_SCHEMA_VERSION = 2026072402 as const;
 export const CONTAINER_PATHS = {
   "data_root": "/var/lib/ubitech-agent",
   "workspace": "/workspace",

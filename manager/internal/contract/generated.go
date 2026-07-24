@@ -4,7 +4,7 @@ package contract
 const (
 	SchemaVersion                   = 1
 	ReleaseChannel                  = "main"
-	DatabaseSchemaVersion           = 2026072401
+	DatabaseSchemaVersion           = 2026072402
 	ContainerDataRoot               = "/var/lib/ubitech-agent"
 	ContainerWorkspace              = "/workspace"
 	ContainerAgentHome              = "/home/agent"

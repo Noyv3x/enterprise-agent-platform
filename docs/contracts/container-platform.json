@@ -2,7 +2,7 @@
   "schema_version": 1,
   "policy": "container-platform",
   "release_channel": "main",
-  "database_schema_version": 2026072401,
+  "database_schema_version": 2026072402,
   "container_paths": {
     "data_root": "/var/lib/ubitech-agent",
     "workspace": "/workspace",

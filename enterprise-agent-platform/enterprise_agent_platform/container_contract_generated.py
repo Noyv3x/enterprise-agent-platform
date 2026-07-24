@@ -3,7 +3,7 @@ from __future__ import annotations
 
 CONTAINER_PLATFORM_SCHEMA_VERSION = 1
 RELEASE_CHANNEL = 'main'
-DATABASE_SCHEMA_VERSION = 2026072401
+DATABASE_SCHEMA_VERSION = 2026072402
 CONTAINER_PATHS = {'data_root': '/var/lib/ubitech-agent', 'workspace': '/workspace', 'agent_home': '/home/agent', 'agent_env': '/opt/agent-env'}
 EXECUTION_TARGETS = ('sandbox', 'host')
 SANDBOX_IDLE_SECONDS = 1800

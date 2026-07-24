@@ -107,7 +107,7 @@ Sandbox 容器创建时只让入口以 root 完成一次 UID/GID 映射与挂载
 
 迁移变更锁只负责串行化上述会修改持久计划、服务或文件系统的操作，不能被 Gateway 和控制面公开的 `Plan`、`Active` 等只读状态查询获取或等待。迁移服务每次成功原子落盘后必须在独立短锁下发布不可变的内存快照；读端返回快照的深拷贝，并且在首次读取时也只使用独立状态锁从原子状态文件初始化。这样即使首次复制、归档或回滚长期占用变更锁，维护页仍能快速看到最近一次已持久化状态，同时读写双方不得共享可变 slice 或产生数据竞争。
 
-任何预检、复制、迁移或 readiness 失败都在清理旧目录前恢复旧源码服务；监听入口继续展示维护或安全恢复状态。切换旧 systemd 服务前先读取并持久记录原 `UnitFileState` 与 stop intent，再执行可逆的 `disable --now`，避免此后任一主机重启让旧 unit 抢占公网端口。命令返回后任何状态落盘失败都必须同步补偿：原 enabled unit 使用 `enable --now`，原 disabled unit 只恢复运行而不改变其启用语义。恢复看到 stop intent 时不能依赖可能尚未写入的 `old_service_stopped` 结果位，而要按持久的原状态保守恢复；只有新 Manager watchdog 已健康提交后，Commit 才确认永久 disabled。
+任何预检、复制、迁移或 readiness 失败都在清理旧目录前恢复旧源码服务；监听入口继续展示维护或安全恢复状态。数据库迁移版本随 release 单调递增，Platform 必须把结构变更、外键完整性检查和版本标记作为一个原子事务；即使遗留子表为空，也要验证或清理其外键定义，不能只按数据行违规数判断成功。切换旧 systemd 服务前先读取并持久记录原 `UnitFileState` 与 stop intent，再执行可逆的 `disable --now`，避免此后任一主机重启让旧 unit 抢占公网端口。命令返回后任何状态落盘失败都必须同步补偿：原 enabled unit 使用 `enable --now`，原 disabled unit 只恢复运行而不改变其启用语义。恢复看到 stop intent 时不能依赖可能尚未写入的 `old_service_stopped` 结果位，而要按持久的原状态保守恢复；只有新 Manager watchdog 已健康提交后，Commit 才确认永久 disabled。
 
 数据复制使用同一文件系统内的 staging 目录。校验完成后必须先按自底向上顺序同步 staging 中的文件和每层目录，再持久化 `copy_prepared` 和文件清单。把 staging 原子 rename 为目标后，还必须成功同步目标父目录，最后才允许持久化 `copied`；任一同步失败都必须保持旧服务可恢复，不得在另一状态目录中先行承诺迁移已完成。回滚和重新武装迁移必须同时处理 `copy_prepared`、`copied`、staging 已存在以及 rename 已完成这几种组合，确认旧数据仍存在后幂等删除未提交目标，不能让断电留下的完整副本阻塞后续自动重试。
 

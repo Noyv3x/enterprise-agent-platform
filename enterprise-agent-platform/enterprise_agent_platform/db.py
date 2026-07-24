@@ -15,6 +15,12 @@ from .memory_security import memory_content_hash
 from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
 
 
+_AGENT_SCOPES_SANDBOX_MIGRATION_VERSION = 2026072402
+_AGENT_SCOPES_SANDBOX_MIGRATION_NAME = "agent-scopes-container-sandbox-v2"
+if _AGENT_SCOPES_SANDBOX_MIGRATION_VERSION > DATABASE_SCHEMA_VERSION:
+    raise RuntimeError("Agent scope migration is newer than the database contract")
+
+
 def now_ts() -> int:
     return int(time.time())
 
@@ -368,13 +374,29 @@ class Database:
             self._conn.commit()
 
     def _migrate_agent_scopes_to_sandbox(self) -> None:
-        """Version the host-to-Sandbox scope schema change without data loss."""
+        """Version the host-to-Sandbox scope schema and retire rollback state."""
 
-        version = DATABASE_SCHEMA_VERSION
-        if self._conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
-        ).fetchone():
+        version = _AGENT_SCOPES_SANDBOX_MIGRATION_VERSION
+        applied = self._conn.execute(
+            "SELECT name FROM schema_migrations WHERE version = ?", (version,)
+        ).fetchone()
+        if applied:
+            if str(applied["name"]) != _AGENT_SCOPES_SANDBOX_MIGRATION_NAME:
+                raise sqlite3.IntegrityError(
+                    f"database migration version {version} is owned by "
+                    f"{applied['name']!r}, expected "
+                    f"{_AGENT_SCOPES_SANDBOX_MIGRATION_NAME!r}"
+                )
             return
+        named_version = self._conn.execute(
+            "SELECT version FROM schema_migrations WHERE name = ?",
+            (_AGENT_SCOPES_SANDBOX_MIGRATION_NAME,),
+        ).fetchone()
+        if named_version:
+            raise sqlite3.IntegrityError(
+                f"database migration {_AGENT_SCOPES_SANDBOX_MIGRATION_NAME!r} "
+                f"is recorded at version {named_version['version']}, expected {version}"
+            )
         columns = {
             str(row["name"])
             for row in self._conn.execute("PRAGMA table_info(agent_scopes)").fetchall()
@@ -384,13 +406,48 @@ class Database:
         ).fetchone()
         schema = str(table["sql"] or "").lower() if table else ""
         needs_rebuild = "sandbox_id" not in columns or "execution_backend = 'host'" in schema
+        retired_sessions_exist = bool(
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'agent_scope_sessions'"
+            ).fetchone()
+        )
         if needs_rebuild:
+            supported_dependents = {
+                "agent_scopes": {"agent_runtime_scopes", "agent_scope_sessions"},
+                "agent_runtime_scopes": {"agent_runtime_scope_sessions"},
+                "agent_runtime_scope_sessions": set(),
+                "agent_scope_sessions": set(),
+            }
+            for parent_name, supported_children in supported_dependents.items():
+                unsupported_children = sorted(
+                    self._foreign_key_dependents(parent_name) - supported_children
+                )
+                if unsupported_children:
+                    raise sqlite3.IntegrityError(
+                        f"scope migration found unsupported {parent_name} dependents: "
+                        + ", ".join(unsupported_children)
+                    )
+        elif retired_sessions_exist:
+            unsupported_children = sorted(
+                self._foreign_key_dependents("agent_scope_sessions")
+            )
+            if unsupported_children:
+                raise sqlite3.IntegrityError(
+                    "scope migration found unsupported agent_scope_sessions dependents: "
+                    + ", ".join(unsupported_children)
+                )
+
+        if needs_rebuild or retired_sessions_exist:
             self._conn.commit()
             self._conn.execute("PRAGMA foreign_keys=OFF")
             try:
-                self._conn.executescript(
-                    """
+                if needs_rebuild:
+                    self._conn.executescript(
+                        """
                     BEGIN IMMEDIATE;
+                    DROP INDEX IF EXISTS idx_agent_scope_sessions_lookup;
+                    DROP TABLE IF EXISTS agent_scope_sessions;
                     ALTER TABLE agent_runtime_scope_sessions RENAME TO agent_runtime_scope_sessions_legacy;
                     ALTER TABLE agent_runtime_scopes RENAME TO agent_runtime_scopes_legacy;
                     ALTER TABLE agent_scopes RENAME TO agent_scopes_legacy;
@@ -443,13 +500,44 @@ class Database:
                     DROP TABLE agent_runtime_scopes_legacy;
                     DROP TABLE agent_scopes_legacy;
                     """
+                    )
+                else:
+                    # The first container release could leave an empty retired
+                    # table pointing at the already-dropped temporary parent.
+                    # It has no current Runtime owner, so remove it even when
+                    # the active Sandbox schema itself no longer needs rebuild.
+                    self._conn.executescript(
+                        """
+                        BEGIN IMMEDIATE;
+                        DROP INDEX IF EXISTS idx_agent_scope_sessions_lookup;
+                        DROP TABLE agent_scope_sessions;
+                        """
+                    )
+                stale_dependents = sorted(
+                    self._foreign_key_dependents("agent_scopes_legacy")
                 )
+                if stale_dependents:
+                    raise sqlite3.IntegrityError(
+                        "scope migration left stale agent_scopes foreign keys: "
+                        + ", ".join(stale_dependents)
+                    )
+                missing_parents = self._missing_foreign_key_parents()
+                if missing_parents:
+                    raise sqlite3.IntegrityError(
+                        "scope migration left missing foreign-key parents: "
+                        + ", ".join(missing_parents)
+                    )
                 violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
                 if violations:
                     raise sqlite3.IntegrityError(
                         "scope migration produced "
                         f"{len(violations)} foreign-key violations"
                     )
+                self._conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) "
+                    "VALUES (?, ?, ?)",
+                    (version, _AGENT_SCOPES_SANDBOX_MIGRATION_NAME, now_ts()),
+                )
                 self._conn.commit()
             except Exception:
                 if self._conn.in_transaction:
@@ -457,10 +545,59 @@ class Database:
                 raise
             finally:
                 self._conn.execute("PRAGMA foreign_keys=ON")
+            return
+        missing_parents = self._missing_foreign_key_parents()
+        if missing_parents:
+            raise sqlite3.IntegrityError(
+                "scope migration found missing foreign-key parents: "
+                + ", ".join(missing_parents)
+            )
         self._conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-            (version, "agent-scopes-container-sandbox", now_ts()),
+            (version, _AGENT_SCOPES_SANDBOX_MIGRATION_NAME, now_ts()),
         )
+
+    def _foreign_key_dependents(self, parent_table: str) -> set[str]:
+        """Return user tables whose declared foreign keys target parent_table."""
+
+        dependents: set[str] = set()
+        normalized_parent = parent_table.casefold()
+        tables = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for row in tables:
+            name = str(row["name"])
+            quoted_name = '"' + name.replace('"', '""') + '"'
+            foreign_keys = self._conn.execute(
+                f"PRAGMA foreign_key_list({quoted_name})"
+            ).fetchall()
+            if any(
+                str(foreign_key["table"]).casefold() == normalized_parent
+                for foreign_key in foreign_keys
+            ):
+                dependents.add(name)
+        return dependents
+
+    def _missing_foreign_key_parents(self) -> list[str]:
+        """Return child-to-parent edges whose declared parent table is absent."""
+
+        rows = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        tables = {str(row["name"]).casefold() for row in rows}
+        missing: set[str] = set()
+        for row in rows:
+            child_name = str(row["name"])
+            quoted_name = '"' + child_name.replace('"', '""') + '"'
+            foreign_keys = self._conn.execute(
+                f"PRAGMA foreign_key_list({quoted_name})"
+            ).fetchall()
+            for foreign_key in foreign_keys:
+                parent_name = str(foreign_key["table"])
+                if parent_name.casefold() not in tables:
+                    missing.add(f"{child_name}->{parent_name}")
+        return sorted(missing)
 
     def _ensure_user_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)").fetchall()}
