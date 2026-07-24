@@ -1,0 +1,12 @@
+use_default_settings: true
+
+server:
+  secret_key: "development-only-change-me"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json

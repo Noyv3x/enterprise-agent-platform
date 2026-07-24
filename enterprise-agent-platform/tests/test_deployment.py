@@ -2138,6 +2138,27 @@ class DeploymentTests(unittest.TestCase):
                 "300",
             )
 
+    def test_runtime_env_persists_authenticated_source_migration_bridge(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root)
+            socket_path = root / "manager" / "control" / "manager.sock"
+            token_path = root / "manager" / "secrets" / "manager-token"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_MANAGER_SOCKET": str(socket_path),
+                    "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
+                },
+                clear=True,
+            ):
+                env = runtime_env(paths, host="127.0.0.1", port=8765)
+
+            self.assertEqual(env["UBITECH_SOURCE_MIGRATION_BRIDGE"], "1")
+            self.assertEqual(env["UBITECH_MANAGER_SOCKET"], str(socket_path))
+            self.assertEqual(env["UBITECH_MANAGER_TOKEN_FILE"], str(token_path))
+
     def test_searxng_ready_timeout_is_configurable_with_safe_default(self):
         with mock.patch.dict(
             os.environ,
@@ -2162,6 +2183,347 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("foreground", result.stdout)
         syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_installer_externalizes_retry_before_manager_release_exists(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        installer_text = source.read_text(encoding="utf-8")
+        self.assertNotIn("$legacy_root/manager/dist", installer_text)
+        self.assertNotIn("$legacy_root/.migration", installer_text)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            data_home = root / "data-home"
+            tools = root / "tools"
+            legacy = root / "legacy checkout"
+            legacy_data = legacy / "enterprise-agent-platform" / "data"
+            for path in (home, config_home, data_home, tools, legacy_data):
+                path.mkdir(parents=True, exist_ok=True)
+            systemctl_log = root / "systemctl.log"
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "curl").write_text("#!/bin/sh\nexit 22\n", encoding="utf-8")
+            (tools / "systemctl").write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            for executable in tools.iterdir():
+                executable.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "XDG_DATA_HOME": str(data_home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                    "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manifest-url",
+                    "https://releases.example/release.json",
+                    "--migrate-from",
+                    str(legacy),
+                    "--legacy-data",
+                    str(legacy_data),
+                    "--legacy-service",
+                    "custom-agent.service",
+                    "--legacy-platform-url",
+                    "http://127.0.0.1:8765",
+                    "--expected-source-commit",
+                    "a" * 40,
+                    "--yes",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 75, result.stderr)
+            control = data_home / "ubitech-agent" / "manager" / "control"
+            external_installer = control / "install-source-migration.sh"
+            bootstrap_retry = control / "retry-install-source-migration.sh"
+            self.assertEqual(external_installer.read_bytes(), source.read_bytes())
+            retry_text = bootstrap_retry.read_text(encoding="utf-8")
+            self.assertIn(
+                "--channel-manifest-url https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/release.json",
+                retry_text,
+            )
+            self.assertIn("--legacy-service custom-agent.service", retry_text)
+            self.assertIn("--legacy-platform-url http://127.0.0.1:8765", retry_text)
+            self.assertIn(f"--expected-source-commit {'a' * 40}", retry_text)
+            self.assertIn("if ((status != 0 && status != 75)); then", retry_text)
+            retry_syntax = subprocess.run(
+                ["bash", "-n", str(bootstrap_retry)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(retry_syntax.returncode, 0, retry_syntax.stderr)
+            timer = config_home / "systemd" / "user" / "ubitech-agent-migrate.timer"
+            service = config_home / "systemd" / "user" / "ubitech-agent-migrate.service"
+            self.assertTrue(timer.is_file())
+            self.assertIn(str(bootstrap_retry), service.read_text(encoding="utf-8"))
+            self.assertIn("enable --now ubitech-agent-migrate.timer", systemctl_log.read_text(encoding="utf-8"))
+
+    def test_installer_persists_expected_commit_in_manager_operation_retry(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            data_home = root / "data-home"
+            tools = root / "tools"
+            legacy = root / "legacy"
+            legacy_data = legacy / "data"
+            manager = root / "manager"
+            manager_log = root / "manager.log"
+            manager_count = root / "manager.count"
+            for path in (home, config_home, data_home, tools, legacy_data):
+                path.mkdir(parents=True, exist_ok=True)
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            manager.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_MANAGER_LOG\"\n"
+                "if [ \"${1:-}\" = install ]; then\n"
+                "  count=0\n"
+                "  if [ -f \"$FAKE_MANAGER_COUNT\" ]; then count=$(cat \"$FAKE_MANAGER_COUNT\"); fi\n"
+                "  count=$((count + 1))\n"
+                "  printf '%s\\n' \"$count\" > \"$FAKE_MANAGER_COUNT\"\n"
+                "  if [ \"$count\" -eq 1 ]; then exit 75; fi\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            for executable in (*tools.iterdir(), manager):
+                executable.chmod(0o755)
+            expected = "b" * 40
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "XDG_DATA_HOME": str(data_home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                    "FAKE_MANAGER_LOG": str(manager_log),
+                    "FAKE_MANAGER_COUNT": str(manager_count),
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manifest-url",
+                    "https://releases.example/container/release.json",
+                    "--manager-binary",
+                    str(manager),
+                    "--migrate-from",
+                    str(legacy),
+                    "--legacy-data",
+                    str(legacy_data),
+                    "--legacy-platform-url",
+                    "http://127.0.0.1:8765",
+                    "--expected-source-commit",
+                    expected,
+                    "--yes",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 75, result.stderr)
+            retry = data_home / "ubitech-agent" / "manager" / "control" / "retry-source-migration.sh"
+            retry_text = retry.read_text(encoding="utf-8")
+            self.assertIn(f"--expected-source-commit {expected}", retry_text)
+            self.assertIn("elif ((status != 75)); then", retry_text)
+            retry_syntax = subprocess.run(
+                ["bash", "-n", str(retry)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(retry_syntax.returncode, 0, retry_syntax.stderr)
+            manager_calls = manager_log.read_text(encoding="utf-8")
+            self.assertIn("preflight --config", manager_calls)
+            self.assertIn("--verify-source-migration-config", manager_calls)
+            self.assertIn("--expect-data-root", manager_calls)
+            self.assertIn("--expect-listen 127.0.0.1:8080", manager_calls)
+            self.assertIn(
+                "--expect-release-manifest-url https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/release.json",
+                manager_calls,
+            )
+            self.assertIn("--expect-release-channel main", manager_calls)
+            self.assertIn(
+                "--expect-legacy-platform-url http://127.0.0.1:8765",
+                manager_calls,
+            )
+            self.assertIn("--expect-control-socket", manager_calls)
+            self.assertIn("--probe-user-systemd-transient", manager_calls)
+            self.assertIn(f"--expected-source-commit {expected}", manager_calls)
+
+            retry_result = subprocess.run(
+                ["bash", str(retry)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(retry_result.returncode, 0, retry_result.stderr)
+            self.assertEqual(manager_count.read_text(encoding="utf-8").strip(), "2")
+            install_calls = [
+                line
+                for line in manager_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("install ")
+            ]
+            self.assertEqual(len(install_calls), 2)
+            self.assertFalse(
+                (config_home / "systemd" / "user" / "ubitech-agent-migrate.timer").exists()
+            )
+
+    def test_installer_persists_channel_catalog_not_exact_bootstrap_manifest(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            tools = root / "tools"
+            manager = root / "manager"
+            for path in (home, config_home, tools):
+                path.mkdir(parents=True, exist_ok=True)
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            manager.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for executable in (*tools.iterdir(), manager):
+                executable.chmod(0o755)
+
+            config_path = config_home / "ubitech-agent" / "manager.toml"
+            exact = "https://releases.example/container-abc/release.json"
+            channel = "https://releases.example/latest/release.json"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manifest-url",
+                    exact,
+                    "--channel-manifest-url",
+                    channel,
+                    "--manager-binary",
+                    str(manager),
+                    "--config",
+                    str(config_path),
+                    "--data-root",
+                    str(root / "data"),
+                    "--yes",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = config_path.read_text(encoding="utf-8")
+            self.assertIn(f'release_manifest_url = "{channel}"', config)
+            self.assertNotIn(f'release_manifest_url = "{exact}"', config)
+
+    def test_source_migration_preflight_fails_before_replacing_manager_or_unit(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            data_home = root / "data-home"
+            tools = root / "tools"
+            legacy = root / "legacy"
+            legacy_data = legacy / "data"
+            candidate = root / "candidate-manager"
+            for path in (home, config_home, data_home, tools, legacy_data):
+                path.mkdir(parents=True, exist_ok=True)
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            candidate.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = preflight ]; then\n"
+                "  printf '%s\\n' 'source migration config mismatch for listen' >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            for executable in (*tools.iterdir(), candidate):
+                executable.chmod(0o755)
+
+            stable = home / ".local" / "bin" / "ubitech-manager"
+            stable.parent.mkdir(parents=True)
+            stable.write_text("existing-manager\n", encoding="utf-8")
+            unit = config_home / "systemd" / "user" / "ubitech-agent-manager.service"
+            unit.parent.mkdir(parents=True)
+            unit.write_text("existing-unit\n", encoding="utf-8")
+            data_root = data_home / "ubitech-agent"
+            manager_config = config_home / "ubitech-agent" / "manager.toml"
+            manager_config.parent.mkdir(parents=True)
+            manager_config.write_text(
+                f'data_root = "{data_root}"\n'
+                'listen = "127.0.0.1:8080"\n'
+                'release_manifest_url = "https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/release.json"\n'
+                'release_channel = "main"\n'
+                'legacy_platform_gate_url = "http://127.0.0.1:8765"\n',
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "XDG_DATA_HOME": str(data_home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manager-binary",
+                    str(candidate),
+                    "--migrate-from",
+                    str(legacy),
+                    "--legacy-data",
+                    str(legacy_data),
+                    "--legacy-platform-url",
+                    "http://127.0.0.1:8765",
+                    "--expected-source-commit",
+                    "c" * 40,
+                    "--yes",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("source migration config mismatch", result.stderr)
+            self.assertEqual(stable.read_text(encoding="utf-8"), "existing-manager\n")
+            self.assertEqual(unit.read_text(encoding="utf-8"), "existing-unit\n")
 
     def test_ordinary_deploy_modes_check_docs_and_changes_before_bootstrap(self):
         source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
@@ -2295,6 +2657,12 @@ exit 0
             shutil.copy2(source_script, root / "deploy.sh")
             (root / "scripts").mkdir()
             (root / "scripts" / "docs_sync.py").write_text("# fake\n", encoding="utf-8")
+            test_log = base / "test.log"
+            (root / "scripts" / "test.sh").write_text(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> \"$FAKE_TEST_LOG\"\n",
+                encoding="utf-8",
+            )
+            (root / "scripts" / "test.sh").chmod(0o755)
             platform = root / "enterprise-agent-platform"
             runtime = platform / "agent-runtime"
             frontend = platform / "frontend"
@@ -2353,12 +2721,14 @@ exit 0
                     "PYTHON_BIN": str(fake_python),
                     "FAKE_PYTHON_LOG": str(python_log),
                     "FAKE_NPM_LOG": str(npm_log),
+                    "FAKE_TEST_LOG": str(test_log),
                 }
             )
 
             def run_test_and_assert_base(expected_base: str) -> None:
                 python_log.unlink(missing_ok=True)
                 npm_log.unlink(missing_ok=True)
+                test_log.unlink(missing_ok=True)
                 result = subprocess.run(
                     ["bash", str(root / "deploy.sh"), "test"],
                     cwd=root,
@@ -2379,26 +2749,9 @@ exit 0
                         f"{root}|{root / 'scripts' / 'docs_sync.py'} check-change --base HEAD --head WORKTREE",
                     ],
                 )
-                self.assertEqual(
-                    python_calls[4:],
-                    [
-                        f"{platform}|-m unittest discover -s tests",
-                        f"{platform}|-m compileall enterprise_agent_platform tests",
-                    ],
-                )
-                self.assertEqual(
-                    npm_log.read_text(encoding="utf-8").splitlines(),
-                    [
-                        f"{runtime}|ci",
-                        f"{runtime}|run check",
-                        f"{runtime}|test",
-                        f"{runtime}|run build",
-                        f"{frontend}|ci",
-                        f"{frontend}|run check",
-                        f"{frontend}|test",
-                        f"{frontend}|run build",
-                    ],
-                )
+                self.assertEqual(python_calls[4:], [])
+                self.assertFalse(npm_log.exists())
+                self.assertEqual(test_log.read_text(encoding="utf-8").splitlines(), [f"{root}|"])
 
             # A branch ahead of upstream uses their merge-base, covering the
             # complete unpublished series rather than only the tip commit.
@@ -2612,6 +2965,106 @@ node --version >/dev/null
                     f"new:check-change:--base:{old_sha}:--head:HEAD",
                 ],
             )
+
+    def test_first_bridge_update_restarts_source_then_queues_exact_commit_release(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout, old_sha, _ = make_update_checkout(base, source_script)
+            upstream = base / "upstream"
+            (upstream / "docs" / "contracts").mkdir(parents=True)
+            (upstream / "docs" / "contracts" / "container-platform.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (upstream / "install.sh").write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_INSTALL_ARGS\"\nexit 75\n",
+                encoding="utf-8",
+            )
+            (upstream / "install.sh").chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "container bridge"], cwd=upstream, check=True)
+            target_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+            fake_python = base / "fake-python"
+            bridge_env_log = base / "bridge-env.log"
+            fake_python.write_text(
+                """#!/bin/sh
+case "${1:-}" in
+  */scripts/docs_sync.py) exit 0 ;;
+esac
+printf '%s\n%s\n%s\n' \
+  "${UBITECH_SOURCE_MIGRATION_BRIDGE:-}" \
+  "${UBITECH_MANAGER_SOCKET:-}" \
+  "${UBITECH_MANAGER_TOKEN_FILE:-}" > "$FAKE_BRIDGE_ENV_LOG"
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            install_args = base / "install-args.log"
+            manager_root = base / "manager data"
+            legacy_data = base / "legacy data"
+            legacy_data.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_BRIDGE_ENV_LOG": str(bridge_env_log),
+                    "FAKE_INSTALL_ARGS": str(install_args),
+                    "UBITECH_DATA_ROOT": str(manager_root),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "update",
+                    "--data",
+                    str(legacy_data),
+                    "--service-name",
+                    "custom-agent.service",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "9876",
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(old_sha, target_sha)
+            self.assertEqual(
+                bridge_env_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "1",
+                    str(manager_root / "manager" / "control" / "manager.sock"),
+                    str(manager_root / "manager" / "secrets" / "manager-token"),
+                ],
+            )
+            values = install_args.read_text(encoding="utf-8").splitlines()
+            release_base = (
+                "https://github.com/Noyv3x/enterprise-agent-platform/releases/download/"
+                f"container-{target_sha}"
+            )
+            self.assertIn(f"{release_base}/release.json", values)
+            self.assertIn(
+                "https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/release.json",
+                values,
+            )
+            self.assertIn(f"{release_base}/ubitech-manager-linux-amd64", values)
+            self.assertIn("0.0.0.0:9876", values)
+            self.assertIn("http://127.0.0.1:9876", values)
+            self.assertIn("custom-agent.service", values)
+            self.assertIn(str(legacy_data), values)
 
     def test_failed_update_documentation_gate_uses_existing_rollback(self):
         if not shutil.which("git") or not shutil.which("flock"):

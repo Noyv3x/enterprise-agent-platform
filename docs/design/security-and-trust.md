@@ -4,71 +4,80 @@
 
 ## 信任模型
 
-ubitech agent 面向彼此可信的成员。所有 Agent 以同一个平台服务账号在宿主机执行，workspace、session、memory 和浏览器 Profile 提供逻辑隔离，不提供抵抗恶意租户的 OS 隔离。
+ubitech agent 面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个私人 Agent 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
 
-部署方必须把该服务账号可读取、写入和联网的范围控制在可接受水平。审批、路径校验和命令文本规则是纵深防护，不能替代最小权限、网络隔离、容器、cgroup 或独立主机。
+默认工具在 Sandbox 执行。模型可以为单次工具显式选择宿主目标；管理器随即以部署用户执行，并允许使用该用户已有的免密 `sudo`。这等同把该次操作授予部署用户乃至 root 能力。部署方必须只给可信成员使用，并把部署用户、宿主文件和网络权限控制在可接受范围。
 
 ## 认证与权限
 
-密码使用 PBKDF2-SHA256 和随机盐。登录失败按客户端与账号限流，并有固定 dummy hash 降低用户名时序泄漏。用户停用、改密、权限变化或显式吊销会推进 token version，使旧会话失效。
+密码使用 PBKDF2-SHA256 和随机盐。登录失败按客户端与账号限流，并使用固定 dummy hash 降低用户名时序泄漏。用户停用、改密、权限变化或显式吊销会推进 token version，使旧会话失效。
 
 浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly` 和 `SameSite=Lax`；公共 URL 为 HTTPS 时增加 `Secure`。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer；只有运维明确启用可信代理后才使用转发头。
 
-权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。内部 Agent 工具使用独立 bearer token，不接受浏览器 session 代替。
+权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。Platform、Runtime 与 Manager 的内部接口分别使用独立 bearer 或 owner-only Unix socket；浏览器 session 不能替代内部身份。
 
-## 网络边界
+## 容器与网络边界
 
-平台托管的 Agent Runtime、SearXNG、Firecrawl 和 Camoufox 必须使用无内嵌凭据的数值回环 endpoint；外置 SearXNG 仍只允许本机数值回环，Camoufox 当前不提供外置模式。外置 Agent Runtime 与 Firecrawl 可以由受信任运维配置为 HTTP(S) endpoint，但凭据必须通过 header 传递，不能内嵌在 URL 中；携带凭据的内部服务请求不得跟随重定向。Runtime 的所有接口，包括健康检查，都需要 bearer token；缺少 token 时 Runtime 必须拒绝启动。外置 Runtime 会获得 Agent 请求与宿主机工作上下文，必须置于等价的受控网络和认证边界内，不得把 Runtime 端口或内部工具路由裸露到公网。
+只有宿主管理器访问 Docker socket。Platform、Runtime、Sandbox、Camoufox、SearXNG 和 Firecrawl 都不得挂载或代理 Docker socket。固定服务与 Sandbox 位于管理器预创建并持有的持久私有 bridge 网络；Compose generation 只引用该 external network，不创建或删除它，因此固定栈切换不能中断仍在运行的 Sandbox。管理器只接管带产品 managed label 且 driver 符合契约的网络；同名但来源或配置不明的网络必须拒绝而不是覆盖。只有 Platform backend 被管理器发布到宿主回环，sidecar 不发布公网端口。
 
-搜索结果和 Firecrawl 提取 URL 只允许公开 HTTP(S)，拒绝内嵌凭据、回环、私网、链路本地地址、云元数据及敏感查询参数；搜索结果的轻量过滤不代替提取前的 DNS 感知 SSRF 校验。
+Sandbox 镜像只允许 PID 1 entrypoint 在启动映射阶段短暂以 root 运行。它必须验证管理器传入的正整数 UID/GID、拒绝与其它镜像账号冲突的 UID、验证 `/workspace`、`/home/agent` 与 `/opt/agent-env` 都是非符号链接目录，并且只调整这三个挂载根本身的所有权和模式；不得递归 `chown`、跟随符号链接或修改只读附件。验证完成后必须以映射后的 `agent` UID/GID `exec` 业务命令，不能保留 root shell 或 root 业务进程。管理器对该容器的每次 `docker exec` 也必须显式指定同一 UID/GID，不能依赖容器创建时的 root entrypoint 身份。
 
-浏览器是受信成员操作宿主机网络的工作工具，允许正常访问回环与内网 HTTP(S)。浏览器导航仍拒绝内嵌凭据、云元数据、链路本地、多播、保留和不可路由目标，并在操作前后重新校验。部署方必须把“Agent 可浏览内网”纳入服务账号和网络信任边界，不能把公开网页提取的 SSRF 策略错误套用为浏览器隔离承诺。
+Runtime 和 Platform 的所有内部 HTTP 接口，包括健康检查，都需要 token。管理器容器控制 socket 位于独立的 owner-only `control/` 目录；Runtime/Platform 只读挂载该目录而不是单个 socket inode 或整个 Manager 状态根，使 Manager 原子重建 socket 后容器能看到新 inode，同时不能读取 journal、release 和其它 secret。管理器在单一 Unix socket 上同时校验同 UID peer credential 与严格的 `Authorization: Bearer <token>`，并按 capability 分离身份：`manager-token` 只允许 Platform、宿主 CLI 与 Manager 回调访问状态、配置、日志、迁移和变更 operation；独立的 `manager-executor-token` 只允许 Runtime 访问 `/v1/executor/*`。两枚 token 不得互相授权，Platform 不挂载 executor token，Runtime 不挂载 control token；知道 socket 路径、容器名称、网络地址或 scope key 均不能替代 capability 与主 Agent sandbox identity。
 
-GitHub 自动更新 webhook 使用 HMAC 签名；Telegram webhook 使用不可猜 secret path。运维必须在边界代理覆盖客户端提供的转发头。
+Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真实宿主对象。目录必须由部署 UID 拥有、是非符号链接目录并收紧为 `0700`；token 必须由部署 UID 拥有、是非符号链接普通文件并收紧为 `0600`。任何 owner、类型或符号链接异常都必须拒绝启动，不能通过 `ReadFile` 或 `MkdirAll` 跟随既有路径继续运行。只读 bind mount 与 `SO_PEERCRED` 是外层纵深防护，不能代替按路由的 token capability。
 
-## 宿主机工具
+搜索结果和 Firecrawl 提取 URL 只允许公开 HTTP(S)，拒绝内嵌凭据、回环、私网、链路本地地址、云元数据及敏感查询参数；搜索结果轻量过滤不能替代提取前的 DNS 感知 SSRF 校验。
 
-审批决策为 `once`、`session`、`always` 或 `deny`。审批前先执行确定性的工具策略，结果只有 `hard_block`、`approval_required` 或 `allow`；`hard_block` 永远不能由历史授权或用户批准覆盖。下列操作必须审批：
+浏览器按可信成员模型允许正常访问回环与内网 HTTP(S)，但拒绝内嵌凭据、云元数据、链路本地、多播、保留和不可路由目标，并在操作前后重新校验。部署方必须把“Agent 可浏览内网”纳入网络信任边界。
 
-- 所有 terminal 命令；
-- 文件创建、修改和补丁；
-- workspace 外读取与搜索；
-- 主动进程控制；
-- 已提交记忆、技能和计划修改；
-- 点击、输入、下载、关闭等敏感浏览器动作。
+自动更新 webhook 使用签名；Telegram webhook 使用不可猜 secret path。运维必须在边界代理覆盖客户端提供的转发头。
 
-`always` 按 Agent 授权 scope 和稳定审批对象持久化；`session` 只在当前 lifecycle、session 和相同审批对象内有效。terminal 审批 identity 绑定未经 Unicode 折叠或其它语义改写的完整实际命令、canonical cwd、前后台方式和有效超时，批准一个命令不得授权其它命令。文件工具绑定 canonical 目标和全部执行参数，并将预检时固定的 canonical 目标写回执行参数；这也适用于 workspace 内无需审批的读取和搜索，具体操作前还会拒绝已发生的路径重定向。进程、记忆、技能、计划和浏览器等其他敏感工具同样绑定全部执行参数。敏感正文可在审批卡中只显示脱敏值或字节数，但必须参与授权 hash；`process.write` 只允许 `once`/`deny`，同一 process id 的后续 stdin 不能复用旧授权。旧版仅按工具名保存的宽泛授权不继承为新授权。无人值守计划任务只能使用与实际调用匹配的既有持久 `always` 授权，且不能修改计划本身。
+## 工具执行与审计
 
-审批事件展示完整可理解参数，但命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开 Runtime 前脱敏；`curl -H/--header` 的紧凑、等号和非引号写法遵守同一敏感头脱敏规则。统一脱敏器还必须识别常见客户端的紧凑凭据参数，包括 `curl` 用户/代理用户/Cookie、OAuth bearer 参数，`sshpass` 密码参数，以及数据库、缓存和容器登录客户端的短密码参数；参数和值之间有空格、等号或完全连写时都不得进入审批事件、工作记录、持久 session 或终端预览。凭据若出现在 shell `-c`、`eval`、命令替换或进程替换等嵌套求值中，整条命令必须拒绝，并以不含原文的占位说明进入诊断记录。任何将被脱敏的 terminal 命令或 `process.write` 片段中，`$(`（包括 `$((`）、反引号、`${…@P}` 以及 `<(`/`>(` 都不享有引号或转义豁免；未转义、未引号的其它 Bash `<`/`>` 语法（包括普通重定向、heredoc 和 here-string）也必须在审批前拒绝。敏感环境变量赋值只接受可选的一层成对引号及 `[A-Za-z0-9._~+/:@%=-]` 凭据安全字符；复杂值直接拒绝。同一命令存在这种脱敏赋值时，`eval`、shell `-c`、敏感变量作为命令位、算术求值或 prompt 重求值一律 fail closed；无法完整证明 Bash 数据流安全时宁可拒绝。`<`/`>` 的普通字面文本在转义、单引号或双引号内可放行。不得通过脱敏让用户批准不可见的副作用。超过完整可展示上限的命令直接拒绝，不得让用户批准一条尾部被截断的命令。稳定审批 key 仅在 Runtime 和授权存储内部使用，不进入 SSE/工作记录。原始参数只留在当前执行闭包内；EventJournal、持久 session JSONL 和 archive 中的 tool call 必须按工具脱敏或省略写入/补丁/输入载荷，工具结果中名称敏感的字段无论值是字符串、数组还是对象都必须整值脱敏。审批超时、通知失败、取消和拒绝都属于未授权，并产生已解决事件；返回给 Agent 的结果明确禁止通过改写、重试或换工具实现同一被拒目标。审批等待暂停 Run 空闲计时，但不能把沉默解释为同意。
+所有 terminal、process 和文件调用先执行确定性的 hard-block、参数/正文上限、canonical 路径校验和凭据脱敏，再进入执行器。hard-block 不可被目标、历史记录或模型参数覆盖。至少拒绝：
 
-`process.write` 不允许向长驻 shell 写入任何需要敏感脱敏的输入，避免隐藏值先进入变量、位置参数或 shell 状态后在后续独立输入中重新解释；不触发敏感模式的普通 stdin 数据仍可使用。需要携带凭据的完整命令必须改用一次性 terminal 审批。
+- Docker socket、管理器控制/状态目录和其它容器编排入口；
+- 云元数据、进程凭据/内存、原始块设备和危险系统伪文件；
+- 文件系统格式化、删除系统根或核心系统目录、fork bomb 与无边界 kill-all；
+- 会改变或隐藏展示字节的双向/不可见控制字符；
+- 超过完整可展示上限、因而无法让用户理解真实作用的命令。
 
-聊天侧栏的实时终端预览以及 Agent 可见的 `process.list/read/stop` 快照必须复用同一命令脱敏器后再做长度裁剪，不能维护一套较弱的独立规则；紧凑 curl 敏感头、凭据和危险格式控制字符均不得进入预览、工具结果或后续持久 session。
+`target=sandbox` 是默认值，在主 Agent 独立容器内执行。路径以 `/workspace` 为默认 cwd，只允许映射到该 Agent 的 workspace、HOME 和 env；后台进程登记在 Sandbox，决定其空闲生命周期。
 
-直接文件工具拒绝受保护系统树、进程凭据/内存和 Docker socket。terminal 和 `process.write` 先拒绝会改变展示或隐藏实际字节的控制字符，包括 U+00AD、U+061C、U+200B、U+200E–U+200F、U+202A–U+202E、U+2060–U+2069 和 U+FEFF；旧持久记录的命令展示也必须移除这些字符。只在不参与授权 identity 和实际执行的检测副本上做 NFKC 归一化，并在不执行 shell 的前提下识别真实命令起点、常见 wrapper、quoting/escaping、管道给 shell、`eval`、`find -exec/-delete`、命令变量与 HOME 表达。关机、文件系统格式化、原始块设备覆盖、删除系统根/核心系统目录/home、fork bomb、kill-all、云元数据及 Docker socket 属于不可批准底线；shell 的表达能力意味着这些规则永远不是完整解析器或沙箱。
+`target=host` 必须由模型在当前调用显式选择，不弹出用户审批，也不形成 session/always 授权。管理器在执行前持久化并向聊天发送审计事件，展示 target、完整实际命令参数或 canonical 文件路径、cwd、前后台方式和有效超时；执行后记录退出、时长与是否调用 sudo。日志可脱敏 secret，但不能隐去影响命令语义的普通参数。
 
-所有子进程移除名称疑似 secret、token、password、API key、credential 或 private key 的环境变量。取消和 scope cleanup 尽力终止登记进程组；主动 `setsid` 脱离或 Runtime 被强杀后遗失登记的信息需要部署层控制处理。
+命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开执行器前脱敏。统一脱敏器覆盖常见客户端的紧凑、等号和分离参数形式；无法安全解析嵌套 shell 求值中的 secret 时直接拒绝。原始 secret 只留在当前执行闭包，不能进入事件 journal、session、预览或错误文本。
+
+终端预览和 `process.list/read/stop` 快照复用同一脱敏器后再裁剪。取消和 scope cleanup 尽力终止前台进程；Sandbox 后台进程可跨 Run 保留，但必须有登记、输出上限和管理员可见状态。Sandbox 停止会终止其容器进程，持久挂载数据保留。
+
+## 管理器与更新
+
+Manager control socket、配置、release manifest、operation journal 和 registry 凭据必须 owner-only。所有 install/update/restart/rollback/repair operation 带 idempotency key、期望 generation 和持久阶段；并发冲突不能启动第二个变更。
+
+发布清单锁定源 commit、数据库版本、管理器校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；旧 Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
+
+快照恢复、新 generation readiness 和管理器重启验证完成前不能删除旧源码或数据。首次迁移未知 ignored 文件随完整 checkout 进入至少保留七天的 recovery pack；清理只能处理迁移清单明确列出的路径，不能跟随符号链接或跨越配置根。
 
 ## 文件与附件
 
-平台数据根、workspace 与 Runtime 根必须由服务账号拥有、不是符号链接，并收紧目录和文件权限。workspace 路径的每个组成部分都要重新检查符号链接。
+数据根、workspace、Runtime 根和 Agent env 必须由部署用户拥有、不是符号链接，并收紧权限。workspace 路径的每个组成部分都要重新检查符号链接。数据库保存相对 workspace 标识，不能把旧宿主绝对路径带入容器。
 
-上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。只有允许的位图格式可以内联，其余主动下载。Agent 生成附件只能从 workspace、平台管理的媒体目录和显式 `ENTERPRISE_MEDIA_ROOTS` 返回，并在解析真实路径后再次校验。
+上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载 `/workspace/.ubitech/attachments` 访问。Platform 不得把自己的数据路径写进 prompt 或 Run，Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
 ## 凭据与敏感数据
 
-OAuth refresh token、session secret、内部 token 和其它 secret 保存在平台 SQLite `settings` 表，并用 `secret` 标志控制展示；数据目录和数据库文件依靠宿主机权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。
+OAuth refresh token、session secret、内部 token 和其它 secret 保存在 Platform SQLite `settings` 表，并用 `secret` 标志控制展示；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。
 
-OAuth token 不得写入 Runtime metadata、session、SSE、日志、workspace 或 Git。Runtime 只在模型调用时从 Python 获取当前访问凭据。OAuth 导出文件本身包含敏感信息，必须由管理员像密钥一样处理。
+OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。
 
-## 不可信模型数据
+## 不可信内容与提示词注入
 
-记忆召回、知识、搜索结果、网页、浏览器快照/像素、历史会话、计划定义/历史、用户附件文字/图片和技能支持文件都属于不可信数据。所有相应工具文本结果必须进入防伪闭合边界：先中和内容中伪造的边界 token，再添加来源和“仅数据、非指令”说明；不能因文本较短或包含图片而跳过。`search_files` 的文件名和内容命中整体按 workspace 搜索数据包裹，避免附件或工作区文件中的指令文本借搜索摘要绕过边界；`read_file` 对当前 Run 附件路径的读取必须标记为附件数据。图片块前必须有固定不可信说明，不能暗示像素在文本边界内。它们不得被描述成更高优先级指令。模型提供的 owner、scope、provider endpoint、API 类型和浏览器 user id 均不能覆盖可信 Run context。Skill 主指令只能作为低优先级流程建议，不能覆盖 system、权限或审批。
+用户显示名、职位、频道名、网页、浏览器、知识、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。
 
-需要进入长期指令上下文的记忆、技能主指令和计划任务 prompt 还要经过共享高置信威胁扫描，并在写入与加载/执行两个边界复查。扫描器必须有输入上限和有界模式以避免 ReDoS，覆盖 NFKC 兼容字符、不可见/双向 Unicode、明确的指令覆盖、角色劫持、系统提示泄露和凭据外传表达；扫描命中是纵深防护，不得宣称能识别所有注入。
+需要进入长期指令上下文的记忆、Skill 主指令和计划 prompt 在写入与加载/执行两个边界经过共享高置信威胁扫描。扫描有输入上限和有界模式，覆盖 NFKC 兼容字符、不可见/双向 Unicode、明确的指令覆盖、角色劫持、系统提示泄露和凭据外传；它是纵深防护，不能宣称识别所有注入。
 
-长期 session JSONL 中的 message entry 使用 Runtime 写入的模型内容安全版本标记区分新旧格式。缺少当前版本标记的旧 `web`、`browser`、`memory`、`knowledge`、`session`、`session_search`、`search_files`、`schedule` 和 `skill` 工具结果，在送入模型前必须仅在内存中按 `toolName` 重建不可信边界；旧 assistant tool call 参数也必须在模型副本中按工具脱敏。加载本身不得改写旧日志。`session` 的 read/search 摘要无论来自当前日志还是 archive，都必须再次按工具脱敏参数，不能把历史命令凭据带回模型。当前版本标记的结果不得重复包裹。旧 skill 结果统一降级为不可信历史数据，不能恢复成可执行流程建议；只有当前 Runtime 生成并标记的 skill 主指令可以保留受控的低优先级流程建议语义。正常追加与上下文压缩产生的新 message entry 必须写入当前版本标记。
+旧 session 中未带当前安全版本的 web、browser、memory、knowledge、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；旧 assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
 
 ## 安全变更要求
 
-涉及认证、权限、路径、内部协议、凭据、工具审批、进程或自动更新的变更必须先修改本文或对应设计文档，再修改实现，并增加滥用与恢复测试。Run 空闲、模型轮次和 terminal 默认超时只引用 [`runtime-policy.json`](../contracts/runtime-policy.json)；其它安全边界由对应配置参考和测试约束。
+涉及认证、权限、路径、内部协议、凭据、工具目标、进程、容器或自动更新的变更必须先修改本文或对应设计文档，再修改实现，并增加滥用与恢复测试。Run 空闲、模型轮次和 terminal 默认超时引用 [`runtime-policy.json`](../contracts/runtime-policy.json)；容器路径、目标、状态和操作引用 [`container-platform.json`](../contracts/container-platform.json)。

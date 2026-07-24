@@ -26,7 +26,7 @@ workspaces/
 logs/
 
 # Legacy upstream checkouts left behind when the former gitlinks are removed.
-# Managed copies live under ENTERPRISE_PLATFORM_DATA/runtimes instead.
+# Production consumes CI-built images; these local repositories are references only.
 /cognee/
 /firecrawl/
 
@@ -49,3 +49,4 @@ build/
 tmp/
 temp/
 *.log
+/manager/ubitech-manager

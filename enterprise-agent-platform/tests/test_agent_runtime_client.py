@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -394,6 +396,72 @@ class AgentRuntimeClientTests(unittest.TestCase):
 
         self.assertEqual(result.content, "Chunked response accepted")
         self.assertEqual(result.session_id, "session-2")
+
+    def test_managed_generate_inlines_images_and_keeps_sandbox_file_paths(self):
+        self.runtime.events = [
+            _event(
+                1,
+                "run.completed",
+                {"output": "done", "session_id": "session-2"},
+            )
+        ]
+        client = AgentRuntimeClient(
+            self.runtime.base_url,
+            "runtime-secret",
+            managed_execution=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.png"
+            image.write_bytes(b"small-image")
+            client.generate(
+                system_prompt="system",
+                user_message="inspect these files",
+                history=[],
+                session_id="session-1",
+                session_key="private:7",
+                metadata={
+                    "execution": {
+                        "lifecycle_id": "life-1",
+                        "sandbox_id": "agent-1",
+                        "workspace_id": "user-7",
+                    },
+                    "workspace": {"path": "/workspace"},
+                },
+                attachments=[
+                    {
+                        "local_path": str(image),
+                        "path": "/workspace/.ubitech/attachments/image.png",
+                        "filename": "image.png",
+                        "mime_type": "image/png",
+                    },
+                    {
+                        "local_path": str(Path(directory) / "notes.txt"),
+                        "path": "/workspace/.ubitech/attachments/notes.txt",
+                        "filename": "notes.txt",
+                        "mime_type": "text/plain",
+                    },
+                ],
+                model={"provider": "openai-codex", "id": "gpt-5"},
+            )
+
+        body = self.runtime.request("POST", "/v1/runs")["body"]
+        self.assertEqual(
+            body["execution_context"],
+            {"sandbox_id": "agent-1", "workspace_id": "user-7"},
+        )
+        self.assertEqual(body["input"][0], {"type": "text", "text": "inspect these files"})
+        self.assertEqual(body["input"][1]["type"], "image")
+        self.assertEqual(body["input"][1]["mimeType"], "image/png")
+        self.assertEqual(
+            body["attachments"],
+            [
+                {
+                    "path": "/workspace/.ubitech/attachments/notes.txt",
+                    "name": "notes.txt",
+                    "mime_type": "text/plain",
+                }
+            ],
+        )
 
     def test_steer_run_posts_an_idempotent_scoped_input(self):
         result = self.client.steer_run(

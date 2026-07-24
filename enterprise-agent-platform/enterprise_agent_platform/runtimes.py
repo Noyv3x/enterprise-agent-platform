@@ -45,6 +45,7 @@ from .design_contract_generated import (
 )
 from .loopback_http import (
     open_loopback_url,
+    open_private_service_url,
     open_trusted_service_url,
     validate_http_base_url,
     validate_loopback_url,
@@ -106,14 +107,14 @@ CAMOFOX_BROWSER_ASSETS = {
         "b146b98b0c2c41023716feef36451f319a534309f72c54584a4b0b88670f510b",
         661_687_098,
         "150.0.2",
-        "alpha.26",
+        "beta.25",
     ),
     ("Linux", "aarch64"): (
         "camoufox-150.0.2-alpha.25-lin.arm64.zip",
         "b2870af8cd99721d41bd48f0cce0f949449ab75364b80ee3d389bd35953ea213",
         652_036_669,
         "150.0.2",
-        "alpha.25",
+        "beta.25",
     ),
 }
 FIRECRAWL_IMAGE = "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c"
@@ -806,6 +807,7 @@ class PlatformRuntimeManager:
                 "AGENT_PLATFORM_INTERNAL_URL": self._platform_internal_url(),
                 "AGENT_PLATFORM_INTERNAL_TOKEN": self._first_secret("agent_tool_token", "ENTERPRISE_AGENT_TOOL_TOKEN"),
                 "AGENT_RUNTIME_MAX_CONCURRENCY": str(self._effective_agent_max_concurrency()),
+                "AGENT_RUNTIME_EXECUTOR_MODE": "local",
                 RUN_IDLE_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE: str(
                     round(self._effective_agent_idle_timeout_seconds() * 1000)
                 ),
@@ -931,6 +933,25 @@ class PlatformRuntimeManager:
         }
 
     def prepare_cognee(self) -> RuntimeStatus:
+        if self.config.deployment_mode == "container":
+            try:
+                self._seed_cognee_env()
+                available = _module_importable("cognee")
+                return RuntimeStatus(
+                    "cognee",
+                    True,
+                    available,
+                    "prepared" if available else "missing",
+                    "Cognee is installed in the Platform image" if available else "",
+                    path=str(self.config.cognee_runtime_dir),
+                    error="" if available else "Cognee package is missing from the Platform image",
+                    source="image",
+                )
+            except Exception as exc:
+                return RuntimeStatus(
+                    "cognee", True, False, "error",
+                    path=str(self.config.cognee_runtime_dir), error=str(exc), source="image"
+                )
         if not self._managed_cognee_enabled():
             return RuntimeStatus("cognee", False, False, "external", "managed Cognee disabled")
         try:
@@ -974,6 +995,16 @@ class PlatformRuntimeManager:
         read-only query. Seeding stays on the explicit prepare/ensure path that
         actually materializes the runtime before use.
         """
+        if self.config.deployment_mode == "container":
+            available = _module_importable("cognee")
+            return RuntimeStatus(
+                "cognee", True, available,
+                "prepared" if available else "missing",
+                "Cognee is installed in the Platform image" if available else "",
+                path=str(self.config.cognee_runtime_dir),
+                error="" if available else "Cognee package is missing from the Platform image",
+                source="image",
+            )
         if not self._managed_cognee_enabled():
             return RuntimeStatus("cognee", False, False, "external", "managed Cognee disabled")
         repo = self._effective_cognee_repo()
@@ -1002,6 +1033,8 @@ class PlatformRuntimeManager:
 
     def prepare_camofox(self) -> RuntimeStatus:
         if not self._managed_camofox_enabled():
+            if self.config.deployment_mode == "container":
+                return self.camofox_status(refresh=True)
             return RuntimeStatus(
                 "camofox",
                 False,
@@ -1192,7 +1225,9 @@ class PlatformRuntimeManager:
         try:
             with self._lock:
                 if not self._managed_camofox_enabled():
-                    return self.camofox_status(refresh=False)
+                    return self.camofox_status(
+                        refresh=self.config.deployment_mode == "container"
+                    )
                 # During auto-update the live process still serves requests while a
                 # separate deployment process publishes the next locked app. Keep
                 # using that known-owned healthy process instead of making the old
@@ -1246,6 +1281,22 @@ class PlatformRuntimeManager:
 
     def camofox_status(self, *, refresh: bool = True) -> RuntimeStatus:
         if not self._managed_camofox_enabled():
+            if self.config.deployment_mode == "container":
+                url_error = self._trusted_http_url_error(
+                    "Camofox", self._effective_camofox_url()
+                )
+                healthy = not url_error and self._probe_camofox_health() if refresh else False
+                return RuntimeStatus(
+                    "camofox",
+                    False,
+                    healthy,
+                    "running" if healthy else ("invalid_config" if url_error else "external"),
+                    "Manager-owned Camoufox API is reachable" if healthy else "Manager owns the Camoufox container",
+                    url=self._effective_camofox_url(),
+                    path=str(self.config.runtime_dir / "camofox"),
+                    error=url_error or ("Manager-owned Camoufox API is not reachable" if refresh and not healthy else ""),
+                    source="container",
+                )
             return RuntimeStatus(
                 "camofox",
                 False,
@@ -2872,7 +2923,14 @@ class PlatformRuntimeManager:
             "services:",
         ]
         for service, image in FIRECRAWL_SERVICE_IMAGES:
-            lines.extend((f"  {service}:", f"    image: {image}"))
+            lines.extend(
+                (
+                    f"  {service}:",
+                    f"    image: {image}",
+                    "    labels:",
+                    '      org.ubitech.agent.managed: "true"',
+                )
+            )
             if service == "api":
                 # The upstream initializer is intentionally a one-shot
                 # container.  Declaring it as a successful-completion
@@ -2990,6 +3048,8 @@ class PlatformRuntimeManager:
                 "services:",
                 "  searxng:",
                 f"    image: {SEARXNG_IMAGE}",
+                "    labels:",
+                '      org.ubitech.agent.managed: "true"',
                 "    restart: unless-stopped",
                 "    environment:",
                 '      FORCE_OWNERSHIP: "false"',
@@ -3088,7 +3148,11 @@ class PlatformRuntimeManager:
 
     def _searxng_loopback_url_error(self, *, managed: bool = True) -> str:
         url = self._effective_searxng_api_url()
-        error = self._managed_loopback_url_error("SearXNG", url)
+        error = (
+            self._trusted_http_url_error("SearXNG", url)
+            if self.config.deployment_mode == "container" and not managed
+            else self._managed_loopback_url_error("SearXNG", url)
+        )
         if error:
             return error
         try:
@@ -3100,11 +3164,12 @@ class PlatformRuntimeManager:
                 return "Managed SearXNG URL loopback port must be between 1 and 65535"
         except ValueError:
             return "Managed SearXNG URL must contain a valid loopback port"
-        try:
-            if not ipaddress.ip_address(str(parsed.hostname or "")).is_loopback:
+        if self.config.deployment_mode != "container" or managed:
+            try:
+                if not ipaddress.ip_address(str(parsed.hostname or "")).is_loopback:
+                    return "SearXNG URL must use a literal loopback IP address"
+            except ValueError:
                 return "SearXNG URL must use a literal loopback IP address"
-        except ValueError:
-            return "SearXNG URL must use a literal loopback IP address"
         if managed and parsed.scheme != "http":
             return "Managed SearXNG URL must use http on its private loopback listener"
         if (
@@ -3322,7 +3387,12 @@ class PlatformRuntimeManager:
                 headers=headers,
                 method=method,
             )
-            with open_loopback_url(request, timeout=timeout) as response:
+            open_request = (
+                open_private_service_url
+                if self.config.deployment_mode == "container"
+                else open_loopback_url
+            )
+            with open_request(request, timeout=timeout) as response:
                 if not 200 <= response.status < 300:
                     return None
                 raw = response.read(512 * 1024)
@@ -3344,7 +3414,12 @@ class PlatformRuntimeManager:
             headers={"Authorization": f"Bearer {self._camofox_access_key()}"},
             method="GET",
         )
-        with open_loopback_url(request, timeout=timeout) as response:
+        open_request = (
+            open_private_service_url
+            if self.config.deployment_mode == "container"
+            else open_loopback_url
+        )
+        with open_request(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"HTTP {response.status}")
             content_type = str(response.headers.get("Content-Type") or "").lower()
@@ -3369,7 +3444,12 @@ class PlatformRuntimeManager:
                 headers={"Accept": "text/plain"},
                 method="GET",
             )
-            with open_loopback_url(request, timeout=0.8) as response:
+            open_request = (
+                open_private_service_url
+                if self.config.deployment_mode == "container"
+                else open_loopback_url
+            )
+            with open_request(request, timeout=0.8) as response:
                 if not 200 <= response.status < 300:
                     return False
                 # Require SearXNG's exact health marker so an unrelated HTTP
@@ -3386,19 +3466,19 @@ class PlatformRuntimeManager:
         ):
             return False
 
-    @staticmethod
-    def _probe_json_health(base_url: str, paths: tuple[str, ...], validator) -> bool:
+    def _probe_json_health(self, base_url: str, paths: tuple[str, ...], validator) -> bool:
         base = base_url.rstrip("/")
         if not base:
             return False
         for path in paths:
             try:
                 request = urllib.request.Request(f"{base}{path}", method="GET")
-                open_request = (
-                    open_loopback_url
-                    if PlatformRuntimeManager._uses_loopback_transport(base)
-                    else open_trusted_service_url
-                )
+                if PlatformRuntimeManager._uses_loopback_transport(base):
+                    open_request = open_loopback_url
+                elif self.config.deployment_mode == "container":
+                    open_request = open_private_service_url
+                else:
+                    open_request = open_trusted_service_url
                 with open_request(request, timeout=0.8) as response:
                     if not 200 <= response.status < 300:
                         continue

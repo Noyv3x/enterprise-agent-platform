@@ -7,10 +7,23 @@
 从仓库根执行：
 
 ```bash
-./deploy.sh test
+./scripts/test.sh
 ```
 
-该命令先分别校验文档树、最近提交、暂存快照与完整工作区内的文档/代码双向同步，再运行 Python `unittest`、Python compileall，并分别在 Agent Runtime 和前端执行锁定依赖安装、类型检查、测试和构建。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。
+该命令先校验文档与生成契约，再运行 Manager、Python、Agent Runtime 和前端测试与构建。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。`./deploy.sh test` 在桥接版本中可以转发到该命令，但迁移后不再是运行管理入口。
+
+## Manager 与容器
+
+```bash
+cd manager
+go test ./...
+go vet ./...
+go build ./cmd/ubitech-manager
+cd ..
+docker compose -f containers/compose.yaml config
+```
+
+Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。
 
 ## Python 平台
 
@@ -79,13 +92,13 @@ npm run build
 
 ## 部署与冒烟
 
-高风险 deployment、Gateway、Runtime packaging 或 static 发布变更还应在临时数据目录执行 prepare/foreground 冒烟，检查：
+高风险 Manager、容器、Runtime packaging 或 static 发布变更还应在临时数据目录执行安装/更新冒烟，检查：
 
 - `/healthz` 和搜索健康；
-- Gateway backend generation 切换；
+- Manager Gateway generation 切换；
 - Runtime bearer 和 `/v1/models`；
 - 登录、普通 API、SSE 与附件；
-- 托管服务启动/停止不会遗留错误进程或 Compose stack；
+- 固定服务与 Agent Sandbox 启停不会遗留错误容器；
 - 更新期间维护页阻断，完成后恢复。
 
 部署等待和 deadline 不写在本文，由对应部署配置与测试约束；不得误用 Agent Runtime 的空闲或 terminal 契约代替部署策略。

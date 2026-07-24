@@ -92,6 +92,14 @@ Provider 层次必须保持以下职责：
 
 对话框需要焦点圈定、Esc 关闭和嵌套栈管理；图标按钮必须有可读名称；状态不能只依赖颜色。主题初始化脚本在 React 启动前应用用户选择，避免首屏闪烁。
 
+## 容器管理状态
+
+管理面板中的“自动更新”改为管理器状态页，展示当前/候选/上一 generation、release commit、核心服务健康、下载进度、公开 state、operation phase 和最近安全错误。正常状态下可提交检查更新、更新、重启和回滚；这些操作只创建管理器 operation，前端不得自行拼接 Docker 或 Git 命令。
+
+Manager 的数值 `generation` 是并发修改版本，必须单独透传为操作的 `expected_generation`；release `current/target/previous.id` 只用于展示，不能互相替代。RFC3339 `checked_at` 在 Platform 边界规范化为前端可解析的时间，每个 service 的 `status` 规范化为明确的 `available/state`，未知或 unavailable 状态不得默认显示为 ready。
+
+候选镜像预拉取和 `waiting_for_tasks` 不阻断其它页面；进入 `updating` 后，全局 `UpdateGate` 禁止使用并显示管理器维护状态。失败时如果 Platform 仍可用，管理页展示 operation id 和使用宿主 CLI 的恢复提示；不得向普通页面泄露 Docker socket、registry 凭据、宿主绝对路径或完整管理日志。
+
 ## 验证
 
 组件测试应使用与生产一致的 `eap` 组件前缀、主题和 i18n Provider，并使用真实 Store 和请求边界覆盖关键生命周期，特别是空数据 selector、迟到响应、移动宽度、维护切换、SSE 重连和首帧加载。业务样式需要绑定组件库公开的 semantic `classNames/styles`，测试不得依赖默认 `ant` 前缀掩盖生产选择器错误。命令见[测试与验证](../development/testing.md)。

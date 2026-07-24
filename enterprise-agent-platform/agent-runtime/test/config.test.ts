@@ -22,7 +22,11 @@ import { temporaryDirectory } from "./helpers.js";
 const TEST_RUNTIME_TOKEN = "config-test-token";
 
 function runtimeEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return { AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN, ...overrides };
+  return {
+    AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
+    AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    ...overrides,
+  };
 }
 
 function boundedIntegerError(minimum: number, maximum: number): RegExp {
@@ -39,15 +43,21 @@ test("runtime bearer token is mandatory and rejects missing or blank values", ()
 });
 
 test("runtime bearer token accepts trimmed direct and file-backed values but rejects an empty file", async () => {
-  assert.equal(loadConfig({ AGENT_RUNTIME_TOKEN: "  direct-token \n" }).bearerToken, "direct-token");
+  assert.equal(loadConfig({
+    AGENT_RUNTIME_TOKEN: "  direct-token \n",
+    AGENT_RUNTIME_EXECUTOR_MODE: "local",
+  }).bearerToken, "direct-token");
   const home = await temporaryDirectory("agent-runtime-config-token-");
   const tokenFile = join(home, "token");
   try {
     await writeFile(tokenFile, "  file-token \n", { encoding: "utf8", mode: 0o600 });
-    assert.equal(loadConfig({ AGENT_RUNTIME_TOKEN_FILE: tokenFile }).bearerToken, "file-token");
+    assert.equal(loadConfig({
+      AGENT_RUNTIME_TOKEN_FILE: tokenFile,
+      AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    }).bearerToken, "file-token");
     await writeFile(tokenFile, " \n\t", "utf8");
     assert.throws(
-      () => loadConfig({ AGENT_RUNTIME_TOKEN_FILE: tokenFile }),
+      () => loadConfig({ AGENT_RUNTIME_TOKEN_FILE: tokenFile, AGENT_RUNTIME_EXECUTOR_MODE: "local" }),
       /AGENT_RUNTIME_TOKEN or AGENT_RUNTIME_TOKEN_FILE to a non-empty value/,
     );
   } finally {

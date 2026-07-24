@@ -10,6 +10,7 @@ from unittest import mock
 
 from enterprise_agent_platform.loopback_http import (
     open_loopback_url,
+    open_private_service_url,
     open_trusted_service_url,
 )
 
@@ -85,6 +86,22 @@ class LoopbackHTTPTests(unittest.TestCase):
         )
         with self.assertRaises(urllib.error.HTTPError) as raised:
             open_trusted_service_url(request, timeout=2)
+        self.assertEqual(raised.exception.code, 302)
+
+    def test_private_service_request_ignores_proxies_and_rejects_redirects(self):
+        request = urllib.request.Request(self.base_url + "/ok", method="GET")
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""},
+            clear=False,
+        ):
+            with open_private_service_url(request, timeout=2) as response:
+                self.assertEqual(response.read(), b"OK")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            open_private_service_url(
+                urllib.request.Request(self.base_url + "/redirect", method="GET"),
+                timeout=2,
+            )
         self.assertEqual(raised.exception.code, 302)
 
     def test_loopback_request_rejects_public_and_hostname_targets(self):

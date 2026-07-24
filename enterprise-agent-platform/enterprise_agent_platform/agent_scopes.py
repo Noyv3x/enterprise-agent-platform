@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import PlatformConfig
+from .container_contract_generated import CONTAINER_PATHS
 from .db import Database, now_ts
 from .secure_fs import ensure_private_directory, write_private_file_exclusive
 
@@ -26,11 +27,11 @@ _SCOPE_SELECT = """
 
 @dataclass(frozen=True)
 class AgentExecutionScope:
-    """Stable host-execution identity for one private or channel Agent.
+    """Stable container-execution identity for one private or channel Agent.
 
     A scope separates normal file, memory, session and process state.  It is a
-    logical product boundary, not an OS security sandbox: every scope executes
-    as the same trusted host service account.
+    logical product boundary and isolated work environment, not an adversarial
+    multi-tenant security boundary.
     """
 
     scope_key: str
@@ -39,21 +40,25 @@ class AgentExecutionScope:
     session_id: str
     lifecycle_id: str
     workspace_path: str
+    workspace_id: str
+    sandbox_id: str
 
     def to_execution_dict(self) -> dict[str, Any]:
         return {
-            "backend": "host",
-            "isolation": "logical",
+            "backend": "sandbox",
+            "isolation": "container-workspace",
             "scope_key": self.scope_key,
             "session_id": self.session_id,
             "lifecycle_id": self.lifecycle_id,
-            "workspace_path": self.workspace_path,
-            "approval_policy": "sensitive",
+            "sandbox_id": self.sandbox_id,
+            "workspace_id": self.workspace_id,
+            "workspace_path": CONTAINER_PATHS["workspace"],
+            "default_target": "sandbox",
         }
 
 
 class AgentScopeManager:
-    """Own stable host-executed Agent workspaces and runtime sessions."""
+    """Own stable Agent workspaces, sandbox identities and runtime sessions."""
 
     def __init__(self, config: PlatformConfig, db: Database):
         self.config = config
@@ -63,6 +68,7 @@ class AgentScopeManager:
         self._workspace_root = self._workspace_root.resolve()
         self._scope_cache: dict[str, AgentExecutionScope] = {}
         self._scope_cache_lock = threading.RLock()
+        self._normalize_workspace_records()
 
     @staticmethod
     def private_scope_key(user_id: int) -> str:
@@ -85,16 +91,19 @@ class AgentScopeManager:
             and not any(ch in session_id for ch in "\r\n\x00")
         )
 
-    def _expected_workspace(self, scope_type: str, scope_id: str) -> Path:
+    def _workspace_id(self, scope_type: str, scope_id: str) -> str:
         if scope_type == "private":
             user_id = int(scope_id)
             if user_id <= 0:
                 raise ValueError("private Agent scope requires a positive user id")
-            candidate = self._workspace_root / f"user-{user_id}"
+            return f"user-{user_id}"
         elif scope_type == "channel":
-            candidate = self._workspace_root / "channels" / f"channel-{self._safe_channel_id(scope_id)}"
+            return f"channels/channel-{self._safe_channel_id(scope_id)}"
         else:
             raise ValueError(f"unsupported Agent scope type: {scope_type}")
+
+    def _expected_workspace(self, scope_type: str, scope_id: str) -> Path:
+        candidate = self._workspace_root / self._workspace_id(scope_type, scope_id)
 
         ensure_private_directory(candidate.parent)
         candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -114,6 +123,25 @@ class AgentScopeManager:
                 raise ValueError("Agent workspace must not contain symlink path components")
         ensure_private_directory(resolved)
         return resolved
+
+    def _normalize_workspace_records(self) -> None:
+        """Replace legacy absolute workspace values with relative identifiers."""
+
+        rows = self.db.query(
+            "SELECT scope_key, scope_type, scope_id, workspace_path FROM agent_scopes"
+        )
+        timestamp = now_ts()
+        updates: list[tuple[str, int, str]] = []
+        for row in rows:
+            expected = self._workspace_id(str(row["scope_type"]), str(row["scope_id"]))
+            if str(row.get("workspace_path") or "") != expected:
+                updates.append((expected, timestamp, str(row["scope_key"])))
+        if updates:
+            with self.db.transaction() as conn:
+                conn.executemany(
+                    "UPDATE agent_scopes SET workspace_path = ?, updated_at = ? WHERE scope_key = ?",
+                    updates,
+                )
 
     def ensure_private_scope(self, user_id: int) -> AgentExecutionScope:
         uid = int(user_id)
@@ -150,6 +178,7 @@ class AgentScopeManager:
         # must not turn a later directory-to-symlink replacement into a durable
         # cross-scope workspace escape.
         workspace = self._expected_workspace(scope_type, scope_id)
+        workspace_id = self._workspace_id(scope_type, scope_id)
         with self._scope_cache_lock:
             cached = self._scope_cache.get(scope_key)
         if (
@@ -184,11 +213,11 @@ class AgentScopeManager:
                 """
                 INSERT INTO agent_scopes(
                     scope_key, scope_type, scope_id, session_id, lifecycle_id, workspace_path,
-                    execution_backend, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'host', ?, ?)
+                    sandbox_id, execution_backend, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'sandbox', ?, ?)
                 ON CONFLICT(scope_key) DO UPDATE SET
                     workspace_path=excluded.workspace_path,
-                    execution_backend='host',
+                    execution_backend='sandbox',
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -197,7 +226,8 @@ class AgentScopeManager:
                     scope_id,
                     default_session_id,
                     scope_lifecycle_id,
-                    str(workspace),
+                    workspace_id,
+                    f"agent-{secrets.token_hex(16)}",
                     ts,
                     ts,
                 ),
@@ -352,15 +382,27 @@ class AgentScopeManager:
         with self.db.transaction() as transaction:
             write(transaction)
 
-    @staticmethod
-    def _from_row(row: dict[str, Any]) -> AgentExecutionScope:
+    def _from_row(self, row: dict[str, Any]) -> AgentExecutionScope:
+        workspace_id = str(row["workspace_path"])
+        stored = Path(workspace_id)
+        if stored.is_absolute():
+            workspace_id = self._workspace_id(str(row["scope_type"]), str(row["scope_id"]))
+            workspace = self._expected_workspace(str(row["scope_type"]), str(row["scope_id"]))
+        else:
+            workspace = (self._workspace_root / stored).resolve()
+            try:
+                workspace.relative_to(self._workspace_root)
+            except ValueError as exc:
+                raise ValueError("stored Agent workspace escapes the workspace root") from exc
         return AgentExecutionScope(
             scope_key=str(row["scope_key"]),
             scope_type=str(row["scope_type"]),
             scope_id=str(row["scope_id"]),
             session_id=str(row["runtime_session_id"]),
             lifecycle_id=str(row["runtime_lifecycle_id"]),
-            workspace_path=str(row["workspace_path"]),
+            workspace_path=str(workspace),
+            workspace_id=workspace_id,
+            sandbox_id=str(row["sandbox_id"]),
         )
 
     @staticmethod
@@ -372,8 +414,10 @@ class AgentScopeManager:
                 "scope_type": scope.scope_type,
                 "scope_id": scope.scope_id,
                 "lifecycle_id": scope.lifecycle_id,
-                "execution_backend": "host",
-                "isolation": "logical",
+                "sandbox_id": scope.sandbox_id,
+                "workspace_id": scope.workspace_id,
+                "execution_backend": "sandbox",
+                "isolation": "container-workspace",
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -394,8 +438,10 @@ class AgentScopeManager:
                 and payload.get("scope_type") == scope.scope_type
                 and str(payload.get("scope_id")) == scope.scope_id
                 and payload.get("lifecycle_id") == scope.lifecycle_id
-                and payload.get("execution_backend") == "host"
-                and payload.get("isolation") == "logical"
+                and payload.get("sandbox_id") == scope.sandbox_id
+                and payload.get("workspace_id") == scope.workspace_id
+                and payload.get("execution_backend") == "sandbox"
+                and payload.get("isolation") == "container-workspace"
             )
         except (OSError, ValueError, TypeError):
             return False

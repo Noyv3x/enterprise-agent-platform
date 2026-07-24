@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .container_contract_generated import DATABASE_SCHEMA_VERSION
 from .memory_security import memory_content_hash
 from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
 
@@ -122,6 +123,12 @@ class Database:
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
 
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    applied_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
@@ -221,7 +228,9 @@ class Database:
                     session_id TEXT NOT NULL,
                     lifecycle_id TEXT NOT NULL DEFAULT '',
                     workspace_path TEXT NOT NULL,
-                    execution_backend TEXT NOT NULL DEFAULT 'host' CHECK(execution_backend = 'host'),
+                    sandbox_id TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'sandbox'
+                        CHECK(execution_backend = 'sandbox'),
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE(scope_type, scope_id)
@@ -343,6 +352,7 @@ class Database:
                     ON telegram_updates(status, update_id);
                 """
             )
+            self._migrate_agent_scopes_to_sandbox()
             self._ensure_user_columns()
             self._ensure_message_columns()
             self._ensure_conversation_revisions()
@@ -356,6 +366,101 @@ class Database:
             self._ensure_fts()
             self._ensure_message_fts()
             self._conn.commit()
+
+    def _migrate_agent_scopes_to_sandbox(self) -> None:
+        """Version the host-to-Sandbox scope schema change without data loss."""
+
+        version = DATABASE_SCHEMA_VERSION
+        if self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+        ).fetchone():
+            return
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(agent_scopes)").fetchall()
+        }
+        table = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_scopes'"
+        ).fetchone()
+        schema = str(table["sql"] or "").lower() if table else ""
+        needs_rebuild = "sandbox_id" not in columns or "execution_backend = 'host'" in schema
+        if needs_rebuild:
+            self._conn.commit()
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self._conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE agent_runtime_scope_sessions RENAME TO agent_runtime_scope_sessions_legacy;
+                    ALTER TABLE agent_runtime_scopes RENAME TO agent_runtime_scopes_legacy;
+                    ALTER TABLE agent_scopes RENAME TO agent_scopes_legacy;
+                    DROP INDEX IF EXISTS idx_agent_runtime_scope_sessions_lookup;
+                    DROP INDEX IF EXISTS idx_agent_scopes_type_id;
+
+                    CREATE TABLE agent_scopes (
+                        scope_key TEXT PRIMARY KEY,
+                        scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
+                        scope_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        lifecycle_id TEXT NOT NULL DEFAULT '',
+                        workspace_path TEXT NOT NULL,
+                        sandbox_id TEXT NOT NULL,
+                        execution_backend TEXT NOT NULL DEFAULT 'sandbox'
+                            CHECK(execution_backend = 'sandbox'),
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        UNIQUE(scope_type, scope_id)
+                    );
+                    CREATE INDEX idx_agent_scopes_type_id
+                        ON agent_scopes(scope_type, scope_id);
+                    CREATE TABLE agent_runtime_scopes (
+                        scope_key TEXT PRIMARY KEY REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                        session_id TEXT NOT NULL,
+                        lifecycle_id TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE agent_runtime_scope_sessions (
+                        scope_key TEXT NOT NULL REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
+                        lifecycle_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                    );
+                    CREATE INDEX idx_agent_runtime_scope_sessions_lookup
+                        ON agent_runtime_scope_sessions(scope_key, lifecycle_id, session_id);
+                    INSERT INTO agent_scopes(
+                        scope_key, scope_type, scope_id, session_id, lifecycle_id,
+                        workspace_path, sandbox_id, execution_backend, created_at, updated_at
+                    )
+                    SELECT scope_key, scope_type, scope_id, session_id, lifecycle_id,
+                           workspace_path, 'agent-' || lower(hex(randomblob(16))),
+                           'sandbox', created_at, updated_at
+                    FROM agent_scopes_legacy;
+                    INSERT INTO agent_runtime_scopes SELECT * FROM agent_runtime_scopes_legacy;
+                    INSERT INTO agent_runtime_scope_sessions SELECT * FROM agent_runtime_scope_sessions_legacy;
+                    DROP TABLE agent_runtime_scope_sessions_legacy;
+                    DROP TABLE agent_runtime_scopes_legacy;
+                    DROP TABLE agent_scopes_legacy;
+                    """
+                )
+                violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        "scope migration produced "
+                        f"{len(violations)} foreign-key violations"
+                    )
+                self._conn.commit()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+            finally:
+                self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+            (version, "agent-scopes-container-sandbox", now_ts()),
+        )
 
     def _ensure_user_columns(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -601,6 +706,12 @@ class Database:
             )
         self._conn.execute(
             "UPDATE agent_scopes SET lifecycle_id = lower(hex(randomblob(16))) WHERE lifecycle_id = ''"
+        )
+        if "sandbox_id" not in columns:
+            raise sqlite3.DatabaseError("agent_scopes sandbox migration did not complete")
+        self._conn.execute(
+            "UPDATE agent_scopes SET sandbox_id = 'agent-' || lower(hex(randomblob(16))) "
+            "WHERE sandbox_id = ''"
         )
 
     def _ensure_agent_runtime_scopes(self) -> None:

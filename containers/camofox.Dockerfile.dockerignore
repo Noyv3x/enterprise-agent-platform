@@ -1,0 +1,11 @@
+**
+!enterprise-agent-platform/
+!enterprise-agent-platform/**
+!containers/
+!containers/**
+enterprise-agent-platform/data/
+enterprise-agent-platform/**/node_modules/
+enterprise-agent-platform/**/dist/
+enterprise-agent-platform/**/.cache/
+enterprise-agent-platform/**/coverage/
+enterprise-agent-platform/**/*.log

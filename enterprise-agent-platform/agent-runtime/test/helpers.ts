@@ -33,6 +33,8 @@ export function testConfig(home: string, overrides: Partial<RuntimeConfig> = {})
     cleanupGraceMs: 500,
     maxConcurrency: 8,
     maxQueuedRuns: 256,
+    executionMode: "local",
+    managerRequestTimeoutMs: 3_630_000,
     ...overrides,
   };
 }

@@ -5,12 +5,11 @@ ubitech agent 的设计、架构、运维与开发规范统一收录在 [canonic
 ## 快速开始
 
 ```bash
-git clone https://github.com/Noyv3x/enterprise-agent-platform.git
-cd enterprise-agent-platform
-./deploy.sh
+curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/install.sh | bash
+ubitech-manager status
 ```
 
-启动后访问 `http://127.0.0.1:8765`。
+安装器校验并启动用户级 `ubitech-manager`；默认访问地址由 `~/.config/ubitech-agent/manager.toml` 的 `listen` 决定。源码 checkout 只用于开发，不参与生产运行。
 
 - [安装、配置与服务管理](docs/operations/deployment.md)
 - [系统架构](docs/design/system-architecture.md)

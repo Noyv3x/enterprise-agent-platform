@@ -1,0 +1,919 @@
+name: Container release
+
+on:
+  workflow_run:
+    workflows:
+      - Quality gates
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or ref to release after its quality workflow succeeded
+        required: true
+        default: main
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  # A bridge may have pulled any qualified main commit, so a newer workflow
+  # must not evict its pending exact release. Channel monotonicity is enforced
+  # separately when the immutable release is made public.
+  group: container-release-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve release commit
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      image_namespace: ${{ steps.release.outputs.image_namespace }}
+      cognee_revision: ${{ steps.release.outputs.cognee_revision }}
+      firecrawl_revision: ${{ steps.release.outputs.firecrawl_revision }}
+    steps:
+      - name: Check out qualified source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable release inputs
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$source_commit" origin/main
+          image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          cognee_revision="$(jq -er '.sources.cognee.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
+          firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
+          {
+            echo "source_commit=$source_commit"
+            echo "image_namespace=$image_namespace"
+            echo "cognee_revision=$cognee_revision"
+            echo "firecrawl_revision=$firecrawl_revision"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require a successful quality run for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          successful="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+          if [[ "$successful" -lt 1 ]]; then
+            echo "No successful pushed Quality gates run exists for $SOURCE_COMMIT" >&2
+            exit 1
+          fi
+
+      - name: Recheck container definitions
+        run: scripts/container-smoke.sh
+
+  upstream-contracts:
+    name: Validate managed upstream sources
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Validate exact Cognee and Firecrawl revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          git -C "$root" init cognee
+          git -C "$root/cognee" remote add origin https://github.com/topoteretes/cognee.git
+          git -C "$root/cognee" fetch --depth=1 origin '${{ needs.prepare.outputs.cognee_revision }}'
+          git -C "$root/cognee" checkout --detach FETCH_HEAD
+          test "$(git -C "$root/cognee" rev-parse HEAD)" = '${{ needs.prepare.outputs.cognee_revision }}'
+          test -f "$root/cognee/pyproject.toml"
+          test -f "$root/cognee/cognee/__init__.py"
+
+          git -C "$root" init firecrawl
+          git -C "$root/firecrawl" remote add origin https://github.com/firecrawl/firecrawl.git
+          git -C "$root/firecrawl" fetch --depth=1 origin '${{ needs.prepare.outputs.firecrawl_revision }}'
+          git -C "$root/firecrawl" checkout --detach FETCH_HEAD
+          test "$(git -C "$root/firecrawl" rev-parse HEAD)" = '${{ needs.prepare.outputs.firecrawl_revision }}'
+          test -f "$root/firecrawl/docker-compose.yaml"
+          docker compose -f "$root/firecrawl/docker-compose.yaml" config --services | sort > "$root/actual-services"
+          jq -r '.sources.firecrawl.compose_services[]' docs/contracts/upstream-sources.json | sort > "$root/expected-services"
+          diff -u "$root/expected-services" "$root/actual-services"
+
+      - name: Verify immutable integration image indexes exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          images=(
+            'ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812'
+            'ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c'
+            'ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2'
+            'ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6'
+            'redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
+            'rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
+            'foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48'
+          )
+          for image in "${images[@]}"; do
+            raw="$(docker buildx imagetools inspect "$image" --raw)"
+            jq -e '
+              [.manifests[]?.platform | select(.os == "linux") | .architecture]
+              | (index("amd64") != null and index("arm64") != null)
+            ' <<<"$raw" >/dev/null
+          done
+
+  images:
+    name: Build ${{ matrix.component }} image
+    needs:
+      - prepare
+      - upstream-contracts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: platform
+            dockerfile: containers/platform.Dockerfile
+            image: platform
+          - component: agent-runtime
+            dockerfile: containers/agent-runtime.Dockerfile
+            image: agent-runtime
+          - component: camofox
+            dockerfile: containers/camofox.Dockerfile
+            image: camofox
+          - component: agent-sandbox
+            dockerfile: containers/agent-sandbox.Dockerfile
+            image: agent-sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-architecture image
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}:${{ needs.prepare.outputs.source_commit }}
+          build-args: |
+            SOURCE_COMMIT=${{ needs.prepare.outputs.source_commit }}
+            RELEASE_VERSION=${{ needs.prepare.outputs.source_commit }}
+            COGNEE_REVISION=${{ needs.prepare.outputs.cognee_revision }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+      - name: Record immutable image identity
+        shell: bash
+        env:
+          COMPONENT: ${{ matrix.component }}
+          IMAGE: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          raw="$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw)"
+          jq -e '
+            [.manifests[]?.platform | select(.os == "linux") | .architecture]
+            | (index("amd64") != null and index("arm64") != null)
+          ' <<<"$raw" >/dev/null
+          jq -n \
+            --arg component "$COMPONENT" \
+            --arg reference "$IMAGE" \
+            --arg digest "$DIGEST" \
+            '{component:$component,reference:$reference,digest:$digest}' \
+            > "${COMPONENT}.json"
+
+      - name: Upload image identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ matrix.component }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  public-images:
+    name: Verify anonymously pullable images
+    needs:
+      - prepare
+      - images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Download immutable image identities
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: image-metadata
+          merge-multiple: true
+
+      - name: Require release packages to be public
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          [[ "$owner" =~ ^[a-z0-9]([a-z0-9-]{0,37}[a-z0-9])?$ ]]
+          [[ ${#repository} -le 100 && "$repository" =~ ^[a-z0-9._-]+$ ]]
+          owner_type="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/users/${owner}" --jq '.type')"
+          case "$owner_type" in
+            Organization) package_base="/orgs/${owner}/packages/container" ;;
+            User) package_base="/user/packages/container" ;;
+            *) echo "Unsupported package owner type: $owner_type" >&2; exit 1 ;;
+          esac
+
+          for component in platform agent-runtime camofox agent-sandbox; do
+            metadata="image-metadata/${component}.json"
+            package="${repository}/${component}"
+            reference="$(jq -er '.reference' "$metadata")"
+            expected_reference="ghcr.io/${owner}/${package}"
+            [[ "$reference" == "$expected_reference" ]] || {
+              echo "Unexpected image reference for ${component}: ${reference}" >&2
+              exit 1
+            }
+            encoded_package="$(jq -rn --arg value "$package" '$value | @uri')"
+            endpoint="${package_base}/${encoded_package}"
+            package_json="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$endpoint")"
+            jq -e \
+                --arg owner "$owner" \
+                --arg package "$package" '
+                  .package_type == "container" and
+                  (.owner.login | ascii_downcase) == $owner and
+                  (.name | ascii_downcase) == $package
+                ' <<<"$package_json" >/dev/null
+            visibility="$(jq -er '.visibility' <<<"$package_json")"
+            if [[ "$visibility" != public ]]; then
+              settings_url="$(jq -er '.html_url | select(startswith("https://github.com/"))' <<<"$package_json")/settings"
+              echo "::error title=GHCR package is not public::Set ${package} to Public once at ${settings_url}, then rerun this release. GitHub exposes no supported package-visibility mutation API, so publication fails closed."
+              exit 1
+            fi
+          done
+
+      - name: Pull every final digest without registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          anonymous_config="$(mktemp -d "${RUNNER_TEMP}/anonymous-docker.XXXXXX")"
+          cleanup() { rm -rf "$anonymous_config"; }
+          trap cleanup EXIT
+          chmod 0700 "$anonymous_config"
+          printf '{}\n' > "$anonymous_config/config.json"
+          chmod 0600 "$anonymous_config/config.json"
+          export DOCKER_CONFIG="$anonymous_config"
+          unset DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE
+          jq -e '
+            ((.auths // {}) | length) == 0 and
+            (has("credsStore") | not) and
+            (has("credHelpers") | not)
+          ' "$DOCKER_CONFIG/config.json" >/dev/null
+
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+
+          for component in platform agent-runtime camofox agent-sandbox; do
+            package="${repository}/${component}"
+            image="$(jq -er '
+              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
+              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+              .reference + "@" + .digest
+            ' "image-metadata/${component}.json")"
+            digest="${image##*@}"
+            anonymous_token="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
+              --fail --silent --show-error --get \
+              --data-urlencode 'service=ghcr.io' \
+              --data-urlencode "scope=repository:${owner}/${package}:pull" \
+              'https://ghcr.io/token' | jq -er '.token | select(type == "string" and length > 0)')"
+            manifest_headers="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
+              --fail --silent --show-error --head \
+              --header "Authorization: Bearer ${anonymous_token}" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${owner}/${package}/manifests/${digest}")"
+            registry_digest="$(awk 'BEGIN {IGNORECASE=1} $1 == "docker-content-digest:" {gsub("\r", "", $2); print tolower($2)}' <<<"$manifest_headers" | tail -n 1)"
+            [[ "$registry_digest" == "$digest" ]] || {
+              echo "Anonymous registry metadata returned ${registry_digest:-no digest} for ${image}" >&2
+              exit 1
+            }
+            docker image rm --force "$image" >/dev/null 2>&1 || true
+            docker pull "$image"
+            docker image inspect "$image" --format '{{json .RepoDigests}}' |
+              jq -e --arg image "$image" 'index($image) != null' >/dev/null
+          done
+
+          jq -e '
+            ((.auths // {}) | length) == 0 and
+            (has("credsStore") | not) and
+            (has("credHelpers") | not)
+          ' "$DOCKER_CONFIG/config.json" >/dev/null
+
+  manager-binaries:
+    name: Manager linux/${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: manager/go.mod
+          cache: false
+
+      - name: Test manager
+        working-directory: manager
+        run: go test ./...
+
+      - name: Build static manager
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.arch }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          output="dist/ubitech-manager-linux-${GOARCH}"
+          CGO_ENABLED=0 GOOS=linux go -C manager build \
+            -trimpath \
+            -ldflags "-s -w -buildid= -X main.version=${SOURCE_COMMIT}" \
+            -o "../$output" \
+            ./cmd/ubitech-manager
+          test -s "$output"
+          (cd dist && sha256sum "$(basename "$output")" > "$(basename "$output").sha256")
+
+      - name: Upload manager binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: manager-${{ matrix.arch }}
+          path: |
+            dist/ubitech-manager-linux-${{ matrix.arch }}
+            dist/ubitech-manager-linux-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  compose-smoke:
+    name: Core Compose smoke test
+    needs:
+      - prepare
+      - images
+      - public-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download image identities
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: image-metadata
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start and probe the core stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          export UBITECH_COMPOSE_PROJECT="ubitech-release-smoke-${GITHUB_RUN_ID}"
+          export UBITECH_CORE_NETWORK="${UBITECH_COMPOSE_PROJECT}-core"
+          export UBITECH_DATA_ROOT="$root/state"
+          export UBITECH_SECRETS_DIR="$UBITECH_DATA_ROOT/manager/secrets"
+          export UBITECH_MANAGER_CONTROL_DIR="$UBITECH_DATA_ROOT/manager/control"
+          export UBITECH_UID="$(id -u)"
+          export UBITECH_GID="$(id -g)"
+          export UBITECH_PLATFORM_BIND=127.0.0.1:18080
+          export UBITECH_PUBLIC_BASE_URL=http://127.0.0.1:18080
+          export UBITECH_PLATFORM_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/platform.json)"
+          export UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/agent-runtime.json)"
+          export UBITECH_CAMOFOX_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/camofox.json)"
+          sandbox_image="$(jq -er '.reference + "@" + .digest' image-metadata/agent-sandbox.json)"
+          sandbox_container="${UBITECH_COMPOSE_PROJECT}-sandbox"
+          manager_stub_pid=""
+          cleanup() {
+            docker rm --force "$sandbox_container" >/dev/null 2>&1 || true
+            docker compose -f containers/compose.yaml down --volumes --remove-orphans >/dev/null 2>&1 || true
+            docker network rm "$UBITECH_CORE_NETWORK" >/dev/null 2>&1 || true
+            if [[ -n "$manager_stub_pid" ]]; then
+              kill "$manager_stub_pid" >/dev/null 2>&1 || true
+              wait "$manager_stub_pid" 2>/dev/null || true
+            fi
+            rm -rf "$root"
+          }
+          trap cleanup EXIT
+          mkdir -p \
+            "$UBITECH_SECRETS_DIR" "$UBITECH_MANAGER_CONTROL_DIR" \
+            "$UBITECH_DATA_ROOT/data/runtimes/agent" \
+            "$UBITECH_DATA_ROOT/data/runtimes/camofox" \
+            "$UBITECH_DATA_ROOT/data/runtimes/searxng/config" \
+            "$UBITECH_DATA_ROOT/data/runtimes/searxng/cache"
+          for secret in \
+            session-secret agent-tool-token agent-runtime-token camofox-access-key manager-token manager-executor-token \
+            firecrawl-postgres-password firecrawl-bull-auth-key; do
+            openssl rand -hex 32 > "$UBITECH_SECRETS_DIR/$secret"
+          done
+          cp containers/searxng/settings.yml "$UBITECH_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
+          chmod 0700 \
+            "$UBITECH_DATA_ROOT/data/runtimes/searxng/config" \
+            "$UBITECH_DATA_ROOT/data/runtimes/searxng/cache"
+          chmod 0600 "$UBITECH_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
+          python3 - "$UBITECH_MANAGER_CONTROL_DIR/manager.sock" "$UBITECH_SECRETS_DIR/manager-token" <<'PY' &
+          import datetime
+          import hmac
+          import http.server
+          import json
+          import os
+          import socketserver
+          import sys
+          from pathlib import Path
+
+          socket_path = Path(sys.argv[1])
+          token = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+
+          class ManagerContract(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, format, *args):
+                  return
+
+              def send_json(self, status, payload):
+                  body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                  self.send_response(status)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Connection", "close")
+                  self.end_headers()
+                  self.wfile.write(body)
+                  self.close_connection = True
+
+              def do_GET(self):
+                  supplied = self.headers.get("Authorization", "")
+                  if not hmac.compare_digest(supplied, f"Bearer {token}"):
+                      self.send_json(401, {"error": "control authentication failed"})
+                      return
+                  if self.path != "/v1/status":
+                      self.send_json(404, {"error": "not found"})
+                      return
+                  checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                  self.send_json(200, {
+                      "generation": 0,
+                      "current": None,
+                      "previous": None,
+                      "target": None,
+                      "public_state": "idle",
+                      "phase": "",
+                      "services": {
+                          "manager": {"status": "healthy"},
+                          "platform": {"status": "running"},
+                      },
+                      "error": "",
+                      "maintenance": False,
+                      "active_operation_id": "",
+                      "finalize_pending_operation_id": "",
+                      "operation_id": "",
+                      "checked_at": checked_at,
+                  })
+
+          class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+              daemon_threads = True
+
+          server = ThreadingUnixHTTPServer(str(socket_path), ManagerContract)
+          os.chmod(socket_path, 0o600)
+          server.serve_forever()
+          PY
+          manager_stub_pid="$!"
+          for attempt in $(seq 1 50); do
+            [[ -S "$UBITECH_MANAGER_CONTROL_DIR/manager.sock" ]] && break
+            kill -0 "$manager_stub_pid"
+            sleep 0.1
+          done
+          test -S "$UBITECH_MANAGER_CONTROL_DIR/manager.sock"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --unix-socket "$UBITECH_MANAGER_CONTROL_DIR/manager.sock" \
+            http://manager/v1/status)" = 401
+          manager_status="$(curl --fail --silent --show-error \
+            --unix-socket "$UBITECH_MANAGER_CONTROL_DIR/manager.sock" \
+            --header "Authorization: Bearer $(<"$UBITECH_SECRETS_DIR/manager-token")" \
+            http://manager/v1/status)"
+          jq -e '
+            .public_state == "idle" and
+            .maintenance == false and
+            .active_operation_id == "" and
+            .finalize_pending_operation_id == "" and
+            .operation_id == "" and
+            .services.manager.status == "healthy"
+          ' <<<"$manager_status" >/dev/null
+          docker network create \
+            --driver bridge \
+            --label org.ubitech.agent.network=core \
+            "$UBITECH_CORE_NETWORK"
+          docker compose -f containers/compose.yaml config --quiet
+          docker compose -f containers/compose.yaml up --detach agent-runtime camofox searxng platform
+          for service in agent-runtime camofox searxng platform; do
+            container="$(docker compose -f containers/compose.yaml ps -q "$service")"
+            for attempt in $(seq 1 60); do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
+              [[ "$status" == healthy ]] && break
+              [[ "$status" != unhealthy || "$attempt" -lt 60 ]] || {
+                docker compose -f containers/compose.yaml logs "$service"
+                exit 1
+              }
+              sleep 5
+            done
+            test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
+          done
+          curl --fail --silent --show-error http://127.0.0.1:18080/healthz | jq -e '.service == "ubitech-agent-platform"'
+          docker compose -f containers/compose.yaml exec -T camofox node --input-type=module - <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const key = readFileSync('/run/secrets/ubitech/camofox-access-key', 'utf8').trim();
+          const response = await fetch('http://127.0.0.1:9377/tabs', {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${key}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+              userId: 'release-smoke',
+              sessionKey: 'browser',
+              url: 'https://example.com/',
+            }),
+          });
+          if (!response.ok) throw new Error(`Camoufox tab creation failed: ${response.status} ${await response.text()}`);
+          const tab = await response.json();
+          if (tab.url !== 'https://example.com/') throw new Error(`unexpected Camoufox URL: ${tab.url}`);
+          const health = await (await fetch('http://127.0.0.1:9377/health')).json();
+          if (!health.browserConnected || !health.browserRunning) throw new Error('Camoufox browser did not start');
+          NODE
+          sandbox_mount_root="$root/sandbox-uid-mapping"
+          mkdir -p "$sandbox_mount_root/workspace" "$sandbox_mount_root/home" "$sandbox_mount_root/env"
+          touch "$sandbox_mount_root/workspace/ownership-sentinel"
+          sentinel_uid="$(stat -c %u "$sandbox_mount_root/workspace/ownership-sentinel")"
+          docker run --rm \
+            --env UBITECH_AGENT_UID=12345 \
+            --env UBITECH_AGENT_GID=23456 \
+            --env "UBITECH_SENTINEL_UID=$sentinel_uid" \
+            --mount "type=bind,src=$sandbox_mount_root/workspace,dst=/workspace" \
+            --mount "type=bind,src=$sandbox_mount_root/home,dst=/home/agent" \
+            --mount "type=bind,src=$sandbox_mount_root/env,dst=/opt/agent-env" \
+            "$sandbox_image" \
+            sh -eu -c 'test "$(id -u)" = 12345; test "$(id -g)" = 23456; test "$(sudo -n id -u)" = 0; test "$(stat -c %u /workspace/ownership-sentinel)" = "$UBITECH_SENTINEL_UID"; chmod 0755 /workspace /home/agent /opt/agent-env'
+          test "$(stat -c %u "$sandbox_mount_root/workspace/ownership-sentinel")" = "$sentinel_uid"
+          docker compose -f containers/compose.yaml create \
+            firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
+            firecrawl-postgres firecrawl-foundationdb firecrawl-foundationdb-init
+          docker run --detach \
+            --name "$sandbox_container" \
+            --network "$UBITECH_CORE_NETWORK" \
+            --env UBITECH_AGENT_UID=12345 \
+            --env UBITECH_AGENT_GID=23456 \
+            "$sandbox_image"
+          docker exec --user 12345:23456 "$sandbox_container" sh -eu -c \
+            'test "$(id -u)" = 12345; test "$(id -g)" = 23456'
+          docker compose -f containers/compose.yaml down --remove-orphans
+          test "$(docker inspect --format '{{.State.Running}}' "$sandbox_container")" = true
+          docker network inspect "$UBITECH_CORE_NETWORK" \
+            --format '{{index .Labels "org.ubitech.agent.network"}}' | grep -Fx core
+          docker network inspect "$UBITECH_CORE_NETWORK" \
+            --format '{{json .Containers}}' | jq -e --arg id "$(docker inspect --format '{{.Id}}' "$sandbox_container")" 'has($id)'
+          docker compose -f containers/compose.yaml up --detach --wait \
+            agent-runtime camofox searxng platform
+          test "$(docker inspect --format '{{.State.Running}}' "$sandbox_container")" = true
+
+  publish:
+    name: Publish atomic main release
+    needs:
+      - prepare
+      - upstream-contracts
+      - images
+      - manager-binaries
+      - compose-smoke
+      - public-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*'
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble and validate release manifest
+        id: manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/release"
+          mkdir -p "$stage"
+          cp artifacts/ubitech-manager-linux-amd64 artifacts/ubitech-manager-linux-amd64.sha256 "$stage/"
+          cp artifacts/ubitech-manager-linux-arm64 artifacts/ubitech-manager-linux-arm64.sha256 "$stage/"
+          cp containers/compose.yaml "$stage/ubitech-compose.yaml"
+          cp install.sh "$stage/install.sh"
+          chmod 0755 "$stage"/ubitech-manager-linux-* "$stage/install.sh"
+          bash -n "$stage/install.sh"
+          release_tag="container-${SOURCE_COMMIT}"
+          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
+          compose_sha="$(sha256sum "$stage/ubitech-compose.yaml" | awk '{print $1}')"
+          amd64_sha="$(awk 'NR==1 {print $1}' "$stage/ubitech-manager-linux-amd64.sha256")"
+          arm64_sha="$(awk 'NR==1 {print $1}' "$stage/ubitech-manager-linux-arm64.sha256")"
+          generated_at="$(git show -s --format=%cI "$SOURCE_COMMIT")"
+          database_schema_version="$(jq -er '.database_schema_version' docs/contracts/container-platform.json)"
+          image() { jq -er '.reference + "@" + .digest' "artifacts/$1.json"; }
+          jq -n \
+            --arg source_commit "$SOURCE_COMMIT" \
+            --arg generated_at "$generated_at" \
+            --argjson database_schema_version "$database_schema_version" \
+            --arg manager_version "$SOURCE_COMMIT" \
+            --arg manager_amd64_url "$release_base/ubitech-manager-linux-amd64" \
+            --arg manager_amd64_sha "$amd64_sha" \
+            --arg manager_arm64_url "$release_base/ubitech-manager-linux-arm64" \
+            --arg manager_arm64_sha "$arm64_sha" \
+            --arg compose_url "$release_base/ubitech-compose.yaml" \
+            --arg compose_sha "$compose_sha" \
+            --arg platform "$(image platform)" \
+            --arg runtime "$(image agent-runtime)" \
+            --arg camofox "$(image camofox)" \
+            --arg sandbox "$(image agent-sandbox)" \
+            '{
+              schema_version: 1,
+              channel: "main",
+              source_commit: $source_commit,
+              generated_at: $generated_at,
+              protocol_version: 1,
+              database_schema_version: $database_schema_version,
+              manager: {
+                version: $manager_version,
+                artifacts: {
+                  amd64: {url: $manager_amd64_url, sha256: $manager_amd64_sha},
+                  arm64: {url: $manager_arm64_url, sha256: $manager_arm64_sha}
+                }
+              },
+              compose: {url: $compose_url, sha256: $compose_sha},
+              images: {
+                platform: $platform,
+                "agent-runtime": $runtime,
+                camofox: $camofox,
+                "agent-sandbox": $sandbox,
+                searxng: "ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812",
+                "firecrawl-api": "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c",
+                "firecrawl-playwright": "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2",
+                "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
+                "firecrawl-redis": "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
+                "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69",
+                "firecrawl-foundationdb": "foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48"
+              }
+            }' > "$stage/release.json"
+          python3 - "$stage/release.json" <<'PY'
+          import json
+          import re
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          if set(data) != {"schema_version", "channel", "source_commit", "generated_at", "protocol_version", "database_schema_version", "manager", "compose", "images"}:
+              raise SystemExit("release manifest top-level shape mismatch")
+          if data["schema_version"] != 1 or data["channel"] != "main":
+              raise SystemExit("release manifest channel/schema mismatch")
+          digest = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+          for name, image in data["images"].items():
+              if not digest.fullmatch(image):
+                  raise SystemExit(f"invalid image digest for {name}: {image}")
+          for artifact in [*data["manager"]["artifacts"].values(), data["compose"]]:
+              if not artifact["url"].startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]):
+                  raise SystemExit("invalid release artifact")
+          PY
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish complete release as one visible generation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          STAGE: ${{ steps.manifest.outputs.stage }}
+          RELEASE_TAG: ${{ steps.manifest.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != true ]]; then
+              mkdir -p "$RUNNER_TEMP/existing"
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/existing"
+              for asset in \
+                release.json ubitech-compose.yaml install.sh \
+                ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
+                ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
+                test -f "$RUNNER_TEMP/existing/$asset"
+                cmp "$STAGE/$asset" "$RUNNER_TEMP/existing/$asset"
+              done
+              (
+                cd "$RUNNER_TEMP/existing"
+                bash -n install.sh
+              )
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_COMMIT" \
+              --title "ubitech agent ${SOURCE_COMMIT:0:12}" \
+              --notes "Immutable Docker release for ${SOURCE_COMMIT}." \
+              --draft
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$STAGE/ubitech-manager-linux-amd64" \
+            "$STAGE/ubitech-manager-linux-amd64.sha256" \
+            "$STAGE/ubitech-manager-linux-arm64" \
+            "$STAGE/ubitech-manager-linux-arm64.sha256" \
+            "$STAGE/ubitech-compose.yaml" \
+            "$STAGE/install.sh"
+          # release.json is deliberately the final uploaded artifact. Publish
+          # this exact generation as non-latest; the serialized promotion job
+          # below owns the mutable main channel.
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "$STAGE/release.json"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+
+  promote:
+    name: Promote main channel monotonically
+    needs:
+      - prepare
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: container-channel-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out release history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Promote newest qualified release on main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin main
+          declare -A released=()
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^container-([0-9a-f]{40})$ ]]; then
+              released["${BASH_REMATCH[1]}"]=1
+            fi
+          done < <(gh api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          release_tag=""
+          while IFS= read -r commit; do
+            if [[ -n "${released[$commit]:-}" ]]; then
+              release_tag="container-${commit}"
+              break
+            fi
+          done < <(git rev-list origin/main)
+          if [[ -z "$release_tag" ]]; then
+            echo "No public qualified container release is reachable from main" >&2
+            exit 1
+          fi
+          release_dir="$RUNNER_TEMP/channel-release"
+          mkdir -p "$release_dir"
+          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$release_dir"
+          for asset in \
+            release.json ubitech-compose.yaml install.sh \
+            ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
+            ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
+            test -f "$release_dir/$asset"
+          done
+          release_commit="${release_tag#container-}"
+          python3 - "$release_dir/release.json" "$release_commit" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          expected_commit = sys.argv[2]
+          manifest = json.loads(path.read_text(encoding="utf-8"))
+          if manifest.get("channel") != "main" or manifest.get("source_commit") != expected_commit:
+              raise SystemExit("release channel/source identity mismatch")
+          root = path.parent
+          artifacts = {
+              "ubitech-compose.yaml": manifest["compose"]["sha256"],
+              "ubitech-manager-linux-amd64": manifest["manager"]["artifacts"]["amd64"]["sha256"],
+              "ubitech-manager-linux-arm64": manifest["manager"]["artifacts"]["arm64"]["sha256"],
+          }
+          for name, expected in artifacts.items():
+              actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"release asset checksum mismatch: {name}")
+              if name.startswith("ubitech-manager-"):
+                  sidecar = (root / f"{name}.sha256").read_text(encoding="utf-8").split()
+                  if not sidecar or sidecar[0] != expected:
+                      raise SystemExit(f"release checksum sidecar mismatch: {name}")
+          PY
+          (
+            cd "$release_dir"
+            bash -n install.sh
+          )
+          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          if [[ "$current_tag" == "$release_tag" ]]; then
+            exit 0
+          fi
+          # Every surviving serialized promotion recomputes the globally newest
+          # public release on main, so replacement of a pending job cannot
+          # strand a newer already-published generation.
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --latest

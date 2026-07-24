@@ -1,281 +1,218 @@
-/* <AutoUpdateConfig/> — GitHub-webhook/polling auto-update watcher config + a
-   live status board (based on legacy renderAutoUpdateConfig, legacy-app.js:2364-2456).
-   interval_seconds is kept as STRING state and sent raw; the webhook secret is
-   never seeded (empty = keep) and clears via the post-save re-seed. Status polls
-   without overwriting an in-progress form draft. The "立即检查" button is gated
-   on the LIVE config.enabled (not the form draft). */
-
-import { Button, Input, Switch } from "antd";
+import {
+  Alert,
+  Button,
+  Descriptions,
+  Input,
+  Popconfirm,
+  Progress,
+  Space,
+  Switch,
+  Tag,
+  Typography,
+} from "antd";
 import { useEffect, useId, useState } from "react";
-import { checkAutoUpdateNow, saveAutoUpdateConfig } from "../../../data/adminActions";
+import {
+  checkAutoUpdateNow,
+  runManagerOperation,
+  saveAutoUpdateConfig,
+} from "../../../data/adminActions";
 import { loadAutoUpdateConfig } from "../../../data/loaders";
+import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import { formatTime, formatTimestamp, shortSha } from "../../../utils/format";
-import type { AutoUpdateConfigValues, AutoUpdateStatus } from "../../../types";
-import { CardHead } from "../../common/CardHead";
+import type { AutoUpdateConfigValues, AutoUpdateStatus, ManagerOperation } from "../../../types";
+import { formatTimestamp, shortSha } from "../../../utils/format";
 import { Field } from "../../common/Field";
 import { Icon } from "../../common/Icon";
-import { StatusBadge } from "../../common/StatusBadge";
-import { UsageMetricTile } from "../../common/UsageMetricTile";
 import { AdminCard } from "../AdminCard";
-import { useI18n } from "../../../i18n";
 
-function updateTriggerLabel(t: ReturnType<typeof useI18n>["t"], trigger: string | undefined): string {
-  switch (trigger) {
-    case "startup": return t("admin.updates.trigger.startup");
-    case "config": return t("admin.updates.trigger.config");
-    case "manual": return t("admin.updates.trigger.manual");
-    case "webhook": return t("admin.updates.trigger.webhook");
-    case "poll": return t("admin.updates.trigger.poll");
-    default: return trigger || "-";
-  }
-}
+const ACTIVE_STATES = new Set(["waiting_for_tasks", "updating"]);
 
-function updateStateLabel(
-  t: ReturnType<typeof useI18n>["t"],
-  status: AutoUpdateStatus,
-): string {
-  const state = String(status.state || status.phase || "");
-  switch (state) {
-    case "checking": return t("admin.updates.state.checking");
+function stateLabel(t: ReturnType<typeof useI18n>["t"], status: AutoUpdateStatus): string {
+  switch (status.state) {
     case "waiting_for_tasks": return t("admin.updates.state.waiting");
-    case "launching": return t("admin.updates.state.launching");
     case "updating": return t("admin.updates.state.updating");
     case "failed": return t("admin.updates.state.failed");
-    case "idle": return t("admin.updates.idle");
-    default:
-      return status.in_progress
-        ? t("admin.updates.checking")
-        : status.update_started
-          ? t("admin.updates.triggered")
-          : status.update_available
-            ? t("admin.updates.available")
-            : t("admin.updates.idle");
+    default: return t("admin.updates.idle");
   }
 }
 
-function updateTime(value: number | string | undefined): string {
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && numeric > 0) return formatTime(numeric);
-  return formatTimestamp(value);
-}
-
-interface AutoUpdateFormState {
-  enabled: boolean;
-  interval: string;
-  remote: string;
-  branch: string;
-  webhookSecret: string;
-}
-
-function seedForm(config: AutoUpdateConfigValues): AutoUpdateFormState {
+function seedForm(config: AutoUpdateConfigValues) {
   return {
-    enabled: !!config.enabled,
-    interval: String(config.interval_seconds || 30),
-    remote: config.remote || "origin",
-    branch: config.branch || "",
-    webhookSecret: "",
+    enabled: config.enabled !== false,
+    interval: String(config.interval_seconds || 300),
+    manifestUrl: String(config.release_manifest_url || ""),
   };
+}
+
+function generation(value: string | undefined): string {
+  return value ? value.slice(0, 18) : "-";
 }
 
 export function AutoUpdateConfig() {
   const { t } = useI18n();
-  const enabledLabelId = useId();
-  const enabledHintId = useId();
-  const intervalId = useId();
-  const remoteId = useId();
-  const branchId = useId();
-  const webhookSecretId = useId();
   const store = useStoreHandle();
-  const saving = useStore((state) => state.pendingOperations.includes("admin:updates:save"));
-  const checking = useStore((state) => state.pendingOperations.includes("admin:updates:check"));
-  const autoUpdateConfig = useStore((state) => state.autoUpdateConfig);
-  const config = autoUpdateConfig?.config || {};
-  const status = autoUpdateConfig?.status || {};
-  const webhookUrl = config.webhook_url || t("admin.updates.webhookPlaceholder");
-  const updateState = updateStateLabel(t, status);
-  const phase = status.state || status.phase || "";
-  const clean = !status.dirty;
-  const configFingerprint = JSON.stringify(config);
+  const data = useStore((state) => state.autoUpdateConfig);
+  const pending = useStore((state) => state.pendingOperations);
+  const config = data?.config || {};
+  const status = data?.status || {};
+  const [form, setForm] = useState(() => seedForm(config));
+  const fingerprint = JSON.stringify(config);
+  const enabledLabelId = useId();
 
-  const [form, setForm] = useState<AutoUpdateFormState>(() =>
-    seedForm(autoUpdateConfig?.config || {}),
-  );
-
-  useEffect(() => {
-    setForm(seedForm(config));
-  }, [configFingerprint]);
+  useEffect(() => setForm(seedForm(config)), [fingerprint]);
 
   useEffect(() => {
     let stopped = false;
-    let running = false;
-    let timer: number | null = null;
-
-    const schedule = () => {
-      if (timer !== null) window.clearTimeout(timer);
-      if (stopped || document.hidden) return;
-      const liveStatus = store.getState().autoUpdateConfig?.status;
-      const livePhase = liveStatus?.state || liveStatus?.phase || "";
-      const delay = ["checking", "waiting_for_tasks", "launching", "updating"].includes(livePhase)
-        ? 2_000
-        : 5_000;
-      timer = window.setTimeout(() => void refresh(), delay);
-    };
+    let timer: number | undefined;
     const refresh = async () => {
-      if (stopped || running || document.hidden) return;
-      running = true;
+      if (stopped || document.hidden) return;
       try {
         await loadAutoUpdateConfig(store);
       } catch {
-        // The top-level update gate owns maintenance/reconnect feedback.
+        // UpdateGate owns manager/maintenance connectivity feedback.
       } finally {
-        running = false;
-        schedule();
+        if (!stopped) {
+          timer = window.setTimeout(
+            () => void refresh(),
+            ACTIVE_STATES.has(String(store.getState().autoUpdateConfig?.status?.state)) ? 2_000 : 8_000,
+          );
+        }
       }
     };
-    const resume = () => {
-      if (document.hidden) {
-        if (timer !== null) window.clearTimeout(timer);
-        timer = null;
-      } else {
-        void refresh();
-      }
+    timer = window.setTimeout(() => void refresh(), 8_000);
+    const visibility = () => {
+      if (timer) window.clearTimeout(timer);
+      if (!document.hidden) void refresh();
     };
-
-    document.addEventListener("visibilitychange", resume);
-    schedule();
+    document.addEventListener("visibilitychange", visibility);
     return () => {
       stopped = true;
-      if (timer !== null) window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", resume);
+      if (timer) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visibility);
     };
   }, [store]);
 
-  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(autoUpdateConfig?.config || {}));
+  const saving = pending.includes("admin:updates:save");
+  const checking = pending.includes("admin:updates:check");
+  const operationRunning = pending.some((item) => item.startsWith("admin:updates:") && item !== "admin:updates:save" && item !== "admin:updates:check");
+  const busy = status.state === "updating" || operationRunning;
+  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(config));
+  const services = Object.entries(status.services || {});
+  const images = Object.entries(status.images || {});
 
-  const handleSubmit = (event: React.FormEvent) => {
+  const save = (event: React.FormEvent) => {
     event.preventDefault();
-    void saveAutoUpdateConfig(
-      store,
-      {
-        enabled: form.enabled,
-        interval_seconds: form.interval,
-        remote: form.remote,
-        branch: form.branch,
-        webhook_secret: form.webhookSecret,
-      },
-      () => setForm((current) => ({ ...current, webhookSecret: "" })),
-    );
+    void saveAutoUpdateConfig(store, {
+      enabled: form.enabled,
+      interval_seconds: form.interval,
+      release_manifest_url: form.manifestUrl,
+    });
+  };
+
+  const operate = (operation: Exclude<ManagerOperation, "install">) => {
+    if (typeof status.manager_generation !== "number") return;
+    void runManagerOperation(store, operation, status.manager_generation);
   };
 
   return (
-    <AdminCard className="config-form">
-      <CardHead
-        title={t("admin.updates.title")}
-        icon="refresh"
-        desc={t("admin.updates.description")}
-        extra={<StatusBadge ok={!!config.enabled} label={t(config.enabled ? "admin.common.enabled" : "admin.common.disabled")} />}
-      />
-      <form onSubmit={handleSubmit}>
-        <div className="config-grid">
-          <div className="check-row">
-            <Switch
-              checked={form.enabled}
-              aria-labelledby={enabledLabelId}
-              aria-describedby={enabledHintId}
-              onChange={(checked) => setForm((prev) => ({ ...prev, enabled: checked }))}
-            />
-            <div className="check-row__text">
-              <strong id={enabledLabelId}>{t("admin.updates.enableWatcher")}</strong>
-              <span id={enabledHintId}>{t("admin.updates.enableWatcherHint")}</span>
+    <div className="eap-manager-update-page">
+      <AdminCard className="eap-manager-overview">
+        <div className="eap-manager-overview__head">
+          <div>
+            <Typography.Title level={4}>{t("admin.updates.managerTitle")}</Typography.Title>
+            <Typography.Paragraph type="secondary">{t("admin.updates.managerDescription")}</Typography.Paragraph>
+          </div>
+          <Tag color={status.state === "failed" ? "error" : status.state === "idle" ? "success" : "processing"}>
+            {stateLabel(t, status)}
+          </Tag>
+        </div>
+
+        {status.state === "updating" ? (
+          <Progress percent={100} status="active" showInfo={false} aria-label={t("admin.updates.state.updating")} />
+        ) : null}
+        {status.state === "waiting_for_tasks" ? <Alert showIcon type="info" message={t("admin.updates.waitingNotice")} /> : null}
+        {status.last_error ? (
+          <Alert showIcon type="error" message={t("admin.updates.state.failed")} description={status.last_error} />
+        ) : null}
+
+        <Descriptions className="eap-manager-generations" size="small" column={{ xs: 1, sm: 2, lg: 3 }}>
+          <Descriptions.Item label={t("admin.updates.currentGeneration")}>{generation(status.current_generation)}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.targetGeneration")}>{generation(status.target_generation)}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.previousGeneration")}>{generation(status.previous_generation)}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.currentRevision")}>{shortSha(status.current_revision)}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.targetRevision")}>{shortSha(status.remote_revision)}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.phase")}>{status.phase || "-"}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.operationId")} span={3}>
+            <Typography.Text code copyable={!!status.operation_id}>{status.operation_id || "-"}</Typography.Text>
+          </Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.lastCheck")}>{formatTimestamp(status.last_check_at) || "-"}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.activeTasks")}>{status.active_tasks ?? "-"}</Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.queuedTasks")}>{status.queued_tasks ?? "-"}</Descriptions.Item>
+        </Descriptions>
+
+        {services.length ? (
+          <div className="eap-manager-service-list" aria-label={t("admin.updates.services")}>
+            {services.map(([name, service]) => (
+              <Tag key={name} color={service.available === false ? "error" : "success"}>
+                {name}: {service.state || (service.available === false ? "unavailable" : "ready")}
+              </Tag>
+            ))}
+          </div>
+        ) : null}
+
+        {images.length ? (
+          <details className="eap-manager-images">
+            <summary>{t("admin.updates.imageDigests")}</summary>
+            {images.map(([name, digest]) => <code key={name}>{name}: {digest}</code>)}
+          </details>
+        ) : null}
+
+        <Space wrap className="eap-manager-actions">
+          <Button loading={checking} disabled={busy} icon={<Icon name="refresh" size={15} />} onClick={() => void checkAutoUpdateNow(store)}>
+            {t("admin.updates.checkNow")}
+          </Button>
+          <Button type="primary" disabled={busy || !status.update_available || typeof status.manager_generation !== "number"} onClick={() => operate("update")}>
+            {t("admin.updates.updateNow")}
+          </Button>
+          <Popconfirm title={t("admin.updates.restartConfirm")} onConfirm={() => operate("restart")}>
+            <Button disabled={busy || typeof status.manager_generation !== "number"}>{t("admin.updates.restart")}</Button>
+          </Popconfirm>
+          <Popconfirm title={t("admin.updates.rollbackConfirm")} onConfirm={() => operate("rollback")}>
+            <Button disabled={busy || !status.previous_generation || typeof status.manager_generation !== "number"}>{t("admin.updates.rollback")}</Button>
+          </Popconfirm>
+          {status.state === "failed" ? (
+            <Button danger disabled={operationRunning || typeof status.manager_generation !== "number"} onClick={() => operate("repair")}>{t("admin.updates.repair")}</Button>
+          ) : null}
+        </Space>
+      </AdminCard>
+
+      <AdminCard className="config-form">
+        <form onSubmit={save}>
+          <div className="config-grid">
+            <div className="check-row field--full">
+              <Switch checked={form.enabled} aria-labelledby={enabledLabelId} onChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
+              <div className="check-row__text">
+                <strong id={enabledLabelId}>{t("admin.updates.enableWatcher")}</strong>
+                <span>{t("admin.updates.enableWatcherHint")}</span>
+              </div>
+            </div>
+            <Field label={t("admin.updates.interval")}>
+              <Input type="number" min="30" max="86400" value={form.interval} onChange={(event) => setForm((current) => ({ ...current, interval: event.target.value }))} />
+            </Field>
+            <Field label={t("admin.updates.channel")}>
+              <Input value={config.release_channel || "main"} disabled />
+            </Field>
+            <div className="field--full">
+              <Field label={t("admin.updates.manifestUrl")}>
+                <Input value={form.manifestUrl} placeholder="https://…/main.json" onChange={(event) => setForm((current) => ({ ...current, manifestUrl: event.target.value }))} />
+              </Field>
             </div>
           </div>
-          <Field label={t("admin.updates.interval")}>
-            <Input
-              id={intervalId}
-              aria-label={t("admin.updates.interval")}
-              type="number"
-              min="5"
-              max="3600"
-              step="1"
-              value={form.interval}
-              onChange={(event) => setForm((prev) => ({ ...prev, interval: event.target.value }))}
-            />
-          </Field>
-          <Field label={t("admin.updates.remote")}>
-            <Input
-              id={remoteId}
-              aria-label={t("admin.updates.remote")}
-              value={form.remote}
-              placeholder={t("admin.updates.remotePlaceholder")}
-              onChange={(event) => setForm((prev) => ({ ...prev, remote: event.target.value }))}
-            />
-          </Field>
-          <Field label={t("admin.updates.branch")}>
-            <Input
-              id={branchId}
-              aria-label={t("admin.updates.branch")}
-              value={form.branch}
-              placeholder={t("admin.updates.branchPlaceholder")}
-              onChange={(event) => setForm((prev) => ({ ...prev, branch: event.target.value }))}
-            />
-          </Field>
-          <div className="field--full">
-            <Field label={t("admin.updates.webhookSecret")}>
-              <Input.Password
-                id={webhookSecretId}
-                aria-label={t("admin.updates.webhookSecret")}
-                autoComplete="off"
-                placeholder={config.webhook_secret_configured ? t("admin.common.keepUnchanged") : t("admin.updates.secretPlaceholder")}
-                value={form.webhookSecret}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, webhookSecret: event.target.value }))
-                }
-              />
-            </Field>
+          <div className="form-actions">
+            <Button type="primary" htmlType="submit" disabled={!dirty || busy} loading={saving}>{t("admin.updates.save")}</Button>
           </div>
-          <div className="field--full field-stack">
-            <span className="field-help">{t("admin.updates.webhookUrl")}</span>
-            <code className="mono config-value">{webhookUrl}</code>
-          </div>
-        </div>
-        <div className="form-actions">
-          <Button
-            type="primary"
-            htmlType="submit"
-            disabled={!dirty}
-            loading={saving}
-          >
-            {t(saving ? "admin.common.saving" : "admin.updates.save")}
-          </Button>
-          <Button
-            htmlType="button"
-            disabled={!config.enabled}
-            loading={checking}
-            icon={checking ? undefined : <Icon name="refresh" size={15} />}
-            onClick={() => void checkAutoUpdateNow(store)}
-          >
-            {t(checking ? "admin.common.checking" : "admin.updates.checkNow")}
-          </Button>
-        </div>
-      </form>
-      <div className="metric-grid metric-grid--compact">
-        <UsageMetricTile label={t("admin.updates.status")} value={updateState} />
-        <UsageMetricTile label={t("admin.updates.activeTasks")} value={status.active_tasks ?? "-"} />
-        <UsageMetricTile label={t("admin.updates.queuedTasks")} value={status.queued_tasks ?? "-"} />
-        <UsageMetricTile label={t("admin.updates.protectedProcesses")} value={status.protected_processes ?? "-"} />
-        <UsageMetricTile label={t("admin.updates.waitingSince")} value={updateTime(status.waiting_since) || "-"} />
-        <UsageMetricTile label={t("admin.updates.worktree")} value={t(clean ? "admin.updates.clean" : "admin.updates.dirty")} />
-        <UsageMetricTile label={t("admin.updates.currentRevision")} value={shortSha(status.current_revision)} />
-        <UsageMetricTile label={t("admin.updates.remoteRevision")} value={shortSha(status.remote_revision)} />
-        <UsageMetricTile label={t("admin.updates.lastCheck")} value={formatTime(Number(status.last_check_at) || undefined) || "-"} />
-        <UsageMetricTile label={t("admin.updates.lastTrigger")} value={updateTriggerLabel(t, status.last_trigger)} />
-      </div>
-      {phase === "waiting_for_tasks" ? (
-        <div className="notice">{t("admin.updates.waitingNotice")}</div>
-      ) : null}
-      {status.last_error ? <div className="notice notice--warn">{status.last_error}</div> : null}
-      {status.dirty_summary ? <pre className="config-preview">{status.dirty_summary}</pre> : null}
-    </AdminCard>
+        </form>
+      </AdminCard>
+    </div>
   );
 }

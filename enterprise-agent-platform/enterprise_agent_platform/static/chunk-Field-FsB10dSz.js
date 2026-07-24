@@ -1,0 +1,1 @@
+import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{_t as t}from"./app-C33JQupF.js";var n=e();function r({label:e,children:r}){return(0,n.jsx)(t.Item,{className:`eap-field`,label:e,layout:`vertical`,colon:!1,children:r})}export{r as t};

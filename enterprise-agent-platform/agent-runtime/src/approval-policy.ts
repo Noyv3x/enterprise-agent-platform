@@ -50,6 +50,10 @@ function redactCommandFlat(value: string): string {
     /(["'])((?:authorization|proxy-authorization|(?:x[-_])?(?:api[-_]?key|access[-_]?token|auth[-_]?token|secret)|(?:set-)?cookie)\s*:)[\s\S]*?\1/gi,
     "$1$2 [redacted]$1",
   );
+  // Match the authentication scheme and its value before the generic header
+  // fallback; otherwise the fallback would redact only "Bearer"/"Basic" and
+  // leave the credential itself visible.
+  command = command.replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^\s'";|&]+/gi, "$1[redacted]");
   command = command.replace(
     /((?:^|\s)(?:authorization|proxy-authorization|(?:x[-_])?(?:api[-_]?key|access[-_]?token|auth[-_]?token|secret))\s*:\s*)[^\s'";|&]+/gi,
     "$1[redacted]",
@@ -58,7 +62,6 @@ function redactCommandFlat(value: string): string {
     redactedAssignmentPattern(),
     (match, name: string) => SENSITIVE_COMMAND_NAME.test(name) ? `${name}=[redacted]` : match,
   );
-  command = command.replace(/(authorization\s*:\s*(?:bearer|basic)\s+)[^\s'";|&]+/gi, "$1[redacted]");
   command = command.replace(/((?:set-)?cookie\s*:\s*)[^\s'";|&]+/gi, "$1[redacted]");
   command = command.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, "$1[redacted]@");
   command = command.replace(
@@ -761,6 +764,9 @@ export function hardBlockedCommand(command: string): string | undefined {
     if (!isLiteralOutputCommand(executable) && args.some((arg) => isDockerSocketTarget(arg))) {
       return "Docker socket access is blocked";
     }
+    if (!isLiteralOutputCommand(executable) && args.some((arg) => isManagerControlTarget(arg))) {
+      return "Manager control and state access is blocked";
+    }
     if (!isLiteralOutputCommand(executable) && args.some((arg) => isProtectedProcessTarget(arg))) {
       return "Reading process credentials and memory is blocked";
     }
@@ -1393,6 +1399,16 @@ function isCloudMetadataTarget(value: string): boolean {
 
 function isDockerSocketTarget(value: string): boolean {
   return /(?:\/var\/run|\/run)\/docker\.sock(?:\/|$)/i.test(value);
+}
+
+function isManagerControlTarget(value: string): boolean {
+  const normalized = value.replaceAll("\\", "/");
+  return /^(?:\/var\/run|\/run)\/ubitech-agent(?:\/|$)/i.test(normalized)
+    || /^\/var\/lib\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
+    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
+    || /^\/(?:root|home\/[^/]+)\/\.config\/ubitech-agent(?:\/|$)/i.test(normalized)
+    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
+    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.config\/ubitech-agent(?:\/|$)/i.test(normalized);
 }
 
 function isProtectedProcessTarget(value: string): boolean {

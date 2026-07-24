@@ -11,8 +11,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: quality-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Every main commit can already be running on a source deployment waiting
+  # for its exact container release. Keep push generations independent; only
+  # supersede repeated validation for the same pull request.
+  group: quality-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   documentation:
@@ -192,3 +195,44 @@ jobs:
 
       - name: Audit runtime dependencies
         run: npm audit --audit-level=high
+
+  manager:
+    name: Manager (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: manager
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: manager/go.mod
+          cache: false
+
+      - name: Test manager
+        run: go test ./...
+
+      - name: Vet manager
+        run: go vet ./...
+
+      - name: Build manager
+        run: go build ./cmd/ubitech-manager
+
+  container-definitions:
+    name: Container definitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate Dockerfiles, Compose, and release schema
+        run: scripts/container-smoke.sh

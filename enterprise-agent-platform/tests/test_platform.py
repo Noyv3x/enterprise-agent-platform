@@ -835,6 +835,48 @@ class AutoUpdateLaunchTests(unittest.TestCase):
 
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_container_takeover_preserves_sessions_and_synchronizes_internal_tokens(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = EnterpriseService(make_config(root), agent_client=RecordingAgent())
+            old_token, _ = source.authenticate("admin", "admin")
+            source.set_setting("agent_tool_token", "legacy-tool-token", secret=True)
+            source.set_setting("agent_runtime_token", "legacy-runtime-token", secret=True)
+            source.close()
+
+            container_config = replace(
+                make_config(root),
+                deployment_mode="container",
+                token_secret="new-manager-session-secret",
+                agent_tool_token="new-manager-tool-token",
+                agent_runtime_token="new-manager-runtime-token",
+            )
+            service = EnterpriseService(
+                container_config,
+                agent_client=RecordingAgent(),
+                autostart_runtime=False,
+                manager_client=SimpleNamespace(
+                    status=lambda: {
+                        "maintenance": False,
+                        "active_operation_id": "",
+                        "finalize_pending_operation_id": "",
+                        "operation_id": "",
+                    }
+                ),
+            )
+            try:
+                self.assertIsNotNone(service.user_from_token(old_token))
+                self.assertEqual(
+                    service.get_secret("agent_tool_token"),
+                    "new-manager-tool-token",
+                )
+                self.assertEqual(
+                    service.get_secret("agent_runtime_token"),
+                    "new-manager-runtime-token",
+                )
+            finally:
+                service.close()
+
     @staticmethod
     def _complete_telegram_link(
         service: EnterpriseService,
@@ -3110,7 +3152,7 @@ class PlatformServiceTests(unittest.TestCase):
 
                 call = agent.calls[-1]
                 self.assertIn("brief.txt", call["user_message"])
-                self.assertIn("local path:", call["user_message"])
+                self.assertIn("path:", call["user_message"])
                 self.assertTrue(Path(call["attachments"][0]["local_path"]).exists())
             finally:
                 service.close()
@@ -5474,7 +5516,7 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_host_backend_never_provisions_agent_container(self):
+    def test_scope_identity_uses_sandbox_backend_contract(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
                 make_config(Path(td)),
@@ -5482,7 +5524,8 @@ class PlatformServiceTests(unittest.TestCase):
             )
             try:
                 scope = service.agent_scopes.ensure_private_scope(1)
-                self.assertEqual(scope.to_execution_dict()["backend"], "host")
+                self.assertEqual(scope.to_execution_dict()["backend"], "sandbox")
+                self.assertEqual(scope.to_execution_dict()["workspace_path"], "/workspace")
             finally:
                 service.close()
 

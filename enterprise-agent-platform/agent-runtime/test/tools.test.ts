@@ -723,6 +723,24 @@ test("tool policy blocks writes to protected host paths", async () => {
   assert.match((await classifyToolCall("patch_file", { path: "/proc/sys/kernel/hostname" }, "/tmp/workspace")).hardBlock || "", /protected/);
   assert.match((await classifyToolCall("terminal", { command: "echo unsafe > /boot/marker" })).hardBlock || "", /protected/);
   assert.match((await classifyToolCall("terminal", { command: "curl --unix-socket /var/run/docker.sock http://localhost" })).hardBlock || "", /Docker/);
+  assert.match(
+    (await classifyToolCall("terminal", { command: "cat /run/ubitech-agent/manager.sock" })).hardBlock || "",
+    /Manager control/,
+  );
+  assert.match(
+    (await classifyToolCall("terminal", { command: "cat ~/.config/ubitech-agent/manager.toml" })).hardBlock || "",
+    /Manager control/,
+  );
+  assert.match(
+    (await classifyToolCall(
+      "read_file",
+      { target: "host", path: "/home/deploy/.local/share/ubitech-agent/manager/state.json" },
+      "/workspace",
+      undefined,
+      true,
+    )).hardBlock || "",
+    /protected/,
+  );
 });
 
 test("tool policy blocks direct process secret reads", async () => {

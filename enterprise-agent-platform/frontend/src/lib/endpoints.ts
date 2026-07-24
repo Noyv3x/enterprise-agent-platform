@@ -13,6 +13,7 @@ import type {
   AgentRuntimeConfigUpdateRequest,
   AutoUpdateConfigResponse,
   AutoUpdateConfigUpdateRequest,
+  ManagerOperationRequest,
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
   AgentMemoriesExportResponse,
@@ -456,6 +457,10 @@ export const endpoints = {
     () => "/api/system/auto-update/config",
   ),
   autoUpdateCheck: ep<string, unknown>("POST", () => "/api/system/auto-update/check"),
+  managerOperation: ep<ManagerOperationRequest, unknown, [string]>(
+    "POST",
+    (operation) => `/api/system/auto-update/operations/${encodeURIComponent(operation)}`,
+  ),
   cogneeConfig: ep<void, CogneeConfigResponse>("GET", () => "/api/system/cognee/config"),
   updateCogneeConfig: ep<CogneeConfigUpdateRequest, unknown>(
     "PUT",

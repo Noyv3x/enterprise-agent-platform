@@ -104,6 +104,30 @@ def build_trusted_service_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(RejectRedirectHandler())
 
 
+def build_private_service_opener() -> urllib.request.OpenerDirector:
+    """Build a direct opener for trusted private-network service names."""
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        RejectRedirectHandler(),
+    )
+
+
+def _validate_service_request_url(value: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        origin = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "", "", "")
+        )
+        validate_http_base_url(origin)
+        if parsed.fragment:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "trusted service requests require a credential-free HTTP(S) URL"
+        ) from exc
+
+
 def open_trusted_service_url(
     request: urllib.request.Request,
     *,
@@ -111,24 +135,19 @@ def open_trusted_service_url(
 ):
     """Open a trusted HTTP(S) service URL without forwarding auth on redirects."""
 
-    try:
-        parsed = urllib.parse.urlsplit(request.full_url)
-        port = parsed.port
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.fragment
-            or (port is not None and not 1 <= port <= 65535)
-        ):
-            raise ValueError
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "trusted service requests require a credential-free HTTP(S) URL"
-        ) from exc
+    _validate_service_request_url(request.full_url)
     return build_trusted_service_opener().open(request, timeout=timeout)
+
+
+def open_private_service_url(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+):
+    """Open a trusted Docker/private-network URL without using host proxies."""
+
+    _validate_service_request_url(request.full_url)
+    return build_private_service_opener().open(request, timeout=timeout)
 
 
 def open_loopback_url(request: urllib.request.Request, *, timeout: float):

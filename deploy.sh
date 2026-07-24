@@ -137,6 +137,12 @@ UPDATE_HEARTBEAT_PID=""
 UPDATE_RECOVERY_ATTEMPTED=0
 UPDATE_COMPLETED=0
 UPDATE_COMMAND_ARGS=()
+CONTAINER_BRIDGE_ACTIVE=0
+LEGACY_DATA=""
+LEGACY_SERVICE="${ENTERPRISE_SERVICE_NAME:-$SERVICE_NAME}"
+LEGACY_HOST="${ENTERPRISE_PLATFORM_HOST:-127.0.0.1}"
+LEGACY_PORT="${ENTERPRISE_PLATFORM_PORT:-8765}"
+MANAGER_DATA_ROOT="${UBITECH_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/ubitech-agent}"
 
 acquire_update_lock() {
   if ! command -v git >/dev/null 2>&1; then
@@ -375,22 +381,116 @@ finalize_update_on_exit() {
 capture_update_context() {
   local previous=""
   for argument in "$@"; do
-    if [[ "$previous" == "data" ]]; then
-      ENTERPRISE_PLATFORM_DATA="$argument"
-      export ENTERPRISE_PLATFORM_DATA
+    if [[ -n "$previous" ]]; then
+      case "$previous" in
+        data) ENTERPRISE_PLATFORM_DATA="$argument"; export ENTERPRISE_PLATFORM_DATA ;;
+        service) LEGACY_SERVICE="$argument" ;;
+        host) LEGACY_HOST="$argument" ;;
+        port) LEGACY_PORT="$argument" ;;
+      esac
       previous=""
       continue
     fi
     case "$argument" in
-      --data)
-        previous="data"
-        ;;
+      --data) previous="data" ;;
       --data=*)
         ENTERPRISE_PLATFORM_DATA="${argument#--data=}"
         export ENTERPRISE_PLATFORM_DATA
         ;;
+      --service-name) previous="service" ;;
+      --service-name=*) LEGACY_SERVICE="${argument#--service-name=}" ;;
+      --host) previous="host" ;;
+      --host=*) LEGACY_HOST="${argument#--host=}" ;;
+      --port) previous="port" ;;
+      --port=*) LEGACY_PORT="${argument#--port=}" ;;
     esac
   done
+  if [[ -n "$previous" ]]; then
+    echo "Missing value for update option --${previous}." >&2
+    return 1
+  fi
+  LEGACY_DATA="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}"
+}
+
+prepare_container_bridge() {
+  if [[ ! -x "$ROOT/install.sh" || ! -f "$ROOT/docs/contracts/container-platform.json" ]]; then
+    return 0
+  fi
+  if [[ "${UBITECH_SKIP_CONTAINER_MIGRATION:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$MANAGER_DATA_ROOT" != /* ]]; then
+    echo "Cannot migrate: UBITECH_DATA_ROOT must be an absolute path." >&2
+    return 1
+  fi
+  if [[ ! "$LEGACY_PORT" =~ ^[0-9]+$ ]] || ((10#$LEGACY_PORT < 1 || 10#$LEGACY_PORT > 65535)); then
+    echo "Cannot migrate: the effective Platform port is invalid." >&2
+    return 1
+  fi
+  if [[ ! "$LEGACY_SERVICE" =~ ^[A-Za-z0-9_@:.][A-Za-z0-9_.@:-]*\.service$ ]]; then
+    echo "Cannot migrate: the effective user-systemd service name is invalid." >&2
+    return 1
+  fi
+  if [[ -z "$LEGACY_HOST" || "$LEGACY_HOST" == *$'\n'* || "$LEGACY_HOST" == *$'\r'* ]]; then
+    echo "Cannot migrate: the effective Platform host is invalid." >&2
+    return 1
+  fi
+  export UBITECH_SOURCE_MIGRATION_BRIDGE=1
+  export UBITECH_MANAGER_SOCKET="$MANAGER_DATA_ROOT/manager/control/manager.sock"
+  export UBITECH_MANAGER_TOKEN_FILE="$MANAGER_DATA_ROOT/manager/secrets/manager-token"
+  CONTAINER_BRIDGE_ACTIVE=1
+}
+
+run_container_bridge_installer() {
+  if (( ! CONTAINER_BRIDGE_ACTIVE )); then
+    return 0
+  fi
+  local listen_host gate_host listen gate_url status source_commit release_base manifest_url channel_manifest_url manager_url manager_arch
+  listen_host="$LEGACY_HOST"
+  gate_host="$LEGACY_HOST"
+  case "$LEGACY_HOST" in
+    0.0.0.0) gate_host="127.0.0.1" ;;
+    ::|"[::]") gate_host="[::1]" ; listen_host="[::]" ;;
+    *:*)
+      [[ "$listen_host" == \[*\] ]] || listen_host="[$listen_host]"
+      [[ "$gate_host" == \[*\] ]] || gate_host="[$gate_host]"
+      ;;
+  esac
+  listen="$listen_host:$LEGACY_PORT"
+  gate_url="http://$gate_host:$LEGACY_PORT"
+  source_commit="$(git -C "$ROOT" rev-parse HEAD)"
+  release_base="https://github.com/${UBITECH_RELEASE_REPOSITORY:-Noyv3x/enterprise-agent-platform}/releases/download/container-${source_commit}"
+  manifest_url="${UBITECH_RELEASE_MANIFEST_URL:-$release_base/release.json}"
+  channel_manifest_url="${UBITECH_RELEASE_CHANNEL_MANIFEST_URL:-https://github.com/${UBITECH_RELEASE_REPOSITORY:-Noyv3x/enterprise-agent-platform}/releases/latest/download/release.json}"
+  case "$(uname -m)" in
+    x86_64|amd64) manager_arch="amd64" ;;
+    aarch64|arm64) manager_arch="arm64" ;;
+    *) manager_arch="" ;;
+  esac
+  if [[ -z "$manager_arch" ]]; then
+    echo "Cannot migrate: unsupported manager architecture $(uname -m)." >&2
+    return 1
+  fi
+  manager_url="${UBITECH_MANAGER_URL:-$release_base/ubitech-manager-linux-$manager_arch}"
+  status=0
+  "$ROOT/install.sh" \
+    --manifest-url "$manifest_url" \
+    --channel-manifest-url "$channel_manifest_url" \
+    --manager-url "$manager_url" \
+    --manager-checksum-url "${UBITECH_MANAGER_CHECKSUM_URL:-$manager_url.sha256}" \
+    --data-root "$MANAGER_DATA_ROOT" \
+    --listen "$listen" \
+    --migrate-from "$ROOT" \
+    --legacy-data "$LEGACY_DATA" \
+    --legacy-service "$LEGACY_SERVICE" \
+    --legacy-platform-url "$gate_url" \
+    --expected-source-commit "$source_commit" \
+    --yes || status=$?
+  if ((status == 75)); then
+    echo "Container migration is queued; the source bridge remains available."
+    return 0
+  fi
+  return "$status"
 }
 
 wait_for_gateway_writes() {
@@ -441,6 +541,10 @@ case "$cmd" in
       recover_failed_update
       exit 1
     fi
+    if ! prepare_container_bridge; then
+      recover_failed_update
+      exit 1
+    fi
     if ! python_bootstrap_checked auto "$@"; then
       recover_failed_update
       exit 1
@@ -451,6 +555,7 @@ case "$cmd" in
       exit 1
     fi
     UPDATE_COMPLETED=1
+    run_container_bridge_installer
     ;;
   deploy|up)
     shift || true
@@ -486,25 +591,9 @@ case "$cmd" in
     ;;
   test)
     shift || true
-    recent_base="$(documentation_test_base)"
-    check_documentation
-    check_documentation_change "$recent_base" HEAD
-    check_documentation_change HEAD INDEX
-    check_documentation_change HEAD WORKTREE
-    cd "$PLATFORM_DIR"
-    "$PYTHON_BIN" -m unittest discover -s tests "$@"
-    "$PYTHON_BIN" -m compileall enterprise_agent_platform tests
-    require_node_runtime
-    cd "$PLATFORM_DIR/agent-runtime"
-    npm ci
-    npm run check
-    npm test
-    npm run build
-    cd "$PLATFORM_DIR/frontend"
-    npm ci
-    npm run check
-    npm test
-    npm run build
+    check_documentation_checkout
+    export UBITECH_DOCS_ALREADY_CHECKED=1
+    exec "$ROOT/scripts/test.sh" "$@"
     ;;
   *)
     check_documentation_checkout

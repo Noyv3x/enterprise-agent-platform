@@ -1,0 +1,311 @@
+name: ${UBITECH_COMPOSE_PROJECT:-ubitech-agent}
+
+x-ubitech-logging: &ubitech-logging
+  driver: json-file
+  options:
+    max-size: ${UBITECH_LOG_MAX_SIZE:-20m}
+    max-file: ${UBITECH_LOG_MAX_FILES:-5}
+    compress: "true"
+
+x-ubitech-service: &ubitech-service
+  init: true
+  restart: unless-stopped
+  networks:
+    - core
+  logging: *ubitech-logging
+  security_opt:
+    - no-new-privileges:true
+
+x-firecrawl-environment: &firecrawl-environment
+  REDIS_URL: redis://firecrawl-redis:6379
+  REDIS_RATE_LIMIT_URL: redis://firecrawl-redis:6379
+  PLAYWRIGHT_MICROSERVICE_URL: http://firecrawl-playwright:3000/scrape
+  POSTGRES_USER: postgres
+  POSTGRES_DB: postgres
+  POSTGRES_HOST: firecrawl-postgres
+  POSTGRES_PORT: "5432"
+  USE_DB_AUTHENTICATION: "false"
+  NUM_WORKERS_PER_QUEUE: ${FIRECRAWL_NUM_WORKERS_PER_QUEUE:-2}
+  CRAWL_CONCURRENT_REQUESTS: ${FIRECRAWL_CRAWL_CONCURRENT_REQUESTS:-4}
+  MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_CONCURRENT_JOBS:-3}
+  BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:-3}
+  NUQ_RABBITMQ_URL: amqp://firecrawl-rabbitmq:5672
+  NUQ_BACKEND: ${FIRECRAWL_NUQ_BACKEND:-}
+  FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+  ENV: local
+  LOGGING_LEVEL: ${FIRECRAWL_LOGGING_LEVEL:-info}
+
+services:
+  platform:
+    <<: *ubitech-service
+    image: ${UBITECH_PLATFORM_IMAGE:?UBITECH_PLATFORM_IMAGE must be an immutable digest reference}
+    user: ${UBITECH_UID:-1000}:${UBITECH_GID:-1000}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      ENTERPRISE_PLATFORM_DATA: /var/lib/ubitech-agent
+      ENTERPRISE_PLATFORM_HOST: 0.0.0.0
+      ENTERPRISE_PLATFORM_PORT: "8765"
+      UBITECH_DEPLOYMENT_MODE: container
+      ENTERPRISE_PUBLIC_BASE_URL: ${UBITECH_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+      ENTERPRISE_TRUSTED_PROXY: "1"
+      ENTERPRISE_MANAGE_AGENT_RUNTIME: "0"
+      ENTERPRISE_MANAGE_CAMOFOX: "0"
+      ENTERPRISE_MANAGE_FIRECRAWL: "0"
+      ENTERPRISE_MANAGE_SEARXNG: "0"
+      ENTERPRISE_MANAGE_COGNEE: "0"
+      ENTERPRISE_AGENT_RUNTIME_URL: http://agent-runtime:8766
+      ENTERPRISE_CAMOFOX_URL: http://camofox:9377
+      ENTERPRISE_SEARXNG_API_URL: http://searxng:8080
+      ENTERPRISE_FIRECRAWL_API_URL: http://firecrawl-api:3002
+      ENTERPRISE_SESSION_SECRET_FILE: /run/secrets/ubitech/session-secret
+      ENTERPRISE_AGENT_TOOL_TOKEN_FILE: /run/secrets/ubitech/agent-tool-token
+      ENTERPRISE_AGENT_RUNTIME_TOKEN_FILE: /run/secrets/ubitech/agent-runtime-token
+      CAMOFOX_ACCESS_KEY_FILE: /run/secrets/ubitech/camofox-access-key
+      UBITECH_MANAGER_SOCKET: /run/ubitech-manager/manager.sock
+      UBITECH_MANAGER_TOKEN_FILE: /run/secrets/manager-token
+    ports:
+      - ${UBITECH_PLATFORM_BIND:-127.0.0.1:18080}:8765
+    volumes:
+      - ${UBITECH_DATA_ROOT:?UBITECH_DATA_ROOT must be set}/data:/var/lib/ubitech-agent
+      - ${UBITECH_SECRETS_DIR:?UBITECH_SECRETS_DIR must be set}/session-secret:/run/secrets/ubitech/session-secret:ro
+      - ${UBITECH_SECRETS_DIR}/agent-tool-token:/run/secrets/ubitech/agent-tool-token:ro
+      - ${UBITECH_SECRETS_DIR}/agent-runtime-token:/run/secrets/ubitech/agent-runtime-token:ro
+      - ${UBITECH_SECRETS_DIR}/camofox-access-key:/run/secrets/ubitech/camofox-access-key:ro
+      - ${UBITECH_SECRETS_DIR}/manager-token:/run/secrets/manager-token:ro
+      - ${UBITECH_MANAGER_CONTROL_DIR:?UBITECH_MANAGER_CONTROL_DIR must be set}:/run/ubitech-manager:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - 'import json,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=2)); raise SystemExit(0 if p.get("service")=="ubitech-agent-platform" else 1)'
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  agent-runtime:
+    <<: *ubitech-service
+    image: ${UBITECH_AGENT_RUNTIME_IMAGE:?UBITECH_AGENT_RUNTIME_IMAGE must be an immutable digest reference}
+    user: ${UBITECH_UID:-1000}:${UBITECH_GID:-1000}
+    read_only: true
+    stop_grace_period: 30s
+    environment:
+      AGENT_RUNTIME_HOME: /var/lib/ubitech-agent/runtime
+      AGENT_RUNTIME_HOST: 0.0.0.0
+      AGENT_RUNTIME_PORT: "8766"
+      AGENT_RUNTIME_MAX_BODY_BYTES: "33554432"
+      AGENT_RUNTIME_TOKEN_FILE: /run/secrets/ubitech/agent-runtime-token
+      AGENT_PLATFORM_INTERNAL_URL: http://platform:8765
+      AGENT_PLATFORM_INTERNAL_TOKEN_FILE: /run/secrets/ubitech/agent-tool-token
+      AGENT_MANAGER_EXECUTOR_SOCKET: /run/ubitech-manager/manager.sock
+      AGENT_MANAGER_EXECUTOR_TOKEN_FILE: /run/secrets/manager-executor-token
+      CAMOFOX_URL: http://camofox:9377
+      CAMOFOX_API_KEY_FILE: /run/secrets/ubitech/camofox-access-key
+      FIRECRAWL_API_URL: http://firecrawl-api:3002
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/agent:/var/lib/ubitech-agent/runtime
+      - ${UBITECH_SECRETS_DIR}/agent-runtime-token:/run/secrets/ubitech/agent-runtime-token:ro
+      - ${UBITECH_SECRETS_DIR}/agent-tool-token:/run/secrets/ubitech/agent-tool-token:ro
+      - ${UBITECH_SECRETS_DIR}/manager-executor-token:/run/secrets/manager-executor-token:ro
+      - ${UBITECH_SECRETS_DIR}/camofox-access-key:/run/secrets/ubitech/camofox-access-key:ro
+      - ${UBITECH_MANAGER_CONTROL_DIR}:/run/ubitech-manager:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'const fs=require("fs");const t=fs.readFileSync("/run/secrets/ubitech/agent-runtime-token","utf8").trim();fetch("http://127.0.0.1:8766/health",{headers:{authorization:`Bearer $${t}`}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  camofox:
+    <<: *ubitech-service
+    image: ${UBITECH_CAMOFOX_IMAGE:?UBITECH_CAMOFOX_IMAGE must be an immutable digest reference}
+    user: ${UBITECH_UID:-1000}:${UBITECH_GID:-1000}
+    shm_size: 1gb
+    stop_grace_period: 30s
+    environment:
+      CAMOFOX_PORT: "9377"
+      CAMOFOX_HOST: 0.0.0.0
+      UBITECH_CAMOFOX_BIND_HOST: 0.0.0.0
+      CAMOFOX_ACCESS_KEY_FILE: /run/secrets/ubitech/camofox-access-key
+      CAMOFOX_PROFILE_DIR: /var/lib/ubitech-agent/camofox/profiles
+      CAMOFOX_COOKIES_DIR: /var/lib/ubitech-agent/camofox/cookies
+      CAMOFOX_TRACES_DIR: /var/lib/ubitech-agent/camofox/traces
+      XDG_CACHE_HOME: /var/lib/ubitech-agent/camofox/home/.cache
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/camofox:/var/lib/ubitech-agent/camofox
+      - ${UBITECH_SECRETS_DIR}/camofox-access-key:/run/secrets/ubitech/camofox-access-key:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'fetch("http://127.0.0.1:9377/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 45s
+
+  searxng:
+    <<: *ubitech-service
+    image: ${UBITECH_SEARXNG_IMAGE:-ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812}
+    user: ${UBITECH_UID:-1000}:${UBITECH_GID:-1000}
+    read_only: true
+    environment:
+      FORCE_OWNERSHIP: "false"
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/searxng/config/settings.yml:/etc/searxng/settings.yml:ro
+      - ${UBITECH_DATA_ROOT}/data/runtimes/searxng/cache:/var/cache/searxng
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    healthcheck:
+      test: [CMD, wget, --quiet, --tries=1, --spider, http://127.0.0.1:8080/healthz]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  firecrawl-playwright:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE:-ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2}
+    shm_size: 1gb
+    environment:
+      PORT: "3000"
+      BLOCK_MEDIA: ${FIRECRAWL_BLOCK_MEDIA:-false}
+      MAX_CONCURRENT_PAGES: ${FIRECRAWL_CRAWL_CONCURRENT_REQUESTS:-4}
+      ALLOW_LOCAL_WEBHOOKS: "false"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g
+    healthcheck:
+      test: [CMD, node, -e, 'fetch("http://127.0.0.1:3000/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  firecrawl-redis:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_REDIS_IMAGE:-redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005}
+    command: [redis-server, --bind, 0.0.0.0, --appendonly, "yes"]
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  firecrawl-rabbitmq:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_RABBITMQ_IMAGE:-rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69}
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, check_running]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  firecrawl-postgres:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_POSTGRES_IMAGE:-ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/ubitech/firecrawl-postgres-password
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/postgres:/var/lib/postgresql/data
+      - ${UBITECH_SECRETS_DIR}/firecrawl-postgres-password:/run/secrets/ubitech/firecrawl-postgres-password:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d postgres]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 15s
+
+  firecrawl-foundationdb:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_FOUNDATIONDB_IMAGE:-foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48}
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_COORDINATOR_PORT: "4500"
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/data:/var/fdb/data
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb
+    healthcheck:
+      test: [CMD-SHELL, 'fdbcli -C /var/fdb/fdb.cluster --exec status >/dev/null 2>&1']
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  firecrawl-foundationdb-init:
+    image: ${UBITECH_FIRECRAWL_FOUNDATIONDB_IMAGE:-foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48}
+    restart: "no"
+    networks:
+      - core
+    logging: *ubitech-logging
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      firecrawl-foundationdb:
+        condition: service_healthy
+    entrypoint: [/bin/bash, -eu, -o, pipefail, -c]
+    command:
+      - 'out=$$(fdbcli -C /var/fdb/fdb.cluster --exec "configure new single ssd" 2>&1) && exit 0; printf "%s\n" "$$out" | grep -Eiq "already.*configured|database.*configured"'
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb
+
+  firecrawl-api:
+    <<: *ubitech-service
+    image: ${UBITECH_FIRECRAWL_API_IMAGE:-ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c}
+    stop_grace_period: 45s
+    environment:
+      <<: *firecrawl-environment
+      HOST: 0.0.0.0
+      PORT: "3002"
+      EXTRACT_WORKER_PORT: "3004"
+      WORKER_PORT: "3005"
+      HARNESS_STARTUP_TIMEOUT_MS: "60000"
+    depends_on:
+      firecrawl-redis:
+        condition: service_healthy
+      firecrawl-rabbitmq:
+        condition: service_healthy
+      firecrawl-postgres:
+        condition: service_healthy
+      firecrawl-playwright:
+        condition: service_healthy
+      firecrawl-foundationdb-init:
+        condition: service_completed_successfully
+    entrypoint: [/bin/sh, -eu, -c]
+    command:
+      - 'export BULL_AUTH_KEY="$$(cat /run/secrets/ubitech/firecrawl-bull-auth-key)"; export POSTGRES_PASSWORD="$$(cat /run/secrets/ubitech/firecrawl-postgres-password)"; exec node dist/src/harness.js --start-docker'
+    volumes:
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb:ro
+      - ${UBITECH_SECRETS_DIR}/firecrawl-bull-auth-key:/run/secrets/ubitech/firecrawl-bull-auth-key:ro
+      - ${UBITECH_SECRETS_DIR}/firecrawl-postgres-password:/run/secrets/ubitech/firecrawl-postgres-password:ro
+    healthcheck:
+      test: [CMD, node, -e, 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+networks:
+  core:
+    name: ${UBITECH_CORE_NETWORK:-ubitech-agent_core}
+    external: true

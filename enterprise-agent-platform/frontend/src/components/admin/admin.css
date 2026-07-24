@@ -394,6 +394,54 @@
   align-content: start;
 }
 
+.eap-manager-update-page {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.eap-manager-overview__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eap-manager-overview__head .eap-typography {
+  margin-block: 0 4px;
+}
+
+.eap-manager-generations {
+  margin-top: 18px;
+}
+
+.eap-manager-generations .eap-descriptions-item-content,
+.eap-manager-images code {
+  overflow-wrap: anywhere;
+}
+
+.eap-manager-service-list,
+.eap-manager-actions {
+  margin-top: 18px;
+}
+
+.eap-manager-images {
+  margin-top: 16px;
+  color: var(--text-muted);
+}
+
+.eap-manager-images summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.eap-manager-images code {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
 /* The secondary menu is allowed only when its own content container can keep
    at least 840px for the page. This deliberately does not use viewport width. */
 @container eap-admin-shell (max-width: 1079px) {

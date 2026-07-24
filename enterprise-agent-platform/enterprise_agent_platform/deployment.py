@@ -1834,6 +1834,24 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         "ENTERPRISE_PLATFORM_PORT": str(effective_port),
         "ENTERPRISE_PUBLIC_BASE_URL": settings.get("platform_public_base_url") or DeploymentManager.public_url(effective_host, effective_port),
     }
+    if _env_bool("UBITECH_SOURCE_MIGRATION_BRIDGE", False):
+        manager_socket = os.getenv("UBITECH_MANAGER_SOCKET", "").strip()
+        manager_token_file = os.getenv("UBITECH_MANAGER_TOKEN_FILE", "").strip()
+        if not manager_socket or not Path(manager_socket).is_absolute():
+            raise DeploymentError(
+                "source migration bridge requires an absolute UBITECH_MANAGER_SOCKET"
+            )
+        if not manager_token_file or not Path(manager_token_file).is_absolute():
+            raise DeploymentError(
+                "source migration bridge requires an absolute UBITECH_MANAGER_TOKEN_FILE"
+            )
+        values.update(
+            {
+                "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                "UBITECH_MANAGER_SOCKET": manager_socket,
+                "UBITECH_MANAGER_TOKEN_FILE": manager_token_file,
+            }
+        )
     if "platform_trusted_proxy" in settings:
         values["ENTERPRISE_TRUSTED_PROXY"] = settings["platform_trusted_proxy"]
     if "platform_session_ttl_seconds" in settings:

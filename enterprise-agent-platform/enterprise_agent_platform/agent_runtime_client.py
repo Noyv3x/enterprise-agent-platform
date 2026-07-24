@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import inspect
 import json
+import os
 import re
 import socket
+import stat
 import threading
 import urllib.error
 import urllib.parse
@@ -185,6 +188,15 @@ _PROGRESS_EVENT_TYPES = frozenset(
 # silent/broken connection rather than total task duration.
 AGENT_RUNTIME_REQUEST_TIMEOUT_SECONDS = 30.0
 AGENT_RUNTIME_EVENT_IDLE_TIMEOUT_SECONDS = 60.0
+_MODEL_IMAGE_BYTES = 10 * 1024 * 1024
+_MODEL_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
+_INLINE_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+}
 
 
 class AgentRuntimeClient:
@@ -207,6 +219,7 @@ class AgentRuntimeClient:
         default_provider: str = "",
         default_model: str = "",
         require_loopback: bool = False,
+        managed_execution: bool = False,
     ):
         clean_base = str(base_url or "").strip().rstrip("/")
         try:
@@ -239,6 +252,7 @@ class AgentRuntimeClient:
         self.gateway_token = str(gateway_token or "")
         self.default_provider = str(default_provider or "").strip()
         self.default_model = str(default_model or "").strip()
+        self.managed_execution = bool(managed_execution)
         try:
             validate_loopback_url(clean_base, base_url=True)
             self._loopback_transport = True
@@ -286,13 +300,17 @@ class AgentRuntimeClient:
             raise ValueError("session_key is required")
 
         clean_metadata = dict(metadata or {})
+        input_payload, runtime_attachments = self._runtime_input(
+            str(user_message or ""),
+            attachments or [],
+        )
         body: dict[str, Any] = {
             "scope_key": clean_scope_key,
             "session_id": clean_session_id,
             "system_prompt": str(system_prompt or ""),
-            "input": str(user_message or ""),
+            "input": input_payload,
             "history": self._normalize_history(history),
-            "attachments": self._normalize_attachments(attachments or []),
+            "attachments": runtime_attachments,
             "metadata": clean_metadata,
         }
         lifecycle_id = self._lifecycle_id(clean_metadata)
@@ -301,6 +319,9 @@ class AgentRuntimeClient:
         workspace = self._workspace(clean_metadata)
         if workspace:
             body["workspace"] = workspace
+        execution_context = self._execution_context(clean_metadata)
+        if self.managed_execution and execution_context:
+            body["execution_context"] = execution_context
         model_payload = self._model_payload(model, reasoning_config, clean_metadata)
         if model_payload:
             body["model"] = model_payload
@@ -439,12 +460,16 @@ class AgentRuntimeClient:
     ) -> dict[str, Any]:
         clean_run_id = self._required_id("run_id", run_id)
         clean_message_id = self._required_id("message_id", message_id)
+        input_payload, runtime_attachments = self._runtime_input(
+            str(user_message or ""),
+            attachments or [],
+        )
         body = {
             "message_id": clean_message_id,
             "scope_key": self._required_id("scope_key", scope_key),
             "lifecycle_id": self._required_id("lifecycle_id", lifecycle_id),
-            "input": str(user_message or ""),
-            "attachments": self._normalize_attachments(attachments or []),
+            "input": input_payload,
+            "attachments": runtime_attachments,
         }
         path = f"/v1/runs/{urllib.parse.quote(clean_run_id, safe='')}/input"
         for attempt in range(2):
@@ -1177,6 +1202,81 @@ class AgentRuntimeClient:
             normalized.append(item)
         return normalized
 
+    def _runtime_input(
+        self,
+        user_message: str,
+        attachments: list[dict[str, Any]],
+    ) -> tuple[str | list[dict[str, str]], list[dict[str, str]]]:
+        """Inline bounded images when Runtime cannot see Platform storage."""
+
+        normalized = self._normalize_attachments(attachments)
+        if not self.managed_execution:
+            return user_message, normalized
+
+        image_blocks: list[dict[str, str]] = []
+        non_image_attachments: list[dict[str, Any]] = []
+        total_bytes = 0
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            mime_type = str(attachment.get("mime_type") or "").strip().lower()
+            if mime_type not in _INLINE_IMAGE_MIME_TYPES:
+                non_image_attachments.append(attachment)
+                continue
+            local_path = str(attachment.get("local_path") or "").strip()
+            if not local_path:
+                raise ValueError("managed image attachment is missing its Platform path")
+            payload = self._read_inline_image(local_path)
+            total_bytes += len(payload)
+            if total_bytes > _MODEL_IMAGE_TOTAL_BYTES:
+                raise ValueError(
+                    f"model image attachments exceed {_MODEL_IMAGE_TOTAL_BYTES} bytes in total"
+                )
+            image_blocks.append(
+                {
+                    "type": "image",
+                    "data": base64.b64encode(payload).decode("ascii"),
+                    "mimeType": mime_type,
+                }
+            )
+        if not image_blocks:
+            return user_message, normalized
+        return (
+            [{"type": "text", "text": user_message}, *image_blocks],
+            self._normalize_attachments(non_image_attachments),
+        )
+
+    @staticmethod
+    def _read_inline_image(path: str) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("model image attachment must be a regular file")
+            if info.st_size > _MODEL_IMAGE_BYTES:
+                raise ValueError(
+                    f"model image attachment exceeds {_MODEL_IMAGE_BYTES} bytes"
+                )
+            chunks: list[bytes] = []
+            remaining = _MODEL_IMAGE_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > _MODEL_IMAGE_BYTES:
+                raise ValueError(
+                    f"model image attachment exceeds {_MODEL_IMAGE_BYTES} bytes"
+                )
+            return payload
+        finally:
+            os.close(fd)
+
     def _model_payload(
         self,
         model: str | dict[str, Any] | None,
@@ -1220,6 +1320,17 @@ class AgentRuntimeClient:
             execution = metadata.get("execution")
             value = execution.get("workspace_path") if isinstance(execution, dict) else ""
         return str(value or "").strip()
+
+    @staticmethod
+    def _execution_context(metadata: dict[str, Any]) -> dict[str, str]:
+        execution = metadata.get("execution")
+        if not isinstance(execution, dict):
+            return {}
+        sandbox_id = str(execution.get("sandbox_id") or "").strip()
+        workspace_id = str(execution.get("workspace_id") or "").strip()
+        if not sandbox_id or not workspace_id:
+            return {}
+        return {"sandbox_id": sandbox_id, "workspace_id": workspace_id}
 
     @staticmethod
     def _required_id(name: str, value: Any) -> str:

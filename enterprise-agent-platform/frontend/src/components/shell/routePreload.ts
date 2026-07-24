@@ -13,7 +13,7 @@ async function maintenanceIsBlocking(): Promise<boolean> {
       signal: controller.signal,
     });
     const payload = await response.json() as { state?: string };
-    return ["launching", "updating", "failed"].includes(
+    return ["updating", "failed"].includes(
       String(payload.state || ""),
     );
   } catch {

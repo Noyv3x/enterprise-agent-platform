@@ -406,9 +406,12 @@ export type PlatformUpdateStatusResponse = PlatformUpdateStatus;
 export interface AutoUpdateConfigUpdateRequest {
   enabled: boolean;
   interval_seconds: string;
-  remote: string;
-  branch: string;
-  webhook_secret: string;
+  release_manifest_url: string;
+}
+
+export interface ManagerOperationRequest {
+  idempotency_key?: string;
+  expected_generation?: number;
 }
 
 export type CogneeConfigResponse = CogneeConfigState;

@@ -665,6 +665,7 @@ class SearXNGSearchTests(unittest.TestCase):
 
     def test_external_firecrawl_uses_trusted_no_redirect_transport(self):
         response = _HTTPResponse({"data": {"markdown": "Extracted"}})
+        service = _service()
         with (
             mock.patch(
                 "enterprise_agent_platform.service.open_trusted_service_url",
@@ -674,7 +675,7 @@ class SearXNGSearchTests(unittest.TestCase):
                 "enterprise_agent_platform.service.open_loopback_url",
             ) as loopback_open,
         ):
-            payload = EnterpriseService._runtime_json_request(
+            payload = service._runtime_json_request(
                 "https://firecrawl.example:3002/v1/scrape",
                 {"url": "https://example.test/page"},
                 headers={"Authorization": "Bearer firecrawl-key"},
@@ -685,6 +686,30 @@ class SearXNGSearchTests(unittest.TestCase):
         self.assertEqual(payload["data"]["markdown"], "Extracted")
         trusted_open.assert_called_once()
         loopback_open.assert_not_called()
+
+    def test_container_services_use_direct_private_transport(self):
+        response = _HTTPResponse({"results": []})
+        service = _service(_config(deployment_mode="container"))
+        with (
+            mock.patch(
+                "enterprise_agent_platform.service.open_private_service_url",
+                return_value=response,
+            ) as private_open,
+            mock.patch(
+                "enterprise_agent_platform.service.open_trusted_service_url",
+            ) as trusted_open,
+        ):
+            payload = service._runtime_json_request(
+                "http://searxng:8080/search?q=test&format=json",
+                None,
+                headers={},
+                timeout=20,
+                method="GET",
+            )
+
+        self.assertEqual(payload, {"results": []})
+        private_open.assert_called_once()
+        trusted_open.assert_not_called()
 
 
 if __name__ == "__main__":

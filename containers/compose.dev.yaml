@@ -1,0 +1,31 @@
+services:
+  platform:
+    image: ubitech-agent/platform:dev
+    build:
+      context: ..
+      dockerfile: containers/platform.Dockerfile
+      args:
+        SOURCE_COMMIT: development
+        RELEASE_VERSION: development
+
+  agent-runtime:
+    image: ubitech-agent/agent-runtime:dev
+    build:
+      context: ..
+      dockerfile: containers/agent-runtime.Dockerfile
+      args:
+        SOURCE_COMMIT: development
+        RELEASE_VERSION: development
+
+  camofox:
+    image: ubitech-agent/camofox:dev
+    build:
+      context: ..
+      dockerfile: containers/camofox.Dockerfile
+      args:
+        SOURCE_COMMIT: development
+        RELEASE_VERSION: development
+
+  searxng:
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro

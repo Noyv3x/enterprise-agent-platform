@@ -4,6 +4,8 @@
    consumed. Field names are part of the backend contract and must not drift.
    ===================================================================== */
 
+import type { PublicUpdateState as PlatformUpdateState } from "../container-contract.generated";
+
 /** Ids come back from the server as numbers but are compared with String()
  *  coercion throughout the legacy code, so callers may hold either. */
 export type Id = string | number;
@@ -716,22 +718,18 @@ export interface TelegramConfigState {
 }
 
 /* auto-update config */
+export type {
+  ManagerOperation,
+  ManagerOperationPhase,
+  PublicUpdateState as PlatformUpdateState,
+} from "../container-contract.generated";
+
 export interface AutoUpdateConfigValues {
   enabled?: boolean;
   interval_seconds?: number | string;
-  remote?: string;
-  branch?: string;
-  webhook_secret_configured?: boolean;
-  webhook_url?: string;
+  release_manifest_url?: string;
+  release_channel?: string;
 }
-
-export type PlatformUpdateState =
-  | "idle"
-  | "checking"
-  | "waiting_for_tasks"
-  | "launching"
-  | "updating"
-  | "failed";
 
 /** Public, deliberately redacted update state used before authentication. */
 export interface PlatformUpdateStatus {
@@ -744,8 +742,7 @@ export interface PlatformUpdateStatus {
 
 export interface AutoUpdateStatus {
   state?: PlatformUpdateState;
-  /** Compatibility alias for revisions that shipped the phase name first. */
-  phase?: PlatformUpdateState;
+  phase?: string;
   in_progress?: boolean;
   update_started?: boolean;
   update_available?: boolean;
@@ -759,7 +756,14 @@ export interface AutoUpdateStatus {
   active_tasks?: number;
   queued_tasks?: number;
   protected_processes?: number;
+  manager_generation?: number;
   waiting_since?: number | string;
+  current_generation?: string;
+  previous_generation?: string;
+  target_generation?: string;
+  operation_id?: string;
+  images?: Record<string, string>;
+  services?: Record<string, { available?: boolean; state?: string; error?: string }>;
 }
 
 export interface AutoUpdateConfigState {

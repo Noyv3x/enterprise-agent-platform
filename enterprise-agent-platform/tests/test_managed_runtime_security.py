@@ -18,6 +18,8 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform.runtimes import (
+    CAMOFOX_BROWSER_ASSETS,
+    CAMOFOX_BROWSER_RELEASE,
     CAMOFOX_JS_VERSION,
     CAMOFOX_MANAGED_VERSION,
     CAMOFOX_PLAYWRIGHT_VERSION,
@@ -221,6 +223,12 @@ class ManagedToolRuntimeSecurityTests(unittest.TestCase):
                 stat.S_IMODE((tmp / "runtimes" / "camofox" / "access-key").stat().st_mode),
                 0o600,
             )
+
+    def test_camofox_asset_build_suffix_is_not_used_as_release_metadata(self):
+        self.assertEqual(CAMOFOX_BROWSER_RELEASE, "v150.0.2-beta.25")
+        for filename, _digest, _size, version, release in CAMOFOX_BROWSER_ASSETS.values():
+            self.assertIn(f"camoufox-{version}-alpha.", filename)
+            self.assertEqual(release, "beta.25")
 
     def test_managed_camofox_does_not_inherit_host_display_variables(self):
         with tempfile.TemporaryDirectory() as td:
@@ -554,6 +562,7 @@ const guard = require(process.argv[1]);
             script = r"""
 const http = require('node:http');
 const net = require('node:net');
+process.env.UBITECH_CAMOFOX_BIND_HOST = '0.0.0.0';
 const guard = require(process.argv[1]);
 
 function listen(server) {
@@ -650,7 +659,10 @@ function proxyWebSocket(port, targetPort) {
     const missing = await proxyHttp(proxyPort, `http://missing.test:${originPort}/missing`);
     const connect = await proxyConnect(proxyPort, originPort);
     const websocket = await proxyWebSocket(proxyPort, originPort);
-    console.log(JSON.stringify({ normal, blocked, mapped, missing, connect, websocket }));
+    console.log(JSON.stringify({
+      proxyHost: proxyUrl.hostname,
+      normal, blocked, mapped, missing, connect, websocket,
+    }));
   } finally {
     await proxy.close();
     await close(origin);
@@ -666,6 +678,7 @@ function proxyWebSocket(port, targetPort) {
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(result.stdout)
+            self.assertEqual(payload["proxyHost"], "127.0.0.1")
             self.assertEqual(payload["normal"], {"status": 200, "body": "http-ok:/http"})
             self.assertEqual(payload["blocked"]["status"], 403)
             self.assertEqual(payload["mapped"]["status"], 403)
@@ -1306,10 +1319,16 @@ console.log(JSON.stringify(payload));
             self.assertIn(
                 "  api:\n"
                 f"    image: {FIRECRAWL_IMAGE}\n"
+                "    labels:\n"
+                '      org.ubitech.agent.managed: "true"\n'
                 "    depends_on:\n"
                 "      foundationdb-init:\n"
                 "        condition: service_completed_successfully",
                 override,
+            )
+            self.assertEqual(
+                override.count('      org.ubitech.agent.managed: "true"'),
+                len(FIRECRAWL_SERVICE_IMAGES),
             )
             self.assertNotIn("searxng", override.lower())
             self.assertNotIn('"0.0.0.0:', override)
@@ -1444,6 +1463,7 @@ console.log(JSON.stringify(payload));
             self.assertEqual(stat.S_IMODE(settings_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(secret_path.stat().st_mode), 0o600)
             self.assertIn(f"    image: {SEARXNG_IMAGE}", override)
+            self.assertIn('      org.ubitech.agent.managed: "true"', override)
             self.assertIn(
                 f'"{SEARXNG_LOOPBACK_PUBLISH}:8080"',
                 override,
@@ -1588,6 +1608,10 @@ console.log(JSON.stringify(payload));
             self.assertEqual(set(services), upstream_services)
             for service, image in FIRECRAWL_SERVICE_IMAGES:
                 self.assertEqual(services[service]["image"], image)
+                self.assertEqual(
+                    services[service]["labels"]["org.ubitech.agent.managed"],
+                    "true",
+                )
                 self.assertRegex(image, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
             self.assertEqual(
                 services["api"]["depends_on"]["foundationdb-init"]["condition"],
@@ -1636,6 +1660,10 @@ console.log(JSON.stringify(payload));
             self.assertEqual(set(searxng_services), {"searxng"})
             searxng = searxng_services["searxng"]
             self.assertEqual(searxng["image"], SEARXNG_IMAGE)
+            self.assertEqual(
+                searxng["labels"]["org.ubitech.agent.managed"],
+                "true",
+            )
             self.assertRegex(
                 searxng["image"],
                 r"^[^@\s]+@sha256:[0-9a-f]{64}$",
@@ -1779,27 +1807,29 @@ console.log(JSON.stringify(payload));
 
     def test_managed_health_probe_requires_2xx_and_expected_json_shape(self):
         validator = lambda payload: payload.get("ok") is True and payload.get("engine") == "camoufox"
-        with mock.patch(
-            "enterprise_agent_platform.runtimes.open_loopback_url",
-            return_value=_FakeHTTPResponse(404, {"ok": True, "engine": "camoufox"}),
-        ):
-            self.assertFalse(
-                PlatformRuntimeManager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
-            )
-        with mock.patch(
-            "enterprise_agent_platform.runtimes.open_loopback_url",
-            return_value=_FakeHTTPResponse(200, {"status": "some unrelated service"}),
-        ):
-            self.assertFalse(
-                PlatformRuntimeManager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
-            )
-        with mock.patch(
-            "enterprise_agent_platform.runtimes.open_loopback_url",
-            return_value=_FakeHTTPResponse(200, {"ok": True, "engine": "camoufox"}),
-        ):
-            self.assertTrue(
-                PlatformRuntimeManager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
-            )
+        with tempfile.TemporaryDirectory() as td:
+            manager = self._manager(Path(td))
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.open_loopback_url",
+                return_value=_FakeHTTPResponse(404, {"ok": True, "engine": "camoufox"}),
+            ):
+                self.assertFalse(
+                    manager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
+                )
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.open_loopback_url",
+                return_value=_FakeHTTPResponse(200, {"status": "some unrelated service"}),
+            ):
+                self.assertFalse(
+                    manager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
+                )
+            with mock.patch(
+                "enterprise_agent_platform.runtimes.open_loopback_url",
+                return_value=_FakeHTTPResponse(200, {"ok": True, "engine": "camoufox"}),
+            ):
+                self.assertTrue(
+                    manager._probe_json_health("http://127.0.0.1:9", ("/health",), validator)
+                )
 
 
 if __name__ == "__main__":

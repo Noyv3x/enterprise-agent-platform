@@ -258,6 +258,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             # keeps this defense-in-depth check.
             if (
                 os.environ.get("ENTERPRISE_GATEWAY_ACTIVE") != "1"
+                and not path.startswith("/internal/manager/")
                 and self.server.service.platform_update_is_blocking()
             ):
                 self._json(
@@ -277,6 +278,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/internal/agent/"):
                 self._handle_agent_internal(method, path)
+                return
+            if path.startswith("/internal/manager/"):
+                self._handle_manager_internal(method, path)
                 return
             if path.startswith("/api/") and method in UNSAFE_METHODS:
                 self._require_same_origin()
@@ -336,6 +340,24 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ServiceError(400, "JSON body must be an object")
         self._json(self.server.service.auto_update_webhook(payload), status=202)
+
+    def _handle_manager_internal(self, method: str, path: str) -> None:
+        service = self.server.service
+        token = bearer_token(self.headers.get("Authorization", ""))
+        if not service.validate_manager_internal_token(token):
+            raise ServiceError(401, "invalid manager token")
+        if path == "/internal/manager/health" and method == "GET":
+            self._json(service.manager_internal_health())
+            return
+        if path == "/internal/manager/update/readiness" and method == "POST":
+            body = self._body_json()
+            self._json(service.manager_update_readiness(str(body.get("operation_id") or "")))
+            return
+        if path == "/internal/manager/update/release" and method == "POST":
+            body = self._body_json()
+            self._json(service.manager_update_release(str(body.get("operation_id") or "")))
+            return
+        raise ServiceError(404, "manager endpoint not found")
 
     def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
@@ -852,6 +874,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/system/auto-update/check" and method == "POST":
             self._json(service.trigger_auto_update_check(actor), status=202)
+            return
+        m = re.fullmatch(
+            r"/api/system/auto-update/operations/(update|restart|rollback|repair)",
+            path,
+        )
+        if m and method == "POST":
+            self._json(
+                service.trigger_manager_operation(actor, m.group(1), self._body_json()),
+                status=202,
+            )
             return
         if path == "/api/system/cognee/config" and method == "GET":
             self._json(service.cognee_config(actor))

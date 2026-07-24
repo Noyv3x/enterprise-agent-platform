@@ -1,0 +1,1 @@
+import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{t}from"./chunk-card-DorYtlo2.js";import{t as n}from"./chunk-cx-DNvgD-9W.js";var r=e();function i({children:e,className:i}){return(0,r.jsx)(t,{className:n(`eap-admin-card`,i),styles:{body:{display:`grid`,gap:16,minWidth:0,padding:`var(--eap-admin-card-body-padding, 20px)`}},children:e})}export{i as t};

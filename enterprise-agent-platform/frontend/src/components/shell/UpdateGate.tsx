@@ -19,9 +19,7 @@ const MAX_POLL_MS = 30_000;
 const STATUS_TIMEOUT_MS = 5_000;
 const KNOWN_STATES = new Set<PlatformUpdateState>([
   "idle",
-  "checking",
   "waiting_for_tasks",
-  "launching",
   "updating",
   "failed",
 ]);
@@ -76,17 +74,17 @@ export async function fetchPlatformUpdateStatus(
 }
 
 function blocksPlatform(state: PlatformUpdateState | undefined): boolean {
-  return state === "launching" || state === "updating" || state === "failed";
+  return state === "updating" || state === "failed";
 }
 
 function pollInterval(state: PlatformUpdateState | undefined): number {
-  if (state === "launching" || state === "updating" || state === "failed") return 1_000;
+  if (state === "updating" || state === "failed") return 1_000;
   if (state === "waiting_for_tasks") return 3_000;
   return DEFAULT_POLL_MS;
 }
 
 interface UpdateStatusScreenProps {
-  state: "probing" | "launching" | "updating" | "failed";
+  state: "probing" | "updating" | "failed";
 }
 
 function UpdateStatusScreen({ state }: UpdateStatusScreenProps) {
@@ -282,9 +280,7 @@ export function UpdateGate({
     const screenState: UpdateStatusScreenProps["state"] =
       status.state === "failed"
         ? "failed"
-        : status.state === "launching"
-          ? "launching"
-          : "updating";
+        : "updating";
     return (
       <UpdateStatusScreen state={screenState} />
     );

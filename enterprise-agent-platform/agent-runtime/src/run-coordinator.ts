@@ -19,7 +19,15 @@ import type {
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { ApprovalBroker } from "./approval-broker.js";
 import { redactCommandForApproval, redactToolArgumentsForJournal } from "./approval-policy.js";
+import { CONTAINER_PATHS, EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import { EventJournal } from "./event-journal.js";
+import {
+  createExecutionManager,
+  executionContext,
+  type ExecutionAuditReceipt,
+  type ExecutionManager,
+  type ScopeExecutionIdentity,
+} from "./executor.js";
 import {
   modelSupportsImages,
   resolveAuxiliaryVisionModel,
@@ -39,12 +47,15 @@ import {
   canProposeMemory,
   createTools,
   isCanonicalPrivateScope,
+  isExecutionTool,
   isScheduleMutation,
+  managedExecutionBinding,
   readRegularFileRange,
 } from "./tools.js";
 import type {
   ApprovalDecision,
   ContextUsage,
+  ExecutionContext,
   GatewayToolResponse,
   JsonObject,
   JsonValue,
@@ -124,6 +135,7 @@ export class RunCoordinator {
   readonly gateway: PlatformGateway;
   readonly approvals: ApprovalBroker;
   readonly idempotency: IdempotencyStore;
+  readonly executor: ExecutionManager | undefined;
   private readonly config: RuntimeConfig;
   private readonly streamFn: StreamFn | undefined;
   private readonly visionStreamFn: StreamFn;
@@ -146,6 +158,7 @@ export class RunCoordinator {
   private readonly forcedReviewReasons = new Map<string, string>();
   private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, string>>();
   private readonly runActivities = new Map<string, RunActivityState>();
+  private readonly scopeExecutionContexts = new Map<string, ExecutionContext>();
 
   constructor(options: RunCoordinatorOptions) {
     this.config = options.config;
@@ -157,6 +170,7 @@ export class RunCoordinator {
     }
     this.sessions = new SessionStore(options.config.home);
     this.processes = new ProcessRegistry();
+    this.executor = createExecutionManager(options.config);
     this.gateway = new PlatformGateway(options.config.platformUrl, options.config.platformToken);
     this.idempotency = new IdempotencyStore(options.config.home);
     this.approvals = new ApprovalBroker(
@@ -204,6 +218,26 @@ export class RunCoordinator {
         throw error;
       }
       throw new RunValidationError(errorMessage(error));
+    }
+    if (this.executor?.managed && !request.execution_context) {
+      throw new RunValidationError("execution_context is required when Manager execution is enabled");
+    }
+    if (this.executor?.managed && request.workspace !== CONTAINER_PATHS.workspace) {
+      throw new RunValidationError(`Manager execution requires the fixed ${CONTAINER_PATHS.workspace} container path`);
+    }
+    if (request.execution_context) {
+      const contextKey = scopeExecutionContextKey(request.scope_key, request.lifecycle_id);
+      const existingContext = this.scopeExecutionContexts.get(contextKey);
+      if (
+        existingContext
+        && (
+          existingContext.sandbox_id !== request.execution_context.sandbox_id
+          || existingContext.workspace_id !== request.execution_context.workspace_id
+        )
+      ) {
+        throw new RunValidationError("execution_context conflicts with the established scope identity");
+      }
+      this.scopeExecutionContexts.set(contextKey, structuredClone(request.execution_context));
     }
     this.assertScopeAvailable(request);
     const idempotencyKey = runIdempotencyKey(request);
@@ -394,7 +428,21 @@ export class RunCoordinator {
     record.controller.abort();
     this.agents.get(runId)?.abort();
     this.approvals.cancelRun(runId);
-    this.processes.killRun(runId);
+    if (this.executor?.managed) {
+      void this.executor.cancelRun(runExecutionIdentity(record)).then((confirmed) => {
+        if (!confirmed) {
+          this.journals.get(runId)?.publish("execution.cleanup.failed", {
+            reason: "Manager did not confirm run execution cleanup",
+          });
+        }
+      }).catch((error) => {
+        this.journals.get(runId)?.publish("execution.cleanup.failed", {
+          reason: errorMessage(error),
+        });
+      });
+    } else {
+      this.processes.killRun(runId);
+    }
     if (record.status === "queued") {
       const queueIndex = this.topLevelQueue.indexOf(runId);
       if (queueIndex >= 0) this.topLevelQueue.splice(queueIndex, 1);
@@ -440,15 +488,87 @@ export class RunCoordinator {
         throw new Error("Agent run cancellation could not be confirmed");
       }
       await this.approvals.clearScope(scopeKey, lifecycleId);
-      this.processes.killScope(scopeKey, lifecycleId);
-      if (!await this.processes.waitForScopeExit(scopeKey, lifecycleId)) {
-        throw new Error("Agent process cleanup could not be confirmed");
+      if (this.executor?.managed) {
+        const contexts = this.executionContextsForScope(scopeKey, lifecycleId);
+        for (const context of contexts) {
+          if (!await this.executor.cleanupScope(context)) {
+            throw new Error("Manager did not confirm Agent process cleanup");
+          }
+        }
+        for (const key of this.scopeExecutionContexts.keys()) {
+          const parsed = parseScopeExecutionContextKey(key);
+          if (
+            parsed
+            && scopeOwns(scopeKey, parsed.scopeKey)
+            && (!lifecycleId || lifecycleId === parsed.lifecycleId)
+          ) this.scopeExecutionContexts.delete(key);
+        }
+      } else {
+        this.processes.killScope(scopeKey, lifecycleId);
+        if (!await this.processes.waitForScopeExit(scopeKey, lifecycleId)) {
+          throw new Error("Agent process cleanup could not be confirmed");
+        }
       }
       if (deleteSessions) await this.sessions.deleteScopeFamily(scopeKey, lifecycleId);
       return cancelled;
     } finally {
       this.scopeCleanupFences.delete(fence);
     }
+  }
+
+  async previewProcesses(
+    scopeKey: string,
+    lifecycleId: string,
+    sinceRevision?: string,
+  ): Promise<ReturnType<ProcessRegistry["preview"]>> {
+    if (!this.executor?.managed) return this.processes.preview(scopeKey, lifecycleId, sinceRevision);
+    return await this.executor.preview(
+      this.scopeExecutionIdentity(scopeKey, lifecycleId),
+      sinceRevision,
+    );
+  }
+
+  async previewProcessSummary(
+    scopeKey: string,
+    lifecycleId: string,
+  ): Promise<ReturnType<ProcessRegistry["previewSummary"]>> {
+    if (!this.executor?.managed) return this.processes.previewSummary(scopeKey, lifecycleId);
+    return await this.executor.previewSummary(this.scopeExecutionIdentity(scopeKey, lifecycleId));
+  }
+
+  async updateBlockerSummary(): Promise<ReturnType<ProcessRegistry["updateBlockerSummary"]>> {
+    if (!this.executor?.managed) return this.processes.updateBlockerSummary();
+    return await this.executor.updateBlockerSummary();
+  }
+
+  private scopeExecutionIdentity(scopeKey: string, lifecycleId: string): Required<ScopeExecutionIdentity> {
+    const entry = [...this.scopeExecutionContexts.entries()].find(([key]) => {
+      const parsed = parseScopeExecutionContextKey(key);
+      return parsed?.lifecycleId === lifecycleId
+        && (scopeOwns(scopeKey, parsed.scopeKey) || scopeOwns(parsed.scopeKey, scopeKey));
+    });
+    if (!entry) throw new Error("Trusted execution context is unavailable for this scope");
+    return {
+      scope_id: scopeKey,
+      lifecycle_id: lifecycleId,
+      execution_context: structuredClone(entry[1]),
+    };
+  }
+
+  private executionContextsForScope(scopeKey: string, lifecycleId?: string): ScopeExecutionIdentity[] {
+    const unique = new Map<string, ScopeExecutionIdentity>();
+    for (const [key, context] of this.scopeExecutionContexts.entries()) {
+      const parsed = parseScopeExecutionContextKey(key);
+      if (!parsed || !scopeOwns(scopeKey, parsed.scopeKey)) continue;
+      if (lifecycleId && lifecycleId !== parsed.lifecycleId) continue;
+      const identityKey = `${context.sandbox_id}\0${context.workspace_id}`;
+      unique.set(identityKey, {
+        scope_id: scopeKey,
+        ...(lifecycleId ? { lifecycle_id: lifecycleId } : {}),
+        execution_context: structuredClone(context),
+      });
+    }
+    return [...unique.values()];
   }
 
   private assertScopeAvailable(request: RunRequest): void {
@@ -554,7 +674,11 @@ export class RunCoordinator {
         record.controller.abort();
         this.agents.get(record.id)?.abort();
         this.approvals.cancelRun(record.id);
-        this.processes.killRun(record.id);
+        if (this.executor?.managed) {
+          void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
+        } else {
+          this.processes.killRun(record.id);
+        }
         rejectIdleTimeout(abortError(idleTimeoutMessage));
       }, pollIntervalMs);
       idleWatchdog.unref();
@@ -597,6 +721,8 @@ export class RunCoordinator {
       const journalToolArguments = new Map<string, JsonObject>();
       const approvedTerminalCwds = new Map<string, string>();
       const approvedFilePaths = new Map<string, string>();
+      const executionTargets = new Map<string, ExecutionTarget>();
+      const executionReceipts = new Map<string, ExecutionAuditReceipt>();
       const startedToolCalls = new Set<string>();
       const rawTools = createTools({
         runId: record.id,
@@ -613,6 +739,14 @@ export class RunCoordinator {
         delegate: async (prompt, systemPrompt, signal) => await this.delegate(record, prompt, systemPrompt, signal),
         defaultTerminalTimeoutMs: this.config.terminalTimeoutMs,
         currentAttachmentPaths: () => this.runAttachmentPaths.get(record.id) ?? [],
+        ...(this.executor ? {
+          executor: this.executor,
+          executionReceipt: (toolCallId: string) => {
+            const receipt = executionReceipts.get(toolCallId);
+            if (!receipt) throw new Error("Manager execution is missing its audit receipt");
+            return receipt;
+          },
+        } : {}),
         ...(this.config.runIdleTimeoutMs > 0 ? {
           onActivity: (description: string) => this.touchRunActivity(record.id, description),
           activityHeartbeatMs: Math.max(1, Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3))),
@@ -622,9 +756,55 @@ export class RunCoordinator {
         ...tool,
         execute: async (toolCallId, params, signal, onUpdate) => {
           if (!approvedToolCalls.has(toolCallId)) {
-            throw new Error("Tool execution was not approved by the platform policy");
+            throw new Error("Tool execution did not pass the platform policy preflight");
           }
           if (record.controller.signal.aborted || signal?.aborted) throw abortError();
+          const approvedCwd = tool.name === "terminal" ? approvedTerminalCwds.get(toolCallId) : undefined;
+          const approvedPath = approvedFilePaths.get(toolCallId);
+          const executionParams = approvedCwd
+            ? { ...recordValue(params), cwd: approvedCwd }
+            : approvedPath
+              ? { ...recordValue(params), path: approvedPath }
+              : params;
+          let receipt: ExecutionAuditReceipt | undefined;
+          if (this.executor?.managed && isExecutionTool(tool.name)) {
+            const target = executionTargets.get(toolCallId) ?? EXECUTION_TARGETS[0];
+            const auditId = id("audit");
+            const binding = managedExecutionBinding(
+              tool.name,
+              executionParams,
+              record.request.workspace,
+              this.config.terminalTimeoutMs,
+            );
+            const details = journalToolArguments.get(toolCallId)
+              ?? redactToolArgumentsForJournal(
+                tool.name,
+                recordValue(executionParams),
+                record.request.workspace,
+              );
+            journal.publish("execution.audit", {
+              audit_id: auditId,
+              tool_call_id: toolCallId,
+              tool_name: tool.name,
+              operation: binding.operation,
+              target,
+              details,
+            });
+            receipt = await this.executor.audit({
+              audit_id: auditId,
+              target,
+              operation: binding.operation,
+              action: binding.action,
+              arguments: binding.arguments,
+              details,
+              run_id: record.id,
+              scope_id: record.request.scope_key,
+              lifecycle_id: record.request.lifecycle_id,
+              tool_call_id: toolCallId,
+              execution_context: executionContext(record.request),
+            }, signal);
+            executionReceipts.set(toolCallId, receipt);
+          }
           startedToolCalls.add(toolCallId);
           this.touchRunActivity(record.id, `tool started: ${tool.name}`);
           journal.publish("tool.started", {
@@ -633,17 +813,16 @@ export class RunCoordinator {
             arguments: journalToolArguments.get(toolCallId)
               ?? redactToolArgumentsForJournal(tool.name, recordValue(params), record.request.workspace),
             execution_started: true,
+            ...(receipt ? {
+              audit_id: receipt.audit_id,
+              executor_id: receipt.executor_id,
+              target: receipt.target,
+            } : {}),
           });
           try {
-            const approvedCwd = tool.name === "terminal" ? approvedTerminalCwds.get(toolCallId) : undefined;
-            const approvedPath = approvedFilePaths.get(toolCallId);
-            const executionParams = approvedCwd
-              ? { ...recordValue(params), cwd: approvedCwd }
-              : approvedPath
-                ? { ...recordValue(params), path: approvedPath }
-                : params;
             return await tool.execute(toolCallId, executionParams, signal, onUpdate);
           } finally {
+            executionReceipts.delete(toolCallId);
             this.touchRunActivity(record.id, `tool settled: ${tool.name}`);
           }
         },
@@ -744,6 +923,9 @@ export class RunCoordinator {
               approvedTerminalCwds.set(toolContext.toolCall.id, policy.approvedCwd);
             }
             if (policy.approvedPath) approvedFilePaths.set(toolContext.toolCall.id, policy.approvedPath);
+            if (policy.executionTarget) {
+              executionTargets.set(toolContext.toolCall.id, policy.executionTarget);
+            }
             journalToolArguments.set(
               toolContext.toolCall.id,
               policy.displayArguments
@@ -762,6 +944,7 @@ export class RunCoordinator {
             toolContext.args,
             record.request.workspace,
             this.config.terminalTimeoutMs,
+            this.executor?.managed === true,
           );
           if (policy.hardBlock) return { block: true, reason: policy.hardBlock };
           if (
@@ -930,7 +1113,13 @@ export class RunCoordinator {
       this.forcedReviewReasons.delete(record.id);
       this.unattendedAuthorizationBlocks.delete(record.id);
       this.approvals.cancelRun(record.id);
-      if (!record.result) this.processes.killRun(record.id);
+      if (!record.result) {
+        if (this.executor?.managed) {
+          void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
+        } else {
+          this.processes.killRun(record.id);
+        }
+      }
       this.runActivities.delete(record.id);
     }
   }
@@ -987,7 +1176,8 @@ export class RunCoordinator {
       else if (update.type === "toolcall_delta") {
         // Incremental JSON fragments can split a credential across arbitrary
         // boundaries and therefore cannot be redacted safely. Publish only a
-        // progress marker; the later approval/tool.started event carries the
+        // progress marker; the later approval, execution.audit, or
+        // tool.started event carries the
         // complete display-safe argument object.
         journal.publish("tool.arguments.delta", { content_index: update.contentIndex, ...turn });
       }
@@ -1019,9 +1209,9 @@ export class RunCoordinator {
       return;
     }
     if (event.type === "tool_execution_start") {
-      // Pi emits this before argument validation and before beforeToolCall
-      // approval. The authoritative visible start is published by the tool's
-      // execute wrapper at the point execution actually begins.
+      // Pi emits this before argument validation and policy/audit preflight.
+      // The authoritative visible start is published by the tool's execute
+      // wrapper after the Manager has echoed its execution receipt.
       return;
     } else if (event.type === "tool_execution_update") {
       journal.publish("tool.updated", {
@@ -1322,11 +1512,15 @@ export class RunCoordinator {
     } finally {
       unsubscribeChildJournal?.();
       signal?.removeEventListener("abort", onAbort);
-      this.processes.killScope(child.request.scope_key, child.request.lifecycle_id);
-      await this.processes.waitForScopeExit(
-        child.request.scope_key,
-        child.request.lifecycle_id,
-      ).catch(() => false);
+      if (this.executor?.managed) {
+        await this.executor.cancelRun(runExecutionIdentity(child)).catch(() => false);
+      } else {
+        this.processes.killScope(child.request.scope_key, child.request.lifecycle_id);
+        await this.processes.waitForScopeExit(
+          child.request.scope_key,
+          child.request.lifecycle_id,
+        ).catch(() => false);
+      }
       await this.gateway.invoke(
         child.request,
         child.id,
@@ -1498,7 +1692,7 @@ export class RunCoordinator {
 
   shutdown(): void {
     for (const record of this.runs.values()) if (!isTerminal(record.status)) this.cancel(record.id);
-    this.processes.shutdown();
+    if (!this.executor?.managed) this.processes.shutdown();
   }
 
   private drainTopLevelQueue(): void {
@@ -2222,6 +2416,24 @@ function validateRunRequest(request: RunRequest): void {
   assertMaximumLength(request.lifecycle_id, 512, "lifecycle_id");
   assertMaximumLength(request.session_id, 512, "session_id");
   assertMaximumLength(request.workspace, 4_096, "workspace");
+  if (request.scope_key.includes("\0") || request.lifecycle_id.includes("\0")) {
+    throw new Error("scope_key and lifecycle_id cannot contain NUL");
+  }
+  if (request.execution_context !== undefined) {
+    if (
+      !request.execution_context
+      || typeof request.execution_context !== "object"
+      || Array.isArray(request.execution_context)
+    ) {
+      throw new Error("execution_context must be an object");
+    }
+    const allowed = new Set(["sandbox_id", "workspace_id"]);
+    if (Object.keys(request.execution_context).some((key) => !allowed.has(key))) {
+      throw new Error("execution_context accepts only sandbox_id and workspace_id");
+    }
+    assertExecutionIdentifier(request.execution_context.sandbox_id, "execution_context.sandbox_id");
+    assertWorkspaceIdentifier(request.execution_context.workspace_id);
+  }
   if (typeof request.system_prompt !== "string") throw new Error("system_prompt must be a string");
   if (typeof request.input !== "string" && !Array.isArray(request.input)) throw new Error("input must be a string or content array");
   if (Array.isArray(request.input)) {
@@ -2800,6 +3012,44 @@ export function compactContext(messages: AgentMessage[]): AgentMessage[] {
 
 function isTerminal(status: RunRecord["status"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "needs_review";
+}
+
+function assertExecutionIdentifier(value: unknown, label: string): void {
+  if (
+    typeof value !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+  ) {
+    throw new Error(`${label} must be an opaque identifier of at most 128 safe characters`);
+  }
+}
+
+function assertWorkspaceIdentifier(value: unknown): void {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512 || value.startsWith("/")) {
+    throw new Error("execution_context.workspace_id must be a safe relative identifier");
+  }
+  const segments = value.split("/");
+  if (segments.some((segment) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(segment))) {
+    throw new Error("execution_context.workspace_id must contain only safe relative path segments");
+  }
+}
+
+function runExecutionIdentity(record: RunRecord): Omit<import("./executor.js").ExecutionIdentity, "tool_call_id"> {
+  return {
+    run_id: record.id,
+    scope_id: record.request.scope_key,
+    lifecycle_id: record.request.lifecycle_id,
+    execution_context: executionContext(record.request),
+  };
+}
+
+function scopeExecutionContextKey(scopeKey: string, lifecycleId: string): string {
+  return `${scopeKey}\0${lifecycleId}`;
+}
+
+function parseScopeExecutionContextKey(key: string): { scopeKey: string; lifecycleId: string } | undefined {
+  const separator = key.indexOf("\0");
+  if (separator < 0) return undefined;
+  return { scopeKey: key.slice(0, separator), lifecycleId: key.slice(separator + 1) };
 }
 
 function deferred(initial: RunRecord): RunCompletion {

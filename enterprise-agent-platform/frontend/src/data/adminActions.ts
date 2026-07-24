@@ -42,6 +42,7 @@ import { t } from "../i18n";
 import type {
   AdminPageId,
   AutoUpdateConfigUpdateRequest,
+  ManagerOperation,
   CreateUserRequest,
   DeleteBeforeRequest,
   DeleteClearAllRequest,
@@ -374,6 +375,21 @@ export async function saveAutoUpdateConfig(
 export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
   await runBusy(store, "admin:updates:check", async () => {
     await api(endpoints.autoUpdateCheck.path(), { method: "POST", body: EMPTY_BODY });
+    await loadAutoUpdateConfig(store);
+    toast(t("admin.toast.autoUpdateCheck"), { type: "ok", title: t("admin.toast.sent") });
+  });
+}
+
+export async function runManagerOperation(
+  store: AppStore,
+  operation: Exclude<ManagerOperation, "install">,
+  expectedGeneration: number,
+): Promise<void> {
+  await runBusy(store, `admin:updates:${operation}`, async () => {
+    await api(endpoints.managerOperation.path(operation), {
+      method: "POST",
+      body: JSON.stringify({ expected_generation: expectedGeneration }),
+    });
     await loadAutoUpdateConfig(store);
     toast(t("admin.toast.autoUpdateCheck"), { type: "ok", title: t("admin.toast.sent") });
   });

@@ -7,12 +7,183 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform.agent_scopes import AgentScopeManager
+from enterprise_agent_platform.container_contract_generated import DATABASE_SCHEMA_VERSION
 from enterprise_agent_platform.db import Database
 
 from test_platform import make_config
 
 
 class AgentScopeSessionTests(unittest.TestCase):
+    def test_scope_uses_stable_sandbox_identity_and_relative_database_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                scope = manager.ensure_private_scope(1)
+                stored = db.query_one(
+                    "SELECT workspace_path, sandbox_id, execution_backend FROM agent_scopes WHERE scope_key = ?",
+                    (scope.scope_key,),
+                )
+                self.assertEqual(stored["workspace_path"], "user-1")
+                self.assertEqual(stored["execution_backend"], "sandbox")
+                self.assertEqual(stored["sandbox_id"], scope.sandbox_id)
+                self.assertTrue(Path(scope.workspace_path).is_absolute())
+                execution = scope.to_execution_dict()
+                self.assertEqual(execution["backend"], "sandbox")
+                self.assertEqual(execution["workspace_path"], "/workspace")
+                self.assertEqual(execution["workspace_id"], "user-1")
+            finally:
+                db.close()
+
+    def test_legacy_host_scope_schema_is_rebuilt_and_preserves_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'host' CHECK(execution_backend = 'host'),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE TABLE agent_runtime_scopes (
+                    scope_key TEXT PRIMARY KEY REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE agent_runtime_scope_sessions (
+                    scope_key TEXT NOT NULL REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                INSERT INTO agent_scopes VALUES(
+                    'private:1', 'private', '1', 'legacy-meta', 'legacy-meta-life',
+                    '/old/source/data/workspaces/user-1', 'host', 1, 1
+                );
+                INSERT INTO agent_runtime_scopes VALUES(
+                    'private:1', 'legacy-runtime', 'legacy-runtime-life', 1, 1
+                );
+                INSERT INTO agent_runtime_scope_sessions VALUES(
+                    'private:1', 'legacy-runtime-life', 'legacy-runtime', 1
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                scope = manager.get_scope("private:1")
+                self.assertIsNotNone(scope)
+                self.assertEqual(scope.session_id, "legacy-runtime")
+                self.assertEqual(scope.lifecycle_id, "legacy-runtime-life")
+                self.assertEqual(scope.workspace_id, "user-1")
+                self.assertTrue(scope.sandbox_id.startswith("agent-"))
+                self.assertEqual(
+                    db.scalar("SELECT execution_backend FROM agent_scopes WHERE scope_key = 'private:1'"),
+                    "sandbox",
+                )
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (DATABASE_SCHEMA_VERSION,),
+                    ),
+                    1,
+                )
+                self.assertFalse(db.query("PRAGMA foreign_key_check"))
+            finally:
+                db.close()
+
+    def test_legacy_scope_migration_rolls_back_on_foreign_key_violation(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            connection = sqlite3.connect(config.db_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE agent_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL DEFAULT 'host'
+                        CHECK(execution_backend = 'host'),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(scope_type, scope_id)
+                );
+                CREATE TABLE agent_runtime_scopes (
+                    scope_key TEXT PRIMARY KEY
+                        REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    lifecycle_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE agent_runtime_scope_sessions (
+                    scope_key TEXT NOT NULL
+                        REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
+                    lifecycle_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, lifecycle_id, session_id)
+                );
+                INSERT INTO agent_runtime_scopes VALUES(
+                    'private:missing', 'orphan', 'orphan-life', 1, 1
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "foreign-key violations",
+            ):
+                Database(config.db_path)
+
+            verification = sqlite3.connect(config.db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in verification.execute(
+                        "PRAGMA table_info(agent_scopes)"
+                    ).fetchall()
+                }
+                tables = {
+                    row[0]
+                    for row in verification.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                self.assertNotIn("sandbox_id", columns)
+                self.assertNotIn("agent_scopes_legacy", tables)
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT COUNT(*) FROM agent_runtime_scopes "
+                        "WHERE scope_key = 'private:missing'"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                verification.close()
+
     def test_repeated_ensure_uses_read_only_scope_fast_path(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

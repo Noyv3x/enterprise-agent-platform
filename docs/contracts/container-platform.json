@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "policy": "container-platform",
+  "release_channel": "main",
+  "database_schema_version": 2026072401,
+  "container_paths": {
+    "data_root": "/var/lib/ubitech-agent",
+    "workspace": "/workspace",
+    "agent_home": "/home/agent",
+    "agent_env": "/opt/agent-env"
+  },
+  "execution_targets": [
+    "sandbox",
+    "host"
+  ],
+  "sandbox_idle_seconds": 1800,
+  "migration_backup_retention_seconds": 604800,
+  "public_update_states": [
+    "idle",
+    "waiting_for_tasks",
+    "updating",
+    "failed"
+  ],
+  "operations": [
+    "install",
+    "update",
+    "restart",
+    "rollback",
+    "repair"
+  ],
+  "operation_phases": [
+    "validating",
+    "pulling",
+    "preparing",
+    "draining",
+    "snapshotting",
+    "migrating",
+    "starting",
+    "probing",
+    "committing",
+    "rolling_back"
+  ]
+}

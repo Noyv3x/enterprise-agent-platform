@@ -61,6 +61,7 @@ class DocsSyncTests(unittest.TestCase):
                     ".gitignore",
                     ".github/**",
                     "deploy.sh",
+                    "manager/**",
                     "scripts/**",
                     "src/*.py",
                     "enterprise-agent-platform/pyproject.toml",
@@ -97,7 +98,7 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "id": "deployment",
                     "documents": ["docs/design/deployment.md"],
-                    "code": ["deploy.sh"],
+                    "code": ["deploy.sh", "manager/**"],
                     "tests": [],
                 },
                 {
@@ -134,6 +135,29 @@ class DocsSyncTests(unittest.TestCase):
                 },
             ],
             "contracts": [
+                {
+                    "id": "container-platform",
+                    "source": "docs/contracts/container-platform.json",
+                    "domains": ["deployment", "platform", "agent-runtime", "frontend"],
+                    "targets": [
+                        {
+                            "path": "manager/internal/contract/generated.go",
+                            "format": "go-container-platform",
+                        },
+                        {
+                            "path": "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py",
+                            "format": "python-container-platform",
+                        },
+                        {
+                            "path": "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts",
+                            "format": "typescript-container-platform",
+                        },
+                        {
+                            "path": "enterprise-agent-platform/frontend/src/container-contract.generated.ts",
+                            "format": "typescript-container-platform",
+                        },
+                    ],
+                },
                 {
                     "id": "upstream-sources",
                     "source": "docs/contracts/upstream-sources.json",
@@ -216,6 +240,44 @@ class DocsSyncTests(unittest.TestCase):
         files: dict[str, str] = {
             "docs/domains.json": json.dumps(manifest or self.manifest(), indent=2) + "\n",
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
+            "docs/contracts/container-platform.json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "policy": "container-platform",
+                    "release_channel": "main",
+                    "database_schema_version": 2026072401,
+                    "container_paths": {
+                        "data_root": "/var/lib/ubitech-agent",
+                        "workspace": "/workspace",
+                        "agent_home": "/home/agent",
+                        "agent_env": "/opt/agent-env",
+                    },
+                    "execution_targets": ["sandbox", "host"],
+                    "sandbox_idle_seconds": 1800,
+                    "migration_backup_retention_seconds": 604800,
+                    "public_update_states": [
+                        "idle",
+                        "waiting_for_tasks",
+                        "updating",
+                        "failed",
+                    ],
+                    "operations": ["install", "update", "restart", "rollback", "repair"],
+                    "operation_phases": [
+                        "validating",
+                        "pulling",
+                        "preparing",
+                        "draining",
+                        "snapshotting",
+                        "migrating",
+                        "starting",
+                        "probing",
+                        "committing",
+                        "rolling_back",
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
             "docs/contracts/upstream-sources.json": json.dumps(
                 {
                     "schema_version": 1,
@@ -535,7 +597,10 @@ class DocsSyncTests(unittest.TestCase):
             / "enterprise-agent-platform/frontend/src/design-contract.generated.ts"
         )
         original = generated.read_text(encoding="utf-8")
+        container_generated = generated.with_name("container-contract.generated.ts")
+        container_original = container_generated.read_text(encoding="utf-8")
         generated.unlink()
+        container_generated.unlink()
         generated.parent.rmdir()
         generated.parent.symlink_to("../redirected-src", target_is_directory=True)
         self.git("add", "-A", "enterprise-agent-platform/frontend/src")
@@ -543,6 +608,7 @@ class DocsSyncTests(unittest.TestCase):
         generated.parent.unlink()
         generated.parent.mkdir()
         generated.write_text(original, encoding="utf-8")
+        container_generated.write_text(container_original, encoding="utf-8")
 
         result = self.run_command(
             "check-change",
@@ -821,6 +887,7 @@ class DocsSyncTests(unittest.TestCase):
         )
         frontend_parent = frontend_target.parent
         frontend_target.unlink()
+        frontend_target.with_name("container-contract.generated.ts").unlink()
         frontend_parent.rmdir()
         redirected_parent = self.root / "redirected-frontend-src"
         redirected_parent.mkdir()

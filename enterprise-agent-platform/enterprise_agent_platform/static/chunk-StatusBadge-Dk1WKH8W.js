@@ -1,1 +1,0 @@
-import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{t}from"./chunk-badge-CqzbeCd0.js";var n=e();function r({ok:e,label:r}){return(0,n.jsx)(t,{className:`status ${e?`status--ok`:`status--warn`}`,status:e?`success`:`warning`,text:(0,n.jsx)(`span`,{className:`status__label`,children:r})})}export{r as t};

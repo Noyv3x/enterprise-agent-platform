@@ -10,6 +10,10 @@
       ".github/**/*.yml",
       ".github/**/*.yaml",
       "deploy.sh",
+      "manager/go.mod",
+      "manager/go.sum",
+      "manager/**/*.go",
+      "containers/**",
       "scripts/**",
       "enterprise-agent-platform/pyproject.toml",
       "enterprise-agent-platform/enterprise_agent_platform/**/*.py",
@@ -82,6 +86,8 @@
       ],
       "code": [
         "deploy.sh",
+        "manager/**",
+        "containers/**",
         "enterprise-agent-platform/enterprise_agent_platform/deployment.py",
         "enterprise-agent-platform/enterprise_agent_platform/auto_update.py",
         "enterprise-agent-platform/enterprise_agent_platform/update_state.py",
@@ -141,7 +147,10 @@
         "enterprise-agent-platform/agent-runtime/src/platform-gateway.ts",
         "enterprise-agent-platform/agent-runtime/src/process-registry.ts",
         "enterprise-agent-platform/agent-runtime/src/server.ts",
-        "enterprise-agent-platform/agent-runtime/src/tools.ts"
+        "enterprise-agent-platform/agent-runtime/src/tools.ts",
+        "manager/internal/control/**",
+        "manager/internal/driver/**",
+        "manager/internal/executor/**"
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_security_hardening.py",
@@ -230,6 +239,34 @@
     }
   ],
   "contracts": [
+    {
+      "id": "container-platform",
+      "source": "docs/contracts/container-platform.json",
+      "domains": [
+        "deployment",
+        "platform",
+        "agent-runtime",
+        "frontend"
+      ],
+      "targets": [
+        {
+          "path": "manager/internal/contract/generated.go",
+          "format": "go-container-platform"
+        },
+        {
+          "path": "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py",
+          "format": "python-container-platform"
+        },
+        {
+          "path": "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts",
+          "format": "typescript-container-platform"
+        },
+        {
+          "path": "enterprise-agent-platform/frontend/src/container-contract.generated.ts",
+          "format": "typescript-container-platform"
+        }
+      ]
+    },
     {
       "id": "upstream-sources",
       "source": "docs/contracts/upstream-sources.json",

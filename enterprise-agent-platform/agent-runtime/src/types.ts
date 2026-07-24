@@ -4,6 +4,15 @@ import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-a
 export type JsonObject = Record<string, unknown>;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * Stable execution ownership assigned by the authenticated Platform request.
+ * This object is deliberately not part of any model-visible tool schema.
+ */
+export interface ExecutionContext {
+  sandbox_id: string;
+  workspace_id: string;
+}
+
 export interface RuntimeConfig {
   home: string;
   host: string;
@@ -24,6 +33,10 @@ export interface RuntimeConfig {
   cleanupGraceMs: number;
   maxConcurrency: number;
   maxQueuedRuns: number;
+  executionMode: "manager" | "local";
+  managerSocketPath?: string;
+  managerToken?: string;
+  managerRequestTimeoutMs: number;
 }
 
 export interface ModelRequest {
@@ -67,6 +80,7 @@ export interface RunRequest {
   lifecycle_id: string;
   session_id: string;
   workspace: string;
+  execution_context?: ExecutionContext;
   system_prompt: string;
   input: UserInput;
   history?: AgentMessage[];

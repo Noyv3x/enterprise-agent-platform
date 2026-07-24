@@ -1,145 +1,132 @@
 # 配置参考
 
-本文说明 ubitech agent 的配置来源、优先级和变更生命周期。部署方式见[部署](../operations/deployment.md)，目录位置见[数据布局](data-layout.md)。跨 Python 与 Node 的 Run 空闲、模型轮次和 terminal 默认超时契约见 [`runtime-policy.json`](../contracts/runtime-policy.json)；其它配置由本文列出，并由对应实现与测试校验。
+本文说明 Docker 部署后的配置所有权、来源和生命周期。部署方式见[部署](../operations/deployment.md)，目录位置见[数据布局](data-layout.md)。Run 策略见 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器管理契约见 [`container-platform.json`](../contracts/container-platform.json)。
 
-## 配置来源
-
-平台没有一个适用于所有字段的全局优先级。每类配置必须按其所有者解析：
+## 配置所有权
 
 | 来源 | 所有者 | 用途 |
 |---|---|---|
-| 进程环境与 CLI | `PlatformConfig` / deployment | 首次启动基线、目录、监听和托管服务默认值 |
-| SQLite `settings` | Python 平台 | 管理界面可更新的产品设置与 secret |
-| systemd unit 环境 | deployment | 根据数据目录中的持久设置生成下一代服务进程环境 |
-| Agent Runtime 环境 | `PlatformRuntimeManager` | 由有效平台设置生成托管 Node sidecar 配置 |
-| Cognee `.env` | Cognee bridge | Cognee 自身的 provider、存储与内部目录配置 |
-| 浏览器 localStorage | React 前端 | 语言和主题等非安全界面偏好 |
+| `~/.config/ubitech-agent/manager.toml` | Manager | 公网监听、release channel、registry、数据根、更新轮询和 Docker 参数 |
+| Manager secret 文件 | Manager | control/executor token 与 registry 凭据 |
+| SQLite `settings` | Platform | 产品设置、OAuth、Telegram、模型、知识和可在管理界面更新的 secret |
+| release manifest | CI / Manager | 源 commit、协议/数据库版本、Manager 校验和和镜像 digest |
+| Manager 生成的容器环境 | Manager | 固定容器网络、mount、内部 endpoint、token file 和运行限制 |
+| Agent scope metadata | Platform / Manager | 主 Agent identity、workspace 相对标识和 Sandbox 生命周期 |
+| 浏览器 localStorage | React | 语言和主题等非安全界面偏好 |
 
-`ENTERPRISE_` 是现存兼容性环境变量前缀，不代表产品名称。重命名这些键需要独立兼容迁移，不能只修改文档。
+配置没有一个跨所有字段的全局优先级。每个字段只能由表中所有者解析；容器环境是生成物，不能手改为第二套配置。
 
-## 启动配置
+## Manager 配置
+
+标准 TOML 字段：
+
+```toml
+data_root = "~/.local/share/ubitech-agent"
+listen = "127.0.0.1:8080"
+release_manifest_url = "https://example.invalid/ubitech-agent/main.json"
+release_channel = "main"
+update_enabled = true
+update_interval = "5m"
+sandbox_idle = "30m"
+log_max_size = "20MiB"
+log_max_files = 5
+```
+
+- `data_root` 是 Manager、Platform 数据和恢复备份的唯一宿主根；展开后必须为绝对、非符号链接、部署用户可写路径。Platform 数据目录固定为规范化后的 `$data_root/data`，Manager 的迁移、快照、Sandbox registry、容器环境和 Compose bind mount 必须全部使用该同一路径。`data_dir` 不是独立可配置项；为兼容曾写入该字段的配置，解析器只能接受其规范化后恰好等于 `$data_root/data`，任何分叉路径都必须在启动、preflight 或停止旧服务前 fail closed。
+- `listen` 是唯一产品入口；生产反向代理连接此地址。Platform 容器端口由 Manager 动态选择，不单独配置公网监听。
+- `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。首次源码迁移可以用 `install.sh --manifest-url` 绑定精确引导 release，但长期值由 `--channel-manifest-url` 或 `UBITECH_RELEASE_CHANNEL_MANIFEST_URL` 提供，不能持久化精确 commit URL。运行身份永远使用 digest，不使用 tag。
+- `update_enabled` 与 `update_interval` 控制检测；手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
+- `sandbox_idle` 默认值由机器契约生成；配置覆盖必须在受支持范围内，并同时作用于任务与后台进程判断。
+- 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。
+
+Manager 配置修改通过临时文件、fsync 和原子替换保存。常驻进程只热加载明确声明可热更新的字段；listen、data root 和 control socket 变化需要 restart operation。
+
+## 容器生成配置
+
+Manager 为固定服务生成私有网络和下列路径：
+
+- Platform 数据：容器 `/var/lib/ubitech-agent`，宿主 `$DATA_ROOT/data`；
+- Runtime 状态：容器 `/var/lib/ubitech-agent/runtime`；
+- Camoufox/SearXNG/Firecrawl：各自明确的 `$DATA_ROOT/data/runtimes/*` 子目录；
+- Sandbox：`/workspace`、`/home/agent`、`/opt/agent-env`，分别映射主 Agent 的 workspace、home 和 env。
+
+Platform 与 Runtime 内部 URL 使用 Compose service name，不接受部署用户提供的公网 base URL。内部 bearer 通过 owner-only token file 或 Docker secret 风格只读挂载传入，不能出现在 Compose 命令行、环境 dump 或 Manager 公共状态。Manager control 使用 `manager-token`，仅挂载给 Platform；Manager executor 使用独立的 `manager-executor-token`，仅挂载给 Runtime。宿主 CLI 从 Manager owner-only secret 读取 control token。两枚 token 即使共享同一个 owner-only Unix socket，也不能访问对方的路由集合。
+
+Manager 配置只记录 control token file 路径，不接受 TOML 中的 `internal_token` 明文值。读取 capability 前必须先完成 owner、普通文件、非符号链接与 mode 校验。
+
+固定服务镜像、网络别名、健康检查和数据库迁移入口由 release manifest 与 Manager 模板决定。管理界面不能写镜像 tag、任意 mount、capability、privileged、Docker socket 或容器 command。
+
+## Platform 启动配置
+
+Platform 容器接受 Manager 生成的最小环境：
+
+- `ENTERPRISE_PLATFORM_DATA=/var/lib/ubitech-agent`；
+- 内部监听 host/port、public base URL 和 trusted proxy；
+- Agent Runtime、Camoufox、SearXNG 与 Firecrawl 的私有 service URL；
+- 对应内部 token file；
+- 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制。
+
+`ENTERPRISE_` 是现存环境前缀，不代表产品名称。它们是 Manager 到容器的内部兼容接口，不是生产部署的首选用户入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
+
+若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。容器首次接管已有数据库时，数据库中已持久化的 session secret 优先于 Manager 新建文件，从而保留现有登录会话；新库才使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store，使 Platform 与 Runtime 不会因旧数据库残值使用不同 token。该同步不导出 OAuth、Telegram 或其它产品 secret。
+
+## Platform 动态设置
 
 ### 平台与认证
 
-- `ENTERPRISE_PLATFORM_DATA`：平台状态根目录。
-- `ENTERPRISE_PLATFORM_HOST`、`ENTERPRISE_PLATFORM_PORT`：期望的公共监听地址。
-- `ENTERPRISE_PUBLIC_BASE_URL`：生成 webhook/public URL、Secure Cookie 和同源校验的基准。
-- `ENTERPRISE_TRUSTED_PROXY`：是否信任反向代理重建的转发头。
-- `ENTERPRISE_SESSION_SECRET`、`ENTERPRISE_SESSION_TTL_SECONDS`：会话签名和生命周期。
-- `ENTERPRISE_ADMIN_PASSWORD`：首次创建管理员时使用，不覆盖已有账号。
-- `ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD`：仅用于明确的本地开发启动。
-- `ENTERPRISE_AGENT_TOOL_TOKEN`：Python 内部 Agent 工具 token 的首次配置回退。
-
-如果没有管理员密码，平台生成随机密码并写入数据目录的受限 bootstrap 文件。显式 `ENTERPRISE_SESSION_SECRET` 始终优先；否则复用数据库中已保存的 secret，最后才生成并持久化新值。
-
-### Agent Runtime
-
-- `ENTERPRISE_MANAGE_AGENT_RUNTIME`：是否由平台管理 sidecar。
-- `ENTERPRISE_AGENT_RUNTIME_URL`、`ENTERPRISE_AGENT_RUNTIME_TOKEN`、`ENTERPRISE_AGENT_RUNTIME_HOME`：endpoint、认证与状态根。
-- `ENTERPRISE_AGENT_RUNTIME_PROVIDER`、`ENTERPRISE_AGENT_RUNTIME_MODEL`：首次默认选择。
-- `ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS`：首次无进展策略；管理界面的持久设置可以覆盖。
-- `ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS`：Python 调度门的首次并发值。
-
-模型 provider 只接受 Codex OAuth 和 Grok OAuth。模型 ID 必须来自 Runtime 当前目录，不能以环境变量绕过验证。
-
-`ENTERPRISE_MANAGE_AGENT_RUNTIME`、外置 Runtime URL/token 由直接启动、`./deploy.sh foreground` 或外部进程管理器读取。当前标准 `./deploy.sh service` 和管理界面不提供切换外置 Runtime endpoint 的入口；该部署方式使用平台托管 Runtime。不要通过手改 SQLite 或生成的 systemd unit 模拟受支持配置。
-
-### 知识与托管工具
-
-- `ENTERPRISE_KB_BACKEND`：`local`、`hybrid` 或 `cognee`。
-- `ENTERPRISE_COGNEE_REPO`、`ENTERPRISE_COGNEE_DATASET`、`ENTERPRISE_COGNEE_INGEST_BACKGROUND`、`ENTERPRISE_MANAGE_COGNEE`。开关默认开启；没有持久化覆盖时，设为 `0` 的 foreground/外部进程管理启动不会下载 Cognee 源码或安装其依赖，并保留外置 repo 路径。
-- `ENTERPRISE_MANAGE_CAMOFOX`、`ENTERPRISE_CAMOFOX_URL`、`ENTERPRISE_CAMOFOX_COMMAND`。
-- `ENTERPRISE_MANAGE_FIRECRAWL`、`ENTERPRISE_FIRECRAWL_REPO`、`ENTERPRISE_FIRECRAWL_API_URL`、`ENTERPRISE_FIRECRAWL_COMMAND`。开关默认开启；没有持久化覆盖时，设为 `0` 的 foreground/外部进程管理启动不会下载 Firecrawl 源码，并保留外置 repo 路径。
-- `FIRECRAWL_API_KEY`：外置 Firecrawl 的可选 bearer secret。标准 service 部署从平台 secret store 读取；环境变量是 foreground 或外部进程管理方式的回退。
-- `ENTERPRISE_MANAGE_SEARXNG`、`ENTERPRISE_SEARXNG_API_URL`。
-- `ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS` 以及 SearXNG/Compose 的部署等待配置。
-
-托管 endpoint 必须使用无内嵌凭据的数值回环地址；外置 SearXNG 仍受同一约束。外置 Agent Runtime 与 Firecrawl 可以使用无内嵌凭据的 HTTP(S) base URL，并分别通过 Runtime bearer 与 Firecrawl API key 认证；Camoufox 关闭托管后浏览器能力不可用。服务启动等待由部署配置解析，并由托管服务测试覆盖，不属于 Runtime 跨层契约。
-
-外置 Cognee/Firecrawl 的 managed 开关与 repo，以及 Firecrawl 的 URL 和 command，与外置 Runtime 一样，只是 foreground/外部进程管理模式的兼容配置。有对应数据库设置时，`cognee_manage` 和 `firecrawl_manage` 优先于环境变量；有效关闭时，bootstrap、生成的运行环境和平台配置必须贯穿显式外置 repo；有效开启时，生成的 managed 开关和 repo 必须固定为托管值，不能被遗留的外置环境变量覆盖。当前标准 `./deploy.sh service` 与管理界面使用默认开启的托管模式，不提供切换入口。`FIRECRAWL_API_KEY` 可以先保存在平台 secret store，供上述外置模式读取。
-
-### Telegram 与自动更新
-
-- `ENTERPRISE_TELEGRAM_ENABLED`、`ENTERPRISE_TELEGRAM_BOT_TOKEN`、`ENTERPRISE_TELEGRAM_BOT_USERNAME`、`ENTERPRISE_TELEGRAM_WEBHOOK_SECRET`、`ENTERPRISE_TELEGRAM_POLLING`。
-- `ENTERPRISE_AUTO_UPDATE_ENABLED`、`ENTERPRISE_AUTO_UPDATE_INTERVAL_SECONDS`、`ENTERPRISE_AUTO_UPDATE_REMOTE`、`ENTERPRISE_AUTO_UPDATE_BRANCH`、`ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET`。
-
-这些值用于首次启动；管理界面保存后，数据库设置是运行中行为的主要来源。
-
-### 容量与运维
-
-平台还提供附件总量、账号/全局附件配额、上传速率、Agent job lease、Cognee 重试、Telegram delivery、schedule poll、HTTP 请求并发、SSE 并发、媒体根、部署模式、服务名、自动安装 Node/APT 等运维变量。
-
-此类字段通常在模块加载或进程启动时解析，修改后需要重启。其合法范围和默认值由对应配置解析器与测试保持一致；只有 Run 空闲、模型轮次和 terminal 默认超时三项同时受 Runtime 跨层契约约束。
-
-## 数据库动态设置
-
-### 平台设置
-
 - `platform_public_base_url`
 - `platform_trusted_proxy`
-- `platform_host`
-- `platform_port`
 - `platform_session_ttl_seconds`
 
-public URL、trusted proxy 和 session TTL 可立即影响请求处理；host/port 保存为期望值，下一次部署根据数据库生成 systemd 环境并生效。session secret 轮换需要重启现有 signer。
+public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen 和容器端口属于 Manager，不再由 Platform 设置或数据库生成 systemd unit。
 
-### Runtime 设置
+### Runtime 与模型
 
-- `agent_runtime_manage`
-- `agent_runtime_url`
 - `agent_runtime_provider`
 - `agent_runtime_model`
 - `agent_runtime_idle_timeout_seconds`
 - `agent_runtime_max_concurrency`
 - `agent_runtime_compaction_threshold`
 
-更新 Runtime 设置时使用单一事务。托管 Runtime 随后重启，Python client 和模型目录缓存一起刷新；Python 并发门在并发值变化时同步 resize。
+模型 provider 只接受受支持 OAuth 类型，model ID 必须来自 Runtime 实时目录。更新这些设置使用单一事务；需要 Runtime restart 时由 Platform 请求 Manager operation，不能自行启动 Node 进程。
 
-当前受支持的管理界面只写 provider、model、idle timeout、max concurrency 和 compaction threshold。Runtime manager 仍能读取既有的 `agent_runtime_manage`、`agent_runtime_url` 行以保持内部兼容，但它们不是当前产品配置入口；不得依赖手工写数据库来设计部署。
+### 知识与集成
 
-### 集成设置
+Cognee backend、dataset 与内部设置由管理入口持久化。托管 Cognee/Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、Cognee provider secret 和 Telegram secret仍由 Platform secret store 管理。
 
-Cognee 的 backend、dataset 和内部配置由对应管理入口持久化。托管 Cognee/Firecrawl 的 source 路径由部署根据 canonical 源码契约决定；旧数据库中的 `cognee_repo`、`firecrawl_repo` 不得覆盖托管路径。Runtime manager 保留读取既有 Camoufox/Firecrawl managed、endpoint 和 command 设置的外置兼容能力，但当前产品管理界面不写这些键。Telegram 和自动更新保存各自 enabled、polling/interval、remote/branch 等字段。
+### Telegram 与自动更新
 
-有效设置通常是“数据库非空值，否则 `PlatformConfig` 启动基线”。每个新增字段必须在实现和本参考中明确自己的回退方式，不得假设这一规则自动适用。
+Telegram enabled、bot token、username、webhook secret 与 polling 仍属于 Platform。自动更新 enabled/interval/channel、当前/候选 generation 和 operation 则属于 Manager；Platform 只显示和提交受限 operation，不再保存 Git remote、branch、worktree 或 deploy command。旧部署已经保存的自动更新 webhook secret 可继续验证兼容 webhook，但验证成功后只能调用 Manager channel check，不能唤醒源码更新器；新部署以 Manager 轮询和管理界面手工检查为标准入口。
+
+## Agent Runtime 环境
+
+Manager 生成：
+
+- `AGENT_RUNTIME_HOME`、内部 host/port 和 token file；
+- Platform 内部 URL/token file；
+- Manager executor socket/token file；
+- approval/request body/cleanup/retention 与并发上限；
+- `AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS`、`AGENT_RUNTIME_MAX_TURNS`、`AGENT_RUNTIME_TERMINAL_TIMEOUT_MS`；
+- 容器固定 workspace/HOME/env 路径。
+
+Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.json` 的生成值。Sandbox 空闲和 execution target 必须来自 `container-platform.json`。Runtime token 不能为空；健康检查也需要 token。
 
 ## Secret
 
-以下 secret 保存在 SQLite `settings`，并用 `secret=1` 控制 API 展示：
+Platform secret store保存 OAuth、session、Agent tool、Runtime、Firecrawl、Cognee、Telegram，以及迁移后仍需接受兼容更新 webhook 时的验证 secret。Manager secret目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
 
-- Codex OAuth access/refresh token；
-- Grok OAuth access/refresh/id token；
-- session secret；
-- Agent tool token 与 Agent Runtime token；
-- 外置 Firecrawl API key；
-- Telegram bot/webhook secret；
-- 自动更新 webhook secret。
+`secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限；界面不得宣称“加密存储”。secret 值不能进入文档、日志、Run metadata、release manifest、operation journal 或 Git。
 
-一般 secret 读取是数据库优先、同名环境变量回退。systemd service 不把 secret 明文复制到 unit；应通过管理界面写入平台 secret store。session secret 和托管 Runtime token 存在明确的启动优先级例外，修改代码时必须保留对应测试。
+## 首次源码迁移输入
 
-`secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限，详见[安全与信任边界](../design/security-and-trust.md)。不得把 secret 值写入文档、日志、Run metadata 或 Git。
+桥接版本只迁移有明确所有权的有效配置，不把整个旧进程环境或 `deploy.env` 复制进容器。旧更新器把本次 handoff 实际使用的 data、service、host 和 port 原样交给安装器；SQLite 随数据迁移继续保存账号、OAuth、Telegram、模型、知识和其它 Platform 动态设置。Manager 为容器基础设施生成新的 capability 与 service 配置，不能让旧 source command、repo path 或任意环境覆盖镜像拓扑。
 
-## Cognee 内部配置
+Manager 的公网 `listen` 保留旧监听地址，`legacy_platform_gate_url` 使用通配监听对应的回环地址；长期 `platform_gate_url` 仍指向容器 Platform。桥接源码服务仅在 `UBITECH_SOURCE_MIGRATION_BRIDGE=1` 时接受 `UBITECH_MANAGER_SOCKET` 与 `UBITECH_MANAGER_TOKEN_FILE`，二者必须是绝对路径且 token file 由 Manager owner-only 创建。缺任一字段均拒绝启动桥接控制面，不能降级为未认证内部接口。无法归属到上述字段或 SQLite 的旧 unit 环境只进入七天恢复包，不自动注入新容器。
 
-管理界面编辑 Cognee 内部字段时，平台原子更新 `$DATA/runtimes/cognee/.env`。该文件包含 LLM、Embedding、存储、关系/图/向量数据库、安全、抓取和可观测性配置。敏感字段在 API 中只返回 configured/masked 状态。
+若安装目标已经存在 `manager.toml`，安装器不得自行用 shell 提取或猜测字段，也不得静默沿用与本次源码桥输入不同的配置。它把桥接期望值交给下载并校验过的 Manager，由 Manager 正式解析器比较有效 `data_root`、`listen`、`release_manifest_url`、`release_channel`、`legacy_platform_gate_url` 和 `socket_path`；任一有效值为空或不一致均在安装 unit 和切换服务前失败。`socket_path` 同时承载 capability 分离的 control/executor API，因此必须等于桥接源码服务实际连接的路径。
 
-平台管理的 data、system、cache、logs 路径优先作为安全默认值；`.env` 中显式配置可以覆盖 Cognee 自身字段。此文件属于运行数据，不能提交。
-
-## Agent Runtime 直接环境
-
-托管 Runtime 使用以下配置族：
-
-- `AGENT_RUNTIME_HOME`、`AGENT_RUNTIME_HOST`、`AGENT_RUNTIME_PORT`、`AGENT_RUNTIME_TOKEN` 或 `AGENT_RUNTIME_TOKEN_FILE`；
-- `AGENT_PLATFORM_INTERNAL_URL`、`AGENT_PLATFORM_INTERNAL_TOKEN`；
-- `AGENT_RUNTIME_APPROVAL_TIMEOUT_MS`、`AGENT_RUNTIME_RUN_RETENTION_MS`；
-- `AGENT_RUNTIME_MAX_DELEGATION_DEPTH`、`AGENT_RUNTIME_MAX_DELEGATES`；
-- `AGENT_RUNTIME_MAX_BODY_BYTES`、`AGENT_RUNTIME_REQUEST_BODY_TIMEOUT_MS`；
-- `AGENT_RUNTIME_COMPACTION_THRESHOLD`；
-- `AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS`、`AGENT_RUNTIME_MAX_TURNS`、`AGENT_RUNTIME_TERMINAL_TIMEOUT_MS`；
-- `AGENT_RUNTIME_CLEANUP_GRACE_MS`、`AGENT_RUNTIME_MAX_CONCURRENCY`、`AGENT_RUNTIME_MAX_QUEUED_RUNS`。
-
-托管模式下这些值由 Python 生成，运维不应同时维护第二套手写启动脚本。Runtime token 是必填项；空 token 不代表“仅本机免认证”。外置 Runtime 的运维者必须保证 Run 空闲、模型轮次和 terminal 默认超时与 [`runtime-policy.json`](../contracts/runtime-policy.json) 一致；其余字段按本参考及 Runtime 配置校验执行。
+迁移成功后删除旧 unit、源码 checkout 和源码内数据；这些环境变量不再由宿主 systemd 直接启动产品。桥接读取器只服务首次迁移，不得成为长期双配置兼容层。
 
 ## 变更规则
 
-新增、删除或改变配置字段时，先修改本文和需要的机器可读契约，再同步：解析器、持久设置、管理 API、前端表单、部署环境、敏感字段掩码和测试。只在代码中增加环境变量视为未完成变更。
+新增、删除或改变配置字段时，先修改本文和需要的机器可读契约，再同步解析器、持久设置、Manager API、容器模板、管理界面、敏感字段掩码和测试。只在 Dockerfile、环境变量或数据库中加入字段视为未完成变更。

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ubitech.invalid/schemas/release-manifest-v1.json",
+  "title": "ubitech agent release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "channel",
+    "source_commit",
+    "generated_at",
+    "protocol_version",
+    "database_schema_version",
+    "manager",
+    "compose",
+    "images"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "channel": { "const": "main" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "protocol_version": { "type": "integer", "minimum": 1 },
+    "database_schema_version": { "type": "integer", "minimum": 1 },
+    "manager": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "artifacts"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amd64", "arm64"],
+          "properties": {
+            "amd64": { "$ref": "#/$defs/artifact" },
+            "arm64": { "$ref": "#/$defs/artifact" }
+          }
+        }
+      }
+    },
+    "compose": { "$ref": "#/$defs/artifact" },
+    "images": {
+      "type": "object",
+      "minProperties": 10,
+      "additionalProperties": { "$ref": "#/$defs/image" },
+      "required": [
+        "platform",
+        "agent-runtime",
+        "camofox",
+        "agent-sandbox",
+        "searxng",
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-postgres",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+        "firecrawl-foundationdb"
+      ]
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "sha256"],
+      "properties": {
+        "url": { "type": "string", "pattern": "^https://" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "image": {
+      "type": "string",
+      "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"
+    }
+  }
+}

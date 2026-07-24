@@ -56,6 +56,16 @@ REQUIRED_UPSTREAM_SOURCES_DOMAINS = frozenset({"integrations", "platform"})
 REQUIRED_UPSTREAM_SOURCES_TARGETS = {
     "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py": "python-upstream-sources",
 }
+REQUIRED_CONTAINER_PLATFORM_SOURCE = "docs/contracts/container-platform.json"
+REQUIRED_CONTAINER_PLATFORM_DOMAINS = frozenset(
+    {"deployment", "platform", "agent-runtime", "frontend"}
+)
+REQUIRED_CONTAINER_PLATFORM_TARGETS = {
+    "manager/internal/contract/generated.go": "go-container-platform",
+    "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py": "python-container-platform",
+    "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts": "typescript-container-platform",
+    "enterprise-agent-platform/frontend/src/container-contract.generated.ts": "typescript-container-platform",
+}
 REQUIRED_OWNED_CODE_PROBES = {
     ".gitignore": frozenset({"repository-development"}),
     ".github/workflows/quality.yml": frozenset({"repository-development"}),
@@ -391,6 +401,9 @@ def load_manifest(root: Path) -> Manifest:
                 "python-runtime-policy",
                 "typescript-runtime-policy",
                 "python-upstream-sources",
+                "python-container-platform",
+                "typescript-container-platform",
+                "go-container-platform",
             }:
                 raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
             _reject_symlink_chain(root, target_path, f"{target_label}.path")
@@ -487,6 +500,34 @@ def load_manifest(root: Path) -> Manifest:
     ):
         raise DocsSyncError(
             "upstream-sources targets and formats must match the required Python target"
+        )
+
+    container_contracts = [
+        contract
+        for contract in manifest.contracts
+        if contract.identifier == "container-platform"
+    ]
+    if len(container_contracts) != 1:
+        raise DocsSyncError("manifest must define exactly one container-platform contract")
+    container_contract = container_contracts[0]
+    if container_contract.source != REQUIRED_CONTAINER_PLATFORM_SOURCE:
+        raise DocsSyncError(
+            f"container-platform source must be {REQUIRED_CONTAINER_PLATFORM_SOURCE}"
+        )
+    if set(container_contract.domains) != REQUIRED_CONTAINER_PLATFORM_DOMAINS:
+        raise DocsSyncError(
+            "container-platform domains must be exactly: "
+            + ", ".join(sorted(REQUIRED_CONTAINER_PLATFORM_DOMAINS))
+        )
+    container_targets = {
+        target.path: target.format for target in container_contract.targets
+    }
+    if (
+        len(container_targets) != len(container_contract.targets)
+        or container_targets != REQUIRED_CONTAINER_PLATFORM_TARGETS
+    ):
+        raise DocsSyncError(
+            "container-platform targets and formats must match the required Go, Python, Runtime and frontend targets"
         )
 
     for contract in manifest.contracts:
@@ -1028,6 +1069,171 @@ export const TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE = {_typescript_string
 '''
 
 
+def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any]:
+    contract = _expect_object(raw, label)
+    _reject_unknown_keys(
+        contract,
+        {
+            "schema_version",
+            "policy",
+            "release_channel",
+            "database_schema_version",
+            "container_paths",
+            "execution_targets",
+            "sandbox_idle_seconds",
+            "migration_backup_retention_seconds",
+            "public_update_states",
+            "operations",
+            "operation_phases",
+        },
+        label,
+    )
+    if contract.get("schema_version") != 1:
+        raise DocsSyncError(f"{label}.schema_version must be 1")
+    if contract.get("policy") != "container-platform":
+        raise DocsSyncError(f"{label}.policy must be 'container-platform'")
+    if contract.get("release_channel") != "main":
+        raise DocsSyncError(f"{label}.release_channel must be 'main'")
+
+    paths = _expect_object(contract.get("container_paths"), f"{label}.container_paths")
+    expected_paths = {"data_root", "workspace", "agent_home", "agent_env"}
+    if set(paths) != expected_paths:
+        raise DocsSyncError(
+            f"{label}.container_paths must contain exactly: "
+            + ", ".join(sorted(expected_paths))
+        )
+    for name, value in paths.items():
+        if (
+            not isinstance(value, str)
+            or not value.startswith("/")
+            or "//" in value
+            or value.endswith("/")
+            or any(part in {".", ".."} for part in PurePosixPath(value).parts)
+        ):
+            raise DocsSyncError(f"{label}.container_paths.{name} must be a canonical absolute path")
+
+    list_fields = {
+        "execution_targets": ("sandbox", "host"),
+        "public_update_states": ("idle", "waiting_for_tasks", "updating", "failed"),
+        "operations": ("install", "update", "restart", "rollback", "repair"),
+        "operation_phases": (
+            "validating",
+            "pulling",
+            "preparing",
+            "draining",
+            "snapshotting",
+            "migrating",
+            "starting",
+            "probing",
+            "committing",
+            "rolling_back",
+        ),
+    }
+    for field, expected in list_fields.items():
+        values = _expect_string_list(contract.get(field), f"{label}.{field}")
+        if values != expected:
+            raise DocsSyncError(
+                f"{label}.{field} must exactly match the documented ordered values"
+            )
+
+    for field in (
+        "database_schema_version",
+        "sandbox_idle_seconds",
+        "migration_backup_retention_seconds",
+    ):
+        value = contract.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise DocsSyncError(f"{label}.{field} must be a positive integer")
+        if value > JAVASCRIPT_MAX_SAFE_INTEGER:
+            raise DocsSyncError(f"{label}.{field} must be a JavaScript safe integer")
+    return contract
+
+
+def _render_python_container_platform(contract: dict[str, Any], source: str) -> str:
+    paths = contract["container_paths"]
+    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
+from __future__ import annotations
+
+CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]}
+RELEASE_CHANNEL = {contract["release_channel"]!r}
+DATABASE_SCHEMA_VERSION = {contract["database_schema_version"]}
+CONTAINER_PATHS = {paths!r}
+EXECUTION_TARGETS = {tuple(contract["execution_targets"])!r}
+SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]}
+MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]}
+PUBLIC_UPDATE_STATES = {tuple(contract["public_update_states"])!r}
+MANAGER_OPERATIONS = {tuple(contract["operations"])!r}
+MANAGER_OPERATION_PHASES = {tuple(contract["operation_phases"])!r}
+'''
+
+
+def _render_typescript_container_platform(contract: dict[str, Any], source: str) -> str:
+    paths = json.dumps(contract["container_paths"], ensure_ascii=False, indent=2)
+    targets = json.dumps(contract["execution_targets"], ensure_ascii=False)
+    states = json.dumps(contract["public_update_states"], ensure_ascii=False)
+    operations = json.dumps(contract["operations"], ensure_ascii=False)
+    phases = json.dumps(contract["operation_phases"], ensure_ascii=False)
+    return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
+export const CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]} as const;
+export const RELEASE_CHANNEL = {_typescript_string(contract["release_channel"])} as const;
+export const DATABASE_SCHEMA_VERSION = {contract["database_schema_version"]} as const;
+export const CONTAINER_PATHS = {paths} as const;
+export const EXECUTION_TARGETS = {targets} as const;
+export type ExecutionTarget = (typeof EXECUTION_TARGETS)[number];
+export const SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]} as const;
+export const MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]} as const;
+export const PUBLIC_UPDATE_STATES = {states} as const;
+export type PublicUpdateState = (typeof PUBLIC_UPDATE_STATES)[number];
+export const MANAGER_OPERATIONS = {operations} as const;
+export type ManagerOperation = (typeof MANAGER_OPERATIONS)[number];
+export const MANAGER_OPERATION_PHASES = {phases} as const;
+export type ManagerOperationPhase = (typeof MANAGER_OPERATION_PHASES)[number];
+'''
+
+
+def _go_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
+    paths = contract["container_paths"]
+
+    def strings(values: Sequence[str]) -> str:
+        return ", ".join(_go_string(value) for value in values)
+
+    constants = (
+        ("SchemaVersion", str(contract["schema_version"])),
+        ("ReleaseChannel", _go_string(contract["release_channel"])),
+        ("DatabaseSchemaVersion", str(contract["database_schema_version"])),
+        ("ContainerDataRoot", _go_string(paths["data_root"])),
+        ("ContainerWorkspace", _go_string(paths["workspace"])),
+        ("ContainerAgentHome", _go_string(paths["agent_home"])),
+        ("ContainerAgentEnv", _go_string(paths["agent_env"])),
+        ("SandboxIdleSeconds", str(contract["sandbox_idle_seconds"])),
+        (
+            "MigrationBackupRetentionSeconds",
+            str(contract["migration_backup_retention_seconds"]),
+        ),
+    )
+    name_width = max(len(name) for name, _ in constants)
+    constant_lines = "\n".join(
+        f"\t{name:<{name_width}} = {value}" for name, value in constants
+    )
+
+    return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
+package contract
+
+const (
+{constant_lines}
+)
+
+var ExecutionTargets = []string{{{strings(contract["execution_targets"])}}}
+var PublicUpdateStates = []string{{{strings(contract["public_update_states"])}}}
+var Operations = []string{{{strings(contract["operations"])}}}
+var OperationPhases = []string{{{strings(contract["operation_phases"])}}}
+'''
+
+
 def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     contract = _expect_object(raw, label)
     _reject_unknown_keys(contract, {"schema_version", "sources"}, label)
@@ -1123,6 +1329,10 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
     raw = _read_json(_safe_path(root, contract.source), f"contract {contract.identifier}")
     if contract.identifier == "runtime-policy":
         parsed = _validate_runtime_contract(raw, f"contract {contract.identifier}")
+    elif contract.identifier == "container-platform":
+        parsed = _validate_container_platform_contract(
+            raw, f"contract {contract.identifier}"
+        )
     elif contract.identifier == "upstream-sources":
         parsed = _validate_upstream_sources_contract(
             raw, f"contract {contract.identifier}"
@@ -1137,6 +1347,12 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_typescript_runtime_policy(parsed, contract.source)
         elif target.format == "python-upstream-sources":
             content = _render_python_upstream_sources(parsed, contract.source)
+        elif target.format == "python-container-platform":
+            content = _render_python_container_platform(parsed, contract.source)
+        elif target.format == "typescript-container-platform":
+            content = _render_typescript_container_platform(parsed, contract.source)
+        elif target.format == "go-container-platform":
+            content = _render_go_container_platform(parsed, contract.source)
         else:  # Protected by manifest validation; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content

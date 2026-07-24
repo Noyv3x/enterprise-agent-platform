@@ -4,6 +4,11 @@ import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { Type, type ImageContent, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
+  CONTAINER_PATHS,
+  EXECUTION_TARGETS,
+  type ExecutionTarget,
+} from "./container-contract.generated.js";
+import {
   TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
   TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS,
   TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
@@ -16,6 +21,12 @@ import {
   processWriteHardBlock,
   terminalApprovalObject,
 } from "./approval-policy.js";
+import type {
+  ExecutionAuditReceipt,
+  ExecutionCallContext,
+  ExecutionManager,
+} from "./executor.js";
+import { executionContext } from "./executor.js";
 import type { JsonObject, JsonValue, RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
 import { ProcessRegistry } from "./process-registry.js";
@@ -38,6 +49,8 @@ export interface ToolFactoryContext {
   currentAttachmentPaths?: () => Iterable<string>;
   onActivity?: (description: string) => void;
   activityHeartbeatMs?: number;
+  executor?: ExecutionManager;
+  executionReceipt?: (toolCallId: string) => ExecutionAuditReceipt;
 }
 
 function textResult(content: string, details: JsonValue = null): AgentToolResult<JsonValue> {
@@ -121,12 +134,15 @@ async function withUntrustedErrorBoundary<T>(
 }
 
 const terminalSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])], {
+    description: "Execution target. Defaults to this Agent's sandbox; choose host explicitly for one call only.",
+  })),
   command: Type.String({
     minLength: 1,
     description: "Shell command to run. Keep it focused; do not embed file-reading, searching, or editing workflows that have dedicated tools.",
   }),
   cwd: Type.Optional(Type.String({
-    description: "Working directory. Relative paths use the Agent workspace; absolute host paths go through approval.",
+    description: "Working directory. Relative paths use the selected target's Agent workspace.",
   })),
   timeout_ms: Type.Optional(Type.Integer({
     minimum: TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
@@ -142,9 +158,12 @@ const terminalSchema = Type.Object({
   ], {
     description: "Update policy for a background process. Defaults to wait; use terminate only for disposable work that may stop during a platform update.",
   })),
-});
+}, { additionalProperties: false });
 
 const processSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])], {
+    description: "Process target. Defaults to sandbox and must match the target that created the process.",
+  })),
   action: Type.Union([Type.Literal("list"), Type.Literal("read"), Type.Literal("write"), Type.Literal("kill")]),
   process_id: Type.Optional(Type.String({
     description: "Process id returned by terminal when background=true.",
@@ -153,12 +172,13 @@ const processSchema = Type.Object({
     maxLength: APPROVAL_ARGUMENT_MAX_BYTES,
     description: "Input to send to a running background process when action=write.",
   })),
-});
+}, { additionalProperties: false });
 
 const readFileSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
   path: Type.String({
     minLength: 1,
-    description: "File path. Relative paths use the Agent workspace; absolute host paths go through approval.",
+    description: "File path. Relative paths use the selected target's Agent workspace.",
   }),
   offset: Type.Optional(Type.Integer({
     minimum: 0,
@@ -169,24 +189,26 @@ const readFileSchema = Type.Object({
     maximum: 1_000_000,
     description: "Maximum bytes to return. Defaults to 100000.",
   })),
-});
+}, { additionalProperties: false });
 
 const MAX_PATCH_FILE_BYTES = 10 * 1024 * 1024;
 
 const writeFileSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
   path: Type.String({
     minLength: 1,
-    description: "Destination path. Relative paths use the Agent workspace; absolute host paths go through approval.",
+    description: "Destination path. Relative paths use the selected target's Agent workspace.",
   }),
   content: Type.String({
     description: "Complete UTF-8 file contents.",
   }),
-});
+}, { additionalProperties: false });
 
 const patchFileSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
   path: Type.String({
     minLength: 1,
-    description: "File path. Relative paths use the Agent workspace; absolute host paths go through approval.",
+    description: "File path. Relative paths use the selected target's Agent workspace.",
   }),
   old_text: Type.String({
     minLength: 1,
@@ -200,15 +222,16 @@ const patchFileSchema = Type.Object({
     maximum: 10_000,
     description: "Required number of exact matches. Defaults to 1.",
   })),
-});
+}, { additionalProperties: false });
 
 const searchFilesSchema = Type.Object({
+  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
   query: Type.String({
     minLength: 1,
     description: "Text or regular expression to find in filenames and UTF-8 file contents.",
   }),
   path: Type.Optional(Type.String({
-    description: "Directory to search. Relative paths use the Agent workspace; absolute host paths go through approval.",
+    description: "Directory to search. Relative paths use the selected target's Agent workspace.",
   })),
   regex: Type.Optional(Type.Boolean({
     description: "Interpret query as a JavaScript regular expression.",
@@ -221,7 +244,7 @@ const searchFilesSchema = Type.Object({
     maximum: 1000,
     description: "Maximum matches to return. Defaults to 100.",
   })),
-});
+}, { additionalProperties: false });
 
 const gatewaySchema = Type.Object({
   action: Type.String({ minLength: 1 }),
@@ -591,7 +614,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "terminal",
     label: "Terminal",
     description: [
-      "Run a focused shell command on the host in this Agent's workspace.",
+      "Run a focused shell command in this Agent's sandbox workspace by default. Use target=host only for a call that must affect the deployment host.",
       "Use terminal for builds, tests, Git, package managers, network commands, and processes.",
       "Do not use cat/head/tail to read files; use read_file.",
       "Prefer search_files over grep/rg/find for workspace discovery and content search; use ls only when the directory listing itself matters.",
@@ -608,6 +631,37 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         throw new Error("update_behavior is supported only when background=true");
       }
       context.markSideEffect();
+      if (context.executor?.managed) {
+        const binding = managedExecutionBinding(
+          "terminal",
+          params,
+          context.request.workspace,
+          context.defaultTerminalTimeoutMs,
+        );
+        const heartbeat = !background && context.onActivity
+          ? setInterval(
+            () => context.onActivity?.("Manager terminal command still running"),
+            context.activityHeartbeatMs ?? 10_000,
+          )
+          : undefined;
+        heartbeat?.unref();
+        try {
+          const response = await context.executor.terminal(
+            managedCallContext(context, _toolCallId),
+            binding.arguments,
+            signal,
+          );
+          const result = response.result;
+          return textResult(
+            result.status === "running"
+              ? `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
+              : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
+            result as unknown as JsonValue,
+          );
+        } finally {
+          if (heartbeat) clearInterval(heartbeat);
+        }
+      }
       const cwd = resolveWorkspacePath(context.request.workspace, params.cwd || ".");
       const options: Parameters<ProcessRegistry["run"]>[0] = {
         runId: context.runId,
@@ -649,7 +703,37 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     description: "List, inspect, write to, or stop background processes owned by this Agent. After starting a service, inspect its output and verify readiness before claiming success.",
     parameters: processSchema,
     executionMode: "sequential",
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
+      if (params.action === "write") {
+        const input = params.input ?? "";
+        const hardBlock = processWriteHardBlock(input);
+        if (hardBlock) throw new Error(`Process input is blocked: ${hardBlock}`);
+      }
+      if (context.executor?.managed) {
+        if (params.action === "write" || params.action === "kill") context.markSideEffect();
+        const binding = managedExecutionBinding(
+          "process",
+          params,
+          context.request.workspace,
+          context.defaultTerminalTimeoutMs,
+        );
+        const response = await context.executor.process(
+          managedCallContext(context, _toolCallId),
+          binding.action,
+          binding.arguments,
+          signal,
+        );
+        const result = response.result;
+        if (params.action === "write") return textResult("Input sent", result);
+        if (params.action === "kill") return textResult("Process stop requested", result);
+        if (params.action === "read" && result && typeof result === "object" && !Array.isArray(result)) {
+          const snapshot = result as JsonObject;
+          const stdout = typeof snapshot.stdout === "string" ? snapshot.stdout : "";
+          const stderr = typeof snapshot.stderr === "string" ? snapshot.stderr : "";
+          return textResult(`${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`, result);
+        }
+        return textResult(JSON.stringify(result, null, 2), result);
+      }
       if (params.action === "list") {
         return textResult(JSON.stringify(
           context.processes.list(context.request.scope_key, context.request.lifecycle_id),
@@ -669,8 +753,6 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       context.markSideEffect();
       if (params.action === "write") {
         const input = params.input ?? "";
-        const hardBlock = processWriteHardBlock(input);
-        if (hardBlock) throw new Error(`Process input is blocked: ${hardBlock}`);
         context.processes.write(
           context.request.scope_key,
           params.process_id,
@@ -698,6 +780,20 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
+      if (context.executor?.managed) {
+        const binding = managedExecutionBinding("read_file", params, context.request.workspace);
+        const response = await context.executor.file(
+          managedCallContext(context, _toolCallId),
+          binding.action,
+          binding.arguments,
+          signal,
+        );
+        const path = String(params.path);
+        const modelText = await isCurrentAttachmentPath(context, path)
+          ? frameUntrustedText("attachment", response.content)
+          : response.content;
+        return textResult(modelText, response.details ?? null);
+      }
       const path = resolveWorkspacePath(context.request.workspace, params.path);
       await assertPinnedReadableTarget(path);
       const offset = params.offset ?? 0;
@@ -724,6 +820,17 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
+      if (context.executor?.managed) {
+        context.markSideEffect();
+        const binding = managedExecutionBinding("write_file", params, context.request.workspace);
+        const response = await context.executor.file(
+          managedCallContext(context, _toolCallId),
+          binding.action,
+          binding.arguments,
+          signal,
+        );
+        return textResult(response.content, response.details ?? null);
+      }
       const path = resolveWorkspacePath(context.request.workspace, params.path);
       await assertPinnedWritableTarget(path);
       context.markSideEffect();
@@ -749,6 +856,17 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
+      if (context.executor?.managed) {
+        context.markSideEffect();
+        const binding = managedExecutionBinding("patch_file", params, context.request.workspace);
+        const response = await context.executor.file(
+          managedCallContext(context, _toolCallId),
+          binding.action,
+          binding.arguments,
+          signal,
+        );
+        return textResult(response.content, response.details ?? null);
+      }
       const path = resolveWorkspacePath(context.request.workspace, params.path);
       await assertPinnedWritableTarget(path);
       const selected = await readRegularFileRange(
@@ -784,6 +902,19 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     parameters: searchFilesSchema,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
+      if (context.executor?.managed) {
+        const binding = managedExecutionBinding("search_files", params, context.request.workspace);
+        const response = await context.executor.file(
+          managedCallContext(context, _toolCallId),
+          binding.action,
+          binding.arguments,
+          signal,
+        );
+        return textResult(
+          frameUntrustedText("workspace_search", response.content),
+          response.details ?? null,
+        );
+      }
       const root = resolveWorkspacePath(context.request.workspace, params.path || ".");
       await assertPinnedReadableTarget(root);
       const max = params.max_results ?? 100;
@@ -1018,6 +1149,94 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
   ];
 }
 
+function managedCallContext(context: ToolFactoryContext, toolCallId: string): ExecutionCallContext {
+  const receipt = context.executionReceipt?.(toolCallId);
+  if (!receipt) throw new Error("Manager execution is missing its audit receipt");
+  return {
+    run_id: context.runId,
+    scope_id: context.request.scope_key,
+    lifecycle_id: context.request.lifecycle_id,
+    tool_call_id: toolCallId,
+    execution_context: executionContext(context.request),
+    receipt,
+  };
+}
+
+function withoutTarget(value: object): JsonObject {
+  const result: JsonObject = { ...value };
+  delete result.target;
+  return result;
+}
+
+export interface ManagedExecutionBinding {
+  operation: string;
+  action: string;
+  arguments: JsonObject;
+}
+
+// This is the single canonical projection from a validated tool call to the
+// Manager protocol. The coordinator audits this projection and each managed
+// tool executes the same projection, preventing display-only audit details
+// from being exchanged for different commands, paths, or process actions.
+export function managedExecutionBinding(
+  toolName: string,
+  params: unknown,
+  workspace: string,
+  defaultTerminalTimeoutMs: number = TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
+): ManagedExecutionBinding {
+  const values = objectValue(params);
+  if (toolName === "terminal") {
+    if (typeof values.command !== "string" || !values.command) {
+      throw new Error("Managed terminal command is required");
+    }
+    const background = values.background === true;
+    if (!background && values.update_behavior !== undefined) {
+      throw new Error("update_behavior is supported only when background=true");
+    }
+    const arguments_: JsonObject = {
+      command: values.command,
+      cwd: typeof values.cwd === "string" && values.cwd ? values.cwd : workspace,
+      background,
+    };
+    if (background) {
+      arguments_.update_behavior = typeof values.update_behavior === "string"
+        ? values.update_behavior
+        : "wait";
+    } else {
+      arguments_.timeout_ms = typeof values.timeout_ms === "number"
+        ? values.timeout_ms
+        : defaultTerminalTimeoutMs;
+    }
+    if (background && typeof values.timeout_ms === "number") {
+      arguments_.timeout_ms = values.timeout_ms;
+    }
+    return { operation: "terminal", action: "run", arguments: arguments_ };
+  }
+  if (toolName === "process") {
+    const action = typeof values.action === "string" ? values.action : "";
+    if (!["list", "read", "write", "kill"].includes(action)) {
+      throw new Error("Managed process action is invalid");
+    }
+    const arguments_: JsonObject = {};
+    if (typeof values.process_id === "string" && values.process_id) {
+      arguments_.process_id = values.process_id;
+    }
+    if (values.input !== undefined) arguments_.input = values.input;
+    return { operation: "process", action, arguments: arguments_ };
+  }
+  const fileActions: Readonly<Record<string, string>> = {
+    read_file: "read",
+    write_file: "write",
+    patch_file: "patch",
+    search_files: "search",
+  };
+  const action = fileActions[toolName];
+  if (action) {
+    return { operation: toolName, action, arguments: withoutTarget(values) };
+  }
+  throw new Error(`Tool ${toolName} is not managed by the execution Manager`);
+}
+
 async function isCurrentAttachmentPath(
   context: ToolFactoryContext,
   path: string,
@@ -1031,6 +1250,10 @@ async function isCurrentAttachmentPath(
           : []
       );
   if (candidates.length === 0) return false;
+  if (context.executor?.managed) {
+    const target = resolveWorkspacePath(context.request.workspace, path);
+    return candidates.some((candidate) => resolveWorkspacePath(context.request.workspace, candidate) === target);
+  }
   let target: string;
   try {
     target = await realpath(path);
@@ -1074,6 +1297,7 @@ export interface ToolPolicyResult {
   approvedPath?: string;
   allowSession?: boolean;
   allowPermanent?: boolean;
+  executionTarget?: ExecutionTarget;
 }
 
 export async function classifyToolCall(
@@ -1081,6 +1305,7 @@ export async function classifyToolCall(
   args: unknown,
   workspace?: string,
   defaultTerminalTimeoutMs: number = TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
+  managedExecution = false,
 ): Promise<ToolPolicyResult> {
   const values = objectValue(args);
   if (toolName === "terminal") {
@@ -1088,6 +1313,28 @@ export async function classifyToolCall(
     const hardBlock = hardBlockedCommand(command);
     if (hardBlock) return { hardBlock };
     const requestedCwd = typeof values.cwd === "string" && values.cwd ? values.cwd : ".";
+    const target = requestedExecutionTarget(values.target);
+    if (managedExecution) {
+      const approvedCwd = resolve(workspace || CONTAINER_PATHS.workspace, requestedCwd);
+      if (target === EXECUTION_TARGETS[1] && protectedManagerPath(approvedCwd)) {
+        return { hardBlock: `Accessing protected Manager path ${approvedCwd} is blocked` };
+      }
+      let approval;
+      try {
+        approval = terminalApprovalObject(
+          { ...values, cwd: approvedCwd },
+          workspace || CONTAINER_PATHS.workspace,
+          defaultTerminalTimeoutMs,
+        );
+      } catch (error) {
+        return { hardBlock: errorMessage(error) };
+      }
+      return {
+        displayArguments: { target, ...approval.displayArguments },
+        approvedCwd,
+        executionTarget: target,
+      };
+    }
     const addressedCwd = workspace ? resolveWorkspacePath(workspace, requestedCwd) : resolve(requestedCwd);
     const approvedCwd = await canonicalPath(addressedCwd);
     const approval = terminalApprovalObject(
@@ -1104,8 +1351,29 @@ export async function classifyToolCall(
   }
   if (["read_file", "write_file", "patch_file", "search_files"].includes(toolName)) {
     const requestedPath = typeof values.path === "string" ? values.path : ".";
+    const target = requestedExecutionTarget(values.target);
     const addressedPath = workspace ? resolveWorkspacePath(workspace, requestedPath) : requestedPath;
     const mutatesFile = toolName === "write_file" || toolName === "patch_file";
+    if (managedExecution) {
+      const approvedPath = resolve(workspace || CONTAINER_PATHS.workspace, requestedPath);
+      if (mutatesFile && protectedWritePath(approvedPath)) {
+        return { hardBlock: `Writing protected host path ${approvedPath} is blocked` };
+      }
+      if (!mutatesFile && protectedReadPath(approvedPath)) {
+        return { hardBlock: `Reading protected host path ${approvedPath} is blocked` };
+      }
+      let approval;
+      try {
+        approval = fileApprovalObject(toolName, approvedPath, values);
+      } catch (error) {
+        return { hardBlock: errorMessage(error) };
+      }
+      return {
+        displayArguments: { target, ...approval.displayArguments },
+        approvedPath,
+        executionTarget: target,
+      };
+    }
     if (mutatesFile) {
       let canonicalTarget: string;
       try {
@@ -1178,11 +1446,31 @@ export async function classifyToolCall(
     } catch (error) {
       return { hardBlock: errorMessage(error) };
     }
+    if (managedExecution) {
+      const target = requestedExecutionTarget(values.target);
+      return {
+        displayArguments: { target, ...approval.displayArguments },
+        executionTarget: target,
+      };
+    }
     return {
       approvalReason: "Control this host process",
       approvalKey: approval.key,
       displayArguments: approval.displayArguments,
       ...(values.action === "write" ? { allowSession: false, allowPermanent: false } : {}),
+    };
+  }
+  if (toolName === "process" && managedExecution) {
+    const target = requestedExecutionTarget(values.target);
+    let approval;
+    try {
+      approval = actionApprovalObject(toolName, values);
+    } catch (error) {
+      return { hardBlock: errorMessage(error) };
+    }
+    return {
+      displayArguments: { target, ...approval.displayArguments },
+      executionTarget: target,
     };
   }
   if (
@@ -1252,6 +1540,16 @@ export async function classifyToolCall(
   return {};
 }
 
+export function isExecutionTool(toolName: string): boolean {
+  return ["terminal", "process", "read_file", "write_file", "patch_file", "search_files"].includes(toolName);
+}
+
+function requestedExecutionTarget(value: unknown): ExecutionTarget {
+  if (value === undefined || value === null || value === "") return EXECUTION_TARGETS[0];
+  if (value === EXECUTION_TARGETS[0] || value === EXECUTION_TARGETS[1]) return value;
+  throw new Error("target must be sandbox or host");
+}
+
 async function isOutsideWorkspace(workspace: string, addressedPath: string): Promise<boolean> {
   const [canonicalWorkspace, canonicalTarget] = await Promise.all([
     canonicalPath(resolve(workspace)),
@@ -1279,14 +1577,24 @@ function protectedWritePath(path: string): boolean {
   const normalized = path.replaceAll("\\", "/");
   if (/^\/dev\/(?:null|stdin|stdout|stderr)$/.test(normalized)) return false;
   return /^\/(?:etc|boot|proc|sys|dev)(?:\/|$)/.test(normalized)
-    || /^(?:\/var\/run|\/run)\/docker\.sock$/.test(normalized);
+    || /^(?:\/var\/run|\/run)\/docker\.sock$/.test(normalized)
+    || protectedManagerPath(normalized);
 }
 
 function protectedReadPath(path: string): boolean {
   if (!path || !isAbsolute(path)) return false;
   const normalized = path.replaceAll("\\", "/");
   return /^\/proc\/(?:self|thread-self|\d+)\/(?:environ|cmdline|mem|fd)(?:\/|$)/.test(normalized)
-    || /^\/proc\/(?:kcore|keys|key-users)(?:\/|$)/.test(normalized);
+    || /^\/proc\/(?:kcore|keys|key-users)(?:\/|$)/.test(normalized)
+    || /^(?:\/var\/run|\/run)\/docker\.sock$/.test(normalized)
+    || protectedManagerPath(normalized);
+}
+
+function protectedManagerPath(path: string): boolean {
+  return /^(?:\/var\/run|\/run)\/ubitech-agent(?:\/|$)/.test(path)
+    || /^\/var\/lib\/ubitech-agent\/manager(?:\/|$)/.test(path)
+    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/.test(path)
+    || /^\/(?:root|home\/[^/]+)\/\.config\/ubitech-agent(?:\/|$)/.test(path);
 }
 
 export async function assertReadableTargetAllowed(target: string): Promise<void> {

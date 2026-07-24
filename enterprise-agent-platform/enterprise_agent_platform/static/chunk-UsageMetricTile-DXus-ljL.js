@@ -1,1 +1,0 @@
-import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{v as t}from"./app-Dina3WtM.js";var n=e();function r({label:e,value:r,suffix:i=``}){return(0,n.jsxs)(`div`,{className:`metric-tile`,children:[(0,n.jsx)(`span`,{children:e}),(0,n.jsx)(`strong`,{children:typeof r==`string`?r:t(r)}),i?(0,n.jsx)(`small`,{children:i}):null]})}export{r as t};

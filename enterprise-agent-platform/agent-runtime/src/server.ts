@@ -193,7 +193,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       }
       sinceRevision = value;
     }
-    json(response, 200, coordinator.processes.preview(scopeKey, lifecycleId, sinceRevision));
+    json(response, 200, await coordinator.previewProcesses(scopeKey, lifecycleId, sinceRevision));
     return;
   }
 
@@ -212,7 +212,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     if (!lifecycleId || lifecycleId.length > 512) {
       throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
     }
-    json(response, 200, coordinator.processes.previewSummary(scopeKey, lifecycleId));
+    json(response, 200, await coordinator.previewProcessSummary(scopeKey, lifecycleId));
     return;
   }
 
@@ -220,7 +220,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     if ([...url.searchParams.keys()].length > 0) {
       throw httpError(400, "Update blocker summary does not accept query parameters");
     }
-    json(response, 200, coordinator.processes.updateBlockerSummary());
+    json(response, 200, await coordinator.updateBlockerSummary());
     return;
   }
 

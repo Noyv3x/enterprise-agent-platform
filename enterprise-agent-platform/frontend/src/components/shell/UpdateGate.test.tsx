@@ -76,7 +76,7 @@ describe("UpdateGate", () => {
     expect(loadStatus).toHaveBeenCalledTimes(2);
   });
 
-  it("blocks the product for launching, updating, and failed states", async () => {
+  it("blocks the product for updating and failed states", async () => {
     renderGate(vi.fn(async () => status("updating")));
 
     expect(

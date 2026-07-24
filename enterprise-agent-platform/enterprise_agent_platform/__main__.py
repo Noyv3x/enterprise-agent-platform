@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import replace
 from pathlib import Path
 
 from .config import PlatformConfig
+from .db import Database
 from .server import run_server
 from .service import EnterpriseService
 
@@ -33,6 +35,8 @@ def main() -> None:
 
     token = sub.add_parser("print-agent-token", help="Print the internal Agent tool token")
     token.add_argument("--data", default=None)
+    migrate = sub.add_parser("migrate", help="Apply database migrations and exit")
+    migrate.add_argument("--data", default=None)
     deploy = sub.add_parser("deploy", help="Bootstrap one-command deployment")
     from .deployment import add_bootstrap_args
 
@@ -65,6 +69,19 @@ def main() -> None:
         from .gateway import run_gateway
 
         run_gateway(config, mode=args.mode)
+        return
+    if cmd == "migrate":
+        database = Database(config.db_path)
+        try:
+            version = int(
+                database.scalar(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                )
+                or 0
+            )
+            print(json.dumps({"ok": True, "schema_version": version}))
+        finally:
+            database.close()
         return
 
     service = EnterpriseService(config, autostart_runtime=False)

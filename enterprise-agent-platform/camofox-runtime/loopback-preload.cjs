@@ -1,26 +1,28 @@
 "use strict";
 
-// @askjo/camofox-browser 1.11.2 calls app.listen(PORT), so Express binds to
-// every interface and ignores HOST/CAMOFOX_HOST. The managed runtime is an
-// internal sidecar; constrain every TCP listener opened by this Node process
-// to the loopback address selected by the platform.
+// @askjo/camofox-browser 1.11.2 calls app.listen(PORT), so Express ignores
+// HOST/CAMOFOX_HOST. Force that service listener onto the address selected by
+// the platform. The in-process connection-pinning proxy deliberately bypasses
+// this override and remains loopback-only, even when a container API listens
+// on its private network interface.
 const net = require("node:net");
 const http = require("node:http");
 const dns = require("node:dns").promises;
 
-const bindHost = process.env.UBITECH_CAMOFOX_BIND_HOST || "127.0.0.1";
+const serviceBindHost = process.env.UBITECH_CAMOFOX_BIND_HOST || "127.0.0.1";
+const pinningProxyHost = "127.0.0.1";
 const originalListen = net.Server.prototype.listen;
 
 net.Server.prototype.listen = function managedLoopbackListen(...args) {
   const target = args[0];
   if (target && typeof target === "object" && !Array.isArray(target) && "port" in target) {
-    args[0] = { ...target, host: bindHost };
+    args[0] = { ...target, host: serviceBindHost };
   } else if (
     typeof target === "number"
     || (typeof target === "string" && /^\d+$/.test(target))
   ) {
-    if (typeof args[1] === "string") args[1] = bindHost;
-    else args.splice(1, 0, bindHost);
+    if (typeof args[1] === "string") args[1] = serviceBindHost;
+    else args.splice(1, 0, serviceBindHost);
   }
   return originalListen.apply(this, args);
 };
@@ -524,7 +526,7 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
       if (proxyUrl) return proxyUrl;
       await new Promise((resolve, reject) => {
         server.once("error", reject);
-        originalListen.call(server, { port: 0, host: bindHost }, () => {
+        originalListen.call(server, { port: 0, host: pinningProxyHost }, () => {
           server.off("error", reject);
           resolve();
         });

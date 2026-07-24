@@ -72,6 +72,10 @@ class PlatformConfig:
     agent_runtime_idle_timeout_seconds: float = float(
         RUN_IDLE_TIMEOUT_DEFAULT_SECONDS
     )
+    deployment_mode: str = "source"
+    platform_internal_url: str = ""
+    manager_socket: Path | None = None
+    manager_token_file: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -100,13 +104,43 @@ class PlatformConfig:
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
         base = base_dir or Path.cwd()
+        deployment_mode = os.getenv("UBITECH_DEPLOYMENT_MODE", "source").strip().lower()
+        if deployment_mode not in {"source", "container"}:
+            raise ValueError("UBITECH_DEPLOYMENT_MODE must be 'source' or 'container'")
+        containerized = deployment_mode == "container"
+        source_migration_bridge = _env_bool(
+            "UBITECH_SOURCE_MIGRATION_BRIDGE", False
+        )
+        if containerized and source_migration_bridge:
+            raise ValueError(
+                "UBITECH_SOURCE_MIGRATION_BRIDGE cannot be enabled in container mode"
+            )
+        manager_socket: Path | None = None
+        manager_token_file: Path | None = None
+        if containerized or source_migration_bridge:
+            manager_socket = Path(
+                os.getenv(
+                    "UBITECH_MANAGER_SOCKET",
+                    "/run/ubitech-manager/manager.sock" if containerized else "",
+                )
+            ).expanduser()
+            manager_token_file = Path(
+                os.getenv(
+                    "UBITECH_MANAGER_TOKEN_FILE",
+                    "/run/secrets/manager-token" if containerized else "",
+                )
+            ).expanduser()
+            if not manager_socket.is_absolute() or not manager_token_file.is_absolute():
+                raise ValueError(
+                    "Manager socket and token file paths must be absolute"
+                )
         data_dir = Path(os.getenv("ENTERPRISE_PLATFORM_DATA", base / "data")).expanduser()
         host = os.getenv("ENTERPRISE_PLATFORM_HOST", "127.0.0.1")
         port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
         token_secret = os.getenv("ENTERPRISE_SESSION_SECRET") or secrets.token_urlsafe(32)
         manage_cognee = _env_bool("ENTERPRISE_MANAGE_COGNEE", True)
-        manage_firecrawl = _env_bool("ENTERPRISE_MANAGE_FIRECRAWL", True)
+        manage_firecrawl = False if containerized else _env_bool("ENTERPRISE_MANAGE_FIRECRAWL", True)
         managed_cognee_repo = (
             data_dir
             / "runtimes"
@@ -146,18 +180,24 @@ class PlatformConfig:
             cognee_repo=cognee_repo,
             manage_cognee=manage_cognee,
             runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
-            manage_camofox=os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
-            in {"1", "true", "yes", "on"},
-            camofox_url=os.getenv("ENTERPRISE_CAMOFOX_URL", "http://127.0.0.1:9377").strip().rstrip("/"),
+            manage_camofox=(False if containerized else os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
+            in {"1", "true", "yes", "on"}),
+            camofox_url=os.getenv(
+                "ENTERPRISE_CAMOFOX_URL",
+                "http://camofox:9377" if containerized else "http://127.0.0.1:9377",
+            ).strip().rstrip("/"),
             camofox_command=os.getenv("ENTERPRISE_CAMOFOX_COMMAND", "").strip(),
             manage_firecrawl=manage_firecrawl,
             firecrawl_repo=firecrawl_repo,
-            firecrawl_api_url=os.getenv("ENTERPRISE_FIRECRAWL_API_URL", "http://127.0.0.1:3002").strip().rstrip("/"),
+            firecrawl_api_url=os.getenv(
+                "ENTERPRISE_FIRECRAWL_API_URL",
+                "http://firecrawl:3002" if containerized else "http://127.0.0.1:3002",
+            ).strip().rstrip("/"),
             firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
-            manage_searxng=_env_bool("ENTERPRISE_MANAGE_SEARXNG", True),
+            manage_searxng=False if containerized else _env_bool("ENTERPRISE_MANAGE_SEARXNG", True),
             searxng_api_url=os.getenv(
                 "ENTERPRISE_SEARXNG_API_URL",
-                "http://127.0.0.1:13003",
+                "http://searxng:8080" if containerized else "http://127.0.0.1:13003",
             ).strip().rstrip("/"),
             searxng_timeout_seconds=_env_float(
                 "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS",
@@ -177,10 +217,10 @@ class PlatformConfig:
             auto_update_remote=os.getenv("ENTERPRISE_AUTO_UPDATE_REMOTE", "origin").strip() or "origin",
             auto_update_branch=os.getenv("ENTERPRISE_AUTO_UPDATE_BRANCH", "").strip(),
             auto_update_webhook_secret=os.getenv("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", "").strip(),
-            manage_agent_runtime=_env_bool("ENTERPRISE_MANAGE_AGENT_RUNTIME", True),
+            manage_agent_runtime=False if containerized else _env_bool("ENTERPRISE_MANAGE_AGENT_RUNTIME", True),
             agent_runtime_url=os.getenv(
                 "ENTERPRISE_AGENT_RUNTIME_URL",
-                "http://127.0.0.1:8766",
+                "http://agent-runtime:8766" if containerized else "http://127.0.0.1:8766",
             ).strip().rstrip("/"),
             agent_runtime_token=os.getenv("ENTERPRISE_AGENT_RUNTIME_TOKEN", "").strip(),
             agent_runtime_home=Path(
@@ -196,6 +236,13 @@ class PlatformConfig:
                 minimum=float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
                 maximum=float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS),
             ),
+            deployment_mode=deployment_mode,
+            platform_internal_url=os.getenv(
+                "ENTERPRISE_PLATFORM_INTERNAL_URL",
+                "http://platform:8765" if containerized else "",
+            ).strip().rstrip("/"),
+            manager_socket=manager_socket,
+            manager_token_file=manager_token_file,
         )
 
 

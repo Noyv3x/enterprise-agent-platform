@@ -296,6 +296,52 @@ class InternalConfigTests(unittest.TestCase):
                 self.assertEqual(values.get(key), expected, key)
 
 class ConfigFromEnvTests(unittest.TestCase):
+    def test_source_migration_bridge_requires_and_exposes_absolute_manager_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket_path = root / "manager" / "control" / "manager.sock"
+            token_path = root / "manager" / "secrets" / "manager-token"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_DEPLOYMENT_MODE": "source",
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_MANAGER_SOCKET": str(socket_path),
+                    "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
+                },
+                clear=True,
+            ):
+                config = PlatformConfig.from_env(root)
+            self.assertEqual(config.deployment_mode, "source")
+            self.assertEqual(config.manager_socket, socket_path)
+            self.assertEqual(config.manager_token_file, token_path)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_MANAGER_SOCKET": "relative.sock",
+                    "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "must be absolute"):
+                    PlatformConfig.from_env(root)
+
+    def test_source_mode_ignores_manager_paths_without_explicit_migration_bridge(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UBITECH_DEPLOYMENT_MODE": "source",
+                "UBITECH_MANAGER_SOCKET": "/tmp/untrusted.sock",
+                "UBITECH_MANAGER_TOKEN_FILE": "/tmp/untrusted-token",
+            },
+            clear=True,
+        ):
+            config = PlatformConfig.from_env(Path("/tmp"))
+        self.assertIsNone(config.manager_socket)
+        self.assertIsNone(config.manager_token_file)
+
     def test_host_execution_defaults_enable_agent_runtime_and_ignore_removed_container_env(self):
         key = "ENTERPRISE_CONTAINER_BACKEND"
         previous = os.environ.get(key)
