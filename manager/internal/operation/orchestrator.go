@@ -64,6 +64,13 @@ type Orchestrator struct {
 	running             map[string]context.CancelFunc
 }
 
+const reservationReleaseTimeout = 10 * time.Second
+
+type reservationReleaseUncertainError struct{ cause error }
+
+func (e *reservationReleaseUncertainError) Error() string { return e.cause.Error() }
+func (e *reservationReleaseUncertainError) Unwrap() error { return e.cause }
+
 func (o *Orchestrator) Preflight(ctx context.Context) error {
 	if err := o.Engine.Preflight(ctx); err != nil {
 		return err
@@ -102,12 +109,13 @@ func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, b
 	if request.ExpectedSourceCommit != "" && !validSourceCommit(request.ExpectedSourceCommit) {
 		return model.Operation{}, false, errors.New("expected_source_commit must be a 40-character lowercase Git commit")
 	}
+	o.mu.Lock()
 	op, reused, err := o.Store.Begin(request, o.now())
 	if err != nil || reused {
+		o.mu.Unlock()
 		return op, reused, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	o.mu.Lock()
 	if o.running == nil {
 		o.running = map[string]context.CancelFunc{}
 	}
@@ -154,6 +162,20 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 	return o.recover(ctx, true, false)
 }
 
+func (o *Orchestrator) RecoveryPending() bool {
+	state := o.Store.State()
+	if state.FinalizePendingOperationID != "" {
+		return true
+	}
+	if state.ActiveOperationID == "" {
+		return false
+	}
+	o.mu.Lock()
+	_, running := o.running[state.ActiveOperationID]
+	o.mu.Unlock()
+	return !running
+}
+
 func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activationPreflight bool) error {
 	state := o.Store.State()
 	if state.FinalizePendingOperationID != "" {
@@ -165,6 +187,9 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 	}
 	if op == nil {
 		return nil
+	}
+	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
+		return o.recoverUnconfirmedReservation(ctx, *op)
 	}
 	state = o.Store.State()
 	if op.Status == model.OperationSucceeded && state.Candidate != nil && op.TargetGeneration == state.Candidate.ID {
@@ -215,9 +240,22 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 		if o.running == nil {
 			o.running = map[string]context.CancelFunc{}
 		}
+		if _, exists := o.running[op.ID]; exists {
+			o.mu.Unlock()
+			cancel()
+			return nil
+		}
 		o.running[op.ID] = cancel
 		o.mu.Unlock()
-		go func() { defer cancel(); o.run(resume, *op) }()
+		go func() {
+			defer func() {
+				o.mu.Lock()
+				delete(o.running, op.ID)
+				o.mu.Unlock()
+				cancel()
+			}()
+			o.run(resume, *op)
+		}()
 		return nil
 	}
 	return o.recoverRollback(ctx, *op)
@@ -370,32 +408,31 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	legacyCutover := op.Kind == model.OperationInstall && o.Legacy != nil && o.Legacy.Active()
 	if !freshInstall {
 		if err = o.reserve(ctx, op.ID, legacyCutover); err != nil {
-			o.failBeforeMaintenance(op, err)
+			o.failReservation(op, err)
 			return
 		}
 	}
 	if legacyCutover {
 		if err = o.Legacy.PreCutover(ctx, op.ID); err != nil {
-			gate := o.Gate
-			if o.LegacyGate != nil {
-				gate = o.LegacyGate
-			}
-			if releaseErr := gate.Release(context.Background(), op.ID); releaseErr != nil {
-				o.failAfterMaintenance(ctx, op, nil, errors.Join(err, fmt.Errorf("release reservation after cutover preflight: %w", releaseErr)))
+			if releaseErr := o.releaseReservation(o.reservationGate(true), op.ID, err); releaseErr != nil {
+				o.failReservation(op, releaseErr)
 			} else {
 				o.failBeforeMaintenance(op, err)
 			}
 			return
 		}
 	}
-	if _, err = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "business admission reserved", o.now()); err != nil {
-		gate := o.Gate
-		if legacyCutover && o.LegacyGate != nil {
-			gate = o.LegacyGate
+	if freshInstall {
+		if _, err = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "fresh install entering maintenance", o.now()); err != nil {
+			o.failBeforeMaintenance(op, fmt.Errorf("persist fresh-install maintenance phase: %w", err))
+			return
 		}
-		_ = gate.Release(context.Background(), op.ID)
-		o.failBeforeMaintenance(op, fmt.Errorf("persist reserved admission phase: %w", err))
-		return
+	}
+	if !freshInstall {
+		if err = o.beginReservedMutation(op.ID, legacyCutover); err != nil {
+			o.failReservation(op, err)
+			return
+		}
 	}
 	if op.Kind == model.OperationInstall && o.Legacy != nil && o.Legacy.Active() {
 		if err = o.Legacy.Cutover(ctx, op.ID); err != nil {
@@ -578,19 +615,30 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 	}
 	op.TargetGeneration = state.Current.ID
 	if err = o.reserve(ctx, op.ID, false); err != nil {
-		o.failBeforeMaintenance(op, err)
+		o.failReservation(op, err)
 		return
 	}
-	_, _ = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "restart reserved", o.now())
-	if err = o.Engine.StopFixed(ctx); err == nil {
-		_, _ = o.Store.SetPhase(op.ID, model.PhaseStarting, model.StateUpdating, true, "restarting current generation", o.now())
-		err = o.Engine.StartFixed(ctx, manifest)
+	if err = o.beginReservedMutation(op.ID, false); err != nil {
+		o.failReservation(op, err)
+		return
 	}
-	if err == nil {
-		_, _ = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing restarted generation", o.now())
-		err = o.Engine.Probe(ctx, manifest)
+	if err = o.Engine.StopFixed(ctx); err != nil {
+		o.failAfterMaintenance(ctx, op, nil, err)
+		return
 	}
-	if err != nil {
+	if _, err = o.Store.SetPhase(op.ID, model.PhaseStarting, model.StateUpdating, true, "restarting current generation", o.now()); err != nil {
+		o.failAfterMaintenance(ctx, op, &manifest, fmt.Errorf("persist restart start phase: %w", err))
+		return
+	}
+	if err = o.Engine.StartFixed(ctx, manifest); err != nil {
+		o.failAfterMaintenance(ctx, op, nil, err)
+		return
+	}
+	if _, err = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing restarted generation", o.now()); err != nil {
+		o.failAfterMaintenance(ctx, op, &manifest, fmt.Errorf("persist restart probe phase: %w", err))
+		return
+	}
+	if err = o.Engine.Probe(ctx, manifest); err != nil {
 		o.failAfterMaintenance(ctx, op, nil, err)
 		return
 	}
@@ -632,10 +680,13 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 	}
 	op.TargetGeneration = state.Previous.ID
 	if err = o.reserve(ctx, op.ID, false); err != nil {
-		o.failBeforeMaintenance(op, err)
+		o.failReservation(op, err)
 		return
 	}
-	_, _ = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "rollback reserved", o.now())
+	if err = o.beginReservedMutation(op.ID, false); err != nil {
+		o.failReservation(op, err)
+		return
+	}
 	if err = o.Engine.StopFixed(ctx); err != nil {
 		o.failAfterMaintenance(ctx, op, nil, err)
 		return
@@ -662,12 +713,19 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		o.failAfterMaintenance(ctx, op, nil, err)
 		return
 	}
-	_, _ = o.Store.SetPhase(op.ID, model.PhaseStarting, model.StateUpdating, true, "starting previous generation", o.now())
-	if err = o.Engine.StartFixed(ctx, manifest); err == nil {
-		_, _ = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing previous generation", o.now())
-		err = o.Engine.Probe(ctx, manifest)
+	if _, err = o.Store.SetPhase(op.ID, model.PhaseStarting, model.StateUpdating, true, "starting previous generation", o.now()); err != nil {
+		o.failAfterMaintenance(ctx, op, &manifest, fmt.Errorf("persist rollback start phase: %w", err))
+		return
 	}
-	if err != nil {
+	if err = o.Engine.StartFixed(ctx, manifest); err != nil {
+		o.failAfterMaintenance(ctx, op, nil, err)
+		return
+	}
+	if _, err = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing previous generation", o.now()); err != nil {
+		o.failAfterMaintenance(ctx, op, &manifest, fmt.Errorf("persist rollback probe phase: %w", err))
+		return
+	}
+	if err = o.Engine.Probe(ctx, manifest); err != nil {
 		o.failAfterMaintenance(ctx, op, nil, err)
 		return
 	}
@@ -757,6 +815,10 @@ func (o *Orchestrator) reserve(ctx context.Context, id string, legacy bool) erro
 	if _, err := o.Store.SetPhase(id, model.PhaseDraining, model.StateWaitingForTasks, false, "waiting for active tasks", o.now()); err != nil {
 		return fmt.Errorf("persist task wait phase: %w", err)
 	}
+	gate := o.reservationGate(legacy)
+	if gate == nil {
+		return errors.New("platform admission gate is not configured")
+	}
 	for {
 		if o.LocalUpdateBlockers != nil {
 			running, _, _ := o.LocalUpdateBlockers()
@@ -774,16 +836,34 @@ func (o *Orchestrator) reserve(ctx context.Context, id string, legacy bool) erro
 				continue
 			}
 		}
-		gate := o.Gate
-		if legacy && o.LegacyGate != nil {
-			gate = o.LegacyGate
-		}
 		reservation, err := gate.Reserve(ctx, id)
 		if err != nil {
-			return err
+			return o.resolveReservationUncertainty(gate, id, fmt.Errorf("reserve Platform admission: %w", err))
 		}
 		if reservation.Reserved {
-			return nil
+			// The Platform reservation freezes new Agent admissions, so this
+			// second local inventory closes the race where a background terminal
+			// was registered after the first local check but before Platform idle.
+			if o.LocalUpdateBlockers != nil {
+				running, _, _ := o.LocalUpdateBlockers()
+				if running > 0 {
+					if releaseErr := o.releaseReservation(gate, id, errors.New("a local task appeared while Platform admission was being reserved")); releaseErr != nil {
+						return releaseErr
+					}
+					const retry = 5
+					if _, stateErr := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+						state.RetryAfterSeconds = retry
+						return nil
+					}); stateErr != nil {
+						return fmt.Errorf("persist local post-reservation wait state: %w", stateErr)
+					}
+					if waitErr := o.wait(ctx, retry*time.Second); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
+			}
+			break
 		}
 		retry := reservation.RetryAfterSeconds
 		if retry < 1 {
@@ -796,6 +876,168 @@ func (o *Orchestrator) reserve(ctx context.Context, id string, legacy bool) erro
 			return err
 		}
 	}
+
+	// Persist the Manager-side maintenance owner before asking the Platform to
+	// confirm the same reservation. If the source Platform restarts after the
+	// first response, its startup path can now reconstruct the reservation from
+	// this durable state before it starts any business worker.
+	if _, err := o.Store.UpdateOperation(id, func(value *model.Operation) error {
+		value.ReservationStatus = model.ReservationConfirmationPending
+		value.UpdatedAt = o.now()
+		return nil
+	}); err != nil {
+		return o.resolveReservationUncertainty(gate, id, fmt.Errorf("persist reservation confirmation intent: %w", err))
+	}
+	if _, err := o.Store.SetPhase(id, model.PhaseDraining, model.StateUpdating, true, "admission reserved; confirming durable maintenance", o.now()); err != nil {
+		return o.resolveReservationUncertainty(gate, id, fmt.Errorf("persist reserved admission phase: %w", err))
+	}
+
+	for {
+		reservation, err := gate.Reserve(ctx, id)
+		if err != nil {
+			return o.resolveReservationUncertainty(gate, id, fmt.Errorf("confirm Platform admission reservation: %w", err))
+		}
+		if reservation.Reserved {
+			break
+		}
+		retry := reservation.RetryAfterSeconds
+		if retry < 1 {
+			retry = 5
+		}
+		if _, err = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+			state.RetryAfterSeconds = retry
+			return nil
+		}); err != nil {
+			return o.resolveReservationUncertainty(gate, id, fmt.Errorf("persist Platform reservation confirmation wait: %w", err))
+		}
+		if err = o.wait(ctx, time.Duration(retry)*time.Second); err != nil {
+			return o.resolveReservationUncertainty(gate, id, err)
+		}
+	}
+	if _, err := o.Store.UpdateOperation(id, func(value *model.Operation) error {
+		value.ReservationStatus = model.ReservationConfirmed
+		value.UpdatedAt = o.now()
+		return nil
+	}); err != nil {
+		return o.resolveReservationUncertainty(gate, id, fmt.Errorf("persist reservation confirmation: %w", err))
+	}
+	if _, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+		state.RetryAfterSeconds = 0
+		return nil
+	}); err != nil {
+		return o.resolveReservationUncertainty(gate, id, fmt.Errorf("persist confirmed reservation state: %w", err))
+	}
+	return nil
+}
+
+func (o *Orchestrator) reservationGate(legacy bool) Gate {
+	if legacy && o.LegacyGate != nil {
+		return o.LegacyGate
+	}
+	return o.Gate
+}
+
+func (o *Orchestrator) beginReservedMutation(id string, legacy bool) error {
+	if _, err := o.Store.UpdateOperation(id, func(value *model.Operation) error {
+		if value.ReservationStatus != model.ReservationConfirmed {
+			return errors.New("admission reservation is not durably confirmed")
+		}
+		value.ReservationStatus = model.ReservationMutationStarted
+		value.UpdatedAt = o.now()
+		return nil
+	}); err != nil {
+		return o.resolveReservationUncertainty(o.reservationGate(legacy), id, fmt.Errorf("persist destructive mutation boundary: %w", err))
+	}
+	return nil
+}
+
+func (o *Orchestrator) resolveReservationUncertainty(gate Gate, id string, cause error) error {
+	if err := o.releaseReservation(gate, id, cause); err != nil {
+		return err
+	}
+	return cause
+}
+
+func (o *Orchestrator) releaseReservation(gate Gate, id string, cause error) error {
+	if gate == nil {
+		return &reservationReleaseUncertainError{cause: errors.Join(cause, errors.New("platform admission gate is not configured for release"))}
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
+	defer cancel()
+	if err := gate.Release(releaseCtx, id); err != nil {
+		return &reservationReleaseUncertainError{cause: errors.Join(cause, fmt.Errorf("confirm reservation release: %w", err))}
+	}
+	return nil
+}
+
+func (o *Orchestrator) failReservation(op model.Operation, cause error) {
+	var uncertain *reservationReleaseUncertainError
+	if !errors.As(cause, &uncertain) {
+		o.failBeforeMaintenance(op, cause)
+		return
+	}
+	_ = o.holdUnconfirmedReservation(op, cause)
+}
+
+func (o *Orchestrator) holdUnconfirmedReservation(op model.Operation, cause error) error {
+	message := cause.Error()
+	if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationRunning
+		value.Finalized = false
+		value.CompletedAt = nil
+		value.Phase = model.PhaseDraining
+		value.ReservationStatus = model.ReservationReleaseUncertain
+		value.Error = message
+		value.UpdatedAt = o.now()
+		return nil
+	}); err != nil {
+		persistErr := fmt.Errorf("persist uncertain reservation recovery intent: %w", err)
+		o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cause, persistErr))
+		return persistErr
+	}
+	if _, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+		state.ActiveOperationID = op.ID
+		state.Phase = model.PhaseDraining
+		state.PublicState = model.StateFailed
+		state.Maintenance = true
+		state.LastError = message
+		state.RetryAfterSeconds = 5
+		return nil
+	}); err != nil {
+		persistErr := fmt.Errorf("persist fail-closed reservation state: %w", err)
+		o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cause, persistErr))
+		return persistErr
+	}
+	o.event(op.ID, "operation.failed", op.TargetGeneration, cause)
+	return nil
+}
+
+func (o *Orchestrator) recoverUnconfirmedReservation(_ context.Context, op model.Operation) error {
+	legacy := op.Kind == model.OperationInstall && o.Legacy != nil && o.Legacy.Active()
+	gate := o.reservationGate(legacy)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
+	defer cancel()
+	if gate == nil {
+		return o.holdUnconfirmedReservation(op, errors.New("platform admission gate is not configured for reservation recovery"))
+	}
+	if err := gate.Release(releaseCtx, op.ID); err != nil {
+		original := errors.New("reservation release remains unconfirmed")
+		if op.Error != "" {
+			original = errors.New(op.Error)
+		}
+		return o.holdUnconfirmedReservation(op, errors.Join(original, fmt.Errorf("retry reservation release: %w", err)))
+	}
+	message := op.Error
+	if message == "" {
+		message = "operation interrupted before the admission reservation was confirmed"
+	}
+	_, err := o.Store.Complete(op.ID, false, func(state *model.ManagerState) {
+		state.PublicState = model.StateIdle
+		state.Maintenance = false
+		state.LastError = message
+		state.RetryAfterSeconds = 0
+	}, message, o.now())
+	return err
 }
 func (o *Orchestrator) snapshot(ctx context.Context, id string) (string, error) {
 	if _, err := o.Store.SetPhase(id, model.PhaseSnapshotting, model.StateUpdating, true, "creating consistent state snapshot", o.now()); err != nil {

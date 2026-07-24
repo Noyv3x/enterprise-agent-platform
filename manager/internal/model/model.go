@@ -45,6 +45,15 @@ const (
 	OperationFailed    OperationStatus = "failed"
 )
 
+type ReservationStatus string
+
+const (
+	ReservationConfirmationPending ReservationStatus = "confirmation_pending"
+	ReservationConfirmed           ReservationStatus = "confirmed"
+	ReservationMutationStarted     ReservationStatus = "mutation_started"
+	ReservationReleaseUncertain    ReservationStatus = "release_uncertain"
+)
+
 type Generation struct {
 	ID                   string            `json:"id"`
 	ManifestPath         string            `json:"manifest_path,omitempty"`
@@ -88,25 +97,26 @@ type PhaseEvent struct {
 }
 
 type Operation struct {
-	SchemaVersion        int             `json:"schema_version"`
-	ID                   string          `json:"id"`
-	Kind                 OperationKind   `json:"kind"`
-	IdempotencyKey       string          `json:"idempotency_key"`
-	Attempt              int             `json:"attempt"`
-	ExpectedGeneration   uint64          `json:"expected_generation"`
-	TargetManifestURL    string          `json:"target_manifest_url,omitempty"`
-	ExpectedSourceCommit string          `json:"expected_source_commit,omitempty"`
-	TargetGeneration     string          `json:"target_generation,omitempty"`
-	Status               OperationStatus `json:"status"`
-	Finalized            bool            `json:"finalized"`
-	Retryable            bool            `json:"retryable,omitempty"`
-	Phase                OperationPhase  `json:"phase"`
-	SnapshotPath         string          `json:"snapshot_path,omitempty"`
-	Error                string          `json:"error,omitempty"`
-	History              []PhaseEvent    `json:"history"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
-	CompletedAt          *time.Time      `json:"completed_at,omitempty"`
+	SchemaVersion        int               `json:"schema_version"`
+	ID                   string            `json:"id"`
+	Kind                 OperationKind     `json:"kind"`
+	IdempotencyKey       string            `json:"idempotency_key"`
+	Attempt              int               `json:"attempt"`
+	ExpectedGeneration   uint64            `json:"expected_generation"`
+	TargetManifestURL    string            `json:"target_manifest_url,omitempty"`
+	ExpectedSourceCommit string            `json:"expected_source_commit,omitempty"`
+	TargetGeneration     string            `json:"target_generation,omitempty"`
+	Status               OperationStatus   `json:"status"`
+	Finalized            bool              `json:"finalized"`
+	Retryable            bool              `json:"retryable,omitempty"`
+	Phase                OperationPhase    `json:"phase"`
+	ReservationStatus    ReservationStatus `json:"reservation_status,omitempty"`
+	SnapshotPath         string            `json:"snapshot_path,omitempty"`
+	Error                string            `json:"error,omitempty"`
+	History              []PhaseEvent      `json:"history"`
+	CreatedAt            time.Time         `json:"created_at"`
+	UpdatedAt            time.Time         `json:"updated_at"`
+	CompletedAt          *time.Time        `json:"completed_at,omitempty"`
 }
 
 type OperationRequest struct {

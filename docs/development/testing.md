@@ -20,8 +20,10 @@ go test ./...
 go vet ./...
 go build ./cmd/ubitech-manager
 cd ..
-docker compose -f containers/compose.yaml config
+./scripts/container-smoke.sh
 ```
+
+顶层测试脚本执行 Compose 静态校验时必须自行注入不可变的占位镜像引用和临时挂载路径，并忽略开发机的 `.env`；校验不能依赖生产部署变量，也不能连接或修改正在运行的容器。
 
 Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。
 

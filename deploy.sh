@@ -135,7 +135,10 @@ UPDATE_STATE_ACTIVE=0
 UPDATE_SOURCE_MOVED=0
 UPDATE_HEARTBEAT_PID=""
 UPDATE_RECOVERY_ATTEMPTED=0
-UPDATE_COMPLETED=0
+# This flag is the Git/source rollback boundary, not proof that the subsequent
+# Manager migration completed. Once set, installer recovery belongs to the
+# durable Manager/retry state and must never race a Git reset.
+SOURCE_UPDATE_COMMITTED=0
 UPDATE_COMMAND_ARGS=()
 CONTAINER_BRIDGE_ACTIVE=0
 LEGACY_DATA=""
@@ -143,6 +146,53 @@ LEGACY_SERVICE="${ENTERPRISE_SERVICE_NAME:-$SERVICE_NAME}"
 LEGACY_HOST="${ENTERPRISE_PLATFORM_HOST:-127.0.0.1}"
 LEGACY_PORT="${ENTERPRISE_PLATFORM_PORT:-8765}"
 MANAGER_DATA_ROOT="${UBITECH_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/ubitech-agent}"
+ORIGINAL_SOURCE_BRIDGE_SET=0
+ORIGINAL_SOURCE_MIGRATION_PROTOCOL_SET=0
+ORIGINAL_MANAGER_SOCKET_SET=0
+ORIGINAL_MANAGER_TOKEN_FILE_SET=0
+ORIGINAL_SOURCE_BRIDGE=""
+ORIGINAL_SOURCE_MIGRATION_PROTOCOL=""
+ORIGINAL_MANAGER_SOCKET=""
+ORIGINAL_MANAGER_TOKEN_FILE=""
+if [[ -v UBITECH_SOURCE_MIGRATION_BRIDGE ]]; then
+  ORIGINAL_SOURCE_BRIDGE_SET=1
+  ORIGINAL_SOURCE_BRIDGE="$UBITECH_SOURCE_MIGRATION_BRIDGE"
+fi
+if [[ -v UBITECH_SOURCE_MIGRATION_PROTOCOL ]]; then
+  ORIGINAL_SOURCE_MIGRATION_PROTOCOL_SET=1
+  ORIGINAL_SOURCE_MIGRATION_PROTOCOL="$UBITECH_SOURCE_MIGRATION_PROTOCOL"
+fi
+if [[ -v UBITECH_MANAGER_SOCKET ]]; then
+  ORIGINAL_MANAGER_SOCKET_SET=1
+  ORIGINAL_MANAGER_SOCKET="$UBITECH_MANAGER_SOCKET"
+fi
+if [[ -v UBITECH_MANAGER_TOKEN_FILE ]]; then
+  ORIGINAL_MANAGER_TOKEN_FILE_SET=1
+  ORIGINAL_MANAGER_TOKEN_FILE="$UBITECH_MANAGER_TOKEN_FILE"
+fi
+
+restore_container_bridge_environment() {
+  if (( ORIGINAL_SOURCE_BRIDGE_SET )); then
+    export UBITECH_SOURCE_MIGRATION_BRIDGE="$ORIGINAL_SOURCE_BRIDGE"
+  else
+    unset UBITECH_SOURCE_MIGRATION_BRIDGE
+  fi
+  if (( ORIGINAL_SOURCE_MIGRATION_PROTOCOL_SET )); then
+    export UBITECH_SOURCE_MIGRATION_PROTOCOL="$ORIGINAL_SOURCE_MIGRATION_PROTOCOL"
+  else
+    unset UBITECH_SOURCE_MIGRATION_PROTOCOL
+  fi
+  if (( ORIGINAL_MANAGER_SOCKET_SET )); then
+    export UBITECH_MANAGER_SOCKET="$ORIGINAL_MANAGER_SOCKET"
+  else
+    unset UBITECH_MANAGER_SOCKET
+  fi
+  if (( ORIGINAL_MANAGER_TOKEN_FILE_SET )); then
+    export UBITECH_MANAGER_TOKEN_FILE="$ORIGINAL_MANAGER_TOKEN_FILE"
+  else
+    unset UBITECH_MANAGER_TOKEN_FILE
+  fi
+}
 
 acquire_update_lock() {
   if ! command -v git >/dev/null 2>&1; then
@@ -184,17 +234,22 @@ update_repo() {
     return 1
   fi
 
-  local branch upstream remote target_branch
+  local branch upstream remote target_branch requested_revision target_ref
   branch="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD || true)"
   upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
   remote="${ENTERPRISE_AUTO_UPDATE_REMOTE:-origin}"
   target_branch="${ENTERPRISE_AUTO_UPDATE_BRANCH:-}"
+  requested_revision="${ENTERPRISE_AUTO_UPDATE_TARGET_REVISION:-}"
   if [[ "$remote" == -* || ! "$remote" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "Cannot update: invalid git remote name." >&2
     return 1
   fi
   if [[ -n "$target_branch" ]] && ! git check-ref-format --branch "$target_branch" >/dev/null 2>&1; then
     echo "Cannot update: invalid git branch name." >&2
+    return 1
+  fi
+  if [[ -n "$requested_revision" && ! "$requested_revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "Cannot update: the requested source revision is not a full Git commit." >&2
     return 1
   fi
 
@@ -220,14 +275,25 @@ update_repo() {
 
   git -C "$ROOT" fetch "$remote" || return 1
   if [[ -n "$target_branch" ]]; then
-    git -C "$ROOT" merge --ff-only "$remote/$target_branch" || return 1
+    target_ref="$remote/$target_branch"
   elif [[ -n "$upstream" && "$remote" == "${upstream%%/*}" ]]; then
-    git -C "$ROOT" merge --ff-only "$upstream" || return 1
+    target_ref="$upstream"
   elif [[ -n "$branch" ]]; then
-    git -C "$ROOT" merge --ff-only "$remote/$branch" || return 1
+    target_ref="$remote/$branch"
   else
     echo "Cannot update while the repository is in detached HEAD state." >&2
     return 1
+  fi
+  if [[ -n "$requested_revision" ]]; then
+    requested_revision="${requested_revision,,}"
+    if ! git -C "$ROOT" cat-file -e "${requested_revision}^{commit}" \
+      || ! git -C "$ROOT" merge-base --is-ancestor "$requested_revision" "$target_ref"; then
+      echo "Cannot update: the requested source revision is not reachable from ${target_ref}." >&2
+      return 1
+    fi
+    git -C "$ROOT" merge --ff-only "$requested_revision" || return 1
+  else
+    git -C "$ROOT" merge --ff-only "$target_ref" || return 1
   fi
   UPDATE_SOURCE_MOVED=1
 }
@@ -260,6 +326,7 @@ rollback_update() {
     echo "Automatic rollback was refused because concurrent local changes could not be preserved." >&2
     return 1
   fi
+  restore_container_bridge_environment
   # Reinstall and restart from the restored revision so the live service runs
   # known-good code again. If even this fails, surface manual recovery steps.
   if python_bootstrap_checked auto "$@"; then
@@ -325,13 +392,39 @@ stop_update_heartbeat() {
 }
 
 finish_update_success() {
+  local outcome="${1:-success}"
   if (( UPDATE_STATE_ACTIVE )); then
     stop_update_heartbeat
-    if ! update_state success --outcome success; then
+    if ! update_state success --outcome "$outcome"; then
       return 1
     fi
     UPDATE_STATE_ACTIVE=0
   fi
+}
+
+finish_source_bridge_ready() {
+  if (( UPDATE_STATE_ACTIVE )); then
+    stop_update_heartbeat
+    local source_revision
+    source_revision="$(git -C "$ROOT" rev-parse HEAD)"
+    if ! update_state source-bridge-ready --source-revision "$source_revision"; then
+      return 1
+    fi
+    UPDATE_STATE_ACTIVE=0
+  fi
+}
+
+record_container_migration_result() {
+  local outcome="$1"
+  local error="${2:-}"
+  if (( ! UPDATE_STATE_PROTOCOL_AVAILABLE )); then
+    return 0
+  fi
+  if [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/update_state.py" ]]; then
+    echo "Container migration result could not be recorded because the source state helper is unavailable." >&2
+    return 1
+  fi
+  update_state container-migration-result --outcome "$outcome" --error "$error"
 }
 
 finish_update_failure() {
@@ -348,7 +441,41 @@ finish_update_failure() {
   UPDATE_STATE_ACTIVE=0
 }
 
+source_handoff_is_committed() {
+  if (( ! UPDATE_STATE_PROTOCOL_AVAILABLE )) \
+    || [[ -z "${ENTERPRISE_AUTO_UPDATE_ID:-}" ]] \
+    || [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/update_state.py" ]]; then
+    return 1
+  fi
+  local persisted="" persisted_phase="" persisted_revision="" current_revision=""
+  persisted="$(ENTERPRISE_PLATFORM_DATA="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}" \
+    PYTHONPATH="$PLATFORM_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON_BIN" -c 'from enterprise_agent_platform.update_state import read_state; import os; state=read_state(os.environ["ENTERPRISE_PLATFORM_DATA"]) or {}; print("{}\t{}".format(state.get("phase", ""), state.get("source_revision", "")) if state.get("update_id") == os.environ.get("ENTERPRISE_AUTO_UPDATE_ID") else "")' \
+    2>/dev/null)" || return 1
+  IFS=$'\t' read -r persisted_phase persisted_revision <<<"$persisted"
+  current_revision="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)" || return 1
+  if [[ ! "$persisted_revision" =~ ^[0-9a-f]{40}$ \
+    || "$persisted_revision" != "$current_revision" ]]; then
+    return 1
+  fi
+  case "$persisted_phase" in
+    source_bridge_ready|container_migration_queued|container_migration_failed)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 recover_failed_update() {
+  # A marker may have crossed its atomic rename boundary even when the helper
+  # later reports a chmod/fsync/transport error. Re-read it before any reset;
+  # a durable handoff always wins over the helper's ambiguous exit status.
+  if source_handoff_is_committed; then
+    stop_update_heartbeat
+    SOURCE_UPDATE_COMMITTED=1
+    UPDATE_STATE_ACTIVE=0
+    return 0
+  fi
   if (( UPDATE_RECOVERY_ATTEMPTED )); then
     return 0
   fi
@@ -366,7 +493,10 @@ recover_failed_update() {
 finalize_update_on_exit() {
   local status=$?
   trap - EXIT
-  if (( ! UPDATE_COMPLETED && ! UPDATE_RECOVERY_ATTEMPTED )) \
+  if (( ! SOURCE_UPDATE_COMMITTED )) && source_handoff_is_committed; then
+    SOURCE_UPDATE_COMMITTED=1
+  fi
+  if (( ! SOURCE_UPDATE_COMMITTED && ! UPDATE_RECOVERY_ATTEMPTED )) \
     && (( status != 0 || UPDATE_STATE_ACTIVE || UPDATE_SOURCE_MOVED )); then
     # This catches signals and failures in marker/heartbeat steps as well as
     # deployment failures. Once source moved, every incomplete exit attempts
@@ -413,8 +543,16 @@ capture_update_context() {
 }
 
 prepare_container_bridge() {
-  if [[ ! -x "$ROOT/install.sh" || ! -f "$ROOT/docs/contracts/container-platform.json" ]]; then
+  local installer_present=0 contract_present=0
+  [[ -e "$ROOT/install.sh" ]] && installer_present=1
+  [[ -e "$ROOT/docs/contracts/container-platform.json" ]] && contract_present=1
+  if (( ! installer_present && ! contract_present )); then
     return 0
+  fi
+  if [[ ! -f "$ROOT/install.sh" || ! -x "$ROOT/install.sh" \
+    || ! -f "$ROOT/docs/contracts/container-platform.json" ]]; then
+    echo "Cannot migrate: the container bridge release is incomplete or the installer is not executable." >&2
+    return 1
   fi
   if [[ "${UBITECH_SKIP_CONTAINER_MIGRATION:-0}" == "1" ]]; then
     return 0
@@ -436,6 +574,7 @@ prepare_container_bridge() {
     return 1
   fi
   export UBITECH_SOURCE_MIGRATION_BRIDGE=1
+  export UBITECH_SOURCE_MIGRATION_PROTOCOL=2
   export UBITECH_MANAGER_SOCKET="$MANAGER_DATA_ROOT/manager/control/manager.sock"
   export UBITECH_MANAGER_TOKEN_FILE="$MANAGER_DATA_ROOT/manager/secrets/manager-token"
   CONTAINER_BRIDGE_ACTIVE=1
@@ -484,13 +623,37 @@ run_container_bridge_installer() {
     --legacy-data "$LEGACY_DATA" \
     --legacy-service "$LEGACY_SERVICE" \
     --legacy-platform-url "$gate_url" \
+    --legacy-update-id "${ENTERPRISE_AUTO_UPDATE_ID:-}" \
     --expected-source-commit "$source_commit" \
     --yes || status=$?
-  if ((status == 75)); then
-    echo "Container migration is queued; the source bridge remains available."
-    return 0
-  fi
   return "$status"
+}
+
+complete_container_bridge_handoff() {
+  local installer_status=0 migration_error=""
+  run_container_bridge_installer || installer_status=$?
+  case "$installer_status" in
+    0)
+      # Manager state is authoritative now. Successful legacy cleanup may
+      # already have archived ROOT, so do not touch source files below.
+      return 0
+      ;;
+    75)
+      if ! record_container_migration_result container_migration_queued; then
+        echo "Warning: queued container migration could not be mirrored to the legacy marker." >&2
+      fi
+      echo "Container migration is queued; the source bridge remains available."
+      return 0
+      ;;
+    *)
+      migration_error="Container migration installer failed with exit status ${installer_status}; the source bridge remains available."
+      if ! record_container_migration_result container_migration_failed "$migration_error"; then
+        echo "The container migration failure could not be written to the legacy update state." >&2
+      fi
+      echo "$migration_error" >&2
+      return "$installer_status"
+      ;;
+  esac
 }
 
 wait_for_gateway_writes() {
@@ -545,17 +708,85 @@ case "$cmd" in
       recover_failed_update
       exit 1
     fi
+    if (( CONTAINER_BRIDGE_ACTIVE && UPDATE_STATE_ACTIVE )); then
+      if ! update_state heartbeat --phase source_bridge_bootstrapping; then
+        echo "Container bridge intent could not be persisted; rolling back." >&2
+        recover_failed_update
+        exit 1
+      fi
+    fi
     if ! python_bootstrap_checked auto "$@"; then
       recover_failed_update
       exit 1
+    fi
+    if (( CONTAINER_BRIDGE_ACTIVE )); then
+      # The healthy source restart is the Git rollback boundary. Set the
+      # in-memory flag before the durable write so an asynchronous EXIT cannot
+      # race a committed bridge marker; synchronous failure resets it below.
+      SOURCE_UPDATE_COMMITTED=1
+      if ! finish_source_bridge_ready; then
+        SOURCE_UPDATE_COMMITTED=0
+        echo "Updated source could not commit its container handoff state; rolling back." >&2
+        recover_failed_update
+        exit 1
+      fi
+      complete_container_bridge_handoff
+      exit $?
     fi
     if ! finish_update_success; then
       echo "Updated deployment could not finalize its maintenance state; rolling back." >&2
       recover_failed_update
       exit 1
     fi
-    UPDATE_COMPLETED=1
-    run_container_bridge_installer
+    SOURCE_UPDATE_COMMITTED=1
+    ;;
+  migrate-container)
+    shift || true
+    acquire_update_lock
+    capture_update_context "$@"
+    repair_failed=0
+    for argument in "$@"; do
+      if [[ "$argument" == "--repair" ]]; then
+        repair_failed=1
+      fi
+    done
+    if [[ ! -f "$PLATFORM_DIR/enterprise_agent_platform/update_state.py" ]]; then
+      echo "Cannot resume container migration without the source state helper." >&2
+      exit 1
+    fi
+    UPDATE_STATE_PROTOCOL_AVAILABLE=1
+    if [[ -z "${ENTERPRISE_AUTO_UPDATE_ID:-}" ]]; then
+      ENTERPRISE_AUTO_UPDATE_ID="$(ENTERPRISE_PLATFORM_DATA="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}" \
+        PYTHONPATH="$PLATFORM_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" -c 'from enterprise_agent_platform.update_state import read_state; import os; print((read_state(os.environ["ENTERPRISE_PLATFORM_DATA"]) or {}).get("update_id", ""))' \
+        2>/dev/null || true)"
+      export ENTERPRISE_AUTO_UPDATE_ID
+      if [[ -z "$ENTERPRISE_AUTO_UPDATE_ID" ]]; then
+        echo "Cannot resume container migration without its update id." >&2
+        exit 1
+      fi
+    fi
+    if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
+      echo "Cannot resume container migration from a dirty checkout." >&2
+      exit 1
+    fi
+    source_revision="$(git -C "$ROOT" rev-parse HEAD)"
+    repair_arguments=()
+    if (( repair_failed )); then
+      repair_arguments+=(--repair-failed)
+    fi
+    if ! update_state recover-source-bridge --source-revision "$source_revision" "${repair_arguments[@]}"; then
+      echo "Container migration marker does not match this exact checkout." >&2
+      exit 1
+    fi
+    if ! prepare_container_bridge; then
+      migration_error="Container migration bridge validation failed; the source deployment remains available."
+      record_container_migration_result container_migration_failed "$migration_error" || true
+      echo "$migration_error" >&2
+      exit 1
+    fi
+    complete_container_bridge_handoff
+    exit $?
     ;;
   deploy|up)
     shift || true

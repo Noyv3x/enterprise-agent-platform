@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,48 @@ func (g *retryGate) Release(context.Context, string) error {
 }
 func (g *retryGate) Health(context.Context) error { return nil }
 
+type gateStep struct {
+	reservation Reservation
+	err         error
+}
+
+type scriptedGate struct {
+	steps           []gateStep
+	reserveIDs      []string
+	releaseIDs      []string
+	releaseErr      error
+	releaseHasBound bool
+	onReserve       func(int)
+	onRelease       func(int)
+}
+
+func (g *scriptedGate) Reserve(_ context.Context, id string) (Reservation, error) {
+	g.reserveIDs = append(g.reserveIDs, id)
+	call := len(g.reserveIDs)
+	if g.onReserve != nil {
+		g.onReserve(call)
+	}
+	if len(g.steps) == 0 {
+		return Reservation{Reserved: true}, nil
+	}
+	step := g.steps[0]
+	g.steps = g.steps[1:]
+	return step.reservation, step.err
+}
+
+func (g *scriptedGate) Release(ctx context.Context, id string) error {
+	g.releaseIDs = append(g.releaseIDs, id)
+	if _, ok := ctx.Deadline(); ok {
+		g.releaseHasBound = true
+	}
+	if g.onRelease != nil {
+		g.onRelease(len(g.releaseIDs))
+	}
+	return g.releaseErr
+}
+
+func (*scriptedGate) Health(context.Context) error { return nil }
+
 type recordingSelfUpdate struct {
 	marked, activated   int
 	failActivateOnce    bool
@@ -218,6 +261,7 @@ type preflightLegacy struct {
 	preflightErr error
 	preflights   int
 	cutovers     int
+	rollbacks    int
 }
 
 func (*preflightLegacy) Active() bool { return true }
@@ -226,7 +270,10 @@ func (l *preflightLegacy) PreCutover(context.Context, string) error {
 	return l.preflightErr
 }
 func (l *preflightLegacy) Cutover(context.Context, string) error { l.cutovers++; return nil }
-func (*preflightLegacy) Rollback(context.Context, string) error  { return nil }
+func (l *preflightLegacy) Rollback(context.Context, string) error {
+	l.rollbacks++
+	return nil
+}
 func (*preflightLegacy) FinalizeCleanup(context.Context, string) error {
 	return nil
 }
@@ -470,10 +517,509 @@ func TestReserveWaitsForLocalHostAndSandboxTerminalsBeforePlatformGate(t *testin
 	if err := orchestrator.reserve(context.Background(), op.ID, false); err != nil {
 		t.Fatal(err)
 	}
-	if checks != 2 || waits != 1 || gate.reservations != 1 {
+	if checks != 3 || waits != 1 || gate.reservations != 2 {
 		t.Fatalf("unexpected local readiness sequence: checks=%d waits=%d reservations=%d", checks, waits, gate.reservations)
 	}
+	if state := store.State(); !state.Maintenance || state.PublicState != model.StateUpdating {
+		t.Fatalf("confirmed reservation was not durably closed: %#v", state)
+	}
 }
+
+func TestReserveRechecksLocalProcessesAfterPlatformAdmissionIsFrozen(t *testing.T) {
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "post-gate-local-terminal", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &scriptedGate{}
+	checks, waits := 0, 0
+	orchestrator := &Orchestrator{
+		Store: store,
+		Gate:  gate,
+		LocalUpdateBlockers: func() (running, blocking, terminable int) {
+			checks++
+			if checks == 2 {
+				return 1, 1, 0
+			}
+			return 0, 0, 0
+		},
+		Sleep: func(context.Context, time.Duration) error {
+			waits++
+			if len(gate.reserveIDs) != 1 || len(gate.releaseIDs) != 1 || store.State().Maintenance {
+				t.Fatalf("post-reservation process race was not released before waiting: gate=%#v state=%#v", gate, store.State())
+			}
+			return nil
+		},
+	}
+	if err := orchestrator.reserve(context.Background(), op.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 4 || waits != 1 || len(gate.reserveIDs) != 3 || len(gate.releaseIDs) != 1 {
+		t.Fatalf("unexpected two-control-plane reservation sequence: checks=%d waits=%d gate=%#v", checks, waits, gate)
+	}
+	if state := store.State(); !state.Maintenance || state.PublicState != model.StateUpdating {
+		t.Fatalf("replacement reservation was not durably confirmed: %#v", state)
+	}
+}
+
+func TestUpdateAndLegacyInstallConfirmReservationBeforeCutover(t *testing.T) {
+	for _, kind := range []model.OperationKind{model.OperationUpdate, model.OperationInstall} {
+		t.Run(string(kind), func(t *testing.T) {
+			server, url := testReleaseServer(t)
+			defer server.Close()
+			store, _ := journal.Open(t.TempDir(), time.Now())
+			engine := &fakeEngine{}
+			legacy := &preflightLegacy{}
+			var observation string
+			gate := &scriptedGate{onReserve: func(call int) {
+				if call != 2 {
+					return
+				}
+				state := store.State()
+				engine.mu.Lock()
+				calls := append([]string(nil), engine.calls...)
+				engine.mu.Unlock()
+				if !state.Maintenance || state.PublicState != model.StateUpdating {
+					observation = fmt.Sprintf("second reserve preceded durable maintenance: %#v", state)
+				} else if strings.Contains(strings.Join(calls, ","), "stop") {
+					observation = fmt.Sprintf("destructive engine work preceded confirmation: %v", calls)
+				} else if kind == model.OperationInstall && (legacy.preflights != 0 || legacy.cutovers != 0) {
+					observation = fmt.Sprintf("legacy cutover work preceded confirmation: %#v", legacy)
+				}
+			}}
+			orchestrator := &Orchestrator{
+				Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(),
+				ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+			}
+			if kind == model.OperationInstall {
+				orchestrator.Legacy = legacy
+				orchestrator.LegacyGate = gate
+			}
+			op, _, err := orchestrator.Start(model.OperationRequest{Kind: kind, IdempotencyKey: "two-stage-" + string(kind), ExpectedGeneration: store.State().Generation})
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed, err := orchestrator.Await(context.Background(), op.ID)
+			if err != nil || completed.Status != model.OperationSucceeded {
+				t.Fatalf("operation did not complete: operation=%#v err=%v", completed, err)
+			}
+			if observation != "" {
+				t.Fatal(observation)
+			}
+			if len(gate.reserveIDs) != 2 || gate.reserveIDs[0] != op.ID || gate.reserveIDs[1] != op.ID {
+				t.Fatalf("reservation was not confirmed with the same operation id: %v", gate.reserveIDs)
+			}
+			if kind == model.OperationInstall && (legacy.preflights != 1 || legacy.cutovers != 1) {
+				t.Fatalf("legacy cutover did not run after confirmation: %#v", legacy)
+			}
+		})
+	}
+}
+
+func TestRestartAndRollbackConfirmReservationBeforeDestructiveWork(t *testing.T) {
+	for _, kind := range []model.OperationKind{model.OperationRestart, model.OperationRollback} {
+		t.Run(string(kind), func(t *testing.T) {
+			dir := t.TempDir()
+			store, _ := journal.Open(filepath.Join(dir, "state"), time.Now())
+			aID, bID := strings.Repeat("a", 40), strings.Repeat("b", 40)
+			aPath := writeRollbackManifest(t, dir, aID)
+			bPath := writeRollbackManifest(t, dir, bID)
+			_, _ = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+				state.Current = &model.Generation{ID: bID, ManifestPath: bPath, RollbackSnapshotPath: "/snapshots/a"}
+				state.Previous = &model.Generation{ID: aID, ManifestPath: aPath}
+				return nil
+			})
+			engine := &fakeEngine{}
+			snapshots := &scriptedSnapshot{creates: []string{"/snapshots/rescue"}}
+			var observation string
+			gate := &scriptedGate{onReserve: func(call int) {
+				if call != 2 {
+					return
+				}
+				state := store.State()
+				engine.mu.Lock()
+				calls := append([]string(nil), engine.calls...)
+				engine.mu.Unlock()
+				if !state.Maintenance || state.PublicState != model.StateUpdating {
+					observation = fmt.Sprintf("second reserve preceded durable maintenance: %#v", state)
+				} else if strings.Contains(strings.Join(calls, ","), "stop") || len(snapshots.creates) != 1 || len(snapshots.restores) != 0 {
+					observation = fmt.Sprintf("destructive work preceded confirmation: calls=%v snapshots=%#v", calls, snapshots)
+				}
+			}}
+			orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: snapshots, Channel: "main"}
+			op, _, err := store.Begin(model.OperationRequest{Kind: kind, IdempotencyKey: "two-stage-" + string(kind), ExpectedGeneration: store.State().Generation}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == model.OperationRestart {
+				orchestrator.runRestart(context.Background(), op)
+			} else {
+				orchestrator.runRollback(context.Background(), op)
+			}
+			completed, err := store.Operation(op.ID)
+			if err != nil || completed.Status != model.OperationSucceeded {
+				t.Fatalf("operation did not complete: operation=%#v err=%v", completed, err)
+			}
+			if observation != "" {
+				t.Fatal(observation)
+			}
+			if len(gate.reserveIDs) != 2 || gate.reserveIDs[0] != op.ID || gate.reserveIDs[1] != op.ID {
+				t.Fatalf("reservation was not confirmed with the same operation id: %v", gate.reserveIDs)
+			}
+		})
+	}
+}
+
+func TestRestartAndRollbackStopWhenMaintenancePersistenceFails(t *testing.T) {
+	for _, kind := range []model.OperationKind{model.OperationRestart, model.OperationRollback} {
+		t.Run(string(kind), func(t *testing.T) {
+			dir := t.TempDir()
+			stateDir := filepath.Join(dir, "state")
+			statePath := filepath.Join(stateDir, "state.json")
+			store, _ := journal.Open(stateDir, time.Now())
+			aID, bID := strings.Repeat("a", 40), strings.Repeat("b", 40)
+			aPath := writeRollbackManifest(t, dir, aID)
+			bPath := writeRollbackManifest(t, dir, bID)
+			_, _ = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+				state.Current = &model.Generation{ID: bID, ManifestPath: bPath, RollbackSnapshotPath: "/snapshots/a"}
+				state.Previous = &model.Generation{ID: aID, ManifestPath: aPath}
+				return nil
+			})
+
+			var originalState []byte
+			var callbackErr error
+			restoreState := func() {
+				if originalState == nil {
+					return
+				}
+				if err := os.RemoveAll(statePath); err != nil && callbackErr == nil {
+					callbackErr = err
+					return
+				}
+				if err := os.WriteFile(statePath, originalState, 0o600); err != nil && callbackErr == nil {
+					callbackErr = err
+					return
+				}
+				originalState = nil
+			}
+			t.Cleanup(restoreState)
+			gate := &scriptedGate{
+				onReserve: func(call int) {
+					if call != 1 {
+						return
+					}
+					originalState, callbackErr = os.ReadFile(statePath)
+					if callbackErr != nil {
+						return
+					}
+					if callbackErr = os.Remove(statePath); callbackErr != nil {
+						return
+					}
+					callbackErr = os.Mkdir(statePath, 0o700)
+				},
+				onRelease: func(int) { restoreState() },
+			}
+			engine := &fakeEngine{}
+			snapshots := &scriptedSnapshot{creates: []string{"/snapshots/rescue"}}
+			orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: snapshots, Channel: "main"}
+			op, _, err := store.Begin(model.OperationRequest{Kind: kind, IdempotencyKey: "maintenance-fsync-" + string(kind), ExpectedGeneration: store.State().Generation}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == model.OperationRestart {
+				orchestrator.runRestart(context.Background(), op)
+			} else {
+				orchestrator.runRollback(context.Background(), op)
+			}
+			if callbackErr != nil {
+				t.Fatal(callbackErr)
+			}
+			completed, err := store.Operation(op.ID)
+			state := store.State()
+			if err != nil || completed.Status != model.OperationFailed || state.Maintenance || state.PublicState != model.StateIdle {
+				t.Fatalf("maintenance persistence failure did not stop reversibly: state=%#v operation=%#v err=%v", state, completed, err)
+			}
+			engine.mu.Lock()
+			calls := strings.Join(engine.calls, ",")
+			engine.mu.Unlock()
+			if strings.Contains(calls, "stop") || len(snapshots.creates) != 1 || len(snapshots.restores) != 0 {
+				t.Fatalf("persistence failure crossed a destructive boundary: calls=%q snapshots=%#v", calls, snapshots)
+			}
+			if len(gate.reserveIDs) != 1 || len(gate.releaseIDs) != 1 || gate.releaseIDs[0] != op.ID {
+				t.Fatalf("failed maintenance persistence did not release the first reservation: %#v", gate)
+			}
+		})
+	}
+}
+
+func TestReservationResponseUncertaintyIsReleasedBeforeFailure(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		steps []gateStep
+	}{
+		{name: "first response lost", steps: []gateStep{{err: errors.New("connection reset after request")}}},
+		{name: "confirmation response lost", steps: []gateStep{{reservation: Reservation{Reserved: true}}, {err: errors.New("connection reset after confirmation")}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, url := testReleaseServer(t)
+			defer server.Close()
+			store, _ := journal.Open(t.TempDir(), time.Now())
+			engine := &fakeEngine{}
+			gate := &scriptedGate{steps: append([]gateStep(nil), test.steps...)}
+			orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+			op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: test.name, ExpectedGeneration: store.State().Generation}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			orchestrator.runUpdate(context.Background(), op)
+			completed, err := store.Operation(op.ID)
+			state := store.State()
+			if err != nil || completed.Status != model.OperationFailed || state.Maintenance || state.PublicState != model.StateIdle {
+				t.Fatalf("confirmed cleanup did not fail open safely: state=%#v operation=%#v err=%v", state, completed, err)
+			}
+			if len(gate.releaseIDs) != 1 || gate.releaseIDs[0] != op.ID || !gate.releaseHasBound {
+				t.Fatalf("uncertain response did not use a bounded same-id release: %#v", gate)
+			}
+			engine.mu.Lock()
+			calls := strings.Join(engine.calls, ",")
+			engine.mu.Unlock()
+			if strings.Contains(calls, "stop") {
+				t.Fatalf("uncertain reservation reached destructive work: %s", calls)
+			}
+		})
+	}
+}
+
+func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	engine := &fakeEngine{}
+	gate := &scriptedGate{
+		steps:      []gateStep{{reservation: Reservation{Reserved: true}}, {err: errors.New("confirmation response lost")}},
+		releaseErr: errors.New("release response lost"),
+	}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "uncertain-release", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	pending, err := store.Operation(op.ID)
+	state := store.State()
+	if err != nil || pending.Status != model.OperationRunning || pending.ReservationStatus != model.ReservationReleaseUncertain || state.ActiveOperationID != op.ID || state.PublicState != model.StateFailed || !state.Maintenance {
+		t.Fatalf("unconfirmed release was not held closed: state=%#v operation=%#v err=%v", state, pending, err)
+	}
+	if !orchestrator.RecoveryPending() {
+		t.Fatal("in-process recovery loop did not observe the uncertain reservation")
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") {
+		t.Fatalf("unconfirmed release triggered destructive rollback work: %s", calls)
+	}
+
+	gate.releaseErr = nil
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := store.Operation(op.ID)
+	state = store.State()
+	if completed.Status != model.OperationFailed || state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || len(gate.releaseIDs) != 2 {
+		t.Fatalf("confirmed recovery release did not reopen safely: state=%#v operation=%#v releases=%v", state, completed, gate.releaseIDs)
+	}
+}
+
+func TestRecoveredRunIsRemovedFromLiveMapBeforeAnotherRecoveryAttempt(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	gate := &scriptedGate{
+		steps:      []gateStep{{err: errors.New("reserve response lost")}},
+		releaseErr: errors.New("release response lost"),
+	}
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "recovered-run-cleanup", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if state := store.State(); state.PublicState == model.StateFailed && state.Maintenance {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	state := store.State()
+	if state.PublicState != model.StateFailed || !state.Maintenance {
+		t.Fatalf("recovered run did not reach release uncertainty: %#v", state)
+	}
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !orchestrator.RecoveryPending() {
+		time.Sleep(time.Millisecond)
+	}
+	if !orchestrator.RecoveryPending() {
+		t.Fatal("completed recovery goroutine remained registered as live")
+	}
+
+	gate.releaseErr = nil
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := store.Operation(op.ID)
+	state = store.State()
+	if completed.Status != model.OperationFailed || state.ActiveOperationID != "" || state.Maintenance {
+		t.Fatalf("second in-process recovery did not converge: state=%#v operation=%#v", state, completed)
+	}
+}
+
+func TestReservationIntentJournalFailureDoesNotInventMaintenance(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	stateDir := t.TempDir()
+	operationsDir := filepath.Join(stateDir, "operations")
+	store, _ := journal.Open(stateDir, time.Now())
+	engine := &fakeEngine{}
+	gate := &scriptedGate{
+		steps:      []gateStep{{err: errors.New("reserve response lost")}},
+		releaseErr: errors.New("release response lost"),
+		onRelease: func(call int) {
+			if call == 1 {
+				_ = os.Chmod(operationsDir, 0o500)
+			}
+		},
+	}
+	t.Cleanup(func() { _ = os.Chmod(operationsDir, 0o700) })
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "uncertain-intent-fsync", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	state := store.State()
+	pending, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Maintenance || state.PublicState != model.StateWaitingForTasks || pending.ReservationStatus != "" || pending.Status != model.OperationRunning {
+		t.Fatalf("failed uncertainty journal write invented durable maintenance: state=%#v operation=%#v", state, pending)
+	}
+	engine.mu.Lock()
+	beforeRecovery := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(beforeRecovery, "stop") {
+		t.Fatalf("journal failure crossed a destructive boundary: %s", beforeRecovery)
+	}
+	if !orchestrator.RecoveryPending() {
+		t.Fatal("abandoned active operation was not scheduled for in-process recovery")
+	}
+
+	if err := os.Chmod(operationsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gate.releaseErr = nil
+	var recoveryObservation string
+	gate.onRelease = nil
+	gate.onReserve = func(call int) {
+		if call != 2 {
+			return
+		}
+		engine.mu.Lock()
+		defer engine.mu.Unlock()
+		if strings.Contains(strings.Join(engine.calls, ","), "stop") {
+			recoveryObservation = "recovery ran destructive work before reacquiring the same reservation"
+		}
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil || completed.Status != model.OperationSucceeded {
+		t.Fatalf("same-id recovery did not converge: operation=%#v err=%v", completed, err)
+	}
+	if recoveryObservation != "" {
+		t.Fatal(recoveryObservation)
+	}
+	if len(gate.reserveIDs) != 3 || gate.reserveIDs[0] != op.ID || gate.reserveIDs[1] != op.ID || gate.reserveIDs[2] != op.ID {
+		t.Fatalf("recovery did not reuse and confirm the same reservation id: %v", gate.reserveIDs)
+	}
+}
+
+func TestConfirmedReservationWithoutMutationMarkerRecoversByReleaseOnly(t *testing.T) {
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationRestart, IdempotencyKey: "confirmed-before-mutation", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationRunning
+		value.Phase = model.PhaseDraining
+		value.ReservationStatus = model.ReservationConfirmed
+		value.Error = "reservation cleanup response was lost"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.PublicState = model.StateUpdating
+		state.Maintenance = true
+		state.Phase = model.PhaseDraining
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	gate := &scriptedGate{}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}}
+	if !orchestrator.RecoveryPending() {
+		t.Fatal("confirmed pre-mutation reservation was not recoverable")
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := store.Operation(op.ID)
+	state := store.State()
+	if completed.Status != model.OperationFailed || state.Maintenance || state.PublicState != model.StateIdle || len(gate.releaseIDs) != 1 || gate.releaseIDs[0] != op.ID {
+		t.Fatalf("confirmed pre-mutation recovery did not release safely: state=%#v operation=%#v gate=%#v", state, completed, gate)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") {
+		t.Fatalf("pre-mutation recovery stopped workloads before confirming release: %s", calls)
+	}
+}
+
+func TestReservationConflictDoesNotConfirmAbsence(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	gate := &scriptedGate{
+		steps:      []gateStep{{err: errors.New("dial failed before response")}},
+		releaseErr: &HTTPStatusError{StatusCode: http.StatusConflict, Body: "reservation does not match"},
+	}
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "missing-reservation", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	completed, _ := store.Operation(op.ID)
+	state := store.State()
+	if completed.Status != model.OperationRunning || completed.ReservationStatus != model.ReservationReleaseUncertain || !state.Maintenance || state.PublicState != model.StateFailed {
+		t.Fatalf("reservation conflict did not remain fail-closed: state=%#v operation=%#v", state, completed)
+	}
+}
+
 func TestPullFailureNeverEntersMaintenance(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -552,6 +1098,35 @@ func TestSourceMigrationRechecksPreflightAfterReservationBeforeCutover(t *testin
 	engine.mu.Unlock()
 	if strings.Contains(strings.Join(calls, ","), "stop") || strings.Contains(strings.Join(calls, ","), "migrate") {
 		t.Fatalf("failed cutover preflight reached destructive engine work: %v", calls)
+	}
+}
+
+func TestSourcePreCutoverFailureWithUnconfirmedReleaseNeverStartsRollback(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	engine := &fakeEngine{}
+	gate := &scriptedGate{releaseErr: errors.New("release response lost")}
+	legacy := &preflightLegacy{preflightErr: errors.New("configuration fingerprint changed")}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "uncertain-pre-cutover-release", ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40)}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	pending, err := store.Operation(op.ID)
+	state := store.State()
+	if err != nil || pending.Status != model.OperationRunning || pending.ReservationStatus != model.ReservationReleaseUncertain || state.PublicState != model.StateFailed || !state.Maintenance {
+		t.Fatalf("uncertain pre-cutover release was not held closed: state=%#v operation=%#v err=%v", state, pending, err)
+	}
+	if legacy.preflights != 1 || legacy.cutovers != 0 || legacy.rollbacks != 0 || len(gate.releaseIDs) != 1 || !gate.releaseHasBound {
+		t.Fatalf("pre-cutover failure crossed the mutation boundary: legacy=%#v gate=%#v", legacy, gate)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") {
+		t.Fatalf("pre-cutover release uncertainty stopped workloads: %s", calls)
 	}
 }
 

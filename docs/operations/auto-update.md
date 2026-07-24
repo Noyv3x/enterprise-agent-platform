@@ -14,11 +14,15 @@ CI 只有在文档门禁、Python/Runtime/前端/管理器测试、镜像构建�
 
 本机 `releases/<source-commit>/` 也是不可变身份：Manager 必须先把 manifest 与 Compose 下载到同目录 staging，完整校验后原子发布。相同 commit 再次出现时，两个文件必须逐字节一致；缺件或内容不同视为 immutable-ID collision，并在拉镜像和进入维护前失败，不能覆盖 current/rollback 所引用的发布物。
 
+源码自动更新在检测阶段得到完整 40 位 target commit 后，该 commit 就是本次事务的不可变目标。部署 worker 可以再次 fetch 以验证可达性，但必须只 fast-forward 到已检测的 commit；即使 remote branch 在检测与执行之间又推进，也不能追逐新 HEAD。marker 的 target/source revision、实际 checkout 和容器 release 必须始终一致，下一个 commit 由下一次事务处理。
+
 镜像就绪后公开 state 进入 `waiting_for_tasks`。Platform 继续服务，直到确认没有活动 Agent Run、queued/running Agent job、消息或知识写入准入窗口、正在执行的 Cognee 摄取与 Telegram 外发、Manager 已登记的运行中后台终端或其它不可安全切换的业务任务。Manager 必须先检查本地 ProcessManager；只要 host 或 Sandbox 中任一已登记后台终端仍在运行（包括声明为 `terminate` 的进程），就保持 `waiting_for_tasks`、不请求 Platform reservation，并在本地进程清零后自动重试。只有本地检查通过后，Manager 才请求 Platform 在对话锁内原子复核 Agent 任务并建立 reservation。后台终端视为仍在运行的任务：Manager 不终止它，也不开始固定栈或自身更新；进程结束后排队的更新自动继续。如果目标版本要求重建该 Sandbox，则仍只在该 Sandbox 空闲后刷新镜像。
 
 ## 原子准入与维护
 
-Platform 继续拥有业务空闲判断。管理器使用内部 token 请求 readiness/reserve，Platform 在对话锁内完成最后检查并持久化 reservation。预约成功后所有新 Agent 消息在持久化/入队边界前收到维护响应，不存在已写消息却未建 job 的窗口。每个容器 Platform 进程必须在启动任何 Agent、知识摄取、计划任务或 Telegram worker 前，从 Manager owner socket 恢复当前持久 maintenance/finalize reservation 及其 operation id；Manager 状态不可读时容器启动失败，不能把未知状态解释为空闲。只有 Manager 对同一 operation 明确 release 后才恢复这些 worker，因此候选 readiness 窗口和宿主重启都不会产生随后被快照回滚抹除的新副作用。
+Platform 继续拥有业务空闲判断。管理器使用内部 token 请求 readiness/reserve，Platform 在对话锁内完成最后检查并建立 reservation。管理器收到首次成功响应后，必须立即把同一 operation 的 `maintenance=true` 持久化，再向 Platform 使用同一 operation id 重复 reserve 并取得确认；在第二次确认之前不得停止 Platform、快照或迁移。这使源码 Platform 恰好在两次请求之间重启时，能先从 Manager 恢复持久维护状态，然后由第二次 reserve 重新建立进程内准入栅栏。
+
+任一 reserve 请求如果响应丢失或返回不确定错误，Manager 必须对同一 operation 尝试 release；只有 release 明确成功才能回到非维护失败状态。release 也失败时必须持久保持 `failed + maintenance=true`，等待恢复循环重试，不能假定 Platform 没有建立预约。`update/install`、`restart`和显式 `rollback` 都使用这一两阶段协议，且任何维护状态持久化失败都在破坏性操作前 fail closed。预约成功后所有新 Agent 消息在持久化/入队边界前收到维护响应，不存在已写消息却未建 job 的窗口。每个容器 Platform 进程必须在启动任何 Agent、知识摄取、计划任务或 Telegram worker 前，从 Manager owner socket 恢复当前持久 maintenance/finalize reservation 及其 operation id；Manager 状态不可读时容器启动失败，不能把未知状态解释为空闲。只有 Manager 对同一 operation 明确 release 后才恢复这些 worker；如果源码 marker 此时又进入阻断态，Platform 必须先重新同步 marker，不能在 Manager owner 释放和 marker owner 建立之间短暂唤醒 worker。
 
 管理器随后切换入口到维护、排空写请求并停止旧 Platform。公开状态保持：
 
@@ -59,7 +63,29 @@ operation 终态与 Manager state 分两次原子写时，恢复必须显式收�
 
 ## 首次桥接
 
-旧源码实例只保留一次桥接更新：先正常部署桥接代码并恢复产品，待完整 Docker 清单发布后再自动执行第二次维护切换。这样镜像构建速度不会把第一次 Git 更新长时间困在维护页。
+旧源码实例的 Git 更新与 Docker 首迁是两个连续但独立的事务。启动更新的 `deploy.sh` 能力由拉取前的提交决定；运行中的 Bash 在 Git fast-forward 后不会自动获得目标提交中新加入的函数。因此，从桥接功能出现前的版本升级时，第一次更新可以只安装并启动 bridge-capable 源码，不能假定同一个旧 shell 会继续调用新安装器。
+
+已经具有第代桥接函数但尚未具有环境回滚保护的旧 shell，可能在目标 bootstrap 失败后把 `UBITECH_SOURCE_MIGRATION_BRIDGE` 和 Manager 路径误写回旧 service unit。目标 bootstrap 必须识别缺少当前桥接协议标识的调用者；如果这类 bootstrap 失败，在返回旧 shell 前先把 owner-only 回滚守护程序固化到 checkout 外。systemd 源码更新必须用新的独立 `systemd-run --user` transient unit 启动守护，不能只 `setsid` 后留在原更新 unit 的 cgroup 内；前台部署才可使用独立 session 子进程。守护程序等旧 shell 结束后删除 service unit 中的三个桥接环境项、daemon-reload 并重启已回滚源码，使其普通自动更新继续工作。当前 shell 必须显式传入协议标识，并在自己的 rollback 路径恢复原环境，不得依赖该兼容守护。
+
+bridge-capable 源码启动后必须幂等检查当前部署是否仍需首迁。只要当前 checkout 同时包含受支持的容器契约和可执行安装器、仍处于源码部署且没有显式跳过迁移，它就把“容器首迁尚未交接”视为待处理更新；即使 `HEAD` 已等于 Git remote，也要通过既有空闲预约与独立 systemd worker 再运行当前版本的更新入口。已经进入桥接状态后的恢复只能调用不执行 fetch、merge、bootstrap 或 Git rollback 的迁移恢复入口，并继续使用 marker 绑定的 exact HEAD；不得借恢复机会取得更新提交。该自举不得依赖未来碰巧出现另一个 main 提交，也不得在缺少完整桥接资产时伪造成功。
+
+旧源码的 `auto-update-state.json` 只描述 Git/源码事务，不是 Docker generation 的真相源。源码健康重启后，桥接更新先停止 heartbeat、解除业务维护并进入非阻塞的 `source_bridge_ready`；随后安装器结果按以下方式收敛：
+
+- 返回 `75`：安装器已经持久化 owner-only retry service/timer，源码继续服务，旧 marker 记为 `container_migration_queued`；
+- 返回其它非零值：不得回滚已经健康运行的源码或与可能已建立的 Manager journal 竞争，旧 marker 以非阻塞 `container_migration_failed` 保存退出码和错误，等待下一次受控修复；
+- 返回 `0`：Manager install operation 已到 succeeded，之后由 Manager journal、`finalize_pending` 和恢复循环继续；旧 checkout 可能已经被归档，调用方不得再依赖其中的脚本或状态文件。
+
+`source_bridge_ready` 不是完成态：如果原 bridge worker 在安装器返回前中断，新源码必须在确认旧 owner 已退出后，通过同一个 update id 和无 Git 恢复入口续跑。协调器的“需要启动”只依赖持久 handoff phase，不依赖启动瞬间能否取得 repository flock；真正恢复前才检查锁，因此新 Platform 在旧 updater 仍持锁时启动也不会永久丢失续跑机会。`container_migration_queued` 与 `container_migration_failed` 是 checkout 冻结态；普通或手工 Git update 都不得覆盖它们。retry 脚本必须在 checkout 之外以 owner-only 权限固化 update id、旧数据路径、exact HEAD 和可执行 Python 路径，不能依赖 transient systemd unit 的进程环境。一次 `75` 之后的永久失败必须把同一 marker 从 queued 单向收敛为 failed；继续返回 `75` 保持 queued，成功后完全交由 Manager journal。
+
+`container_migration_failed` 不是需要手改 JSON 的死路。运维修复 Docker、systemd、网络或配置后，使用 `deploy.sh migrate-container --repair`：该入口必须持有 repository flock，从 marker 恢复同一 update id，核对 exact source revision，并只把 failed 回收为 `source_bridge_ready` 后重跑安装器。它不 fetch、不改变 checkout，普通 `migrate-container` 也不得隐式覆盖失败。
+
+Git 回滚边界以持久 marker 为准，不以 helper 进程的最终退出码为准。如果 `source_bridge_ready`、`container_migration_queued` 或 `container_migration_failed` 已经为同一 update id 原子替换到目标文件，即使 helper 随后在权限收紧、目录 fsync 或进程退出时报错，调用方也必须重读 marker 并视为源码已提交，绝不得 Git reset。
+
+完整迁移成功不能根据旧 marker 的 `phase=success`、安装器退出 `0` 或源码服务健康来推断；必须同时由 Manager 证明 current generation 已提交、operation 已 finalized、`finalize_pending` 为空且 maintenance 已解除。bridge intent 一旦建立，源码控制器停止 Git fetch/merge；它至多检查本地 marker 并运行无 Git 的迁移恢复入口，避免 checkout 越过已绑定的 exact `expected_source_commit`。Manager socket 在首迁期间暂不可用是预期状态：源码 Platform 的状态、配置与任务准入必须回退到旧 marker，只有容器部署才要求 Manager 状态不可读时 fail closed。
+
+这样镜像构建速度不会把第一次 Git 更新长时间困在维护页：完整 release 尚未出现时，源码继续可用；发布物就绪后 Manager 再等待自然空闲并执行维护切换。
+
+首迁安装器的 Manager 二进制和 checksum 下载必须同时设置有界的 connect timeout 与总时限。超时与其它下载失败使用同一持久 retry/timer 路径并返回 `75`；不能让半开连接在 timer 建立之前无限持有 repository flock。
 
 桥接迁移成功并清理源码后，Git updater、dirty-tree、fast-forward 和 `git reset` 不再属于部署协议。仓库中的桥接兼容实现应在已部署实例完成迁移后的清理版本移除；新安装始终从管理器开始。
 
@@ -67,4 +93,4 @@ operation 终态与 Manager state 分两次原子写时，恢复必须显式收�
 
 正常管理面板展示当前/目标版本、digest 摘要、operation、phase、下载与健康状态；失败恢复使用宿主 CLI。公共维护页只展示 operation id 和安全摘要。
 
-测试至少覆盖预拉取失败、任务等待、消息准入竞态、重复 operation、并发冲突、每个 phase 断电、数据库快照恢复、Docker daemon 重启、管理器自更新失败、旧 generation 回滚、Sandbox 后台进程保留和维护入口连续可用。
+测试至少覆盖预拉取失败、任务等待、消息准入竞态、重复 operation、并发冲突、每个 phase 断电、数据库快照恢复、Docker daemon 重启、管理器自更新失败、旧 generation 回滚、Sandbox 后台进程保留和维护入口连续可用。源码首迁还必须使用桥接功能加入前的真实旧脚本发起更新，证明第一次只安装新源码后，无 Git revision 差异也会由新源码再次触发当前桥接入口；用已经包含桥接函数的脚本伪装旧版本不构成该回归测试。

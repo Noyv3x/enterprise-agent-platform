@@ -4,7 +4,9 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import stat
+import subprocess
 import time
 import uuid
 from contextlib import contextmanager
@@ -18,6 +20,17 @@ AUTO_UPDATE_STATE_SCHEMA_VERSION = 1
 PUBLIC_UPDATE_STATES = frozenset({"idle", "waiting_for_tasks", "updating", "failed"})
 BLOCKING_UPDATE_STATES = frozenset({"updating", "failed"})
 STALE_UPDATE_HEARTBEAT_SECONDS = 60
+MIGRATION_RESULT_PHASES = frozenset(
+    {"container_migration_queued", "container_migration_failed"}
+)
+SOURCE_BRIDGE_READY_PHASE = "source_bridge_ready"
+SOURCE_BRIDGE_BOOTSTRAP_PHASE = "source_bridge_bootstrapping"
+SOURCE_MIGRATION_HANDOFF_PHASES = frozenset(
+    {SOURCE_BRIDGE_READY_PHASE, *MIGRATION_RESULT_PHASES}
+)
+SOURCE_MIGRATION_RESUME_PHASES = frozenset(
+    {"migration_reserving", "migration_launching", "migration_resuming"}
+)
 
 
 def state_path(data_dir: Path | str) -> Path:
@@ -144,6 +157,21 @@ def mark_updating(
         existing = read_state(data_dir)
         existing_id = str((existing or {}).get("update_id") or "")
         existing_state = str((existing or {}).get("state") or "")
+        existing_phase = str((existing or {}).get("phase") or "")
+        clean_phase = _clean_text(phase, 80) or "launching"
+        if existing_phase == SOURCE_BRIDGE_BOOTSTRAP_PHASE:
+            raise RuntimeError("source bridge bootstrap owns this checkout")
+        if existing_phase in MIGRATION_RESULT_PHASES:
+            raise RuntimeError(
+                "container migration owns this checkout; Git update is frozen"
+            )
+        if existing_phase == SOURCE_BRIDGE_READY_PHASE and not (
+            existing_id == clean_update_id
+            and clean_phase in SOURCE_MIGRATION_RESUME_PHASES
+        ):
+            raise RuntimeError(
+                "source bridge handoff can only enter explicit migration recovery"
+            )
         if existing_id == clean_update_id and existing_state in {"idle", "failed"}:
             raise RuntimeError("a terminal auto-update state cannot be restarted")
         if (
@@ -161,7 +189,7 @@ def mark_updating(
         state = {
             "schema_version": AUTO_UPDATE_STATE_SCHEMA_VERSION,
             "state": "updating",
-            "phase": _clean_text(phase, 80) or "launching",
+            "phase": clean_phase,
             "update_id": clean_update_id,
             "instance_id": clean_instance_id,
             "reason": _clean_text(reason, 120),
@@ -214,8 +242,14 @@ def mark_success(
 ) -> dict[str, Any]:
     with update_state_lock(data_dir):
         current = _matching_state(data_dir, update_id)
-        if str(current.get("state") or "") == "idle":
+        current_state = str(current.get("state") or "")
+        if current_state == "idle":
             return current
+        if current_state == "failed" and outcome == "operator_recovered":
+            pass
+        if current_state != "updating":
+            if not (current_state == "failed" and outcome == "operator_recovered"):
+                raise RuntimeError("auto-update success requires an active source update")
         now = int(time.time())
         updated = {
             **current,
@@ -232,6 +266,194 @@ def mark_success(
         return updated
 
 
+def mark_source_bridge_ready(
+    data_dir: Path | str,
+    *,
+    update_id: str,
+    instance_id: str = "",
+    source_revision: str = "",
+) -> dict[str, Any]:
+    """Commit the healthy source transaction without claiming Docker success.
+
+    ``waiting_for_tasks`` is deliberately non-blocking for the legacy gateway.
+    The Manager must be able to query and reserve that source Platform after
+    the installer starts, while the old marker still makes the handoff visible.
+    """
+
+    with update_state_lock(data_dir):
+        current = _matching_state(data_dir, update_id)
+        current_state = str(current.get("state") or "")
+        if current_state == "waiting_for_tasks" and str(
+            current.get("phase") or ""
+        ) == SOURCE_BRIDGE_READY_PHASE:
+            if source_revision:
+                existing_revision = _clean_source_revision(
+                    str(current.get("source_revision") or current.get("target_revision") or "")
+                )
+                if existing_revision != _clean_source_revision(source_revision):
+                    raise RuntimeError("source bridge revision does not match its marker")
+            return current
+        if current_state != "updating":
+            raise RuntimeError("source bridge handoff requires an active source update")
+        clean_revision = _clean_source_revision(
+            source_revision or str(current.get("target_revision") or "")
+        )
+        now = int(time.time())
+        updated = {
+            **current,
+            "schema_version": AUTO_UPDATE_STATE_SCHEMA_VERSION,
+            "state": "waiting_for_tasks",
+            "phase": SOURCE_BRIDGE_READY_PHASE,
+            "instance_id": _clean_text(instance_id, 160)
+            or str(current.get("instance_id") or ""),
+            "updated_at": now,
+            "source_completed_at": now,
+            "source_revision": clean_revision,
+        }
+        updated.pop("error", None)
+        try:
+            _write_state(data_dir, updated)
+        except OSError:
+            # os.replace is the commit point. chmod or the parent-directory
+            # fsync can still report an error after the new marker is already
+            # visible; treating that ambiguous result as "not committed"
+            # would let an older deploy shell reset a healthy bridge checkout.
+            committed = read_state(data_dir)
+            if not _source_bridge_ready_matches(
+                committed,
+                update_id=update_id,
+                source_revision=clean_revision,
+            ):
+                raise
+        return updated
+
+
+def mark_container_migration_result(
+    data_dir: Path | str,
+    *,
+    update_id: str,
+    outcome: str,
+    error: str = "",
+    instance_id: str = "",
+) -> dict[str, Any]:
+    """Annotate the legacy marker after the Manager installer returns.
+
+    A queued or failed handoff leaves the healthy source Platform available,
+    so both outcomes are terminal ``idle`` states. A successful Manager
+    operation is intentionally not written here because it may already have
+    archived this checkout; the Manager journal is authoritative from then on.
+    """
+
+    clean_outcome = _clean_text(outcome, 80)
+    if clean_outcome not in MIGRATION_RESULT_PHASES:
+        raise ValueError("invalid container migration result")
+    with update_state_lock(data_dir):
+        current = _matching_state(data_dir, update_id)
+        current_state = str(current.get("state") or "")
+        current_phase = str(current.get("phase") or "")
+        if current_state == "idle" and current_phase == clean_outcome:
+            return current
+        source_bridge_ready = current_state == "waiting_for_tasks" and str(
+            current.get("phase") or ""
+        ) == SOURCE_BRIDGE_READY_PHASE
+        # The first bridge-capable release marked the source transaction as a
+        # generic success before invoking install.sh. Accept that exact legacy
+        # boundary so the updated installer can repair status for machines
+        # whose currently running deploy.sh still has the old ordering.
+        legacy_bridge_success = current_state == "idle" and current_phase == "success"
+        queued_to_failed = (
+            current_state == "idle"
+            and current_phase == "container_migration_queued"
+            and clean_outcome == "container_migration_failed"
+        )
+        if current_phase == "container_migration_failed":
+            raise RuntimeError("a failed container migration requires explicit repair")
+        if not source_bridge_ready and not legacy_bridge_success and not queued_to_failed:
+            raise RuntimeError("container migration result requires a source bridge handoff")
+        now = int(time.time())
+        updated = {
+            **current,
+            "schema_version": AUTO_UPDATE_STATE_SCHEMA_VERSION,
+            "state": "idle",
+            "phase": clean_outcome,
+            "instance_id": _clean_text(instance_id, 160)
+            or str(current.get("instance_id") or ""),
+            "updated_at": now,
+            "completed_at": now,
+        }
+        if error:
+            updated["error"] = _clean_text(error, 2000)
+        else:
+            updated.pop("error", None)
+        _write_state(data_dir, updated)
+        return updated
+
+
+def recover_source_bridge_handoff(
+    data_dir: Path | str,
+    *,
+    update_id: str,
+    instance_id: str = "",
+    source_revision: str,
+    repair_failed: bool = False,
+) -> dict[str, Any] | None:
+    """Recover a bridge worker that died after the healthy source restart.
+
+    This transition is intentionally separate from generic ``mark_updating``:
+    only a source process already carrying the persisted bridge environment
+    calls it, and it never changes the checkout or update id.
+    """
+
+    if not _inherited_update_lock_is_held():
+        raise RuntimeError("source bridge recovery requires the repository update lock")
+    clean_update_id = _required_id(update_id, "update_id")
+    clean_revision = _clean_source_revision(source_revision)
+    with update_state_lock(data_dir):
+        current = _matching_state(data_dir, clean_update_id)
+        current_state = str(current.get("state") or "")
+        current_phase = str(current.get("phase") or "")
+        if (
+            current_state == "waiting_for_tasks"
+            and current_phase == SOURCE_BRIDGE_READY_PHASE
+        ):
+            existing_revision = _clean_source_revision(
+                str(current.get("source_revision") or current.get("target_revision") or "")
+            )
+            if existing_revision != clean_revision:
+                raise RuntimeError("source bridge recovery revision does not match its marker")
+            return current
+        recoverable_active = current_state == "updating"
+        legacy_success = current_state == "idle" and current_phase == "success"
+        explicit_failed_repair = (
+            repair_failed
+            and current_state == "idle"
+            and current_phase == "container_migration_failed"
+        )
+        if not recoverable_active and not legacy_success and not explicit_failed_repair:
+            raise RuntimeError("source bridge marker is not recoverable")
+        existing_revision = _clean_source_revision(
+            str(current.get("source_revision") or current.get("target_revision") or "")
+        )
+        if existing_revision != clean_revision:
+            raise RuntimeError("source bridge recovery revision does not match its marker")
+        now = int(time.time())
+        updated = {
+            **current,
+            "schema_version": AUTO_UPDATE_STATE_SCHEMA_VERSION,
+            "state": "waiting_for_tasks",
+            "phase": SOURCE_BRIDGE_READY_PHASE,
+            "instance_id": _clean_text(instance_id, 160)
+            or str(current.get("instance_id") or ""),
+            "updated_at": now,
+            "source_completed_at": int(current.get("source_completed_at") or now),
+            "source_revision": clean_revision,
+        }
+        updated.pop("error", None)
+        updated.pop("completed_at", None)
+        _write_state(data_dir, updated)
+        return updated
+
+
 def mark_failure(
     data_dir: Path | str,
     *,
@@ -243,6 +465,9 @@ def mark_failure(
     with update_state_lock(data_dir):
         current = _matching_state(data_dir, update_id)
         current_state = str(current.get("state") or "")
+        current_phase = str(current.get("phase") or "")
+        if current_phase in SOURCE_MIGRATION_HANDOFF_PHASES:
+            raise RuntimeError("source migration handoff cannot become a source failure")
         if current_state == "idle":
             return current
         if current_state == "failed" and not rollback_succeeded:
@@ -288,6 +513,21 @@ def _matching_state(data_dir: Path | str, update_id: str) -> dict[str, Any]:
     if current is None or str(current.get("update_id") or "") != str(update_id):
         raise RuntimeError("auto-update state belongs to a different update")
     return current
+
+
+def _source_bridge_ready_matches(
+    state: dict[str, Any] | None,
+    *,
+    update_id: str,
+    source_revision: str,
+) -> bool:
+    return bool(
+        state
+        and str(state.get("update_id") or "") == str(update_id)
+        and str(state.get("state") or "") == "waiting_for_tasks"
+        and str(state.get("phase") or "") == SOURCE_BRIDGE_READY_PHASE
+        and str(state.get("source_revision") or "") == source_revision
+    )
 
 
 def _inherited_update_lock_is_held() -> bool:
@@ -343,6 +583,27 @@ def _required_id(value: str, label: str) -> str:
     if not clean:
         raise ValueError(f"{label} is required")
     return clean
+
+
+def _clean_source_revision(value: str) -> str:
+    clean = _clean_text(value, 40).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", clean):
+        raise ValueError("source_revision must be a full Git commit")
+    return clean
+
+
+def _current_checkout_revision() -> str:
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("could not resolve the bridge checkout revision")
+    return _clean_source_revision(result.stdout.strip())
 
 
 def _update_owner_is_abandoned(state: dict[str, Any] | None) -> bool:
@@ -428,6 +689,16 @@ def main(argv: list[str] | None = None) -> None:
     beat_loop.add_argument("--interval", type=float, default=5.0)
     success = subparsers.add_parser("success")
     success.add_argument("--outcome", default="success")
+    bridge_ready = subparsers.add_parser("source-bridge-ready")
+    bridge_ready.add_argument("--source-revision", required=True)
+    bridge_recover = subparsers.add_parser("recover-source-bridge")
+    bridge_recover.add_argument("--source-revision", required=True)
+    bridge_recover.add_argument("--repair-failed", action="store_true")
+    migration_result = subparsers.add_parser("container-migration-result")
+    migration_result.add_argument(
+        "--outcome", required=True, choices=sorted(MIGRATION_RESULT_PHASES)
+    )
+    migration_result.add_argument("--error", default="")
     failure = subparsers.add_parser("failure")
     failure.add_argument("--rollback-succeeded", action="store_true")
     failure.add_argument("--error", default="")
@@ -438,21 +709,26 @@ def main(argv: list[str] | None = None) -> None:
         if args.takeover and not _inherited_update_lock_is_held():
             raise RuntimeError("auto-update marker takeover requires the repository update lock")
         current = read_state(data_dir)
+        inherited = (
+            current
+            if str((current or {}).get("update_id") or "") == update_id
+            else None
+        )
         mark_updating(
             data_dir,
             update_id=update_id,
             instance_id=os.getenv("ENTERPRISE_AUTO_UPDATE_INSTANCE_ID", "").strip()
-            or str((current or {}).get("instance_id") or "").strip()
+            or str((inherited or {}).get("instance_id") or "").strip()
             or f"deployment-{os.getpid()}",
             reason=os.getenv("ENTERPRISE_AUTO_UPDATE_REASON", "").strip()
-            or str((current or {}).get("reason") or "").strip()
+            or str((inherited or {}).get("reason") or "").strip()
             or "manual",
             target_revision=os.getenv("ENTERPRISE_AUTO_UPDATE_TARGET_REVISION", "").strip()
-            or str((current or {}).get("target_revision") or "").strip(),
+            or str((inherited or {}).get("target_revision") or "").strip(),
             remote=os.getenv("ENTERPRISE_AUTO_UPDATE_REMOTE", "").strip()
-            or str((current or {}).get("remote") or "").strip(),
+            or str((inherited or {}).get("remote") or "").strip(),
             branch=os.getenv("ENTERPRISE_AUTO_UPDATE_BRANCH", "").strip()
-            or str((current or {}).get("branch") or "").strip(),
+            or str((inherited or {}).get("branch") or "").strip(),
             phase=args.phase,
             owner_pid=int(os.getenv("ENTERPRISE_AUTO_UPDATE_OWNER_PID", "0") or 0),
             takeover=bool(args.takeover),
@@ -478,7 +754,46 @@ def main(argv: list[str] | None = None) -> None:
             except RuntimeError:
                 return
     elif args.command == "success":
-        mark_success(data_dir, update_id=update_id, outcome=args.outcome)
+        # Compatibility for the first bridge-capable target: its already
+        # running deploy.sh calls the generic success command after restarting
+        # a source service with the bridge environment. The target helper must
+        # repair that old shell ordering without claiming Docker completion.
+        if (
+            args.outcome == "success"
+            and os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
+        ):
+            mark_source_bridge_ready(
+                data_dir,
+                update_id=update_id,
+                # The already-running legacy shell can re-fetch after the
+                # controller detected its target. Bind the marker to the
+                # checkout actually bootstrapped, which is also what the
+                # installer uses for its immutable release.
+                source_revision=_current_checkout_revision(),
+            )
+        else:
+            mark_success(data_dir, update_id=update_id, outcome=args.outcome)
+    elif args.command == "source-bridge-ready":
+        mark_source_bridge_ready(
+            data_dir,
+            update_id=update_id,
+            source_revision=args.source_revision,
+        )
+    elif args.command == "recover-source-bridge":
+        recover_source_bridge_handoff(
+            data_dir,
+            update_id=update_id,
+            instance_id=os.getenv("ENTERPRISE_AUTO_UPDATE_INSTANCE_ID", ""),
+            source_revision=args.source_revision,
+            repair_failed=bool(args.repair_failed),
+        )
+    elif args.command == "container-migration-result":
+        mark_container_migration_result(
+            data_dir,
+            update_id=update_id,
+            outcome=args.outcome,
+            error=args.error,
+        )
     elif args.command == "failure":
         mark_failure(
             data_dir,

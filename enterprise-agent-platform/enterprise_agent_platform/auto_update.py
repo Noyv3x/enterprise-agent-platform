@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
@@ -11,6 +12,10 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .update_state import (
+    MIGRATION_RESULT_PHASES,
+    SOURCE_BRIDGE_BOOTSTRAP_PHASE,
+    SOURCE_BRIDGE_READY_PHASE,
+    SOURCE_MIGRATION_HANDOFF_PHASES,
     clear_state,
     heartbeat,
     is_blocking,
@@ -69,6 +74,7 @@ class AutoUpdateManager:
         self._lifecycle_generation = 0
         self._pending_reason = "startup"
         self._pending_update: dict[str, Any] | None = None
+        self._migration_resume_launched_at = 0.0
         self._instance_id = uuid.uuid4().hex
         configured_data_dir = getattr(getattr(self.service, "config", None), "data_dir", None)
         fallback_data_dir = Path(
@@ -80,12 +86,16 @@ class AutoUpdateManager:
         ).expanduser().resolve()
         restored = read_state(self._data_dir)
         restored_blocking = is_blocking(restored)
+        restored_bridge_phase = (
+            str((restored or {}).get("phase") or "")
+            in SOURCE_MIGRATION_HANDOFF_PHASES
+        )
         self._status: dict[str, Any] = {
             "running": False,
             "in_progress": False,
             "phase": (
                 str((restored or {}).get("phase") or (restored or {}).get("state") or "idle")
-                if restored_blocking
+                if restored_blocking or restored_bridge_phase
                 else "idle"
             ),
             "last_check_at": None,
@@ -113,17 +123,15 @@ class AutoUpdateManager:
             "blocker_error": "",
             "instance_id": self._instance_id,
             "state_file": str(state_path(self._data_dir)),
+            "container_migration_required": False,
+            "update_action": "",
             "repo_root": str(self.repo_root),
             "deploy_script": str(self.deploy_script),
         }
 
     def start(self) -> None:
         with self._state_lock:
-            if (
-                self._thread is not None
-                and self._thread.is_alive()
-                and not self._stop.is_set()
-            ):
+            if self._thread is not None and self._thread.is_alive():
                 return
             self._lifecycle_generation += 1
             generation = self._lifecycle_generation
@@ -146,7 +154,9 @@ class AutoUpdateManager:
         if thread is not None:
             thread.join(timeout=2)
         with self._state_lock:
-            if self._thread is thread:
+            if self._thread is thread and (
+                thread is None or not thread.is_alive()
+            ):
                 self._thread = None
             if self._status.get("phase") == "waiting_for_tasks":
                 self._pending_update = None
@@ -160,6 +170,10 @@ class AutoUpdateManager:
                 )
             self._status["running"] = False
             self._status["in_progress"] = False
+
+    def worker_thread(self) -> threading.Thread | None:
+        with self._state_lock:
+            return self._thread
 
     def trigger(self, reason: str = "manual") -> dict[str, Any]:
         self.start()
@@ -195,12 +209,17 @@ class AutoUpdateManager:
             status = dict(self._status)
             has_pending_update = self._pending_update is not None
         marker = read_state(self._data_dir)
-        if is_blocking(marker):
+        marker_state = str((marker or {}).get("state") or "")
+        source_bridge_waiting = (
+            marker_state == "waiting_for_tasks"
+            and str((marker or {}).get("phase") or "") == "source_bridge_ready"
+        )
+        if is_blocking(marker) or source_bridge_waiting:
             status.update(
                 {
                     "phase": str(marker.get("phase") or marker.get("state") or "updating"),
                     "update_id": str(marker.get("update_id") or ""),
-                    "update_started": True,
+                    "update_started": is_blocking(marker),
                 }
             )
         elif (
@@ -208,7 +227,11 @@ class AutoUpdateManager:
             and str(marker.get("state") or "") == "idle"
             and str(marker.get("update_id") or "")
             and str(marker.get("update_id") or "") == str(status.get("update_id") or "")
-            and str(status.get("phase") or "") in {"launching", "updating"}
+            and (
+                str(status.get("phase") or "") in {"launching", "updating"}
+                or str(marker.get("phase") or "")
+                in SOURCE_MIGRATION_HANDOFF_PHASES
+            )
         ):
             # The detached deploy worker may finish before restarting this
             # process (for example, a final dirty-tree refusal). Reconcile its
@@ -216,7 +239,7 @@ class AutoUpdateManager:
             # stuck on "updating" after product access has safely resumed.
             status.update(
                 {
-                    "phase": "idle",
+                    "phase": str(marker.get("phase") or "idle"),
                     "update_started": False,
                     "update_available": False,
                     "last_error": str(marker.get("error") or status.get("last_error") or ""),
@@ -234,6 +257,8 @@ class AutoUpdateManager:
         phase = str(status.get("phase") or "idle")
         if is_blocking(marker):
             status_state = str(marker.get("state") or "updating")
+        elif source_bridge_waiting:
+            status_state = "waiting_for_tasks"
         elif has_pending_update or phase == "waiting_for_tasks":
             status_state = "waiting_for_tasks"
         elif phase in {"checking", "launching", "updating"}:
@@ -264,7 +289,7 @@ class AutoUpdateManager:
 
     def public_status(self) -> dict[str, Any]:
         marker = read_state(self._data_dir)
-        if is_blocking(marker):
+        if is_blocking(marker) or str((marker or {}).get("state") or "") == "waiting_for_tasks":
             return read_public(self._data_dir, instance_id=self._instance_id)
         with self._state_lock:
             waiting = self._pending_update is not None
@@ -276,6 +301,26 @@ class AutoUpdateManager:
 
     def blocks_platform_use(self) -> bool:
         return is_blocking(read_state(self._data_dir))
+
+    def source_migration_recovery_required(self) -> bool:
+        """Return whether a durable handoff requires a live coordinator.
+
+        Startup must not depend on the repository lock being available. The
+        old updater still owns that lock while it restarts this process; the
+        coordinator waits and rechecks the lock immediately before launch.
+        """
+
+        return self._source_migration_recoverable()
+
+    def source_migration_bootstrap_required(self) -> bool:
+        """Return whether a synchronized legacy source still needs first handoff."""
+
+        try:
+            return self._container_migration_required()
+        except RuntimeError:
+            # Keep the lightweight controller alive so its normal check path
+            # can expose the incomplete release instead of killing startup.
+            return True
 
     def blocking_update_id(self) -> str:
         marker = read_state(self._data_dir)
@@ -294,7 +339,7 @@ class AutoUpdateManager:
         try:
             if not self._generation_is_current(_generation):
                 return self.status()
-            if self.blocks_platform_use():
+            if self.blocks_platform_use() and not self._source_migration_resume_candidate():
                 return self.status()
             with self._state_lock:
                 self._status.update(
@@ -335,12 +380,18 @@ class AutoUpdateManager:
                     )
                 return self.status()
             if result["update_available"]:
+                if str(result.get("update_action") or "") == "migrate-container":
+                    return self._attempt_source_migration_resume(
+                        result,
+                        reason=reason,
+                        generation=_generation,
+                    )
                 with self._state_lock:
                     if self._pending_update is None:
                         pending = {
                             **result,
                             "reason": reason,
-                            "update_id": uuid.uuid4().hex,
+                            "update_id": str(result.get("update_id") or uuid.uuid4().hex),
                             "detected_at": int(time.time()),
                         }
                         self._pending_update = pending
@@ -398,6 +449,53 @@ class AutoUpdateManager:
                 if _generation is None or _generation == self._lifecycle_generation:
                     self._status["in_progress"] = False
             self._check_lock.release()
+
+    def _attempt_source_migration_resume(
+        self,
+        migration: dict[str, Any],
+        *,
+        reason: str,
+        generation: int | None,
+    ) -> dict[str, Any]:
+        """Launch the exact installer without taking a source reservation.
+
+        The source remains usable while artifacts download. The Manager owns
+        the later idle/readiness reservation, so this path must not reuse the
+        Git updater's blocking ``try_reserve_auto_update`` transaction.
+        """
+
+        if not self._generation_is_current(generation) or self._stop.is_set():
+            return self.status()
+        now = time.monotonic()
+        with self._state_lock:
+            if now - self._migration_resume_launched_at < 30:
+                return self.status()
+            self._migration_resume_launched_at = now
+            self._status.update(
+                {
+                    **migration,
+                    "phase": SOURCE_BRIDGE_READY_PHASE,
+                    "update_action": "migrate-container",
+                    "update_id": str(migration.get("update_id") or ""),
+                    "last_trigger": reason,
+                }
+            )
+        try:
+            command = self._launcher(reason)
+        except Exception:
+            with self._state_lock:
+                self._migration_resume_launched_at = 0.0
+            raise
+        with self._state_lock:
+            self._status.update(
+                {
+                    "phase": SOURCE_BRIDGE_READY_PHASE,
+                    "last_update_requested_at": int(time.time()),
+                    "update_started": True,
+                    "update_command": " ".join(command),
+                }
+            )
+        return self.status()
 
     def _generation_is_current(self, generation: int | None) -> bool:
         if generation is None:
@@ -474,7 +572,7 @@ class AutoUpdateManager:
                 if (
                     (generation is not None and generation != self._lifecycle_generation)
                     or self._stop.is_set()
-                    or not self.service.auto_update_enabled()
+                    or not self._controller_enabled()
                 ):
                     raise RuntimeError(
                         "auto update was disabled or stopped before deployment handoff"
@@ -490,6 +588,7 @@ class AutoUpdateManager:
                     phase="launching",
                 )
                 self._status["phase"] = "launching"
+                self._status["update_action"] = "update"
             command = self._launcher(str(pending.get("reason") or "poll"))
             # Returning from the launcher is the ownership handoff boundary.
             # From this point onward the detached deploy worker may already be
@@ -580,19 +679,40 @@ class AutoUpdateManager:
                 return
             self._status["running"] = True
         while self._generation_is_current(generation) and not self._stop.is_set():
-            enabled = bool(self.service.auto_update_enabled())
-            interval = int(self.service.auto_update_interval_seconds())
+            sync = getattr(self.service, "sync_auto_update_reservation", None)
+            if callable(sync):
+                sync()
+            # Manager status is an external Unix-socket read. stop() may win
+            # while it is in flight; never touch settings/SQLite after that
+            # lifecycle boundary because Service.close may already be closing
+            # those resources.
+            if self._stop.is_set() or not self._generation_is_current(generation):
+                break
             with self._state_lock:
+                if generation != self._lifecycle_generation or self._stop.is_set():
+                    break
+                # Serialize settings reads with stop(): once stop advances the
+                # generation it can safely let Service.close proceed.
+                enabled = self._controller_enabled()
+                interval = int(self.service.auto_update_interval_seconds())
                 waiting = self._pending_update is not None
-            wait_seconds = 1 if waiting else max(5, interval if enabled else 60)
+            bridge_coordinator = self._source_migration_handoff_active()
+            wait_seconds = (
+                1
+                if waiting
+                else (2 if bridge_coordinator else max(5, interval if enabled else 60))
+            )
             woke = self._wake.wait(wait_seconds)
             self._wake.clear()
             if self._stop.is_set() or not self._generation_is_current(generation):
                 break
             if not enabled and not woke:
                 continue
-            if not self.service.auto_update_enabled():
-                continue
+            with self._state_lock:
+                if generation != self._lifecycle_generation or self._stop.is_set():
+                    break
+                if not self._controller_enabled():
+                    continue
             with self._state_lock:
                 reason = self._pending_reason if woke else "poll"
                 self._pending_reason = "poll"
@@ -610,11 +730,44 @@ class AutoUpdateManager:
         branch = _safe_git_name(branch or "main", "branch")
         dirty_summary = self._git_stdout(["git", "status", "--porcelain"])
         current = self._git_stdout(["git", "rev-parse", "HEAD"])
+        marker = read_state(self._data_dir)
+        marker_phase = str((marker or {}).get("phase") or "")
+        handoff_active = self._source_migration_handoff_active()
+        if handoff_active:
+            self._validate_container_bridge_assets()
+            expected = str(
+                (marker or {}).get("source_revision")
+                or (marker or {}).get("target_revision")
+                or ""
+            )
+            if expected and expected != current:
+                raise RuntimeError(
+                    "source bridge checkout no longer matches its exact target revision"
+                )
+            resume_required = self._source_migration_resume_candidate(marker)
+            return {
+                "current_revision": current,
+                "remote_revision": expected or current,
+                "remote": str((marker or {}).get("remote") or remote),
+                "branch": str((marker or {}).get("branch") or branch),
+                "dirty": bool(dirty_summary.strip()),
+                "dirty_summary": dirty_summary.strip(),
+                "update_available": resume_required,
+                "update_action": "migrate-container" if resume_required else "",
+                "update_id": str((marker or {}).get("update_id") or ""),
+                "container_migration_required": resume_required,
+                "source_migration_handoff_active": True,
+            }
         self._git(["git", "fetch", "--quiet", remote, branch], timeout=120)
         remote_ref = f"{remote}/{branch}"
         remote_revision = self._git_stdout(["git", "rev-parse", remote_ref])
+        container_migration_required = self._container_migration_required()
         if current == remote_revision:
-            update_available = False
+            # A pre-bridge deploy.sh can fast-forward and start the new source
+            # without ever executing the bridge calls introduced by that
+            # commit. The restarted source must therefore schedule one pass of
+            # the current deploy.sh even when Git is already synchronized.
+            update_available = container_migration_required
         else:
             ancestor = self._git(["git", "merge-base", "--is-ancestor", current, remote_revision], check=False)
             if ancestor.returncode != 0:
@@ -628,11 +781,135 @@ class AutoUpdateManager:
             "dirty": bool(dirty_summary.strip()),
             "dirty_summary": dirty_summary.strip(),
             "update_available": update_available,
+            "update_action": "update" if update_available else "",
+            "container_migration_required": container_migration_required,
+            "source_migration_handoff_active": False,
         }
+
+    def _container_migration_required(self) -> bool:
+        if os.getenv("UBITECH_SKIP_CONTAINER_MIGRATION", "0") == "1":
+            return False
+        if self._source_migration_handoff_active():
+            return False
+        config = getattr(self.service, "config", None)
+        if str(getattr(config, "deployment_mode", "source") or "source").lower() == "container":
+            return False
+        self._validate_container_bridge_assets(optional=True)
+        installer = self.repo_root / "install.sh"
+        contract = self.repo_root / "docs" / "contracts" / "container-platform.json"
+        return installer.exists() and contract.exists()
+
+    def _validate_container_bridge_assets(self, *, optional: bool = False) -> None:
+        installer = self.repo_root / "install.sh"
+        contract = self.repo_root / "docs" / "contracts" / "container-platform.json"
+        installer_present = installer.exists()
+        contract_present = contract.exists()
+        if not installer_present and not contract_present:
+            if optional:
+                return
+            raise RuntimeError("container bridge assets are missing")
+        if (
+            not installer.is_file()
+            or not os.access(installer, os.X_OK)
+            or not contract.is_file()
+        ):
+            raise RuntimeError(
+                "container bridge assets are incomplete or the installer is not executable"
+            )
+
+    def _source_bridge_environment_active(self) -> bool:
+        config = getattr(self.service, "config", None)
+        return (
+            str(getattr(config, "deployment_mode", "source") or "source").lower()
+            == "source"
+            and os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
+        )
+
+    def _source_migration_handoff_active(self) -> bool:
+        if self._source_bridge_environment_active():
+            return True
+        marker = read_state(self._data_dir)
+        return str((marker or {}).get("phase") or "") in (
+            SOURCE_MIGRATION_HANDOFF_PHASES | {SOURCE_BRIDGE_BOOTSTRAP_PHASE}
+        )
+
+    def _controller_enabled(self) -> bool:
+        return (
+            bool(self.service.auto_update_enabled())
+            or self._source_migration_handoff_active()
+            or self.source_migration_bootstrap_required()
+        )
+
+    def _source_migration_resume_candidate(
+        self,
+        marker: dict[str, Any] | None = None,
+    ) -> bool:
+        return self._source_migration_recoverable(
+            marker
+        ) and self._repository_update_lock_available()
+
+    def _source_migration_recoverable(
+        self,
+        marker: dict[str, Any] | None = None,
+    ) -> bool:
+        marker = marker if marker is not None else read_state(self._data_dir)
+        if marker is None:
+            return False
+        if os.getenv("UBITECH_SKIP_CONTAINER_MIGRATION", "0") == "1":
+            return False
+        phase = str(marker.get("phase") or "")
+        state = str(marker.get("state") or "")
+        if phase in MIGRATION_RESULT_PHASES:
+            return False
+        revision = str(
+            marker.get("source_revision") or marker.get("target_revision") or ""
+        )
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            return False
+        recoverable = state == "waiting_for_tasks" and phase == SOURCE_BRIDGE_READY_PHASE
+        if self._source_bridge_environment_active():
+            recoverable = recoverable or (state == "idle" and phase == "success") or (
+                state == "updating"
+                and str(read_public(self._data_dir).get("state") or "") == "failed"
+            )
+        return recoverable
+
+    def _repository_update_lock_available(self) -> bool:
+        git_entry = self.repo_root / ".git"
+        if git_entry.is_dir():
+            lock_path = git_entry / "ubitech-agent-update.lock"
+        else:
+            try:
+                declaration = git_entry.read_text(encoding="utf-8").strip()
+            except OSError:
+                return False
+            if not declaration.startswith("gitdir:"):
+                return False
+            git_dir = Path(declaration.removeprefix("gitdir:").strip())
+            if not git_dir.is_absolute():
+                git_dir = (self.repo_root / git_dir).resolve()
+            lock_path = git_dir / "ubitech-agent-update.lock"
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return True
 
     def _launch_update_command(self, reason: str) -> list[str]:
         if not self.deploy_script.exists():
             raise RuntimeError(f"deploy script not found: {self.deploy_script}")
+        with self._state_lock:
+            update_action = str(self._status.get("update_action") or "update")
+        command_name = (
+            "migrate-container" if update_action == "migrate-container" else "update"
+        )
         handoff = self._deployment_handoff()
         systemd_managed = _running_under_systemd()
         systemd_tools = bool(shutil.which("systemd-run") and shutil.which("systemctl"))
@@ -657,7 +934,7 @@ class AutoUpdateManager:
                 f"--working-directory={self.repo_root}",
                 *[f"--setenv={key}={value}" for key, value in handoff.items()],
                 str(self.deploy_script),
-                "update",
+                command_name,
                 "--data",
                 handoff["ENTERPRISE_PLATFORM_DATA"],
                 "--service-name",
@@ -688,7 +965,7 @@ class AutoUpdateManager:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             str(self.deploy_script),
-            "update",
+            command_name,
             "--data",
             handoff["ENTERPRISE_PLATFORM_DATA"],
             "--service-name",
@@ -779,6 +1056,21 @@ class AutoUpdateManager:
                 or "300"
             ),
         }
+        # Only explicitly supported source-migration overrides cross the
+        # service -> transient systemd boundary. Arbitrary process environment
+        # is intentionally not forwarded.
+        for key in (
+            "UBITECH_DATA_ROOT",
+            "UBITECH_RELEASE_REPOSITORY",
+            "UBITECH_RELEASE_MANIFEST_URL",
+            "UBITECH_RELEASE_CHANNEL_MANIFEST_URL",
+            "UBITECH_MANAGER_URL",
+            "UBITECH_MANAGER_CHECKSUM_URL",
+            "UBITECH_SKIP_CONTAINER_MIGRATION",
+        ):
+            value = os.getenv(key, "").strip()
+            if value:
+                values[key] = value
         with self._state_lock:
             if self._status.get("update_id"):
                 values["ENTERPRISE_AUTO_UPDATE_ID"] = str(self._status["update_id"])

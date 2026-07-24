@@ -56,6 +56,8 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 发布清单锁定源 commit、数据库版本、管理器校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；旧 Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
 
+源码首迁必须区分 `source_marker` 与 `manager` 预约所有者，marker 同步不得释放 Manager 预约。Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 id 确认 reserve 后才可执行破坏性操作；响应不确定时只有 release 明确成功才可回到非维护状态。Manager owner 释放时如果 source marker 已阻断，Platform 先重新建立 marker owner 再决定是否唤醒 worker。bridge worker 中断后的恢复先持有真实 repository flock，再核对 marker update id、完整桥接资产和 exact source revision；协调器启动不以当下能否取锁为条件，恢复入口不执行 fetch、merge、bootstrap 或 Git rollback。queued/failed handoff 冻结 checkout，普通 `begin --takeover` 也不能覆盖。Manager 暂不可达时源码只允许只读状态回退，管理写操作继续 fail closed。
+
 快照恢复、新 generation readiness 和管理器重启验证完成前不能删除旧源码或数据。首次迁移未知 ignored 文件随完整 checkout 进入至少保留七天的 recovery pack；清理只能处理迁移清单明确列出的路径，不能跟随符号链接或跨越配置根。
 
 ## 文件与附件

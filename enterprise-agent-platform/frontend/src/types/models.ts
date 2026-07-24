@@ -743,6 +743,8 @@ export interface PlatformUpdateStatus {
 export interface AutoUpdateStatus {
   state?: PlatformUpdateState;
   phase?: string;
+  control_plane?: "manager" | "source_bridge" | "source";
+  manager_available?: boolean;
   in_progress?: boolean;
   update_started?: boolean;
   update_available?: boolean;

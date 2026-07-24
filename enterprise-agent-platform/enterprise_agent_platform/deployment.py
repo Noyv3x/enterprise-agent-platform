@@ -60,6 +60,8 @@ DEFAULT_COGNEE_INSTALL_TIMEOUT_SECONDS = 3600
 FINAL_READINESS_RECHECK_SECONDS = 10
 AUTO_UPDATE_SOURCE_PID_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_PID"
 AUTO_UPDATE_SOURCE_MODE_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"
+SOURCE_MIGRATION_PROTOCOL_ENV = "UBITECH_SOURCE_MIGRATION_PROTOCOL"
+CURRENT_SOURCE_MIGRATION_PROTOCOL = "2"
 MINIMUM_NODE_VERSION = (22, 19)
 MANAGED_NODE_VERSION = "22.19.0"
 MAX_MANAGED_NODE_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -1848,6 +1850,7 @@ def runtime_env(paths: DeploymentPaths, *, host: str, port: int) -> dict[str, st
         values.update(
             {
                 "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                SOURCE_MIGRATION_PROTOCOL_ENV: CURRENT_SOURCE_MIGRATION_PROTOCOL,
                 "UBITECH_MANAGER_SOCKET": manager_socket,
                 "UBITECH_MANAGER_TOKEN_FILE": manager_token_file,
             }
@@ -2503,18 +2506,222 @@ def bootstrap_from_args(args: argparse.Namespace) -> DeploymentResult:
     data_dir = requested_data or existing.data_dir
     paths = DeploymentPaths.from_root(root, data_dir=data_dir, service_name=service_name)
     manager = DeploymentManager(paths)
-    result = manager.bootstrap(
-        host=args.host,
-        port=args.port,
-        mode=args.mode,
-        prepare_runtime=not args.skip_runtime_prepare,
-    )
+    try:
+        result = manager.bootstrap(
+            host=args.host,
+            port=args.port,
+            mode=args.mode,
+            prepare_runtime=not args.skip_runtime_prepare,
+        )
+    except Exception:
+        if (
+            _env_bool("UBITECH_SOURCE_MIGRATION_BRIDGE", False)
+            and os.getenv(SOURCE_MIGRATION_PROTOCOL_ENV, "").strip()
+            != CURRENT_SOURCE_MIGRATION_PROTOCOL
+        ):
+            try:
+                _schedule_legacy_bridge_rollback_guard(paths)
+            except Exception as guard_exc:
+                print(
+                    "WARNING: could not install the legacy bridge rollback guard: "
+                    f"{guard_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        raise
     if result.service_started:
         print(f"ubitech agent service started: {result.url}")
         print(f"Service file: {result.service_path}")
     elif result.mode == "prepare":
         print(f"ubitech agent prepared: {result.url}")
     return result
+
+
+_LEGACY_BRIDGE_ROLLBACK_GUARD = r'''#!/usr/bin/env python3
+import os
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BRIDGE_KEYS = (
+    "UBITECH_SOURCE_MIGRATION_BRIDGE=",
+    "UBITECH_SOURCE_MIGRATION_PROTOCOL=",
+    "UBITECH_MANAGER_SOCKET=",
+    "UBITECH_MANAGER_TOKEN_FILE=",
+)
+
+def process_start(pid):
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        tail = raw[raw.rfind(")") + 2:].split()
+        return tail[19]
+    except (OSError, IndexError):
+        return ""
+
+def parent_is_same(pid, expected_start):
+    return bool(expected_start and process_start(pid) == expected_start)
+
+def rewrite_unit(path):
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("legacy service unit is not a regular file")
+    if metadata.st_uid != os.getuid() or metadata.st_size > 1024 * 1024:
+        raise RuntimeError("legacy service unit ownership or size is invalid")
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    filtered = [
+        line for line in lines
+        if not (
+            line.startswith("Environment=")
+            and any(key in line for key in BRIDGE_KEYS)
+        )
+    ]
+    updated = "\n".join(filtered) + ("\n" if original.endswith("\n") else "")
+    if updated == original:
+        return
+    temporary = path.with_name(f".{path.name}.bridge-recovery-{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, stat.S_IMODE(metadata.st_mode))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+def main():
+    parent_pid = int(sys.argv[1])
+    parent_start = sys.argv[2]
+    unit_path = Path(sys.argv[3])
+    service_name = sys.argv[4]
+    deadline = time.monotonic() + 900
+    while parent_is_same(parent_pid, parent_start) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    if parent_is_same(parent_pid, parent_start):
+        raise RuntimeError("legacy deploy shell did not exit before recovery deadline")
+    rewrite_unit(unit_path)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+    subprocess.run(["systemctl", "--user", "restart", service_name], check=True, timeout=120)
+    Path(__file__).unlink(missing_ok=True)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _schedule_legacy_bridge_rollback_guard(paths: DeploymentPaths) -> Path:
+    """Repair a service unit rewritten by the deployed first-generation shell."""
+
+    manager_socket = Path(os.getenv("UBITECH_MANAGER_SOCKET", "")).expanduser()
+    if not manager_socket.is_absolute() or len(manager_socket.parents) < 2:
+        raise DeploymentError("legacy bridge rollback guard requires an absolute Manager socket")
+    recovery_dir = manager_socket.parent.parent / "recovery"
+    ensure_private_directory(recovery_dir)
+    update_id = re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "-",
+        os.getenv("ENTERPRISE_AUTO_UPDATE_ID", "legacy")[:120],
+    ) or "legacy"
+    script = recovery_dir / f"source-rollback-{update_id}.py"
+    temporary = script.with_name(f".{script.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o700,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+            handle.write(_LEGACY_BRIDGE_ROLLBACK_GUARD)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, script)
+        os.chmod(script, 0o700)
+        directory = os.open(recovery_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    parent_pid = os.getppid()
+    parent_start = ""
+    try:
+        raw = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8")
+        parent_start = raw[raw.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError):
+        pass
+    if not parent_start:
+        raise DeploymentError("could not identify the legacy deploy shell")
+    environment = {
+        key: value
+        for key in (
+            "HOME",
+            "PATH",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        )
+        if (value := os.getenv(key))
+    }
+    guard_command = [
+        sys.executable,
+        str(script),
+        str(parent_pid),
+        parent_start,
+        str(paths.service_path),
+        paths.service_name,
+    ]
+    if os.getenv(AUTO_UPDATE_SOURCE_MODE_ENV, "").strip() == "service":
+        unit_suffix = re.sub(r"[^A-Za-z0-9_-]", "-", update_id)[:60]
+        command = [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--service-type=exec",
+            f"--unit=ubitech-agent-source-rollback-{unit_suffix}-{os.getpid()}",
+            *[f"--setenv={key}={value}" for key, value in environment.items()],
+            *guard_command,
+        ]
+        launched = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if launched.returncode != 0:
+            detail = (launched.stderr or launched.stdout or "").strip()
+            raise DeploymentError(
+                "could not launch the bridge rollback guard in an independent "
+                f"systemd unit{': ' + detail if detail else ''}"
+            )
+    else:
+        subprocess.Popen(
+            guard_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+            start_new_session=True,
+        )
+    return script
 
 
 def _existing_service_data_dir(service_name: str) -> Path | None:

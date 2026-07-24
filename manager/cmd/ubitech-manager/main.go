@@ -347,8 +347,7 @@ func (a *application) background(ctx context.Context) {
 				a.sandboxes.SetImage(current.Images["agent-sandbox"])
 			}
 		case now := <-updateTicker.C:
-			state := a.state.State()
-			if state.FinalizePendingOperationID != "" || (state.ActiveOperationID != "" && state.Phase == model.PhaseRollingBack && state.PublicState == model.StateFailed) {
+			if a.operations.RecoveryPending() {
 				_ = a.operations.Recover(ctx)
 				continue
 			}

@@ -30,5 +30,15 @@ npm test
 npm run build
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  docker compose -f "$ROOT/containers/compose.yaml" config >/dev/null
+  env -i \
+    PATH="$PATH" \
+    HOME="$HOME" \
+    UBITECH_PLATFORM_IMAGE="example.invalid/ubitech/platform@sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+    UBITECH_AGENT_RUNTIME_IMAGE="example.invalid/ubitech/agent-runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    UBITECH_CAMOFOX_IMAGE="example.invalid/ubitech/camofox@sha256:2222222222222222222222222222222222222222222222222222222222222222" \
+    UBITECH_DATA_ROOT="/tmp/ubitech-compose-config/data" \
+    UBITECH_SECRETS_DIR="/tmp/ubitech-compose-config/secrets" \
+    UBITECH_MANAGER_CONTROL_DIR="/tmp/ubitech-compose-config/control" \
+    docker compose --env-file /dev/null \
+      -f "$ROOT/containers/compose.yaml" config --quiet
 fi

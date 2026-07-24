@@ -65,4 +65,6 @@ terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进
 
 用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台进程属于 Sandbox 生命周期，不因单个 Run 完成而停止；管理器根据任务和进程登记决定空闲回收。
 
+源码到容器的桥接期间，Platform 仍须查询宿主 Runtime 的受保护终端清单；Manager socket 已配置并不表示旧 Runtime 已由容器接管。只有容器 deployment mode 才能跳过宿主清单。迁移安装器下载和预检保持业务可用，真正切换前的空闲预约由 Manager 建立，源码恢复协调器不得提前占用同一预约。
+
 Runtime 没有活动任务的固定墙钟上限。无进展保护、模型轮次上限和 terminal 默认超时的精确跨层值由 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义。审批、请求体、清理和保留等其它边界由[配置参考](../reference/configuration.md)列出，并由 Runtime 配置测试校验。

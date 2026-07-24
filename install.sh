@@ -16,8 +16,46 @@ legacy_root=""
 legacy_data=""
 legacy_service="enterprise-agent-platform.service"
 legacy_platform_url=""
+legacy_update_id="${ENTERPRISE_AUTO_UPDATE_ID:-}"
 expected_source_commit=""
 assume_yes=0
+migration_handoff_accepted=0
+
+record_legacy_migration_exit() {
+  local status=$?
+  if (($#)); then
+    status="$1"
+  fi
+  trap - EXIT
+  if ((status != 0 && ! migration_handoff_accepted)) \
+    && [[ -n "$legacy_root" && -n "$legacy_data" \
+      && -n "$legacy_update_id" \
+      && -f "$legacy_root/enterprise-agent-platform/enterprise_agent_platform/update_state.py" ]]; then
+    local outcome="container_migration_failed"
+    local error="Container migration installer failed with exit status ${status}; the source bridge remains available."
+    if ((status == 75)); then
+      outcome="container_migration_queued"
+      error=""
+    fi
+    local python_bin="${PYTHON_BIN:-python3}"
+    local source_python_path="$legacy_root/enterprise-agent-platform"
+    if [[ -n "${PYTHONPATH:-}" ]]; then
+      source_python_path="$source_python_path:$PYTHONPATH"
+    fi
+    if command -v "$python_bin" >/dev/null 2>&1; then
+      ENTERPRISE_PLATFORM_DATA="$legacy_data" \
+      ENTERPRISE_AUTO_UPDATE_ID="$legacy_update_id" \
+      PYTHONPATH="$source_python_path" \
+        "$python_bin" -m enterprise_agent_platform.update_state \
+          container-migration-result --outcome "$outcome" --error "$error" \
+          >/dev/null 2>&1 \
+        || printf 'Warning: legacy container migration result could not be recorded.\n' >&2
+    fi
+  fi
+  exit "$status"
+}
+
+trap record_legacy_migration_exit EXIT
 
 usage() {
   cat <<'EOF'
@@ -41,6 +79,7 @@ Usage: ./install.sh [options]
   --legacy-service NAME    user-systemd service of that source deployment
   --legacy-platform-url URL
                            authenticated loopback URL used during cutover
+  --legacy-update-id ID    durable source update marker identity
   --expected-source-commit COMMIT
                            exact 40-character bridge HEAD required by the release
   --yes                    do not prompt before installation
@@ -62,6 +101,7 @@ while (($#)); do
     --legacy-data) legacy_data="${2:?missing path}"; shift 2 ;;
     --legacy-service) legacy_service="${2:?missing name}"; shift 2 ;;
     --legacy-platform-url) legacy_platform_url="${2:?missing URL}"; shift 2 ;;
+    --legacy-update-id) legacy_update_id="${2?missing id}"; shift 2 ;;
     --expected-source-commit) expected_source_commit="${2:?missing commit}"; shift 2 ;;
     --yes) assume_yes=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -111,6 +151,11 @@ fi
 if [[ -z "$legacy_root" && -n "$expected_source_commit" ]]; then
   printf '%s\n' '--expected-source-commit is valid only with --migrate-from' >&2
   exit 64
+fi
+if [[ -n "$legacy_update_id" ]] \
+  && [[ ! "$legacy_update_id" =~ ^[A-Za-z0-9._:-]{1,160}$ ]]; then
+  printf 'invalid legacy update id: %s\n' "$legacy_update_id" >&2
+  exit 65
 fi
 
 for command in curl sha256sum install systemctl uname awk; do
@@ -164,7 +209,7 @@ elif [[ ! -f "$manager_binary" || -L "$manager_binary" || ! -x "$manager_binary"
   printf 'local manager is not an executable regular file: %s\n' "$manager_binary" >&2
   exit 66
 fi
-for value in "$config_path" "$data_root" "$listen" "$legacy_root" "$legacy_data" "$legacy_service" "$legacy_platform_url" "$expected_source_commit" "$manager_binary" "$manifest_url" "$channel_manifest_url" "$manager_url" "$manager_checksum_url"; do
+for value in "$config_path" "$data_root" "$listen" "$legacy_root" "$legacy_data" "$legacy_service" "$legacy_platform_url" "$legacy_update_id" "$expected_source_commit" "$manager_binary" "$manifest_url" "$channel_manifest_url" "$manager_url" "$manager_checksum_url"; do
   if [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *'"'* || "$value" == *'\'* ]]; then
     printf 'unsupported control character or quote in installation value\n' >&2
     exit 65
@@ -184,6 +229,14 @@ retry_bootstrap_script="$retry_dir/retry-install-source-migration.sh"
 retry_installer="$retry_dir/install-source-migration.sh"
 retry_service="$unit_dir/ubitech-agent-migrate.service"
 retry_timer="$unit_dir/ubitech-agent-migrate.timer"
+legacy_python=""
+if [[ -n "$legacy_update_id" ]]; then
+  legacy_python="$(command -v "${PYTHON_BIN:-python3}" || true)"
+  if [[ -z "$legacy_python" || ! -x "$legacy_python" ]]; then
+    printf '%s\n' 'source migration state recording requires an executable Python runtime' >&2
+    exit 69
+  fi
+fi
 
 cleanup_migration_retry() {
   systemctl --user disable --now ubitech-agent-migrate.timer >/dev/null 2>&1 || true
@@ -210,12 +263,19 @@ schedule_installer_retry() {
   printf -v quoted_legacy_data '%q' "$legacy_data"
   printf -v quoted_legacy_service '%q' "$legacy_service"
   printf -v quoted_legacy_platform_url '%q' "$legacy_platform_url"
+  printf -v quoted_legacy_update_id '%q' "$legacy_update_id"
+  printf -v quoted_legacy_python '%q' "$legacy_python"
+  printf -v quoted_legacy_python_path '%q' "$legacy_root/enterprise-agent-platform"
   printf -v quoted_expected_source_commit '%q' "$expected_source_commit"
   printf -v quoted_retry_service '%q' "$retry_service"
   printf -v quoted_retry_timer '%q' "$retry_timer"
   cat > "$retry_bootstrap_script" <<EOF
 #!/usr/bin/env bash
 set -u
+export ENTERPRISE_AUTO_UPDATE_ID=$quoted_legacy_update_id
+export ENTERPRISE_PLATFORM_DATA=$quoted_legacy_data
+export PYTHON_BIN=$quoted_legacy_python
+export PYTHONPATH=$quoted_legacy_python_path
 status=0
 $quoted_installer \\
   --manifest-url $quoted_manifest \\
@@ -229,6 +289,7 @@ $quoted_installer \\
   --legacy-data $quoted_legacy_data \\
   --legacy-service $quoted_legacy_service \\
   --legacy-platform-url $quoted_legacy_platform_url \\
+  --legacy-update-id $quoted_legacy_update_id \\
   --expected-source-commit $quoted_expected_source_commit \\
   --yes || status=\$?
 if ((status != 0 && status != 75)); then
@@ -269,12 +330,18 @@ EOF
 }
 
 temporary="$(mktemp -d)"
-trap 'rm -rf "$temporary"' EXIT
+cleanup_installer_exit() {
+  local status=$?
+  rm -rf "$temporary" || true
+  record_legacy_migration_exit "$status"
+}
+trap cleanup_installer_exit EXIT
 if [[ -n "$manager_binary" ]]; then
   install -m 0755 "$manager_binary" "$temporary/$asset"
 else
   download_status=0
   curl --fail --location --proto '=https' --tlsv1.2 --retry 4 \
+    --connect-timeout 20 --max-time 600 --retry-max-time 600 \
     --output "$temporary/$asset" "$manager_url" || download_status=$?
   if ((download_status != 0)); then
     if [[ -n "$legacy_root" ]]; then
@@ -286,6 +353,7 @@ else
   fi
   download_status=0
   curl --fail --location --proto '=https' --tlsv1.2 --retry 4 \
+    --connect-timeout 20 --max-time 600 --retry-max-time 600 \
     --output "$temporary/$asset.sha256" "$manager_checksum_url" || download_status=$?
   if ((download_status != 0)); then
     if [[ -n "$legacy_root" ]]; then
@@ -395,6 +463,9 @@ if ((operation_status != 0)); then
     printf -v quoted_legacy_root '%q' "$legacy_root"
     printf -v quoted_legacy_data '%q' "$legacy_data"
     printf -v quoted_legacy_service '%q' "$legacy_service"
+    printf -v quoted_legacy_update_id '%q' "$legacy_update_id"
+    printf -v quoted_legacy_python '%q' "$legacy_python"
+    printf -v quoted_legacy_python_path '%q' "$legacy_root/enterprise-agent-platform"
     printf -v quoted_expected_source_commit '%q' "$expected_source_commit"
     printf -v quoted_retry_script '%q' "$retry_script"
     printf -v quoted_retry_installer '%q' "$retry_installer"
@@ -404,6 +475,8 @@ if ((operation_status != 0)); then
     cat > "$retry_script" <<EOF
 #!/usr/bin/env bash
 set -u
+export ENTERPRISE_AUTO_UPDATE_ID=$quoted_legacy_update_id
+export ENTERPRISE_PLATFORM_DATA=$quoted_legacy_data
 status=0
 $quoted_manager install \\
   --config $quoted_config \\
@@ -418,6 +491,14 @@ if ((status == 0)); then
   systemctl --user daemon-reload >/dev/null 2>&1 || true
   rm -f $quoted_retry_script $quoted_retry_bootstrap_script $quoted_retry_installer
 elif ((status != 75)); then
+  if [[ -n $quoted_legacy_update_id && -x $quoted_legacy_python ]]; then
+    PYTHONPATH=$quoted_legacy_python_path \
+      $quoted_legacy_python -m enterprise_agent_platform.update_state \
+        container-migration-result --outcome container_migration_failed \
+        --error "Container migration retry failed with exit status \${status}; the source bridge remains available." \
+        >/dev/null 2>&1 \
+      || printf 'Warning: permanent migration retry failure could not be recorded.\n' >&2
+  fi
   systemctl --user disable --now ubitech-agent-migrate.timer >/dev/null 2>&1 || true
   rm -f $quoted_retry_service $quoted_retry_timer
   systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -456,6 +537,7 @@ EOF
   fi
   exit "$operation_status"
 fi
+migration_handoff_accepted=1
 
 if [[ -n "$legacy_root" ]]; then
   cleanup_migration_retry

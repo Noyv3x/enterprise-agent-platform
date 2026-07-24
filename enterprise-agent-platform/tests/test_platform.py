@@ -6053,6 +6053,13 @@ class PlatformHTTPTests(unittest.TestCase):
             config = make_config(Path(td))
             service = EnterpriseService(config, agent_client=RecordingAgent())
             fake_updater = FakeAutoUpdater()
+            # Source-mode services may own a migration listener even when
+            # periodic updates are disabled. Stop that owned worker before
+            # replacing the manager with this HTTP-only test double; otherwise
+            # close() cannot discover the original listener and it can wake up
+            # later against the test's already-closed SQLite connection.
+            owned_updater = service._auto_updater
+            owned_updater.stop()
             service._auto_updater = fake_updater
             secret = "auto-update-secret-value"
             service.set_setting("auto_update_enabled", "1")
@@ -6088,8 +6095,11 @@ class PlatformHTTPTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+                service._auto_updater = owned_updater
                 service.close()
                 thread.join(timeout=2)
+            worker = owned_updater.worker_thread()
+            self.assertFalse(worker is not None and worker.is_alive())
 
     def test_token_usage_api_is_admin_only(self):
         with tempfile.TemporaryDirectory() as td:

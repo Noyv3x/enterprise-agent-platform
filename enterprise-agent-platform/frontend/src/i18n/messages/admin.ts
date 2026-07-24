@@ -265,6 +265,16 @@ const baseAdminMessages = defineMessages({
     "The update is queued. Existing and newly submitted work remains available, and the update will start automatically at a natural idle point.",
     "更新已排隊。現有與新提交的任務仍可正常執行；平台會在自然閒置時自動開始更新。",
   ),
+  "admin.updates.sourceBridgeReadOnly": m(
+    "源码迁移桥接仍在接管过程中。当前状态仅供查看，管理器接管后会自动恢复更新控制。",
+    "The source migration bridge is still handing over control. Status is read-only until the manager takes over.",
+    "原始碼遷移橋接仍在接管過程中。目前狀態僅供查看，管理器接管後會自動恢復更新控制。",
+  ),
+  "admin.updates.managerUnavailableReadOnly": m(
+    "管理器暂时不可用。当前显示源码迁移状态，所有更新操作已禁用并会在管理器恢复后自动开放。",
+    "The manager is temporarily unavailable. Source migration status remains visible, and update controls will return automatically after recovery.",
+    "管理器暫時無法使用。目前顯示原始碼遷移狀態，所有更新操作已停用，並會在管理器恢復後自動開放。",
+  ),
   "admin.updates.enableWatcher": m("自动跟随 main 发布", "Follow main releases automatically", "自動跟隨 main 發布"),
   "admin.updates.enableWatcherHint": m("完整发布清单就绪后预拉取镜像，并在任务自然空闲时切换。", "Pre-pull images after a complete release manifest appears, then switch at a natural idle point.", "完整發布清單就緒後預拉取映像，並在任務自然閒置時切換。"),
   "admin.updates.interval": m("轮询间隔（秒）", "Polling interval (seconds)", "輪詢間隔（秒）"),

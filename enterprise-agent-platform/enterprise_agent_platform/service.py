@@ -381,6 +381,7 @@ class EnterpriseService:
             else None
         )
         startup_reservation_id = ""
+        startup_reservation_owner = ""
         if self.config.deployment_mode == "container":
             if self.manager_client is None:
                 raise RuntimeError(
@@ -394,6 +395,25 @@ class EnterpriseService:
                 raise RuntimeError(
                     f"container startup could not restore Manager maintenance state: {exc}"
                 ) from exc
+            if startup_reservation_id:
+                startup_reservation_owner = "manager"
+        elif (
+            self.manager_client is not None
+            and os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
+        ):
+            # During source-to-container handoff the socket may not exist yet.
+            # If a Manager operation already owns maintenance, recover it
+            # before any worker starts; otherwise the legacy marker remains
+            # the source control plane until Manager becomes authoritative.
+            try:
+                manager_status = self.manager_client.status()
+                if bool((manager_status or {}).get("maintenance")):
+                    startup_reservation_id = self._manager_startup_reservation_id(
+                        manager_status
+                    )
+                    startup_reservation_owner = "manager"
+            except Exception:
+                pass
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
         self._instance_lock_finalizer: weakref.finalize | None = None
@@ -480,6 +500,7 @@ class EnterpriseService:
         self._auto_update_reserved = bool(startup_reservation_id)
         self._auto_update_reservation_id = startup_reservation_id
         self._auto_update_reservation_durable = bool(startup_reservation_id)
+        self._auto_update_reservation_owner = startup_reservation_owner
         self._auto_update_last_released_id = ""
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
@@ -527,10 +548,15 @@ class EnterpriseService:
             launcher=auto_update_launcher,
         )
         restored_update_id = self._auto_updater.blocking_update_id()
-        if self.manager_client is None and self._auto_updater.blocks_platform_use():
+        if (
+            self.config.deployment_mode == "source"
+            and not self._auto_update_reserved
+            and self._auto_updater.blocks_platform_use()
+        ):
             self._auto_update_reserved = True
             self._auto_update_reservation_id = restored_update_id
             self._auto_update_reservation_durable = True
+            self._auto_update_reservation_owner = "source_marker"
         self._closed = False
         self._resources_closed = False
         self._close_lock = threading.Lock()
@@ -653,6 +679,14 @@ class EnterpriseService:
             if self._telegram_gateway is not None:
                 self._telegram_gateway.stop()
             self._auto_updater.stop()
+            worker_thread_getter = getattr(self._auto_updater, "worker_thread", None)
+            auto_update_worker = (
+                worker_thread_getter()
+                if callable(worker_thread_getter)
+                else None
+            )
+            if not isinstance(auto_update_worker, threading.Thread):
+                auto_update_worker = None
             self._ingest_wakeup.set()
             self._telegram_delivery_wakeup.set()
             self._schedule_wakeup.set()
@@ -676,14 +710,26 @@ class EnterpriseService:
                 telegram_delivery = self._telegram_delivery_thread
             schedule_worker = self._schedule_thread
             deadline = time.monotonic() + 15.0
-            for worker in [ingest, telegram_delivery, schedule_worker, *workers]:
+            for worker in [
+                auto_update_worker,
+                ingest,
+                telegram_delivery,
+                schedule_worker,
+                *workers,
+            ]:
                 if worker is None or worker is threading.current_thread():
                     continue
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
             live_workers = [
                 worker
-                for worker in [ingest, telegram_delivery, schedule_worker, *workers]
+                for worker in [
+                    auto_update_worker,
+                    ingest,
+                    telegram_delivery,
+                    schedule_worker,
+                    *workers,
+                ]
                 if worker is not None and worker is not threading.current_thread() and worker.is_alive()
             ]
             if live_workers:
@@ -1556,9 +1602,15 @@ class EnterpriseService:
         self._start_telegram_gateway()
 
     def _start_auto_update_listener(self) -> None:
-        if self.manager_client is not None:
+        if self.config.deployment_mode == "container":
             return
-        if self.auto_update_enabled():
+        if (
+            self.auto_update_enabled()
+            or os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
+            or self.manager_client is not None
+            or self._auto_updater.source_migration_recovery_required()
+            or self._auto_updater.source_migration_bootstrap_required()
+        ):
             self._auto_updater.start()
 
     def ensure_bootstrap(self) -> None:
@@ -3440,7 +3492,8 @@ class EnterpriseService:
         if self.manager_client is None:
             raise ServiceError(404, "manager integration is not active")
         released = self.release_auto_update_reservation(
-            str(operation_id or "").strip()
+            str(operation_id or "").strip(),
+            expected_owner="manager",
         )
         if not released:
             raise ServiceError(
@@ -3461,11 +3514,34 @@ class EnterpriseService:
         }
 
     def auto_update_public_status(self) -> dict[str, Any]:
+        legacy_status: dict[str, Any] | None = None
+        if self.config.deployment_mode == "source":
+            with self._conversation_lock:
+                self._sync_auto_update_reservation_locked()
+            public_status = getattr(self._auto_updater, "public_status", None)
+            legacy_status = (
+                public_status()
+                if callable(public_status)
+                else {
+                    "state": "updating" if self._auto_update_reserved else "idle",
+                    "instance_id": "",
+                    "retry_after_ms": 3000,
+                }
+            )
+            if str(legacy_status.get("state") or "") in {"updating", "failed"}:
+                return legacy_status
         if self.manager_client is not None:
             try:
                 status = self.manager_client.status()
             except ManagerClientError:
-                return {"state": "idle", "phase": "idle", "retry_after_ms": 3000}
+                if legacy_status is not None:
+                    return legacy_status
+                return {"state": "failed", "phase": "manager_unavailable", "retry_after_ms": 3000}
+            if (
+                legacy_status is not None
+                and not self._manager_update_status_is_authoritative(status)
+            ):
+                return legacy_status
             state = str(status.get("public_state") or status.get("state") or "idle")
             return {
                 "state": state,
@@ -3473,21 +3549,37 @@ class EnterpriseService:
                 "instance_id": str(status.get("operation_id") or ""),
                 "retry_after_ms": 2000 if state in {"waiting_for_tasks", "updating"} else 5000,
             }
-        # Syncing here lets a freshly started backend begin serving immediately
-        # after deploy/rollback marks the durable handoff successful.
-        with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
-        public_status = getattr(self._auto_updater, "public_status", None)
-        if callable(public_status):
-            return public_status()
-        return {
+        return legacy_status or {
             "state": "updating" if self._auto_update_reserved else "idle",
             "instance_id": "",
             "retry_after_ms": 3000,
         }
 
+    @staticmethod
+    def _manager_update_status_is_authoritative(status: dict[str, Any]) -> bool:
+        if not isinstance(status, dict):
+            return False
+        if bool(status.get("maintenance")):
+            return True
+        if str(status.get("public_state") or status.get("state") or "idle") != "idle":
+            return True
+        if any(
+            str(status.get(field) or "")
+            for field in (
+                "operation_id",
+                "active_operation_id",
+                "finalize_pending_operation_id",
+            )
+        ):
+            return True
+        for field in ("current", "target", "previous"):
+            value = status.get(field)
+            if isinstance(value, dict) and value.get("id"):
+                return True
+        return False
+
     def platform_update_is_blocking(self) -> bool:
-        if self.manager_client is not None:
+        if self.config.deployment_mode == "container":
             return self._auto_update_reserved
         with self._conversation_lock:
             self._sync_auto_update_reservation_locked()
@@ -3531,7 +3623,7 @@ class EnterpriseService:
         # is in flight, its epoch change invalidates the snapshot below.
         process_result = (
             {"protected_processes": 0, "terminable_processes": 0, "blocker_error": ""}
-            if self.manager_client is not None
+            if self.config.deployment_mode == "container"
             else self._auto_update_process_blockers()
         )
         result.update(process_result)
@@ -3578,6 +3670,11 @@ class EnterpriseService:
             self._auto_update_reserved = True
             self._auto_update_reservation_id = clean_update_id
             self._auto_update_reservation_durable = prepare is not None
+            self._auto_update_reservation_owner = (
+                "source_marker"
+                if prepare is not None
+                else ("manager" if self.manager_client is not None else "ephemeral")
+            )
             self._clear_auto_update_probe_locked(probe_token)
             result["reserved"] = True
             return result
@@ -3659,10 +3756,24 @@ class EnterpriseService:
         update_id: str,
         *,
         cleanup: Callable[[], None] | None = None,
+        expected_owner: str = "",
     ) -> bool:
         clean_update_id = str(update_id or "").strip()
+        resume_workers = False
         with self._conversation_lock:
             self._sync_auto_update_reservation_locked()
+            if expected_owner and self._auto_update_reservation_owner != expected_owner:
+                if not self._auto_update_reserved and clean_update_id:
+                    # A Manager may be resolving an ambiguous Reserve response.
+                    # Proving that this process has no reservation for any
+                    # owner is a successful idempotent release; an active
+                    # source_marker or different owner still fails closed.
+                    self._auto_update_last_released_id = clean_update_id
+                    return True
+                return bool(
+                    clean_update_id
+                    and self._auto_update_last_released_id == clean_update_id
+                )
             if (
                 not self._auto_update_reserved
                 and clean_update_id
@@ -3680,8 +3791,16 @@ class EnterpriseService:
             self._auto_update_reserved = False
             self._auto_update_reservation_id = ""
             self._auto_update_reservation_durable = False
-            self._start_deferred_agent_workers_locked()
-        self._resume_deferred_background_workers()
+            self._auto_update_reservation_owner = ""
+            # A source marker can become blocking while a Manager reservation
+            # is being released. Re-adopt it under the same admission lock so
+            # workers are never woken in the owner-transition gap.
+            self._sync_auto_update_reservation_locked()
+            resume_workers = not self._auto_update_reserved
+            if resume_workers:
+                self._start_deferred_agent_workers_locked()
+        if resume_workers:
+            self._resume_deferred_background_workers()
         return True
 
     def _resume_deferred_background_workers(self) -> None:
@@ -3698,7 +3817,7 @@ class EnterpriseService:
     def _sync_auto_update_reservation_locked(self) -> None:
         """Synchronize process-local admission with the durable update marker."""
 
-        if self.manager_client is not None:
+        if self.config.deployment_mode == "container":
             return
 
         blocking_update_id_getter = getattr(self._auto_updater, "blocking_update_id", None)
@@ -3707,20 +3826,58 @@ class EnterpriseService:
             return
         blocking_update_id = blocking_update_id_getter()
         blocking = blocking_getter()
-        if blocking:
+        if blocking and self._auto_update_reservation_owner != "manager":
             self._auto_update_reserved = True
             self._auto_update_reservation_id = blocking_update_id
             self._auto_update_reservation_durable = True
+            self._auto_update_reservation_owner = "source_marker"
             if self._auto_update_probe_token:
                 self._clear_auto_update_probe_locked(self._auto_update_probe_token)
-        elif self._auto_update_reserved and self._auto_update_reservation_durable:
+        elif (
+            self._auto_update_reserved
+            and self._auto_update_reservation_owner == "source_marker"
+        ):
             released_id = self._auto_update_reservation_id
             self._auto_update_reserved = False
             self._auto_update_reservation_id = ""
             self._auto_update_reservation_durable = False
+            self._auto_update_reservation_owner = ""
             self._auto_update_last_released_id = released_id
             self._start_deferred_agent_workers_locked()
             self._resume_deferred_background_workers()
+
+    def sync_auto_update_reservation(self) -> None:
+        """Let the update coordinator reconcile a marker without API traffic."""
+
+        manager_reservation_id = ""
+        if self.config.deployment_mode == "source" and self.manager_client is not None:
+            try:
+                manager_status_client = self.manager_client
+                if isinstance(manager_status_client, ManagerClient):
+                    manager_status_client = ManagerClient(
+                        manager_status_client.socket_path,
+                        manager_status_client.token_file,
+                        timeout_seconds=1.0,
+                    )
+                manager_reservation_id = self._manager_startup_reservation_id(
+                    manager_status_client.status()
+                )
+            except Exception:
+                # The source bridge is intentionally usable before the
+                # Manager socket appears. If this process already adopted a
+                # Manager reservation, an unreadable status never releases it.
+                manager_reservation_id = ""
+        with self._conversation_lock:
+            if manager_reservation_id:
+                self._auto_update_reserved = True
+                self._auto_update_reservation_id = manager_reservation_id
+                self._auto_update_reservation_durable = True
+                self._auto_update_reservation_owner = "manager"
+                if self._auto_update_probe_token:
+                    self._clear_auto_update_probe_locked(
+                        self._auto_update_probe_token
+                    )
+            self._sync_auto_update_reservation_locked()
 
     def _begin_agent_update_admission(self) -> None:
         with self._conversation_lock:
@@ -3741,12 +3898,35 @@ class EnterpriseService:
 
     def auto_update_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
+        if (
+            self.config.deployment_mode == "source"
+            and self._auto_updater.blocks_platform_use()
+        ):
+            manager_available = False
+            if self.manager_client is not None:
+                try:
+                    self.manager_client.status()
+                    manager_available = True
+                except ManagerClientError:
+                    pass
+            return self._source_auto_update_config_payload(
+                manager_available=manager_available
+            )
         if self.manager_client is not None:
             try:
                 manager_config = self.manager_client.config()
                 manager_status = self.manager_client.status()
             except ManagerClientError as exc:
+                if self.config.deployment_mode == "source":
+                    return self._source_auto_update_config_payload(
+                        manager_available=False
+                    )
                 raise ServiceError(503, str(exc)) from exc
+            if (
+                self.config.deployment_mode == "source"
+                and not self._manager_update_status_is_authoritative(manager_status)
+            ):
+                return self._source_auto_update_config_payload(manager_available=True)
             current = manager_status.get("current")
             target = manager_status.get("target")
             previous = manager_status.get("previous")
@@ -3780,6 +3960,8 @@ class EnterpriseService:
                 "status": {
                     "state": public_state,
                     "phase": str(manager_status.get("phase") or public_state),
+                    "control_plane": "manager",
+                    "manager_available": True,
                     "manager_generation": int(manager_status.get("generation") or 0),
                     "in_progress": public_state == "updating",
                     "update_available": bool(
@@ -3808,6 +3990,24 @@ class EnterpriseService:
                     "protected_processes": 0,
                 },
             }
+        return self._source_auto_update_config_payload(
+            manager_available=self.manager_client is not None
+        )
+
+    def _source_auto_update_config_payload(
+        self,
+        *,
+        manager_available: bool,
+    ) -> dict[str, Any]:
+        status = self._auto_updater.status()
+        status["control_plane"] = "source_bridge" if (
+            os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
+            or (
+                self.config.deployment_mode == "source"
+                and self.manager_client is not None
+            )
+        ) else "source"
+        status["manager_available"] = bool(manager_available)
         return {
             "config": {
                 "enabled": self.auto_update_enabled(),
@@ -3817,12 +4017,28 @@ class EnterpriseService:
                 "webhook_secret_configured": bool(self.auto_update_webhook_secret()),
                 "webhook_url": self.auto_update_webhook_url(),
             },
-            "status": self._auto_updater.status(),
+            "status": status,
         }
+
+    def _require_authoritative_manager_control_plane(self) -> None:
+        if self.config.deployment_mode != "source":
+            return
+        if self.manager_client is None:
+            raise ServiceError(409, "container migration control plane is not active")
+        try:
+            status = self.manager_client.status()
+        except ManagerClientError as exc:
+            raise ServiceError(503, str(exc)) from exc
+        if not self._manager_update_status_is_authoritative(status):
+            raise ServiceError(
+                409,
+                "container migration handoff is read-only until Manager takes control",
+            )
 
     def update_auto_update_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         if self.manager_client is not None:
+            self._require_authoritative_manager_control_plane()
             allowed = {"enabled", "interval_seconds", "release_manifest_url"}
             unknown = sorted(set(body) - allowed)
             if unknown:
@@ -3892,6 +4108,7 @@ class EnterpriseService:
     def trigger_auto_update_check(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         if self.manager_client is not None:
+            self._require_authoritative_manager_control_plane()
             try:
                 result = self.manager_client.check(
                     idempotency_key=f"ui-check-{int(time.time()) // 5}"
@@ -3912,6 +4129,7 @@ class EnterpriseService:
         require_admin(actor)
         if self.manager_client is None:
             raise ServiceError(409, "container manager is not active")
+        self._require_authoritative_manager_control_plane()
         clean_operation = str(operation or "").strip()
         if clean_operation not in {"update", "restart", "rollback", "repair"}:
             raise ServiceError(400, "unsupported manager operation")
@@ -3939,6 +4157,7 @@ class EnterpriseService:
 
     def auto_update_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.manager_client is not None:
+            self._require_authoritative_manager_control_plane()
             try:
                 manager_config = self.manager_client.config()
                 if not bool(manager_config.get("update_enabled", True)):

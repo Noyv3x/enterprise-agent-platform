@@ -60,3 +60,5 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 ## 上游边界
 
 本仓库不包含 Cognee 或 Firecrawl 的 gitlink、vendored tree 或镜像副本。临时构建 checkout 不得承载产品修改或被推送。平台行为实现于 Python adapter、Agent Runtime、Manager 或平台生成配置；浏览器补丁实现于 `camofox-runtime/`。升级上游先修改源码契约并通过镜像集成验证。
+
+自动更新预约是所有有副作用集成 worker 的共同门：legacy source marker 或 Manager maintenance 生效时，Cognee 摄取、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。源码 marker 提交为非阻塞 bridge-ready 后，只有 `source_marker` 所有者的预约自动释放并统一唤醒这些 worker；Manager 所有的预约只能由匹配 operation id 的内部 release 解除。

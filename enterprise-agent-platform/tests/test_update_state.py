@@ -15,13 +15,18 @@ import enterprise_agent_platform.update_state as update_state_module
 from enterprise_agent_platform.update_state import (
     heartbeat,
     main as update_state_main,
+    mark_container_migration_result,
     mark_failure,
+    mark_source_bridge_ready,
     mark_success,
     mark_updating,
     read_state,
+    recover_source_bridge_handoff,
     state_lock_path,
     update_state_lock,
 )
+
+SOURCE_REVISION = "a" * 40
 
 
 def _mark_updating(data_dir: Path, update_id: str) -> dict[str, object]:
@@ -30,7 +35,7 @@ def _mark_updating(data_dir: Path, update_id: str) -> dict[str, object]:
         update_id=update_id,
         instance_id="instance-1",
         reason="test",
-        target_revision="abc123",
+        target_revision=SOURCE_REVISION,
         remote="origin",
         branch="main",
     )
@@ -114,6 +119,203 @@ exit 0
 
 
 class UpdateStateConcurrencyTests(unittest.TestCase):
+    def test_source_bridge_handoff_is_nonblocking_and_records_installer_results(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+
+            ready = mark_source_bridge_ready(data_dir, update_id="update-1")
+            self.assertEqual(ready["state"], "waiting_for_tasks")
+            self.assertEqual(ready["phase"], "source_bridge_ready")
+            with self.assertRaisesRegex(RuntimeError, "no longer active"):
+                heartbeat(data_dir, update_id="update-1")
+
+            queued = mark_container_migration_result(
+                data_dir,
+                update_id="update-1",
+                outcome="container_migration_queued",
+            )
+            self.assertEqual(queued["state"], "idle")
+            self.assertEqual(queued["phase"], "container_migration_queued")
+            self.assertNotIn("error", queued)
+
+    def test_container_migration_failure_keeps_healthy_source_nonblocking(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            mark_source_bridge_ready(data_dir, update_id="update-1")
+
+            failed = mark_container_migration_result(
+                data_dir,
+                update_id="update-1",
+                outcome="container_migration_failed",
+                error="installer exited 69",
+            )
+
+            self.assertEqual(failed["state"], "idle")
+            self.assertEqual(failed["phase"], "container_migration_failed")
+            self.assertEqual(failed["error"], "installer exited 69")
+            with self.assertRaisesRegex(ValueError, "invalid container migration result"):
+                mark_container_migration_result(
+                    data_dir,
+                    update_id="update-1",
+                    outcome="success",
+                )
+
+    def test_queued_migration_can_only_converge_to_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            mark_source_bridge_ready(data_dir, update_id="update-1")
+            mark_container_migration_result(
+                data_dir,
+                update_id="update-1",
+                outcome="container_migration_queued",
+            )
+
+            failed = mark_container_migration_result(
+                data_dir,
+                update_id="update-1",
+                outcome="container_migration_failed",
+                error="retry exited 69",
+            )
+            self.assertEqual(failed["phase"], "container_migration_failed")
+            with self.assertRaisesRegex(RuntimeError, "explicit repair"):
+                mark_container_migration_result(
+                    data_dir,
+                    update_id="update-1",
+                    outcome="container_migration_queued",
+                )
+
+    def test_handoff_phases_freeze_generic_update_takeover(self):
+        for terminal in (None, "container_migration_queued", "container_migration_failed"):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as td:
+                data_dir = Path(td)
+                _mark_updating(data_dir, "update-1")
+                mark_source_bridge_ready(data_dir, update_id="update-1")
+                if terminal:
+                    mark_container_migration_result(
+                        data_dir,
+                        update_id="update-1",
+                        outcome=terminal,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "migration|bridge"):
+                    mark_updating(
+                        data_dir,
+                        update_id="update-2",
+                        instance_id="instance-2",
+                        reason="manual",
+                        target_revision="b" * 40,
+                        remote="origin",
+                        branch="main",
+                        takeover=True,
+                    )
+
+    def test_bridge_environment_repairs_old_generic_success_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENTERPRISE_PLATFORM_DATA": str(data_dir),
+                    "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
+                    "ENTERPRISE_AUTO_UPDATE_TARGET_REVISION": SOURCE_REVISION,
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                },
+                clear=False,
+            ):
+                update_state_main(["success", "--outcome", "success"])
+            state = read_state(data_dir)
+            actual_revision = subprocess.check_output(
+                ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            self.assertEqual(state["state"], "waiting_for_tasks")
+            self.assertEqual(state["phase"], "source_bridge_ready")
+            self.assertEqual(state["source_revision"], actual_revision)
+            self.assertNotEqual(state["source_revision"], SOURCE_REVISION)
+
+    def test_bridge_ready_treats_post_replace_chmod_error_as_committed(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            with mock.patch.object(
+                update_state_module.os,
+                "chmod",
+                side_effect=OSError(5, "after replace"),
+            ):
+                ready = mark_source_bridge_ready(
+                    data_dir,
+                    update_id="update-1",
+                    source_revision=SOURCE_REVISION,
+                )
+            self.assertEqual(ready["phase"], "source_bridge_ready")
+            self.assertEqual(read_state(data_dir)["source_revision"], SOURCE_REVISION)
+
+    def test_failed_container_migration_requires_locked_explicit_repair(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            mark_source_bridge_ready(
+                data_dir,
+                update_id="update-1",
+                source_revision=SOURCE_REVISION,
+            )
+            mark_container_migration_result(
+                data_dir,
+                update_id="update-1",
+                outcome="container_migration_failed",
+                error="docker unavailable",
+            )
+            with self.assertRaisesRegex(RuntimeError, "repository update lock"):
+                recover_source_bridge_handoff(
+                    data_dir,
+                    update_id="update-1",
+                    source_revision=SOURCE_REVISION,
+                    repair_failed=True,
+                )
+
+            lock_path = data_dir / "repo.lock"
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_AUTO_UPDATE_LOCK_FD": str(descriptor),
+                        "ENTERPRISE_AUTO_UPDATE_LOCK_PATH": str(lock_path),
+                    },
+                    clear=False,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "different update"):
+                        recover_source_bridge_handoff(
+                            data_dir,
+                            update_id="update-2",
+                            source_revision=SOURCE_REVISION,
+                            repair_failed=True,
+                        )
+                    repaired = recover_source_bridge_handoff(
+                        data_dir,
+                        update_id="update-1",
+                        source_revision=SOURCE_REVISION,
+                        repair_failed=True,
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(repaired["state"], "waiting_for_tasks")
+            self.assertEqual(repaired["phase"], "source_bridge_ready")
+            self.assertNotIn("error", repaired)
+
+    def test_late_source_failure_cannot_replace_ready_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _mark_updating(data_dir, "update-1")
+            mark_source_bridge_ready(data_dir, update_id="update-1")
+            with self.assertRaisesRegex(RuntimeError, "handoff"):
+                mark_failure(data_dir, update_id="update-1", error="late")
+            self.assertEqual(read_state(data_dir)["phase"], "source_bridge_ready")
+
     def test_heartbeat_worker_drops_inherited_repository_lock_descriptor(self):
         with tempfile.TemporaryDirectory() as td:
             repo_lock = Path(td) / "ubitech-agent-update.lock"

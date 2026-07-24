@@ -100,6 +100,8 @@ Manager 的数值 `generation` 是并发修改版本，必须单独透传为操�
 
 候选镜像预拉取和 `waiting_for_tasks` 不阻断其它页面；进入 `updating` 后，全局 `UpdateGate` 禁止使用并显示管理器维护状态。失败时如果 Platform 仍可用，管理页展示 operation id 和使用宿主 CLI 的恢复提示；不得向普通页面泄露 Docker socket、registry 凭据、宿主绝对路径或完整管理日志。
 
+源码首迁期间 Manager socket 暂不可达不能伪造为 `idle`。只读状态和管理配置回退到 legacy marker，并标明 `source_bridge` 控制面及 Manager 可用性；`source_bridge_ready`、`container_migration_queued` 和 `container_migration_failed` 必须保留其真实 phase。当 `control_plane=source_bridge` 或 `manager_available=false` 时，管理页必须明确显示“迁移交接中，当前只读”，禁用保存配置、检查更新、更新、重启和回滚等所有变更入口，不能让用户点击后才收到 400/503。Manager 一旦报告 operation、maintenance 或 current/target generation，界面改用 Manager 状态。写操作不回退到 Git updater。
+
 ## 验证
 
 组件测试应使用与生产一致的 `eap` 组件前缀、主题和 i18n Provider，并使用真实 Store 和请求边界覆盖关键生命周期，特别是空数据 selector、迟到响应、移动宽度、维护切换、SSE 重连和首帧加载。业务样式需要绑定组件库公开的 semantic `classNames/styles`，测试不得依赖默认 `ant` 前缀掩盖生产选择器错误。命令见[测试与验证](../development/testing.md)。

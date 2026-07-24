@@ -24,6 +24,15 @@ type Gate interface {
 	Health(context.Context) error
 }
 
+type HTTPStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("platform gate HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 type HTTPGate struct {
 	BaseURL, Token string
 	Client         *http.Client
@@ -73,7 +82,7 @@ func (g HTTPGate) call(ctx context.Context, method, path string, body any, resul
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("platform gate HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(data)))
+		return &HTTPStatusError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
 	if result == nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import signal
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -24,15 +26,23 @@ from enterprise_agent_platform.deployment import (
     DeploymentManager,
     DeploymentPaths,
     UpstreamSourceSpec,
+    _LEGACY_BRIDGE_ROLLBACK_GUARD,
     _camofox_system_dependency_problems,
     _existing_service_data_dir,
     _probe_json_health,
     _resolve_existing_service_deployment,
+    _schedule_legacy_bridge_rollback_guard,
     apt_get_command_base,
     python_venv_package_names,
     runtime_env,
     searxng_ready_timeout_seconds,
     user_service_unit,
+)
+from enterprise_agent_platform.update_state import (
+    mark_source_bridge_ready,
+    mark_success,
+    mark_updating,
+    read_state,
 )
 
 
@@ -212,6 +222,12 @@ while [ "$#" -gt 0 ]; do
 done
 version="$(tr -d '\\n' < "$root/version.txt")"
 printf '%s\\n' "$version" >> "$FAKE_DEPLOY_LOG"
+if [ -n "${FAKE_BRIDGE_ENV_LOG:-}" ]; then
+  printf '%s\\n%s\\n%s\\n' \
+    "${UBITECH_SOURCE_MIGRATION_BRIDGE:-}" \
+    "${UBITECH_MANAGER_SOCKET:-}" \
+    "${UBITECH_MANAGER_TOKEN_FILE:-}" >> "$FAKE_BRIDGE_ENV_LOG"
+fi
 if [ "$version" = "new" ]; then
   if [ "${FAKE_CREATE_LOCAL_CHANGE:-}" = "1" ]; then
     printf 'preserve\\n' > "$root/local-after-pull.txt"
@@ -2156,8 +2172,105 @@ class DeploymentTests(unittest.TestCase):
                 env = runtime_env(paths, host="127.0.0.1", port=8765)
 
             self.assertEqual(env["UBITECH_SOURCE_MIGRATION_BRIDGE"], "1")
+            self.assertEqual(env["UBITECH_SOURCE_MIGRATION_PROTOCOL"], "2")
             self.assertEqual(env["UBITECH_MANAGER_SOCKET"], str(socket_path))
             self.assertEqual(env["UBITECH_MANAGER_TOKEN_FILE"], str(token_path))
+
+    def test_legacy_bridge_rollback_guard_removes_stale_unit_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            unit = root / "legacy.service"
+            unit.write_text(
+                "\n".join(
+                    [
+                        "[Service]",
+                        'Environment="UBITECH_SOURCE_MIGRATION_BRIDGE=1"',
+                        'Environment="UBITECH_SOURCE_MIGRATION_PROTOCOL=1"',
+                        'Environment="UBITECH_MANAGER_SOCKET=/tmp/manager.sock"',
+                        'Environment="UBITECH_MANAGER_TOKEN_FILE=/tmp/token"',
+                        'Environment="ENTERPRISE_PLATFORM_DATA=/srv/data"',
+                        "ExecStart=/srv/platform",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            guard = root / "guard.py"
+            guard.write_text(_LEGACY_BRIDGE_ROLLBACK_GUARD, encoding="utf-8")
+            guard.chmod(0o700)
+            tools = root / "tools"
+            tools.mkdir()
+            systemctl_log = root / "systemctl.log"
+            fake_systemctl = tools / "systemctl"
+            fake_systemctl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{tools}:{environment.get('PATH', '')}"
+            environment["SYSTEMCTL_LOG"] = str(systemctl_log)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(guard),
+                    "999999999",
+                    "not-the-same-process",
+                    str(unit),
+                    "legacy.service",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rewritten = unit.read_text(encoding="utf-8")
+            self.assertNotIn("UBITECH_SOURCE_MIGRATION_BRIDGE", rewritten)
+            self.assertNotIn("UBITECH_SOURCE_MIGRATION_PROTOCOL", rewritten)
+            self.assertNotIn("UBITECH_MANAGER_SOCKET", rewritten)
+            self.assertNotIn("UBITECH_MANAGER_TOKEN_FILE", rewritten)
+            self.assertIn("ENTERPRISE_PLATFORM_DATA=/srv/data", rewritten)
+            self.assertEqual(
+                systemctl_log.read_text(encoding="utf-8").splitlines(),
+                ["--user daemon-reload", "--user restart legacy.service"],
+            )
+            self.assertFalse(guard.exists())
+
+    def test_legacy_bridge_rollback_guard_is_externalized_owner_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = DeploymentPaths.from_root(root)
+            manager_socket = root / "manager-data" / "manager" / "control" / "manager.sock"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                    "ENTERPRISE_AUTO_UPDATE_ID": "old-shell-update",
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "service",
+                },
+                clear=False,
+            ), mock.patch(
+                "enterprise_agent_platform.deployment.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as launch:
+                script = _schedule_legacy_bridge_rollback_guard(paths)
+
+            self.assertTrue(script.is_file())
+            self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                script.parent,
+                root / "manager-data" / "manager" / "recovery",
+            )
+            launch.assert_called_once()
+            command = launch.call_args.args[0]
+            self.assertEqual(command[:4], ["systemd-run", "--user", "--collect", "--service-type=exec"])
+            self.assertTrue(any(part.startswith("--unit=ubitech-agent-source-rollback-") for part in command))
+            self.assertIn(str(script), command)
+            self.assertEqual(command[-2:], [str(paths.service_path), paths.service_name])
 
     def test_searxng_ready_timeout_is_configurable_with_safe_default(self):
         with mock.patch.dict(
@@ -2189,6 +2302,9 @@ class DeploymentTests(unittest.TestCase):
         installer_text = source.read_text(encoding="utf-8")
         self.assertNotIn("$legacy_root/manager/dist", installer_text)
         self.assertNotIn("$legacy_root/.migration", installer_text)
+        self.assertEqual(installer_text.count("--connect-timeout 20"), 2)
+        self.assertEqual(installer_text.count("--max-time 600"), 2)
+        self.assertEqual(installer_text.count("--retry-max-time 600"), 2)
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -2199,6 +2315,25 @@ class DeploymentTests(unittest.TestCase):
             legacy_data = legacy / "enterprise-agent-platform" / "data"
             for path in (home, config_home, data_home, tools, legacy_data):
                 path.mkdir(parents=True, exist_ok=True)
+            package = legacy / "enterprise-agent-platform" / "enterprise_agent_platform"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1]
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
+            mark_updating(
+                legacy_data,
+                update_id="update-1",
+                instance_id="instance-1",
+                reason="test",
+                target_revision="a" * 40,
+                remote="origin",
+                branch="main",
+            )
+            mark_success(legacy_data, update_id="update-1")
             systemctl_log = root / "systemctl.log"
             (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (tools / "curl").write_text("#!/bin/sh\nexit 22\n", encoding="utf-8")
@@ -2216,6 +2351,9 @@ class DeploymentTests(unittest.TestCase):
                     "XDG_DATA_HOME": str(data_home),
                     "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
                     "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
+                    "PYTHON_BIN": sys.executable,
+                    "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
+                    "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
                 }
             )
 
@@ -2256,6 +2394,8 @@ class DeploymentTests(unittest.TestCase):
             )
             self.assertIn("--legacy-service custom-agent.service", retry_text)
             self.assertIn("--legacy-platform-url http://127.0.0.1:8765", retry_text)
+            self.assertIn("export ENTERPRISE_AUTO_UPDATE_ID=update-1", retry_text)
+            self.assertIn("--legacy-update-id update-1", retry_text)
             self.assertIn(f"--expected-source-commit {'a' * 40}", retry_text)
             self.assertIn("if ((status != 0 && status != 75)); then", retry_text)
             retry_syntax = subprocess.run(
@@ -2271,8 +2411,84 @@ class DeploymentTests(unittest.TestCase):
             self.assertTrue(timer.is_file())
             self.assertIn(str(bootstrap_retry), service.read_text(encoding="utf-8"))
             self.assertIn("enable --now ubitech-agent-migrate.timer", systemctl_log.read_text(encoding="utf-8"))
+            marker = read_state(legacy_data)
+            self.assertEqual(marker["state"], "idle")
+            self.assertEqual(marker["phase"], "container_migration_queued")
 
-    def test_installer_persists_expected_commit_in_manager_operation_retry(self):
+    def test_installer_repairs_legacy_success_marker_on_permanent_handoff_failure(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        state_module = (
+            Path(__file__).resolve().parents[1]
+            / "enterprise_agent_platform"
+            / "update_state.py"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            tools = root / "tools"
+            legacy = root / "legacy"
+            legacy_data = legacy / "data"
+            package = legacy / "enterprise-agent-platform" / "enterprise_agent_platform"
+            for path in (home, tools, legacy_data, package):
+                path.mkdir(parents=True, exist_ok=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(state_module, package / "update_state.py")
+            docker = tools / "docker"
+            docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            docker.chmod(0o755)
+            mark_updating(
+                legacy_data,
+                update_id="update-1",
+                instance_id="instance-1",
+                reason="test",
+                target_revision="a" * 40,
+                remote="origin",
+                branch="main",
+            )
+            mark_success(legacy_data, update_id="update-1")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                    "PYTHON_BIN": sys.executable,
+                    "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
+                    "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manifest-url",
+                    "https://releases.example/release.json",
+                    "--migrate-from",
+                    str(legacy),
+                    "--legacy-data",
+                    str(legacy_data),
+                    "--legacy-service",
+                    "custom-agent.service",
+                    "--legacy-platform-url",
+                    "http://127.0.0.1:8765",
+                    "--expected-source-commit",
+                    "a" * 40,
+                    "--yes",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 69)
+            marker = read_state(legacy_data)
+            self.assertEqual(marker["state"], "idle")
+            self.assertEqual(marker["phase"], "container_migration_failed")
+            self.assertIn("exit status 69", marker["error"])
+
+    def test_manager_operation_retry_persists_update_id_and_records_permanent_failure(self):
         source = Path(__file__).resolve().parents[2] / "install.sh"
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2282,11 +2498,19 @@ class DeploymentTests(unittest.TestCase):
             tools = root / "tools"
             legacy = root / "legacy"
             legacy_data = legacy / "data"
+            package = legacy / "enterprise-agent-platform" / "enterprise_agent_platform"
             manager = root / "manager"
             manager_log = root / "manager.log"
             manager_count = root / "manager.count"
-            for path in (home, config_home, data_home, tools, legacy_data):
+            for path in (home, config_home, data_home, tools, legacy_data, package):
                 path.mkdir(parents=True, exist_ok=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1]
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
             (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             manager.write_text(
@@ -2297,6 +2521,7 @@ class DeploymentTests(unittest.TestCase):
                 "  count=$((count + 1))\n"
                 "  printf '%s\\n' \"$count\" > \"$FAKE_MANAGER_COUNT\"\n"
                 "  if [ \"$count\" -eq 1 ]; then exit 75; fi\n"
+                "  exit \"${FAKE_MANAGER_RETRY_STATUS:-0}\"\n"
                 "fi\n"
                 "exit 0\n",
                 encoding="utf-8",
@@ -2304,6 +2529,16 @@ class DeploymentTests(unittest.TestCase):
             for executable in (*tools.iterdir(), manager):
                 executable.chmod(0o755)
             expected = "b" * 40
+            mark_updating(
+                legacy_data,
+                update_id="update-1",
+                instance_id="instance-1",
+                reason="test",
+                target_revision=expected,
+                remote="origin",
+                branch="main",
+            )
+            mark_success(legacy_data, update_id="update-1")
             env = os.environ.copy()
             env.update(
                 {
@@ -2313,6 +2548,10 @@ class DeploymentTests(unittest.TestCase):
                     "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
                     "FAKE_MANAGER_LOG": str(manager_log),
                     "FAKE_MANAGER_COUNT": str(manager_count),
+                    "FAKE_MANAGER_RETRY_STATUS": "69",
+                    "PYTHON_BIN": sys.executable,
+                    "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
+                    "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
                 }
             )
             result = subprocess.run(
@@ -2343,6 +2582,7 @@ class DeploymentTests(unittest.TestCase):
             retry = data_home / "ubitech-agent" / "manager" / "control" / "retry-source-migration.sh"
             retry_text = retry.read_text(encoding="utf-8")
             self.assertIn(f"--expected-source-commit {expected}", retry_text)
+            self.assertIn("export ENTERPRISE_AUTO_UPDATE_ID=update-1", retry_text)
             self.assertIn("elif ((status != 75)); then", retry_text)
             retry_syntax = subprocess.run(
                 ["bash", "-n", str(retry)],
@@ -2370,15 +2610,23 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("--probe-user-systemd-transient", manager_calls)
             self.assertIn(f"--expected-source-commit {expected}", manager_calls)
 
+            retry_env = dict(env)
+            for key in tuple(retry_env):
+                if key.startswith("ENTERPRISE_") or key in {
+                    "PYTHONHOME",
+                    "PYTHONPATH",
+                    "PYTHON_BIN",
+                }:
+                    retry_env.pop(key, None)
             retry_result = subprocess.run(
                 ["bash", str(retry)],
-                env=env,
+                env=retry_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
             )
-            self.assertEqual(retry_result.returncode, 0, retry_result.stderr)
+            self.assertEqual(retry_result.returncode, 69, retry_result.stderr)
             self.assertEqual(manager_count.read_text(encoding="utf-8").strip(), "2")
             install_calls = [
                 line
@@ -2389,6 +2637,9 @@ class DeploymentTests(unittest.TestCase):
             self.assertFalse(
                 (config_home / "systemd" / "user" / "ubitech-agent-migrate.timer").exists()
             )
+            marker = read_state(legacy_data)
+            self.assertEqual(marker["phase"], "container_migration_failed")
+            self.assertIn("exit status 69", marker["error"])
 
     def test_installer_persists_channel_catalog_not_exact_bootstrap_manifest(self):
         source = Path(__file__).resolve().parents[2] / "install.sh"
@@ -3065,6 +3316,639 @@ exit 0
             self.assertIn("http://127.0.0.1:9876", values)
             self.assertIn("custom-agent.service", values)
             self.assertIn(str(legacy_data), values)
+
+    def test_pre_bridge_updater_requires_and_supports_a_no_diff_bridge_pass(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        root_source = Path(__file__).resolve().parents[2]
+        current_script = root_source / "deploy.sh"
+        legacy_fixture = Path(__file__).resolve().parent / "fixtures" / "deploy-78a85cb.sh"
+        self.assertEqual(
+            hashlib.sha256(legacy_fixture.read_bytes()).hexdigest(),
+            "500245a266d1bd8027696477da8c8c8610bd19502df181dd827127cbc1793626",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upstream = base / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=upstream, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=upstream, check=True)
+            shutil.copy2(legacy_fixture, upstream / "deploy.sh")
+            (upstream / "deploy.sh").chmod(0o755)
+            (upstream / "version.txt").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "pre-container source"], cwd=upstream, check=True)
+
+            checkout = base / "checkout"
+            subprocess.run(["git", "clone", "-q", str(upstream), str(checkout)], check=True)
+
+            shutil.copy2(current_script, upstream / "deploy.sh")
+            (upstream / "deploy.sh").chmod(0o755)
+            (upstream / "version.txt").write_text("new\n", encoding="utf-8")
+            contract = upstream / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            installer = upstream / "install.sh"
+            installer.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_INSTALL_ARGS\"\nexit 75\n",
+                encoding="utf-8",
+            )
+            installer.chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "container bridge"], cwd=upstream, check=True)
+            bridge_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+
+            fake_python = make_fake_deploy_python(base)
+            deploy_log = base / "deploy.log"
+            bridge_env_log = base / "bridge-env.log"
+            install_args = base / "install-args.log"
+            manager_root = base / "manager-data"
+            legacy_data = base / "legacy-data"
+            legacy_data.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "FAKE_BRIDGE_ENV_LOG": str(bridge_env_log),
+                    "FAKE_INSTALL_ARGS": str(install_args),
+                    "UBITECH_DATA_ROOT": str(manager_root),
+                }
+            )
+            command = [
+                "bash",
+                str(checkout / "deploy.sh"),
+                "update",
+                "--data",
+                str(legacy_data),
+                "--service-name",
+                "custom-agent.service",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9876",
+            ]
+
+            first = subprocess.run(
+                command,
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertFalse(install_args.exists())
+            self.assertEqual(
+                bridge_env_log.read_text(encoding="utf-8").splitlines(),
+                ["", "", ""],
+            )
+            self.assertEqual(
+                subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(),
+                bridge_sha,
+            )
+
+            # No third Git commit is needed. The restarted source updater will
+            # schedule this same current-script pass because migration remains
+            # pending; invoke it synchronously here to exercise the shell edge.
+            second = subprocess.run(
+                command,
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("Container migration is queued", second.stdout)
+            self.assertEqual(
+                bridge_env_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "",
+                    "",
+                    "",
+                    "1",
+                    str(manager_root / "manager" / "control" / "manager.sock"),
+                    str(manager_root / "manager" / "secrets" / "manager-token"),
+                ],
+            )
+            values = install_args.read_text(encoding="utf-8").splitlines()
+            self.assertIn(
+                "https://github.com/Noyv3x/enterprise-agent-platform/releases/download/"
+                f"container-{bridge_sha}/release.json",
+                values,
+            )
+            self.assertEqual(deploy_log.read_text(encoding="utf-8").splitlines(), ["new", "new"])
+
+    def test_e682_shell_bootstrap_failure_externalizes_independent_rollback_guard(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        root_source = Path(__file__).resolve().parents[2]
+        legacy_fixture = (
+            Path(__file__).resolve().parent / "fixtures" / "deploy-e68224a.sh"
+        )
+        self.assertEqual(
+            hashlib.sha256(legacy_fixture.read_bytes()).hexdigest(),
+            "144af899ebaa9016a9fe7a1543fd9d8beae12ab669b3ddef9c5310f845415dc6",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upstream = base / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=upstream, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=upstream, check=True)
+            shutil.copy2(legacy_fixture, upstream / "deploy.sh")
+            (upstream / "deploy.sh").chmod(0o755)
+            old_package = upstream / "enterprise-agent-platform" / "enterprise_agent_platform"
+            old_package.mkdir(parents=True)
+            (old_package / "__init__.py").write_text("", encoding="utf-8")
+            (old_package / "update_state.py").write_text(
+                "# first-generation bridge helper fixture\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "e682 bridge shell"], cwd=upstream, check=True)
+            old_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+
+            checkout = base / "checkout"
+            subprocess.run(["git", "clone", "-q", str(upstream), str(checkout)], check=True)
+            shutil.rmtree(old_package)
+            shutil.copytree(
+                root_source / "enterprise-agent-platform" / "enterprise_agent_platform",
+                old_package,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            contract = upstream / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            shutil.copy2(
+                root_source / "docs" / "contracts" / "container-platform.json",
+                contract,
+            )
+            shutil.copy2(root_source / "install.sh", upstream / "install.sh")
+            (upstream / "install.sh").chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "guarded target"], cwd=upstream, check=True)
+
+            tools = base / "tools"
+            tools.mkdir()
+            systemd_log = base / "systemd-run.log"
+            fake_systemd_run = tools / "systemd-run"
+            fake_systemd_run.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMD_RUN_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_systemd_run.chmod(0o755)
+            fake_node = tools / "node"
+            fake_node.write_text("#!/bin/sh\nprintf 'v1.0.0\\n'\n", encoding="utf-8")
+            fake_node.chmod(0o755)
+            python_wrapper = tools / "python"
+            python_wrapper.write_text(
+                f"""#!/bin/sh
+if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "enterprise_agent_platform.update_state" ]; then
+  exit 0
+fi
+case "${{1:-}}" in
+  */scripts/docs_sync.py) exit 0 ;;
+esac
+exec {shlex.quote(sys.executable)} "$@"
+""",
+                encoding="utf-8",
+            )
+            python_wrapper.chmod(0o755)
+            manager_root = base / "manager-data"
+            data_dir = base / "legacy-data"
+            data_dir.mkdir()
+            config_home = base / "config"
+            config_home.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{tools}:{env.get('PATH', '')}",
+                    "PYTHON_BIN": str(python_wrapper),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "ENTERPRISE_AUTO_UPDATE_ID": "e682-failure",
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "service",
+                    "ENTERPRISE_DEPLOY_AUTO_NODE": "0",
+                    "UBITECH_DATA_ROOT": str(manager_root),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "SYSTEMD_RUN_LOG": str(systemd_log),
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "update",
+                    "--data",
+                    str(data_dir),
+                    "--service-name",
+                    "legacy-agent.service",
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                old_sha,
+            )
+            launch = systemd_log.read_text(encoding="utf-8")
+            self.assertIn("--collect --service-type=exec", launch)
+            self.assertIn("--unit=ubitech-agent-source-rollback-", launch)
+            recovery_scripts = list(
+                (manager_root / "manager" / "recovery").glob("source-rollback-*.py")
+            )
+            self.assertEqual(len(recovery_scripts), 1)
+            self.assertEqual(recovery_scripts[0].stat().st_mode & 0o777, 0o700)
+
+    def test_bridge_installer_failure_keeps_new_healthy_source_without_git_rollback(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout, old_sha, _ = make_update_checkout(base, source_script)
+            upstream = base / "upstream"
+            contract = upstream / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            installer = upstream / "install.sh"
+            installer.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+            installer.chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "broken installer handoff"], cwd=upstream, check=True)
+            target_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+            fake_python = make_fake_deploy_python(base)
+            deploy_log = base / "deploy.log"
+            legacy_data = base / "legacy-data"
+            legacy_data.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "UBITECH_DATA_ROOT": str(base / "manager-data"),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "update",
+                    "--data",
+                    str(legacy_data),
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 69)
+            self.assertIn("installer failed with exit status 69", result.stderr)
+            self.assertNotEqual(old_sha, target_sha)
+            self.assertEqual(
+                subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(),
+                target_sha,
+            )
+            self.assertEqual(deploy_log.read_text(encoding="utf-8").splitlines(), ["new"])
+
+    def test_update_worker_stops_at_detected_commit_when_remote_advances(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout, _, detected_sha = make_update_checkout(base, source_script)
+            upstream = base / "upstream"
+            (upstream / "version.txt").write_text("later\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "later"], cwd=upstream, check=True)
+            later_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+            fake_python = make_fake_deploy_python(base)
+            deploy_log = base / "deploy.log"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "ENTERPRISE_AUTO_UPDATE_TARGET_REVISION": detected_sha,
+                    "ENTERPRISE_AUTO_UPDATE_REMOTE": "origin",
+                    "ENTERPRISE_AUTO_UPDATE_BRANCH": "main",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(checkout / "deploy.sh"), "update"],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(detected_sha, later_sha)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                detected_sha,
+            )
+            self.assertEqual(deploy_log.read_text(encoding="utf-8").splitlines(), ["new"])
+
+    def test_bridge_marker_commit_wins_when_helper_reports_late_failure(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        root_source = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upstream = base / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=upstream, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=upstream, check=True)
+            shutil.copy2(root_source / "deploy.sh", upstream / "deploy.sh")
+            package = upstream / "enterprise-agent-platform" / "enterprise_agent_platform"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                root_source
+                / "enterprise-agent-platform"
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
+            (upstream / "version.txt").write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "source updater"], cwd=upstream, check=True)
+            old_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+
+            checkout = base / "checkout"
+            subprocess.run(["git", "clone", "-q", str(upstream), str(checkout)], check=True)
+            (upstream / "version.txt").write_text("new\n", encoding="utf-8")
+            contract = upstream / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            installer = upstream / "install.sh"
+            installer.write_text("#!/bin/sh\nexit 75\n", encoding="utf-8")
+            installer.chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=upstream, check=True)
+            target_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=upstream, text=True
+            ).strip()
+
+            wrapper = base / "python-wrapper"
+            wrapper.write_text(
+                f"""#!/bin/sh
+if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "enterprise_agent_platform.deployment" ]; then
+  exit 0
+fi
+case "${{1:-}}" in
+  */scripts/docs_sync.py) exit 0 ;;
+esac
+if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "enterprise_agent_platform.update_state" ] && [ "${{3:-}}" = "source-bridge-ready" ]; then
+  {shlex.quote(sys.executable)} "$@" || exit $?
+  exit 97
+fi
+exec {shlex.quote(sys.executable)} "$@"
+""",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            data_dir = base / "legacy-data"
+            data_dir.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": str(wrapper),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "UBITECH_DATA_ROOT": str(base / "manager-data"),
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "update",
+                    "--data",
+                    str(data_dir),
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("could not commit its container handoff state", result.stderr)
+            self.assertNotEqual(old_sha, target_sha)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                target_sha,
+            )
+            marker = read_state(data_dir)
+            self.assertEqual(marker["phase"], "source_bridge_ready")
+            self.assertEqual(marker["source_revision"], target_sha)
+
+    def test_failed_bridge_bootstrap_restores_original_service_environment_on_rollback(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        source_script = Path(__file__).resolve().parents[2] / "deploy.sh"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout, old_sha, _ = make_update_checkout(base, source_script)
+            upstream = base / "upstream"
+            contract = upstream / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            installer = upstream / "install.sh"
+            installer.write_text("#!/bin/sh\nexit 75\n", encoding="utf-8")
+            installer.chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=upstream, check=True)
+
+            fake_python = make_fake_deploy_python(base)
+            deploy_log = base / "deploy.log"
+            bridge_env_log = base / "bridge-env.log"
+            legacy_data = base / "legacy-data"
+            legacy_data.mkdir()
+            manager_root = base / "manager-data"
+            env = os.environ.copy()
+            env.pop("UBITECH_SOURCE_MIGRATION_BRIDGE", None)
+            env.pop("UBITECH_MANAGER_SOCKET", None)
+            env.pop("UBITECH_MANAGER_TOKEN_FILE", None)
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_DEPLOY_LOG": str(deploy_log),
+                    "FAKE_BRIDGE_ENV_LOG": str(bridge_env_log),
+                    "FAKE_FAIL_NEW": "1",
+                    "UBITECH_DATA_ROOT": str(manager_root),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "update",
+                    "--data",
+                    str(legacy_data),
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                old_sha,
+            )
+            self.assertEqual(
+                bridge_env_log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "1",
+                    str(manager_root / "manager" / "control" / "manager.sock"),
+                    str(manager_root / "manager" / "secrets" / "manager-token"),
+                    "",
+                    "",
+                    "",
+                ],
+            )
+
+    def test_migration_resume_uses_exact_checkout_without_git_remote_or_bootstrap(self):
+        if not shutil.which("git") or not shutil.which("flock"):
+            self.skipTest("git and flock are required")
+        root_source = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout = base / "checkout"
+            checkout.mkdir()
+            shutil.copy2(root_source / "deploy.sh", checkout / "deploy.sh")
+            (checkout / "deploy.sh").chmod(0o755)
+            package = checkout / "enterprise-agent-platform" / "enterprise_agent_platform"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                root_source
+                / "enterprise-agent-platform"
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
+            contract = checkout / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            install_args = base / "install-args"
+            installer = checkout / "install.sh"
+            installer.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_INSTALL_ARGS\"\nexit 75\n",
+                encoding="utf-8",
+            )
+            installer.chmod(0o755)
+            subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.name", "Deploy Test"], cwd=checkout, check=True)
+            subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=checkout, check=True)
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+            ).strip()
+            legacy_data = base / "legacy-data"
+            mark_updating(
+                legacy_data,
+                update_id="bridge-update",
+                instance_id="source",
+                reason="recovery",
+                target_revision=revision,
+                remote="origin",
+                branch="main",
+                owner_pid=999_999_999,
+            )
+            mark_source_bridge_ready(
+                legacy_data,
+                update_id="bridge-update",
+                source_revision=revision,
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON_BIN": sys.executable,
+                    "ENTERPRISE_AUTO_UPDATE_ID": "bridge-update",
+                    "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
+                    "FAKE_INSTALL_ARGS": str(install_args),
+                    "UBITECH_DATA_ROOT": str(base / "manager-data"),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(checkout / "deploy.sh"),
+                    "migrate-container",
+                    "--data",
+                    str(legacy_data),
+                ],
+                cwd=checkout,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Container migration is queued", result.stdout)
+            self.assertEqual(read_state(legacy_data)["phase"], "container_migration_queued")
+            self.assertIn("--legacy-update-id", install_args.read_text(encoding="utf-8"))
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                ).strip(),
+                revision,
+            )
 
     def test_failed_update_documentation_gate_uses_existing_rollback(self):
         if not shutil.which("git") or not shutil.which("flock"):

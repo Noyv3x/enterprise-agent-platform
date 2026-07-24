@@ -75,6 +75,8 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 
 备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。
 
+旧源码的 `auto-update-state.json` 与 Manager operation journal 是不同所有者的数据：前者只提交 Git/source 健康与首迁接力，后者才提交容器 generation。进程内预约必须记录所有者；legacy marker 消失只能释放 `source_marker` 预约，不能释放 Manager operation 的预约。bridge retry 在数据根的 owner-only 控制目录中持久化同一 update id 和 exact source revision，使定时进程可以把 queued 单向收敛为 failed，而不依赖首次进程环境。
+
 数据库 schema version 单调递增，每条迁移拥有创建后不可变的独立版本和唯一名称，不能在运行时借用“全局最新版本”作为自身身份。重建被外键引用的表时，迁移必须显式枚举每个将被替换或删除表的当前子表和已知退役子表，按子到父顺序处理，在同一事务中复制权威数据、清理旧表、执行 `foreign_key_check`、确认全部外键声明的父表仍存在并写入迁移标记；任一步失败都回滚到原结构和原数据。空子表也不能仅凭 `foreign_key_check` 视为安全，因为其外键定义仍可能指向已删除的临时父表。
 
 当前系统没有 Hermes 兼容或迁移路径。任何未来数据格式迁移都必须先更新文档和版本化迁移测试，不能通过运行时猜测旧目录结构。

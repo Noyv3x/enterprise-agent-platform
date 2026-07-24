@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import http.client
+import fcntl
 import json
+import os
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -22,6 +25,8 @@ from enterprise_agent_platform.update_state import (
     clear_state,
     heartbeat,
     mark_failure,
+    mark_container_migration_result,
+    mark_source_bridge_ready,
     mark_success,
     mark_updating,
     read_public,
@@ -145,6 +150,40 @@ class _ManagerStub:
         return {"manifest": {"source_commit": "c" * 40}, "reused": False}
 
 
+class _UnavailableManager:
+    @staticmethod
+    def config():
+        raise ManagerClientError("manager socket unavailable")
+
+    @staticmethod
+    def status():
+        raise ManagerClientError("manager socket unavailable")
+
+
+class _RecoveringManager(_ManagerStub):
+    def __init__(self, status: dict[str, object]):
+        super().__init__(status)
+        self.available = False
+
+    def status(self):
+        if not self.available:
+            raise ManagerClientError("manager is still starting")
+        return super().status()
+
+
+class _BlockingStatusManager(_ManagerStub):
+    def __init__(self):
+        super().__init__()
+        self.status_started = threading.Event()
+        self.release_status = threading.Event()
+
+    def status(self):
+        self.status_started.set()
+        if not self.release_status.wait(timeout=10):
+            raise ManagerClientError("timed out waiting to release manager status")
+        return super().status()
+
+
 def _config(data_dir: Path) -> PlatformConfig:
     return PlatformConfig(
         data_dir=data_dir,
@@ -174,6 +213,264 @@ def _config(data_dir: Path) -> PlatformConfig:
 
 
 class UpdateStateTests(unittest.TestCase):
+    def test_close_keeps_database_open_until_blocked_update_listener_exits(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = _BlockingStatusManager()
+            service = None
+            closer = None
+            thread_errors = []
+            original_excepthook = threading.excepthook
+            threading.excepthook = thread_errors.append
+            try:
+                with mock.patch.dict(
+                    os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "0"}, clear=False
+                ):
+                    service = EnterpriseService(
+                        _config(Path(td)),
+                        agent_client=_BlockingAgent(),
+                        autostart_runtime=False,
+                        manager_client=manager,
+                    )
+                self.assertTrue(manager.status_started.wait(timeout=5))
+                listener = service._auto_updater.worker_thread()
+                self.assertIsInstance(listener, threading.Thread)
+                self.assertTrue(listener.is_alive())
+
+                closer = threading.Thread(target=service.close, name="service-closer")
+                closer.start()
+                deadline = time.monotonic() + 5
+                while not service._auto_updater._stop.is_set():
+                    if time.monotonic() >= deadline:
+                        self.fail("service close did not stop the update listener")
+                    time.sleep(0.01)
+
+                # AutoUpdateManager.stop() has a two-second fast join. The
+                # retained worker handle must keep close() waiting, and SQLite
+                # must remain valid, when an external Manager read lasts longer.
+                time.sleep(2.1)
+                self.assertTrue(closer.is_alive())
+                self.assertFalse(service._resources_closed)
+                self.assertEqual(service.db.scalar("SELECT 1"), 1)
+
+                manager.release_status.set()
+                closer.join(timeout=5)
+                self.assertFalse(closer.is_alive())
+                self.assertFalse(listener.is_alive())
+                self.assertTrue(service._resources_closed)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    service.db.scalar("SELECT 1")
+            finally:
+                manager.release_status.set()
+                if closer is not None:
+                    closer.join(timeout=5)
+                if service is not None and not service._resources_closed:
+                    service.close()
+                threading.excepthook = original_excepthook
+
+            self.assertEqual(thread_errors, [])
+
+    def test_source_bridge_falls_back_to_legacy_marker_when_manager_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).resolve().parents[2],
+                text=True,
+            ).strip()
+            mark_updating(
+                data_dir,
+                update_id="bridge-update",
+                instance_id="old",
+                reason="update",
+                target_revision=revision,
+                remote="origin",
+                branch="main",
+                owner_pid=os.getpid(),
+            )
+            with mock.patch.dict(
+                os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "1"}, clear=False
+            ):
+                service = EnterpriseService(
+                    _config(data_dir),
+                    agent_client=_BlockingAgent(),
+                    autostart_runtime=False,
+                    manager_client=_UnavailableManager(),
+                )
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                self.assertTrue(service.platform_update_is_blocking())
+                self.assertEqual(service.auto_update_public_status()["state"], "updating")
+                payload = service.auto_update_config(actor)
+                self.assertEqual(payload["status"]["phase"], "launching")
+                self.assertEqual(payload["status"]["control_plane"], "source_bridge")
+                self.assertFalse(payload["status"]["manager_available"])
+                with self.assertRaises(ServiceError) as raised:
+                    service.send_private_message(actor, "blocked during source update")
+                self.assertEqual(raised.exception.status, 503)
+            finally:
+                service.close()
+
+    def test_source_bridge_manager_reservation_is_not_released_by_idle_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            operation_id = "manager-operation"
+            manager = _ManagerStub(
+                {
+                    "generation": 1,
+                    "public_state": "updating",
+                    "phase": "migrating",
+                    "maintenance": True,
+                    "active_operation_id": operation_id,
+                    "finalize_pending_operation_id": "",
+                    "operation_id": operation_id,
+                }
+            )
+            with mock.patch.dict(
+                os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "1"}, clear=False
+            ):
+                service = EnterpriseService(
+                    _config(Path(td)),
+                    agent_client=_BlockingAgent(),
+                    autostart_runtime=False,
+                    manager_client=manager,
+                )
+            try:
+                service.sync_auto_update_reservation()
+                self.assertTrue(service.platform_update_is_blocking())
+                self.assertEqual(service._auto_update_reservation_owner, "manager")
+                self.assertEqual(service._auto_update_reservation_id, operation_id)
+                self.assertEqual(
+                    service.manager_update_release(operation_id), {"released": True}
+                )
+                self.assertFalse(service.platform_update_is_blocking())
+            finally:
+                service.close()
+
+    def test_source_bridge_adopts_manager_maintenance_after_socket_recovers(self):
+        with tempfile.TemporaryDirectory() as td:
+            operation_id = "manager-recovered-operation"
+            manager = _RecoveringManager(
+                {
+                    "generation": 1,
+                    "public_state": "updating",
+                    "phase": "draining",
+                    "maintenance": True,
+                    "active_operation_id": operation_id,
+                    "finalize_pending_operation_id": "",
+                    "operation_id": operation_id,
+                }
+            )
+            with mock.patch.dict(
+                os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "1"}, clear=False
+            ):
+                service = EnterpriseService(
+                    _config(Path(td)),
+                    agent_client=_BlockingAgent(),
+                    autostart_runtime=False,
+                    manager_client=manager,
+                )
+            try:
+                self.assertFalse(service.platform_update_is_blocking())
+                manager.available = True
+                service.sync_auto_update_reservation()
+                self.assertTrue(service.platform_update_is_blocking())
+                self.assertEqual(service._auto_update_reservation_owner, "manager")
+                self.assertEqual(service._auto_update_reservation_id, operation_id)
+                self.assertEqual(
+                    service.manager_update_release(operation_id), {"released": True}
+                )
+            finally:
+                service.close()
+
+    def test_manager_release_confirms_absence_but_never_clears_source_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            service = EnterpriseService(
+                _config(data_dir),
+                agent_client=_BlockingAgent(),
+                autostart_runtime=False,
+                manager_client=_ManagerStub(),
+            )
+            try:
+                self.assertEqual(
+                    service.manager_update_release("never-reserved"),
+                    {"released": True},
+                )
+                revision = "a" * 40
+                mark_updating(
+                    data_dir,
+                    update_id="source-owner",
+                    instance_id="source",
+                    reason="test",
+                    target_revision=revision,
+                    remote="origin",
+                    branch="main",
+                )
+                service.sync_auto_update_reservation()
+                with self.assertRaises(ServiceError) as raised:
+                    service.manager_update_release("source-owner")
+                self.assertEqual(raised.exception.status, 409)
+                self.assertTrue(service.platform_update_is_blocking())
+                self.assertEqual(service._auto_update_reservation_owner, "source_marker")
+            finally:
+                clear_state(data_dir, update_id="source-owner")
+                service.close()
+
+    def test_source_bridge_management_writes_are_read_only_before_manager_control(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                _config(Path(td)),
+                agent_client=_BlockingAgent(),
+                autostart_runtime=False,
+                manager_client=_ManagerStub(
+                    {
+                        "generation": 0,
+                        "public_state": "idle",
+                        "phase": "idle",
+                        "maintenance": False,
+                        "active_operation_id": "",
+                        "finalize_pending_operation_id": "",
+                        "operation_id": "",
+                    }
+                ),
+            )
+            _, actor = service.authenticate("admin", "admin")
+            try:
+                for action in (
+                    lambda: service.update_auto_update_config(actor, {"enabled": True}),
+                    lambda: service.trigger_auto_update_check(actor),
+                    lambda: service.trigger_manager_operation(
+                        actor,
+                        "restart",
+                        {"expected_generation": 0},
+                    ),
+                ):
+                    with self.assertRaises(ServiceError) as raised:
+                        action()
+                    self.assertEqual(raised.exception.status, 409)
+            finally:
+                service.close()
+
+    def test_source_bridge_manager_readiness_still_checks_host_terminals(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = _BlockingAgent()
+            agent.blocker_summary = {
+                "running_background_terminal_count": 1,
+                "update_blocking_terminal_count": 1,
+                "terminable_background_terminal_count": 0,
+            }
+            service = EnterpriseService(
+                _config(Path(td)),
+                agent_client=agent,
+                autostart_runtime=False,
+                manager_client=_ManagerStub(),
+            )
+            try:
+                result = service.try_reserve_auto_update("manager-operation")
+                self.assertFalse(result["reserved"])
+                self.assertEqual(result["protected_processes"], 1)
+            finally:
+                service.close()
+
     def test_container_webhook_checks_manager_without_starting_source_updater(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -184,6 +481,8 @@ class UpdateStateTests(unittest.TestCase):
             manager = _ManagerStub()
             source_updater = mock.Mock()
             service.manager_client = manager
+            owned_updater = service._auto_updater
+            owned_updater.stop()
             service._auto_updater = source_updater
             try:
                 result = service.auto_update_webhook({"ref": "refs/heads/main"})
@@ -192,7 +491,12 @@ class UpdateStateTests(unittest.TestCase):
                 self.assertRegex(manager.checks[0], r"^webhook-[0-9]+-[0-9a-f]{8}$")
                 source_updater.trigger.assert_not_called()
             finally:
+                # Restore the owned manager so close() can retain and join its
+                # listener even when its initial two-second stop timed out.
+                service._auto_updater = owned_updater
                 service.close()
+            worker = owned_updater.worker_thread()
+            self.assertFalse(worker is not None and worker.is_alive())
 
     def test_manager_status_keeps_release_identity_and_numeric_concurrency_generation_separate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -207,6 +511,8 @@ class UpdateStateTests(unittest.TestCase):
                 _, actor = service.authenticate("admin", "admin")
                 payload = service.auto_update_config(actor)
                 status = payload["status"]
+                self.assertEqual(status["control_plane"], "manager")
+                self.assertTrue(status["manager_available"])
                 self.assertEqual(status["manager_generation"], 17)
                 self.assertEqual(status["current_generation"], "release-current")
                 self.assertEqual(status["last_check_at"], "2026-07-24T12:34:56Z")
@@ -316,6 +622,208 @@ class UpdateStateTests(unittest.TestCase):
 
 
 class AutoUpdateQueueTests(unittest.TestCase):
+    def test_synced_bridge_source_still_launches_pending_container_migration(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            remote = base / "remote.git"
+            source = base / "source"
+            checkout = base / "checkout"
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.name", "Update Test"], cwd=source, check=True)
+            for name in ("deploy.sh", "install.sh"):
+                path = source / name
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            contract = source / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge ready"], cwd=source, check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=source, check=True)
+            subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=source, check=True)
+            subprocess.run(["git", "clone", "-q", "--branch", "main", str(remote), str(checkout)], check=True)
+
+            service = _UpdateService(base / "state")
+            service.blocked = False
+            launched: list[str] = []
+            manager = AutoUpdateManager(
+                service,
+                repo_root=checkout,
+                launcher=lambda reason: launched.append(reason) or ["deploy.sh", "update"],
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_SKIP_CONTAINER_MIGRATION": "0",
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "0",
+                },
+                clear=False,
+            ):
+                status = manager.check_once("startup")
+
+            self.assertEqual(status["current_revision"], status["remote_revision"])
+            self.assertTrue(status["container_migration_required"])
+            self.assertTrue(status["update_available"])
+            self.assertTrue(status["update_started"])
+            self.assertEqual(launched, ["startup"])
+
+    def test_container_or_active_bridge_does_not_self_trigger_source_migration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "docs" / "contracts").mkdir(parents=True)
+            (root / "docs" / "contracts" / "container-platform.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            installer = root / "install.sh"
+            installer.write_text("#!/bin/sh\n", encoding="utf-8")
+            installer.chmod(0o755)
+            service = _UpdateService(root / "state")
+            manager = AutoUpdateManager(service, repo_root=root)
+
+            service.config.deployment_mode = "container"
+            self.assertFalse(manager._container_migration_required())
+            service.config.deployment_mode = "source"
+            with mock.patch.dict(
+                os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "1"}, clear=False
+            ):
+                self.assertFalse(manager._container_migration_required())
+
+    def test_ready_bridge_resumes_with_no_git_command_or_source_reservation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            checkout = base / "checkout"
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.name", "Update Test"], cwd=checkout, check=True)
+            for name in ("deploy.sh", "install.sh"):
+                path = checkout / name
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            contract = checkout / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=checkout, check=True)
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+            ).strip()
+
+            service = _UpdateService(base / "state")
+            service.blocked = True
+            mark_updating(
+                service.config.data_dir,
+                update_id="bridge-update",
+                instance_id="old",
+                reason="update",
+                target_revision="a" * 40,
+                remote="origin",
+                branch="main",
+            )
+            mark_source_bridge_ready(
+                service.config.data_dir,
+                update_id="bridge-update",
+                source_revision=revision,
+            )
+            launched: list[str] = []
+            manager = AutoUpdateManager(
+                service,
+                repo_root=checkout,
+                launcher=lambda reason: launched.append(reason)
+                or ["deploy.sh", "migrate-container"],
+            )
+            lock_path = checkout / ".git" / "ubitech-agent-update.lock"
+            lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                self.assertTrue(manager.source_migration_recovery_required())
+                self.assertFalse(manager._source_migration_resume_candidate())
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            with mock.patch.dict(
+                os.environ, {"UBITECH_SOURCE_MIGRATION_BRIDGE": "1"}, clear=False
+            ):
+                status = manager.check_once("recovery")
+
+            self.assertEqual(launched, ["recovery"])
+            self.assertEqual(status["update_action"], "migrate-container")
+            self.assertEqual(service.released, [])
+            self.assertEqual(read_state(service.config.data_dir)["phase"], "source_bridge_ready")
+
+    def test_queued_bridge_freezes_checkout_even_when_remote_advances(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            remote = base / "remote.git"
+            source = base / "source"
+            checkout = base / "checkout"
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.name", "Update Test"], cwd=source, check=True)
+            for name in ("deploy.sh", "install.sh"):
+                path = source / name
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            contract = source / "docs" / "contracts" / "container-platform.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=source, check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=source, check=True)
+            subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=source, check=True)
+            subprocess.run(["git", "clone", "-q", "--branch", "main", str(remote), str(checkout)], check=True)
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+            ).strip()
+
+            service = _UpdateService(base / "state")
+            mark_updating(
+                service.config.data_dir,
+                update_id="bridge-update",
+                instance_id="old",
+                reason="update",
+                target_revision=revision,
+                remote="origin",
+                branch="main",
+            )
+            mark_source_bridge_ready(
+                service.config.data_dir,
+                update_id="bridge-update",
+                source_revision=revision,
+            )
+            mark_container_migration_result(
+                service.config.data_dir,
+                update_id="bridge-update",
+                outcome="container_migration_queued",
+            )
+            (source / "later.txt").write_text("later\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "later"], cwd=source, check=True)
+            subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True)
+
+            launched: list[str] = []
+            manager = AutoUpdateManager(
+                service,
+                repo_root=checkout,
+                launcher=lambda reason: launched.append(reason) or [],
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                status = manager.check_once("poll")
+
+            self.assertFalse(status["update_available"])
+            self.assertEqual(launched, [])
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", "origin/main"], cwd=checkout, text=True
+                ).strip(),
+                revision,
+            )
+
     def test_deployment_handoff_preserves_disabled_searxng_configuration(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

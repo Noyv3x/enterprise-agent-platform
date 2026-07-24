@@ -84,6 +84,8 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 
 管理器先验证 release manifest 并预拉取镜像，再等待 Platform 的全局自然空闲点。原子预约成功后入口切换为维护，旧 Platform 停止，数据库快照与迁移完成后启动新 generation；只有所有核心 readiness 通过才恢复业务。完整协议见[自动更新](../operations/auto-update.md)。
 
+从历史源码部署迁移时，Git 更新和 Manager 首迁是两个状态机。旧更新脚本只能完成它启动时已经理解的流程；新 Platform 启动后会把“checkout 已具备完整容器桥接资产、仍处于源码模式且尚未交接 Manager”作为待处理更新，即使 Git 已无 revision 差异也会再次经过空闲预约启动当前桥接入口。旧源码 marker 只报告 bridge ready、迁移已排队或迁移交接失败；容器 generation 是否成功只由 Manager journal 判定。
+
 ## 故障边界
 
 - 两个可写 Platform generation 不能同时打开同一 SQLite。
