@@ -451,7 +451,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$(mktemp -d)"
+          root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"
           export UBITECH_COMPOSE_PROJECT="ubitech-release-smoke-${GITHUB_RUN_ID}"
           export UBITECH_CORE_NETWORK="${UBITECH_COMPOSE_PROJECT}-core"
           export UBITECH_DATA_ROOT="$root/state"
@@ -475,7 +475,11 @@ jobs:
               kill "$manager_stub_pid" >/dev/null 2>&1 || true
               wait "$manager_stub_pid" 2>/dev/null || true
             fi
-            rm -rf "$root"
+            case "$root" in
+              "$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;
+              *) echo "Refusing to remove unexpected smoke root: $root" >&2; return 1 ;;
+            esac
+            sudo -n rm -rf --one-file-system -- "$root"
           }
           trap cleanup EXIT
           mkdir -p \

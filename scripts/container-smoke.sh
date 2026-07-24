@@ -96,6 +96,15 @@ for dependent in ("compose-smoke", "publish"):
 for component in ("platform", "agent-runtime", "camofox", "agent-sandbox"):
     if component not in public_images:
         raise SystemExit(f"public-image gate omits {component}")
+
+compose_smoke = job("compose-smoke")
+for fragment in (
+    'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"',
+    '"$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;',
+    'sudo -n rm -rf --one-file-system -- "$root"',
+):
+    if fragment not in compose_smoke:
+        raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
 PY
 for entrypoint in containers/*-entrypoint.sh; do
   sh -n "$entrypoint"
