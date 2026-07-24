@@ -64,6 +64,8 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载 `/workspace/.ubitech/attachments` 访问。Platform 不得把自己的数据路径写进 prompt 或 Run，Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
+Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理不可信路径。目录枚举只能从该 fd 读取名称，不能根据 `os.File` 的逻辑显示名重新解析宿主路径；每个名称随后以 `O_NOFOLLOW` 和非阻塞模式相对父目录 fd 打开，并以 fd 元数据决定是否读取或递归。符号链接不得跟随，FIFO、设备、socket 与其它特殊文件不得读取；附件覆盖层必须先于普通 workspace 映射并保持只读。该路径必须在 Manager 声明的最低 Go 版本与当前受支持版本上保持相同行为。
+
 ## 凭据与敏感数据
 
 OAuth refresh token、session secret、内部 token 和其它 secret 保存在 Platform SQLite `settings` 表，并用 `secret` 标志控制展示；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。

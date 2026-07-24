@@ -361,16 +361,18 @@ func searchSandboxNode(ctx context.Context, node *os.File, relative string, matc
 	if !info.IsDir() {
 		return nil
 	}
-	entries, err := node.Readdir(-1)
+	// Readdir asks older Go releases to lstat each entry through node.Name().
+	// These Files intentionally carry only logical display names, so enumerate
+	// names from the pinned directory fd and inspect each entry with openat.
+	names, err := node.Readdirnames(-1)
 	if err != nil {
 		return err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	for _, entry := range entries {
+	sort.Strings(names)
+	for _, name := range names {
 		if len(*results) >= max {
 			return nil
 		}
-		name := entry.Name()
 		if name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) {
 			continue
 		}

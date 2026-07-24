@@ -78,6 +78,8 @@ Platform generation 的提交条件为：管理器存活并持有入口、Platfo
 
 Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与专用环境落在数据根；平台升级可以重建容器而保留这些目录。管理器还把当前 scope 的附件目录只读挂载到 `/workspace/.ubitech/attachments`，不得把全局附件根暴露给 Sandbox。基础镜像变更只在该 Sandbox 无活动任务和进程时应用，容器 writable layer 与 apt 安装不属于持久数据。
 
+Manager 在宿主侧读写这些挂载时必须从已验证的数据根 fd 开始逐级使用 `openat`，目录搜索仅从固定 fd 枚举名称，再以 `O_NOFOLLOW` 打开条目并检查 fd 类型；不能让语言运行时根据逻辑显示名重新解析宿主路径。发布门必须在 `manager/go.mod` 的最低 Go 版本验证嵌套文件搜索、附件覆盖层与符号链接逃逸，避免开发机较新工具链掩盖兼容缺陷。
+
 同一 `sandbox_id` 首次登记的 `workspace_id` 不得重绑。管理器操作 Docker 前验证所有 bind root 均为数据目录内由部署用户持有的非符号链接目录；registry 原子写入失败时，必须撤销本次容器创建、启动或镜像替换并恢复原记录，不能留下未登记的运行容器。
 
 Sandbox 容器创建时只让入口以 root 完成一次 UID/GID 映射与挂载根校验，随后 PID 1 立即降权为部署用户对应身份。入口不递归修改数据，也不提供 root 业务进程；管理器每次进入容器执行工具时显式传入相同 UID/GID。发布 smoke test 必须覆盖非 `1000:1000` 身份、无交互 sudo，以及固定 Compose 栈 `down`/重建时既有 Sandbox 和受管网络仍然存在。
