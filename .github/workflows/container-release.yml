@@ -234,6 +234,7 @@ jobs:
           name: image-${{ matrix.component }}
           path: ${{ matrix.component }}.json
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   public-images:
@@ -413,6 +414,7 @@ jobs:
             dist/ubitech-manager-linux-${{ matrix.arch }}
             dist/ubitech-manager-linux-${{ matrix.arch }}.sha256
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   compose-smoke:
@@ -675,6 +677,9 @@ jobs:
     permissions:
       contents: write
       packages: read
+    concurrency:
+      group: container-publish-${{ needs.prepare.outputs.source_commit }}
+      cancel-in-progress: false
     steps:
       - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -683,10 +688,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download release artifacts
+      - name: Download immutable image identities
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: '*'
+          pattern: image-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Download Manager binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: manager-*
           path: artifacts
           merge-multiple: true
 

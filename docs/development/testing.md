@@ -103,6 +103,10 @@ npm run build
 
 发布冒烟会故意把 Agent Sandbox 挂载根映射为与 CI runner 不同的 UID/GID。测试退出路径必须先尝试停止并移除相关容器，再以 runner 的受控提权只清理 `RUNNER_TEMP` 下由 `mktemp` 创建且带固定产品前缀的单一临时树；不能用普通 runner 身份递归删除已重映射的目录，也不能对未经前缀约束的路径执行提权删除。受控临时树清理失败仍应让发布失败，避免把残留数据掩盖为成功。
 
+原子 release 组装只能按独立 artifact family 下载 `image-*` 镜像身份与 `manager-*` 二进制，不得使用 `*` 下载当前 run 的全部 artifact。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
+
+镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖其同名中间 artifact。真正修改 GitHub Release 的 `publish` job 必须按 `prepare` 已解析的完整 source commit 跨 run 串行，不能使用可能指向同一提交的原始分支/ref 文本作为锁键；已公开 release 仍逐文件比较并拒绝漂移，main channel promotion 使用独立的全局单调锁。
+
 部署等待和 deadline 不写在本文，由对应部署配置与测试约束；不得误用 Agent Runtime 的空闲或 terminal 契约代替部署策略。
 
 ## 文档同步检查

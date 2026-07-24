@@ -105,6 +105,22 @@ for fragment in (
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
+
+publish = job("publish")
+if "pattern: '*'" in publish or 'pattern: "*"' in publish:
+    raise SystemExit("publish must not download every workflow artifact")
+for fragment in ("pattern: image-*", "pattern: manager-*"):
+    if fragment not in publish:
+        raise SystemExit(f"publish omits scoped release artifact family: {fragment}")
+for fragment in (
+    "group: container-publish-${{ needs.prepare.outputs.source_commit }}",
+    "cancel-in-progress: false",
+):
+    if fragment not in publish:
+        raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")
+for producer in ("images", "manager-binaries"):
+    if "overwrite: true" not in job(producer):
+        raise SystemExit(f"{producer} artifacts cannot be replaced by a full-run retry")
 PY
 for entrypoint in containers/*-entrypoint.sh; do
   sh -n "$entrypoint"
