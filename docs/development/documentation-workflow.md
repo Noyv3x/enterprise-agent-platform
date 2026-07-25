@@ -48,6 +48,6 @@ Manifest、canonical 文档、机器契约及生成目标都必须位于仓库�
 
 顶层 `scripts/test.sh` 必须可以在没有生产部署变量的开发机或 CI 工作区中直接运行。它对 Compose 做静态解析时使用隔离环境、不可变占位镜像引用和无副作用的占位挂载路径，不读取项目 `.env`，也不连接或修改正在运行的产品容器。
 
-部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。
+部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。安装器重试单元的静态验收应检查 owner-only incoming 文件与原子替换边界，不能把旧的直接写目标实现字符串当作永久契约；相关脚本变化必须同步本流程说明。
 
 Cognee 与 Firecrawl 不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；修改契约必须同步部署实现或验收测试。数据目录中的受管 checkout 不是 canonical 文档或受管产品代码。

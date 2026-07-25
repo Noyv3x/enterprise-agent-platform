@@ -81,6 +81,10 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 
 func (a *API) status(response http.ResponseWriter) {
 	state := a.Store.State()
+	// Legacy journals may contain an error amplified by an old recovery loop.
+	// Project a bounded diagnostic without mutating the durable record merely
+	// because it was observed through the API.
+	state.LastError = journal.BoundDiagnostic(state.LastError)
 	operationID := state.ActiveOperationID
 	if operationID == "" {
 		operationID = state.FinalizePendingOperationID
@@ -191,7 +195,7 @@ func (a *API) startOperation(response http.ResponseWriter, request *http.Request
 		writeError(response, status, err.Error())
 		return
 	}
-	writeJSON(response, http.StatusAccepted, map[string]any{"operation": op, "reused": reused})
+	writeJSON(response, http.StatusAccepted, map[string]any{"operation": operationProjection(op), "reused": reused})
 }
 func (a *API) operation(response http.ResponseWriter, id string) {
 	op, err := a.Store.Operation(id)
@@ -199,7 +203,11 @@ func (a *API) operation(response http.ResponseWriter, id string) {
 		writeError(response, http.StatusNotFound, "operation not found")
 		return
 	}
-	writeJSON(response, http.StatusOK, op)
+	writeJSON(response, http.StatusOK, operationProjection(op))
+}
+
+func operationProjection(op model.Operation) model.Operation {
+	return journal.BoundOperation(op)
 }
 func (a *API) logs(response http.ResponseWriter, request *http.Request) {
 	tail, _ := strconv.Atoi(request.URL.Query().Get("tail"))
@@ -266,7 +274,34 @@ func (a *API) legacyPlan(response http.ResponseWriter) {
 		writeError(response, http.StatusNotFound, "legacy migration is not configured")
 		return
 	}
-	writeJSON(response, http.StatusOK, plan)
+	writeJSON(response, http.StatusOK, migrationPlanProjection(plan))
+}
+
+func migrationPlanProjection(plan migration.Plan) map[string]any {
+	return map[string]any{
+		"schema_version":         plan.SchemaVersion,
+		"id":                     plan.ID,
+		"operation_id":           plan.OperationID,
+		"status":                 plan.Status,
+		"expected_source_commit": plan.ExpectedSourceCommit,
+		"copied":                 plan.Copied,
+		"copy_prepared":          plan.CopyPrepared,
+		"old_service_stopped":    plan.OldServiceStopped,
+		"unit_state_recorded":    plan.UnitStateRecorded,
+		"archive_ready":          plan.ArchiveReady,
+		"archive_restored":       plan.ArchiveRestored,
+		"entry_count":            len(plan.Entries),
+		"archive_tree_count":     len(plan.ArchiveTrees),
+		"archive_file_count":     len(plan.ArchiveFiles),
+		"retired_cache_count":    len(plan.RetiredCaches),
+		"compose_project_count":  len(plan.ComposeProjects),
+		"compose_volume_count":   len(plan.ComposeVolumes),
+		"compose_error_count":    len(plan.ComposeCleanupErrors),
+		"quarantined_count":      len(plan.Quarantined),
+		"error":                  journal.BoundDiagnostic(plan.Error),
+		"created_at":             plan.CreatedAt,
+		"updated_at":             plan.UpdatedAt,
+	}
 }
 
 func (a *API) executorRoute(response http.ResponseWriter, request *http.Request) {
@@ -391,5 +426,5 @@ func writeJSON(response http.ResponseWriter, status int, value any) {
 	_, _ = response.Write(data)
 }
 func writeError(response http.ResponseWriter, status int, message string) {
-	writeJSON(response, status, map[string]string{"error": message})
+	writeJSON(response, status, map[string]string{"error": journal.BoundDiagnostic(message)})
 }

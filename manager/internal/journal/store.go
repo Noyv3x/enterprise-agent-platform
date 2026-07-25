@@ -2,6 +2,7 @@ package journal
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
 	"github.com/ubitech/agent-platform/manager/internal/model"
@@ -18,6 +20,66 @@ import (
 var ErrOperationInProgress = errors.New("another mutation operation is already active")
 var ErrGenerationConflict = errors.New("manager generation changed")
 var ErrIdempotencyConflict = errors.New("idempotency key belongs to a different operation request")
+
+// MaxDiagnosticBytes keeps a diagnostic comfortably below the legacy Manager
+// client's response limit even when JSON escaping expands every retained byte.
+// The marker preserves the original size and a stable identity for forensic
+// correlation without allowing journal records to grow without bound.
+const MaxDiagnosticBytes = 64 << 10
+const MaxHistoryNoteBytes = 2 << 10
+const MaxOperationHistoryEntries = 64
+
+func BoundDiagnostic(message string) string {
+	return boundDiagnostic(message, MaxDiagnosticBytes)
+}
+
+func BoundDiagnosticWithLimit(message string, limit int) string {
+	return boundDiagnostic(message, limit)
+}
+
+func boundDiagnostic(message string, limit int) string {
+	if len(message) <= limit {
+		return message
+	}
+	digest := sha256.Sum256([]byte(message))
+	marker := fmt.Sprintf("\n...[diagnostic truncated; original_bytes=%d; sha256=%s]...\n", len(message), hex.EncodeToString(digest[:]))
+	if limit <= len(marker) {
+		return marker[:limit]
+	}
+	retained := limit - len(marker)
+	headBytes := retained / 2
+	tailBytes := retained - headBytes
+	// Error strings are expected to be UTF-8. Avoid introducing a split rune at
+	// either truncation boundary so API projections remain well-formed text too.
+	for headBytes > 0 && !utf8.RuneStart(message[headBytes]) {
+		headBytes--
+	}
+	tailStart := len(message) - tailBytes
+	for tailStart < len(message) && !utf8.RuneStart(message[tailStart]) {
+		tailStart++
+	}
+	return message[:headBytes] + marker + message[tailStart:]
+}
+
+func BoundOperation(op model.Operation) model.Operation {
+	op.Error = BoundDiagnostic(op.Error)
+	history := op.History
+	if len(history) > MaxOperationHistoryEntries {
+		head := MaxOperationHistoryEntries / 2
+		tail := MaxOperationHistoryEntries - head
+		bounded := make([]model.PhaseEvent, 0, MaxOperationHistoryEntries)
+		bounded = append(bounded, history[:head]...)
+		bounded = append(bounded, history[len(history)-tail:]...)
+		history = bounded
+	} else {
+		history = append([]model.PhaseEvent(nil), history...)
+	}
+	for i := range history {
+		history[i].Note = BoundDiagnosticWithLimit(history[i].Note, MaxHistoryNoteBytes)
+	}
+	op.History = history
+	return op
+}
 
 type Store struct {
 	dir                string
@@ -53,7 +115,9 @@ func Open(dir string, now time.Time) (*Store, error) {
 func (s *Store) State() model.ManagerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneState(s.state)
+	state := cloneState(s.state)
+	state.LastError = BoundDiagnostic(state.LastError)
+	return state
 }
 
 func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (model.ManagerState, error) {
@@ -66,7 +130,7 @@ func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (
 	next.Generation++
 	next.UpdatedAt = now.UTC()
 	next.HeartbeatAt = now.UTC()
-	if err := s.persistStateValueLocked(next); err != nil {
+	if err := s.persistStateValueLocked(&next); err != nil {
 		return model.ManagerState{}, err
 	}
 	s.state = next
@@ -88,6 +152,7 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	if existing, ok, err := s.findByIdempotencyLocked(req.IdempotencyKey); err != nil {
 		return model.Operation{}, false, err
 	} else if ok {
+		existing = BoundOperation(existing)
 		if !sameOperationRequest(existing, req) {
 			return model.Operation{}, false, ErrIdempotencyConflict
 		}
@@ -123,7 +188,7 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 		Status: model.OperationPending, Phase: model.PhaseValidating,
 		History: []model.PhaseEvent{{Phase: model.PhaseValidating, At: now.UTC()}}, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
-	if err := s.persistOperationLocked(op); err != nil {
+	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, false, err
 	}
 	next := cloneState(s.state)
@@ -131,7 +196,7 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	next.ActiveOperationID = op.ID
 	next.Phase = op.Phase
 	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
-	if err := s.persistStateValueLocked(next); err != nil {
+	if err := s.persistStateValueLocked(&next); err != nil {
 		_ = os.Remove(s.operationPath(op.ID))
 		return model.Operation{}, false, err
 	}
@@ -148,7 +213,11 @@ func sameOperationRequest(existing model.Operation, request model.OperationReque
 func (s *Store) Operation(id string) (model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.readOperationLocked(id)
+	op, err := s.readOperationLocked(id)
+	if err != nil {
+		return model.Operation{}, err
+	}
+	return BoundOperation(op), nil
 }
 
 func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.PublicState, maintenance bool, note string, now time.Time) (model.Operation, error) {
@@ -163,7 +232,7 @@ func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.Pub
 	}
 	op.Status, op.Phase, op.UpdatedAt = model.OperationRunning, phase, now.UTC()
 	op.History = append(op.History, model.PhaseEvent{Phase: phase, At: now.UTC(), Note: note})
-	if err := s.persistOperationLocked(op); err != nil {
+	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, err
 	}
 	next := cloneState(s.state)
@@ -172,7 +241,7 @@ func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.Pub
 	next.Maintenance = maintenance
 	next.Phase = phase
 	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
-	if err := s.persistStateValueLocked(next); err != nil {
+	if err := s.persistStateValueLocked(&next); err != nil {
 		return model.Operation{}, err
 	}
 	s.state = next
@@ -189,7 +258,7 @@ func (s *Store) UpdateOperation(id string, fn func(*model.Operation) error) (mod
 	if err := fn(&op); err != nil {
 		return model.Operation{}, err
 	}
-	if err := s.persistOperationLocked(op); err != nil {
+	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, err
 	}
 	return op, nil
@@ -218,10 +287,10 @@ func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerSta
 		stateFn(&next)
 	}
 	op.Finalized = !success || next.FinalizePendingOperationID != id
-	if err := s.persistOperationLocked(op); err != nil {
+	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, err
 	}
-	if err := s.persistStateValueLocked(next); err != nil {
+	if err := s.persistStateValueLocked(&next); err != nil {
 		return model.Operation{}, err
 	}
 	s.state = next
@@ -238,6 +307,10 @@ func (s *Store) RecoverActive() (*model.Operation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("active operation journal is missing: %w", err)
 	}
+	// Recovery consumes the durable record rather than an API projection. Keep
+	// the original diagnostic here so the first bounded recovery write can
+	// retain the original byte count and digest instead of truncating an already
+	// truncated marker a second time.
 	return &op, nil
 }
 
@@ -245,17 +318,19 @@ func (s *Store) operationPath(id string) string {
 	return filepath.Join(s.operations, id+".json")
 }
 
-func (s *Store) persistStateLocked() error { return s.persistStateValueLocked(s.state) }
-func (s *Store) persistStateValueLocked(value model.ManagerState) error {
+func (s *Store) persistStateLocked() error { return s.persistStateValueLocked(&s.state) }
+func (s *Store) persistStateValueLocked(value *model.ManagerState) error {
+	value.LastError = BoundDiagnostic(value.LastError)
 	if s.beforePersistState != nil {
-		if err := s.beforePersistState(cloneState(value)); err != nil {
+		if err := s.beforePersistState(cloneState(*value)); err != nil {
 			return err
 		}
 	}
-	return atomicfile.WriteJSON(s.statePath, value, 0o600)
+	return atomicfile.WriteJSON(s.statePath, *value, 0o600)
 }
-func (s *Store) persistOperationLocked(op model.Operation) error {
-	return atomicfile.WriteJSON(s.operationPath(op.ID), op, 0o600)
+func (s *Store) persistOperationLocked(op *model.Operation) error {
+	*op = BoundOperation(*op)
+	return atomicfile.WriteJSON(s.operationPath(op.ID), *op, 0o600)
 }
 func (s *Store) readOperationLocked(id string) (model.Operation, error) {
 	if !validID(id) {

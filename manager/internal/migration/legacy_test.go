@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 )
 
 type fakeRunner struct {
@@ -112,6 +114,94 @@ func TestCorruptLegacyPlanFailsClosedWithoutBeingOverwritten(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("external state changed after corrupt journal detection: %#v", runner.calls)
+	}
+}
+
+func TestMigrationFailureBoundsPersistentExternalDiagnostics(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "manager", "migration.json")
+	service := &Service{StatePath: statePath, Now: func() time.Time { return time.Unix(20, 0) }}
+	largeError := "migration-error-head\n" + strings.Repeat("e", journal.MaxDiagnosticBytes*3) + "\nmigration-error-tail"
+	largeCleanup := "compose-error-head\n" + strings.Repeat("c", journal.MaxDiagnosticBytes*3) + "\ncompose-error-tail"
+	plan := Plan{
+		SchemaVersion:        1,
+		ID:                   "legacy-test",
+		Status:               "configured",
+		ComposeCleanupErrors: []string{largeCleanup, largeCleanup},
+	}
+	var observed Plan
+	service.BeforePersist = func(value Plan) error {
+		observed = value
+		return nil
+	}
+	cause := errors.New(largeError)
+	if err := service.fail(&plan, cause); !errors.Is(err, cause) {
+		t.Fatalf("migration failure cause changed: %v", err)
+	}
+	for name, value := range map[string]string{
+		"callback error":   observed.Error,
+		"in-memory error":  plan.Error,
+		"callback cleanup": strings.Join(observed.ComposeCleanupErrors, "\n"),
+	} {
+		if len(value) > journal.MaxDiagnosticBytes {
+			t.Fatalf("%s exceeded its bound: %d", name, len(value))
+		}
+		if !strings.Contains(value, "diagnostic truncated") || !strings.Contains(value, "sha256=") {
+			t.Fatalf("%s lost its traceable truncation marker: %q", name, value)
+		}
+	}
+	durable, err := service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(durable.Error) > journal.MaxDiagnosticBytes || len(strings.Join(durable.ComposeCleanupErrors, "\n")) > journal.MaxDiagnosticBytes {
+		t.Fatalf("durable migration diagnostics exceeded their bounds: error=%d cleanup=%d", len(durable.Error), len(strings.Join(durable.ComposeCleanupErrors, "\n")))
+	}
+	if !strings.Contains(durable.Error, "migration-error-head") || !strings.Contains(durable.Error, "migration-error-tail") || !strings.Contains(strings.Join(durable.ComposeCleanupErrors, "\n"), "compose-error-head") || !strings.Contains(strings.Join(durable.ComposeCleanupErrors, "\n"), "compose-error-tail") {
+		t.Fatalf("durable diagnostics did not preserve head and tail: %#v", durable)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) >= 1<<20 {
+		t.Fatalf("bounded migration state remained unexpectedly large: %d", len(data))
+	}
+}
+
+func TestLegacyOversizedMigrationDiagnosticConvergesOnNextWrite(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "manager", "migration.json")
+	legacy := Plan{SchemaVersion: 1, ID: "legacy-oversized", Status: "configured", Error: "legacy-head\n" + strings.Repeat("z", journal.MaxDiagnosticBytes*3) + "\nlegacy-tail"}
+	if err := atomicfile.WriteJSON(statePath, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{StatePath: statePath}
+	projected, err := service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Error) > journal.MaxDiagnosticBytes || !strings.Contains(projected.Error, "diagnostic truncated") {
+		t.Fatalf("legacy diagnostic was not safely projected: %d %q", len(projected.Error), projected.Error)
+	}
+	afterRead, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterRead) != string(before) {
+		t.Fatal("read-only migration projection rewrote durable state")
+	}
+	if err := service.persistLocked(projected); err != nil {
+		t.Fatal(err)
+	}
+	afterWrite, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterWrite) >= len(before) || !strings.Contains(string(afterWrite), "diagnostic truncated") {
+		t.Fatalf("normal migration persistence did not converge legacy diagnostic: before=%d after=%d", len(before), len(afterWrite))
 	}
 }
 

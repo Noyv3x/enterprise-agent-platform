@@ -67,6 +67,8 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。一个可交付变更集应同时包含规范、实现、测试和必要生成产物，避免文档与代码跨提交长期漂移。代码域允许多重匹配；修改跨域文件时必须同步每个声明域，并由评审补充路径映射无法识别的真实语义域。
 
+不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、`install.sh` 及其 SHA-256 sidecar。重复发布同一 source commit 时必须逐项比较这些资产，main 通道提升前也必须重新校验 installer 与 sidecar；恢复冻结旧 bridge 时禁止直接执行未经校验的网络脚本。
+
 提交前检查：
 
 - `git status --short` 中没有意外运行数据或生成源码；

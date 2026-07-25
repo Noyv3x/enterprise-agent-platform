@@ -16,17 +16,22 @@ import (
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/release"
 )
 
 type fakeRunner struct {
-	calls [][]string
-	fail  string
+	calls   [][]string
+	fail    string
+	failure error
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) error {
 	r.calls = append(r.calls, append([]string{name}, args...))
 	if name == r.fail {
+		if r.failure != nil {
+			return r.failure
+		}
 		return errors.New("injected failure")
 	}
 	return nil
@@ -217,5 +222,47 @@ func TestStartupCompletesIntentAfterCrashBetweenBinaryReplaceAndPlanUpdate(t *te
 	}
 	if len(runner.calls) < 3 || runner.calls[len(runner.calls)-1][0] != "systemd-run" {
 		t.Fatalf("startup did not re-arm the lost transient watchdog: %#v", runner.calls)
+	}
+}
+
+func TestActivationPlanBoundsExternalWatchdogFailure(t *testing.T) {
+	manager, manifest, _, runner := newPreparedManager(t)
+	if err := manager.MarkPlatformCommitted(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Activate(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.State()
+	if err != nil || state.Activation == nil {
+		t.Fatalf("activation plan was not prepared: %#v %v", state, err)
+	}
+	var plan Plan
+	if err := atomicfile.ReadJSON(state.Activation.PlanPath, &plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.BootID = "boot-before-restart"
+	if err := atomicfile.WriteJSON(plan.PlanPath, plan, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.fail = "systemd-run"
+	externalFailure := "watchdog-external-head\n" + strings.Repeat("y", journal.MaxDiagnosticBytes*3) + "\nwatchdog-external-tail"
+	runner.failure = errors.New(externalFailure)
+	want := journal.BoundDiagnostic("could not re-arm Manager watchdog after reboot: " + externalFailure)
+	err = manager.acknowledgeExecutable(manager.InstallPath)
+	if err == nil {
+		t.Fatal("watchdog re-arm failure did not roll back activation")
+	}
+	if err.Error() != want {
+		t.Fatalf("returned activation diagnostic does not identify the original external error: got %q want %q", err.Error(), want)
+	}
+	if err := atomicfile.ReadJSON(plan.PlanPath, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Error != want {
+		t.Fatalf("durable activation diagnostic does not identify the original external error: got %q want %q", plan.Error, want)
+	}
+	if !strings.Contains(plan.Error, "watchdog-external-head") || !strings.Contains(plan.Error, "watchdog-external-tail") || !strings.Contains(plan.Error, "diagnostic truncated") || !strings.Contains(plan.Error, "sha256=") {
+		t.Fatalf("durable activation diagnostic lost correlation data: %q", plan.Error)
 	}
 }

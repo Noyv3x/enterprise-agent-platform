@@ -19,7 +19,10 @@ type Client struct {
 	Timeout    time.Duration
 }
 
-const maxManagerResponseBytes int64 = 2 << 20
+// A pre-bounded Manager returns far smaller control projections. Eight MiB is
+// retained only so a repair CLI can decode one valid journal-shaped response
+// from a legacy Manager whose on-disk JSON reader used the same ceiling.
+const maxManagerResponseBytes int64 = 8 << 20
 
 func (c Client) Do(ctx context.Context, method, path string, body, out any) error {
 	if strings.TrimSpace(c.Token) == "" || strings.ContainsAny(c.Token, " \t\r\n") {

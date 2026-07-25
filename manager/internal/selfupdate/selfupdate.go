@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/release"
 )
 
@@ -200,7 +201,7 @@ func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error
 		return errors.New("manager control token file is required for safe activation")
 	}
 	plan := Plan{SchemaVersion: 1, PlanPath: planPath, Status: "prepared", StatePath: m.StatePath, InstallPath: installPath, SocketPath: m.SocketPath, ControlTokenFile: m.ControlTokenFile, UnitName: unit, CandidateVersion: state.Candidate.Version, CandidateSHA: state.Candidate.SHA256, PreviousPath: state.Current.Path, CreatedAt: m.now(), UpdatedAt: m.now(), HealthTimeoutMS: 45_000, BootID: m.bootID()}
-	if err := atomicfile.WriteJSON(planPath, plan, 0o600); err != nil {
+	if err := persistActivationPlan(planPath, plan); err != nil {
 		return err
 	}
 	watchdogUnit := "ubitech-agent-manager-watchdog-" + safeID(manifest.SourceCommit[:12])
@@ -225,7 +226,7 @@ func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error
 	plan.Activated = true
 	plan.Status = "activated"
 	plan.UpdatedAt = m.now()
-	if err := atomicfile.WriteJSON(planPath, plan, 0o600); err != nil {
+	if err := persistActivationPlan(planPath, plan); err != nil {
 		_ = restorePrevious(plan, m.runner())
 		return err
 	}
@@ -276,7 +277,7 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 			if err := atomicfile.WriteJSON(m.StatePath, state, 0o600); err != nil {
 				return err
 			}
-			return atomicfile.WriteJSON(plan.PlanPath, plan, 0o600)
+			return persistActivationPlan(plan.PlanPath, plan)
 		}
 		plan.Error = "running Manager matches neither activation candidate nor previous binary"
 		return restorePrevious(plan, m.runner())
@@ -288,7 +289,7 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 	plan.Acknowledged = true
 	plan.Status = "acknowledged"
 	plan.UpdatedAt = m.now()
-	if err := atomicfile.WriteJSON(state.Activation.PlanPath, plan, 0o600); err != nil {
+	if err := persistActivationPlan(state.Activation.PlanPath, plan); err != nil {
 		return err
 	}
 	if plan.BootID != m.bootID() {
@@ -360,10 +361,11 @@ func commitActivation(planPath string, plan Plan) error {
 	}
 	plan.Status = "committed"
 	plan.UpdatedAt = time.Now().UTC()
-	return atomicfile.WriteJSON(planPath, plan, 0o600)
+	return persistActivationPlan(planPath, plan)
 }
 
 func restorePrevious(plan Plan, runner Runner) error {
+	plan.Error = journal.BoundDiagnostic(plan.Error)
 	previous, readErr := os.ReadFile(plan.PreviousPath)
 	if readErr != nil {
 		return fmt.Errorf("read previous Manager for rollback: %w", readErr)
@@ -380,12 +382,17 @@ func restorePrevious(plan Plan, runner Runner) error {
 	plan.Status = "rolled_back"
 	plan.UpdatedAt = time.Now().UTC()
 	if plan.PlanPath != "" {
-		_ = atomicfile.WriteJSON(plan.PlanPath, plan, 0o600)
+		_ = persistActivationPlan(plan.PlanPath, plan)
 	}
 	if err := runner.Run(context.Background(), "systemctl", "--user", "restart", "--no-block", plan.UnitName); err != nil {
 		return fmt.Errorf("previous Manager restored but restart failed: %w", err)
 	}
 	return errors.New(plan.Error)
+}
+
+func persistActivationPlan(path string, plan Plan) error {
+	plan.Error = journal.BoundDiagnostic(plan.Error)
+	return atomicfile.WriteJSON(path, plan, 0o600)
 }
 
 func (m *Manager) backupRunningVersion() (*Version, error) {

@@ -481,12 +481,19 @@ func managerClient(configPath string) (control.Client, config.Config, error) {
 func waitForManager(client control.Client) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		var response any
-		err := client.Do(ctx, http.MethodGet, "/v1/status", nil, &response)
+		// Give a legacy Manager enough time to encode its historical status before
+		// it can flush the headers. The body is deliberately not consumed below.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// Readiness needs only an authenticated success status. In particular,
+		// a repair CLI must be able to reach an older Manager whose otherwise
+		// healthy status body contains an oversized historical diagnostic.
+		err := client.Do(ctx, http.MethodGet, "/v1/status", nil, nil)
 		cancel()
 		if err == nil {
 			return nil
+		}
+		if !control.IsUnavailable(err) {
+			return err
 		}
 		if time.Now().After(deadline) {
 			return err

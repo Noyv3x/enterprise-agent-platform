@@ -7,6 +7,7 @@ import os
 import signal
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,7 @@ from enterprise_agent_platform.deployment import (
     user_service_unit,
 )
 from enterprise_agent_platform.update_state import (
+    mark_container_migration_result,
     mark_source_bridge_ready,
     mark_success,
     mark_updating,
@@ -3050,14 +3052,689 @@ esac
         syntax = subprocess.run(["bash", "-n", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    def _run_active_manager_recovery_installer_fixture(
+        self,
+        *,
+        identity_mismatch: str = "",
+    ) -> dict[str, object]:
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            data_home = root / "data-home"
+            data_root = data_home / "ubitech-agent"
+            tools = root / "tools"
+            legacy = root / "legacy"
+            legacy_data = legacy / "enterprise-agent-platform" / "data"
+            package = legacy / "enterprise-agent-platform" / "enterprise_agent_platform"
+            manager_state = data_root / "manager"
+            control = manager_state / "control"
+            secrets = manager_state / "secrets"
+            manager_binaries = manager_state / "manager-binaries" / "versions" / "running"
+            for path in (
+                home,
+                config_home,
+                data_home,
+                tools,
+                legacy_data,
+                package,
+                control,
+                secrets,
+                manager_binaries,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1]
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
+            (legacy / ".gitignore").write_text(
+                "enterprise-agent-platform/data/\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "--quiet", str(legacy)], check=True)
+            subprocess.run(
+                ["git", "-C", str(legacy), "add", "."],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "-c",
+                    "user.name=ubitech test",
+                    "-c",
+                    "user.email=ubitech-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "frozen source bridge",
+                ],
+                check=True,
+            )
+            expected_source_commit = subprocess.run(
+                ["git", "-C", str(legacy), "rev-parse", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            mark_updating(
+                legacy_data,
+                update_id="frozen-e0-update",
+                instance_id="frozen-e0-instance",
+                reason="test",
+                target_revision=expected_source_commit,
+                remote="origin",
+                branch="main",
+            )
+            mark_source_bridge_ready(
+                legacy_data,
+                update_id="frozen-e0-update",
+                source_revision=expected_source_commit,
+            )
+            mark_container_migration_result(
+                legacy_data,
+                update_id="frozen-e0-update",
+                outcome="container_migration_failed",
+                error="legacy recovery client could not decode Manager status",
+            )
+
+            sleep_binary = Path(shutil.which("sleep") or "/bin/sleep")
+            authority_manager = root / "authority-manager"
+            shutil.copy2(sleep_binary, authority_manager)
+            authority_manager.chmod(0o700)
+            authority_bytes = authority_manager.read_bytes()
+            authority_sha = hashlib.sha256(authority_bytes).hexdigest()
+
+            running_manager = root / "running-manager"
+            running_arguments = ["120"]
+            if identity_mismatch == "running":
+                tail_binary = Path(shutil.which("tail") or "/usr/bin/tail")
+                shutil.copy2(tail_binary, running_manager)
+                running_arguments = ["-f", "/dev/null"]
+            else:
+                shutil.copy2(authority_manager, running_manager)
+            running_manager.chmod(0o700)
+
+            current_manager = manager_binaries / "ubitech-manager"
+            shutil.copy2(authority_manager, current_manager)
+            current_manager.chmod(0o700)
+            current_sha = (
+                "0" * 64 if identity_mismatch == "current" else authority_sha
+            )
+            (manager_state / "manager-binaries.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "current": {
+                            "version": expected_source_commit,
+                            "path": str(current_manager),
+                            "sha256": current_sha,
+                            "verified_at": "2026-07-25T00:00:00Z",
+                            "platform_committed": True,
+                        },
+                        "updated_at": "2026-07-25T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (manager_state / "manager-binaries.json").chmod(0o600)
+
+            manager_log = root / "manager.log"
+            candidate = root / "recovery-manager"
+            candidate.write_text(
+                "#!/bin/sh\n"
+                "printf '%s|%s\\n' \"$0\" \"$*\" >> \"$FAKE_MANAGER_LOG\"\n"
+                "case \"${1:-}\" in\n"
+                "  version) printf '%s\\n' \"$FAKE_RECOVERY_VERSION\"; exit 0 ;;\n"
+                "  install) exit 75 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            candidate.chmod(0o700)
+            candidate_bytes = candidate.read_bytes()
+            candidate_sha = hashlib.sha256(candidate_bytes).hexdigest()
+
+            stable = home / ".local" / "bin" / "ubitech-manager"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(candidate_bytes)
+            stable.chmod(0o755)
+            stable_before = stable.read_bytes()
+
+            config_path = config_home / "ubitech-agent" / "manager.toml"
+            config_path.parent.mkdir(parents=True)
+            channel_manifest_url = (
+                "https://releases.example/main/release.json"
+            )
+            config_path.write_text(
+                f'data_root = "{data_root}"\n'
+                'listen = "127.0.0.1:8080"\n'
+                f'release_manifest_url = "{channel_manifest_url}"\n'
+                'release_channel = "main"\n'
+                'legacy_platform_gate_url = "http://127.0.0.1:8765"\n',
+                encoding="utf-8",
+            )
+            config_path.chmod(0o600)
+            (secrets / "manager-token").write_text(
+                "manager-control-token-0123456789abcdef\n",
+                encoding="utf-8",
+            )
+            (secrets / "manager-token").chmod(0o600)
+
+            unit = (
+                config_home
+                / "systemd"
+                / "user"
+                / "ubitech-agent-manager.service"
+            )
+            unit.parent.mkdir(parents=True)
+            unit.write_text(
+                "[Unit]\nDescription=existing Manager\n\n"
+                "[Service]\n"
+                f'ExecStart="{stable}" serve --config "{config_path}"\n'
+                "Restart=on-failure\n",
+                encoding="utf-8",
+            )
+            unit.chmod(0o600)
+            unit_before = unit.read_bytes()
+
+            exact_manifest_url = (
+                "https://releases.example/container-"
+                f"{expected_source_commit}/release.json"
+            )
+            authority_manager_url = (
+                "https://releases.example/container-"
+                f"{expected_source_commit}/ubitech-manager-linux-amd64"
+            )
+            authority_manifest = root / "authority-release.json"
+            authority_manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source_commit": expected_source_commit,
+                        "manager": {
+                            "version": expected_source_commit,
+                            "artifacts": {
+                                "amd64": {
+                                    "url": authority_manager_url,
+                                    "sha256": authority_sha,
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            systemctl_log = root / "systemctl.log"
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "uname").write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = -m ]; then printf '%s\\n' x86_64; exit 0; fi\n"
+                "exec /usr/bin/uname \"$@\"\n",
+                encoding="utf-8",
+            )
+            (tools / "curl").write_text(
+                "#!/bin/sh\n"
+                "output=''\nurl=''\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case \"$1\" in\n"
+                "    --output) output=$2; shift 2 ;;\n"
+                "    https://*) url=$1; shift ;;\n"
+                "    *) shift ;;\n"
+                "  esac\n"
+                "done\n"
+                "if [ \"$url\" = \"$FAKE_AUTHORITY_MANIFEST_URL\" ]; then\n"
+                "  cp \"$FAKE_AUTHORITY_MANIFEST\" \"$output\"\n"
+                "elif [ \"$url\" = \"$FAKE_AUTHORITY_MANAGER_URL\" ]; then\n"
+                "  cp \"$FAKE_AUTHORITY_MANAGER\" \"$output\"\n"
+                "else\n"
+                "  printf 'unexpected URL: %s\\n' \"$url\" >&2\n"
+                "  exit 22\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+
+            process = subprocess.Popen(
+                [str(running_manager), *running_arguments],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            control_socket.bind(str(control / "manager.sock"))
+            (control / "manager.sock").chmod(0o600)
+            try:
+                (tools / "systemctl").write_text(
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\n"
+                    "case \"$*\" in\n"
+                    "  '--user show-environment') exit 0 ;;\n"
+                    "  *'is-active --quiet ubitech-agent-manager.service'*) exit 0 ;;\n"
+                    "  *'show ubitech-agent-manager.service'*"
+                    "'--property=FragmentPath --value'*)\n"
+                    "    printf '%s\\n' \"$FAKE_MANAGER_FRAGMENT\"; exit 0 ;;\n"
+                    "  *'show ubitech-agent-manager.service'*"
+                    "'--property=MainPID --value'*)\n"
+                    "    printf '%s\\n' \"$FAKE_MANAGER_PID\"; exit 0 ;;\n"
+                    "  *'show ubitech-agent-manager.service'*"
+                    "'--property=DropInPaths --value'*) exit 0 ;;\n"
+                    "  *'show ubitech-agent-manager.service'*"
+                    "'--property=ExecStart --value'*)\n"
+                    "    printf '{ path=%s ; argv[]=%s serve --config %s ; ignore_errors=no }\\n' "
+                    "\"$FAKE_STABLE_MANAGER\" \"$FAKE_STABLE_MANAGER\" \"$FAKE_MANAGER_CONFIG\"; exit 0 ;;\n"
+                    "  *'enable --now ubitech-agent-migrate.timer'*)\n"
+                    "    mkdir -p \"$(dirname \"$FAKE_TIMER_WANTS_LINK\")\"\n"
+                    "    ln -sfn \"$FAKE_RETRY_TIMER\" \"$FAKE_TIMER_WANTS_LINK\"; exit 0 ;;\n"
+                    "  *) exit 0 ;;\n"
+                    "esac\n",
+                    encoding="utf-8",
+                )
+                for executable in tools.iterdir():
+                    executable.chmod(0o755)
+
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "HOME": str(home),
+                        "XDG_CONFIG_HOME": str(config_home),
+                        "XDG_DATA_HOME": str(data_home),
+                        "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                        "FAKE_AUTHORITY_MANIFEST": str(authority_manifest),
+                        "FAKE_AUTHORITY_MANIFEST_URL": exact_manifest_url,
+                        "FAKE_AUTHORITY_MANAGER": str(authority_manager),
+                        "FAKE_AUTHORITY_MANAGER_URL": authority_manager_url,
+                        "FAKE_MANAGER_FRAGMENT": str(unit),
+                        "FAKE_MANAGER_LOG": str(manager_log),
+                        "FAKE_MANAGER_PID": str(process.pid),
+                        "FAKE_MANAGER_CONFIG": str(config_path),
+                        "FAKE_STABLE_MANAGER": str(stable),
+                        "FAKE_RETRY_TIMER": str(
+                            config_home
+                            / "systemd"
+                            / "user"
+                            / "ubitech-agent-migrate.timer"
+                        ),
+                        "FAKE_TIMER_WANTS_LINK": str(
+                            config_home
+                            / "systemd"
+                            / "user"
+                            / "timers.target.wants"
+                            / "ubitech-agent-migrate.timer"
+                        ),
+                        "FAKE_RECOVERY_VERSION": "recovery-client-new",
+                        "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
+                        "PYTHON_BIN": sys.executable,
+                        "ENTERPRISE_AUTO_UPDATE_ID": "frozen-e0-update",
+                        "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
+                    }
+                )
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(source),
+                        "--manifest-url",
+                        exact_manifest_url,
+                        "--channel-manifest-url",
+                        channel_manifest_url,
+                        "--manager-binary",
+                        str(candidate),
+                        "--config",
+                        str(config_path),
+                        "--data-root",
+                        str(data_root),
+                        "--migrate-from",
+                        str(legacy),
+                        "--legacy-data",
+                        str(legacy_data),
+                        "--legacy-service",
+                        "enterprise-agent-platform.service",
+                        "--legacy-platform-url",
+                        "http://127.0.0.1:8765",
+                        "--legacy-update-id",
+                        "frozen-e0-update",
+                        "--expected-source-commit",
+                        expected_source_commit,
+                        "--repair-failed-handoff",
+                        "--yes",
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+
+                retry = control / "retry-source-migration.sh"
+                retry_result = None
+                if result.returncode == 75 and retry.is_file():
+                    candidate.unlink()
+                    retry_result = subprocess.run(
+                        ["bash", str(retry)],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                recovery = (
+                    manager_state
+                    / "recovery"
+                    / f"ubitech-manager-{candidate_sha}"
+                )
+                return {
+                    "authority_bytes": authority_bytes,
+                    "candidate_bytes": candidate_bytes,
+                    "candidate_sha": candidate_sha,
+                    "expected_source_commit": expected_source_commit,
+                    "exact_manifest_url": exact_manifest_url,
+                    "manager_log": (
+                        manager_log.read_text(encoding="utf-8")
+                        if manager_log.exists()
+                        else ""
+                    ),
+                    "marker": read_state(legacy_data),
+                    "process_alive": process.poll() is None,
+                    "process_pid": process.pid,
+                    "recovery_bytes": recovery.read_bytes() if recovery.is_file() else b"",
+                    "recovery_mode": (
+                        recovery.stat().st_mode & 0o777 if recovery.is_file() else 0
+                    ),
+                    "recovery_path": str(recovery),
+                    "result": result,
+                    "retry_exists": retry.is_file(),
+                    "retry_result": retry_result,
+                    "retry_text": retry.read_text(encoding="utf-8") if retry.is_file() else "",
+                    "stable_after": stable.read_bytes(),
+                    "stable_before": stable_before,
+                    "systemctl_log": systemctl_log.read_text(encoding="utf-8"),
+                    "unit_after": unit.read_bytes(),
+                    "unit_before": unit_before,
+                }
+            finally:
+                control_socket.close()
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_installer_recovers_active_manager_without_preempting_authority(self):
+        observed = self._run_active_manager_recovery_installer_fixture()
+        result = observed["result"]
+        self.assertIsInstance(result, subprocess.CompletedProcess)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertNotEqual(observed["stable_before"], observed["authority_bytes"])
+        self.assertEqual(observed["stable_after"], observed["authority_bytes"])
+        self.assertEqual(observed["unit_after"], observed["unit_before"])
+        self.assertTrue(observed["process_alive"])
+        self.assertEqual(observed["recovery_bytes"], observed["candidate_bytes"])
+        self.assertEqual(observed["recovery_mode"], 0o700)
+        self.assertTrue(observed["retry_exists"])
+        self.assertEqual(observed["marker"]["state"], "idle")
+        self.assertEqual(
+            observed["marker"]["phase"],
+            "container_migration_queued",
+        )
+        retry_result = observed["retry_result"]
+        self.assertIsInstance(retry_result, subprocess.CompletedProcess)
+        self.assertEqual(retry_result.returncode, 75, retry_result.stderr)
+
+        retry_text = str(observed["retry_text"])
+        self.assertIn(str(observed["recovery_path"]), retry_text)
+        self.assertIn(str(observed["exact_manifest_url"]), retry_text)
+        self.assertIn(
+            f"--expected-source-commit {observed['expected_source_commit']}",
+            retry_text,
+        )
+        install_calls = [
+            line
+            for line in str(observed["manager_log"]).splitlines()
+            if "|install " in line
+        ]
+        self.assertEqual(len(install_calls), 2, observed["manager_log"])
+        for call in install_calls:
+            executable, arguments = call.split("|", 1)
+            self.assertEqual(executable, observed["recovery_path"])
+            self.assertIn(
+                f"--release-manifest-url {observed['exact_manifest_url']}",
+                arguments,
+            )
+            self.assertIn(
+                f"--expected-source-commit {observed['expected_source_commit']}",
+                arguments,
+            )
+        self.assertNotIn(
+            "enable --now ubitech-agent-manager.service",
+            observed["systemctl_log"],
+        )
+        self.assertNotIn(
+            "restart ubitech-agent-manager.service",
+            observed["systemctl_log"],
+        )
+
+    def test_installer_active_manager_identity_mismatch_fails_closed(self):
+        for mismatch in ("current", "running"):
+            with self.subTest(mismatch=mismatch):
+                observed = self._run_active_manager_recovery_installer_fixture(
+                    identity_mismatch=mismatch
+                )
+                result = observed["result"]
+                self.assertIsInstance(result, subprocess.CompletedProcess)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(result.returncode, 75, result.stderr)
+                install_calls = [
+                    line
+                    for line in str(observed["manager_log"]).splitlines()
+                    if "|install " in line
+                ]
+                self.assertEqual(install_calls, [])
+                self.assertEqual(observed["stable_after"], observed["stable_before"])
+                self.assertEqual(observed["unit_after"], observed["unit_before"])
+                self.assertTrue(observed["process_alive"])
+                self.assertFalse(observed["retry_exists"])
+                self.assertEqual(
+                    observed["marker"]["phase"],
+                    "container_migration_failed",
+                )
+
+    def test_installer_rejects_symlinked_data_root_before_writing(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            tools = root / "tools"
+            outside = root / "outside"
+            candidate = root / "manager"
+            for path in (home, config_home, tools, outside):
+                path.mkdir(parents=True, exist_ok=True)
+            data_root = root / "data-link"
+            data_root.symlink_to(outside, target_is_directory=True)
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            candidate.write_text(
+                "#!/bin/sh\nprintf '%s\\n' called >> \"$FAKE_MANAGER_LOG\"\n",
+                encoding="utf-8",
+            )
+            for executable in (*tools.iterdir(), candidate):
+                executable.chmod(0o755)
+            manager_log = root / "manager.log"
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(source),
+                    "--manager-binary",
+                    str(candidate),
+                    "--config",
+                    str(config_home / "ubitech-agent" / "manager.toml"),
+                    "--data-root",
+                    str(data_root),
+                    "--yes",
+                ],
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                    "FAKE_MANAGER_LOG": str(manager_log),
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 73, result.stderr)
+            self.assertIn("symlink component", result.stderr)
+            self.assertFalse(manager_log.exists())
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_failed_handoff_lock_contention_preserves_persisted_retry(self):
+        source = Path(__file__).resolve().parents[2] / "install.sh"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config_home = root / "config"
+            data_home = root / "data-home"
+            tools = root / "tools"
+            legacy = root / "legacy"
+            legacy_data = legacy / "enterprise-agent-platform" / "data"
+            package = legacy / "enterprise-agent-platform" / "enterprise_agent_platform"
+            for path in (home, config_home, data_home, tools, legacy_data, package):
+                path.mkdir(parents=True, exist_ok=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(
+                Path(__file__).resolve().parents[1]
+                / "enterprise_agent_platform"
+                / "update_state.py",
+                package / "update_state.py",
+            )
+            (legacy / ".gitignore").write_text(
+                "enterprise-agent-platform/data/\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "--quiet", str(legacy)], check=True)
+            subprocess.run(["git", "-C", str(legacy), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "-c",
+                    "user.name=ubitech test",
+                    "-c",
+                    "user.email=ubitech-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "frozen bridge",
+                ],
+                check=True,
+            )
+            expected = subprocess.run(
+                ["git", "-C", str(legacy), "rev-parse", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            candidate = root / "manager"
+            candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for executable in (*tools.iterdir(), candidate):
+                executable.chmod(0o755)
+            unit_dir = config_home / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            service = unit_dir / "ubitech-agent-migrate.service"
+            timer = unit_dir / "ubitech-agent-migrate.timer"
+            service.write_text("persisted service\n", encoding="utf-8")
+            timer.write_text("persisted timer\n", encoding="utf-8")
+            service.chmod(0o600)
+            timer.chmod(0o600)
+            args = [
+                "bash",
+                str(source),
+                "--manager-binary",
+                str(candidate),
+                "--config",
+                str(config_home / "ubitech-agent" / "manager.toml"),
+                "--data-root",
+                str(data_home / "ubitech-agent"),
+                "--migrate-from",
+                str(legacy),
+                "--legacy-data",
+                str(legacy_data),
+                "--legacy-platform-url",
+                "http://127.0.0.1:8765",
+                "--legacy-update-id",
+                "frozen-update",
+                "--expected-source-commit",
+                expected,
+                "--repair-failed-handoff",
+                "--yes",
+            ]
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(config_home),
+                "XDG_DATA_HOME": str(data_home),
+                "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
+                "PYTHON_BIN": sys.executable,
+            }
+            lock_output = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "rev-parse",
+                    "--git-path",
+                    "ubitech-agent-update.lock",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            lock_path = Path(lock_output)
+            if not lock_path.is_absolute():
+                lock_path = legacy / lock_path
+            with lock_path.open("w") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                direct = subprocess.run(
+                    args,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                persisted = subprocess.run(
+                    args,
+                    env={**env, "UBITECH_MIGRATION_RETRY_PERSISTED": "1"},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(direct.returncode, 73, direct.stderr)
+            self.assertEqual(persisted.returncode, 75, persisted.stderr)
+            self.assertEqual(service.read_text(encoding="utf-8"), "persisted service\n")
+            self.assertEqual(timer.read_text(encoding="utf-8"), "persisted timer\n")
+
     def test_installer_externalizes_retry_before_manager_release_exists(self):
         source = Path(__file__).resolve().parents[2] / "install.sh"
         installer_text = source.read_text(encoding="utf-8")
         self.assertNotIn("$legacy_root/manager/dist", installer_text)
         self.assertNotIn("$legacy_root/.migration", installer_text)
-        self.assertEqual(installer_text.count("--connect-timeout 20"), 2)
-        self.assertEqual(installer_text.count("--max-time 600"), 2)
-        self.assertEqual(installer_text.count("--retry-max-time 600"), 2)
+        self.assertEqual(installer_text.count("--connect-timeout 20"), 1)
+        self.assertEqual(installer_text.count("--max-time 600"), 1)
+        self.assertEqual(installer_text.count("--retry-max-time 600"), 1)
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -3077,12 +3754,36 @@ esac
                 / "update_state.py",
                 package / "update_state.py",
             )
+            (legacy / ".gitignore").write_text(
+                "enterprise-agent-platform/data/\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "--quiet", str(legacy)], check=True)
+            subprocess.run(["git", "-C", str(legacy), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "-c",
+                    "user.name=ubitech test",
+                    "-c",
+                    "user.email=ubitech-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "frozen bridge",
+                ],
+                check=True,
+            )
+            expected = subprocess.check_output(
+                ["git", "-C", str(legacy), "rev-parse", "HEAD"], text=True
+            ).strip()
             mark_updating(
                 legacy_data,
                 update_id="update-1",
                 instance_id="instance-1",
                 reason="test",
-                target_revision="a" * 40,
+                target_revision=expected,
                 remote="origin",
                 branch="main",
             )
@@ -3091,7 +3792,14 @@ esac
             (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (tools / "curl").write_text("#!/bin/sh\nexit 22\n", encoding="utf-8")
             (tools / "systemctl").write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\nexit 0\n",
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *'enable --now ubitech-agent-migrate.timer'*)\n"
+                "    mkdir -p \"$(dirname \"$FAKE_TIMER_WANTS_LINK\")\"\n"
+                "    ln -sfn \"$FAKE_RETRY_TIMER\" \"$FAKE_TIMER_WANTS_LINK\" ;;\n"
+                "esac\n"
+                "exit 0\n",
                 encoding="utf-8",
             )
             for executable in tools.iterdir():
@@ -3104,6 +3812,19 @@ esac
                     "XDG_DATA_HOME": str(data_home),
                     "PATH": f"{tools}{os.pathsep}/usr/bin:/bin",
                     "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
+                    "FAKE_RETRY_TIMER": str(
+                        config_home
+                        / "systemd"
+                        / "user"
+                        / "ubitech-agent-migrate.timer"
+                    ),
+                    "FAKE_TIMER_WANTS_LINK": str(
+                        config_home
+                        / "systemd"
+                        / "user"
+                        / "timers.target.wants"
+                        / "ubitech-agent-migrate.timer"
+                    ),
                     "PYTHON_BIN": sys.executable,
                     "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
                     "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
@@ -3125,7 +3846,7 @@ esac
                     "--legacy-platform-url",
                     "http://127.0.0.1:8765",
                     "--expected-source-commit",
-                    "a" * 40,
+                    expected,
                     "--yes",
                 ],
                 env=env,
@@ -3149,7 +3870,7 @@ esac
             self.assertIn("--legacy-platform-url http://127.0.0.1:8765", retry_text)
             self.assertIn("export ENTERPRISE_AUTO_UPDATE_ID=update-1", retry_text)
             self.assertIn("--legacy-update-id update-1", retry_text)
-            self.assertIn(f"--expected-source-commit {'a' * 40}", retry_text)
+            self.assertIn(f"--expected-source-commit {expected}", retry_text)
             self.assertIn("if ((status != 0 && status != 75)); then", retry_text)
             retry_syntax = subprocess.run(
                 ["bash", "-n", str(bootstrap_retry)],
@@ -3159,6 +3880,41 @@ esac
                 check=False,
             )
             self.assertEqual(retry_syntax.returncode, 0, retry_syntax.stderr)
+            lock_output = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "rev-parse",
+                    "--git-path",
+                    "ubitech-agent-update.lock",
+                ],
+                text=True,
+            ).strip()
+            lock_path = Path(lock_output)
+            if not lock_path.is_absolute():
+                lock_path = legacy / lock_path
+            with lock_path.open("w") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy_retry = subprocess.run(
+                    ["bash", str(bootstrap_retry)],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(busy_retry.returncode, 75, busy_retry.stderr)
+            retry_execution = subprocess.run(
+                ["bash", str(bootstrap_retry)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(retry_execution.returncode, 75, retry_execution.stderr)
+            self.assertNotIn("command not found", retry_execution.stderr)
             timer = config_home / "systemd" / "user" / "ubitech-agent-migrate.timer"
             service = config_home / "systemd" / "user" / "ubitech-agent-migrate.service"
             self.assertTrue(timer.is_file())
@@ -3265,7 +4021,27 @@ esac
                 package / "update_state.py",
             )
             (tools / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            (tools / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (tools / "systemctl").write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *'enable --now ubitech-agent-migrate.timer'*)\n"
+                "    mkdir -p \"$(dirname \"$FAKE_TIMER_WANTS_LINK\")\"\n"
+                "    ln -sfn \"$FAKE_RETRY_TIMER\" \"$FAKE_TIMER_WANTS_LINK\" ;;\n"
+                "esac\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            state_python = tools / "state-python"
+            state_python.write_text(
+                "#!/bin/sh\n"
+                "if [ -f \"$FAKE_PYTHON_FAILURE\" ] "
+                "&& [ \"${1:-}\" = -m ] "
+                "&& printf '%s\\n' \"$*\" | grep -q container-migration-result; "
+                "then exit 1; fi\n"
+                "exec \"$REAL_PYTHON\" \"$@\"\n",
+                encoding="utf-8",
+            )
+            python_failure = root / "python-failure"
             manager.write_text(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_MANAGER_LOG\"\n"
                 "if [ \"${1:-}\" = install ]; then\n"
@@ -3281,7 +4057,24 @@ esac
             )
             for executable in (*tools.iterdir(), manager):
                 executable.chmod(0o755)
-            expected = "b" * 40
+            (legacy / ".gitignore").write_text("data/\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(legacy)], check=True)
+            subprocess.run(
+                ["git", "-C", str(legacy), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(legacy), "config", "user.name", "Test"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(legacy), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(legacy), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            expected = subprocess.check_output(
+                ["git", "-C", str(legacy), "rev-parse", "HEAD"], text=True
+            ).strip()
             mark_updating(
                 legacy_data,
                 update_id="update-1",
@@ -3302,9 +4095,24 @@ esac
                     "FAKE_MANAGER_LOG": str(manager_log),
                     "FAKE_MANAGER_COUNT": str(manager_count),
                     "FAKE_MANAGER_RETRY_STATUS": "69",
-                    "PYTHON_BIN": sys.executable,
+                    "FAKE_PYTHON_FAILURE": str(python_failure),
+                    "REAL_PYTHON": sys.executable,
+                    "PYTHON_BIN": str(state_python),
                     "ENTERPRISE_AUTO_UPDATE_ID": "update-1",
                     "ENTERPRISE_PLATFORM_DATA": str(legacy_data),
+                    "FAKE_RETRY_TIMER": str(
+                        config_home
+                        / "systemd"
+                        / "user"
+                        / "ubitech-agent-migrate.timer"
+                    ),
+                    "FAKE_TIMER_WANTS_LINK": str(
+                        config_home
+                        / "systemd"
+                        / "user"
+                        / "timers.target.wants"
+                        / "ubitech-agent-migrate.timer"
+                    ),
                 }
             )
             result = subprocess.run(
@@ -3382,6 +4190,38 @@ esac
                     "PYTHON_BIN",
                 }:
                     retry_env.pop(key, None)
+            timer_path = (
+                config_home / "systemd" / "user" / "ubitech-agent-migrate.timer"
+            )
+            lock_output = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(legacy),
+                    "rev-parse",
+                    "--git-path",
+                    "ubitech-agent-update.lock",
+                ],
+                text=True,
+            ).strip()
+            lock_path = Path(lock_output)
+            if not lock_path.is_absolute():
+                lock_path = legacy / lock_path
+            with lock_path.open("w") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy_retry = subprocess.run(
+                    ["bash", str(retry)],
+                    env=retry_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(busy_retry.returncode, 75, busy_retry.stderr)
+            self.assertEqual(manager_count.read_text(encoding="utf-8").strip(), "1")
+            self.assertTrue(timer_path.exists(), busy_retry.stderr)
+            self.assertEqual(read_state(legacy_data)["phase"], "container_migration_queued")
+            python_failure.touch()
             retry_result = subprocess.run(
                 ["bash", str(retry)],
                 env=retry_env,
@@ -3392,14 +4232,27 @@ esac
             )
             self.assertEqual(retry_result.returncode, 69, retry_result.stderr)
             self.assertEqual(manager_count.read_text(encoding="utf-8").strip(), "2")
+            self.assertTrue(timer_path.exists(), retry_result.stderr)
+            self.assertEqual(read_state(legacy_data)["phase"], "container_migration_queued")
+            python_failure.unlink()
+            retry_result = subprocess.run(
+                ["bash", str(retry)],
+                env=retry_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(retry_result.returncode, 69, retry_result.stderr)
+            self.assertEqual(manager_count.read_text(encoding="utf-8").strip(), "3")
             install_calls = [
                 line
                 for line in manager_log.read_text(encoding="utf-8").splitlines()
                 if line.startswith("install ")
             ]
-            self.assertEqual(len(install_calls), 2)
+            self.assertEqual(len(install_calls), 3)
             self.assertFalse(
-                (config_home / "systemd" / "user" / "ubitech-agent-migrate.timer").exists()
+                timer_path.exists()
             )
             marker = read_state(legacy_data)
             self.assertEqual(marker["phase"], "container_migration_failed")
@@ -3505,6 +4358,7 @@ esac
                 f'internal_token_file = "{root / "stale" / "manager-token"}"\n',
                 encoding="utf-8",
             )
+            manager_config.chmod(0o600)
             env = os.environ.copy()
             env.update(
                 {

@@ -1,6 +1,7 @@
 package atomicfile
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 )
+
+const maxJSONBytes int64 = 8 << 20
 
 // WriteFile replaces path atomically and fsyncs both the file and its parent.
 func WriteFile(path string, data []byte, mode os.FileMode) error {
@@ -71,7 +74,14 @@ func ReadJSON(path string, value any) error {
 		return err
 	}
 	defer f.Close()
-	dec := json.NewDecoder(io.LimitReader(f, 8<<20))
+	data, err := io.ReadAll(io.LimitReader(f, maxJSONBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if int64(len(data)) > maxJSONBytes {
+		return fmt.Errorf("decode %s: JSON exceeds %d-byte limit", path, maxJSONBytes)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(value); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}

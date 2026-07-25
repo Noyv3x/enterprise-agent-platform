@@ -1,19 +1,30 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/config"
 	"github.com/ubitech/agent-platform/manager/internal/control"
 )
+
+const legacyE0DiagnosticBytes = 3_019_000 // approximately 2.88 MiB
+
+func encodeLegacyE0Response(response http.ResponseWriter, value any) {
+	response.Header().Set("Content-Type", "application/json")
+	// Deliberately omit Content-Length, matching the old Unix-socket HTTP
+	// service. A response this large is emitted with chunked framing.
+	response.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(response).Encode(value)
+}
 
 func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
 	last := time.Unix(100, 0)
@@ -193,6 +204,83 @@ func TestAwaitOperationQueuesOnlyExplicitlyRetryableFailure(t *testing.T) {
 	}
 }
 
+func TestWaitForManagerRejectsDeterministicHTTPFailureImmediately(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "manager.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusUnauthorized)
+		_, _ = response.Write([]byte(`{"error":"control authentication failed"}`))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	started := time.Now()
+	err = waitForManager(control.Client{SocketPath: socket, Token: "wrong-token", Timeout: time.Second})
+	var httpErr *control.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusUnauthorized {
+		t.Fatalf("wait error = %v, want HTTP 401", err)
+	}
+	if time.Since(started) >= time.Second {
+		t.Fatalf("deterministic authentication failure was retried: %s", time.Since(started))
+	}
+}
+
+func TestWaitForManagerDoesNotDecodeLegacyE0OversizedStatus(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "manager.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/status" {
+			http.NotFound(response, request)
+			return
+		}
+		encodeLegacyE0Response(response, map[string]any{
+			"generation":                    17,
+			"public_state":                  "idle",
+			"maintenance":                   false,
+			"active_operation_id":           "",
+			"finalize_pending_operation_id": "",
+			"error":                         strings.Repeat("e", legacyE0DiagnosticBytes),
+		})
+		encoded <- struct{}{}
+		// Keep the chunked response open. A caller attempting to ReadAll/decode it
+		// cannot finish; a status-only caller has already accepted the 2xx header.
+		<-releaseHandler
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForManager(control.Client{SocketPath: socket, Token: "control-token-0123456789abcdef", Timeout: 2 * time.Second})
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			close(releaseHandler)
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(releaseHandler)
+		t.Fatal("readiness waited for or decoded the legacy status body")
+	}
+	select {
+	case <-encoded:
+	case <-time.After(time.Second):
+		close(releaseHandler)
+		t.Fatal("legacy status JSON encoder did not emit its oversized body")
+	}
+	close(releaseHandler)
+}
+
 func TestLegacyInstallQueuesAmbiguousSuccessfulManagerResponse(t *testing.T) {
 	for _, ambiguousRoute := range []string{"operation", "poll"} {
 		t.Run(ambiguousRoute, func(t *testing.T) {
@@ -258,7 +346,7 @@ func TestLegacyInstallQueuesAmbiguousSuccessfulManagerResponse(t *testing.T) {
 	}
 }
 
-func TestLegacyInstallDoesNotReadUnboundedMigrationPlan(t *testing.T) {
+func TestLegacyInstallContinuesPastLegacyE0OversizedStatusAndConfigure(t *testing.T) {
 	root := t.TempDir()
 	dataRoot := filepath.Join(root, "data")
 	configPath := filepath.Join(root, "manager.toml")
@@ -273,27 +361,45 @@ func TestLegacyInstallDoesNotReadUnboundedMigrationPlan(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(secrets, "manager-token"), []byte("control-token-0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	operationStarted := make(chan struct{}, 1)
+	largeDiagnostic := strings.Repeat("e", legacyE0DiagnosticBytes)
+	encoded := make(chan string, 2)
+	releaseHandlers := make(chan struct{})
+	var routeMu sync.Mutex
+	var routes []string
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		response.Header().Set("Content-Type", "application/json")
+		routeMu.Lock()
+		routes = append(routes, request.Method+" "+request.URL.Path)
+		routeMu.Unlock()
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
-			_, _ = response.Write([]byte(`{"public_state":"idle"}`))
+			encodeLegacyE0Response(response, map[string]any{
+				"generation":                    17,
+				"public_state":                  "idle",
+				"maintenance":                   false,
+				"active_operation_id":           "",
+				"finalize_pending_operation_id": "",
+				"error":                         largeDiagnostic,
+			})
+			encoded <- "status"
+			<-releaseHandlers
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/migrations/legacy":
-			_, _ = response.Write(bytes.Repeat([]byte("x"), (2<<20)+1))
+			encodeLegacyE0Response(response, map[string]any{
+				"id":       "legacy-plan",
+				"status":   "configured",
+				"entries":  []map[string]any{{"path": largeDiagnostic, "action": "copy"}},
+				"warnings": []string{},
+			})
+			encoded <- "configure"
+			<-releaseHandlers
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/operations":
-			select {
-			case operationStarted <- struct{}{}:
-			default:
-			}
 			response.WriteHeader(http.StatusAccepted)
 			_, _ = response.Write([]byte(`{"operation":{"id":"op_test","status":"running"}}`))
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/operations/op_test":
-			_, _ = response.Write([]byte(`{"id":"op_test","status":"failed","retryable":true,"error":"retry later"}`))
+			_, _ = response.Write([]byte(`{"id":"op_test","status":"succeeded","finalized":true}`))
 		default:
 			http.NotFound(response, request)
 		}
@@ -301,21 +407,42 @@ func TestLegacyInstallDoesNotReadUnboundedMigrationPlan(t *testing.T) {
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
 
-	err = installCommand([]string{
-		"--config", configPath,
-		"--release-manifest-url", "https://releases.example/release.json",
-		"--legacy-root", filepath.Join(root, "legacy"),
-		"--legacy-data", filepath.Join(root, "legacy", "data"),
-		"--legacy-service", "enterprise-agent-platform.service",
-		"--expected-source-commit", strings.Repeat("a", 40),
-	})
-	started := false
+	result := make(chan error, 1)
+	go func() {
+		result <- installCommand([]string{
+			"--config", configPath,
+			"--release-manifest-url", "https://releases.example/release.json",
+			"--legacy-root", filepath.Join(root, "legacy"),
+			"--legacy-data", filepath.Join(root, "legacy", "data"),
+			"--legacy-service", "enterprise-agent-platform.service",
+			"--expected-source-commit", strings.Repeat("a", 40),
+		})
+	}()
 	select {
-	case <-operationStarted:
-		started = true
-	default:
+	case err := <-result:
+		if err != nil {
+			close(releaseHandlers)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseHandlers)
+		t.Fatal("install waited for or decoded a legacy oversized response")
 	}
-	if !errors.Is(err, errTemporary) || !started {
-		t.Fatalf("unbounded configure response blocked the idempotent install: started=%v err=%v", started, err)
+	for range 2 {
+		select {
+		case <-encoded:
+		case <-time.After(time.Second):
+			close(releaseHandlers)
+			t.Fatal("legacy JSON encoder did not emit both oversized responses")
+		}
+	}
+	close(releaseHandlers)
+
+	routeMu.Lock()
+	gotRoutes := strings.Join(routes, ",")
+	routeMu.Unlock()
+	wantRoutes := "GET /v1/status,POST /v1/migrations/legacy,POST /v1/operations,GET /v1/operations/op_test"
+	if gotRoutes != wantRoutes {
+		t.Fatalf("install did not continue through start and poll: got %s, want %s", gotRoutes, wantRoutes)
 	}
 }

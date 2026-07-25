@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +66,7 @@ type Orchestrator struct {
 }
 
 const reservationReleaseTimeout = 10 * time.Second
+const reservationRetrySeparator = "\n--- latest reservation release retry ---\n"
 
 type reservationReleaseUncertainError struct{ cause error }
 
@@ -584,7 +586,7 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 }
 
 func (o *Orchestrator) finalizeFailure(prefix string, cause error) error {
-	message := prefix + ": " + cause.Error()
+	message := journal.BoundDiagnostic(prefix + ": " + cause.Error())
 	_, _ = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
 		state.PublicState = model.StateUpdating
 		state.Maintenance = true
@@ -991,7 +993,7 @@ func (o *Orchestrator) failReservation(op model.Operation, cause error) {
 }
 
 func (o *Orchestrator) holdUnconfirmedReservation(op model.Operation, cause error) error {
-	message := cause.Error()
+	message := journal.BoundDiagnostic(cause.Error())
 	if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.Status = model.OperationRunning
 		value.Finalized = false
@@ -1029,16 +1031,12 @@ func (o *Orchestrator) recoverUnconfirmedReservation(_ context.Context, op model
 	releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
 	defer cancel()
 	if gate == nil {
-		return o.holdUnconfirmedReservation(op, errors.New("platform admission gate is not configured for reservation recovery"))
+		return o.holdUnconfirmedReservation(op, errors.New(reservationRetryDiagnostic(op.Error, "platform admission gate is not configured for reservation recovery")))
 	}
 	if err := gate.Release(releaseCtx, op.ID); err != nil {
-		original := errors.New("reservation release remains unconfirmed")
-		if op.Error != "" {
-			original = errors.New(op.Error)
-		}
-		return o.holdUnconfirmedReservation(op, errors.Join(original, fmt.Errorf("retry reservation release: %w", err)))
+		return o.holdUnconfirmedReservation(op, errors.New(reservationRetryDiagnostic(op.Error, fmt.Sprintf("retry reservation release: %v", err))))
 	}
-	message := op.Error
+	message := journal.BoundDiagnostic(op.Error)
 	if message == "" {
 		message = "operation interrupted before the admission reservation was confirmed"
 	}
@@ -1049,6 +1047,19 @@ func (o *Orchestrator) recoverUnconfirmedReservation(_ context.Context, op model
 		state.RetryAfterSeconds = 0
 	}, message, o.now())
 	return err
+}
+
+func reservationRetryDiagnostic(existing, latest string) string {
+	root, _, _ := strings.Cut(existing, reservationRetrySeparator)
+	if root == "" {
+		root = "reservation release remains unconfirmed"
+	}
+	// Bound each side before joining so the fixed separator always survives;
+	// the next recovery tick can replace, rather than append to, the latest retry.
+	componentLimit := (journal.MaxDiagnosticBytes - len(reservationRetrySeparator)) / 2
+	root = journal.BoundDiagnosticWithLimit(root, componentLimit)
+	latest = journal.BoundDiagnosticWithLimit(latest, componentLimit)
+	return journal.BoundDiagnostic(root + reservationRetrySeparator + latest)
 }
 func (o *Orchestrator) snapshot(ctx context.Context, id string) (string, error) {
 	if _, err := o.Store.SetPhase(id, model.PhaseSnapshotting, model.StateUpdating, true, "creating consistent state snapshot", o.now()); err != nil {
@@ -1353,7 +1364,7 @@ func (o *Orchestrator) event(id, event, generationID string, err error) {
 	}
 	value := logstore.Event{At: o.now(), Type: event, OperationID: id, Details: map[string]any{"generation": generationID}}
 	if err != nil {
-		value.Error = err.Error()
+		value.Error = journal.BoundDiagnostic(err.Error())
 	}
 	_ = o.Log.Append(value)
 }

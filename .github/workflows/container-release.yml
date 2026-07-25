@@ -718,6 +718,7 @@ jobs:
           cp install.sh "$stage/install.sh"
           chmod 0755 "$stage"/ubitech-manager-linux-* "$stage/install.sh"
           bash -n "$stage/install.sh"
+          (cd "$stage" && sha256sum install.sh > install.sh.sha256)
           release_tag="container-${SOURCE_COMMIT}"
           release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
           compose_sha="$(sha256sum "$stage/ubitech-compose.yaml" | awk '{print $1}')"
@@ -805,7 +806,7 @@ jobs:
               mkdir -p "$RUNNER_TEMP/existing"
               gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/existing"
               for asset in \
-                release.json ubitech-compose.yaml install.sh \
+                release.json ubitech-compose.yaml install.sh install.sh.sha256 \
                 ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
                 ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
                 test -f "$RUNNER_TEMP/existing/$asset"
@@ -831,7 +832,8 @@ jobs:
             "$STAGE/ubitech-manager-linux-arm64" \
             "$STAGE/ubitech-manager-linux-arm64.sha256" \
             "$STAGE/ubitech-compose.yaml" \
-            "$STAGE/install.sh"
+            "$STAGE/install.sh" \
+            "$STAGE/install.sh.sha256"
           # release.json is deliberately the final uploaded artifact. Publish
           # this exact generation as non-latest; the serialized promotion job
           # below owns the mutable main channel.
@@ -889,7 +891,7 @@ jobs:
           mkdir -p "$release_dir"
           gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$release_dir"
           for asset in \
-            release.json ubitech-compose.yaml install.sh \
+            release.json ubitech-compose.yaml install.sh install.sh.sha256 \
             ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
             ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
             test -f "$release_dir/$asset"
@@ -920,6 +922,10 @@ jobs:
                   sidecar = (root / f"{name}.sha256").read_text(encoding="utf-8").split()
                   if not sidecar or sidecar[0] != expected:
                       raise SystemExit(f"release checksum sidecar mismatch: {name}")
+          installer_expected = (root / "install.sh.sha256").read_text(encoding="utf-8").split()
+          installer_actual = hashlib.sha256((root / "install.sh").read_bytes()).hexdigest()
+          if not installer_expected or installer_expected[0] != installer_actual:
+              raise SystemExit("release checksum sidecar mismatch: install.sh")
           PY
           (
             cd "$release_dir"

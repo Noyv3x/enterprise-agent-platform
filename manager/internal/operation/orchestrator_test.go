@@ -1101,6 +1101,91 @@ func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
 	}
 }
 
+func TestRepeatedReservationRecoveryReplacesLatestErrorWithoutGrowth(t *testing.T) {
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &scriptedGate{releaseErr: errors.New("release-000")}
+	orchestrator := &Orchestrator{Store: store, Gate: gate}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind:               model.OperationUpdate,
+		IdempotencyKey:     "bounded-reservation-recovery",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rootCause = "confirm reservation release: original token rejection"
+	if err := orchestrator.holdUnconfirmedReservation(op, errors.New(rootCause)); err != nil {
+		t.Fatal(err)
+	}
+
+	wantLength := 0
+	for attempt := 0; attempt < 12; attempt++ {
+		gate.releaseErr = fmt.Errorf("release-%03d", attempt)
+		current, err := store.Operation(op.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := orchestrator.recoverUnconfirmedReservation(context.Background(), current); err != nil {
+			t.Fatal(err)
+		}
+		current, err = store.Operation(op.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(current.Error, rootCause+reservationRetrySeparator) ||
+			!strings.HasSuffix(current.Error, fmt.Sprintf("retry reservation release: release-%03d", attempt)) ||
+			strings.Count(current.Error, reservationRetrySeparator) != 1 ||
+			strings.Count(current.Error, "retry reservation release:") != 1 {
+			t.Fatalf("retry %d recursively amplified or lost its root: %q", attempt, current.Error)
+		}
+		if attempt == 0 {
+			wantLength = len(current.Error)
+		} else if len(current.Error) != wantLength {
+			t.Fatalf("retry diagnostic grew from %d to %d bytes", wantLength, len(current.Error))
+		}
+		state := store.State()
+		if state.LastError != current.Error || !state.Maintenance || state.ActiveOperationID != op.ID {
+			t.Fatalf("retry %d lost fail-closed state: state=%#v operation=%#v", attempt, state, current)
+		}
+	}
+
+	gate.releaseErr = nil
+	current, _ := store.Operation(op.ID)
+	if err := orchestrator.recoverUnconfirmedReservation(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := store.Operation(op.ID)
+	state := store.State()
+	if completed.Status != model.OperationFailed || !completed.Finalized || completed.Error != state.LastError ||
+		state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
+		t.Fatalf("confirmed release did not converge bounded failure: state=%#v operation=%#v", state, completed)
+	}
+}
+
+func TestReservationRecoveryBoundsTheOriginalLegacyDiagnosticOnce(t *testing.T) {
+	original := strings.Repeat("legacy reservation response was lost\n", 100000)
+	latest := "retry reservation release: current connection failure"
+	bounded := reservationRetryDiagnostic(original, latest)
+	if len(bounded) > journal.MaxDiagnosticBytes {
+		t.Fatalf("bounded retry diagnostic has %d bytes", len(bounded))
+	}
+	if !strings.Contains(bounded, fmt.Sprintf("original_bytes=%d", len(original))) ||
+		!strings.Contains(bounded, "sha256=") ||
+		!strings.HasSuffix(bounded, latest) ||
+		strings.Count(bounded, reservationRetrySeparator) != 1 {
+		t.Fatalf("first recovery did not preserve traceable root and latest retry: %q", bounded)
+	}
+	replaced := reservationRetryDiagnostic(bounded, "retry reservation release: next connection failure")
+	if strings.Count(replaced, reservationRetrySeparator) != 1 ||
+		!strings.Contains(replaced, fmt.Sprintf("original_bytes=%d", len(original))) ||
+		!strings.HasSuffix(replaced, "retry reservation release: next connection failure") {
+		t.Fatalf("subsequent recovery damaged the original truncation marker: %q", replaced)
+	}
+}
+
 func TestRecoveredRunIsRemovedFromLiveMapBeforeAnotherRecoveryAttempt(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()

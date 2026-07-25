@@ -1,9 +1,9 @@
 package control
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -11,6 +11,15 @@ import (
 	"testing"
 	"time"
 )
+
+func validManagerJSONAtSize(size int) []byte {
+	const prefix = `{"value":"`
+	const suffix = `"}`
+	if size < len(prefix)+len(suffix) {
+		panic("JSON response size is too small")
+	}
+	return []byte(prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix)
+}
 
 func TestClientSendsControlBearer(t *testing.T) {
 	t.Parallel()
@@ -125,12 +134,12 @@ func TestClientDetectsOversizedSuccessfulResponse(t *testing.T) {
 	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		response.WriteHeader(http.StatusOK)
-		_, _ = response.Write(bytes.Repeat([]byte("x"), int(maxManagerResponseBytes)+1))
+		_, _ = response.Write(validManagerJSONAtSize(int(maxManagerResponseBytes) + 1))
 	})}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
 
-	client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: time.Second}
+	client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: 10 * time.Second}
 	var result map[string]any
 	err = client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{}, &result)
 	var ambiguous *AmbiguousResponseError
@@ -139,6 +148,38 @@ func TestClientDetectsOversizedSuccessfulResponse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("oversized response reason was lost: %v", err)
+	}
+}
+
+func TestClientDecodesValidJSONAcrossLegacyCompatibilityRange(t *testing.T) {
+	for _, responseBytes := range []int{(2 << 20) + 1, int(maxManagerResponseBytes)} {
+		responseBytes := responseBytes
+		t.Run(fmt.Sprintf("bytes_%d", responseBytes), func(t *testing.T) {
+			socketPath := filepath.Join(t.TempDir(), "manager.sock")
+			listener, err := net.Listen("unix", socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusOK)
+				_, _ = response.Write(validManagerJSONAtSize(responseBytes))
+			})}
+			go func() { _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close() })
+
+			client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: 10 * time.Second}
+			var result struct {
+				Value string `json:"value"`
+			}
+			if err := client.Do(context.Background(), http.MethodGet, "/v1/status", nil, &result); err != nil {
+				t.Fatal(err)
+			}
+			wantValueBytes := responseBytes - len(`{"value":"`) - len(`"}`)
+			if len(result.Value) != wantValueBytes {
+				t.Fatalf("decoded value has %d bytes, want %d", len(result.Value), wantValueBytes)
+			}
+		})
 	}
 }
 

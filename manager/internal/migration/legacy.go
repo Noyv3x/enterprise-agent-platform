@@ -18,6 +18,7 @@ import (
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 )
 
 type FileRecord struct {
@@ -801,7 +802,7 @@ func (s *Service) backupLegacy(plan Plan, operationID string) error {
 			return err
 		}
 	}
-	return atomicfile.WriteJSON(filepath.Join(path, "migration-plan.json"), plan, 0o600)
+	return atomicfile.WriteJSON(filepath.Join(path, "migration-plan.json"), boundPlanDiagnostics(plan), 0o600)
 }
 func (s *Service) quarantineIgnored(ctx context.Context, plan Plan, operationID string) ([]string, error) {
 	result, err := s.runner().Run(ctx, "git", []string{"-C", plan.LegacyRoot, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"}, nil)
@@ -841,9 +842,10 @@ func (s *Service) loadLocked() (Plan, error) {
 	if plan.SchemaVersion != 1 {
 		return Plan{}, errors.New("unsupported legacy migration schema")
 	}
-	return plan, nil
+	return boundPlanDiagnostics(plan), nil
 }
 func (s *Service) persistLocked(plan Plan) error {
+	plan = boundPlanDiagnostics(plan)
 	if s.BeforePersist != nil {
 		if err := s.BeforePersist(plan); err != nil {
 			return err
@@ -857,6 +859,7 @@ func (s *Service) persistLocked(plan Plan) error {
 }
 
 func (s *Service) publishPlan(plan Plan) {
+	plan = boundPlanDiagnostics(plan)
 	s.stateMu.Lock()
 	s.statePlan = clonePlan(plan)
 	s.stateErr = nil
@@ -876,6 +879,33 @@ func clonePlan(plan Plan) Plan {
 	return plan
 }
 
+func boundPlanDiagnostics(plan Plan) Plan {
+	plan.Error = journal.BoundDiagnostic(plan.Error)
+	plan.ComposeCleanupErrors = boundDiagnosticList(plan.ComposeCleanupErrors)
+	return plan
+}
+
+func boundDiagnosticList(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	bounded := append([]string(nil), values...)
+	total := 0
+	for index, value := range bounded {
+		if index != 0 {
+			total++
+		}
+		total += len(value)
+	}
+	if total <= journal.MaxDiagnosticBytes {
+		return bounded
+	}
+	// Compose cleanup presents the collection as one diagnostic. Collapse an
+	// oversized collection into the same bounded head/tail projection so its
+	// original byte count and digest remain available for correlation.
+	return []string{journal.BoundDiagnostic(strings.Join(bounded, "\n"))}
+}
+
 func (s *Service) update(plan *Plan) error {
 	plan.UpdatedAt = s.now()
 	return s.persistLocked(*plan)
@@ -892,7 +922,7 @@ func (s *Service) startLegacyAfterCutoverFailure(ctx context.Context, plan *Plan
 	plan.OldServiceStopped = false
 	plan.Copied = false
 	plan.CopyPrepared = false
-	plan.Error = cause.Error()
+	plan.Error = journal.BoundDiagnostic(cause.Error())
 	plan.UpdatedAt = s.now()
 	if persistErr := s.persistLocked(*plan); persistErr != nil {
 		// The durable stopping_legacy/copy_prepared record intentionally remains.
@@ -905,7 +935,7 @@ func (s *Service) startLegacyAfterCutoverFailure(ctx context.Context, plan *Plan
 
 func (s *Service) cleanupFail(plan *Plan, err error) error {
 	plan.Status = "cleanup_pending"
-	plan.Error = err.Error()
+	plan.Error = journal.BoundDiagnostic(err.Error())
 	plan.UpdatedAt = s.now()
 	if persistErr := s.persistLocked(*plan); persistErr != nil {
 		return fmt.Errorf("%v; persist cleanup state: %w", err, persistErr)
@@ -914,7 +944,7 @@ func (s *Service) cleanupFail(plan *Plan, err error) error {
 }
 func (s *Service) fail(plan *Plan, err error) error {
 	plan.Status = "failed"
-	plan.Error = err.Error()
+	plan.Error = journal.BoundDiagnostic(err.Error())
 	plan.UpdatedAt = s.now()
 	if persistErr := s.persistLocked(*plan); persistErr != nil {
 		return fmt.Errorf("%v; persist migration failure: %w", err, persistErr)
@@ -924,7 +954,7 @@ func (s *Service) fail(plan *Plan, err error) error {
 
 func (s *Service) failCutover(ctx context.Context, plan *Plan, cause error) error {
 	plan.Status = "failed"
-	plan.Error = cause.Error()
+	plan.Error = journal.BoundDiagnostic(cause.Error())
 	plan.UpdatedAt = s.now()
 	if persistErr := s.persistLocked(*plan); persistErr != nil {
 		return s.startLegacyAfterCutoverFailure(ctx, plan, fmt.Errorf("%v; persist migration failure: %w", cause, persistErr))

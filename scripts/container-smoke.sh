@@ -29,7 +29,10 @@ for expected in \
   'OnUnitInactiveSec=2min' \
   'Persistent=true' \
   'Unit=ubitech-agent-migrate.service' \
-  'chmod 0600 "$retry_service" "$retry_timer"' \
+  'chmod 0600 "$retry_service_incoming"' \
+  'mv -f "$retry_service_incoming" "$retry_service"' \
+  'chmod 0600 "$retry_timer_incoming"' \
+  'mv -f "$retry_timer_incoming" "$retry_timer"' \
   'systemctl --user enable --now ubitech-agent-migrate.timer'; do
   grep -Fq "$expected" install.sh || fail "migration retry unit is missing: $expected"
 done
@@ -43,8 +46,12 @@ grep -Fq 'docker network inspect "$UBITECH_CORE_NETWORK"' .github/workflows/cont
   || fail "release smoke test does not verify the durable core network"
 grep -Fq 'cp install.sh "$stage/install.sh"' .github/workflows/container-release.yml \
   || fail "release assembly does not include install.sh"
+grep -Fq 'sha256sum install.sh > install.sh.sha256' .github/workflows/container-release.yml \
+  || fail "release assembly does not checksum install.sh"
 grep -Fq '"$STAGE/install.sh"' .github/workflows/container-release.yml \
   || fail "release publication does not upload install.sh"
+grep -Fq '"$STAGE/install.sh.sha256"' .github/workflows/container-release.yml \
+  || fail "release publication does not upload the install.sh checksum"
 grep -Fq -- '--latest=false' .github/workflows/container-release.yml \
   || fail "stale qualified releases are not prevented from replacing the main channel"
 grep -Fq "group: container-release-\${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}" .github/workflows/container-release.yml \
