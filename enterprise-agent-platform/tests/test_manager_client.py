@@ -8,7 +8,12 @@ import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from enterprise_agent_platform.manager_client import ManagerClient, ManagerClientError
+from enterprise_agent_platform.manager_client import (
+    MAX_MANAGER_RESPONSE_BYTES,
+    ManagerClient,
+    ManagerClientError,
+    ManagerResponseUncertainError,
+)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -30,7 +35,41 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond({"error": "unauthorized"}, 401)
             return
         self.server.requests.append(("GET", self.path, None))  # type: ignore[attr-defined]
-        if self.path == "/v1/status":
+        if self.path == "/v1/empty":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/v1/invalid":
+            raw = b'{"status":'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif self.path == "/v1/oversized":
+            raw = b"x" * (MAX_MANAGER_RESPONSE_BYTES + 1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif self.path == "/v1/truncated":
+            raw = b'{"status":'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw) + 100))
+            self.end_headers()
+            self.wfile.write(raw)
+            self.close_connection = True
+        elif self.path == "/v1/truncated-chunk":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b'20\r\n{"status":')
+            self.wfile.flush()
+            self.close_connection = True
+        elif self.path == "/v1/status":
             self._respond({"public_state": "idle", "generation": "g1"})
         elif self.path == "/v1/config":
             self._respond({"update_enabled": True, "update_interval": 300})
@@ -89,3 +128,35 @@ class ManagerClientTests(unittest.TestCase):
             client = ManagerClient(Path(td) / "missing.sock", Path(td) / "missing-token")
             with self.assertRaisesRegex(ManagerClientError, "token is unavailable"):
                 client.status()
+
+    def test_successful_but_unreadable_response_is_outcome_uncertain(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket_path = root / "manager.sock"
+            token_path = root / "token"
+            token_path.write_text("test-token\n", encoding="utf-8")
+            server = _Server(str(socket_path), _Handler)
+            server.requests = []
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                client = ManagerClient(socket_path, token_path)
+                for path in (
+                    "/v1/empty",
+                    "/v1/invalid",
+                    "/v1/oversized",
+                    "/v1/truncated",
+                ):
+                    with self.subTest(path=path), self.assertRaisesRegex(
+                        ManagerResponseUncertainError, "outcome is uncertain"
+                    ):
+                        client._request("GET", path)
+                with self.assertRaisesRegex(
+                    ManagerResponseUncertainError, "response read failed"
+                ) as caught:
+                    client._request("GET", "/v1/truncated-chunk")
+                self.assertIsNotNone(caught.exception.__cause__)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)

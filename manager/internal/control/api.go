@@ -185,7 +185,7 @@ func (a *API) startOperation(response http.ResponseWriter, request *http.Request
 	op, reused, err := a.Operations.Start(model.OperationRequest{Kind: body.Operation, IdempotencyKey: body.IdempotencyKey, ExpectedGeneration: expected, ManifestURL: body.ManifestURL, ExpectedSourceCommit: body.ExpectedSourceCommit})
 	if err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, journal.ErrGenerationConflict) || errors.Is(err, journal.ErrOperationInProgress) {
+		if errors.Is(err, journal.ErrGenerationConflict) || errors.Is(err, journal.ErrOperationInProgress) || errors.Is(err, journal.ErrIdempotencyConflict) {
 			status = http.StatusConflict
 		}
 		writeError(response, status, err.Error())
@@ -246,7 +246,15 @@ func (a *API) configureLegacy(response http.ResponseWriter, request *http.Reques
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(response, http.StatusOK, plan)
+	writeJSON(response, http.StatusOK, migrationConfigurationAcknowledgement(plan))
+}
+
+func migrationConfigurationAcknowledgement(plan migration.Plan) map[string]any {
+	return map[string]any{
+		"id":                     plan.ID,
+		"status":                 plan.Status,
+		"expected_source_commit": plan.ExpectedSourceCommit,
+	}
 }
 func (a *API) legacyPlan(response http.ResponseWriter) {
 	if a.Legacy == nil {
@@ -373,8 +381,14 @@ func decode(request *http.Request, value any) error {
 	return nil
 }
 func writeJSON(response http.ResponseWriter, status int, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		status = http.StatusInternalServerError
+		data = []byte(`{"error":"encode manager response"}`)
+	}
+	data = append(data, '\n')
 	response.WriteHeader(status)
-	_ = json.NewEncoder(response).Encode(value)
+	_, _ = response.Write(data)
 }
 func writeError(response http.ResponseWriter, status int, message string) {
 	writeJSON(response, status, map[string]string{"error": message})

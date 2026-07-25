@@ -220,6 +220,12 @@ func validatePreflightConfig(path string, verify bool, expected config.SourceMig
 	if !verify {
 		return nil
 	}
+	// Bridge releases predating the explicit token-file flag still bind every
+	// other migration input and always use the state-root default. Derive that
+	// exact path so compatibility retains the same fail-closed comparison.
+	if expected.ControlTokenFile == "" && filepath.IsAbs(expected.DataRoot) {
+		expected.ControlTokenFile = filepath.Join(filepath.Clean(expected.DataRoot), "manager", "secrets", "manager-token")
+	}
 	cfg, err := load(path)
 	if err != nil {
 		return err
@@ -518,8 +524,7 @@ func installCommand(arguments []string) error {
 		if !validExpectedSourceCommit(*expectedSourceCommit) {
 			return errors.New("--expected-source-commit must be a 40-character lowercase Git commit for source migration")
 		}
-		var plan any
-		if err := client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{"legacy_root": *legacyRoot, "legacy_data": *legacyData, "legacy_service": *legacyService, "expected_source_commit": *expectedSourceCommit}, &plan); err != nil {
+		if err := client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{"legacy_root": *legacyRoot, "legacy_data": *legacyData, "legacy_service": *legacyService, "expected_source_commit": *expectedSourceCommit}, nil); err != nil {
 			if control.IsUnavailable(err) {
 				return fmt.Errorf("%w: Manager is temporarily unavailable: %v", errTemporary, err)
 			}

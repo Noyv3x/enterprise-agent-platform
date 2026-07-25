@@ -26,6 +26,10 @@ Platform 继续拥有业务空闲判断。管理器使用内部 token 请求 rea
 
 bridge 与 Manager 的有效 control token-file 规范化绝对路径属于首迁配置指纹。已有 `manager.toml` 显式指向其它路径时，安装器必须在替换二进制、安装 unit、创建 operation 或发出 gate 请求前拒绝；默认路径必须解析为本次 bridge 使用的同一文件。HTTP 401 是确定性的桥接认证/配置故障，不能作为发布物暂不可用那样无限返回 `75`；只有已经持久化能够改变该条件的修复动作时才允许排队重试。
 
+为修复已经冻结在第一代 bridge checkout 的部署，较新的 Manager 二进制必须能够接受旧安装器尚未显式传入 token-file expectation 的预检调用，但不能省略比较：只有其它 source-migration expectations 完整且已绑定绝对 `data_root` 时，Manager 才把缺失字段推导为 `$data_root/manager/secrets/manager-token`，再与有效配置逐项核对。显式字段永远优先；自定义 token 路径、缺失 data root 或任何推导后不一致仍然 fail closed。该兼容只允许替换 Manager 工件修复控制协议，不改变 exact source manifest、checkout、数据或迁移 id。
+
+Manager control API 的成功响应必须先完整编码，再提交 2xx 状态。客户端已经收到 2xx、但它所要求的正文为空、截断、超过有界读取上限或不是合法 JSON 时，不能据此断言对应请求没有生效：配置迁移可能已经落盘，operation 也可能已经用幂等键提交。源码首迁必须把这种响应归类为结果不确定，保留或重建持久重试并返回临时状态 `75`；后续只使用相同的配置参数、exact source revision 与稳定幂等键读取或重放，由 Manager journal 决定复用正在运行的 operation、观察其终态，或在上一 attempt 明确失败后创建下一 attempt。迁移配置 mutation 的成功响应只能返回固定大小的身份与状态确认，不能把会随历史文件数量增长的完整复制、归档或校验清单作为写请求响应；install CLI 不消费该 plan，只以成功状态确认同参数的幂等 Configure 已完成。需要读取响应的客户端必须用 `limit+1` 明确识别超限，不能把静默截断伪装成普通 JSON 语法错误。不得把响应解码失败直接写成 `container_migration_failed`、删除 retry unit 后再要求操作员猜测服务端状态。确定性的 HTTP 4xx、经过结构化 JSON 返回的永久校验错误与不确定响应必须保持不同分类。
+
 任一 reserve 请求如果响应丢失或返回不确定错误，Manager 必须对同一 operation 尝试 release；只有 release 明确成功才能回到非维护失败状态。release 也失败时必须持久保持 `failed + maintenance=true`，等待恢复循环重试，不能假定 Platform 没有建立预约。`update/install`、`restart`和显式 `rollback` 都使用这一两阶段协议，且任何维护状态持久化失败都在破坏性操作前 fail closed。预约成功后所有新 Agent 消息在持久化/入队边界前收到维护响应，不存在已写消息却未建 job 的窗口。每个容器 Platform 进程必须在启动任何 Agent、知识摄取、计划任务或 Telegram worker 前，从 Manager owner socket 恢复当前持久 maintenance/finalize reservation 及其 operation id；Manager 状态不可读时容器启动失败，不能把未知状态解释为空闲。只有 Manager 对同一 operation 明确 release 后才恢复这些 worker；如果源码 marker 此时又进入阻断态，Platform 必须先重新同步 marker，不能在 Manager owner 释放和 marker owner 建立之间短暂唤醒 worker。
 
 管理器随后切换入口到维护、排空写请求并停止旧 Platform。公开状态保持：

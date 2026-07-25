@@ -46,7 +46,7 @@ ubitech-manager repair
 ubitech-manager logs
 ```
 
-命令通过 owner-only Unix socket 连接常驻管理器，并从 Manager secret 读取 control capability。Platform 使用同一 control capability 代理已通过管理员授权的操作；Runtime 只有独立 executor capability，不能访问管理 operation。所有变更操作带 operation id、幂等键和期望 generation；重复提交返回同一操作，并发冲突不启动第二个变更。管理器进程退出后根据持久 operation journal 继续、回滚或进入可诊断的 `failed`，不能猜测成功。generation 写入与提交后副作用之间必须有持久 `finalize_pending` 边界；新 Manager 先由旧二进制 watchdog 确认健康，再在仍持有 Platform 更新预约时完成并持久化旧部署完整恢复归档、旧运行物清理和 live-data cache 退役，最后才解除预约并标记 `finalized`。任一 finalize cleanup 失败都继续保持预约、维护和 `finalize_pending` 供幂等恢复，绝不能先开放后台任务再归档或删除其输入。启动恢复既要处理 operation 已完成但 generation 尚未写入，也要处理 generation 已写入但 finalize hooks 尚未完成的窗口。旧源码和数据的破坏性清理必须晚于新 Manager 健康确认，不能只以“已写 self-update intent”作为删除依据。
+命令通过 owner-only Unix socket 连接常驻管理器，并从 Manager secret 读取 control capability。Platform 使用同一 control capability 代理已通过管理员授权的操作；Runtime 只有独立 executor capability，不能访问管理 operation。所有变更操作带 operation id、幂等键和期望 generation；Manager 必须先按幂等键查找并核对 operation 类型、manifest 与 source commit 指纹，再判断 generation。相同指纹的重复提交即使携带创建前的旧 generation，也返回原操作；相同 key 携带不同指纹必须冲突。只有上一 attempt 已明确失败且调用方重新读取并提交当前 generation 时，才以同 key 创建下一 attempt。并发冲突不启动第二个变更。管理器进程退出后根据持久 operation journal 继续、回滚或进入可诊断的 `failed`，不能猜测成功。generation 写入与提交后副作用之间必须有持久 `finalize_pending` 边界；新 Manager 先由旧二进制 watchdog 确认健康，再在仍持有 Platform 更新预约时完成并持久化旧部署完整恢复归档、旧运行物清理和 live-data cache 退役，最后才解除预约并标记 `finalized`。任一 finalize cleanup 失败都继续保持预约、维护和 `finalize_pending` 供幂等恢复，绝不能先开放后台任务再归档或删除其输入。启动恢复既要处理 operation 已完成但 generation 尚未写入，也要处理 generation 已写入但 finalize hooks 尚未完成的窗口。旧源码和数据的破坏性清理必须晚于新 Manager 健康确认，不能只以“已写 self-update intent”作为删除依据。
 
 首次安装脚本只负责下载并校验管理器、执行 preflight、写 user-systemd unit 和提交 install operation。安装完成后源码目录不参与运行。源码首迁的 preflight 必须先由待安装的 Manager 使用正式配置解析器读取现有 `manager.toml`，并把其有效 `data_root`、公网 `listen`、长期 release manifest URL/channel、旧 Platform 回环 URL 和共享 control/executor Unix socket 与桥接输入逐项比较；任何不一致都必须在覆盖 Manager 二进制、写 unit 或停止旧服务前 fail-safe。下载或 operation 返回可重试状态时，安装器必须把 exact source commit、旧部署参数、legacy update id 与其状态记录器固化到 checkout 外的 owner-only retry 脚本；timer 进程不得依赖首次 transient worker 的环境继承。普通空机安装不携带这组首迁期望值，不受该一致性门影响。
 
@@ -99,11 +99,15 @@ Sandbox 容器创建时只让入口以 root 完成一次 UID/GID 映射与挂载
 
 源码更新与 Manager 首迁的提交边界不得混用。文档、Git、源码 bootstrap 或源码状态提交失败发生在新源码健康确认前，继续使用既有 Git rollback；一旦新源码已健康并进入 `source_bridge_ready`，此后安装器可能已经写入 Manager 配置、unit 或 operation journal，任何失败都不得再执行 Git reset。安装器退出码约定为：`75` 仅表示持久重试已经排队，`0` 表示 Manager operation 到达 succeeded，其它值表示需要记录的迁移交接失败。永久失败保留健康源码服务并记录非阻塞 `container_migration_failed`，不能显示成全局成功，也不能留下无错误说明的 bridge 模式。
 
+Manager 的本地 control socket 仍是跨进程网络边界。CLI 对迁移 plan、operation 创建或 operation 查询收到 2xx 却无法完整解码 JSON 时，服务端提交结果未知；首迁安装器必须按临时交接状态持久排队，而不是当作永久退出。所有可能重放的 mutation 都必须具有由同一迁移输入导出的稳定幂等身份，重连后先以 Manager state/journal 对账。服务端必须在写出状态码前完成 JSON 编码，编码失败返回结构化非 2xx；写 mutation 只返回固定大小确认，不回传可无限增长的迁移清单。客户端仍需防御进程重启、socket 断开和有界读取超限造成的截断成功响应。
+
 当前 bridge shell 在调用源码 bootstrap 时传入显式协议版本，并在 bootstrap 失败的 Git rollback 重部署前恢复原始 bridge/Manager 环境。为已部署的旧桥接 shell 保留一次兼容保护：目标 bootstrap 在缺少该协议版本且失败时，安装 checkout 外的有界回滚守护，等旧 shell 退出后清除它误持久的 bridge/Manager unit 环境并重启旧服务。该守护只恢复更新能力，不自行改变数据、checkout 或开始 Manager 迁移。正常 bootstrap 写入 bridge 环境后也必须验证运行进程而非 unit 文件：长期 Gateway 的进程环境不因 `daemon-reload` 改变，源码 bridge readiness 以受控重启后的实际四项环境为准；之后的 Manager cutover/admission readiness 还必须使用真实 Bearer 完成 reserve，不能把前一 marker 当作认证成功。
 
 支持容器首迁的 checkout 必须同时具有可执行 `install.sh` 和容器契约；只存在其中一项属于损坏发布并应 fail closed，不能静默跳过。源码更新日志位于对应 transient auto-update unit（前台模式才写旧数据目录日志），排队重试看 `ubitech-agent-migrate.service`，Manager 阶段看 `ubitech-agent-manager.service` 及 Manager state/journal。旧 `auto-update-state.json` 的成功只说明源码事务，不能用来判断容器迁移完成。
 
 在上述流程开始等待空闲和停止旧服务之前，Manager preflight 还必须通过可等待且自动回收的 `systemd-run --user` oneshot `true` transient unit 验证用户会话具备启动独立 watchdog 的能力。这个探针不修改产品状态；无法创建、等待或收集 transient unit 时首迁必须终止并保持旧服务运行，不能等到 Manager 自更新阶段才发现 watchdog 不可用。由于 release 排队可能持续很久，Manager 在取得全局空闲预约后、切换维护和停止旧服务前，必须再次读取配置、核对首次预检绑定的关键配置指纹并重跑 transient-unit 探针；复检失败要释放预约且保持旧系统运行。
+
+冻结在旧 bridge 的恢复可以只替换经过发布校验的 Manager 工件，仍由旧 checkout 的 `migrate-container --repair`、原 update id 和 exact release manifest 驱动。旧安装器未携带 token-file expectation 时，新 Manager 只能从绝对 `data_root` 推导标准 owner-only token 路径后执行同样的配置比对；不得把兼容解释为允许任意 token 文件或越过 preflight。
 
 源码树内的默认数据移动到 XDG 数据根；明确配置在源码树外的数据原地复用。旧源码 checkout 与新数据目录不得在任一方向形成祖先/后代关系；旧数据根与新数据根也必须拒绝任一方向的重叠（两者规范化后完全相同的原地采用除外），避免 staging 递归复制自身或清理旧 checkout 时触碰新权威数据。清理前必须把旧 checkout、配置、systemd unit、Compose 元数据和不与新数据目录共享的外部 data 形成 operation 绑定的可恢复归档，并记录类型、mode、size、link target 与内容 hash 清单。位于同一文件系统且不再被运行路径引用的树优先原子 rename 到备份根；跨文件系统则 copy、fsync、逐项校验后才允许删除源。工作区、附件和 Profile 已由新数据目录权威持有时可以只在归档中保存经双方计数、总字节数和 hash 对账的迁移清单，避免第二份巨大副本。未知 ignored 文件纳入同一七天隔离归档，不能静默删除。归档和迁移清单至少保留七天，并提供将 checkout、配置、unit 与外部 data 恢复到原路径的验证流程。
 

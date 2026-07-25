@@ -17,6 +17,7 @@ import (
 
 var ErrOperationInProgress = errors.New("another mutation operation is already active")
 var ErrGenerationConflict = errors.New("manager generation changed")
+var ErrIdempotencyConflict = errors.New("idempotency key belongs to a different operation request")
 
 type Store struct {
 	dir                string
@@ -83,20 +84,30 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	if req.IdempotencyKey == "" {
 		return model.Operation{}, false, errors.New("idempotency_key is required")
 	}
-	if req.ExpectedGeneration != s.state.Generation {
-		return model.Operation{}, false, ErrGenerationConflict
-	}
 	attempt := 1
 	if existing, ok, err := s.findByIdempotencyLocked(req.IdempotencyKey); err != nil {
 		return model.Operation{}, false, err
 	} else if ok {
+		if !sameOperationRequest(existing, req) {
+			return model.Operation{}, false, ErrIdempotencyConflict
+		}
 		if existing.Status != model.OperationFailed {
+			return existing, true, nil
+		}
+		// An exact replay after a lost response still carries the generation
+		// used to create the failed operation and must observe that terminal
+		// attempt. A caller explicitly starting the next attempt first reads
+		// current state and supplies its newer generation.
+		if req.ExpectedGeneration == existing.ExpectedGeneration {
 			return existing, true, nil
 		}
 		attempt = existing.Attempt + 1
 		if attempt < 2 {
 			attempt = 2
 		}
+	}
+	if req.ExpectedGeneration != s.state.Generation {
+		return model.Operation{}, false, ErrGenerationConflict
 	}
 	if s.state.ActiveOperationID != "" || s.state.FinalizePendingOperationID != "" {
 		return model.Operation{}, false, ErrOperationInProgress
@@ -126,6 +137,12 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	}
 	s.state = next
 	return op, false, nil
+}
+
+func sameOperationRequest(existing model.Operation, request model.OperationRequest) bool {
+	return existing.Kind == request.Kind &&
+		existing.TargetManifestURL == request.ManifestURL &&
+		existing.ExpectedSourceCommit == request.ExpectedSourceCommit
 }
 
 func (s *Store) Operation(id string) (model.Operation, error) {

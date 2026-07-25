@@ -32,6 +32,8 @@ Docker network
 - sandbox/host 执行路由，以及宿主执行审计；
 - 容器 generation、operation journal 和健康状态。
 
+控制 socket 的 HTTP 响应与远程网络响应采用同一不确定性边界：服务端在提交状态码前编码完整 JSON，写 mutation 只返回固定大小确认；需要正文的客户端以有界 `limit+1` 读取并区分超限。2xx 正文丢失或损坏时，调用方使用原 idempotency key 和 operation journal 对账，不能因本地 JSON 解码失败推断 mutation 未执行。
+
 管理器不拥有账号、频道、消息、OAuth 或 Agent 上下文。Platform 正常时，管理面板通过内部认证接口读取安全摘要并提交管理 operation；Platform 失败时只使用宿主 CLI 恢复。
 
 ## Python 平台

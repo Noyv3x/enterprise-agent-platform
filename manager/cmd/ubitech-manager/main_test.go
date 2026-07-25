@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"net/http"
@@ -105,6 +106,11 @@ func TestValidatePreflightConfigUsesManagerParserAndFailsClosed(t *testing.T) {
 	if err := validatePreflightConfig(configPath, true, expected); err != nil {
 		t.Fatal(err)
 	}
+	legacyExpected := expected
+	legacyExpected.ControlTokenFile = ""
+	if err := validatePreflightConfig(configPath, true, legacyExpected); err != nil {
+		t.Fatalf("legacy bridge token path was not safely derived: %v", err)
+	}
 	expected.ReleaseChannel = "candidate"
 	if err := validatePreflightConfig(configPath, true, expected); err == nil || !strings.Contains(err.Error(), "mismatch for release_channel") {
 		t.Fatalf("expected release channel mismatch, got %v", err)
@@ -116,6 +122,9 @@ func TestValidatePreflightConfigUsesManagerParserAndFailsClosed(t *testing.T) {
 	}
 	if err := validatePreflightConfig(configPath, true, expected); err == nil || !strings.Contains(err.Error(), "mismatch for internal_token_file") {
 		t.Fatalf("expected control token path mismatch, got %v", err)
+	}
+	if err := validatePreflightConfig(configPath, true, legacyExpected); err == nil || !strings.Contains(err.Error(), "mismatch for internal_token_file") {
+		t.Fatalf("legacy bridge compatibility accepted a divergent token path: %v", err)
 	}
 }
 
@@ -181,5 +190,132 @@ func TestAwaitOperationQueuesOnlyExplicitlyRetryableFailure(t *testing.T) {
 	}
 	if err := awaitOperation(client, "op_permanent", 0, true); err == nil || errors.Is(err, errTemporary) {
 		t.Fatalf("permanent source migration failure was incorrectly queued: %v", err)
+	}
+}
+
+func TestLegacyInstallQueuesAmbiguousSuccessfulManagerResponse(t *testing.T) {
+	for _, ambiguousRoute := range []string{"operation", "poll"} {
+		t.Run(ambiguousRoute, func(t *testing.T) {
+			root := t.TempDir()
+			dataRoot := filepath.Join(root, "data")
+			configPath := filepath.Join(root, "manager.toml")
+			socketPath := filepath.Join(root, "manager.sock")
+			if err := os.WriteFile(configPath, []byte("data_root = \""+dataRoot+"\"\nsocket_path = \""+socketPath+"\"\nrelease_manifest_url = \"https://releases.example/release.json\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			secrets := filepath.Join(dataRoot, "manager", "secrets")
+			controlDir := filepath.Join(dataRoot, "manager", "control")
+			if err := os.MkdirAll(secrets, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(controlDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(secrets, "manager-token"), []byte("control-token-0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				switch {
+				case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
+					_, _ = response.Write([]byte(`{"public_state":"idle"}`))
+				case request.Method == http.MethodPost && request.URL.Path == "/v1/migrations/legacy":
+					if ambiguousRoute != "migration" {
+						_, _ = response.Write([]byte(`{"status":"configured"}`))
+					}
+				case request.Method == http.MethodPost && request.URL.Path == "/v1/operations":
+					response.WriteHeader(http.StatusAccepted)
+					if ambiguousRoute != "operation" {
+						_, _ = response.Write([]byte(`{"operation":{"id":"op_test","status":"running"}}`))
+					}
+				case request.Method == http.MethodGet && request.URL.Path == "/v1/operations/op_test":
+					if ambiguousRoute != "poll" {
+						_, _ = response.Write([]byte(`{"id":"op_test","status":"failed","retryable":true,"error":"retry later"}`))
+					}
+				default:
+					http.NotFound(response, request)
+				}
+			})}
+			go func() { _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close() })
+
+			err = installCommand([]string{
+				"--config", configPath,
+				"--release-manifest-url", "https://releases.example/release.json",
+				"--legacy-root", filepath.Join(root, "legacy"),
+				"--legacy-data", filepath.Join(root, "legacy", "data"),
+				"--legacy-service", "enterprise-agent-platform.service",
+				"--expected-source-commit", strings.Repeat("a", 40),
+			})
+			if !errors.Is(err, errTemporary) {
+				t.Fatalf("ambiguous %s response did not queue source migration: %v", ambiguousRoute, err)
+			}
+		})
+	}
+}
+
+func TestLegacyInstallDoesNotReadUnboundedMigrationPlan(t *testing.T) {
+	root := t.TempDir()
+	dataRoot := filepath.Join(root, "data")
+	configPath := filepath.Join(root, "manager.toml")
+	socketPath := filepath.Join(root, "manager.sock")
+	if err := os.WriteFile(configPath, []byte("data_root = \""+dataRoot+"\"\nsocket_path = \""+socketPath+"\"\nrelease_manifest_url = \"https://releases.example/release.json\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(dataRoot, "manager", "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secrets, "manager-token"), []byte("control-token-0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operationStarted := make(chan struct{}, 1)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
+			_, _ = response.Write([]byte(`{"public_state":"idle"}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/migrations/legacy":
+			_, _ = response.Write(bytes.Repeat([]byte("x"), (2<<20)+1))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/operations":
+			select {
+			case operationStarted <- struct{}{}:
+			default:
+			}
+			response.WriteHeader(http.StatusAccepted)
+			_, _ = response.Write([]byte(`{"operation":{"id":"op_test","status":"running"}}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/operations/op_test":
+			_, _ = response.Write([]byte(`{"id":"op_test","status":"failed","retryable":true,"error":"retry later"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	err = installCommand([]string{
+		"--config", configPath,
+		"--release-manifest-url", "https://releases.example/release.json",
+		"--legacy-root", filepath.Join(root, "legacy"),
+		"--legacy-data", filepath.Join(root, "legacy", "data"),
+		"--legacy-service", "enterprise-agent-platform.service",
+		"--expected-source-commit", strings.Repeat("a", 40),
+	})
+	started := false
+	select {
+	case <-operationStarted:
+		started = true
+	default:
+	}
+	if !errors.Is(err, errTemporary) || !started {
+		t.Fatalf("unbounded configure response blocked the idempotent install: started=%v err=%v", started, err)
 	}
 }

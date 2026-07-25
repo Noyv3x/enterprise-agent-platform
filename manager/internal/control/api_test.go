@@ -1,13 +1,16 @@
 package control
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/journal"
+	"github.com/ubitech/agent-platform/manager/internal/migration"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 )
 
@@ -93,5 +96,41 @@ func TestStatusExposesDurableMaintenanceReservation(t *testing.T) {
 	}
 	if status.OperationID == nil || *status.OperationID != "op_finalize_pending" {
 		t.Fatalf("operation_id = %v, want finalize-pending operation", status.OperationID)
+	}
+}
+
+func TestWriteJSONEncodesBeforeCommittingSuccess(t *testing.T) {
+	t.Parallel()
+	response := httptest.NewRecorder()
+	writeJSON(response, http.StatusAccepted, make(chan int))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	var failure map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&failure); err != nil {
+		t.Fatalf("decode structured encoding failure: %v", err)
+	}
+	if failure["error"] != "encode manager response" {
+		t.Fatalf("unexpected failure response: %#v", failure)
+	}
+}
+
+func TestMigrationConfigurationAcknowledgementIsBounded(t *testing.T) {
+	t.Parallel()
+	plan := migration.Plan{
+		ID:                   "migration-1",
+		Status:               "configured",
+		ExpectedSourceCommit: strings.Repeat("a", 40),
+		Entries:              []migration.FileRecord{{Path: strings.Repeat("large-entry", 1<<18)}},
+	}
+	data, err := json.Marshal(migrationConfigurationAcknowledgement(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("large-entry")) || bytes.Contains(data, []byte("entries")) {
+		t.Fatalf("configuration acknowledgement leaked the unbounded migration inventory")
+	}
+	if len(data) > 512 {
+		t.Fatalf("configuration acknowledgement is unexpectedly large: %d bytes", len(data))
 	}
 }

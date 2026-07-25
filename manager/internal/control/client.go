@@ -19,6 +19,8 @@ type Client struct {
 	Timeout    time.Duration
 }
 
+const maxManagerResponseBytes int64 = 2 << 20
+
 func (c Client) Do(ctx context.Context, method, path string, body, out any) error {
 	if strings.TrimSpace(c.Token) == "" || strings.ContainsAny(c.Token, " \t\r\n") {
 		return errors.New("manager control token is missing or invalid")
@@ -53,8 +55,17 @@ func (c Client) Do(ctx context.Context, method, path string, body, out any) erro
 		return err
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	// Some idempotent calls only need the HTTP commit status. Their caller opts
+	// out of a response value explicitly so an older Manager returning a large
+	// legacy plan cannot force the CLI to buffer an inventory it never uses.
+	if response.StatusCode >= 200 && response.StatusCode < 300 && out == nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxManagerResponseBytes+1))
 	if err != nil {
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			return &AmbiguousResponseError{Method: method, Path: path, Status: response.StatusCode, Cause: fmt.Errorf("read manager response: %w", err)}
+		}
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -67,13 +78,43 @@ func (c Client) Do(ctx context.Context, method, path string, body, out any) erro
 		}
 		return &HTTPError{Status: response.StatusCode, Message: failure.Error}
 	}
+	if int64(len(data)) > maxManagerResponseBytes {
+		return &AmbiguousResponseError{
+			Method: method,
+			Path:   path,
+			Status: response.StatusCode,
+			Cause:  fmt.Errorf("manager response exceeds %d-byte limit", maxManagerResponseBytes),
+		}
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return &AmbiguousResponseError{Method: method, Path: path, Status: response.StatusCode, Cause: io.ErrUnexpectedEOF}
+	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode manager response: %w", err)
+			return &AmbiguousResponseError{Method: method, Path: path, Status: response.StatusCode, Cause: err}
 		}
 	}
 	return nil
 }
+
+// AmbiguousResponseError means the Manager committed a successful HTTP status
+// but the client could not prove what response body accompanied it. The
+// request may already have crossed its durable mutation boundary, so callers
+// must reconcile with the same idempotency identity instead of treating it as
+// a deterministic failure.
+type AmbiguousResponseError struct {
+	Method string
+	Path   string
+	Status int
+	Cause  error
+}
+
+func (e *AmbiguousResponseError) Error() string {
+	return fmt.Sprintf("decode manager response for %s %s (HTTP %d; outcome uncertain): %v", e.Method, e.Path, e.Status, e.Cause)
+}
+
+func (e *AmbiguousResponseError) Unwrap() error { return e.Cause }
 
 type HTTPError struct {
 	Status  int
@@ -81,4 +122,8 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string { return fmt.Sprintf("manager HTTP %d: %s", e.Status, e.Message) }
-func IsUnavailable(err error) bool { var netErr net.Error; return errors.As(err, &netErr) }
+func IsUnavailable(err error) bool {
+	var netErr net.Error
+	var ambiguous *AmbiguousResponseError
+	return errors.As(err, &netErr) || errors.As(err, &ambiguous)
+}

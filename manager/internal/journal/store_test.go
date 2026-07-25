@@ -20,7 +20,7 @@ func TestOperationIdempotencyAndPersistence(t *testing.T) {
 	if err != nil || reused {
 		t.Fatalf("begin: reused=%v err=%v", reused, err)
 	}
-	again, reused, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "same-request", ExpectedGeneration: store.State().Generation}, now)
+	again, reused, err := store.Begin(request, now)
 	if err != nil || !reused || again.ID != first.ID {
 		t.Fatalf("idempotency failed: %#v %v", again, err)
 	}
@@ -47,10 +47,50 @@ func TestFailedIdempotentOperationCreatesANewAttempt(t *testing.T) {
 	if _, err := store.Complete(first.ID, false, nil, "temporary failure", time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	replayed, reused, err := store.Begin(request, time.Now())
+	if err != nil || !reused || replayed.ID != first.ID || replayed.Status != model.OperationFailed {
+		t.Fatalf("exact failed response replay did not return the original attempt: %#v %v %v", replayed, reused, err)
+	}
 	request.ExpectedGeneration = store.State().Generation
 	second, reused, err := store.Begin(request, time.Now().Add(time.Second))
 	if err != nil || reused || second.ID == first.ID || second.Attempt != 2 {
 		t.Fatalf("failed request was not retried as a new attempt: %#v %v %v", second, reused, err)
+	}
+}
+
+func TestIdempotencyKeyRejectsDifferentOperationFingerprint(t *testing.T) {
+	store, err := Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := model.OperationRequest{
+		Kind:                 model.OperationInstall,
+		IdempotencyKey:       "stable-key",
+		ExpectedGeneration:   store.State().Generation,
+		ManifestURL:          "https://releases.example/one.json",
+		ExpectedSourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if _, _, err := store.Begin(request, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	staleConflict := request
+	staleConflict.ManifestURL = "https://releases.example/conflict.json"
+	if _, _, err := store.Begin(staleConflict, time.Now()); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("stale generation hid an idempotency fingerprint conflict: %v", err)
+	}
+	for _, mutate := range []func(*model.OperationRequest){
+		func(value *model.OperationRequest) { value.Kind = model.OperationUpdate },
+		func(value *model.OperationRequest) { value.ManifestURL = "https://releases.example/two.json" },
+		func(value *model.OperationRequest) {
+			value.ExpectedSourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		},
+	} {
+		conflict := request
+		conflict.ExpectedGeneration = store.State().Generation
+		mutate(&conflict)
+		if _, _, err := store.Begin(conflict, time.Now()); !errors.Is(err, ErrIdempotencyConflict) {
+			t.Fatalf("different request reused an idempotency key: %#v err=%v", conflict, err)
+		}
 	}
 }
 func TestBeginRejectsStaleGeneration(t *testing.T) {
