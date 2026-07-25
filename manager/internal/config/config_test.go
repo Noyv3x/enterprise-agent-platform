@@ -103,6 +103,7 @@ func TestValidateSourceMigrationUsesEffectiveParsedConfiguration(t *testing.T) {
 		ReleaseChannel:     "main",
 		LegacyPlatformURL:  "http://127.0.0.1:18765",
 		ControlSocketPath:  filepath.Join(dataRoot, "manager", "control", "manager.sock"),
+		ControlTokenFile:   filepath.Join(dataRoot, "manager", "secrets", "manager-token"),
 	}
 	if err := cfg.ValidateSourceMigration(expected); err != nil {
 		t.Fatal(err)
@@ -121,6 +122,7 @@ func TestValidateSourceMigrationRejectsMismatchAndIncompleteExpectations(t *test
 		ReleaseChannel:     cfg.ReleaseChannel,
 		LegacyPlatformURL:  "http://127.0.0.1:18765",
 		ControlSocketPath:  cfg.SocketPath,
+		ControlTokenFile:   cfg.ControlTokenFile(),
 	}
 	cfg.ReleaseURL = expected.ReleaseManifestURL
 	cfg.LegacyPlatformGateURL = expected.LegacyPlatformURL
@@ -134,6 +136,11 @@ func TestValidateSourceMigrationRejectsMismatchAndIncompleteExpectations(t *test
 	incomplete.ControlSocketPath = ""
 	if err := cfg.ValidateSourceMigration(incomplete); err == nil || !strings.Contains(err.Error(), "socket_path is required") {
 		t.Fatalf("expected missing socket requirement, got %v", err)
+	}
+	staleToken := cfg
+	staleToken.InternalTokenFile = filepath.Join(filepath.Dir(cfg.DataRoot), "stale", "manager-token")
+	if err := staleToken.ValidateSourceMigration(expected); err == nil || !strings.Contains(err.Error(), "mismatch for internal_token_file") {
+		t.Fatalf("expected stale control token path mismatch, got %v", err)
 	}
 }
 

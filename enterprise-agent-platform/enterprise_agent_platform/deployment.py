@@ -54,6 +54,7 @@ DEFAULT_PIP_NETWORK_RETRIES = 8
 DEFAULT_PIP_TIMEOUT_SECONDS = 120
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 120
+SERVICE_CONTROL_TIMEOUT_MARGIN_SECONDS = 30
 DEFAULT_SEARXNG_READY_TIMEOUT_SECONDS = 300
 DEFAULT_UPSTREAM_SOURCE_FETCH_TIMEOUT_SECONDS = 1800
 DEFAULT_COGNEE_INSTALL_TIMEOUT_SECONDS = 3600
@@ -62,6 +63,13 @@ AUTO_UPDATE_SOURCE_PID_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_PID"
 AUTO_UPDATE_SOURCE_MODE_ENV = "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"
 SOURCE_MIGRATION_PROTOCOL_ENV = "UBITECH_SOURCE_MIGRATION_PROTOCOL"
 CURRENT_SOURCE_MIGRATION_PROTOCOL = "2"
+SOURCE_BRIDGE_PROCESS_ENVIRONMENT_KEYS = (
+    "UBITECH_SOURCE_MIGRATION_BRIDGE",
+    SOURCE_MIGRATION_PROTOCOL_ENV,
+    "UBITECH_MANAGER_SOCKET",
+    "UBITECH_MANAGER_TOKEN_FILE",
+)
+MAX_PROCESS_ENVIRONMENT_BYTES = 2 * 1024 * 1024
 MINIMUM_NODE_VERSION = (22, 19)
 MANAGED_NODE_VERSION = "22.19.0"
 MAX_MANAGED_NODE_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -360,17 +368,87 @@ class DeploymentManager:
         if gateway_process_is_live(live_gateway) and (
             mode == "auto" or mode == live_mode
         ):
+            restart_for_bridge_environment = False
+            desired_environment = runtime_env(
+                self.paths,
+                host=host,
+                port=port,
+            )
+            bridge_environment_matches = (
+                self._live_gateway_bridge_environment_matches(
+                    live_gateway,
+                    desired_environment,
+                )
+            )
             if live_mode == "service":
+                # Re-exec inherits the current process environment, so it
+                # cannot add, change, or remove source-bridge capabilities.
+                # Compare the complete four-field contract symmetrically and
+                # restart whenever the running process differs from the unit
+                # that is about to become authoritative.
+                restart_for_bridge_environment = not bridge_environment_matches
+                if (
+                    restart_for_bridge_environment
+                    and desired_environment.get(
+                        "UBITECH_SOURCE_MIGRATION_BRIDGE"
+                    )
+                    == "1"
+                    and os.getenv(AUTO_UPDATE_SOURCE_MODE_ENV, "")
+                    .strip()
+                    .lower()
+                    == "service"
+                ):
+                    # The update may have been launched by an older deploy.sh
+                    # whose rollback bootstrap only SIGHUPs the Gateway. Arm
+                    # an external transaction guard before changing the unit;
+                    # it will force the restored unit into a new process only
+                    # if that frozen shell later resets Git to its old HEAD.
+                    _schedule_source_bridge_transition_guard(self.paths)
                 self._write_user_service(host=host, port=port)
                 self.runner.run(["systemctl", "--user", "daemon-reload"], timeout=30)
                 self.runner.run(["systemctl", "--user", "enable", self.paths.service_name], timeout=60)
-            self._reload_live_gateway(
-                host=host,
-                port=port,
-                previous_generation=int((live_gateway or {}).get("generation") or 0),
-                previous_exec_generation=int((live_gateway or {}).get("exec_generation") or 0),
-                mode=live_mode,
-            )
+            elif not bridge_environment_matches:
+                # A live foreground process cannot acquire authenticated
+                # bridge changes through SIGHUP, including removal of stale
+                # capability paths. Without a service supervisor there is no
+                # safe environment handoff, so fail before the source
+                # bootstrap can be treated as migration-ready.
+                raise DeploymentError(
+                    "the live foreground gateway cannot apply the requested source migration bridge environment"
+                )
+            if restart_for_bridge_environment:
+                # A live gateway re-execs with its own environment. Rewriting
+                # and reloading the unit therefore cannot add or change the
+                # source-bridge capability paths in that process. Restart the
+                # service at the already-drained update boundary so systemd
+                # supplies the newly written environment.
+                self.runner.run(
+                    ["systemctl", "--user", "restart", self.paths.service_name],
+                    timeout=(
+                        service_stop_timeout_seconds()
+                        + SERVICE_CONTROL_TIMEOUT_MARGIN_SECONDS
+                    ),
+                )
+                self.wait_for_service_ready(host=host, port=port)
+                restarted_gateway = read_gateway_state(self.paths.data_dir)
+                if (
+                    not gateway_process_is_live(restarted_gateway)
+                    or not self._live_gateway_bridge_environment_matches(
+                        restarted_gateway,
+                        desired_environment,
+                    )
+                ):
+                    raise DeploymentError(
+                        "the restarted platform gateway did not apply the required source migration bridge environment"
+                    )
+            else:
+                self._reload_live_gateway(
+                    host=host,
+                    port=port,
+                    previous_generation=int((live_gateway or {}).get("generation") or 0),
+                    previous_exec_generation=int((live_gateway or {}).get("exec_generation") or 0),
+                    mode=live_mode,
+                )
             if live_mode == "service":
                 self.ensure_user_linger()
             return DeploymentResult(
@@ -1177,6 +1255,27 @@ class DeploymentManager:
             raise DeploymentError(
                 "the refreshed platform gateway stopped while SearXNG was starting"
             )
+
+    @staticmethod
+    def _live_gateway_bridge_environment_matches(
+        gateway_state: dict[str, object] | None,
+        desired_environment: dict[str, str],
+    ) -> bool:
+        try:
+            pid = int((gateway_state or {}).get("pid") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        current_environment = _read_process_environment_values(
+            pid,
+            SOURCE_BRIDGE_PROCESS_ENVIRONMENT_KEYS,
+        )
+        if current_environment is None:
+            return False
+        return all(
+            current_environment.get(name, "")
+            == str(desired_environment.get(name, ""))
+            for name in SOURCE_BRIDGE_PROCESS_ENVIRONMENT_KEYS
+        )
 
     def _foreground_update_source_pid(self) -> int | None:
         """Return the authenticated handoff candidate supplied by auto-update."""
@@ -2163,6 +2262,38 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _read_process_environment_values(
+    pid: int,
+    names: tuple[str, ...],
+) -> dict[str, str] | None:
+    """Read selected values from a live Linux process environment.
+
+    A missing, inaccessible, or oversized environment is deliberately unknown:
+    callers use that result to choose a full service restart instead of assuming
+    a SIGHUP re-exec can acquire newly written systemd environment values.
+    """
+
+    if pid <= 1:
+        return None
+    try:
+        with Path(f"/proc/{pid}/environ").open("rb") as handle:
+            raw = handle.read(MAX_PROCESS_ENVIRONMENT_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_PROCESS_ENVIRONMENT_BYTES:
+        return None
+    wanted = {os.fsencode(name): name for name in names}
+    values: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        encoded_name, separator, encoded_value = entry.partition(b"=")
+        if not separator:
+            continue
+        name = wanted.get(encoded_name)
+        if name is not None:
+            values[name] = os.fsdecode(encoded_value)
+    return values
+
+
 def service_ready_timeout_seconds() -> int:
     return positive_int_env(
         "ENTERPRISE_SERVICE_READY_TIMEOUT", DEFAULT_SERVICE_READY_TIMEOUT_SECONDS
@@ -2621,6 +2752,372 @@ def main():
 if __name__ == "__main__":
     main()
 '''
+
+
+_SOURCE_BRIDGE_TRANSITION_GUARD = r'''#!/usr/bin/env python3
+import os
+import json
+import shlex
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BRIDGE_KEYS = (
+    "UBITECH_SOURCE_MIGRATION_BRIDGE",
+    "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+    "UBITECH_MANAGER_SOCKET",
+    "UBITECH_MANAGER_TOKEN_FILE",
+)
+MAX_ENVIRONMENT_BYTES = 2 * 1024 * 1024
+
+def process_start(pid):
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        tail = raw[raw.rfind(")") + 2:].split()
+        return tail[19]
+    except (OSError, IndexError):
+        return ""
+
+def parent_is_same(pid, expected_start):
+    return bool(expected_start and process_start(pid) == expected_start)
+
+def durable_handoff(data_dir, update_id, target_revision):
+    try:
+        value = json.loads(
+            (data_dir / "auto-update-state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    if (
+        not isinstance(value, dict)
+        or str(value.get("update_id") or "") != update_id
+        or str(value.get("source_revision") or "").lower() != target_revision
+    ):
+        return False
+    state = str(value.get("state") or "")
+    phase = str(value.get("phase") or "")
+    return (state, phase) in {
+        ("waiting_for_tasks", "source_bridge_ready"),
+        ("idle", "container_migration_queued"),
+        ("idle", "container_migration_failed"),
+    }
+
+def restore_unit(snapshot, destination):
+    metadata = snapshot.lstat()
+    if snapshot.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("source service rollback snapshot is not a regular file")
+    if metadata.st_uid != os.getuid() or metadata.st_size > 1024 * 1024:
+        raise RuntimeError("source service rollback snapshot ownership or size is invalid")
+    content = snapshot.read_bytes()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.transition-restore-{os.getpid()}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, stat.S_IMODE(metadata.st_mode))
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        os.chmod(destination, stat.S_IMODE(metadata.st_mode))
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def unit_bridge_environment(path):
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("restored source service unit is not a regular file")
+    if metadata.st_uid != os.getuid() or metadata.st_size > 1024 * 1024:
+        raise RuntimeError("restored source service unit ownership or size is invalid")
+    values = {name: "" for name in BRIDGE_KEYS}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("Environment="):
+            continue
+        try:
+            assignments = shlex.split(line.split("=", 1)[1])
+        except ValueError as exc:
+            raise RuntimeError("restored source service Environment is invalid") from exc
+        for assignment in assignments:
+            name, separator, value = assignment.partition("=")
+            if separator and name in values:
+                values[name] = value
+    return values
+
+def service_pid(service_name):
+    result = subprocess.run(
+        ["systemctl", "--user", "show", service_name, "--property=MainPID", "--value"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return 0
+    try:
+        return int((result.stdout or "").strip() or "0")
+    except ValueError:
+        return 0
+
+def process_bridge_environment(pid):
+    if pid <= 1:
+        return None
+    try:
+        with Path(f"/proc/{pid}/environ").open("rb") as handle:
+            raw = handle.read(MAX_ENVIRONMENT_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_ENVIRONMENT_BYTES:
+        return None
+    wanted = {os.fsencode(name): name for name in BRIDGE_KEYS}
+    values = {}
+    for entry in raw.split(b"\0"):
+        encoded_name, separator, encoded_value = entry.partition(b"=")
+        if not separator:
+            continue
+        name = wanted.get(encoded_name)
+        if name is not None:
+            values[name] = os.fsdecode(encoded_value)
+    return {name: values.get(name, "") for name in BRIDGE_KEYS}
+
+def cleanup(script, snapshot):
+    script.unlink(missing_ok=True)
+    snapshot.unlink(missing_ok=True)
+
+def main():
+    parent_pid = int(sys.argv[1])
+    parent_start = sys.argv[2]
+    root = Path(sys.argv[3])
+    data_dir = Path(sys.argv[4])
+    target_revision = sys.argv[5].lower()
+    update_id = sys.argv[6]
+    unit_path = Path(sys.argv[7])
+    snapshot = Path(sys.argv[8])
+    service_name = sys.argv[9]
+    restart_timeout = int(sys.argv[10])
+    verify_timeout = int(sys.argv[11])
+    script = Path(__file__)
+    deadline = time.monotonic() + 6 * 60 * 60
+    while parent_is_same(parent_pid, parent_start) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    if parent_is_same(parent_pid, parent_start):
+        raise RuntimeError("source update shell did not exit before recovery deadline")
+
+    # Manager cleanup removes the checkout only after a committed migration.
+    # Otherwise only the exact update ID's durable handoff marker can disarm
+    # recovery; retaining the target HEAD is not proof of success because an
+    # old shell may have refused rollback after bootstrap failed.
+    if not root.exists() or durable_handoff(
+        data_dir, update_id, target_revision
+    ):
+        cleanup(script, snapshot)
+        return
+
+    restore_unit(snapshot, unit_path)
+    expected = unit_bridge_environment(unit_path)
+    previous_pid = service_pid(service_name)
+    if process_bridge_environment(previous_pid) == expected:
+        cleanup(script, snapshot)
+        return
+    subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        check=True,
+        timeout=30,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "restart", service_name],
+        check=True,
+        timeout=restart_timeout,
+    )
+    deadline = time.monotonic() + verify_timeout
+    while time.monotonic() < deadline:
+        pid = service_pid(service_name)
+        if (
+            pid > 1
+            and pid != previous_pid
+            and process_bridge_environment(pid) == expected
+        ):
+            cleanup(script, snapshot)
+            return
+        time.sleep(0.25)
+    raise RuntimeError(
+        "restored source service did not start with the rollback unit environment"
+    )
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _schedule_source_bridge_transition_guard(paths: DeploymentPaths) -> Path:
+    """Arm rollback recovery before a service process changes bridge identity.
+
+    The guard is intentionally independent of the checked-out Python package:
+    an update launched by a frozen old deploy.sh may reset that package before
+    it exits. Unless the exact update ID reached a durable handoff phase, the
+    guard atomically restores the pre-transition unit snapshot and restarts the
+    service so that unit, rather than inherited SIGHUP environment, becomes
+    authoritative.
+    """
+
+    manager_socket = Path(os.getenv("UBITECH_MANAGER_SOCKET", "")).expanduser()
+    if not manager_socket.is_absolute() or len(manager_socket.parents) < 2:
+        raise DeploymentError(
+            "source bridge transition guard requires an absolute Manager socket"
+        )
+    update_id_raw = os.getenv("ENTERPRISE_AUTO_UPDATE_ID", "").strip()
+    if not update_id_raw:
+        raise DeploymentError(
+            "source bridge transition guard requires an auto-update ID"
+        )
+    target_revision = _git_query_stdout(
+        paths.root,
+        ["rev-parse", "--verify", "HEAD"],
+    ).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", target_revision):
+        raise DeploymentError("source bridge transition guard requires a Git HEAD")
+    recovery_dir = manager_socket.parent.parent / "recovery"
+    ensure_private_directory(recovery_dir)
+    update_id = re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "-",
+        update_id_raw[:120],
+    ) or "transition"
+    script = recovery_dir / f"source-transition-{update_id}.py"
+    snapshot = recovery_dir / f"source-transition-{update_id}.unit"
+    try:
+        unit_metadata = paths.service_path.lstat()
+        if (
+            paths.service_path.is_symlink()
+            or not stat.S_ISREG(unit_metadata.st_mode)
+            or unit_metadata.st_uid != os.getuid()
+            or unit_metadata.st_size > MAX_EXISTING_SERVICE_UNIT_BYTES
+        ):
+            raise DeploymentError(
+                "source bridge transition guard requires an owner-only regular service unit"
+            )
+        unit_content = paths.service_path.read_bytes()
+    except OSError as exc:
+        raise DeploymentError(
+            "source bridge transition guard could not snapshot the current service unit"
+        ) from exc
+    snapshot_temporary = snapshot.with_name(
+        f".{snapshot.name}.{os.getpid()}.tmp"
+    )
+    snapshot_descriptor = os.open(
+        snapshot_temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        stat.S_IMODE(unit_metadata.st_mode),
+    )
+    try:
+        with os.fdopen(
+            snapshot_descriptor, "wb", closefd=True
+        ) as snapshot_handle:
+            snapshot_handle.write(unit_content)
+            snapshot_handle.flush()
+            os.fsync(snapshot_handle.fileno())
+        os.replace(snapshot_temporary, snapshot)
+        os.chmod(snapshot, stat.S_IMODE(unit_metadata.st_mode))
+    finally:
+        try:
+            snapshot_temporary.unlink()
+        except FileNotFoundError:
+            pass
+    temporary = script.with_name(f".{script.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o700,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+            handle.write(_SOURCE_BRIDGE_TRANSITION_GUARD)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, script)
+        os.chmod(script, 0o700)
+        directory = os.open(recovery_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    parent_pid = os.getppid()
+    try:
+        raw = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8")
+        parent_start = raw[raw.rfind(")") + 2 :].split()[19]
+    except (OSError, IndexError) as exc:
+        script.unlink(missing_ok=True)
+        snapshot.unlink(missing_ok=True)
+        raise DeploymentError("could not identify the source update shell") from exc
+    if not parent_start:
+        script.unlink(missing_ok=True)
+        snapshot.unlink(missing_ok=True)
+        raise DeploymentError("could not identify the source update shell")
+    environment = {
+        key: value
+        for key in (
+            "HOME",
+            "PATH",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        )
+        if (value := os.getenv(key))
+    }
+    unit_suffix = re.sub(r"[^A-Za-z0-9_-]", "-", update_id)[:60]
+    command = [
+        "systemd-run",
+        "--user",
+        "--collect",
+        "--service-type=exec",
+        f"--unit=ubitech-agent-source-transition-{unit_suffix}-{os.getpid()}",
+        *[f"--setenv={key}={value}" for key, value in environment.items()],
+        sys.executable,
+        str(script),
+        str(parent_pid),
+        parent_start,
+        str(paths.root),
+        str(paths.data_dir),
+        target_revision,
+        update_id_raw,
+        str(paths.service_path),
+        str(snapshot),
+        paths.service_name,
+        str(service_stop_timeout_seconds() + SERVICE_CONTROL_TIMEOUT_MARGIN_SECONDS),
+        str(service_ready_timeout_seconds()),
+    ]
+    launched = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout or "").strip()
+        script.unlink(missing_ok=True)
+        snapshot.unlink(missing_ok=True)
+        raise DeploymentError(
+            "could not launch the source bridge transition guard"
+            f"{': ' + detail if detail else ''}"
+        )
+    return script
 
 
 def _schedule_legacy_bridge_rollback_guard(paths: DeploymentPaths) -> Path:

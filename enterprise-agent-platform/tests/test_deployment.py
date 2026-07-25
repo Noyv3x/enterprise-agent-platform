@@ -25,6 +25,7 @@ from enterprise_agent_platform.deployment import (
     DeploymentError,
     DeploymentManager,
     DeploymentPaths,
+    _SOURCE_BRIDGE_TRANSITION_GUARD,
     UpstreamSourceSpec,
     _LEGACY_BRIDGE_ROLLBACK_GUARD,
     _camofox_system_dependency_problems,
@@ -32,6 +33,7 @@ from enterprise_agent_platform.deployment import (
     _probe_json_health,
     _resolve_existing_service_deployment,
     _schedule_legacy_bridge_rollback_guard,
+    _schedule_source_bridge_transition_guard,
     apt_get_command_base,
     python_venv_package_names,
     runtime_env,
@@ -1025,6 +1027,458 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(["systemctl", "--user", "enable", paths.service_name], commands)
             self.assertIn(["systemctl", "--user", "restart", paths.service_name], commands)
             self.assertNotIn(["systemctl", "--user", "enable", "--now", paths.service_name], commands)
+
+    def test_live_gateway_bridge_environment_match_uses_running_process_values(self):
+        manager = DeploymentManager(DeploymentPaths.from_root(Path("/tmp/bridge-env-test")))
+        gateway = {"pid": 4242}
+        desired = {
+            "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+            "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+            "UBITECH_MANAGER_SOCKET": "/srv/manager/control/manager.sock",
+            "UBITECH_MANAGER_TOKEN_FILE": "/srv/manager/secrets/manager-token",
+        }
+        cases = (
+            ({}, False),
+            (dict(desired), True),
+            ({**desired, "UBITECH_MANAGER_SOCKET": "/old/manager.sock"}, False),
+            ({**desired, "UBITECH_MANAGER_TOKEN_FILE": "/old/manager-token"}, False),
+        )
+        for current, expected in cases:
+            with self.subTest(current=current), mock.patch(
+                "enterprise_agent_platform.deployment._read_process_environment_values",
+                return_value=current,
+            ):
+                self.assertEqual(
+                    manager._live_gateway_bridge_environment_matches(gateway, desired),
+                    expected,
+                )
+
+    def test_live_service_bridge_activation_restarts_with_new_unit_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            manager = DeploymentManager(paths, runner=runner)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_managed_sources",
+                "ensure_platform_venv",
+                "ensure_cognee_dependencies",
+                "prepare_agent_runtime_artifact",
+                "ensure_user_linger",
+                "wait_for_service_ready",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._reload_live_gateway = mock.Mock()
+            manager._live_gateway_bridge_environment_matches = mock.Mock(
+                side_effect=[False, True]
+            )
+            live_gateway = {
+                "mode": "service",
+                "pid": 4242,
+                "generation": 8,
+                "exec_generation": 2,
+            }
+            restarted_gateway = {**live_gateway, "pid": 4243, "generation": 1}
+            manager_socket = root / "manager" / "control" / "manager.sock"
+            manager_token = root / "manager" / "secrets" / "manager-token"
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                        "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                        "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                        "UBITECH_MANAGER_TOKEN_FILE": str(manager_token),
+                    },
+                    clear=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    side_effect=[live_gateway, restarted_gateway],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+            ):
+                result = manager.bootstrap(
+                    host="127.0.0.1",
+                    port=8765,
+                    mode="auto",
+                    prepare_runtime=False,
+                )
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(result.mode, "service")
+            self.assertIn(
+                ["systemctl", "--user", "restart", paths.service_name],
+                commands,
+            )
+            restart_call = next(
+                call
+                for call in runner.calls
+                if call["cmd"]
+                == ["systemctl", "--user", "restart", paths.service_name]
+            )
+            self.assertEqual(restart_call["timeout"], 150)
+            manager.wait_for_service_ready.assert_called_once_with(
+                host="127.0.0.1", port=8765
+            )
+            manager._reload_live_gateway.assert_not_called()
+            unit = paths.service_path.read_text(encoding="utf-8")
+            self.assertIn("UBITECH_SOURCE_MIGRATION_BRIDGE=1", unit)
+            self.assertIn(f"UBITECH_MANAGER_SOCKET={manager_socket}", unit)
+            self.assertIn(f"UBITECH_MANAGER_TOKEN_FILE={manager_token}", unit)
+
+    def test_live_service_bridge_transition_guard_failure_prevents_unit_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            manager = DeploymentManager(paths, runner=runner)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_managed_sources",
+                "ensure_platform_venv",
+                "ensure_cognee_dependencies",
+                "prepare_agent_runtime_artifact",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._live_gateway_bridge_environment_matches = mock.Mock(
+                return_value=False
+            )
+            live_gateway = {"mode": "service", "pid": 4242}
+            manager_socket = root / "manager" / "control" / "manager.sock"
+            manager_token = root / "manager" / "secrets" / "manager-token"
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "service",
+                        "ENTERPRISE_AUTO_UPDATE_ID": "guard-launch-failure",
+                        "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                        "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                        "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                        "UBITECH_MANAGER_TOKEN_FILE": str(manager_token),
+                    },
+                    clear=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    return_value=live_gateway,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment._schedule_source_bridge_transition_guard",
+                    side_effect=DeploymentError("guard unavailable"),
+                ) as schedule,
+            ):
+                with self.assertRaisesRegex(DeploymentError, "guard unavailable"):
+                    manager.bootstrap(
+                        host="127.0.0.1",
+                        port=8765,
+                        mode="auto",
+                        prepare_runtime=False,
+                    )
+
+            schedule.assert_called_once_with(paths)
+            self.assertFalse(paths.service_path.exists())
+            self.assertFalse(
+                any(call["cmd"][:2] == ["systemctl", "--user"] for call in runner.calls)
+            )
+
+    def test_live_service_bridge_removal_restarts_with_clean_unit_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            manager = DeploymentManager(paths, runner=runner)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_managed_sources",
+                "ensure_platform_venv",
+                "ensure_cognee_dependencies",
+                "prepare_agent_runtime_artifact",
+                "ensure_user_linger",
+                "wait_for_service_ready",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._reload_live_gateway = mock.Mock()
+            manager._live_gateway_bridge_environment_matches = mock.Mock(
+                side_effect=[False, True]
+            )
+            live_gateway = {
+                "mode": "service",
+                "pid": 4242,
+                "generation": 8,
+                "exec_generation": 2,
+            }
+            restarted_gateway = {**live_gateway, "pid": 4243, "generation": 1}
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    side_effect=[live_gateway, restarted_gateway],
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+            ):
+                result = manager.bootstrap(
+                    host="127.0.0.1",
+                    port=8765,
+                    mode="auto",
+                    prepare_runtime=False,
+                )
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertEqual(result.mode, "service")
+            self.assertIn(
+                ["systemctl", "--user", "restart", paths.service_name],
+                commands,
+            )
+            manager.wait_for_service_ready.assert_called_once_with(
+                host="127.0.0.1", port=8765
+            )
+            manager._reload_live_gateway.assert_not_called()
+            unit = paths.service_path.read_text(encoding="utf-8")
+            for name in (
+                "UBITECH_SOURCE_MIGRATION_BRIDGE",
+                "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+                "UBITECH_MANAGER_SOCKET",
+                "UBITECH_MANAGER_TOKEN_FILE",
+            ):
+                self.assertNotIn(name, unit)
+
+    def test_live_service_keeps_hot_reload_when_bridge_environment_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            manager = DeploymentManager(paths, runner=runner)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_managed_sources",
+                "ensure_platform_venv",
+                "ensure_cognee_dependencies",
+                "prepare_agent_runtime_artifact",
+                "ensure_user_linger",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._reload_live_gateway = mock.Mock()
+            manager._live_gateway_bridge_environment_matches = mock.Mock(
+                return_value=True
+            )
+            live_gateway = {
+                "mode": "service",
+                "pid": 4242,
+                "generation": 8,
+                "exec_generation": 2,
+            }
+            manager_socket = root / "manager" / "control" / "manager.sock"
+            manager_token = root / "manager" / "secrets" / "manager-token"
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                        "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                        "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                        "UBITECH_MANAGER_TOKEN_FILE": str(manager_token),
+                    },
+                    clear=True,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    return_value=live_gateway,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+            ):
+                manager.bootstrap(
+                    host="127.0.0.1",
+                    port=8765,
+                    mode="auto",
+                    prepare_runtime=False,
+                )
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertNotIn(
+                ["systemctl", "--user", "restart", paths.service_name],
+                commands,
+            )
+            manager._reload_live_gateway.assert_called_once_with(
+                host="127.0.0.1",
+                port=8765,
+                previous_generation=8,
+                previous_exec_generation=2,
+                mode="service",
+            )
+
+    def test_live_service_keeps_hot_reload_for_ordinary_updates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = RecordingDeployRunner(systemd_available=True)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            manager = DeploymentManager(paths, runner=runner)
+            for name in (
+                "ensure_python_version",
+                "ensure_node_version",
+                "ensure_layout",
+                "ensure_managed_sources",
+                "ensure_platform_venv",
+                "ensure_cognee_dependencies",
+                "prepare_agent_runtime_artifact",
+                "ensure_user_linger",
+            ):
+                setattr(manager, name, mock.Mock())
+            manager._reload_live_gateway = mock.Mock()
+            manager._live_gateway_bridge_environment_matches = mock.Mock(
+                return_value=True
+            )
+            live_gateway = {
+                "mode": "service",
+                "pid": 4242,
+                "generation": 8,
+                "exec_generation": 2,
+            }
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.read_gateway_state",
+                    return_value=live_gateway,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.gateway_process_is_live",
+                    return_value=True,
+                ),
+            ):
+                manager.bootstrap(
+                    host="127.0.0.1",
+                    port=8765,
+                    mode="auto",
+                    prepare_runtime=False,
+                )
+
+            commands = [call["cmd"] for call in runner.calls]
+            self.assertNotIn(
+                ["systemctl", "--user", "restart", paths.service_name],
+                commands,
+            )
+            manager._live_gateway_bridge_environment_matches.assert_called_once()
+            manager._reload_live_gateway.assert_called_once()
+
+    def test_live_foreground_rejects_bridge_path_change_and_removal(self):
+        for scenario in ("path-change", "removal"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runner = RecordingDeployRunner(systemd_available=False)
+                paths = DeploymentPaths.from_root(root)
+                manager = DeploymentManager(paths, runner=runner)
+                for name in (
+                    "ensure_python_version",
+                    "ensure_node_version",
+                    "ensure_layout",
+                    "ensure_managed_sources",
+                    "ensure_platform_venv",
+                    "ensure_cognee_dependencies",
+                    "prepare_agent_runtime_artifact",
+                ):
+                    setattr(manager, name, mock.Mock())
+                manager._reload_live_gateway = mock.Mock()
+                live_gateway = {
+                    "mode": "foreground",
+                    "pid": 4242,
+                    "generation": 8,
+                    "exec_generation": 2,
+                }
+                manager_socket = root / "manager" / "control" / "manager.sock"
+                manager_token = root / "manager" / "secrets" / "manager-token"
+                desired = (
+                    {
+                        "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                        "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                        "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                        "UBITECH_MANAGER_TOKEN_FILE": str(manager_token),
+                    }
+                    if scenario == "path-change"
+                    else {}
+                )
+                current = {
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                    "UBITECH_MANAGER_SOCKET": "/old/manager.sock",
+                    "UBITECH_MANAGER_TOKEN_FILE": "/old/manager-token",
+                }
+
+                with (
+                    mock.patch.dict(os.environ, desired, clear=True),
+                    mock.patch(
+                        "enterprise_agent_platform.deployment.read_gateway_state",
+                        return_value=live_gateway,
+                    ),
+                    mock.patch(
+                        "enterprise_agent_platform.deployment.gateway_process_is_live",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "enterprise_agent_platform.deployment._read_process_environment_values",
+                        return_value=current,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        DeploymentError,
+                        "live foreground gateway cannot apply",
+                    ):
+                        manager.bootstrap(
+                            host="127.0.0.1",
+                            port=8765,
+                            mode="auto",
+                            prepare_runtime=False,
+                        )
+
+                manager._reload_live_gateway.assert_not_called()
+                self.assertFalse(
+                    any(
+                        call["cmd"][:2] == ["systemctl", "--user"]
+                        for call in runner.calls
+                    )
+                )
 
     def test_live_gateway_reload_waits_for_gateway_exec_and_updated_code(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2240,6 +2694,305 @@ class DeploymentTests(unittest.TestCase):
             )
             self.assertFalse(guard.exists())
 
+    def test_source_bridge_transition_guard_restarts_frozen_old_rollback_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=checkout,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Deploy Test"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "version.txt").write_text("rolled back\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "old"],
+                cwd=checkout,
+                check=True,
+            )
+            target_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+            ).strip()
+            unit = root / "legacy.service"
+            unit.write_text(
+                "\n".join(
+                    [
+                        "[Service]",
+                        'Environment="UBITECH_SOURCE_MIGRATION_BRIDGE=1"',
+                        'Environment="UBITECH_SOURCE_MIGRATION_PROTOCOL=2"',
+                        'Environment="UBITECH_MANAGER_SOCKET=/new/manager.sock"',
+                        'Environment="UBITECH_MANAGER_TOKEN_FILE=/new/manager-token"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            snapshot = root / "legacy-original.unit"
+            snapshot.write_text(
+                "[Service]\nEnvironment=\"ENTERPRISE_PLATFORM_DATA=/srv/data\"\n",
+                encoding="utf-8",
+            )
+            data_dir = root / "data"
+            data_dir.mkdir()
+            (data_dir / "auto-update-state.json").write_text(
+                json.dumps(
+                    {
+                        "state": "waiting_for_tasks",
+                        "phase": "source_bridge_ready",
+                        "update_id": "frozen-e0-update",
+                        "source_revision": "0" * 40,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            guard = root / "transition-guard.py"
+            guard.write_text(_SOURCE_BRIDGE_TRANSITION_GUARD, encoding="utf-8")
+            guard.chmod(0o700)
+            tools = root / "tools"
+            tools.mkdir()
+            pid_file = root / "service.pid"
+            systemctl_log = root / "systemctl.log"
+            bridge_environment = os.environ.copy()
+            bridge_environment.update(
+                {
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_SOURCE_MIGRATION_PROTOCOL": "2",
+                    "UBITECH_MANAGER_SOCKET": "/new/manager.sock",
+                    "UBITECH_MANAGER_TOKEN_FILE": "/new/manager-token",
+                }
+            )
+            old_process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                env=bridge_environment,
+            )
+            pid_file.write_text(str(old_process.pid), encoding="utf-8")
+            fake_systemctl = tools / "systemctl"
+            fake_systemctl.write_text(
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  *" --property=MainPID --value") cat "$SERVICE_PID_FILE" ;;
+  *" restart "*)
+    kill "$(cat "$SERVICE_PID_FILE")" 2>/dev/null || true
+    env -u UBITECH_SOURCE_MIGRATION_BRIDGE \
+      -u UBITECH_SOURCE_MIGRATION_PROTOCOL \
+      -u UBITECH_MANAGER_SOCKET \
+      -u UBITECH_MANAGER_TOKEN_FILE \
+      "$TEST_PYTHON" -c 'import time; time.sleep(60)' \
+      </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$SERVICE_PID_FILE"
+    ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+            environment = os.environ.copy()
+            for name in (
+                "UBITECH_SOURCE_MIGRATION_BRIDGE",
+                "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+                "UBITECH_MANAGER_SOCKET",
+                "UBITECH_MANAGER_TOKEN_FILE",
+            ):
+                environment.pop(name, None)
+            environment.update(
+                {
+                    "PATH": f"{tools}:{environment.get('PATH', '')}",
+                    "SYSTEMCTL_LOG": str(systemctl_log),
+                    "SERVICE_PID_FILE": str(pid_file),
+                    "TEST_PYTHON": sys.executable,
+                }
+            )
+            new_pid = 0
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(guard),
+                        "999999999",
+                        "not-the-same-process",
+                        str(checkout),
+                        str(data_dir),
+                        target_revision,
+                        "frozen-e0-update",
+                        str(unit),
+                        str(snapshot),
+                        "legacy.service",
+                        "5",
+                        "5",
+                    ],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                new_pid = int(pid_file.read_text(encoding="utf-8"))
+                self.assertNotEqual(new_pid, old_process.pid)
+                process_environment = Path(f"/proc/{new_pid}/environ").read_bytes()
+                for name in (
+                    b"UBITECH_SOURCE_MIGRATION_BRIDGE=",
+                    b"UBITECH_SOURCE_MIGRATION_PROTOCOL=",
+                    b"UBITECH_MANAGER_SOCKET=",
+                    b"UBITECH_MANAGER_TOKEN_FILE=",
+                ):
+                    self.assertNotIn(name, process_environment)
+                actions = systemctl_log.read_text(encoding="utf-8")
+                self.assertIn("--user daemon-reload", actions)
+                self.assertIn("--user restart legacy.service", actions)
+                self.assertFalse(guard.exists())
+                self.assertFalse(snapshot.exists())
+            finally:
+                old_process.terminate()
+                try:
+                    old_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    old_process.kill()
+                if new_pid > 1:
+                    try:
+                        os.kill(new_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+    def test_source_bridge_transition_guard_is_noop_for_committed_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Deploy Test"],
+                cwd=root,
+                check=True,
+            )
+            (root / "version.txt").write_text("target\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "target"],
+                cwd=root,
+                check=True,
+            )
+            target_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            data_dir = root / "data"
+            data_dir.mkdir()
+            (data_dir / "auto-update-state.json").write_text(
+                json.dumps(
+                    {
+                        "state": "waiting_for_tasks",
+                        "phase": "source_bridge_ready",
+                        "update_id": "committed-update",
+                        "source_revision": target_revision,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            guard = root.parent / "transition-noop.py"
+            guard.write_text(_SOURCE_BRIDGE_TRANSITION_GUARD, encoding="utf-8")
+            guard.chmod(0o700)
+            snapshot = root.parent / "transition-noop.unit"
+            snapshot.write_text("[Service]\n", encoding="utf-8")
+            tools = root / "tools"
+            tools.mkdir()
+            fake_systemctl = tools / "systemctl"
+            fake_systemctl.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            fake_systemctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{tools}:{environment.get('PATH', '')}"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(guard),
+                    "999999999",
+                    "not-the-same-process",
+                    str(root),
+                    str(data_dir),
+                    target_revision,
+                    "committed-update",
+                    str(root / "unused.service"),
+                    str(snapshot),
+                    "legacy.service",
+                    "5",
+                    "5",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(guard.exists())
+            self.assertFalse(snapshot.exists())
+
+    def test_source_bridge_transition_guard_is_externalized_before_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = replace(
+                DeploymentPaths.from_root(root),
+                service_dir=root / "systemd-user",
+            )
+            paths.service_dir.mkdir(parents=True)
+            paths.service_path.write_text("[Service]\n", encoding="utf-8")
+            manager_socket = root / "manager-data" / "manager" / "control" / "manager.sock"
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                        "ENTERPRISE_AUTO_UPDATE_ID": "frozen-e0-update",
+                        "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "service",
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment._git_query_stdout",
+                    return_value="a" * 40,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.deployment.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as launch,
+            ):
+                script = _schedule_source_bridge_transition_guard(paths)
+
+            self.assertTrue(script.is_file())
+            self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+            command = launch.call_args.args[0]
+            self.assertEqual(
+                command[:4],
+                ["systemd-run", "--user", "--collect", "--service-type=exec"],
+            )
+            self.assertTrue(
+                any(
+                    part.startswith("--unit=ubitech-agent-source-transition-")
+                    for part in command
+                )
+            )
+            self.assertIn(str(root), command)
+            self.assertIn(str(paths.data_dir), command)
+            self.assertIn("a" * 40, command)
+            self.assertIn("frozen-e0-update", command)
+            snapshot = script.with_suffix(".unit")
+            self.assertTrue(snapshot.is_file())
+            self.assertEqual(snapshot.read_text(encoding="utf-8"), "[Service]\n")
+
     def test_legacy_bridge_rollback_guard_is_externalized_owner_only(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2607,6 +3360,17 @@ class DeploymentTests(unittest.TestCase):
                 manager_calls,
             )
             self.assertIn("--expect-control-socket", manager_calls)
+            self.assertIn(
+                "--expect-control-token-file "
+                + str(
+                    data_home
+                    / "ubitech-agent"
+                    / "manager"
+                    / "secrets"
+                    / "manager-token"
+                ),
+                manager_calls,
+            )
             self.assertIn("--probe-user-systemd-transient", manager_calls)
             self.assertIn(f"--expected-source-commit {expected}", manager_calls)
 
@@ -2714,7 +3478,7 @@ class DeploymentTests(unittest.TestCase):
             candidate.write_text(
                 "#!/bin/sh\n"
                 "if [ \"${1:-}\" = preflight ]; then\n"
-                "  printf '%s\\n' 'source migration config mismatch for listen' >&2\n"
+                "  printf '%s\\n' 'source migration config mismatch for internal_token_file' >&2\n"
                 "  exit 1\n"
                 "fi\n"
                 "exit 0\n",
@@ -2737,7 +3501,8 @@ class DeploymentTests(unittest.TestCase):
                 'listen = "127.0.0.1:8080"\n'
                 'release_manifest_url = "https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/release.json"\n'
                 'release_channel = "main"\n'
-                'legacy_platform_gate_url = "http://127.0.0.1:8765"\n',
+                'legacy_platform_gate_url = "http://127.0.0.1:8765"\n'
+                f'internal_token_file = "{root / "stale" / "manager-token"}"\n',
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -2772,7 +3537,10 @@ class DeploymentTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn("source migration config mismatch", result.stderr)
+            self.assertIn(
+                "source migration config mismatch for internal_token_file",
+                result.stderr,
+            )
             self.assertEqual(stable.read_text(encoding="utf-8"), "existing-manager\n")
             self.assertEqual(unit.read_text(encoding="utf-8"), "existing-unit\n")
 
@@ -3608,6 +4376,7 @@ exec {shlex.quote(sys.executable)} "$@"
                     "PYTHON_BIN": str(fake_python),
                     "FAKE_DEPLOY_LOG": str(deploy_log),
                     "UBITECH_DATA_ROOT": str(base / "manager-data"),
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "foreground",
                 }
             )
 
@@ -3803,59 +4572,172 @@ exec {shlex.quote(sys.executable)} "$@"
             subprocess.run(["git", "commit", "-q", "-m", "bridge"], cwd=upstream, check=True)
 
             fake_python = make_fake_deploy_python(base)
+            python_wrapper = base / "python-wrapper"
+            python_wrapper.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = - ]; then\n"
+                f"  exec {shlex.quote(sys.executable)} \"$@\"\n"
+                "fi\n"
+                f"exec {shlex.quote(str(fake_python))} \"$@\"\n",
+                encoding="utf-8",
+            )
+            python_wrapper.chmod(0o755)
             deploy_log = base / "deploy.log"
             bridge_env_log = base / "bridge-env.log"
             legacy_data = base / "legacy-data"
             legacy_data.mkdir()
-            manager_root = base / "manager-data"
+            # The updater shell intentionally has no bridge variables.  The
+            # live service and its owner-controlled unit are the rollback
+            # source of truth, including systemd's doubled-percent encoding.
+            manager_root = base / "manager%data"
+            tools = base / "tools"
+            tools.mkdir()
+            pid_file = base / "rollback-service.pid"
+            systemctl_log = base / "rollback-systemctl.log"
+            service_unit = base / "enterprise-agent-platform.service"
+            manager_socket = manager_root / "manager" / "control" / "manager.sock"
+            manager_token = manager_root / "manager" / "secrets" / "manager-token"
+            service_unit.write_text(
+                "[Service]\n"
+                f"WorkingDirectory={checkout / 'enterprise-agent-platform'}\n"
+                'Environment="UBITECH_SOURCE_MIGRATION_BRIDGE=1"\n'
+                'Environment="UBITECH_SOURCE_MIGRATION_PROTOCOL=7"\n'
+                "Environment=\"UBITECH_MANAGER_SOCKET="
+                f"{str(manager_socket).replace('%', '%%')}\"\n"
+                "Environment=\"UBITECH_MANAGER_TOKEN_FILE="
+                f"{str(manager_token).replace('%', '%%')}\"\n",
+                encoding="utf-8",
+            )
+            stale_environment = os.environ.copy()
+            stale_environment.update(
+                {
+                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_SOURCE_MIGRATION_PROTOCOL": "7",
+                    "UBITECH_MANAGER_SOCKET": str(manager_socket),
+                    "UBITECH_MANAGER_TOKEN_FILE": str(manager_token),
+                }
+            )
+            stale_process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                env=stale_environment,
+            )
+            pid_file.write_text(str(stale_process.pid), encoding="utf-8")
+            fake_systemctl = tools / "systemctl"
+            fake_systemctl.write_text(
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  *" --property=FragmentPath --value") printf '%s\n' "$SERVICE_UNIT_FILE" ;;
+  *" --property=MainPID --value") cat "$SERVICE_PID_FILE" ;;
+  *" restart "*)
+    kill "$(cat "$SERVICE_PID_FILE")" 2>/dev/null || true
+    env \
+      UBITECH_SOURCE_MIGRATION_BRIDGE="$TEST_ORIGINAL_BRIDGE" \
+      UBITECH_SOURCE_MIGRATION_PROTOCOL="$TEST_ORIGINAL_PROTOCOL" \
+      UBITECH_MANAGER_SOCKET="$TEST_ORIGINAL_SOCKET" \
+      UBITECH_MANAGER_TOKEN_FILE="$TEST_ORIGINAL_TOKEN_FILE" \
+      "$TEST_PYTHON" -c 'import time; time.sleep(60)' \
+      </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$SERVICE_PID_FILE"
+    ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
             env = os.environ.copy()
-            env.pop("UBITECH_SOURCE_MIGRATION_BRIDGE", None)
-            env.pop("UBITECH_MANAGER_SOCKET", None)
-            env.pop("UBITECH_MANAGER_TOKEN_FILE", None)
+            for name in (
+                "UBITECH_SOURCE_MIGRATION_BRIDGE",
+                "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+                "UBITECH_MANAGER_SOCKET",
+                "UBITECH_MANAGER_TOKEN_FILE",
+            ):
+                env.pop(name, None)
             env.update(
                 {
-                    "PYTHON_BIN": str(fake_python),
+                    "PYTHON_BIN": str(python_wrapper),
                     "FAKE_DEPLOY_LOG": str(deploy_log),
                     "FAKE_BRIDGE_ENV_LOG": str(bridge_env_log),
                     "FAKE_FAIL_NEW": "1",
                     "UBITECH_DATA_ROOT": str(manager_root),
+                    "ENTERPRISE_AUTO_UPDATE_SOURCE_MODE": "service",
+                    "PATH": f"{tools}:{env.get('PATH', '')}",
+                    "SYSTEMCTL_LOG": str(systemctl_log),
+                    "SERVICE_PID_FILE": str(pid_file),
+                    "SERVICE_UNIT_FILE": str(service_unit),
+                    "TEST_PYTHON": sys.executable,
+                    "TEST_ORIGINAL_BRIDGE": "1",
+                    "TEST_ORIGINAL_PROTOCOL": "7",
+                    "TEST_ORIGINAL_SOCKET": str(manager_socket),
+                    "TEST_ORIGINAL_TOKEN_FILE": str(manager_token),
                 }
             )
+            new_pid = 0
+            try:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(checkout / "deploy.sh"),
+                        "update",
+                        "--data",
+                        str(legacy_data),
+                    ],
+                    cwd=checkout,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
 
-            result = subprocess.run(
-                [
-                    "bash",
-                    str(checkout / "deploy.sh"),
-                    "update",
-                    "--data",
-                    str(legacy_data),
-                ],
-                cwd=checkout,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(
-                subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
-                ).strip(),
-                old_sha,
-            )
-            self.assertEqual(
-                bridge_env_log.read_text(encoding="utf-8").splitlines(),
-                [
-                    "1",
-                    str(manager_root / "manager" / "control" / "manager.sock"),
-                    str(manager_root / "manager" / "secrets" / "manager-token"),
-                    "",
-                    "",
-                    "",
-                ],
-            )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+                    ).strip(),
+                    old_sha,
+                )
+                self.assertEqual(
+                    bridge_env_log.read_text(encoding="utf-8").splitlines(),
+                    [
+                        "1",
+                        str(manager_socket),
+                        str(manager_token),
+                        "1",
+                        str(manager_socket),
+                        str(manager_token),
+                        "1",
+                        str(manager_socket),
+                        str(manager_token),
+                    ],
+                )
+                actions = systemctl_log.read_text(encoding="utf-8")
+                self.assertIn("--user daemon-reload", actions)
+                self.assertIn(
+                    "--user restart enterprise-agent-platform.service", actions
+                )
+                new_pid = int(pid_file.read_text(encoding="utf-8"))
+                self.assertNotEqual(new_pid, stale_process.pid)
+                process_environment = Path(f"/proc/{new_pid}/environ").read_bytes()
+                for expected in (
+                    b"UBITECH_SOURCE_MIGRATION_BRIDGE=1",
+                    b"UBITECH_SOURCE_MIGRATION_PROTOCOL=7",
+                    os.fsencode(f"UBITECH_MANAGER_SOCKET={manager_socket}"),
+                    os.fsencode(f"UBITECH_MANAGER_TOKEN_FILE={manager_token}"),
+                ):
+                    self.assertIn(expected + b"\0", process_environment)
+            finally:
+                stale_process.terminate()
+                try:
+                    stale_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    stale_process.kill()
+                if new_pid > 1:
+                    try:
+                        os.kill(new_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
 
     def test_migration_resume_uses_exact_checkout_without_git_remote_or_bootstrap(self):
         if not shutil.which("git") or not shutil.which("flock"):

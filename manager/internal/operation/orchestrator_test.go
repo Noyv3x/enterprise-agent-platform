@@ -793,6 +793,273 @@ func TestReservationResponseUncertaintyIsReleasedBeforeFailure(t *testing.T) {
 	}
 }
 
+func TestInitialSourceMigrationAuthenticationRejectionIsPermanent(t *testing.T) {
+	releaseServer, manifestURL := testReleaseServer(t)
+	defer releaseServer.Close()
+	var reserveCalls, releaseCalls int
+	gateServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/internal/manager/update/readiness":
+			reserveCalls++
+			http.Error(response, "invalid manager token", http.StatusUnauthorized)
+		case "/internal/manager/update/release":
+			releaseCalls++
+			http.Error(response, "invalid manager token", http.StatusUnauthorized)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer gateServer.Close()
+
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	legacy := &preflightLegacy{}
+	gate := HTTPGate{BaseURL: gateServer.URL, Token: "wrong-manager-token", Client: gateServer.Client()}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy,
+		Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: manifestURL,
+		Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "source-auth-rejection",
+		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	if completed.Status != model.OperationFailed || completed.Retryable ||
+		state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
+		t.Fatalf("authentication rejection was not a permanent reversible failure: operation=%#v state=%#v", completed, state)
+	}
+	if !strings.Contains(completed.Error, "authentication configuration was rejected") ||
+		!strings.Contains(completed.Error, "HTTP 401") {
+		t.Fatalf("authentication failure was not diagnosed clearly: %q", completed.Error)
+	}
+	if reserveCalls != 1 || releaseCalls != 0 {
+		t.Fatalf("definitive first-reserve rejection used the uncertainty release path: reserve=%d release=%d", reserveCalls, releaseCalls)
+	}
+	if legacy.preflights != 0 || legacy.cutovers != 0 || legacy.rollbacks != 0 {
+		t.Fatalf("authentication failure crossed the source cutover boundary: %#v", legacy)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") || strings.Contains(calls, "migrate") {
+		t.Fatalf("authentication failure reached destructive engine work: %s", calls)
+	}
+}
+
+func TestConfirmationAuthenticationRejectionStillReleasesFailClosed(t *testing.T) {
+	releaseServer, manifestURL := testReleaseServer(t)
+	defer releaseServer.Close()
+	var reserveCalls, releaseCalls int
+	gateServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/internal/manager/update/readiness":
+			reserveCalls++
+			if reserveCalls == 1 {
+				_, _ = response.Write([]byte(`{"ready":true,"reserved":true}`))
+				return
+			}
+			http.Error(response, "invalid manager token", http.StatusUnauthorized)
+		case "/internal/manager/update/release":
+			releaseCalls++
+			http.Error(response, "invalid manager token", http.StatusUnauthorized)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer gateServer.Close()
+
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	gate := HTTPGate{BaseURL: gateServer.URL, Token: "rotated-manager-token", Client: gateServer.Client()}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{},
+		ReleasesDir: t.TempDir(), ManifestURL: manifestURL, Channel: "main",
+		ReleaseClient: release.Client{HTTP: releaseServer.Client()},
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "confirmation-auth-rejection",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	pending, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	if pending.Status != model.OperationRunning ||
+		pending.ReservationStatus != model.ReservationReleaseUncertain ||
+		state.ActiveOperationID != op.ID || !state.Maintenance || state.PublicState != model.StateFailed {
+		t.Fatalf("post-reservation authentication failure did not remain fail-closed: operation=%#v state=%#v", pending, state)
+	}
+	if reserveCalls != 2 || releaseCalls != 1 {
+		t.Fatalf("post-reservation authentication failure skipped same-id release: reserve=%d release=%d", reserveCalls, releaseCalls)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") || strings.Contains(calls, "migrate") {
+		t.Fatalf("unconfirmed release reached destructive engine work: %s", calls)
+	}
+}
+
+func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextInstallAttempt(t *testing.T) {
+	releaseServer, manifestURL := testReleaseServer(t)
+	defer releaseServer.Close()
+
+	const token = "manager-token"
+	type gateRequest struct {
+		path        string
+		operationID string
+		authorized  bool
+	}
+	var gateMu sync.Mutex
+	acceptToken := true
+	requests := make([]gateRequest, 0, 7)
+	gateServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body struct {
+			OperationID string `json:"operation_id"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(response, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		gateMu.Lock()
+		authorized := acceptToken && request.Header.Get("Authorization") == "Bearer "+token
+		requests = append(requests, gateRequest{
+			path: request.URL.Path, operationID: body.OperationID, authorized: authorized,
+		})
+		if authorized && request.URL.Path == "/internal/manager/update/readiness" {
+			successfulReserves := 0
+			for _, item := range requests {
+				if item.path == "/internal/manager/update/readiness" && item.authorized {
+					successfulReserves++
+				}
+			}
+			if successfulReserves == 1 {
+				// Reproduce the incident: the first reservation reaches Platform,
+				// then the long-lived Gateway keeps a stale token for both the
+				// confirmation request and the Manager's bounded release attempt.
+				acceptToken = false
+			}
+		}
+		gateMu.Unlock()
+
+		if !authorized {
+			http.Error(response, "invalid manager token", http.StatusUnauthorized)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/internal/manager/update/readiness":
+			_, _ = response.Write([]byte(`{"ready":true,"reserved":true}`))
+		case "/internal/manager/update/release":
+			_, _ = response.Write([]byte(`{"released":true}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer gateServer.Close()
+
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := &preflightLegacy{}
+	gate := HTTPGate{BaseURL: gateServer.URL, Token: token, Client: gateServer.Client()}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: gate, LegacyGate: gate, Legacy: legacy,
+		Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: manifestURL,
+		Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
+	}
+	request := model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "source-auth-incident-recovery",
+		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40),
+	}
+	first, reused, err := store.Begin(request, time.Now())
+	if err != nil || reused {
+		t.Fatalf("begin first install: operation=%#v reused=%v err=%v", first, reused, err)
+	}
+	orchestrator.runUpdate(context.Background(), first)
+	pending, err := store.Operation(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	if pending.Status != model.OperationRunning ||
+		pending.ReservationStatus != model.ReservationReleaseUncertain ||
+		state.ActiveOperationID != first.ID || !state.Maintenance || state.PublicState != model.StateFailed {
+		t.Fatalf("HTTP authentication incident was not held fail-closed: operation=%#v state=%#v", pending, state)
+	}
+
+	gateMu.Lock()
+	acceptToken = true
+	incidentRequests := append([]gateRequest(nil), requests...)
+	gateMu.Unlock()
+	if len(incidentRequests) != 3 ||
+		incidentRequests[0].path != "/internal/manager/update/readiness" || !incidentRequests[0].authorized ||
+		incidentRequests[1].path != "/internal/manager/update/readiness" || incidentRequests[1].authorized ||
+		incidentRequests[2].path != "/internal/manager/update/release" || incidentRequests[2].authorized {
+		t.Fatalf("unexpected HTTP incident sequence: %#v", incidentRequests)
+	}
+	for _, item := range incidentRequests {
+		if item.operationID != first.ID {
+			t.Fatalf("incident request changed operation id: want=%s request=%#v", first.ID, item)
+		}
+	}
+
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.Operation(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = store.State()
+	if completed.Status != model.OperationFailed || state.ActiveOperationID != "" ||
+		state.Maintenance || state.PublicState != model.StateIdle {
+		t.Fatalf("authenticated same-id release did not converge recovery: operation=%#v state=%#v", completed, state)
+	}
+	gateMu.Lock()
+	recoveredRequests := append([]gateRequest(nil), requests...)
+	gateMu.Unlock()
+	if len(recoveredRequests) != 4 ||
+		recoveredRequests[3].path != "/internal/manager/update/release" ||
+		!recoveredRequests[3].authorized || recoveredRequests[3].operationID != first.ID {
+		t.Fatalf("recovery did not release the original reservation id: %#v", recoveredRequests)
+	}
+
+	request.ExpectedGeneration = state.Generation
+	second, reused, err := orchestrator.Start(request)
+	if err != nil || reused || second.ID == first.ID || second.Attempt != first.Attempt+1 {
+		t.Fatalf("recovered install did not start a new idempotent attempt: first=%#v second=%#v reused=%v err=%v", first, second, reused, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	retried, err := orchestrator.Await(ctx, second.ID)
+	if err != nil || retried.Status != model.OperationSucceeded || !retried.Finalized {
+		t.Fatalf("recovered install attempt did not complete: operation=%#v err=%v", retried, err)
+	}
+}
+
 func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()

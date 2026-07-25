@@ -46,7 +46,8 @@ type Config struct {
 
 // SourceMigrationExpectations are bridge-owned values that must agree with
 // the persisted Manager configuration before a source deployment hands over
-// control. Mutable tuning and secrets deliberately do not belong here.
+// control. Mutable tuning and secret values deliberately do not belong here;
+// the path of the shared control capability does.
 type SourceMigrationExpectations struct {
 	DataRoot           string
 	GatewayAddress     string
@@ -54,6 +55,7 @@ type SourceMigrationExpectations struct {
 	ReleaseChannel     string
 	LegacyPlatformURL  string
 	ControlSocketPath  string
+	ControlTokenFile   string
 }
 
 func Defaults() (Config, error) {
@@ -262,7 +264,7 @@ func set(c *Config, key, value string) error {
 }
 
 func (c Config) Validate() error {
-	for name, path := range map[string]string{"data_root": c.DataRoot, "state_dir": c.StateDir, "data_dir": c.DataDir, "socket_path": c.SocketPath} {
+	for name, path := range map[string]string{"data_root": c.DataRoot, "state_dir": c.StateDir, "data_dir": c.DataDir, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("%s must be absolute", name)
 		}
@@ -286,6 +288,15 @@ func (c Config) PlatformDataDir() string {
 	return filepath.Join(filepath.Clean(c.DataRoot), "data")
 }
 
+// ControlTokenFile returns the effective Manager control capability path. An
+// omitted setting uses the same state-root default as the Manager runtime.
+func (c Config) ControlTokenFile() string {
+	if strings.TrimSpace(c.InternalTokenFile) != "" {
+		return filepath.Clean(c.InternalTokenFile)
+	}
+	return filepath.Join(filepath.Clean(c.StateDir), "secrets", "manager-token")
+}
+
 // ValidateSourceMigration compares values after manager.toml has passed
 // through the Manager's canonical parser. Paths are cleaned so harmless
 // trailing separators do not create false mismatches; network and catalog
@@ -301,6 +312,7 @@ func (c Config) ValidateSourceMigration(expected SourceMigrationExpectations) er
 		"release_channel":          expected.ReleaseChannel,
 		"legacy_platform_gate_url": expected.LegacyPlatformURL,
 		"socket_path":              expected.ControlSocketPath,
+		"internal_token_file":      expected.ControlTokenFile,
 	}
 	for name, value := range required {
 		if strings.TrimSpace(value) == "" {
@@ -315,6 +327,7 @@ func (c Config) ValidateSourceMigration(expected SourceMigrationExpectations) er
 		"release_channel":          c.ReleaseChannel,
 		"legacy_platform_gate_url": c.LegacyPlatformGateURL,
 		"socket_path":              filepath.Clean(c.SocketPath),
+		"internal_token_file":      c.ControlTokenFile(),
 	}
 	expectedValues := map[string]string{
 		"data_root":                filepath.Clean(expected.DataRoot),
@@ -323,8 +336,9 @@ func (c Config) ValidateSourceMigration(expected SourceMigrationExpectations) er
 		"release_channel":          expected.ReleaseChannel,
 		"legacy_platform_gate_url": expected.LegacyPlatformURL,
 		"socket_path":              filepath.Clean(expected.ControlSocketPath),
+		"internal_token_file":      filepath.Clean(expected.ControlTokenFile),
 	}
-	for _, name := range []string{"data_root", "listen", "release_manifest_url", "release_channel", "legacy_platform_gate_url", "socket_path"} {
+	for _, name := range []string{"data_root", "listen", "release_manifest_url", "release_channel", "legacy_platform_gate_url", "socket_path", "internal_token_file"} {
 		if configured[name] != expectedValues[name] {
 			return fmt.Errorf("source migration config mismatch for %s: configured %q, expected %q", name, configured[name], expectedValues[name])
 		}

@@ -100,6 +100,7 @@ func TestValidatePreflightConfigUsesManagerParserAndFailsClosed(t *testing.T) {
 		ReleaseChannel:     "main",
 		LegacyPlatformURL:  legacyURL,
 		ControlSocketPath:  filepath.Join(dataRoot, "manager", "control", "manager.sock"),
+		ControlTokenFile:   filepath.Join(dataRoot, "manager", "secrets", "manager-token"),
 	}
 	if err := validatePreflightConfig(configPath, true, expected); err != nil {
 		t.Fatal(err)
@@ -107,6 +108,14 @@ func TestValidatePreflightConfigUsesManagerParserAndFailsClosed(t *testing.T) {
 	expected.ReleaseChannel = "candidate"
 	if err := validatePreflightConfig(configPath, true, expected); err == nil || !strings.Contains(err.Error(), "mismatch for release_channel") {
 		t.Fatalf("expected release channel mismatch, got %v", err)
+	}
+	expected.ReleaseChannel = "main"
+	staleTokenFile := filepath.Join(root, "stale", "manager-token")
+	if err := os.WriteFile(configPath, []byte(content+"internal_token_file = \""+staleTokenFile+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePreflightConfig(configPath, true, expected); err == nil || !strings.Contains(err.Error(), "mismatch for internal_token_file") {
+		t.Fatalf("expected control token path mismatch, got %v", err)
 	}
 }
 
@@ -132,6 +141,7 @@ func TestSourceMigrationPreflightRejectsDivergentPlatformDataDir(t *testing.T) {
 		ReleaseChannel:     "main",
 		LegacyPlatformURL:  legacyURL,
 		ControlSocketPath:  filepath.Join(dataRoot, "manager", "control", "manager.sock"),
+		ControlTokenFile:   filepath.Join(dataRoot, "manager", "secrets", "manager-token"),
 	}
 	if err := validatePreflightConfig(configPath, true, expected); err == nil || !strings.Contains(err.Error(), "data_dir must equal data_root/data") {
 		t.Fatalf("source migration accepted a data directory outside the Compose bind root: %v", err)

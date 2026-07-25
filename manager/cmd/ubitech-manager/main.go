@@ -113,10 +113,7 @@ func build(path string) (*application, error) {
 	if err := docker.EnsureHostLayout(); err != nil {
 		return nil, err
 	}
-	controlTokenPath := cfg.InternalTokenFile
-	if controlTokenPath == "" {
-		controlTokenPath = filepath.Join(cfg.StateDir, "secrets", "manager-token")
-	}
+	controlTokenPath := cfg.ControlTokenFile()
 	controlToken, err := driver.ReadOwnerSecret(controlTokenPath)
 	if err != nil {
 		return nil, err
@@ -148,6 +145,7 @@ func build(path string) (*application, error) {
 		DataRoot: cfg.DataRoot, GatewayAddress: cfg.GatewayAddress,
 		ReleaseManifestURL: cfg.ReleaseURL, ReleaseChannel: cfg.ReleaseChannel,
 		LegacyPlatformURL: cfg.LegacyPlatformGateURL, ControlSocketPath: cfg.SocketPath,
+		ControlTokenFile: controlTokenPath,
 	}
 	legacy.PreCutoverCheck = func(ctx context.Context, _ migration.Plan) error {
 		current, err := config.Load(cfg.ConfigPath)
@@ -189,6 +187,7 @@ func preflightCommand(arguments []string) error {
 	set.StringVar(&expected.ReleaseChannel, "expect-release-channel", "", "expected release channel")
 	set.StringVar(&expected.LegacyPlatformURL, "expect-legacy-platform-url", "", "expected legacy Platform gate URL")
 	set.StringVar(&expected.ControlSocketPath, "expect-control-socket", "", "expected shared control and executor socket")
+	set.StringVar(&expected.ControlTokenFile, "expect-control-token-file", "", "expected Manager control token file")
 	if err := set.Parse(arguments); err != nil {
 		return err
 	}
@@ -214,7 +213,7 @@ func preflightCommand(arguments []string) error {
 }
 
 func validatePreflightConfig(path string, verify bool, expected config.SourceMigrationExpectations) error {
-	provided := expected.DataRoot != "" || expected.GatewayAddress != "" || expected.ReleaseManifestURL != "" || expected.ReleaseChannel != "" || expected.LegacyPlatformURL != "" || expected.ControlSocketPath != ""
+	provided := expected.DataRoot != "" || expected.GatewayAddress != "" || expected.ReleaseManifestURL != "" || expected.ReleaseChannel != "" || expected.LegacyPlatformURL != "" || expected.ControlSocketPath != "" || expected.ControlTokenFile != ""
 	if provided && !verify {
 		return errors.New("source migration expectations require --verify-source-migration-config")
 	}
@@ -466,10 +465,7 @@ func managerClient(configPath string) (control.Client, config.Config, error) {
 	if err != nil {
 		return control.Client{}, config.Config{}, err
 	}
-	tokenPath := cfg.InternalTokenFile
-	if tokenPath == "" {
-		tokenPath = filepath.Join(cfg.StateDir, "secrets", "manager-token")
-	}
+	tokenPath := cfg.ControlTokenFile()
 	token, err := driver.ReadOwnerSecret(tokenPath)
 	if err != nil {
 		return control.Client{}, config.Config{}, err

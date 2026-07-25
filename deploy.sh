@@ -135,6 +135,7 @@ UPDATE_STATE_ACTIVE=0
 UPDATE_SOURCE_MOVED=0
 UPDATE_HEARTBEAT_PID=""
 UPDATE_RECOVERY_ATTEMPTED=0
+SOURCE_UPDATE_SERVICE_MODE=0
 # This flag is the Git/source rollback boundary, not proof that the subsequent
 # Manager migration completed. Once set, installer recovery belongs to the
 # durable Manager/retry state and must never race a Git reset.
@@ -171,6 +172,152 @@ if [[ -v UBITECH_MANAGER_TOKEN_FILE ]]; then
   ORIGINAL_MANAGER_TOKEN_FILE="$UBITECH_MANAGER_TOKEN_FILE"
 fi
 
+capture_service_bridge_environment() {
+  local capture_file
+  capture_file="$(mktemp "${TMPDIR:-/tmp}/ubitech-source-environment.XXXXXX")" || return 1
+  chmod 0600 "$capture_file"
+  if ! "$PYTHON_BIN" - "$LEGACY_SERVICE" "$ROOT" >"$capture_file" <<'PY'
+import os
+import shlex
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+KEYS = (
+    "UBITECH_SOURCE_MIGRATION_BRIDGE",
+    "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+    "UBITECH_MANAGER_SOCKET",
+    "UBITECH_MANAGER_TOKEN_FILE",
+)
+MAX_UNIT_BYTES = 1024 * 1024
+MAX_ENVIRONMENT_BYTES = 2 * 1024 * 1024
+service_name = sys.argv[1]
+repo_root = Path(sys.argv[2]).expanduser().resolve(strict=False)
+
+def systemd_value(property_name):
+    result = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            service_name,
+            f"--property={property_name}",
+            "--value",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not read service {property_name}")
+    return (result.stdout or "").strip()
+
+def process_start(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return fields[19]
+
+unit_path = Path(systemd_value("FragmentPath"))
+if not unit_path.is_absolute():
+    raise RuntimeError("service FragmentPath is not absolute")
+metadata = unit_path.lstat()
+if (
+    unit_path.is_symlink()
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != os.getuid()
+    or metadata.st_mode & 0o022
+    or metadata.st_size > MAX_UNIT_BYTES
+):
+    raise RuntimeError("service unit is not an owner-only regular file")
+unit_values = {name: None for name in KEYS}
+unit_matches_checkout = False
+for raw_line in unit_path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if line.startswith("WorkingDirectory="):
+        value = line.removeprefix("WorkingDirectory=").strip().strip('"')
+        value = value.replace("\\x20", " ").replace("%%", "%")
+        if Path(value).expanduser().resolve(strict=False) == (
+            repo_root / "enterprise-agent-platform"
+        ).resolve(strict=False):
+            unit_matches_checkout = True
+    if not line.startswith("Environment="):
+        continue
+    assignments = shlex.split(line.split("=", 1)[1])
+    if not assignments:
+        unit_values = {name: None for name in KEYS}
+        continue
+    for assignment in assignments:
+        name, separator, value = assignment.partition("=")
+        if separator and name in unit_values:
+            # DeploymentManager._systemd_quote doubles percent signs so
+            # systemd passes them through as literals instead of specifiers.
+            # The raw unit therefore has to be decoded back to the effective
+            # process value before it can be compared with /proc.
+            unit_values[name] = value.replace("%%", "%")
+if not unit_matches_checkout:
+    raise RuntimeError("service unit does not belong to this source checkout")
+
+pid_text = systemd_value("MainPID")
+try:
+    pid = int(pid_text)
+except ValueError as exc:
+    raise RuntimeError("service MainPID is invalid") from exc
+if pid <= 1:
+    raise RuntimeError("service has no live MainPID")
+start = process_start(pid)
+with Path(f"/proc/{pid}/environ").open("rb") as handle:
+    raw_environment = handle.read(MAX_ENVIRONMENT_BYTES + 1)
+if len(raw_environment) > MAX_ENVIRONMENT_BYTES:
+    raise RuntimeError("service environment is too large")
+process_values = {}
+wanted = {os.fsencode(name): name for name in KEYS}
+for entry in raw_environment.split(b"\0"):
+    encoded_name, separator, encoded_value = entry.partition(b"=")
+    if not separator:
+        continue
+    name = wanted.get(encoded_name)
+    if name is not None:
+        process_values[name] = os.fsdecode(encoded_value)
+if systemd_value("MainPID") != str(pid) or process_start(pid) != start:
+    raise RuntimeError("service process changed while its environment was captured")
+for name in KEYS:
+    configured = unit_values[name]
+    running = process_values.get(name)
+    if configured != running:
+        raise RuntimeError(
+            f"service unit and running process disagree for {name}"
+        )
+output = bytearray()
+for name in KEYS:
+    value = unit_values[name]
+    output.extend(b"1\0" if value is not None else b"0\0")
+    output.extend(os.fsencode(value or "") + b"\0")
+sys.stdout.buffer.write(output)
+PY
+  then
+    rm -f "$capture_file"
+    echo "Cannot update: the current service bridge environment could not be captured safely." >&2
+    return 1
+  fi
+  local -a captured=()
+  mapfile -d '' -t captured <"$capture_file"
+  rm -f "$capture_file"
+  if (( ${#captured[@]} != 8 )); then
+    echo "Cannot update: the current service bridge environment snapshot is invalid." >&2
+    return 1
+  fi
+  ORIGINAL_SOURCE_BRIDGE_SET="${captured[0]}"
+  ORIGINAL_SOURCE_BRIDGE="${captured[1]}"
+  ORIGINAL_SOURCE_MIGRATION_PROTOCOL_SET="${captured[2]}"
+  ORIGINAL_SOURCE_MIGRATION_PROTOCOL="${captured[3]}"
+  ORIGINAL_MANAGER_SOCKET_SET="${captured[4]}"
+  ORIGINAL_MANAGER_SOCKET="${captured[5]}"
+  ORIGINAL_MANAGER_TOKEN_FILE_SET="${captured[6]}"
+  ORIGINAL_MANAGER_TOKEN_FILE="${captured[7]}"
+}
+
 restore_container_bridge_environment() {
   if (( ORIGINAL_SOURCE_BRIDGE_SET )); then
     export UBITECH_SOURCE_MIGRATION_BRIDGE="$ORIGINAL_SOURCE_BRIDGE"
@@ -192,6 +339,98 @@ restore_container_bridge_environment() {
   else
     unset UBITECH_MANAGER_TOKEN_FILE
   fi
+}
+
+verify_restored_service_bridge_environment() {
+  local previous_pid="${1:-0}"
+  "$PYTHON_BIN" - \
+    "$LEGACY_SERVICE" \
+    "$previous_pid" \
+    "$ORIGINAL_SOURCE_BRIDGE_SET" \
+    "$ORIGINAL_SOURCE_BRIDGE" \
+    "$ORIGINAL_SOURCE_MIGRATION_PROTOCOL_SET" \
+    "$ORIGINAL_SOURCE_MIGRATION_PROTOCOL" \
+    "$ORIGINAL_MANAGER_SOCKET_SET" \
+    "$ORIGINAL_MANAGER_SOCKET" \
+    "$ORIGINAL_MANAGER_TOKEN_FILE_SET" \
+    "$ORIGINAL_MANAGER_TOKEN_FILE" <<'PY'
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+service_name = sys.argv[1]
+try:
+    previous_pid = int(sys.argv[2] or "0")
+except ValueError:
+    previous_pid = 0
+keys = (
+    "UBITECH_SOURCE_MIGRATION_BRIDGE",
+    "UBITECH_SOURCE_MIGRATION_PROTOCOL",
+    "UBITECH_MANAGER_SOCKET",
+    "UBITECH_MANAGER_TOKEN_FILE",
+)
+arguments = sys.argv[3:11]
+expected = {
+    name: (arguments[index * 2] == "1", arguments[index * 2 + 1])
+    for index, name in enumerate(keys)
+}
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    result = subprocess.run(
+        ["systemctl", "--user", "show", service_name, "--property=MainPID", "--value"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    try:
+        pid = int((result.stdout or "").strip() or "0") if result.returncode == 0 else 0
+    except ValueError:
+        pid = 0
+    if pid > 1 and pid != previous_pid:
+        try:
+            with Path(f"/proc/{pid}/environ").open("rb") as handle:
+                raw = handle.read(2 * 1024 * 1024 + 1)
+        except OSError:
+            raw = None
+        if raw is not None and len(raw) <= 2 * 1024 * 1024:
+            actual = {}
+            for entry in raw.split(b"\0"):
+                name, separator, value = entry.partition(b"=")
+                if separator:
+                    decoded = os.fsdecode(name)
+                    if decoded in expected:
+                        actual[decoded] = os.fsdecode(value)
+            if all(
+                (name in actual) == is_set
+                and (not is_set or actual[name] == value)
+                for name, (is_set, value) in expected.items()
+            ):
+                raise SystemExit(0)
+    time.sleep(0.25)
+print(
+    "rollback service did not start with the restored bridge environment",
+    file=sys.stderr,
+)
+raise SystemExit(1)
+PY
+}
+
+restart_service_after_bridge_rollback() {
+  if (( ! CONTAINER_BRIDGE_ACTIVE || ! SOURCE_UPDATE_SERVICE_MODE )); then
+    return 0
+  fi
+  local previous_pid="0"
+  previous_pid="$(systemctl --user show "$LEGACY_SERVICE" --property=MainPID --value 2>/dev/null || true)"
+  systemctl --user daemon-reload || return 1
+  systemctl --user restart "$LEGACY_SERVICE" || return 1
+  # The restored revision may only know the SIGHUP path. Run its normal
+  # readiness checks after the forced process boundary, then independently
+  # prove that the new MainPID received all four restored bridge values.
+  python_bootstrap_checked auto "${UPDATE_COMMAND_ARGS[@]}" || return 1
+  verify_restored_service_bridge_environment "$previous_pid"
 }
 
 acquire_update_lock() {
@@ -329,7 +568,8 @@ rollback_update() {
   restore_container_bridge_environment
   # Reinstall and restart from the restored revision so the live service runs
   # known-good code again. If even this fails, surface manual recovery steps.
-  if python_bootstrap_checked auto "$@"; then
+  if python_bootstrap_checked auto "$@" \
+    && restart_service_after_bridge_rollback; then
     echo "Rolled back to ${PREV_SHA}." >&2
     return 0
   else
@@ -509,7 +749,7 @@ finalize_update_on_exit() {
 }
 
 capture_update_context() {
-  local previous=""
+  local previous="" service_working_directory=""
   for argument in "$@"; do
     if [[ -n "$previous" ]]; then
       case "$previous" in
@@ -540,6 +780,23 @@ capture_update_context() {
     return 1
   fi
   LEGACY_DATA="${ENTERPRISE_PLATFORM_DATA:-$PLATFORM_DIR/data}"
+  case "${ENTERPRISE_AUTO_UPDATE_SOURCE_MODE:-}" in
+    service) SOURCE_UPDATE_SERVICE_MODE=1 ;;
+    foreground) SOURCE_UPDATE_SERVICE_MODE=0 ;;
+    *)
+      if command -v systemctl >/dev/null \
+        && systemctl --user is-active --quiet "$LEGACY_SERVICE" >/dev/null 2>&1; then
+        service_working_directory="$(systemctl --user show "$LEGACY_SERVICE" \
+          --property=WorkingDirectory --value 2>/dev/null || true)"
+        if [[ "$service_working_directory" == "$PLATFORM_DIR" ]]; then
+          SOURCE_UPDATE_SERVICE_MODE=1
+        fi
+      fi
+      ;;
+  esac
+  if (( SOURCE_UPDATE_SERVICE_MODE )); then
+    capture_service_bridge_environment
+  fi
 }
 
 prepare_container_bridge() {

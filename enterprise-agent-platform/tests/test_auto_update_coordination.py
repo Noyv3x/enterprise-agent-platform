@@ -1724,13 +1724,19 @@ class ServiceUpdateReservationTests(unittest.TestCase):
     def test_public_status_is_unauthenticated_and_maintenance_blocks_use(self):
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
+            token_file = data_dir / "manager" / "secrets" / "manager-token"
+            token_file.parent.mkdir(parents=True)
             agent = _BlockingAgent()
             service = EnterpriseService(
-                _config(data_dir),
+                replace(
+                    _config(data_dir),
+                    manager_socket=data_dir / "manager" / "control" / "manager.sock",
+                    manager_token_file=token_file,
+                ),
                 agent_client=agent,
                 autostart_runtime=False,
+                manager_client=_ManagerStub(),
             )
-            service.validate_manager_internal_token = lambda token: token == "manager-token"
             service.manager_internal_health = lambda: {"status": "ok"}
             server, thread = serve_in_thread(service.config, service)
             host, port = server.server_address
@@ -1769,9 +1775,40 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     headers={"Authorization": "Bearer manager-token"},
                 )
                 response = conn.getresponse()
+                missing_token = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 401)
+                self.assertEqual(missing_token["error"], "invalid manager token")
+
+                token_file.write_text("manager-token\n", encoding="utf-8")
+                token_file.chmod(0o600)
+                conn.request(
+                    "GET",
+                    "/internal/manager/health",
+                    headers={"Authorization": "Bearer manager-token"},
+                )
+                response = conn.getresponse()
                 manager_health = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(response.status, 200)
                 self.assertEqual(manager_health["status"], "ok")
+
+                token_file.write_text("rotated-manager-token\n", encoding="utf-8")
+                conn.request(
+                    "GET",
+                    "/internal/manager/health",
+                    headers={"Authorization": "Bearer manager-token"},
+                )
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 401)
+                conn.request(
+                    "GET",
+                    "/internal/manager/health",
+                    headers={"Authorization": "Bearer rotated-manager-token"},
+                )
+                response = conn.getresponse()
+                rotated_health = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(rotated_health["status"], "ok")
 
                 conn.request("GET", "/api/platform/update-status")
                 response = conn.getresponse()

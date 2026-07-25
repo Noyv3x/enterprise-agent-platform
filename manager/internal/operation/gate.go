@@ -33,6 +33,16 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("platform gate HTTP %d: %s", e.StatusCode, e.Body)
 }
 
+// isDefinitiveAuthenticationRejection identifies a response which proves that
+// the Platform rejected the request before its authenticated reservation
+// handler ran. Callers must still release on transport errors and on failures
+// after any successful reservation response, because those cases can leave an
+// admission reservation behind even when the Manager did not receive it.
+func isDefinitiveAuthenticationRejection(err error) bool {
+	var statusErr *HTTPStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized
+}
+
 type HTTPGate struct {
 	BaseURL, Token string
 	Client         *http.Client

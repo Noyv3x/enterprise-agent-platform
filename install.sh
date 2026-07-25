@@ -404,6 +404,7 @@ fi
 preflight_args=(preflight --config "$config_path")
 if [[ -n "$legacy_root" ]]; then
   control_socket="$data_root/manager/control/manager.sock"
+  control_token_file="$data_root/manager/secrets/manager-token"
   preflight_args+=(
     --verify-source-migration-config
     --expect-data-root "$data_root"
@@ -412,6 +413,7 @@ if [[ -n "$legacy_root" ]]; then
     --expect-release-channel main
     --expect-legacy-platform-url "$legacy_platform_url"
     --expect-control-socket "$control_socket"
+    --expect-control-token-file "$control_token_file"
     --probe-user-systemd-transient
   )
 fi

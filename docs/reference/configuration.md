@@ -123,7 +123,7 @@ Platform secret store保存 OAuth、session、Agent tool、Runtime、Firecrawl�
 
 Manager 的公网 `listen` 保留旧监听地址，`legacy_platform_gate_url` 使用通配监听对应的回环地址；长期 `platform_gate_url` 仍指向容器 Platform。桥接源码服务仅在 `UBITECH_SOURCE_MIGRATION_BRIDGE=1` 时接受 `UBITECH_MANAGER_SOCKET` 与 `UBITECH_MANAGER_TOKEN_FILE`，二者必须是绝对路径且 token file 由 Manager owner-only 创建。缺任一字段均拒绝启动桥接控制面，不能降级为未认证内部接口。无法归属到上述字段或 SQLite 的旧 unit 环境只进入七天恢复包，不自动注入新容器。
 
-若安装目标已经存在 `manager.toml`，安装器不得自行用 shell 提取或猜测字段，也不得静默沿用与本次源码桥输入不同的配置。它把桥接期望值交给下载并校验过的 Manager，由 Manager 正式解析器比较有效 `data_root`、`listen`、`release_manifest_url`、`release_channel`、`legacy_platform_gate_url` 和 `socket_path`；任一有效值为空或不一致均在安装 unit 和切换服务前失败。`socket_path` 同时承载 capability 分离的 control/executor API，因此必须等于桥接源码服务实际连接的路径。
+若安装目标已经存在 `manager.toml`，安装器不得自行用 shell 提取或猜测字段，也不得静默沿用与本次源码桥输入不同的配置。它把桥接期望值交给下载并校验过的 Manager，由 Manager 正式解析器比较有效 `data_root`、`listen`、`release_manifest_url`、`release_channel`、`legacy_platform_gate_url`、`socket_path` 和 `internal_token_file`；任一有效值为空或不一致均在安装 unit 和切换服务前失败。未显式配置 `internal_token_file` 时，其有效值固定解析为 Manager state 根下的 `secrets/manager-token`。`socket_path` 同时承载 capability 分离的 control/executor API，两条路径都必须分别等于桥接源码服务实际连接和动态读取的路径。
 
 迁移成功后删除旧 unit、源码 checkout 和源码内数据；这些环境变量不再由宿主 systemd 直接启动产品。桥接读取器只服务首次迁移，不得成为长期双配置兼容层。
 

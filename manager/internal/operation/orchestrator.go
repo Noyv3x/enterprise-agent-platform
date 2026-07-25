@@ -838,7 +838,18 @@ func (o *Orchestrator) reserve(ctx context.Context, id string, legacy bool) erro
 		}
 		reservation, err := gate.Reserve(ctx, id)
 		if err != nil {
-			return o.resolveReservationUncertainty(gate, id, fmt.Errorf("reserve Platform admission: %w", err))
+			cause := fmt.Errorf("reserve Platform admission: %w", err)
+			// A 401 response from the first reserve is deterministic: the
+			// Platform authenticates Manager requests before it reaches the
+			// reservation handler, so no admission state can have changed. Do
+			// not turn a broken bridge token configuration into release
+			// uncertainty which a migration timer can never repair by itself.
+			// Once any reserve has succeeded, including the confirmation below,
+			// every error still uses the fail-closed release protocol.
+			if isDefinitiveAuthenticationRejection(err) {
+				return fmt.Errorf("Platform admission authentication configuration was rejected: %w", cause)
+			}
+			return o.resolveReservationUncertainty(gate, id, cause)
 		}
 		if reservation.Reserved {
 			// The Platform reservation freezes new Agent admissions, so this
