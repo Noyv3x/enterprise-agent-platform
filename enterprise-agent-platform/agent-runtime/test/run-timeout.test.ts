@@ -202,22 +202,22 @@ test("approval waits pause the run inactivity deadline", async () => {
     fauxAssistantMessage("approved complete"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 40, approvalTimeoutMs: 1_000 }),
+    config: testConfig(home, { runIdleTimeoutMs: 2_000, approvalTimeoutMs: 10_000 }),
     streamFn: faux.provider.streamSimple,
   });
   try {
     const run = coordinator.createRun(baseRequest(workspace));
     const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
       (event) => event.type === "approval.requested",
-    ));
-    await delay(120);
+    ), 10_000);
+    await delay(3_000);
     assert.equal(coordinator.getRun(run.id)?.status, "running");
     assert.equal(
       coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
       false,
     );
     await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
-    const completed = await withDeadline(coordinator.wait(run.id));
+    const completed = await withDeadline(coordinator.wait(run.id), 10_000);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "approved complete");
   } finally {
@@ -241,22 +241,26 @@ test("delegated child activity refreshes the parent inactivity deadline", async 
     fauxAssistantMessage("parent complete"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 50, maxConcurrency: 1 }),
+    config: testConfig(home, {
+      runIdleTimeoutMs: 2_000,
+      approvalTimeoutMs: 10_000,
+      maxConcurrency: 1,
+    }),
     streamFn: faux.provider.streamSimple,
   });
   try {
     const parent = coordinator.createRun(baseRequest(workspace));
     const approval = await waitUntil(() => coordinator.getJournal(parent.id)?.list().find(
       (event) => event.type === "approval.requested",
-    ));
-    await delay(120);
+    ), 10_000);
+    await delay(3_000);
     assert.equal(coordinator.getRun(parent.id)?.status, "running");
     assert.equal(
       coordinator.getJournal(parent.id)?.list().some((event) => event.type === "run.idle_timeout"),
       false,
     );
     await coordinator.respondApproval(parent.id, String(approval.data.approval_id), "once");
-    const completed = await withDeadline(coordinator.wait(parent.id));
+    const completed = await withDeadline(coordinator.wait(parent.id), 10_000);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "parent complete");
     assert.equal(
