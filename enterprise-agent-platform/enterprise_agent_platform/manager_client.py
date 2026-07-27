@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-MAX_MANAGER_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_MANAGER_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class ManagerClientError(RuntimeError):

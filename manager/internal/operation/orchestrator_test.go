@@ -21,14 +21,18 @@ import (
 
 	"github.com/ubitech/agent-platform/manager/internal/driver"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
+	"github.com/ubitech/agent-platform/manager/internal/migration"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/ubitech/agent-platform/manager/internal/snapshot"
 )
 
 type fakeEngine struct {
-	mu     sync.Mutex
-	calls  []string
-	failAt string
+	mu              sync.Mutex
+	calls           []string
+	failAt          string
+	diagnostic      string
+	diagnosticCalls int
 }
 
 type temporaryManifestTransport struct {
@@ -60,14 +64,23 @@ func (e *fakeEngine) add(value string) error {
 	}
 	return nil
 }
-func (e *fakeEngine) Preflight(context.Context) error                         { return e.add("preflight") }
-func (e *fakeEngine) Pull(context.Context, release.Manifest) error            { return e.add("pull") }
-func (e *fakeEngine) Prepare(context.Context, release.Manifest) error         { return e.add("prepare") }
-func (e *fakeEngine) StopFixed(context.Context) error                         { return e.add("stop") }
-func (e *fakeEngine) StartFixed(context.Context, release.Manifest) error      { return e.add("start") }
-func (e *fakeEngine) Migrate(context.Context, release.Manifest) error         { return e.add("migrate") }
-func (e *fakeEngine) Probe(context.Context, release.Manifest) error           { return e.add("probe") }
-func (e *fakeEngine) Logs(context.Context, string, int) (string, error)       { return "", nil }
+func (e *fakeEngine) Preflight(context.Context) error                    { return e.add("preflight") }
+func (e *fakeEngine) Pull(context.Context, release.Manifest) error       { return e.add("pull") }
+func (e *fakeEngine) Prepare(context.Context, release.Manifest) error    { return e.add("prepare") }
+func (e *fakeEngine) StopFixed(context.Context) error                    { return e.add("stop") }
+func (e *fakeEngine) StartFixed(context.Context, release.Manifest) error { return e.add("start") }
+func (e *fakeEngine) Migrate(context.Context, release.Manifest) error    { return e.add("migrate") }
+func (e *fakeEngine) Probe(context.Context, release.Manifest) error      { return e.add("probe") }
+func (e *fakeEngine) Logs(context.Context, string, int) (string, error)  { return "", nil }
+func (e *fakeEngine) CandidateFailureDiagnostics(context.Context, release.Manifest) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.diagnosticCalls++
+	if e.diagnostic != "" {
+		e.calls = append(e.calls, "diagnostic")
+	}
+	return e.diagnostic
+}
 func (e *fakeEngine) EnsureSandbox(context.Context, driver.SandboxSpec) error { return nil }
 func (e *fakeEngine) StopSandbox(context.Context, string) error               { return nil }
 func (e *fakeEngine) RemoveSandbox(context.Context, string) error             { return nil }
@@ -80,6 +93,35 @@ type fakeSnapshot struct{}
 
 func (fakeSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
 func (fakeSnapshot) Restore(context.Context, string) error          { return nil }
+
+type countingSnapshot struct {
+	store    snapshot.Store
+	creates  int
+	restores int
+}
+
+func (s *countingSnapshot) Create(ctx context.Context, operationID string) (string, error) {
+	s.creates++
+	return s.store.Create(ctx, operationID)
+}
+
+func (s *countingSnapshot) Restore(ctx context.Context, path string) error {
+	s.restores++
+	return s.store.Restore(ctx, path)
+}
+
+type legacySystemdRunner struct {
+	calls []string
+}
+
+func (r *legacySystemdRunner) Run(_ context.Context, name string, args []string, _ []string) (driver.Result, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	if strings.Contains(call, "--property=UnitFileState") {
+		return driver.Result{Stdout: "enabled\n"}, nil
+	}
+	return driver.Result{}, nil
+}
 
 type scriptedSnapshot struct {
 	creates      []string
@@ -240,10 +282,12 @@ type retryLegacy struct {
 	committed bool
 }
 
-func (*retryLegacy) Active() bool                             { return false }
-func (*retryLegacy) PreCutover(context.Context, string) error { return nil }
-func (*retryLegacy) Cutover(context.Context, string) error    { return nil }
-func (*retryLegacy) Rollback(context.Context, string) error   { return nil }
+func (*retryLegacy) Active() bool                                { return false }
+func (*retryLegacy) RequiredSourceCommit() (string, bool, error) { return "", false, nil }
+func (*retryLegacy) Rearm(string) error                          { return nil }
+func (*retryLegacy) PreCutover(context.Context, string) error    { return nil }
+func (*retryLegacy) Cutover(context.Context, string) error       { return nil }
+func (*retryLegacy) Rollback(context.Context, string) error      { return nil }
 func (l *retryLegacy) FinalizeCleanup(context.Context, string) error {
 	if l.committed {
 		return nil
@@ -264,7 +308,9 @@ type preflightLegacy struct {
 	rollbacks    int
 }
 
-func (*preflightLegacy) Active() bool { return true }
+func (*preflightLegacy) Active() bool                                { return true }
+func (*preflightLegacy) RequiredSourceCommit() (string, bool, error) { return "", false, nil }
+func (*preflightLegacy) Rearm(string) error                          { return nil }
 func (l *preflightLegacy) PreCutover(context.Context, string) error {
 	l.preflights++
 	return l.preflightErr
@@ -1541,6 +1587,403 @@ func TestPublicGatewayFailurePreventsGenerationCommit(t *testing.T) {
 	}
 }
 
+func TestCandidateDiagnosticsArePersistedBeforeFailedContainerRemoval(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	engine := &fakeEngine{failAt: "probe", diagnostic: "health=unhealthy\nprobe output: database unavailable"}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main",
+		ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "candidate-diagnostics",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.OperationFailed ||
+		!strings.Contains(completed.Error, "injected probe failure") ||
+		!strings.Contains(completed.Error, "candidate failure diagnostics") ||
+		!strings.Contains(completed.Error, "database unavailable") {
+		t.Fatalf("candidate diagnostic was not retained in the operation: %#v", completed)
+	}
+	engine.mu.Lock()
+	diagnosticCalls := engine.diagnosticCalls
+	calls := append([]string(nil), engine.calls...)
+	engine.mu.Unlock()
+	if diagnosticCalls != 1 {
+		t.Fatalf("candidate diagnostics were collected %d times", diagnosticCalls)
+	}
+	probeIndex, diagnosticIndex := -1, -1
+	for index, call := range calls {
+		if call == "probe" && probeIndex < 0 {
+			probeIndex = index
+		}
+		if call == "diagnostic" && diagnosticIndex < 0 {
+			diagnosticIndex = index
+		}
+	}
+	if probeIndex < 0 || diagnosticIndex <= probeIndex || diagnosticIndex >= len(calls)-1 || calls[len(calls)-1] != "stop" {
+		t.Fatalf("candidate was not removed after diagnostics: %v", calls)
+	}
+}
+
+func TestSourceRollbackCheckpointsSurviveDeletedDestinationAndReleaseRetry(t *testing.T) {
+	releaseServer, manifestURL := testReleaseServer(t)
+	defer releaseServer.Close()
+
+	root := t.TempDir()
+	legacyRoot := filepath.Join(root, "legacy-checkout")
+	legacyData := filepath.Join(legacyRoot, "enterprise-agent-platform", "data")
+	if err := os.MkdirAll(legacyData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("authoritative-legacy-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(root, "managed")
+	destination := filepath.Join(dataRoot, "data")
+	stateDir := filepath.Join(dataRoot, "manager")
+	backups := filepath.Join(dataRoot, "backups")
+	runner := &legacySystemdRunner{}
+	legacy := &migration.Service{
+		StatePath:       filepath.Join(stateDir, "migration.json"),
+		DestinationData: destination,
+		BackupRoot:      backups,
+		QuarantineRoot:  filepath.Join(dataRoot, "quarantine"),
+		LegacyService:   "enterprise-agent-platform.service",
+		Runner:          runner,
+	}
+	expectedCommit := strings.Repeat("b", 40)
+	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
+		t.Fatal(err)
+	}
+	store, err := journal.Open(stateDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := &countingSnapshot{store: snapshot.Store{DataDir: destination, BackupDir: backups}}
+	engine := &fakeEngine{failAt: "probe"}
+	gate := &retryGate{failOnce: true}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy,
+		Snapshots: snapshots, ReleasesDir: filepath.Join(stateDir, "releases"),
+		ManifestURL: manifestURL, Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "source-rollback-checkpoints",
+		ExpectedGeneration: store.State().Generation, ManifestURL: manifestURL,
+		ExpectedSourceCommit: expectedCommit,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orchestrator.runUpdate(context.Background(), op)
+	pending, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingState := store.State()
+	if pending.Status != model.OperationRunning || pending.Phase != model.PhaseRollingBack ||
+		!pending.SnapshotRestored || !pending.LegacyRestored || pending.ReservationReleased ||
+		pendingState.ActiveOperationID != op.ID || !pendingState.Maintenance {
+		t.Fatalf("first rollback attempt did not persist its completed substeps: operation=%#v state=%#v", pending, pendingState)
+	}
+	if snapshots.creates != 1 || snapshots.restores != 1 || gate.releases != 1 {
+		t.Fatalf("unexpected first rollback work: creates=%d restores=%d releases=%d", snapshots.creates, snapshots.restores, gate.releases)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("legacy rollback retained its uncommitted destination: %v", err)
+	}
+	legacyDB, err := os.ReadFile(filepath.Join(legacyData, "platform.db"))
+	if err != nil || string(legacyDB) != "authoritative-legacy-db" {
+		t.Fatalf("legacy source changed during rollback: %q %v", legacyDB, err)
+	}
+
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState := store.State()
+	if completed.Status != model.OperationFailed || !completed.Finalized ||
+		!completed.SnapshotRestored || !completed.LegacyRestored || !completed.ReservationReleased ||
+		finalState.ActiveOperationID != "" || finalState.Maintenance || finalState.PublicState != model.StateIdle {
+		t.Fatalf("checkpointed rollback did not converge: operation=%#v state=%#v", completed, finalState)
+	}
+	if snapshots.restores != 1 {
+		t.Fatalf("recovery replayed an already committed snapshot restore: %d", snapshots.restores)
+	}
+	if gate.releases != 2 {
+		t.Fatalf("recovery did not retry only the unfinished reservation release: %d", gate.releases)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("recovery recreated the discarded source-migration destination: %v", err)
+	}
+}
+
+func TestRolledBackSourceInstallIsBoundAndRearmedOnlyAfterActiveClaim(t *testing.T) {
+	releaseServer, manifestURL := testReleaseServer(t)
+	defer releaseServer.Close()
+	root := t.TempDir()
+	legacyRoot := filepath.Join(root, "legacy-checkout")
+	legacyData := filepath.Join(legacyRoot, "data")
+	if err := os.MkdirAll(legacyData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("legacy-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(root, "managed")
+	stateDir := filepath.Join(dataRoot, "manager")
+	expectedCommit := strings.Repeat("b", 40)
+	legacy := &migration.Service{
+		StatePath: filepath.Join(stateDir, "migration.json"), DestinationData: filepath.Join(dataRoot, "data"),
+		BackupRoot: filepath.Join(dataRoot, "backups"), QuarantineRoot: filepath.Join(dataRoot, "quarantine"),
+		LegacyService: "enterprise-agent-platform.service", Runner: &legacySystemdRunner{},
+	}
+	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Cutover(context.Background(), "previous-attempt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Rollback(context.Background(), "previous-attempt"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := journal.Open(stateDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.CanRearm = func(plan migration.Plan, operationID string) bool {
+		state := store.State()
+		if state.ActiveOperationID != operationID || state.FinalizePendingOperationID != "" {
+			return false
+		}
+		active, readErr := store.Operation(operationID)
+		return readErr == nil && active.Kind == model.OperationInstall && active.Status == model.OperationRunning && active.ExpectedSourceCommit == plan.ExpectedSourceCommit
+	}
+	engine := &fakeEngine{failAt: "pull"}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: fakeGate{}, LegacyGate: fakeGate{}, Legacy: legacy,
+		Snapshots: fakeSnapshot{}, ReleasesDir: filepath.Join(stateDir, "releases"),
+		ManifestURL: manifestURL, Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "claimed-source-retry",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.ExpectedSourceCommit != expectedCommit || completed.Status != model.OperationFailed {
+		t.Fatalf("rolled-back source install escaped its source binding: %#v", completed)
+	}
+	plan, err := legacy.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Status != "configured" || plan.OperationID != "" || !legacy.Active() {
+		t.Fatalf("active install did not rearm the exact rolled-back plan: %#v", plan)
+	}
+}
+
+func TestFreshInstallClaimPreventsConcurrentFirstLegacyConfigure(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "manager")
+	store, err := journal.Open(stateDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimMu := &sync.Mutex{}
+	legacy := &migration.Service{
+		StatePath: filepath.Join(stateDir, "migration.json"), DestinationData: filepath.Join(root, "managed-data"),
+		BackupRoot: filepath.Join(root, "backups"), QuarantineRoot: filepath.Join(root, "quarantine"),
+		LegacyService: "enterprise-agent-platform.service", ClaimMu: claimMu,
+	}
+	legacy.CanConfigure = func() bool {
+		state := store.State()
+		return state.ActiveOperationID == "" && state.FinalizePendingOperationID == ""
+	}
+	releaseStarted := make(chan struct{})
+	releaseFinish := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-releaseStarted:
+		default:
+			close(releaseStarted)
+		}
+		<-releaseFinish
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Legacy: legacy, LegacyClaimMu: claimMu,
+		Snapshots: fakeSnapshot{}, ReleasesDir: filepath.Join(stateDir, "releases"),
+		ManifestURL: server.URL, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+		PollInterval: time.Millisecond,
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "fresh-install-claim",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fresh install did not retain its active claim")
+	}
+	legacyRoot := filepath.Join(root, "legacy")
+	legacyData := filepath.Join(legacyRoot, "data")
+	if err := os.MkdirAll(legacyData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", strings.Repeat("b", 40)); err == nil || !strings.Contains(err.Error(), "operation is active") {
+		t.Fatalf("concurrent Configure changed a claimed fresh install: %v", err)
+	}
+	if _, err := os.Lstat(legacy.StatePath); !os.IsNotExist(err) {
+		t.Fatalf("rejected Configure persisted a migration plan: %v", err)
+	}
+	close(releaseFinish)
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil || completed.Status != model.OperationFailed {
+		t.Fatalf("fresh install did not settle after test release failure: %#v %v", completed, err)
+	}
+}
+
+func TestRecoverLegacyRollbackJournalWithoutCheckpointsRecreatesMissingDataSafely(t *testing.T) {
+	root := t.TempDir()
+	legacyRoot := filepath.Join(root, "legacy-checkout")
+	legacyData := filepath.Join(legacyRoot, "data")
+	if err := os.MkdirAll(legacyData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("legacy-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(root, "managed")
+	destination := filepath.Join(dataRoot, "data")
+	stateDir := filepath.Join(dataRoot, "manager")
+	backups := filepath.Join(dataRoot, "backups")
+	runner := &legacySystemdRunner{}
+	legacy := &migration.Service{
+		StatePath:       filepath.Join(stateDir, "migration.json"),
+		DestinationData: destination,
+		BackupRoot:      backups,
+		QuarantineRoot:  filepath.Join(dataRoot, "quarantine"),
+		LegacyService:   "enterprise-agent-platform.service",
+		Runner:          runner,
+	}
+	expectedCommit := strings.Repeat("b", 40)
+	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
+		t.Fatal(err)
+	}
+	store, err := journal.Open(stateDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "legacy-rollback-without-checkpoints",
+		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: expectedCommit,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Cutover(context.Background(), op.ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshots := &countingSnapshot{store: snapshot.Store{DataDir: destination, BackupDir: backups}}
+	snapshotPath, err := snapshots.Create(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Rollback(context.Background(), op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("test did not reproduce the deleted rollback destination: %v", err)
+	}
+	// Reproduce the old retry timer racing the still-active operation: legacy
+	// Configure used to turn rolled_back back into configured and clear the
+	// operation binding even though the operation journal remained rolling_back.
+	legacy.CanRearm = func(migration.Plan, string) bool { return true }
+	if err := legacy.Rearm("old-timer-rearm"); err != nil {
+		t.Fatal(err)
+	}
+	rearmed, err := legacy.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rearmed.Status != "configured" || rearmed.OperationID != "" {
+		t.Fatalf("test did not reproduce the legacy timer rearm: %#v", rearmed)
+	}
+	if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationRunning
+		value.Phase = model.PhaseRollingBack
+		value.ReservationStatus = model.ReservationMutationStarted
+		value.SnapshotPath = snapshotPath
+		value.Error = "container platform is unhealthy"
+		value.UpdatedAt = time.Now().UTC()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(value *model.ManagerState) error {
+		value.Phase = model.PhaseRollingBack
+		value.PublicState = model.StateFailed
+		value.Maintenance = true
+		value.LastError = "container platform is unhealthy; rollback failed: inspect data directory"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, LegacyGate: fakeGate{},
+		Legacy: legacy, Snapshots: snapshots,
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	if completed.Status != model.OperationFailed || !completed.Finalized ||
+		!completed.SnapshotRestored || !completed.LegacyRestored || !completed.ReservationReleased ||
+		state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
+		t.Fatalf("legacy checkpoint-free rollback did not recover: operation=%#v state=%#v", completed, state)
+	}
+	if snapshots.restores != 1 {
+		t.Fatalf("missing destination was not restored exactly once: %d", snapshots.restores)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("recovered legacy rollback retained the uncommitted destination: %v", err)
+	}
+	legacyDB, err := os.ReadFile(filepath.Join(legacyData, "platform.db"))
+	if err != nil || string(legacyDB) != "legacy-db" {
+		t.Fatalf("checkpoint-free recovery changed authoritative legacy data: %q %v", legacyDB, err)
+	}
+}
+
 func TestCheckClearsCandidateWhenReleaseMatchesCurrentGeneration(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -1556,6 +1999,33 @@ func TestCheckClearsCandidateWhenReleaseMatchesCurrentGeneration(t *testing.T) {
 	}
 	if candidate := store.State().Candidate; candidate != nil {
 		t.Fatalf("same-generation check left a false update target: %#v", candidate)
+	}
+}
+
+func TestCheckExpectedRejectsSourceMismatchBeforeStateMutation(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.LastError = "retain historical failure until exact release is proven"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, ReleasesDir: t.TempDir(), Channel: "main",
+		ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	_, err = orchestrator.CheckExpected(context.Background(), url, strings.Repeat("a", 40))
+	if err == nil || !strings.Contains(err.Error(), "source migration release mismatch") {
+		t.Fatalf("mismatched source release was accepted: %v", err)
+	}
+	state := store.State()
+	if state.Candidate != nil || state.LastError != "retain historical failure until exact release is proven" {
+		t.Fatalf("mismatched check changed Manager state: %#v", state)
 	}
 }
 

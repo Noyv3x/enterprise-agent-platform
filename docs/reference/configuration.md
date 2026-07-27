@@ -37,7 +37,7 @@ log_max_files = 5
 - `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。首次源码迁移可以用 `install.sh --manifest-url` 绑定精确引导 release，但长期值由 `--channel-manifest-url` 或 `UBITECH_RELEASE_CHANNEL_MANIFEST_URL` 提供，不能持久化精确 commit URL。运行身份永远使用 digest，不使用 tag。
 - `update_enabled` 与 `update_interval` 控制检测；手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
 - `sandbox_idle` 默认值由机器契约生成；配置覆盖必须在受支持范围内，并同时作用于任务与后台进程判断。
-- 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。
+- 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。Platform 的 Manager control 客户端只为读取第一代 Manager 已持久化的历史大状态保留 8 MiB 有界兼容预算；新 Manager 的状态、operation 和迁移投影必须远小于该预算，不能把提高客户端上限当作允许诊断继续增长。
 
 Manager 配置修改通过临时文件、fsync 和原子替换保存。常驻进程只热加载明确声明可热更新的字段；listen、data root 和 control socket 变化需要 restart operation。
 

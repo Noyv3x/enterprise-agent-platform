@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
@@ -94,7 +95,8 @@ func (s Store) Restore(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateDataDirectory(s.DataDir); err != nil {
+	s.DataDir = filepath.Clean(s.DataDir)
+	if err := s.ensureDataDirectoryForRestore(); err != nil {
 		return err
 	}
 	transactionDir, err := os.MkdirTemp(s.DataDir, ".snapshot-restore-")
@@ -268,6 +270,75 @@ func validateDataDirectory(path string) error {
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("data directory is not a regular directory")
+	}
+	if err := validateOwnerOnlyDirectory(path, info); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureDataDirectoryForRestore permits one narrowly-scoped recreation path:
+// a rollback journal has already selected and fully validated the snapshot,
+// but an earlier legacy rollback attempt removed its uncommitted destination.
+// Only the final data directory may be absent. Its existing parent remains the
+// trust anchor and must be a real directory owned by the Manager user.
+func (s Store) ensureDataDirectoryForRestore() error {
+	if !filepath.IsAbs(s.DataDir) {
+		return errors.New("data directory must be absolute")
+	}
+	s.DataDir = filepath.Clean(s.DataDir)
+	parent := filepath.Dir(s.DataDir)
+	if parent == s.DataDir {
+		return errors.New("refusing to recreate an unsafe data directory")
+	}
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		return fmt.Errorf("inspect data directory parent: %w", err)
+	}
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("data directory parent is not a regular directory")
+	}
+	if err := validateDirectoryOwner(parent, parentInfo); err != nil {
+		return fmt.Errorf("data directory parent: %w", err)
+	}
+	dataInfo, err := os.Lstat(s.DataDir)
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(s.DataDir, 0o700); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("recreate data directory: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("inspect data directory: %w", err)
+	} else if !dataInfo.IsDir() || dataInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("data directory is not a regular directory")
+	} else if err := validateOwnerOnlyDirectory(s.DataDir, dataInfo); err != nil {
+		return err
+	}
+	if err := validateDataDirectory(s.DataDir); err != nil {
+		return err
+	}
+	if err := s.syncDirectory(parent); err != nil {
+		return fmt.Errorf("sync recreated data directory parent: %w", err)
+	}
+	return nil
+}
+
+func validateDirectoryOwner(path string, info os.FileInfo) error {
+	metadata, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || metadata.Uid != uint32(os.Getuid()) {
+		return fmt.Errorf("directory %s is not owned by the Manager user", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("directory %s is writable by another host identity", path)
+	}
+	return nil
+}
+
+func validateOwnerOnlyDirectory(path string, info os.FileInfo) error {
+	if err := validateDirectoryOwner(path, info); err != nil {
+		return err
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("directory %s is accessible by another host identity", path)
 	}
 	return nil
 }

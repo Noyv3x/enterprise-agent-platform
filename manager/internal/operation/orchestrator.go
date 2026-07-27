@@ -28,6 +28,8 @@ type Snapshotter interface {
 
 type LegacyMigrator interface {
 	Active() bool
+	RequiredSourceCommit() (string, bool, error)
+	Rearm(string) error
 	PreCutover(context.Context, string) error
 	Cutover(context.Context, string) error
 	FinalizeCleanup(context.Context, string) error
@@ -59,6 +61,7 @@ type Orchestrator struct {
 	OnCommit            func(release.Manifest)
 	PublicProbe         func(context.Context) error
 	LocalUpdateBlockers func() (running, blocking, terminable int)
+	LegacyClaimMu       *sync.Mutex
 	mu                  sync.Mutex
 	finalizeMu          sync.Mutex
 	rollbackMu          sync.Mutex
@@ -85,12 +88,19 @@ func (o *Orchestrator) Preflight(ctx context.Context) error {
 	return nil
 }
 func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest, error) {
+	return o.CheckExpected(ctx, url, "")
+}
+
+func (o *Orchestrator) CheckExpected(ctx context.Context, url, expectedSourceCommit string) (release.Manifest, error) {
 	if url == "" {
 		url = o.ManifestURL
 	}
 	manifest, data, err := o.ReleaseClient.Fetch(ctx, url, o.Channel)
 	if err != nil {
 		return release.Manifest{}, err
+	}
+	if expectedSourceCommit != "" && manifest.SourceCommit != expectedSourceCommit {
+		return release.Manifest{}, fmt.Errorf("source migration release mismatch: expected %s, received %s", expectedSourceCommit, manifest.SourceCommit)
 	}
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
@@ -108,6 +118,22 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	return manifest, err
 }
 func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, bool, error) {
+	if o.LegacyClaimMu != nil {
+		o.LegacyClaimMu.Lock()
+		defer o.LegacyClaimMu.Unlock()
+	}
+	if request.Kind == model.OperationInstall && o.Legacy != nil {
+		expected, required, err := o.Legacy.RequiredSourceCommit()
+		if err != nil {
+			return model.Operation{}, false, fmt.Errorf("resolve source migration binding: %w", err)
+		}
+		if required {
+			if request.ExpectedSourceCommit != "" && request.ExpectedSourceCommit != expected {
+				return model.Operation{}, false, errors.New("install expected source commit does not match the legacy migration plan")
+			}
+			request.ExpectedSourceCommit = expected
+		}
+	}
 	if request.ExpectedSourceCommit != "" && !validSourceCommit(request.ExpectedSourceCommit) {
 		return model.Operation{}, false, errors.New("expected_source_commit must be a 40-character lowercase Git commit")
 	}
@@ -322,6 +348,12 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist validation phase: %w", err))
 		return
 	}
+	if op.Kind == model.OperationInstall && op.ExpectedSourceCommit != "" && o.Legacy != nil {
+		if err := o.Legacy.Rearm(op.ID); err != nil {
+			o.failBeforeMaintenance(op, fmt.Errorf("claim legacy migration retry: %w", err))
+			return
+		}
+	}
 	var manifest release.Manifest
 	var data []byte
 	var err error
@@ -436,7 +468,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			return
 		}
 	}
-	if op.Kind == model.OperationInstall && o.Legacy != nil && o.Legacy.Active() {
+	if legacyCutover {
 		if err = o.Legacy.Cutover(ctx, op.ID); err != nil {
 			o.failAfterMaintenance(ctx, op, nil, err)
 			return
@@ -633,7 +665,7 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 		return
 	}
 	if err = o.Engine.StartFixed(ctx, manifest); err != nil {
-		o.failAfterMaintenance(ctx, op, nil, err)
+		o.failAfterMaintenance(ctx, op, &manifest, err)
 		return
 	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing restarted generation", o.now()); err != nil {
@@ -641,7 +673,7 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 		return
 	}
 	if err = o.Engine.Probe(ctx, manifest); err != nil {
-		o.failAfterMaintenance(ctx, op, nil, err)
+		o.failAfterMaintenance(ctx, op, &manifest, err)
 		return
 	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhaseCommitting, model.StateUpdating, true, "committing restarted generation", o.now()); err != nil {
@@ -720,7 +752,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		return
 	}
 	if err = o.Engine.StartFixed(ctx, manifest); err != nil {
-		o.failAfterMaintenance(ctx, op, nil, err)
+		o.failAfterMaintenance(ctx, op, &manifest, err)
 		return
 	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhaseProbing, model.StateUpdating, true, "probing previous generation", o.now()); err != nil {
@@ -728,7 +760,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		return
 	}
 	if err = o.Engine.Probe(ctx, manifest); err != nil {
-		o.failAfterMaintenance(ctx, op, nil, err)
+		o.failAfterMaintenance(ctx, op, &manifest, err)
 		return
 	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhaseCommitting, model.StateUpdating, true, "committing previous generation", o.now()); err != nil {
@@ -1114,23 +1146,46 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 		return
 	}
 	firstAttempt := current.Phase != model.PhaseRollingBack
+	failureAlreadyRecorded := current.Error != ""
 	originalError := current.Error
 	if originalError == "" {
 		originalError = cause.Error()
 	}
+	// Legacy Managers allowed repeated rollback failures to grow Error and
+	// LastError without a bound. Normalize that history even when there is no
+	// live candidate to diagnose, otherwise a successful offline recovery can
+	// restart the stable Manager with another multi-megabyte status response.
+	originalError = journal.BoundDiagnostic(originalError)
+	// Preserve the exact candidate evidence before StopFixed removes the failed
+	// containers. A cancelled operation context must not suppress forensics, so
+	// the optional Docker implementation owns a short, bounded background
+	// deadline. Never append the same diagnostic again during recovery retries.
+	if firstAttempt && !failureAlreadyRecorded && target != nil {
+		if diagnoser, ok := o.Engine.(driver.CandidateFailureDiagnoser); ok {
+			if diagnostic := strings.TrimSpace(diagnoser.CandidateFailureDiagnostics(context.Background(), *target)); diagnostic != "" {
+				originalError = journal.BoundDiagnostic(originalError + "\n\ncandidate failure diagnostics:\n" + diagnostic)
+			}
+		}
+	}
 	// A process can die between persisting the operation terminal record and
 	// persisting Manager state. Re-open that half-commit as a durable rollback
 	// before SetPhase, which intentionally rejects terminal operations.
-	_, _ = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+	if _, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.Status = model.OperationRunning
 		value.Finalized = false
 		value.CompletedAt = nil
 		value.Error = originalError
 		value.UpdatedAt = o.now()
 		return nil
-	})
+	}); operationErr != nil {
+		o.event(op.ID, "operation.failed", op.TargetGeneration, fmt.Errorf("reopen rollback operation: %w", operationErr))
+		return
+	}
 	if firstAttempt {
-		_, _ = o.Store.SetPhase(op.ID, model.PhaseRollingBack, model.StateUpdating, true, "restoring previous generation", o.now())
+		if _, operationErr = o.Store.SetPhase(op.ID, model.PhaseRollingBack, model.StateUpdating, true, "restoring previous generation", o.now()); operationErr != nil {
+			o.event(op.ID, "operation.failed", op.TargetGeneration, fmt.Errorf("persist rollback phase: %w", operationErr))
+			return
+		}
 	}
 	// Stop every possible writer before touching the snapshot or restarting the
 	// legacy service. This also covers a first install, where state.Current is
@@ -1142,16 +1197,38 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 	if readErr == nil && operationErr != nil {
 		readErr = operationErr
 	}
-	if readErr == nil && current.SnapshotPath != "" {
-		readErr = o.Snapshots.Restore(ctx, current.SnapshotPath)
+	if readErr == nil && !current.SnapshotRestored {
+		if current.SnapshotPath != "" {
+			readErr = o.Snapshots.Restore(ctx, current.SnapshotPath)
+		}
+		if readErr == nil {
+			current, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+				value.SnapshotRestored = true
+				value.UpdatedAt = o.now()
+				return nil
+			})
+			if operationErr != nil {
+				readErr = fmt.Errorf("persist snapshot-restored checkpoint: %w", operationErr)
+			}
+		}
 	}
 	state := o.Store.State()
-	legacyRestored := false
-	if stopErr == nil && op.Kind == model.OperationInstall && o.Legacy != nil {
-		if legacyErr := o.Legacy.Rollback(ctx, op.ID); legacyErr == nil {
-			legacyRestored = true
-		} else if readErr == nil {
+	legacyInstall := op.Kind == model.OperationInstall && op.ExpectedSourceCommit != "" && o.Legacy != nil
+	legacyRestored := current.LegacyRestored
+	if readErr == nil && legacyInstall && !legacyRestored {
+		if legacyErr := o.Legacy.Rollback(ctx, op.ID); legacyErr != nil {
 			readErr = legacyErr
+		} else {
+			current, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+				value.LegacyRestored = true
+				value.UpdatedAt = o.now()
+				return nil
+			})
+			if operationErr != nil {
+				readErr = fmt.Errorf("persist legacy-restored checkpoint: %w", operationErr)
+			} else {
+				legacyRestored = true
+			}
 		}
 	}
 	if readErr == nil && state.Current != nil {
@@ -1165,20 +1242,46 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			}
 		}
 	}
-	if readErr == nil && (state.Current != nil || legacyRestored) {
+	if readErr == nil && (state.Current != nil || legacyRestored) && !current.ReservationReleased {
 		gate := o.Gate
 		if legacyRestored && o.LegacyGate != nil {
 			gate = o.LegacyGate
 		}
-		if releaseErr := gate.Release(context.Background(), op.ID); releaseErr != nil {
-			readErr = fmt.Errorf("release update reservation: %w", releaseErr)
+		if gate == nil {
+			readErr = errors.New("release update reservation: Platform admission gate is not configured")
+		}
+		if readErr == nil && legacyRestored {
+			healthCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
+			healthErr := gate.Health(healthCtx)
+			cancel()
+			if healthErr != nil {
+				readErr = fmt.Errorf("probe restored legacy Platform: %w", healthErr)
+			}
+		}
+		if readErr == nil {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
+			releaseErr := gate.Release(releaseCtx, op.ID)
+			cancel()
+			if releaseErr != nil {
+				readErr = fmt.Errorf("release update reservation: %w", releaseErr)
+			}
+		}
+		if readErr == nil {
+			current, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+				value.ReservationReleased = true
+				value.UpdatedAt = o.now()
+				return nil
+			})
+			if operationErr != nil {
+				readErr = fmt.Errorf("persist reservation-released checkpoint: %w", operationErr)
+			}
 		}
 	}
 	if readErr == nil && state.Current == nil && !legacyRestored {
 		// A clean first install has no older generation to restart. Once every
 		// candidate writer is stopped and its pre-install snapshot is restored,
 		// the safe outcome is a terminal failed install behind the Manager page.
-		_, _ = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
+		_, operationErr = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
 			value.PublicState = model.StateFailed
 			value.Maintenance = true
 			value.LastError = originalError
@@ -1186,7 +1289,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			value.RetryAfterSeconds = 0
 		}, originalError, o.now())
 	} else if readErr == nil && (state.Current != nil || legacyRestored) {
-		_, _ = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
+		_, operationErr = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
 			value.PublicState = model.StateIdle
 			value.Maintenance = false
 			value.LastError = originalError
@@ -1198,7 +1301,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 		if readErr != nil {
 			message += "; rollback failed: " + readErr.Error()
 		}
-		_, _ = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		_, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 			value.Status = model.OperationRunning
 			value.Phase = model.PhaseRollingBack
 			value.Error = originalError
@@ -1207,7 +1310,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			value.UpdatedAt = o.now()
 			return nil
 		})
-		_, _ = o.Store.MutateState(o.now(), func(value *model.ManagerState) error {
+		_, stateErr := o.Store.MutateState(o.now(), func(value *model.ManagerState) error {
 			value.ActiveOperationID = op.ID
 			value.Phase = model.PhaseRollingBack
 			value.PublicState = model.StateFailed
@@ -1216,11 +1319,17 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			value.RetryAfterSeconds = 5
 			return nil
 		})
+		if operationErr == nil && stateErr != nil {
+			operationErr = stateErr
+		}
+	}
+	if operationErr != nil {
+		o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cause, fmt.Errorf("persist rollback recovery state: %w", operationErr)))
+		return
 	}
 	if firstAttempt {
 		o.event(op.ID, "operation.failed", op.TargetGeneration, cause)
 	}
-	_ = target
 }
 func (o *Orchestrator) recoverRollback(ctx context.Context, op model.Operation) error {
 	state := o.Store.State()

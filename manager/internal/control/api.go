@@ -125,8 +125,9 @@ func (a *API) preflight(response http.ResponseWriter, request *http.Request) {
 }
 func (a *API) check(response http.ResponseWriter, request *http.Request) {
 	var body struct {
-		IdempotencyKey string `json:"idempotency_key"`
-		ManifestURL    string `json:"manifest_url,omitempty"`
+		IdempotencyKey       string `json:"idempotency_key"`
+		ManifestURL          string `json:"manifest_url,omitempty"`
+		ExpectedSourceCommit string `json:"expected_source_commit,omitempty"`
 	}
 	if err := decode(request, &body); err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
@@ -140,12 +141,16 @@ func (a *API) check(response http.ResponseWriter, request *http.Request) {
 	cached, ok := a.checks[body.IdempotencyKey]
 	a.mu.Unlock()
 	if ok {
+		if body.ExpectedSourceCommit != "" && cached.SourceCommit != body.ExpectedSourceCommit {
+			writeError(response, http.StatusConflict, "source migration release mismatch")
+			return
+		}
 		writeJSON(response, http.StatusOK, map[string]any{"manifest": cached, "reused": true})
 		return
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
 	defer cancel()
-	manifest, err := a.Operations.Check(ctx, body.ManifestURL)
+	manifest, err := a.Operations.CheckExpected(ctx, body.ManifestURL, body.ExpectedSourceCommit)
 	if err != nil {
 		writeError(response, http.StatusBadGateway, err.Error())
 		return
@@ -174,17 +179,19 @@ func (a *API) startOperation(response http.ResponseWriter, request *http.Request
 	if body.ExpectedGeneration != nil {
 		expected = *body.ExpectedGeneration
 	}
-	if body.Operation == model.OperationInstall && a.Legacy != nil && a.Legacy.Active() {
-		plan, planErr := a.Legacy.Plan()
-		if planErr != nil || plan.ExpectedSourceCommit == "" {
+	if body.Operation == model.OperationInstall && a.Legacy != nil {
+		expectedCommit, required, planErr := a.Legacy.RequiredSourceCommit()
+		if planErr != nil {
 			writeError(response, http.StatusConflict, "source migration is missing its expected source commit")
 			return
 		}
-		if body.ExpectedSourceCommit != "" && body.ExpectedSourceCommit != plan.ExpectedSourceCommit {
+		if required && body.ExpectedSourceCommit != "" && body.ExpectedSourceCommit != expectedCommit {
 			writeError(response, http.StatusConflict, "install expected source commit does not match the legacy migration plan")
 			return
 		}
-		body.ExpectedSourceCommit = plan.ExpectedSourceCommit
+		if required {
+			body.ExpectedSourceCommit = expectedCommit
+		}
 	}
 	op, reused, err := a.Operations.Start(model.OperationRequest{Kind: body.Operation, IdempotencyKey: body.IdempotencyKey, ExpectedGeneration: expected, ManifestURL: body.ManifestURL, ExpectedSourceCommit: body.ExpectedSourceCommit})
 	if err != nil {

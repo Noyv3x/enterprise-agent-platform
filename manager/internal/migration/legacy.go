@@ -113,6 +113,9 @@ type Service struct {
 	BeforePersist                                          func(Plan) error
 	BeforeArchiveStep                                      func(string) error
 	PreCutoverCheck                                        func(context.Context, Plan) error
+	CanRearm                                               func(Plan, string) bool
+	CanConfigure                                           func() bool
+	ClaimMu                                                *sync.Mutex
 	ArchiveRename                                          func(string, string) error
 	SyncDir                                                func(string) error
 	mutationMu                                             sync.Mutex
@@ -123,6 +126,10 @@ type Service struct {
 }
 
 func (s *Service) Configure(root, data string, serviceName ...string) (Plan, error) {
+	if s.ClaimMu != nil {
+		s.ClaimMu.Lock()
+		defer s.ClaimMu.Unlock()
+	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 	root, err := cleanRoot(root)
@@ -180,38 +187,17 @@ func (s *Service) Configure(root, data string, serviceName ...string) (Plan, err
 			return Plan{}, errors.New("legacy migration expected source commit changed")
 		}
 		if current.Status == "rolled_back" {
-			if !samePath(current.LegacyData, current.DestinationData) {
-				if err := os.RemoveAll(current.DestinationData); err != nil {
-					return Plan{}, fmt.Errorf("remove rolled-back destination: %w", err)
-				}
-				if err := os.RemoveAll(current.DestinationData + ".migrating-" + current.ID); err != nil {
-					return Plan{}, fmt.Errorf("remove rolled-back staging data: %w", err)
-				}
-			}
-			current.Status = "configured"
-			current.OperationID = ""
-			current.Copied = false
-			current.CopyPrepared = false
-			current.OldServiceStopped = false
-			current.UnitStateRecorded = false
-			current.LegacyUnitFileState = ""
-			current.LegacyWasEnabled = false
-			current.Entries = nil
-			current.ArchivePath = ""
-			current.ArchiveReady = false
-			current.ArchiveTrees = nil
-			current.ArchiveFiles = nil
-			current.RetiredCaches = nil
-			current.ComposeCleanupErrors = nil
-			current.Error = ""
-			current.UpdatedAt = s.now()
-			if err := s.persistLocked(current); err != nil {
-				return Plan{}, err
-			}
+			// Configure is discovery/idempotency only. Rearming is destructive to
+			// the uncommitted destination and therefore belongs to the next install
+			// operation after it has atomically claimed the operation journal.
+			return current, nil
 		}
 		return current, nil
 	} else if !os.IsNotExist(loadErr) {
 		return Plan{}, fmt.Errorf("read existing legacy migration: %w", loadErr)
+	}
+	if s.CanConfigure != nil && !s.CanConfigure() {
+		return Plan{}, errors.New("cannot configure a source migration while a Manager operation is active")
 	}
 	now := s.now()
 	plan := Plan{
@@ -224,6 +210,57 @@ func (s *Service) Configure(root, data string, serviceName ...string) (Plan, err
 		return Plan{}, err
 	}
 	return plan, nil
+}
+
+// Rearm prepares one rolled-back source migration for an install operation
+// that already owns the Manager's active journal slot. Keeping this mutation
+// out of Configure closes the check-then-act window where a timer could alter
+// legacy cutover requirements while another operation was starting.
+func (s *Service) Rearm(operationID string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if strings.TrimSpace(operationID) == "" {
+		return errors.New("legacy rearm operation id is required")
+	}
+	current, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	if current.Status != "rolled_back" {
+		return nil
+	}
+	if s.CanRearm == nil || !s.CanRearm(current, operationID) {
+		return errors.New("legacy migration rearm requires the matching active install operation")
+	}
+	if !samePath(current.LegacyData, current.DestinationData) {
+		if err := os.RemoveAll(current.DestinationData); err != nil {
+			return fmt.Errorf("remove rolled-back destination: %w", err)
+		}
+		if err := os.RemoveAll(current.DestinationData + ".migrating-" + current.ID); err != nil {
+			return fmt.Errorf("remove rolled-back staging data: %w", err)
+		}
+	}
+	current.Status = "configured"
+	current.OperationID = ""
+	current.Copied = false
+	current.CopyPrepared = false
+	current.OldServiceStopped = false
+	current.UnitStateRecorded = false
+	current.LegacyUnitFileState = ""
+	current.LegacyWasEnabled = false
+	current.Entries = nil
+	current.ArchivePath = ""
+	current.ArchiveReady = false
+	current.ArchiveTrees = nil
+	current.ArchiveFiles = nil
+	current.RetiredCaches = nil
+	current.ComposeCleanupErrors = nil
+	current.Error = ""
+	current.UpdatedAt = s.now()
+	if err := s.persistLocked(current); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Plan returns the latest durable migration state without waiting for a long
@@ -258,6 +295,27 @@ func (s *Service) Active() bool {
 		return !os.IsNotExist(err)
 	}
 	return plan.Status != "cleanup_pending" && plan.Status != "committed" && plan.Status != "rolled_back"
+}
+
+// RequiredSourceCommit keeps every install bound to authoritative source data
+// until the migration reaches its irreversible cleanup/commit boundary. A
+// rolled-back plan is intentionally included even though Active returns false:
+// the next install must claim and Rearm it, never bypass it as a fresh install.
+func (s *Service) RequiredSourceCommit() (string, bool, error) {
+	plan, err := s.Plan()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", true, err
+	}
+	if plan.Status == "cleanup_pending" || plan.Status == "committed" {
+		return "", false, nil
+	}
+	if !validCommit(plan.ExpectedSourceCommit) {
+		return "", true, errors.New("source migration is missing its expected source commit")
+	}
+	return plan.ExpectedSourceCommit, true, nil
 }
 
 // PreCutover reruns bridge-owned checks at the last reversible point, after

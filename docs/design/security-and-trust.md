@@ -52,7 +52,7 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 ## 管理器与更新
 
-Manager control socket、配置、release manifest、operation journal 和 registry 凭据必须 owner-only。所有 install/update/restart/rollback/repair operation 带 idempotency key、期望 generation 和持久阶段；Manager 先核对 key 对应的不可变请求指纹，再判断 generation，使丢失响应后的原样重放只能观察原 operation，不能启动第二个变更或用同 key 替换请求。control 服务端先完整编码再提交成功状态，mutation 只返回有界确认；客户端把空、截断、超限或非法的 2xx 响应视为结果不确定并以原幂等身份对账，不能伪造成功或当作确定失败。外部错误正文属于不可信诊断数据：写入 state、operation 或 activation journal 前必须限制大小，重试只替换“最近一次失败”片段而不能递归拼接上一份完整错误；control API 也只返回有界诊断投影，不能让历史错误耗尽本地控制通道预算。
+Manager control socket、配置、release manifest、operation journal 和 registry 凭据必须 owner-only。所有 install/update/restart/rollback/repair operation 带 idempotency key、期望 generation 和持久阶段；Manager 先核对 key 对应的不可变请求指纹，再判断 generation，使丢失响应后的原样重放只能观察原 operation，不能启动第二个变更或用同 key 替换请求。control 服务端先完整编码再提交成功状态，mutation 只返回有界确认；客户端把空、截断、超限或非法的 2xx 响应视为结果不确定并以原幂等身份对账，不能伪造成功或当作确定失败。外部错误正文属于不可信诊断数据：写入 state、operation 或 activation journal 前必须限制大小，重试只替换“最近一次失败”片段而不能递归拼接上一份完整错误；control API 也只返回有界诊断投影，不能让历史错误耗尽本地控制通道预算。候选 Platform readiness 失败时，Manager 在删除容器前先读取 healthcheck 再读取有界日志；两类内容必须先替换精确 Manager capability 和通用凭据模式、再截断并写入 operation，采集失败本身只能成为有界诊断，不能阻止回滚。
 
 发布清单锁定源 commit、数据库版本、管理器校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；旧 Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
 

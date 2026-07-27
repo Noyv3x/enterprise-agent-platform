@@ -30,6 +30,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _respond_chunked(self, payload, status=200):
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for offset in range(0, len(raw), 64 * 1024):
+            chunk = raw[offset : offset + 64 * 1024]
+            self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii"))
+            self.wfile.write(chunk)
+            self.wfile.write(b"\r\n")
+        self.wfile.write(b"0\r\n\r\n")
+
     def do_GET(self):
         if self.headers.get("Authorization") != "Bearer test-token":
             self._respond({"error": "unauthorized"}, 401)
@@ -70,7 +83,19 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
         elif self.path == "/v1/status":
-            self._respond({"public_state": "idle", "generation": "g1"})
+            legacy_error_bytes = getattr(
+                self.server, "legacy_status_error_bytes", 0
+            )
+            if legacy_error_bytes:
+                self._respond_chunked(
+                    {
+                        "public_state": "idle",
+                        "generation": "g1",
+                        "error": "x" * legacy_error_bytes,
+                    }
+                )
+            else:
+                self._respond({"public_state": "idle", "generation": "g1"})
         elif self.path == "/v1/config":
             self._respond({"update_enabled": True, "update_interval": 300})
         else:
@@ -128,6 +153,30 @@ class ManagerClientTests(unittest.TestCase):
             client = ManagerClient(Path(td) / "missing.sock", Path(td) / "missing-token")
             with self.assertRaisesRegex(ManagerClientError, "token is unavailable"):
                 client.status()
+
+    def test_chunked_legacy_status_larger_than_two_mib_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket_path = root / "manager.sock"
+            token_path = root / "token"
+            token_path.write_text("test-token\n", encoding="utf-8")
+            server = _Server(str(socket_path), _Handler)
+            server.requests = []
+            server.legacy_status_error_bytes = 3 * 1024 * 1024
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                self.assertGreater(server.legacy_status_error_bytes, 2 * 1024 * 1024)
+                self.assertLess(server.legacy_status_error_bytes, MAX_MANAGER_RESPONSE_BYTES)
+                response = ManagerClient(socket_path, token_path).status()
+                self.assertEqual(response["generation"], "g1")
+                self.assertEqual(
+                    len(response["error"]), server.legacy_status_error_bytes
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_successful_but_unreadable_response_is_outcome_uncertain(self):
         with tempfile.TemporaryDirectory() as td:

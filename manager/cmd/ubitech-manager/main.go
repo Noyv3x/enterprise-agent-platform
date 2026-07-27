@@ -11,9 +11,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -66,6 +68,8 @@ func run(arguments []string) int {
 		err = preflightCommand(arguments[1:])
 	case "install":
 		err = installCommand(arguments[1:])
+	case "recover-rolling-back":
+		err = recoverRollingBackCommand(arguments[1:])
 	case "status":
 		err = simpleGetCommand("status", arguments[1:], "/v1/status")
 	case "check":
@@ -94,7 +98,7 @@ func run(arguments []string) int {
 	return 1
 }
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ubitech-manager <serve|preflight|install|status|check|update|restart|rollback|repair|logs|version> [options]")
+	fmt.Fprintln(os.Stderr, "usage: ubitech-manager <serve|preflight|install|recover-rolling-back|status|check|update|restart|rollback|repair|logs|version> [options]")
 }
 
 func commonFlags(name string) (*flag.FlagSet, *string) {
@@ -134,7 +138,20 @@ func build(path string) (*application, error) {
 	}
 	audit := logstore.New(filepath.Join(cfg.StateDir, "logs", "audit.jsonl"), cfg.LogMaxBytes, cfg.LogBackups)
 	dataDir := cfg.PlatformDataDir()
-	legacy := &migration.Service{StatePath: filepath.Join(cfg.StateDir, "migration.json"), DestinationData: dataDir, BackupRoot: filepath.Join(cfg.DataRoot, "backups"), QuarantineRoot: filepath.Join(cfg.DataRoot, "quarantine"), LegacyService: "enterprise-agent-platform.service"}
+	legacyClaimMu := &sync.Mutex{}
+	legacy := &migration.Service{StatePath: filepath.Join(cfg.StateDir, "migration.json"), DestinationData: dataDir, BackupRoot: filepath.Join(cfg.DataRoot, "backups"), QuarantineRoot: filepath.Join(cfg.DataRoot, "quarantine"), LegacyService: "enterprise-agent-platform.service", ClaimMu: legacyClaimMu}
+	legacy.CanConfigure = func() bool {
+		current := state.State()
+		return current.ActiveOperationID == "" && current.FinalizePendingOperationID == ""
+	}
+	legacy.CanRearm = func(plan migration.Plan, operationID string) bool {
+		current := state.State()
+		if current.ActiveOperationID != operationID || current.FinalizePendingOperationID != "" {
+			return false
+		}
+		active, err := state.Operation(operationID)
+		return err == nil && active.Kind == model.OperationInstall && active.Status == model.OperationRunning && active.ExpectedSourceCommit == plan.ExpectedSourceCommit
+	}
 	snapshots := snapshot.Store{DataDir: dataDir, BackupDir: filepath.Join(cfg.DataRoot, "backups"), Retention: time.Duration(contract.MigrationBackupRetentionSeconds) * time.Second}
 	legacyGateURL := cfg.LegacyPlatformGateURL
 	if legacyGateURL == "" {
@@ -157,7 +174,7 @@ func build(path string) (*application, error) {
 		}
 		return selfUpdater.ProbeTransientUnit(ctx)
 	}
-	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, LegacyGate: operation.HTTPGate{BaseURL: legacyGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, Legacy: legacy, SelfUpdate: selfUpdater, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval}
+	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, LegacyGate: operation.HTTPGate{BaseURL: legacyGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, Legacy: legacy, LegacyClaimMu: legacyClaimMu, SelfUpdate: selfUpdater, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval}
 	selfUpdater.Client = ops.ReleaseClient
 	image := cfg.SandboxImage
 	if current := state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
@@ -531,6 +548,37 @@ func installCommand(arguments []string) error {
 		if !validExpectedSourceCommit(*expectedSourceCommit) {
 			return errors.New("--expected-source-commit must be a 40-character lowercase Git commit for source migration")
 		}
+		// Every bridge generation, including the first Manager release, supports
+		// the idempotent check endpoint. Besides proving the exact immutable
+		// catalog is readable before cutover, a successful check clears an old
+		// unbounded LastError projection that otherwise prevents an older
+		// Platform client from restoring the Manager maintenance reservation.
+		var checked struct {
+			Manifest release.Manifest `json:"manifest"`
+		}
+		checkBody := map[string]any{
+			// A successful check clears the current historical diagnostic. Use a
+			// fresh identity for each independent installer invocation so an old
+			// Manager's in-memory check cache cannot skip that convergence step on
+			// a later timer retry. The check itself is immutable and non-destructive.
+			"idempotency_key":        stableKey("source-install-check", *manifestURL, *expectedSourceCommit, strconv.FormatInt(time.Now().UnixNano(), 10)),
+			"manifest_url":           *manifestURL,
+			"expected_source_commit": *expectedSourceCommit,
+		}
+		checkErr := client.Do(context.Background(), http.MethodPost, "/v1/check", checkBody, &checked)
+		if legacyCheckDoesNotSupportExpectedCommit(checkErr) {
+			delete(checkBody, "expected_source_commit")
+			checkErr = client.Do(context.Background(), http.MethodPost, "/v1/check", checkBody, &checked)
+		}
+		if checkErr != nil {
+			if control.IsUnavailable(checkErr) {
+				return fmt.Errorf("%w: Manager release check is temporarily unavailable: %v", errTemporary, checkErr)
+			}
+			return checkErr
+		}
+		if checked.Manifest.SourceCommit != *expectedSourceCommit {
+			return fmt.Errorf("source migration release mismatch: expected %s, received %s", *expectedSourceCommit, checked.Manifest.SourceCommit)
+		}
 		if err := client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{"legacy_root": *legacyRoot, "legacy_data": *legacyData, "legacy_service": *legacyService, "expected_source_commit": *expectedSourceCommit}, nil); err != nil {
 			if control.IsUnavailable(err) {
 				return fmt.Errorf("%w: Manager is temporarily unavailable: %v", errTemporary, err)
@@ -554,6 +602,364 @@ func installCommand(arguments []string) error {
 		timeout = 3 * time.Second
 	}
 	return awaitOperation(client, response.Operation.ID, timeout, *legacyRoot != "")
+}
+
+func legacyCheckDoesNotSupportExpectedCommit(err error) bool {
+	var response *control.HTTPError
+	return errors.As(err, &response) && response.Status == http.StatusBadRequest &&
+		strings.Contains(response.Message, "unknown field") && strings.Contains(response.Message, "expected_source_commit")
+}
+
+type rollingBackRecoveryStatus struct {
+	PublicState                model.PublicState    `json:"public_state"`
+	Phase                      model.OperationPhase `json:"phase"`
+	Maintenance                bool                 `json:"maintenance"`
+	ActiveOperationID          string               `json:"active_operation_id"`
+	FinalizePendingOperationID string               `json:"finalize_pending_operation_id"`
+}
+
+var userSystemctl = func(ctx context.Context, arguments ...string) error {
+	command := exec.CommandContext(ctx, "systemctl", append([]string{"--user"}, arguments...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl --user %s: %w: %s", strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func userUnitActive(ctx context.Context, unit string) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return userSystemctl(checkCtx, "is-active", "--quiet", unit) == nil
+}
+
+func userSystemctlWithin(arguments ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return userSystemctl(ctx, arguments...)
+}
+
+func probeLegacyPlatform(cfg config.Config) error {
+	baseURL := cfg.LegacyPlatformGateURL
+	if baseURL == "" {
+		return errors.New("legacy Platform gate URL is not configured")
+	}
+	token, err := driver.ReadOwnerSecret(cfg.ControlTokenFile())
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := (operation.HTTPGate{BaseURL: baseURL, Token: token}).Health(ctx); err != nil {
+		return fmt.Errorf("legacy Platform health check failed: %w", err)
+	}
+	return nil
+}
+
+func recoverRollingBackCommand(arguments []string) (resultErr error) {
+	set, path := commonFlags("recover-rolling-back")
+	operationID := set.String("operation-id", "", "exact active rolling-back operation")
+	expectedSourceCommit := set.String("expected-source-commit", "", "exact frozen source commit")
+	legacyRoot := set.String("legacy-root", "", "exact frozen source checkout")
+	legacyData := set.String("legacy-data", "", "exact legacy data directory")
+	legacyService := set.String("legacy-service", "enterprise-agent-platform.service", "exact legacy user-systemd service")
+	recoveryTimeout := set.Duration("recovery-timeout", 30*time.Minute, "offline rollback recovery limit (1m-2h)")
+	if err := set.Parse(arguments); err != nil {
+		return err
+	}
+	if set.NArg() != 0 {
+		return errors.New("recover-rolling-back does not accept positional arguments")
+	}
+	if *operationID == "" || !validExpectedSourceCommit(*expectedSourceCommit) || *legacyRoot == "" || *legacyData == "" || !validUserServiceName(*legacyService) {
+		return errors.New("recover-rolling-back requires --operation-id, --expected-source-commit, --legacy-root and --legacy-data")
+	}
+	if *recoveryTimeout < time.Minute || *recoveryTimeout > 2*time.Hour {
+		return errors.New("--recovery-timeout must be between 1m and 2h")
+	}
+	cfg, err := load(*path)
+	if err != nil {
+		return err
+	}
+	root, err := canonicalExistingDirectory(*legacyRoot)
+	if err != nil {
+		return fmt.Errorf("validate legacy root: %w", err)
+	}
+	data, err := canonicalExistingDirectory(*legacyData)
+	if err != nil {
+		return fmt.Errorf("validate legacy data: %w", err)
+	}
+	client, _, err := managerClient(*path)
+	if err != nil {
+		return err
+	}
+	var status rollingBackRecoveryStatus
+	if err := client.Do(context.Background(), http.MethodGet, "/v1/status", nil, &status); err != nil {
+		return fmt.Errorf("read active Manager recovery state: %w", err)
+	}
+	var active model.Operation
+	if err := client.Do(context.Background(), http.MethodGet, "/v1/operations/"+*operationID, nil, &active); err != nil {
+		return fmt.Errorf("read active rollback operation: %w", err)
+	}
+	var plan migration.Plan
+	if err := client.Do(context.Background(), http.MethodGet, "/v1/migrations/legacy", nil, &plan); err != nil {
+		return fmt.Errorf("read legacy migration plan: %w", err)
+	}
+	if err := validateRollingBackRecovery(status, active, plan, *operationID, *expectedSourceCommit, root, data, cfg.PlatformDataDir(), *legacyService, false); err != nil {
+		return err
+	}
+	if !userUnitActive(context.Background(), *legacyService) {
+		return fmt.Errorf("legacy service %s must be active before offline rollback recovery", *legacyService)
+	}
+	if err := probeLegacyPlatform(cfg); err != nil {
+		return err
+	}
+	if err := verifyFrozenCheckout(root, *expectedSourceCommit); err != nil {
+		return err
+	}
+
+	const managerUnit = "ubitech-agent-manager.service"
+	const retryService = "ubitech-agent-migrate.service"
+	const retryTimer = "ubitech-agent-migrate.timer"
+	if !userUnitActive(context.Background(), managerUnit) {
+		return errors.New("Manager service must be active before offline rollback recovery")
+	}
+	timerWasActive := userUnitActive(context.Background(), retryTimer)
+	managerStopped := false
+	retryStopped := false
+	var recoveryLock *os.File
+	defer func() {
+		var restoreErrors []error
+		if managerStopped {
+			if err := userSystemctlWithin("restart", managerUnit); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("restore Manager service: %w", err))
+			} else if err := waitForManager(client); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("restore Manager health: %w", err))
+			} else {
+				managerStopped = false
+			}
+		}
+		if retryStopped {
+			if timerWasActive {
+				if err := userSystemctlWithin("start", retryTimer); err != nil {
+					restoreErrors = append(restoreErrors, fmt.Errorf("restore migration retry timer: %w", err))
+				}
+			}
+			retryStopped = false
+		}
+		if recoveryLock != nil {
+			if err := recoveryLock.Close(); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("release source recovery lock: %w", err))
+			}
+			recoveryLock = nil
+		}
+		resultErr = errors.Join(resultErr, errors.Join(restoreErrors...))
+	}()
+
+	retryStopped = true
+	if err := userSystemctlWithin("stop", retryTimer, retryService); err != nil {
+		return fmt.Errorf("pause migration retry units: %w", err)
+	}
+	lock, err := acquireRepositoryRecoveryLock(root)
+	if err != nil {
+		return err
+	}
+	recoveryLock = lock
+	if err := verifyFrozenCheckout(root, *expectedSourceCommit); err != nil {
+		return err
+	}
+	managerStopped = true
+	if err := userSystemctlWithin("stop", managerUnit); err != nil {
+		return fmt.Errorf("stop Manager for offline rollback recovery: %w", err)
+	}
+	if userUnitActive(context.Background(), managerUnit) {
+		return errors.New("Manager service remained active after the controlled stop")
+	}
+
+	app, err := build(*path)
+	if err != nil {
+		return fmt.Errorf("open offline Manager recovery state: %w", err)
+	}
+	localState := app.state.State()
+	localOperation, err := app.state.Operation(*operationID)
+	if err != nil {
+		return fmt.Errorf("re-read offline rollback operation: %w", err)
+	}
+	localPlan, err := app.legacy.Plan()
+	if err != nil {
+		return fmt.Errorf("re-read offline legacy plan: %w", err)
+	}
+	localStatus := rollingBackRecoveryStatus{
+		PublicState: localState.PublicState, Phase: localState.Phase,
+		Maintenance: localState.Maintenance, ActiveOperationID: localState.ActiveOperationID,
+		FinalizePendingOperationID: localState.FinalizePendingOperationID,
+	}
+	if err := validateRollingBackRecovery(localStatus, localOperation, localPlan, *operationID, *expectedSourceCommit, root, data, cfg.PlatformDataDir(), *legacyService, true); err != nil {
+		return fmt.Errorf("offline recovery state changed after Manager stop: %w", err)
+	}
+
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), *recoveryTimeout)
+	defer recoveryCancel()
+	for {
+		if err := app.operations.Recover(recoveryCtx); err != nil {
+			return fmt.Errorf("recover rolling-back operation: %w", err)
+		}
+		current := app.state.State()
+		if current.ActiveOperationID == "" {
+			if current.Maintenance || current.PublicState != model.StateIdle {
+				return errors.New("rollback operation ended without restoring idle admission")
+			}
+			finished, readErr := app.state.Operation(*operationID)
+			if readErr != nil {
+				return readErr
+			}
+			if finished.Status != model.OperationFailed || !finished.Finalized {
+				return errors.New("offline rollback recovery did not reach a finalized failed operation")
+			}
+			break
+		}
+		if current.ActiveOperationID != *operationID || current.Phase != model.PhaseRollingBack {
+			return errors.New("offline rollback recovery changed to an unexpected operation")
+		}
+		select {
+		case <-recoveryCtx.Done():
+			return recoveryCtx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	if err := userSystemctlWithin("start", managerUnit); err != nil {
+		return fmt.Errorf("restart Manager after offline rollback recovery: %w", err)
+	}
+	if err := waitForManager(client); err != nil {
+		return fmt.Errorf("Manager did not become healthy after offline rollback recovery: %w", err)
+	}
+	var recovered rollingBackRecoveryStatus
+	if err := client.Do(context.Background(), http.MethodGet, "/v1/status", nil, &recovered); err != nil {
+		return fmt.Errorf("verify recovered Manager state: %w", err)
+	}
+	if recovered.ActiveOperationID != "" || recovered.FinalizePendingOperationID != "" || recovered.Maintenance || recovered.PublicState != model.StateIdle {
+		return errors.New("restarted Manager did not retain the finalized idle rollback state")
+	}
+	managerStopped = false
+	return nil
+}
+
+func validateRollingBackRecovery(status rollingBackRecoveryStatus, operation model.Operation, plan migration.Plan, operationID, sourceCommit, legacyRoot, legacyData, destinationData, legacyService string, requireExactPlanPaths bool) error {
+	if status.ActiveOperationID != operationID || status.FinalizePendingOperationID != "" || status.Phase != model.PhaseRollingBack || status.PublicState != model.StateFailed || !status.Maintenance {
+		return errors.New("Manager is not in the exact failed rolling-back state requested")
+	}
+	if operation.ID != operationID || operation.Kind != model.OperationInstall || operation.Status != model.OperationRunning || operation.Phase != model.PhaseRollingBack || operation.ExpectedSourceCommit != sourceCommit {
+		return errors.New("active operation does not match the requested source-install rollback")
+	}
+	if plan.ExpectedSourceCommit != sourceCommit {
+		return errors.New("legacy migration plan does not match the requested recovery paths")
+	}
+	planPaths := []struct{ actual, expected string }{
+		{plan.LegacyRoot, legacyRoot},
+		{plan.LegacyData, legacyData},
+		{plan.DestinationData, destinationData},
+	}
+	for _, binding := range planPaths {
+		if binding.actual == "" && !requireExactPlanPaths {
+			continue
+		}
+		if binding.actual == "" || filepath.Clean(binding.actual) != filepath.Clean(binding.expected) {
+			return errors.New("legacy migration plan does not match the requested recovery paths")
+		}
+	}
+	if (plan.LegacyService == "" && requireExactPlanPaths) || (plan.LegacyService != "" && plan.LegacyService != legacyService) {
+		return errors.New("legacy migration plan does not match the requested legacy service")
+	}
+	if plan.OperationID != "" && plan.OperationID != operationID {
+		return errors.New("legacy migration plan belongs to a different operation")
+	}
+	switch plan.Status {
+	case "configured", "failed", "migrated", "rolled_back":
+	default:
+		return fmt.Errorf("legacy migration plan is not recoverable from state %s", plan.Status)
+	}
+	return nil
+}
+
+func validUserServiceName(value string) bool {
+	if !strings.HasSuffix(value, ".service") || len(value) > 255 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_@:.-", r)) {
+			return false
+		}
+	}
+	return value != ".service"
+}
+
+func canonicalExistingDirectory(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(real)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("path is not a non-symlink directory")
+	}
+	return filepath.Clean(real), nil
+}
+
+func verifyFrozenCheckout(root, expected string) error {
+	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil || strings.TrimSpace(string(head)) != expected {
+		return errors.New("frozen source checkout HEAD does not match the expected commit")
+	}
+	status, err := exec.Command("git", "-C", root, "status", "--porcelain=v1", "--untracked-files=all").Output()
+	if err != nil {
+		return fmt.Errorf("inspect frozen source checkout: %w", err)
+	}
+	if len(strings.TrimSpace(string(status))) != 0 {
+		return errors.New("offline rollback recovery requires a clean frozen source checkout")
+	}
+	return nil
+}
+
+func acquireRepositoryRecoveryLock(root string) (*os.File, error) {
+	value, err := exec.Command("git", "-C", root, "rev-parse", "--git-path", "ubitech-agent-update.lock").Output()
+	if err != nil {
+		return nil, fmt.Errorf("resolve source update lock: %w", err)
+	}
+	path := strings.TrimSpace(string(value))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
+	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open source update lock: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("open source update lock: invalid file descriptor")
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, errors.New("source update lock is not a regular file")
+	}
+	metadata, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || metadata.Uid != uint32(os.Getuid()) {
+		file.Close()
+		return nil, errors.New("source update lock is not owned by the deployment user")
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, errors.New("another source update or migration recovery is active")
+	}
+	return file, nil
 }
 
 func validExpectedSourceCommit(value string) bool {

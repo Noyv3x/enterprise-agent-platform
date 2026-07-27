@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -289,6 +290,178 @@ func TestProbeRejectsMissingDuplicateStoppedOrUnhealthyCoreContainer(t *testing.
 				t.Fatalf("Probe() error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestCandidateFailureDiagnosticsCapturesPlatformLogsAndHealthHistory(t *testing.T) {
+	const containerID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	root := t.TempDir()
+	generation := strings.Repeat("f", 40)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "logs"):
+			return Result{Stdout: "platform booted\n", Stderr: "migration warning\n"}, nil
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+			return Result{Stdout: containerID + "\n"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: `{"Status":"unhealthy","FailingStreak":3,"Log":[{"ExitCode":1,"Output":"database rejected startup"}]}` + "\n"}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected Docker arguments: %v", args)
+		}
+	}}
+	docker := DockerCLI{
+		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
+		GenerationDir: root,
+	}
+	diagnostic := docker.CandidateFailureDiagnostics(
+		context.Background(),
+		release.Manifest{SourceCommit: generation},
+	)
+	for _, expected := range []string{
+		"platform compose logs:",
+		"platform booted",
+		"migration warning",
+		"platform Docker healthcheck:",
+		"container_id=" + containerID,
+		`"Status":"unhealthy"`,
+		"database rejected startup",
+	} {
+		if !strings.Contains(diagnostic, expected) {
+			t.Fatalf("candidate diagnostic is missing %q:\n%s", expected, diagnostic)
+		}
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("candidate diagnostic made %d calls, want 3: %#v", len(runner.calls), runner.calls)
+	}
+	envFile := filepath.Join(root, generation, "compose.env")
+	logs := strings.Join(runner.calls[2].args, " ")
+	for _, expected := range []string{
+		"--env-file " + envFile,
+		"logs --no-color --timestamps --tail 200 platform",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("Platform log command is missing %q: %s", expected, logs)
+		}
+	}
+	if got := runner.calls[1].args; !reflect.DeepEqual(got, []string{"inspect", "--format", "{{json .State.Health}}", containerID}) {
+		t.Fatalf("unexpected Platform health inspect: %v", got)
+	}
+}
+
+func TestCandidateFailureDiagnosticsBoundsSuccessAndCollectionFailures(t *testing.T) {
+	const containerID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	generation := strings.Repeat("e", 40)
+
+	t.Run("oversized command output", func(t *testing.T) {
+		runner := &recordingRunner{results: func(args []string) (Result, error) {
+			switch {
+			case len(args) > 0 && args[0] == "compose" && slicesContain(args, "logs"):
+				return Result{Stdout: strings.Repeat("log-output\n", 20_000)}, nil
+			case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+				return Result{Stdout: containerID}, nil
+			case len(args) > 0 && args[0] == "inspect":
+				return Result{Stdout: strings.Repeat("health-output\n", 10_000)}, nil
+			default:
+				return Result{}, nil
+			}
+		}}
+		diagnostic := (DockerCLI{Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
+			context.Background(),
+			release.Manifest{SourceCommit: generation},
+		)
+		if len(diagnostic) > candidateDiagnosticMaxBytes {
+			t.Fatalf("candidate diagnostic has %d bytes, limit is %d", len(diagnostic), candidateDiagnosticMaxBytes)
+		}
+		if strings.Count(diagnostic, "diagnostic truncated") < 2 {
+			t.Fatalf("oversized log and health output were not independently bounded:\n%s", diagnostic)
+		}
+		if !strings.Contains(diagnostic, "platform compose logs:") || !strings.Contains(diagnostic, "platform Docker healthcheck:") {
+			t.Fatalf("bounded diagnostic lost a section heading:\n%s", diagnostic)
+		}
+	})
+
+	t.Run("Docker command failures", func(t *testing.T) {
+		hugeFailure := strings.Repeat("daemon unavailable ", 10_000)
+		runner := &recordingRunner{results: func(args []string) (Result, error) {
+			if len(args) > 0 && args[0] == "compose" && slicesContain(args, "logs") {
+				return Result{Stderr: hugeFailure}, errors.New(hugeFailure)
+			}
+			if len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps") {
+				return Result{Stderr: hugeFailure}, errors.New(hugeFailure)
+			}
+			return Result{}, nil
+		}}
+		diagnostic := (DockerCLI{Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
+			context.Background(),
+			release.Manifest{SourceCommit: generation},
+		)
+		if len(diagnostic) > candidateDiagnosticMaxBytes {
+			t.Fatalf("failed collection diagnostic has %d bytes, limit is %d", len(diagnostic), candidateDiagnosticMaxBytes)
+		}
+		for _, expected := range []string{"platform compose logs:", "command_error:", "platform Docker healthcheck:", "container lookup failed:", "diagnostic truncated"} {
+			if !strings.Contains(diagnostic, expected) {
+				t.Fatalf("failed collection diagnostic is missing %q:\n%s", expected, diagnostic)
+			}
+		}
+		if len(runner.calls) != 2 {
+			t.Fatalf("health inspection should stop after a failed lookup: %#v", runner.calls)
+		}
+	})
+}
+
+func TestCandidateFailureDiagnosticsRedactsKnownAndPatternCredentials(t *testing.T) {
+	const containerID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	generation := strings.Repeat("d", 40)
+	stateDir := t.TempDir()
+	secretsDir := filepath.Join(stateDir, "secrets")
+	if err := os.MkdirAll(secretsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	known := strings.Repeat("k", 40)
+	if err := os.WriteFile(filepath.Join(secretsDir, "manager-token"), []byte(known+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "logs"):
+			return Result{Stdout: strings.Join([]string{
+				"manager capability=" + known,
+				`{"api_key":"third-party-json-secret"}`,
+				"Authorization: Basic opaque-header-token",
+				"worker --password plain-command-secret",
+				"Set-Cookie: sid=cookie-secret; HttpOnly",
+				"-----BEGIN PRIVATE KEY-----\nprivate-key-secret\n-----END PRIVATE KEY-----",
+			}, "\n")}, nil
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+			return Result{Stdout: containerID}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: `{"Status":"unhealthy","Log":[{"Output":"token=health-secret"}]}`}, nil
+		default:
+			return Result{}, nil
+		}
+	}}
+	diagnostic := (DockerCLI{
+		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
+		GenerationDir: t.TempDir(), StateDir: stateDir,
+	}).CandidateFailureDiagnostics(context.Background(), release.Manifest{SourceCommit: generation})
+	for _, secret := range []string{known, "third-party-json-secret", "opaque-header-token", "plain-command-secret", "cookie-secret", "private-key-secret", "health-secret"} {
+		if strings.Contains(diagnostic, secret) {
+			t.Fatalf("candidate diagnostic leaked %q:\n%s", secret, diagnostic)
+		}
+	}
+	if strings.Count(diagnostic, "[redacted]") < 7 {
+		t.Fatalf("candidate diagnostic did not retain redaction markers:\n%s", diagnostic)
+	}
+}
+
+func TestCandidateFailureDiagnosticsRejectsInvalidGenerationWithoutDocker(t *testing.T) {
+	runner := &recordingRunner{}
+	diagnostic := (DockerCLI{Runner: runner}).CandidateFailureDiagnostics(
+		context.Background(),
+		release.Manifest{SourceCommit: "../../outside"},
+	)
+	if !strings.Contains(diagnostic, "generation ID is invalid") || len(runner.calls) != 0 {
+		t.Fatalf("invalid candidate generation reached Docker: diagnostic=%q calls=%#v", diagnostic, runner.calls)
 	}
 }
 

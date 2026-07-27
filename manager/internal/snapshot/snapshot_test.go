@@ -42,6 +42,142 @@ func TestRestoreRemovesWALAbsentFromSnapshot(t *testing.T) {
 	}
 }
 
+func TestRestoreRecreatesMissingOwnedDataDirectory(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "platform.db"), []byte("snapshot-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{DataDir: data, BackupDir: backups}
+	snapshotPath, err := store.Create(context.Background(), "op_missing_data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(data); err != nil {
+		t.Fatal(err)
+	}
+
+	var synced []string
+	store.syncDir = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}
+	if err := store.Restore(context.Background(), snapshotPath); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(data, "platform.db"))
+	if err != nil || string(content) != "snapshot-db" {
+		t.Fatalf("snapshot was not restored into recreated data directory: %q %v", content, err)
+	}
+	info, err := os.Lstat(data)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("recreated data directory is unsafe: info=%v err=%v", info, err)
+	}
+	if len(synced) == 0 || synced[0] != filepath.Clean(root) {
+		t.Fatalf("data parent was not the first durability barrier: %#v", synced)
+	}
+}
+
+func TestRestoreRejectsMissingDataBelowSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	realRoot := filepath.Join(root, "real")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(realRoot, "data")
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "platform.db"), []byte("snapshot-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{DataDir: data, BackupDir: backups}
+	snapshotPath, err := store.Create(context.Background(), "op_symlink_parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(data); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Fatal(err)
+	}
+	store.DataDir = filepath.Join(link, "data")
+
+	err = store.Restore(context.Background(), snapshotPath)
+	if err == nil || !strings.Contains(err.Error(), "parent is not a regular directory") {
+		t.Fatalf("restore accepted a missing data directory below a symlink parent: %v", err)
+	}
+	if _, err := os.Lstat(data); !os.IsNotExist(err) {
+		t.Fatalf("unsafe restore created the symlinked target: %v", err)
+	}
+}
+
+func TestRestoreValidatesSnapshotBeforeRecreatingMissingData(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "platform.db"), []byte("snapshot-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{DataDir: data, BackupDir: backups}
+	snapshotPath, err := store.Create(context.Background(), "op_corrupt_missing_data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshotPath, "platform.db"), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Restore(context.Background(), snapshotPath); err == nil || !strings.Contains(err.Error(), "snapshot") {
+		t.Fatalf("corrupt snapshot was accepted: %v", err)
+	}
+	if _, err := os.Lstat(data); !os.IsNotExist(err) {
+		t.Fatalf("invalid snapshot recreated the missing target: %v", err)
+	}
+}
+
+func TestRestoreRejectsMissingDataBelowWritableParent(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	backups := filepath.Join(root, "backups")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "platform.db"), []byte("snapshot-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{DataDir: data, BackupDir: backups}
+	snapshotPath, err := store.Create(context.Background(), "op_writable_parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(root, 0o700)
+	if err := store.Restore(context.Background(), snapshotPath); err == nil || !strings.Contains(err.Error(), "writable by another host identity") {
+		t.Fatalf("writable parent was accepted: %v", err)
+	}
+	if _, err := os.Lstat(data); !os.IsNotExist(err) {
+		t.Fatalf("unsafe parent gained a recreated target: %v", err)
+	}
+}
+
 func TestRestoreRejectsCorruptSnapshotWithoutChangingCurrentData(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")

@@ -121,6 +121,12 @@ Manager 的本地 control socket 仍是跨进程网络边界。CLI 对迁移 pla
 
 数据复制使用同一文件系统内的 staging 目录。校验完成后必须先按自底向上顺序同步 staging 中的文件和每层目录，再持久化 `copy_prepared` 和文件清单。把 staging 原子 rename 为目标后，还必须成功同步目标父目录，最后才允许持久化 `copied`；任一同步失败都必须保持旧服务可恢复，不得在另一状态目录中先行承诺迁移已完成。回滚和重新武装迁移必须同时处理 `copy_prepared`、`copied`、staging 已存在以及 rename 已完成这几种组合，确认旧数据仍存在后幂等删除未提交目标，不能让断电留下的完整副本阻塞后续自动重试。
 
+首次 Configure 与 operation journal 的 active claim 使用同一进程锁串行化：Configure 先提交 plan 时，随后 install 必须读取并绑定它；operation 先取得 claim 时，Configure 必须拒绝创建计划，不能把运行中的 fresh install 改造成未预约的 source cutover。重复配置同一 legacy migration 只能返回现有 plan，不能把 `rolled_back` 重新武装为 `configured`；只有上一 operation 已明确终结、下一次显式 install attempt 已在 operation journal 中原子取得 active claim 后，才由该 operation 重新武装。重新武装、是否需要 legacy reservation 和后续 Cutover 必须绑定同一个 operation id，不能在两次状态读取之间改变判定。迁移 timer 观察到运行中 operation 时只等待其 journal，不能通过 Configure 改写其回滚状态，也不能为非 retryable 的失败自动创建下一 attempt。
+
+第一代 bridge 的 Manager 状态可能包含超过旧 Platform 客户端上限的历史诊断。新版 install retry CLI 在停止旧服务前必须先用 release check 读取 exact manifest，并让服务端在写 Candidate 或清除错误前核对 expected source commit；旧 Manager 不认识该字段时，CLI 只可在确定的 400 unknown-field 响应后回退到其旧 check 契约。每次独立 retry 都使用新的 check 身份，不能被同进程的旧缓存跳过。当前 Platform 客户端仍保留有界的兼容读取预算。候选启动不允许依赖无限状态正文，新的 Manager API 必须持续输出有界诊断。
+
+若运行中的旧 Manager 已卡在 `rolling_back`，仅替换调用它的 CLI 无法改变服务端恢复逻辑。受支持入口是同一不可变 release 中校验过的 `recover-rolling-back`：第一道门通过 owner-only socket 绑定 exact active operation、源码提交和迁移状态，并在旧 API 提供路径时一并核对；随后确认旧宿主服务健康、暂停迁移 timer、取得源码更新锁并受控停止 Manager service。第二道门由新二进制直接读取 owner-only journal，对 legacy 路径、service 和目标数据目录执行不可省略的 exact 复核，然后才离线恢复。恢复默认允许 30 分钟，可由显式参数在 1 分钟至 2 小时内调整，避免大型数据库仍受旧的短 wall-clock 限制。所有退出路径都必须在仍持有源码锁时恢复原 Manager service 与 timer 状态。它不得修改 stable Manager binary、unit、release manifest 或 Git checkout；只有 operation 已成为失败终态、maintenance 已解除且旧 Manager 重新健康后才返回成功。运维不得用手工 `mkdir`、编辑 journal 或清除 active id 代替该入口。
+
 清理完成是不可逆提交点，此后只使用镜像和数据库快照回滚。
 
 桥接版本在等待完整发布清单期间仍可用旧的源码进程运行。该兼容路径必须显式把 Runtime 设为 local executor，并使用宿主 workspace 绝对路径；它只用于迁移等待和开发测试，不能成为 Docker 生产拓扑的隐式回退。`UBITECH_SOURCE_MIGRATION_BRIDGE=1` 只能与绝对 Manager socket/token-file 路径同时启用，且不会把 Platform 切成 container execution。容器模式必须显式设置部署模式，缺少 Manager socket/token 或执行器时直接失败，不能静默切回宿主本地执行。

@@ -700,7 +700,7 @@ func TestRolledBackMigrationCanBeSafelyRearmed(t *testing.T) {
 	}
 	base := t.TempDir()
 	runner := &fakeRunner{}
-	service := &Service{StatePath: filepath.Join(base, "manager", "migration.json"), DestinationData: filepath.Join(base, "data"), BackupRoot: filepath.Join(base, "backups"), QuarantineRoot: filepath.Join(base, "quarantine"), Runner: runner}
+	service := &Service{StatePath: filepath.Join(base, "manager", "migration.json"), DestinationData: filepath.Join(base, "data"), BackupRoot: filepath.Join(base, "backups"), QuarantineRoot: filepath.Join(base, "quarantine"), Runner: runner, CanRearm: func(Plan, string) bool { return true }}
 	if _, err := service.Configure(root, source); err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +713,14 @@ func TestRolledBackMigrationCanBeSafelyRearmed(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, "data")); !os.IsNotExist(err) {
 		t.Fatalf("first copied destination was not removed: %v", err)
 	}
-	rearmed, err := service.Configure(root, source)
+	unchanged, err := service.Configure(root, source)
+	if err != nil || unchanged.Status != "rolled_back" {
+		t.Fatalf("Configure changed rollback evidence: %#v %v", unchanged, err)
+	}
+	if err := service.Rearm("attempt-2"); err != nil {
+		t.Fatal(err)
+	}
+	rearmed, err := service.Plan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,6 +737,57 @@ func TestRolledBackMigrationCanBeSafelyRearmed(t *testing.T) {
 	migrated, _ := os.ReadFile(filepath.Join(base, "data", "platform.db"))
 	if string(migrated) != "important" {
 		t.Fatalf("retry did not recopy legacy data: %q", migrated)
+	}
+}
+
+func TestRolledBackMigrationIsNotRearmedWhileOperationIsActive(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "checkout")
+	source := filepath.Join(root, "data")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "platform.db"), []byte("important"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	canRearm := false
+	service := &Service{
+		StatePath:       filepath.Join(base, "manager", "migration.json"),
+		DestinationData: filepath.Join(base, "data"),
+		BackupRoot:      filepath.Join(base, "backups"),
+		QuarantineRoot:  filepath.Join(base, "quarantine"),
+		Runner:          &fakeRunner{},
+		CanRearm:        func(Plan, string) bool { return canRearm },
+	}
+	if _, err := service.Configure(root, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Cutover(context.Background(), "active-op"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Rollback(context.Background(), "active-op"); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := service.Configure(root, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Status != "rolled_back" || unchanged.OperationID != "active-op" || service.Active() {
+		t.Fatalf("active rollback evidence was rearmed: %#v", unchanged)
+	}
+	if err := service.Rearm("next-op"); err == nil {
+		t.Fatal("rearm succeeded without a matching active operation")
+	}
+	canRearm = true
+	if err := service.Rearm("next-op"); err != nil {
+		t.Fatal(err)
+	}
+	rearmed, err := service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rearmed.Status != "configured" || rearmed.OperationID != "" || !service.Active() {
+		t.Fatalf("terminal rollback was not rearmed: %#v", rearmed)
 	}
 }
 
@@ -1024,7 +1082,8 @@ func TestDestinationParentSyncFailureNeverPersistsCopiedMigration(t *testing.T) 
 	}
 
 	service.SyncDir = nil
-	if _, err := service.Configure(root, source); err != nil {
+	service.CanRearm = func(Plan, string) bool { return true }
+	if err := service.Rearm("op-parent-sync-retry"); err != nil {
 		t.Fatalf("failed durability attempt could not be safely rearmed: %v", err)
 	}
 	if err := service.Cutover(context.Background(), "op-parent-sync-retry"); err != nil {
@@ -1077,7 +1136,8 @@ func TestRenameBeforeCopiedPersistIsRemovedAndRetryable(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, "data")); !os.IsNotExist(err) {
 		t.Fatalf("rollback retained an uncommitted renamed destination: %v", err)
 	}
-	if _, err := service.Configure(root, source); err != nil {
+	service.CanRearm = func(Plan, string) bool { return true }
+	if err := service.Rearm("op-rename-retry"); err != nil {
 		t.Fatalf("rolled-back rename window could not be rearmed: %v", err)
 	}
 	if err := service.Cutover(context.Background(), "op-rename-retry"); err != nil {
@@ -1128,7 +1188,8 @@ func TestRollbackRemovesLegacyRenameWindowWithoutResultFlags(t *testing.T) {
 	if err != nil || string(data) != "authoritative" {
 		t.Fatalf("authoritative legacy data changed: %q %v", data, err)
 	}
-	if _, err := service.Configure(root, source); err != nil {
+	service.CanRearm = func(Plan, string) bool { return true }
+	if err := service.Rearm("op-old-rename-retry"); err != nil {
 		t.Fatalf("old rename window could not be rearmed: %v", err)
 	}
 }

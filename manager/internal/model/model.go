@@ -112,6 +112,9 @@ type Operation struct {
 	Phase                OperationPhase    `json:"phase"`
 	ReservationStatus    ReservationStatus `json:"reservation_status,omitempty"`
 	SnapshotPath         string            `json:"snapshot_path,omitempty"`
+	SnapshotRestored     bool              `json:"snapshot_restored,omitempty"`
+	LegacyRestored       bool              `json:"legacy_restored,omitempty"`
+	ReservationReleased  bool              `json:"reservation_released,omitempty"`
 	Error                string            `json:"error,omitempty"`
 	History              []PhaseEvent      `json:"history"`
 	CreatedAt            time.Time         `json:"created_at"`

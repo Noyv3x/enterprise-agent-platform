@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
 	"github.com/ubitech/agent-platform/manager/internal/contract"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/release"
 )
 
@@ -125,6 +127,32 @@ type Engine interface {
 	RemoveSandbox(context.Context, string) error
 	SandboxRunning(context.Context, string) (bool, error)
 	ExecArgs(SandboxSpec, string, string, []string) (string, []string)
+}
+
+// CandidateFailureDiagnoser is an optional Engine capability. Keeping it
+// separate from Engine lets non-Docker test engines and alternate backends omit
+// host-specific diagnostics while callers can still collect them when present.
+type CandidateFailureDiagnoser interface {
+	CandidateFailureDiagnostics(context.Context, release.Manifest) string
+}
+
+const (
+	candidateDiagnosticMaxBytes = 48 << 10
+	candidateLogsMaxBytes       = 32 << 10
+	candidateHealthMaxBytes     = 12 << 10
+	candidateDiagnosticTimeout  = 10 * time.Second
+)
+
+var candidateCredentialPatterns = []struct {
+	expression  *regexp.Regexp
+	replacement string
+}{
+	{regexp.MustCompile(`(?i)("[^"]*(api[_-]?key|access[_-]?key|token|password|passwd|secret|credential|private[_-]?key|session|signature|cookie)[^"]*"\s*:\s*)("[^"]*"|[^,}\s]+)`), `${1}"[redacted]"`},
+	{regexp.MustCompile(`(?i)(\b[A-Z0-9_]*(API[_-]?KEY|ACCESS[_-]?KEY|TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|PRIVATE[_-]?KEY|SESSION|SIGNATURE|COOKIE)\s*[:=]\s*)(Bearer[ \t]+)?("[^"]*"|'[^']*'|[^\s,;]+)`), `${1}${3}[redacted]`},
+	{regexp.MustCompile(`(?i)(--(api-key|access-key|token|password|secret|credential|private-key|session|signature|cookie)(=|[ \t]+))("[^"]*"|'[^']*'|[^\s]+)`), `${1}[redacted]`},
+	{regexp.MustCompile(`(?i)(\b(Authorization|Proxy-Authorization)\s*[:=]\s*)(Basic|Bearer)[ \t]+([^\s,;]+)`), `${1}${3} [redacted]`},
+	{regexp.MustCompile(`(?i)(\b(Set-Cookie|Cookie)\s*:\s*)[^\r\n]+`), `${1}[redacted]`},
+	{regexp.MustCompile(`(?s)(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----).*?(-----END [A-Z0-9 ]*PRIVATE KEY-----)`), `${1}\n[redacted]\n${2}`},
 }
 
 type DockerCLI struct {
@@ -374,6 +402,107 @@ func (d DockerCLI) Logs(ctx context.Context, service string, tail int) (string, 
 	}
 	result, err := d.runner().Run(ctx, d.binary(), args, nil)
 	return result.Stdout + result.Stderr, err
+}
+
+// CandidateFailureDiagnostics captures the exact candidate Platform's bounded
+// Compose logs and Docker healthcheck history. Diagnostics are best-effort: a
+// failed Docker command is itself rendered into the result instead of hiding
+// the original candidate failure behind a second error.
+func (d DockerCLI) CandidateFailureDiagnostics(ctx context.Context, manifest release.Manifest) string {
+	if !validGenerationID(manifest.ID()) {
+		return "candidate diagnostics unavailable: release generation ID is invalid"
+	}
+	diagnosticCtx, cancel := context.WithTimeout(ctx, candidateDiagnosticTimeout)
+	defer cancel()
+
+	envFile := filepath.Join(d.GenerationDir, manifest.ID(), "compose.env")
+	// Healthcheck output is the most direct explanation for an unhealthy
+	// candidate and is typically tiny. Capture it before logs can consume the
+	// shared best-effort diagnostic deadline.
+	health := d.candidatePlatformHealthDiagnostic(diagnosticCtx, envFile)
+	logsResult, logsErr := d.runner().Run(
+		diagnosticCtx,
+		d.binary(),
+		d.composeArgs(envFile, "logs", "--no-color", "--timestamps", "--tail", "200", "platform"),
+		nil,
+	)
+	logs := d.boundedCommandDiagnostic(logsResult, logsErr, candidateLogsMaxBytes)
+
+	diagnostic := "platform compose logs:\n" + logs + "\nplatform Docker healthcheck:\n" + health
+	diagnostic = d.redactCandidateDiagnostic(diagnostic)
+	return journal.BoundDiagnosticWithLimit(diagnostic, candidateDiagnosticMaxBytes)
+}
+
+func (d DockerCLI) redactCandidateDiagnostic(value string) string {
+	// Replace exact Manager-generated capabilities first. Pattern redaction then
+	// covers common third-party credential forms that may appear in application
+	// logs without requiring the Manager to read arbitrary container files.
+	for _, name := range []string{
+		"session-secret", "agent-tool-token", "agent-runtime-token",
+		"camofox-access-key", "manager-token", "manager-executor-token",
+		"firecrawl-postgres-password", "firecrawl-bull-auth-key",
+	} {
+		secret, err := ReadOwnerSecret(filepath.Join(d.StateDir, "secrets", name))
+		if err == nil && secret != "" {
+			value = strings.ReplaceAll(value, secret, "[redacted]")
+		}
+	}
+	for _, pattern := range candidateCredentialPatterns {
+		value = pattern.expression.ReplaceAllString(value, pattern.replacement)
+	}
+	return value
+}
+
+func (d DockerCLI) candidatePlatformHealthDiagnostic(ctx context.Context, envFile string) string {
+	listResult, listErr := d.runner().Run(
+		ctx,
+		d.binary(),
+		d.composeArgs(envFile, "ps", "--all", "--quiet", "platform"),
+		nil,
+	)
+	if listErr != nil {
+		return journal.BoundDiagnosticWithLimit(
+			"container lookup failed:\n"+d.boundedCommandDiagnostic(listResult, listErr, candidateHealthMaxBytes),
+			candidateHealthMaxBytes,
+		)
+	}
+	ids := strings.Fields(listResult.Stdout)
+	if len(ids) != 1 {
+		return fmt.Sprintf("unavailable: expected exactly one Platform container, found %d", len(ids))
+	}
+	if !validContainerID(ids[0]) {
+		return "unavailable: Docker returned an invalid Platform container ID"
+	}
+
+	inspectResult, inspectErr := d.runner().Run(
+		ctx,
+		d.binary(),
+		[]string{"inspect", "--format", "{{json .State.Health}}", ids[0]},
+		nil,
+	)
+	return journal.BoundDiagnosticWithLimit(
+		"container_id="+ids[0]+"\n"+d.boundedCommandDiagnostic(inspectResult, inspectErr, candidateHealthMaxBytes),
+		candidateHealthMaxBytes,
+	)
+}
+
+func (d DockerCLI) boundedCommandDiagnostic(result Result, err error, limit int) string {
+	var parts []string
+	// Put the structured execution failure first so head/tail truncation cannot
+	// hide the fact that collection itself failed behind a large stderr stream.
+	if err != nil {
+		parts = append(parts, "command_error: "+d.redactCandidateDiagnostic(err.Error()))
+	}
+	if value := strings.TrimSpace(result.Stdout); value != "" {
+		parts = append(parts, "stdout:\n"+d.redactCandidateDiagnostic(value))
+	}
+	if value := strings.TrimSpace(result.Stderr); value != "" {
+		parts = append(parts, "stderr:\n"+d.redactCandidateDiagnostic(value))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "no output")
+	}
+	return journal.BoundDiagnosticWithLimit(strings.Join(parts, "\n"), limit)
 }
 
 func (d DockerCLI) EnsureSandbox(ctx context.Context, spec SandboxSpec) error {
