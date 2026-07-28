@@ -23,9 +23,17 @@ const sourceRetirementCampaign = "source-v1-retirement-2026-07"
 var sourceRetirementCutoff = time.Date(2026, time.July, 29, 0, 0, 0, 0, time.UTC)
 
 var (
-	recoveryManagerPattern  = regexp.MustCompile(`^ubitech-manager-[0-9a-f]{64}$`)
-	recoveryGuardPattern    = regexp.MustCompile(`^source-(transition|rollback)-[A-Za-z0-9_.-]+\.(py|unit)$`)
-	recoveryIncomingPattern = regexp.MustCompile(`^\.ubitech-manager\.incoming\.[A-Za-z0-9]+$`)
+	recoveryManagerPattern          = regexp.MustCompile(`^ubitech-manager-[0-9a-f]{64}$`)
+	recoveryGuardPattern            = regexp.MustCompile(`^source-(transition|rollback)-[A-Za-z0-9_.-]+\.(py|unit)$`)
+	recoveryIncomingPattern         = regexp.MustCompile(`^\.ubitech-manager\.incoming\.[A-Za-z0-9]+$`)
+	recoveryDownloadPattern         = regexp.MustCompile(`^\.download\.[A-Za-z0-9]{6,32}$`)
+	recoveryDownloadManagerPattern  = regexp.MustCompile(`^(ubitech-manager(-linux-(amd64|arm64))?|manager)$`)
+	recoveryDownloadChecksumPattern = regexp.MustCompile(`^(ubitech-manager(-linux-(amd64|arm64))?|manager)\.sha256$`)
+)
+
+const (
+	maxRecoveryDownloadEntries = 8
+	maxRecoveryDownloadBytes   = int64(512 << 20)
 )
 
 // Retire removes the closed allowlist of source-deployment artifacts after a
@@ -592,6 +600,12 @@ func (s *Service) removeSourceControlArtifacts(plan Plan) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if recoveryDownloadPattern.MatchString(name) {
+			if err := removeRecoveryDownloadStaging(recoveryRoot, filepath.Join(recoveryRoot, name), s.syncDirectory); err != nil {
+				return err
+			}
+			continue
+		}
 		if !recoveryManagerPattern.MatchString(name) && !recoveryGuardPattern.MatchString(name) && !recoveryIncomingPattern.MatchString(name) {
 			return fmt.Errorf("unknown file in source recovery root: %s", name)
 		}
@@ -603,6 +617,138 @@ func (s *Service) removeSourceControlArtifacts(plan Plan) error {
 		return err
 	}
 	return s.syncDirectory(stateRoot)
+}
+
+func removeRecoveryDownloadStaging(root, path string, syncDir func(string) error) error {
+	if err := verifyManagedPath(root, path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("recovery download staging is not an owner-only regular directory")
+	}
+	if err := requireOwned(path, info); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	if len(entries) > maxRecoveryDownloadEntries {
+		return fmt.Errorf("recovery download staging exceeds %d entries", maxRecoveryDownloadEntries)
+	}
+	var total int64
+	for _, entry := range entries {
+		entryPath := filepath.Join(path, entry.Name())
+		entryInfo, err := os.Lstat(entryPath)
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 || entryInfo.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("recovery download artifact %s is not an owner-only regular file", entry.Name())
+		}
+		if err := requireOwned(entryPath, entryInfo); err != nil {
+			return err
+		}
+		if entryInfo.Size() < 0 || entryInfo.Size() > maxRecoveryDownloadBytes-total {
+			return fmt.Errorf("recovery download staging exceeds %d-byte limit", maxRecoveryDownloadBytes)
+		}
+		total += entryInfo.Size()
+		if err := validateRecoveryDownloadArtifact(entryPath, entry.Name(), entryInfo.Size()); err != nil {
+			return err
+		}
+	}
+	// Delete only the files proven above, then remove the now-empty directory.
+	// Avoid RemoveAll so a concurrently introduced nested object cannot be
+	// swept up by the legacy compatibility rule.
+	for _, entry := range entries {
+		if err := removeOwnedRegular(path, filepath.Join(path, entry.Name()), maxRecoveryDownloadBytes, syncDir); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDir(root)
+}
+
+func validateRecoveryDownloadArtifact(path, name string, size int64) error {
+	switch {
+	case recoveryDownloadManagerPattern.MatchString(name):
+		if size < 4 || size > 256<<20 {
+			return fmt.Errorf("recovery Manager artifact %s has an invalid size", name)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		var magic [4]byte
+		_, readErr := io.ReadFull(file, magic[:])
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if magic != [4]byte{0x7f, 'E', 'L', 'F'} {
+			return fmt.Errorf("recovery Manager artifact %s is not an ELF binary", name)
+		}
+		return nil
+	case recoveryDownloadChecksumPattern.MatchString(name):
+		if size <= 0 || size > 4096 {
+			return fmt.Errorf("recovery checksum artifact %s has an invalid size", name)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) < 1 || len(fields) > 2 || len(fields[0]) != 64 {
+			return fmt.Errorf("recovery checksum artifact %s is invalid", name)
+		}
+		if _, err := strconv.ParseUint(fields[0][:16], 16, 64); err != nil {
+			return fmt.Errorf("recovery checksum artifact %s is invalid", name)
+		}
+		for offset := 16; offset < 64; offset += 16 {
+			if _, err := strconv.ParseUint(fields[0][offset:offset+16], 16, 64); err != nil {
+				return fmt.Errorf("recovery checksum artifact %s is invalid", name)
+			}
+		}
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") != strings.TrimSuffix(name, ".sha256") {
+			return fmt.Errorf("recovery checksum artifact %s names an unexpected file", name)
+		}
+		return nil
+	case name == "release.json" || name == "release-manifest.json" || name == "authority-release.json":
+		if size <= 0 || size > 8<<20 {
+			return fmt.Errorf("recovery release manifest %s has an invalid size", name)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		decoder := json.NewDecoder(io.LimitReader(file, (8<<20)+1))
+		var manifest map[string]any
+		if err := decoder.Decode(&manifest); err != nil || len(manifest) == 0 {
+			return fmt.Errorf("recovery release manifest %s is invalid", name)
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			return fmt.Errorf("recovery release manifest %s has trailing data", name)
+		}
+		schema, schemaOK := manifest["schema_version"].(float64)
+		sourceCommit, sourceOK := manifest["source_commit"].(string)
+		if !schemaOK || schema != 1 || !sourceOK || !validCommit(sourceCommit) {
+			return fmt.Errorf("recovery release manifest %s has an invalid release identity", name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown file in recovery download staging: %s", name)
+	}
 }
 
 func (s *Service) removeSourceDataArtifacts(plan Plan) error {

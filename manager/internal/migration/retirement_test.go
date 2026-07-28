@@ -297,6 +297,95 @@ func TestSourceRetirementPurgesOnlyAllowlistedLegacyArtifacts(t *testing.T) {
 	}
 }
 
+func TestSourceRetirementRemovesProvenRecoveryDownloadStaging(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	staging := filepath.Join(filepath.Dir(fixture.service.StatePath), "recovery", ".download.Yhb68PnQ")
+	writeRetirementFile(t, filepath.Join(staging, "ubitech-manager"), "\x7fELFmanager")
+	writeRetirementFile(t, filepath.Join(staging, "ubitech-manager.sha256"), strings.Repeat("a", 64)+"  ubitech-manager\n")
+	writeRetirementFile(t, filepath.Join(staging, "release.json"), `{"schema_version":1,"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+
+	if err := fixture.service.Retire(context.Background()); err != nil {
+		t.Fatalf("proven recovery download staging blocked retirement: %v", err)
+	}
+	if _, err := os.Lstat(staging); !os.IsNotExist(err) {
+		t.Fatalf("proven recovery download staging survived: %v", err)
+	}
+	plan, err := fixture.service.Plan()
+	if err != nil || plan.Status != "purged" || plan.Retirement == nil || plan.Retirement.Status != "completed" {
+		t.Fatalf("recovery download retirement did not converge: %#v %v", plan, err)
+	}
+}
+
+func TestSourceRetirementPreservesUnprovenRecoveryDownloadStaging(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string)
+	}{
+		{
+			name: "unknown file",
+			prepare: func(t *testing.T, staging string) {
+				writeRetirementFile(t, filepath.Join(staging, "operator-note.txt"), "keep")
+			},
+		},
+		{
+			name: "nested directory",
+			prepare: func(t *testing.T, staging string) {
+				if err := os.MkdirAll(filepath.Join(staging, "nested"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			prepare: func(t *testing.T, staging string) {
+				if err := os.MkdirAll(staging, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("/tmp/not-a-manager", filepath.Join(staging, "ubitech-manager")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "permissive mode",
+			prepare: func(t *testing.T, staging string) {
+				writeRetirementFile(t, filepath.Join(staging, "ubitech-manager"), "\x7fELFmanager")
+				if err := os.Chmod(staging, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "forged manager",
+			prepare: func(t *testing.T, staging string) {
+				writeRetirementFile(t, filepath.Join(staging, "ubitech-manager"), "not an ELF")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetirementFixture(t)
+			staging := filepath.Join(filepath.Dir(fixture.service.StatePath), "recovery", ".download.Yhb68PnQ")
+			test.prepare(t, staging)
+
+			err := fixture.service.Retire(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "remove source control artifacts") {
+				t.Fatalf("unproven recovery download staging was accepted: %v", err)
+			}
+			plan, planErr := fixture.service.Plan()
+			if planErr != nil {
+				t.Fatal(planErr)
+			}
+			if plan.Retirement == nil || plan.Retirement.Status != "systemd_removed" || !plan.Retirement.SystemdRemoved || plan.Retirement.SourceStateRemoved {
+				t.Fatalf("unproven staging crossed the source-state checkpoint: %#v", plan)
+			}
+			if _, statErr := os.Lstat(staging); statErr != nil {
+				t.Fatalf("unproven staging was not preserved: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestSourceRetirementRemovesOnlyProvenSupersededAttemptPacks(t *testing.T) {
 	fixture := newRetirementFixture(t)
 	oldAttempt := fixture.plan

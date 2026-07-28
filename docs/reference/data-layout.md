@@ -84,7 +84,7 @@ Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs �
 
 已经由版本化源码退役活动覆盖的存量迁移可以提前结束上述七天源码恢复期，但必须先证明新 Manager activation、当前 generation、公网入口和迁移所需外部服务全部健康，重新验证 recovery receipt 与逐树 hash，并在删除前持久提交活动 intent。intent 前的 readiness 或 recovery pack 验证失败必须持久为不含 generation 且不带任何完成位的 `waiting_readiness`，不得静默丢弃诊断或删除对象。恢复包树清单会随 checkout 文件数线性增长，不得套用小型 Manager 状态文件的 8 MiB JSON 上限；Manager 必须用专用的流式、有界解码路径读取清单，当前安全预算为单清单 256 MiB、两百万条记录，并约束单项路径、mode 与摘要字段，再以 receipt 汇总值和实际归档树逐项复核。超过专用安全预算的清单仍须安全停留并报告，不能通过取消全部边界来换取兼容。最终 recovery pack 删除前，Manager 还可删除经 migration id、源提交、旧路径、创建时间、operation id 与 `backupLegacy` 固定内容集共同证明的较早失败 attempt pack；结构或身份不匹配的目录保留，而瞬时读取或 I/O 错误必须阻止写入 `purged` 并在下次后台轮询重试。活动完成后 `migration.json` 只保留不含宿主绝对路径的 `purged` 凭据；这不会删除或缩短 current/previous generation 和普通数据库快照的保留期。数据库、工作区、附件、Agent session/approval/idempotency、记忆/知识、浏览器 Profile/Cookie/trace 及当前外部服务 bind-mount 数据不属于源码退役清单。
 
-退役对外验收只以 `migration.json` 及 Manager 安全状态投影中同时出现 `status=purged` 和 `retirement.status=completed` 为准；Manager 空闲、Platform 健康或 recovery 步骤前的其它完成位都不能替代该凭据。
+退役对外验收只以 `migration.json` 及 Manager 安全状态投影中同时出现 `status=purged` 和 `retirement.status=completed` 为准；Manager 空闲、Platform 健康或 recovery 步骤前的其它完成位都不能替代该凭据。`manager/recovery/.download.<随机后缀>` 只表示旧受控恢复的临时下载 staging，不是用户数据目录；只有同时满足固定命名、owner-only 单层普通文件结构、Manager 发布资产内容类型、最多 8 项和 512 MiB 总量的目录才属于退役清单，结构不明的同名前缀目录继续保留。
 
 旧 checkout 中无法识别的 ignored 内容随完整 checkout 一起进入 `backups/<operation-id>-legacy/` recovery pack，不能单独静默删除。Manager 的 legacy retention 只清理当前迁移 journal 明确提交、达到保留期并再次通过 receipt 与逐树 hash 校验的 recovery pack；未知、迁移中或 `cleanup_pending` 的 `*-legacy` 目录必须保留。它也不能误删仍被 current/previous generation 引用的普通数据库快照。
 
