@@ -50,4 +50,6 @@ Manifest、canonical 文档、机器契约及生成目标都必须位于仓库�
 
 部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须真实启动 FoundationDB、初始化任务与 API，验证入口脚本、共享 cluster 文件、初始化退出状态和 API 健康，随后在保留同一 bind 数据的前提下重建 FDB/init/API 容器，以容器 id 变化和重建后精确读回首轮写入的数据哨兵同时证明持久数据未被重置；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。安装器重试单元的静态验收应检查 owner-only incoming 文件与原子替换边界，不能把旧的直接写目标实现字符串当作永久契约；相关脚本变化必须同步本流程说明。
 
+`documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`；`data-memory-sessions` 域必须覆盖 `manager/internal/migration/**`。仓库级回归测试要直接锁定这些 owner 关系，避免调整 manifest 时再次使迁移或发布验收脚本失去其规范文档。
+
 Cognee 与 Firecrawl 不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；修改契约必须同步部署实现或验收测试。数据目录中的受管 checkout 不是 canonical 文档或受管产品代码。

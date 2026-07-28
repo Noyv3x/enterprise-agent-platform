@@ -377,6 +377,11 @@ func TestSourceRetirementRetriesUnreadableSupersededAttemptPack(t *testing.T) {
 	if durable.Status == "purged" || durable.Retirement == nil || durable.Retirement.RecoveryRemoved {
 		t.Fatalf("unreadable attempt pack crossed recovery checkpoint: %#v", durable)
 	}
+	if durable.Retirement.Status != "docker_removed" ||
+		!strings.Contains(durable.Retirement.Error, "inspect possible superseded source recovery pack") ||
+		durable.Error != durable.Retirement.Error {
+		t.Fatalf("unreadable attempt pack did not retain a retryable durable diagnostic: %#v", durable)
+	}
 	if _, statErr := os.Lstat(fixture.plan.ArchivePath); statErr != nil {
 		t.Fatalf("current recovery pack was removed after an inspection error: %v", statErr)
 	}

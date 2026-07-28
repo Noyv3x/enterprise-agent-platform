@@ -914,6 +914,13 @@ class DocsSyncTests(unittest.TestCase):
         data_domain = self.manifest_domain(manifest, "data-memory-sessions")
         self.assertIn("manager/internal/migration/**", data_domain["code"])
 
+        governance = self.manifest_domain(manifest, "documentation-governance")
+        self.assertIn("scripts/**", governance["code"])
+        self.assertIn(
+            "enterprise-agent-platform/tests/test_docs_sync.py",
+            governance["tests"],
+        )
+
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
         manifest = self.manifest()
