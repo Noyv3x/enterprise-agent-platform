@@ -303,24 +303,30 @@ describe("MemoryPanel", () => {
     await waitFor(() => expect(screen.queryByText(second.content)).not.toBeInTheDocument());
   });
 
-  it("marks blocked legacy memories and clears hidden unsafe tags on a safe edit", async () => {
-    const user = userEvent.setup();
-    mocks.loadAgentMemories.mockResolvedValueOnce({
-      memories: [{ ...agentMemory, blocked: true, blocked_reasons: ["instruction_override"] }],
-    });
-    renderPanel();
+  it(
+    "marks blocked legacy memories and clears hidden unsafe tags on a safe edit",
+    async () => {
+      const user = userEvent.setup();
+      mocks.loadAgentMemories.mockResolvedValueOnce({
+        memories: [{ ...agentMemory, blocked: true, blocked_reasons: ["instruction_override"] }],
+      });
+      renderPanel();
 
-    expect(await screen.findByText("Excluded from recall")).toBeVisible();
-    expect(screen.getByText(/Agent will not read it in conversations/)).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Edit" }));
-    const editor = screen.getByRole("textbox", { name: "Memory content" });
-    await user.clear(editor);
-    await user.type(editor, "Safe replacement memory.");
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(mocks.updateAgentMemory).toHaveBeenCalledWith(9, {
-      target: "memory",
-      content: "Safe replacement memory.",
-      tags: [],
-    });
-  });
+      expect(await screen.findByText("Excluded from recall")).toBeVisible();
+      expect(screen.getByText(/Agent will not read it in conversations/)).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      const editor = screen.getByRole("textbox", { name: "Memory content" });
+      await user.clear(editor);
+      await user.type(editor, "Safe replacement memory.");
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      expect(mocks.updateAgentMemory).toHaveBeenCalledWith(9, {
+        target: "memory",
+        content: "Safe replacement memory.",
+        tags: [],
+      });
+    },
+    // This full Ant editor interaction can exceed Vitest's 5 s default when
+    // the complete UI suite shares a constrained CI runner.
+    10_000,
+  );
 });
