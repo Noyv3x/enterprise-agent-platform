@@ -134,7 +134,10 @@ class Database:
             fresh_database = not existing_tables
             if not fresh_database:
                 self._upgrade_previous_container_baseline(existing_tables)
-                self._assert_current_database_baseline(existing_tables)
+                # A supported upgrade may remove retired source-baseline
+                # tables. Re-read sqlite_master instead of validating the
+                # pre-migration snapshot.
+                self._assert_current_database_baseline()
             if fresh_database:
                 try:
                     self._conn.executescript(
@@ -594,6 +597,7 @@ class Database:
             tables,
             current_memory_sources=False,
             previous_scope_backend=True,
+            allow_retired_private_agents=True,
         )
         unexpected_dependents = sorted(
             self._foreign_key_dependents("agent_memories")
@@ -622,6 +626,7 @@ class Database:
             self._conn.executescript(
                 """
                 BEGIN IMMEDIATE;
+                DROP TABLE IF EXISTS private_agents;
                 ALTER TABLE agent_scopes DROP COLUMN execution_backend;
                 DROP TRIGGER IF EXISTS agent_memory_ai;
                 DROP TRIGGER IF EXISTS agent_memory_ad;
@@ -775,6 +780,7 @@ class Database:
             tables,
             current_memory_sources=True,
             previous_scope_backend=False,
+            allow_retired_private_agents=False,
         )
 
     def _database_tables(self) -> set[str]:
@@ -792,6 +798,7 @@ class Database:
         *,
         current_memory_sources: bool,
         previous_scope_backend: bool,
+        allow_retired_private_agents: bool,
     ) -> None:
         forbidden = sorted(
             {"agent_scope_sessions", "agent_memories_baseline_source",
@@ -909,7 +916,14 @@ class Database:
             )
             for suffix in ("", "_data", "_idx", "_docsize", "_config")
         }
-        unexpected_tables = sorted(tables - set(required_columns) - fts_tables)
+        retired_tables = (
+            {"private_agents"}
+            if allow_retired_private_agents and "private_agents" in tables
+            else set()
+        )
+        unexpected_tables = sorted(
+            tables - set(required_columns) - fts_tables - retired_tables
+        )
         if unexpected_tables:
             raise sqlite3.DatabaseError(
                 "database contains tables outside the current baseline: "
@@ -938,6 +952,9 @@ class Database:
                     f"database table {table_name} has non-current columns: "
                     + "; ".join(differences)
                 )
+
+        if retired_tables:
+            self._assert_retired_private_agents_redundant()
 
         if previous_scope_backend:
             self._assert_table_sql(
@@ -1089,6 +1106,98 @@ class Database:
         if violations:
             raise sqlite3.IntegrityError(
                 f"database has {len(violations)} foreign-key violations"
+            )
+
+    def _assert_retired_private_agents_redundant(self) -> None:
+        """Prove the previous baseline's retired Agent registry is redundant."""
+
+        expected_columns = (
+            ("user_id", "INTEGER", 0, None, 1),
+            ("session_id", "TEXT", 1, None, 0),
+            ("container_name", "TEXT", 1, "''", 0),
+            ("container_id", "TEXT", 1, "''", 0),
+            ("container_status", "TEXT", 1, "'unknown'", 0),
+            ("workspace_path", "TEXT", 1, None, 0),
+            ("created_at", "INTEGER", 1, None, 0),
+            ("updated_at", "INTEGER", 1, None, 0),
+        )
+        actual_columns = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in self._conn.execute(
+                'PRAGMA table_info("private_agents")'
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            raise sqlite3.DatabaseError(
+                "retired private_agents table is outside the declared source baseline"
+            )
+        self._assert_foreign_keys(
+            "private_agents",
+            {("user_id", "users", "id", "CASCADE")},
+        )
+
+        foreign_key_dependents = sorted(
+            self._foreign_key_dependents("private_agents")
+        )
+        schema_references = [
+            f'{row["type"]}:{row["name"]}'
+            for row in self._conn.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name != 'private_agents' AND sql IS NOT NULL "
+                "AND instr(lower(sql), 'private_agents') > 0 "
+                "ORDER BY type, name"
+            ).fetchall()
+        ]
+        if foreign_key_dependents or schema_references:
+            details = sorted(
+                {f"table:{name}" for name in foreign_key_dependents}
+                | set(schema_references)
+            )
+            raise sqlite3.DatabaseError(
+                "retired private_agents table has unsupported dependents: "
+                + ", ".join(details)
+            )
+
+        unsafe_user_ids = [
+            int(row["user_id"])
+            for row in self._conn.execute(
+                """
+                SELECT retired.user_id
+                FROM private_agents AS retired
+                LEFT JOIN users AS account
+                    ON account.id = retired.user_id
+                LEFT JOIN agent_scopes AS scope
+                    ON scope.scope_key = 'private:' || CAST(retired.user_id AS TEXT)
+                LEFT JOIN agent_runtime_scopes AS runtime
+                    ON runtime.scope_key = scope.scope_key
+                WHERE retired.user_id <= 0
+                   OR account.id IS NULL
+                   OR scope.scope_key IS NULL
+                   OR scope.scope_type != 'private'
+                   OR scope.scope_id != CAST(retired.user_id AS TEXT)
+                   OR scope.workspace_path
+                        != 'user-' || CAST(retired.user_id AS TEXT)
+                   OR length(trim(scope.sandbox_id)) = 0
+                   OR runtime.scope_key IS NULL
+                   OR length(trim(runtime.session_id)) = 0
+                   OR length(trim(runtime.lifecycle_id)) = 0
+                ORDER BY retired.user_id
+                LIMIT 6
+                """
+            ).fetchall()
+        ]
+        if unsafe_user_ids:
+            listed = ", ".join(str(user_id) for user_id in unsafe_user_ids[:5])
+            suffix = ", ..." if len(unsafe_user_ids) > 5 else ""
+            raise sqlite3.DatabaseError(
+                "cannot retire private_agents safely; canonical scope/runtime "
+                f"state is missing for user ids: {listed}{suffix}"
             )
 
     def _assert_table_sql(self, table_name: str, required_fragment: str) -> None:

@@ -29,6 +29,36 @@ class AgentScopeSessionTests(unittest.TestCase):
                 "name = 'agent-scopes-container-sandbox-v2'"
             )
 
+    @staticmethod
+    def _create_retired_private_agents(path: Path, user_id: int = 1) -> None:
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE private_agents (
+                    user_id INTEGER PRIMARY KEY
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL,
+                    container_name TEXT NOT NULL DEFAULT '',
+                    container_id TEXT NOT NULL DEFAULT '',
+                    container_status TEXT NOT NULL DEFAULT 'unknown',
+                    workspace_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO private_agents(
+                    user_id, session_id, container_name, container_id,
+                    container_status, workspace_path, created_at, updated_at
+                ) VALUES (?, 'retired-session', 'retired-container',
+                          'retired-container-id', 'running',
+                          '/retired/absolute/workspace', 1, 2)
+                """,
+                (user_id,),
+            )
+
     def test_scope_uses_stable_sandbox_identity_and_relative_database_workspace(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
@@ -170,6 +200,31 @@ class AgentScopeSessionTests(unittest.TestCase):
             ):
                 Database(path)
 
+    def test_current_marker_with_retired_private_agents_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            path = config.db_path
+            db = Database(path)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO users(
+                        id, username, display_name, password_hash, role,
+                        permission_group, created_at
+                    ) VALUES (1, 'one', 'One', 'hash', 'member', 'member', 1)
+                    """
+                )
+                AgentScopeManager(config, db).ensure_private_scope(1)
+            finally:
+                db.close()
+            self._create_retired_private_agents(path)
+
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "outside the current baseline: private_agents",
+            ):
+                Database(path)
+
     def test_current_marker_with_missing_job_table_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             path = make_config(Path(td)).db_path
@@ -248,7 +303,19 @@ class AgentScopeSessionTests(unittest.TestCase):
             path = config.db_path
             db = Database(path)
             try:
+                db.execute(
+                    """
+                    INSERT INTO users(
+                        id, username, display_name, password_hash, role,
+                        permission_group, created_at
+                    ) VALUES (1, 'one', 'One', 'hash', 'member', 'member', 1)
+                    """
+                )
                 previous_scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                previous_runtime = db.query_one(
+                    "SELECT session_id, lifecycle_id FROM agent_runtime_scopes "
+                    "WHERE scope_key = 'private:1'"
+                )
                 db.execute(
                     """
                     INSERT INTO agent_memories(
@@ -315,6 +382,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                 connection.close()
 
             self._mark_previous_container_baseline(path)
+            self._create_retired_private_agents(path)
 
             connection = sqlite3.connect(path)
             try:
@@ -354,6 +422,16 @@ class AgentScopeSessionTests(unittest.TestCase):
                     "17",
                 )
                 self.assertFalse(upgraded.query("PRAGMA foreign_key_check"))
+                self.assertIsNone(
+                    upgraded.query_one(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'private_agents'"
+                    )
+                )
+                self.assertEqual(
+                    upgraded.scalar("SELECT count(*) FROM users WHERE id = 1"),
+                    1,
+                )
                 self.assertNotIn(
                     "execution_backend",
                     {
@@ -365,10 +443,167 @@ class AgentScopeSessionTests(unittest.TestCase):
                 self.assertEqual(migrated_scope.sandbox_id, previous_scope.sandbox_id)
                 self.assertEqual(migrated_scope.session_id, previous_scope.session_id)
                 self.assertEqual(migrated_scope.lifecycle_id, previous_scope.lifecycle_id)
+                self.assertEqual(
+                    upgraded.query_one(
+                        "SELECT session_id, lifecycle_id "
+                        "FROM agent_runtime_scopes WHERE scope_key = 'private:1'"
+                    ),
+                    previous_runtime,
+                )
+                self.assertNotEqual(migrated_scope.session_id, "retired-session")
                 current_marker = json.loads(marker_path.read_text(encoding="utf-8"))
                 self.assertNotIn("execution_backend", current_marker)
             finally:
                 upgraded.close()
+
+    def test_previous_container_baseline_without_retired_table_still_upgrades(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = make_config(Path(td)).db_path
+            db = Database(path)
+            db.close()
+
+            self._mark_previous_container_baseline(path)
+            upgraded = Database(path)
+            try:
+                self.assertEqual(
+                    upgraded.query_one(
+                        "SELECT version, name FROM schema_migrations"
+                    ),
+                    {
+                        "version": DATABASE_SCHEMA_VERSION,
+                        "name": "ubitech-agent-container-baseline-v1",
+                    },
+                )
+                self.assertIsNone(
+                    upgraded.query_one(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'private_agents'"
+                    )
+                )
+            finally:
+                upgraded.close()
+
+    def test_previous_baseline_keeps_unmapped_private_agents_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = make_config(Path(td)).db_path
+            db = Database(path)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO users(
+                        id, username, display_name, password_hash, role,
+                        permission_group, created_at
+                    ) VALUES (1, 'one', 'One', 'hash', 'member', 'member', 1)
+                    """
+                )
+            finally:
+                db.close()
+
+            self._mark_previous_container_baseline(path)
+            self._create_retired_private_agents(path)
+
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "cannot retire private_agents safely",
+            ):
+                Database(path)
+
+            with sqlite3.connect(path) as verification:
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT version, name FROM schema_migrations"
+                    ).fetchone(),
+                    (2026072402, "agent-scopes-container-sandbox-v2"),
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT user_id, session_id FROM private_agents"
+                    ).fetchall(),
+                    [(1, "retired-session")],
+                )
+                self.assertIn(
+                    "execution_backend",
+                    {
+                        row[1]
+                        for row in verification.execute(
+                            "PRAGMA table_info(agent_scopes)"
+                        ).fetchall()
+                    },
+                )
+
+    def test_previous_baseline_rolls_back_retired_table_when_marker_write_fails(self):
+        class FailingMigrationConnection(sqlite3.Connection):
+            def execute(self, sql: str, parameters=()):
+                if (
+                    "INSERT INTO schema_migrations" in sql
+                    and parameters
+                    and int(parameters[0]) == DATABASE_SCHEMA_VERSION
+                ):
+                    raise sqlite3.OperationalError("injected marker failure")
+                return super().execute(sql, parameters)
+
+        real_connect = sqlite3.connect
+
+        def failing_connect(*args, **kwargs):
+            return real_connect(
+                *args,
+                **kwargs,
+                factory=FailingMigrationConnection,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            path = config.db_path
+            db = Database(path)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO users(
+                        id, username, display_name, password_hash, role,
+                        permission_group, created_at
+                    ) VALUES (1, 'one', 'One', 'hash', 'member', 'member', 1)
+                    """
+                )
+                AgentScopeManager(config, db).ensure_private_scope(1)
+            finally:
+                db.close()
+
+            self._mark_previous_container_baseline(path)
+            self._create_retired_private_agents(path)
+
+            with mock.patch.object(
+                db_module.sqlite3,
+                "connect",
+                side_effect=failing_connect,
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "injected marker failure",
+                ):
+                    Database(path)
+
+            with real_connect(path) as verification:
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT version, name FROM schema_migrations"
+                    ).fetchone(),
+                    (2026072402, "agent-scopes-container-sandbox-v2"),
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT user_id, session_id FROM private_agents"
+                    ).fetchall(),
+                    [(1, "retired-session")],
+                )
+                self.assertIn(
+                    "execution_backend",
+                    {
+                        row[1]
+                        for row in verification.execute(
+                            "PRAGMA table_info(agent_scopes)"
+                        ).fetchall()
+                    },
+                )
 
     def test_previous_baseline_rejects_missing_or_invalid_durable_high_water(self):
         for stored_value in (None, "not-an-integer", "-1"):

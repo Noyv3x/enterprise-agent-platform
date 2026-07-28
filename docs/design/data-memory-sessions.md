@@ -18,7 +18,7 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 
 数据库启用 WAL、外键和按线程连接。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
-Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前发布把容器平台 schema marker 与最终表结构作为唯一 baseline：空数据库直接创建该结构；`durable_jobs`、`agent_run_inputs`、`agent_schedules`、`agent_schedule_runs` 也属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表；仅允许从上一个已部署的容器基线执行一次原子升级，把没有当前来源语义的记忆标记为 `imported`；其它非空数据库缺少受支持 marker、包含退役 scope 表或不满足声明结构时明确拒绝启动，不在 Platform 内猜测来源或修补任意旧结构。
+Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前发布把容器平台 schema marker 与最终表结构作为唯一 baseline：空数据库直接创建该结构；`durable_jobs`、`agent_run_inputs`、`agent_schedules`、`agent_schedule_runs` 也属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表；仅允许从上一个已部署的容器基线执行一次原子升级，把没有当前来源语义的记忆标记为 `imported`，并在确认每个私人 Agent 已由规范 scope 和 Runtime 状态接管后删除该源基线可选携带的退役 `private_agents` 登记表。该表的 session、容器和绝对 workspace 字段不是当前权威数据，不导入或覆盖新基线。其它非空数据库缺少受支持 marker、包含未声明表或不满足声明结构时明确拒绝启动，不在 Platform 内猜测来源或修补任意旧结构。
 
 ## Agent scope
 
@@ -79,6 +79,6 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。当前代码不包含容器 baseline 之前的迁移；启动只接受当前 marker，或精确匹配上一个已部署容器 marker 后执行受限的一次性升级。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或禁止表都拒绝启动。未来新增迁移必须拥有不可变的独立版本、唯一名称和明确 source version，并在 Manager 快照边界内原子执行；不得把旧产品布局扫描重新放回常规启动路径。
+数据库 schema version 单调递增。当前代码不包含容器 baseline 之前的迁移；启动只接受当前 marker，或精确匹配上一个已部署容器 marker 后执行受限的一次性升级。源基线中的 `private_agents` 只能作为结构精确匹配的可选退役表；迁移必须先证明其每行已有对应的 `users`、`private:<user-id>` scope、相对 workspace、sandbox identity 和 Runtime session/lifecycle，再与记忆格式升级及 marker 切换在同一事务中删除。任何证明失败或后续步骤异常都必须保留原表、原数据和原 marker；当前 marker 下不允许该表存在。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或禁止表都拒绝启动。未来新增迁移必须拥有不可变的独立版本、唯一名称和明确 source version，并在 Manager 快照边界内原子执行；不得把旧产品布局扫描重新放回常规启动路径。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；仅支持从届时文档明确声明的上一基线升级，不扫描其它产品目录或猜测未声明布局。
