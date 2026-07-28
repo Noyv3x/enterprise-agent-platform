@@ -74,6 +74,116 @@ func TestFirecrawlRetryDelayBacksOffAndCaps(t *testing.T) {
 	}
 }
 
+func TestCurrentRecoveryRetryDelayBacksOffAndCaps(t *testing.T) {
+	policy := currentRecoveryPolicy{
+		idlePoll:     time.Second,
+		initialDelay: 5 * time.Second,
+		maxDelay:     time.Minute,
+	}
+	tests := map[int]time.Duration{
+		0: time.Second,
+		1: 5 * time.Second,
+		2: 10 * time.Second,
+		3: 20 * time.Second,
+		4: 40 * time.Second,
+		5: time.Minute,
+		9: time.Minute,
+	}
+	for failures, expected := range tests {
+		if got := currentRecoveryRetryDelay(failures, policy); got != expected {
+			t.Fatalf("currentRecoveryRetryDelay(%d) = %s, want %s", failures, got, expected)
+		}
+	}
+}
+
+func TestInitialCurrentRecoveryKeepsFailureForBackgroundRetry(t *testing.T) {
+	want := errors.New("readiness is temporarily unavailable")
+	calls := 0
+	failures := initialCurrentRecovery(
+		context.Background(),
+		currentRecoveryPolicy{attemptTimeout: time.Second},
+		func(context.Context) error {
+			calls++
+			return want
+		},
+	)
+	if failures != 1 || calls != 1 {
+		t.Fatalf("initial recovery = failures %d, calls %d; want 1, 1", failures, calls)
+	}
+}
+
+func TestCurrentRecoveryAttemptHasIndependentTimeout(t *testing.T) {
+	timeout := 20 * time.Millisecond
+	started := time.Now()
+	err := runCurrentRecoveryAttempt(context.Background(), timeout, func(ctx context.Context) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("recovery attempt did not receive a deadline")
+		}
+		if remaining := time.Until(deadline); remaining <= 0 || remaining > timeout {
+			t.Fatalf("recovery deadline remaining = %s, want within (0, %s]", remaining, timeout)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("recovery attempt error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded recovery took %s", elapsed)
+	}
+}
+
+func TestCurrentRecoveryLoopRetriesUntilPendingStateConverges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := currentRecoveryPolicy{
+		attemptTimeout: 100 * time.Millisecond,
+		idlePoll:       time.Millisecond,
+		initialDelay:   2 * time.Millisecond,
+		maxDelay:       8 * time.Millisecond,
+	}
+	var mu sync.Mutex
+	calls := 0
+	converged := make(chan struct{})
+	pending := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls < 3
+	}
+	recover := func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls < 3 {
+			return errors.New("injected transient recovery failure")
+		}
+		close(converged)
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		runCurrentRecoveryLoop(ctx, 0, policy, pending, recover)
+		close(done)
+	}()
+	select {
+	case <-converged:
+	case <-time.After(time.Second):
+		t.Fatal("current recovery did not retry to convergence")
+	}
+	mu.Lock()
+	if calls != 3 {
+		t.Fatalf("recovery calls = %d, want 3", calls)
+	}
+	mu.Unlock()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("current recovery loop did not stop with its Manager context")
+	}
+}
+
 func TestFirecrawlReconciliationRequiresAnIdleCommittedGeneration(t *testing.T) {
 	current := &model.Generation{
 		ID:     strings.Repeat("a", 40),
@@ -181,9 +291,11 @@ func TestCandidateRecoversOperationsBeforeWatchdogAcknowledgement(t *testing.T) 
 	recoverAt := strings.Index(text, "app.operations.RecoverBeforeActivation(")
 	acknowledgeAt := strings.Index(text, "app.selfUpdate.AcknowledgeStartup(")
 	awaitAt := strings.Index(text, "app.selfUpdate.AwaitStartupCommit(")
-	finalizeAt := strings.LastIndex(text, "app.operations.Recover(context.Background())")
-	if recoverAt < 0 || acknowledgeAt < 0 || awaitAt < 0 || finalizeAt < 0 || !(recoverAt < acknowledgeAt && acknowledgeAt < awaitAt && awaitAt < finalizeAt) {
-		t.Fatalf("unsafe candidate startup ordering: recovery=%d acknowledgement=%d watchdog=%d finalize=%d", recoverAt, acknowledgeAt, awaitAt, finalizeAt)
+	currentRecoveryAt := strings.Index(text, "initialRecoveryFailures := initialCurrentRecovery(")
+	retryAt := strings.Index(text, "go runCurrentRecoveryLoop(")
+	backgroundAt := strings.Index(text, "go app.background(ctx)")
+	if recoverAt < 0 || acknowledgeAt < 0 || awaitAt < 0 || currentRecoveryAt < 0 || retryAt < 0 || backgroundAt < 0 || !(recoverAt < acknowledgeAt && acknowledgeAt < awaitAt && awaitAt < currentRecoveryAt && currentRecoveryAt < retryAt && retryAt < backgroundAt) {
+		t.Fatalf("unsafe candidate/current startup ordering: recovery=%d acknowledgement=%d watchdog=%d current=%d retry=%d background=%d", recoverAt, acknowledgeAt, awaitAt, currentRecoveryAt, retryAt, backgroundAt)
 	}
 }
 
@@ -208,6 +320,37 @@ func TestManagerCLIClientLoadsControlCapability(t *testing.T) {
 	}
 	if client.Token != token {
 		t.Fatal("CLI did not load the Manager control capability")
+	}
+}
+
+func TestRecoverCurrentCommandRequiresExplicitSafetyInputs(t *testing.T) {
+	tests := []struct {
+		arguments []string
+		want      string
+	}{
+		{arguments: nil, want: "--yes"},
+		{arguments: []string{"--yes"}, want: "--config"},
+		{arguments: []string{"--yes", "--config", "/tmp/manager.toml"}, want: "--expected-sha256"},
+	}
+	for _, test := range tests {
+		if err := recoverCurrentCommand(test.arguments); err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("recoverCurrentCommand(%v) error = %v, want containing %q", test.arguments, err, test.want)
+		}
+	}
+}
+
+func TestRecoveryConfigRejectsSymbolicLink(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "manager.toml")
+	if err := os.WriteFile(configPath, []byte("data_root = \"/tmp/data\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(directory, "manager-link.toml")
+	if err := os.Symlink(configPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRecoveryConfigFile(linkPath); err == nil {
+		t.Fatal("symbolic-link recovery config was accepted")
 	}
 }
 

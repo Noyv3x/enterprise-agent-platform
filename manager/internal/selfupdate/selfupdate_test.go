@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -52,6 +53,9 @@ func newPreparedManager(t *testing.T) (*Manager, release.Manifest, []byte, *fake
 	manifest, server := candidateManifest(t, newBinary)
 	t.Cleanup(server.Close)
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	install := filepath.Join(root, "bin", "ubitech-manager")
 	if err := atomicfile.WriteFile(install, oldBinary, 0o755); err != nil {
 		t.Fatal(err)
@@ -103,6 +107,19 @@ func TestPrepareVerifiesButDoesNotActivateCandidate(t *testing.T) {
 	}
 }
 
+func TestPrepareCannotRaceExternalCurrentRecovery(t *testing.T) {
+	manager, manifest, _, _ := newPreparedManager(t)
+	releaseLock, err := acquireRecoveryLock(manager.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseLock()
+	err = manager.Prepare(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "external recovery") {
+		t.Fatalf("Prepare while external recovery lock is held = %v", err)
+	}
+}
+
 func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 	manager, manifest, _, runner := newPreparedManager(t)
 	if err := manager.MarkPlatformCommitted(manifest); err != nil {
@@ -123,7 +140,7 @@ func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan.Acknowledged = true
-	plan.HealthTimeoutMS = 3_000
+	plan.HealthTimeoutMS = 5_000
 	if err := atomicfile.WriteJSON(plan.PlanPath, plan, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -131,15 +148,33 @@ func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(manager.SocketPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer 0123456789abcdef0123456789abcdef" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		if request.URL.Path != "/v1/identity" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "healthy", "version": plan.CandidateVersion, "sha256": plan.CandidateSHA,
+		})
 	})}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
+	if _, err := readRecoveryControlToken(manager.ControlTokenFile); err != nil {
+		t.Fatalf("identity fixture token: %v", err)
+	}
+	if err := validateRecoverySocket(manager.SocketPath); err != nil {
+		t.Fatalf("identity fixture socket: %v", err)
+	}
+	if !managerHealthy(context.Background(), manager.SocketPath, manager.ControlTokenFile, plan.CandidateVersion, plan.CandidateSHA) {
+		t.Fatal("candidate identity fixture is not healthy")
+	}
 	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
 		t.Fatal(err)
 	}

@@ -24,6 +24,12 @@ type statusReporter struct {
 	services map[string]driver.FixedServiceState
 }
 
+type identityMustNotProbeDocker struct{ driver.Engine }
+
+func (identityMustNotProbeDocker) FixedServiceStatus(context.Context) map[string]driver.FixedServiceState {
+	panic("identity endpoint called Docker service reporter")
+}
+
 func (s statusReporter) FixedServiceStatus(context.Context) map[string]driver.FixedServiceState {
 	return s.services
 }
@@ -31,8 +37,10 @@ func (s statusReporter) FixedServiceStatus(context.Context) map[string]driver.Fi
 func TestAPICapabilityMatrix(t *testing.T) {
 	t.Parallel()
 	api := &API{
-		ControlToken:  "control-token-0123456789abcdef",
-		ExecutorToken: "executor-token-0123456789abcdef",
+		ControlToken:   "control-token-0123456789abcdef",
+		ExecutorToken:  "executor-token-0123456789abcdef",
+		ManagerVersion: strings.Repeat("a", 40),
+		ManagerSHA256:  strings.Repeat("b", 64),
 	}
 	tests := []struct {
 		name       string
@@ -45,6 +53,9 @@ func TestAPICapabilityMatrix(t *testing.T) {
 		{name: "operation rejects raw token", path: "/v1/operations", authority: "control-token-0123456789abcdef", wantStatus: http.StatusUnauthorized},
 		{name: "operation rejects malformed bearer", path: "/v1/operations", authority: "Bearer  control-token-0123456789abcdef", wantStatus: http.StatusUnauthorized},
 		{name: "operation accepts control token", path: "/v1/operations", authority: "Bearer control-token-0123456789abcdef", wantStatus: http.StatusNotFound},
+		{name: "identity rejects missing token", path: "/v1/identity", wantStatus: http.StatusUnauthorized},
+		{name: "identity rejects executor token", path: "/v1/identity", authority: "Bearer executor-token-0123456789abcdef", wantStatus: http.StatusUnauthorized},
+		{name: "identity accepts control token", path: "/v1/identity", authority: "Bearer control-token-0123456789abcdef", wantStatus: http.StatusOK},
 		{name: "executor rejects missing token", path: "/v1/executor/not-found", wantStatus: http.StatusUnauthorized},
 		{name: "executor rejects control token", path: "/v1/executor/not-found", authority: "Bearer control-token-0123456789abcdef", wantStatus: http.StatusUnauthorized},
 		{name: "executor rejects raw token", path: "/v1/executor/not-found", authority: "executor-token-0123456789abcdef", wantStatus: http.StatusUnauthorized},
@@ -62,6 +73,43 @@ func TestAPICapabilityMatrix(t *testing.T) {
 				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestIdentityIsStrictAndDoesNotProbeManagedServices(t *testing.T) {
+	t.Parallel()
+	api := &API{
+		Engine:         identityMustNotProbeDocker{},
+		ControlToken:   "control-token-0123456789abcdef",
+		ManagerVersion: strings.Repeat("c", 40),
+		ManagerSHA256:  strings.Repeat("d", 64),
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/identity", nil)
+	request.Header.Set("Authorization", "Bearer control-token-0123456789abcdef")
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("identity status = %d; body=%s", response.Code, response.Body.String())
+	}
+	var identity map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &identity); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"status": "healthy", "version": strings.Repeat("c", 40), "sha256": strings.Repeat("d", 64)}
+	if len(identity) != len(want) {
+		t.Fatalf("identity fields = %#v, want exactly %#v", identity, want)
+	}
+	for key, value := range want {
+		if identity[key] != value {
+			t.Fatalf("identity[%s] = %q, want %q", key, identity[key], value)
+		}
+	}
+
+	api.ManagerSHA256 = "invalid"
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("invalid identity status = %d, want 503", response.Code)
 	}
 }
 

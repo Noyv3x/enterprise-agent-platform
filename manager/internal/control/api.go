@@ -24,16 +24,18 @@ import (
 )
 
 type API struct {
-	Store         *journal.Store
-	Operations    *operation.Orchestrator
-	Engine        driver.Engine
-	Executor      *executor.Service
-	Config        *config.Manager
-	AuditLog      *logstore.Store
-	ControlToken  string
-	ExecutorToken string
-	mu            sync.Mutex
-	checks        map[string]release.Manifest
+	Store          *journal.Store
+	Operations     *operation.Orchestrator
+	Engine         driver.Engine
+	Executor       *executor.Service
+	Config         *config.Manager
+	AuditLog       *logstore.Store
+	ControlToken   string
+	ExecutorToken  string
+	ManagerVersion string
+	ManagerSHA256  string
+	mu             sync.Mutex
+	checks         map[string]release.Manifest
 }
 
 func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -52,6 +54,8 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	switch {
+	case request.Method == http.MethodGet && request.URL.Path == "/v1/identity":
+		a.identity(response)
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
 		a.status(response, request.Context())
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
@@ -71,6 +75,24 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}
+}
+
+// identity is the constant-time, owner-authenticated process probe used by the
+// self-update watchdog and the external Current recovery path. It deliberately
+// does not read the operation journal or call Docker: process identity and the
+// health of managed child services are separate signals.
+func (a *API) identity(response http.ResponseWriter) {
+	managerVersion := safeCommit(a.ManagerVersion)
+	managerSHA := safeSHA256(a.ManagerSHA256)
+	if managerVersion == "" || managerSHA == "" {
+		writeError(response, http.StatusServiceUnavailable, "manager identity is unavailable")
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]string{
+		"status":  "healthy",
+		"version": managerVersion,
+		"sha256":  managerSHA,
+	})
 }
 
 func (a *API) status(response http.ResponseWriter, requestContext context.Context) {
@@ -218,6 +240,18 @@ func safeImageName(value string) bool {
 
 func safeCommit(value string) string {
 	if len(value) != 40 {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return ""
+		}
+	}
+	return value
+}
+
+func safeSHA256(value string) string {
+	if len(value) != 64 {
 		return ""
 	}
 	for _, character := range value {

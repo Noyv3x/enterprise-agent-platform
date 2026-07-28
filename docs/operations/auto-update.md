@@ -48,13 +48,15 @@ operation 为 `install`、`update`、`restart`、`rollback` 或 `repair`；phase
 2. 停止当前可写 Platform，并证明没有第二个数据库 writer；
 3. 对 SQLite 和需要同步切换的 sidecar 数据建立一致快照；
 4. 运行版本化、幂等、事务化 schema 与文件迁移；
-5. 启动候选固定服务并执行完整 readiness；
+5. 启动候选核心服务并执行核心 readiness，同时异步启动受管能力服务；
 6. 原子提交 current/previous generation；
 7. 完成 Manager 自更新确认和其它当前 generation finalize hook；
 8. 明确释放 reservation，恢复公网入口和后台 worker；
 9. 各 Sandbox 空闲时独立刷新其基础镜像。
 
-Platform、Runtime、Camoufox、SearXNG 与 Firecrawl 属于核心 readiness；任何一项未收敛都必须使候选 generation 失败并回滚。Firecrawl readiness 同时要求 Playwright、Redis、RabbitMQ、Postgres、FoundationDB 与 API healthy、一次性 init 容器唯一且成功退出；恢复和 finalize 必须重跑同一完整探针。Firecrawl 修复只可操作状态明确异常的组件，不能以 API 或其它依赖故障为由重启健康 FoundationDB。Cognee 默认只影响对应能力；release 若因数据迁移需要提高其门禁，必须在发布契约中显式声明，部署机不能临时猜测。
+Platform 与 Agent Runtime 属于 generation 的核心 readiness；Manager 自身还必须持续持有公网入口和 owner-only 控制接口。Camoufox、SearXNG、Firecrawl 与 Cognee 是能力级服务：候选启动时应尽力拉起并逐项报告健康状态，但它们未收敛时只降级浏览器、搜索、网页提取或知识能力，不能回滚已经健康的核心 generation、阻止 finalize、让整个平台进入长期维护，或终止 Manager。release 若因不可分割的数据迁移确实依赖某项能力服务，必须在发布契约中显式声明本次临时门禁，并提供不依赖该服务自身健康的恢复路径，部署机不能临时猜测。
+
+Firecrawl 后台收敛分别检查 Playwright、Redis、RabbitMQ、Postgres、FoundationDB、一次性 init 与 API，并把结果投影为独立服务状态。修复只可操作状态明确异常的组件，不能以 API 或其它依赖故障为由重启健康 FoundationDB，也不能仅因一次短探针超时就重启仍在恢复的有状态进程。失败后使用有界指数退避；Manager、Platform 与 Runtime 正常时，Firecrawl 修复不得占用全局维护门。
 
 ## 数据库迁移
 
@@ -70,15 +72,19 @@ Platform、Runtime、Camoufox、SearXNG 与 Firecrawl 属于核心 readiness；�
 
 Manager 在任一 phase 被终止、宿主重启或 Docker 重启后，从 operation journal 幂等收敛。数据库迁移 one-off 容器使用确定名称、Manager ownership label 和 Compose project label；恢复数据库前必须先清除已证明归属的残留迁移 writer。无法证明数据库和容器 generation 一致时保持维护，`repair` 不能绕过未完成的 `rolling_back`。
 
-operation 终态与 Manager state 的半提交窗口必须显式收敛：失败 operation 已落盘但 active id 未清除时只能完成失败收尾；current 已提交但 finalize 尚未完成时保持 `finalize_pending` 和维护，重新执行完整核心探针及幂等 finalize hook，最后才释放 reservation。任何 checkpoint 写入错误都必须可观察，不能伪造完成。
+operation 终态与 Manager state 的半提交窗口必须显式收敛：失败 operation 已落盘但 active id 未清除时只能完成失败收尾；current 已提交但 finalize 尚未完成时保持 `finalize_pending` 和维护，重新执行核心探针及幂等 finalize hook，最后才释放 reservation。能力级服务的健康状态不参与该探针。任何 checkpoint 写入错误都必须可观察，不能伪造完成。
+
+候选 Manager 尚未被 watchdog 接纳时，journal 损坏、核心 readiness 失败或控制入口不可用必须使候选进程退出，由 watchdog 恢复 previous Manager。候选已经成为 current 后，恢复或 finalize 的暂时错误不再是 Manager 进程级致命错误：Manager 必须保持公网维护页和控制接口在线，持久保留原 operation，并由后台循环带退避重试。不可恢复错误同样不得形成 systemd 崩溃循环；它保持安全维护状态并向宿主 CLI 提供有界诊断和受控恢复入口。
 
 候选固定服务启动或探针失败时，Manager 在删除容器前采集有界的 healthcheck 和日志诊断。所有诊断先脱敏再截断；采集失败可以附加错误，但不能阻止安全回滚。
 
 ## Manager 自更新
 
-Manager 使用版本目录、持久 activation intent、独立 watchdog 和原子 current/previous 切换更新自身。候选二进制先完成自检、journal 解析和 operation 收敛，再绑定 control socket 与公网入口并通过探针；只有 watchdog 确认后才能成为 current。任一失败都恢复 previous Manager 二进制及其 unit，不能覆盖唯一可启动副本。
+Manager 使用版本目录、持久 activation intent、独立 watchdog 和原子 current/previous 切换更新自身。候选二进制先完成自检、journal 解析和核心 operation 收敛，再绑定 control socket 与公网入口并通过探针；只有 watchdog 确认后才能成为 current。Manager 身份探针必须经过 owner-only control capability 认证，只返回运行 release version 与运行可执行文件 SHA-256，不得执行 Docker 或下游服务检查；完整服务目录与 Manager 进程存活是两个独立信号。任一提交前失败都恢复 previous Manager 二进制及其 unit，不能覆盖唯一可启动副本。
 
 control API 在提交 2xx 前完整编码响应。mutation 只返回有界身份和状态确认；客户端对空、截断、超限或非法 JSON 的成功响应视为结果不确定，并使用原 idempotency key 与 operation journal 对账。外部错误正文写入 journal 前必须脱敏和限制大小，重复失败只保留初始上下文与最近错误，不能递归嵌套历史诊断。
+
+若 current Manager 的旧二进制缺陷使其在启动恢复阶段持续退出，后台轮询本身不可达，不能声称继续推送普通 release 会自动获救。此时只使用[部署文档](deployment.md#manager-失联恢复)定义的校验恢复入口先替换 Manager；恢复成功后由同一 operation journal 补完原 finalize，再恢复普通更新。不得只覆盖 stable 文件而不登记 Manager Current，也不得手工清除 `finalize_pending`。
 
 ## 验证
 
@@ -89,5 +95,7 @@ control API 在提交 2xx 前完整编码响应。mutation 只返回有界身份
 - 数据库 schema 迁移成功、失败与外键回滚；
 - 候选镜像、核心 readiness 和 Manager 自更新失败；
 - operation 在每个持久 phase 被终止后的幂等恢复；
+- current Manager 在 `finalize_pending` 核心探针暂时失败时保持控制接口在线、带退避重试，并在服务恢复后只 finalize 一次；
+- Firecrawl 整体不可用时 Platform 与 Runtime 仍完成 finalize、退出维护并将网页提取标记为 degraded；
 - current/previous 镜像与数据 generation 的往返回滚；
 - Firecrawl FoundationDB 首次初始化和保留同一数据后的幂等重建。

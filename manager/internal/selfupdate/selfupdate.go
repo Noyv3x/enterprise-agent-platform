@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,17 +80,18 @@ func (CommandRunner) Run(ctx context.Context, name string, args ...string) error
 }
 
 type Manager struct {
-	Root             string
-	StatePath        string
-	InstallPath      string
-	SocketPath       string
-	ControlTokenFile string
-	UnitName         string
-	RunningVersion   string
-	Client           release.Client
-	Runner           Runner
-	Now              func() time.Time
-	BootID           func() string
+	Root                    string
+	StatePath               string
+	InstallPath             string
+	SocketPath              string
+	ControlTokenFile        string
+	UnitName                string
+	RunningVersion          string
+	Client                  release.Client
+	Runner                  Runner
+	Now                     func() time.Time
+	BootID                  func() string
+	RecoveryProcessVerifier func(context.Context, string, string, string) error
 }
 
 // ProbeTransientUnit proves that the current user-systemd session can host
@@ -107,6 +106,14 @@ func (m *Manager) ProbeTransientUnit(ctx context.Context) error {
 }
 
 func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error {
+	if err := ensureRecoveryDirectory(m.Root); err != nil {
+		return fmt.Errorf("prepare Manager binary root: %w", err)
+	}
+	releaseRecoveryLock, err := acquireRecoveryLock(m.Root)
+	if err != nil {
+		return fmt.Errorf("coordinate Manager update with external recovery: %w", err)
+	}
+	defer releaseRecoveryLock()
 	artifact, ok := manifest.Manager.Artifacts[runtime.GOARCH]
 	if !ok {
 		return errors.New("manager artifact is missing")
@@ -322,7 +329,7 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 		if err := atomicfile.ReadJSON(planPath, &plan); err != nil {
 			break
 		}
-		if plan.Activated && plan.Acknowledged && managerHealthy(ctx, plan.SocketPath, plan.ControlTokenFile) && binaryMatches(plan.InstallPath, plan.CandidateSHA) {
+		if plan.Activated && plan.Acknowledged && managerHealthy(ctx, plan.SocketPath, plan.ControlTokenFile, plan.CandidateVersion, plan.CandidateSHA) && binaryMatches(plan.InstallPath, plan.CandidateSHA) {
 			consecutive++
 			if consecutive >= 3 {
 				if err := commitActivation(planPath, plan); err != nil {
@@ -501,36 +508,8 @@ func (m *Manager) bootID() string {
 	return strings.TrimSpace(string(data))
 }
 
-func managerHealthy(ctx context.Context, socketPath, tokenFile string) bool {
-	if socketPath == "" || tokenFile == "" {
-		return false
-	}
-	tokenBytes, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return false
-	}
-	token := strings.TrimSpace(string(tokenBytes))
-	if token == "" || strings.ContainsAny(token, " \t\r\n") {
-		return false
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", socketPath)
-	}}
-	client := &http.Client{Transport: transport, Timeout: time.Second}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "http://manager/v1/status", nil)
-	if err != nil {
-		return false
-	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := client.Do(request)
-	if err != nil {
-		return false
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
-	_ = response.Body.Close()
-	return response.StatusCode == http.StatusOK
+func managerHealthy(ctx context.Context, socketPath, tokenFile, expectedVersion, expectedSHA string) bool {
+	return recoveryManagerIdentityMatches(ctx, socketPath, tokenFile, expectedVersion, expectedSHA)
 }
 
 func binaryMatches(path, expected string) bool {

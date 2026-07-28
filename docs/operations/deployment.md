@@ -66,6 +66,14 @@ CLI 通过 owner-only Unix socket 连接常驻 Manager，并从 owner-only secre
 
 所有变更带 operation id、幂等键和 expected generation。Manager 先按幂等键核对不可变请求指纹，再判断 generation：同一指纹重复提交返回原 operation，相同 key 携带不同指纹则冲突。上一 attempt 明确终结后，调用方必须重新读取 generation 才能提交下一 attempt。并发请求不能启动第二个变更。
 
+## Manager 失联恢复
+
+只有 Manager 因已知启动缺陷持续退出、owner-only 控制 socket 无法稳定提供服务，因而普通更新和 `repair` 均不可达时，才允许使用发布二进制自带的 `recover-current` 宿主命令。该入口不是第二套平台更新器：它只替换并登记 Manager 二进制，不修改 Platform generation、operation journal、SQLite、容器或能力服务数据。
+
+操作方先从同一个不可变 release 下载当前架构的 Manager 与 `.sha256` sidecar，核对 HTTPS 来源后把期望 SHA-256 显式传给候选二进制。命令固定要求 `--config`、`--expected-sha256` 与 `--yes`。它必须验证执行用户、配置、stable 路径、数据根、当前 Platform generation、Manager 自更新状态及文件类型；存在普通 activation、未归属文件、符号链接、hash 不一致或候选版本无法验证时拒绝执行。
+
+恢复命令把候选复制到 owner-only 不可变版本目录，停止同一 user-systemd Manager unit，原子替换 stable 二进制并重新启动。健康检查使用经过 control capability 认证、完全不查询 Docker 或下游服务的轻量身份端点；它必须连续返回候选 release version 与当前运行可执行文件 SHA-256，并确认 systemd unit 的主进程确实来自 stable 候选，不能用可能受慢容器探针影响的完整 `/v1/status` 代替。只有这些身份检查通过后，才原子登记新的 Manager `Current`；登记时 `SourceCommit` 保持当前 Platform generation，旧 Manager `Current` 保留为 `Previous`，使当前 `finalize_pending` 可以继续收敛，下一次正常 release 仍能通过 watchdog 更新两者。候选启动、健康检查或登记失败时恢复原 stable 二进制，Manager 状态保持原值并重新启动旧服务。进程在 stable 替换后意外中断时允许原命令以相同期望 hash 重跑并继续收敛，不能要求人工编辑状态文件。
+
 ## 公网入口与维护
 
 Manager 持有唯一产品端口。正常时代理 current Platform generation；维护或 Platform 不可用时直接返回临时页面和精简更新状态，所以应用容器未启动时入口仍然可用。
@@ -82,11 +90,13 @@ main 质量门构建受支持架构的镜像与 Manager 二进制。release mani
 
 托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽 entrypoint、脚本、库或默认配置。FoundationDB 持久数据挂载到 `/var/fdb/data`，共享 cluster 目录挂载到 `/var/fdb/cluster`；server、初始化任务和 Firecrawl API 必须使用其中同一个 `/var/fdb/cluster/fdb.cluster` 文件。
 
-FoundationDB 初始化必须幂等：每次 `configure new single ssd` 尝试后，无论 CLI 的文本和退出码如何，都以有界 `status json` 验证 `.client.database_status.available == true`；只有该真实可用性条件成立才退出 0。不得因 `Database already exists!` 重建、清空或改写数据库。命令失败、无效 JSON、多个 JSON 文档或 database unavailable 继续有界重试并最终失败；初始化自身最多执行 20 轮、约 200 秒，Manager 对包含其它依赖和 API 健康检查的完整 Firecrawl 收敛提供 600 秒等待预算，不能把初始化预算误当成整个依赖链预算。最终诊断必须同时保留最后一次 configure 退出码/有界输出和 status 退出码/有界输出，不得只显示 `Database already exists!` 而隐去真实 readiness 失败。Firecrawl API 同时等待初始化成功和 FoundationDB 健康。
+FoundationDB 初始化必须幂等：每次 `configure new single ssd` 尝试后，无论 CLI 的文本和退出码如何，都以有界 `status json` 验证 `.client.database_status.available == true`；只有该真实可用性条件成立才退出 0。不得因 `Database already exists!` 重建、清空或改写数据库。命令失败、无效 JSON、多个 JSON 文档或 database unavailable 继续有界重试并最终失败；初始化自身最多执行 20 轮、约 200 秒，Firecrawl 后台收敛提供 600 秒等待预算。最终诊断必须同时保留最后一次 configure 退出码/有界输出和 status 退出码/有界输出，不得只显示 `Database already exists!` 而隐去真实 readiness 失败。Firecrawl API 在自身能力栈内等待初始化成功和 FoundationDB 健康，但该等待不占用整个平台维护门。
 
 ## 健康与提交
 
-Platform generation 的核心提交门为：Manager 存活并持有入口、Platform readiness、Agent Runtime、Camoufox、SearXNG 和 Firecrawl 健康。Manager 启动固定栈时必须等待 Firecrawl 的 Playwright、Redis、RabbitMQ、Postgres、FoundationDB、一次性 init 与 API 全部收敛，Probe、恢复、管理状态和 finalize 使用同一完整目录。首次失败后只能依据容器状态做精确修复：init 已非零退出时移除该 one-shot，FoundationDB 非 healthy 时才重启原容器；API、Redis、RabbitMQ、Postgres、Playwright 或配置故障不得触发 FoundationDB 重启。完成必要修复后最多重试一次，不得删除或改写持久数据。第二次仍失败必须返回带两次原始失败摘要和各依赖状态的错误并触发 generation 回滚，不能在任一组件未就绪时静默提交更新。崩溃恢复、Manager 自更新确认和 finalize 必须重新验证六个常驻 Firecrawl 服务为 healthy、init 容器唯一且已退出 0，不能只依赖启动阶段曾经成功。后台自愈单轮上下文为 25 分钟，以覆盖两个各 600 秒的最坏启动尝试及其精确检查和清理；失败后使用指数退避，不能每分钟扰动健康依赖。该预算只约束固定服务收敛，不是 Agent run 的执行超时。Cognee 保持能力级 degraded；目标 schema 或文件迁移依赖 Cognee 时，release 必须明确提升为本次 operation 的必需服务。
+Platform generation 的核心提交门为：Manager 存活并持有公网入口与控制接口、Platform readiness 和 Agent Runtime readiness。核心门通过后可以提交 generation 并退出维护；Camoufox、SearXNG、Firecrawl 与 Cognee 的状态独立显示为 healthy、starting 或 degraded，任何单项故障都不能让 Manager 退出或把健康的 Platform 锁成 503。
+
+Manager 启动固定栈时先等待核心服务，再异步收敛能力服务。Firecrawl 收敛逐项检查 Playwright、Redis、RabbitMQ、Postgres、FoundationDB、一次性 init 与 API。init 已非零退出时可以精确移除该 one-shot；FoundationDB 容器未运行或 Docker 健康状态明确为非 healthy 时才允许重启原容器。API、Redis、RabbitMQ、Postgres、Playwright 或配置故障不得触发 FoundationDB 重启。修复不得删除或改写持久数据，失败后记录有界诊断并指数退避。该预算只约束 Firecrawl 能力收敛，不是更新维护时间或 Agent run 执行超时。
 
 任何时刻最多一个可写 Platform 打开 SQLite。候选镜像先运行无业务 writer 的 preflight；Manager 在维护门关闭并停止 current writer 后，使用同一 Platform 镜像执行：
 
@@ -113,11 +123,11 @@ Sandbox entrypoint 只允许在启动映射 UID/GID 时短暂以 root 运行，�
 部署或更新完成后至少验证：
 
 - Manager service 为 active/enabled，`status` 没有 active/finalize operation；
-- Platform、Runtime、Camoufox 与 SearXNG 核心探针健康；
+- Platform 与 Runtime 核心探针健康；
 - 登录、首页、普通消息、SSE 与附件可用；
 - Agent Sandbox 能按需创建、停止并保留工作区；
-- 搜索、浏览器和 terminal 路径可用；
-- Firecrawl 在空数据首次启动与保留数据重建两种场景均完成 init，API 健康；
+- terminal 路径可用；搜索、浏览器和网页提取分别报告实际能力状态，故障时不影响普通消息与 Agent Runtime；
+- Firecrawl 在空数据首次启动与保留数据重建两种场景均完成 init，API 健康；若暂时 degraded，Manager 保持在线并继续有界自愈；
 - 数据库完整性检查通过，current generation 与 Manager journal 一致。
 
 生产故障只能通过 Manager operation、当前数据库快照和 current/previous generation 处理。不得手工编辑 journal、切换镜像 tag、直接运行 Platform 或创建第二套 Compose 栈。

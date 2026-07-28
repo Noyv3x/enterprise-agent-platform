@@ -161,6 +161,8 @@ var firecrawlHealthyServices = []string{
 	"firecrawl-api",
 }
 
+var capabilityServices = []string{"camofox", "searxng"}
+
 var candidateCredentialPatterns = []struct {
 	expression  *regexp.Regexp
 	replacement string
@@ -291,11 +293,40 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 	if err := d.setActiveGeneration(manifest.ID()); err != nil {
 		return err
 	}
-	_, err = d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--detach", "--wait", "platform", "agent-runtime", "camofox", "searxng"), nil)
+	_, err = d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--detach", "--wait", "platform", "agent-runtime"), nil)
 	if err != nil {
 		return err
 	}
-	return d.reconcileFirecrawl(ctx, env)
+	// Capability services are intentionally outside the generation commit gate.
+	// Start the lightweight services independently so one broken integration
+	// cannot prevent another from starting or keep a healthy Platform in
+	// maintenance. Firecrawl has its own bounded background reconciler because
+	// its dependency graph can take minutes to converge.
+	_ = d.reconcileCapabilities(ctx, env)
+	return nil
+}
+
+// ReconcileCapabilities idempotently asks Compose to converge every lightweight
+// capability service for one immutable generation. Services are attempted
+// independently so one failure does not prevent the others from starting. The
+// caller decides how to report and retry the joined error; generation readiness
+// never depends on this method. Firecrawl uses its own bounded reconciler.
+func (d DockerCLI) ReconcileCapabilities(ctx context.Context, manifest release.Manifest) error {
+	env, err := d.writeGenerationEnvironment(manifest)
+	if err != nil {
+		return err
+	}
+	return d.reconcileCapabilities(ctx, env)
+}
+
+func (d DockerCLI) reconcileCapabilities(ctx context.Context, env string) error {
+	var failures []error
+	for _, service := range capabilityServices {
+		if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--detach", service), nil); err != nil {
+			failures = append(failures, fmt.Errorf("start capability service %s: %w", service, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 // ReconcileFirecrawl converges the complete extraction stack for the active
@@ -485,19 +516,13 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 	if err != nil {
 		return err
 	}
-	required := []string{
-		"platform",
-		"agent-runtime",
-		"camofox",
-		"searxng",
-	}
-	required = append(required, firecrawlHealthyServices...)
+	required := []string{"platform", "agent-runtime"}
 	for _, service := range required {
 		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
 			return err
 		}
 	}
-	return d.probeCompletedComposeService(ctx, env, "firecrawl-foundationdb-init")
+	return nil
 }
 
 func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServiceState {

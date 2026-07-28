@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,20 @@ type application struct {
 	fixedStackMu sync.Locker
 }
 
+type currentRecoveryPolicy struct {
+	attemptTimeout time.Duration
+	idlePoll       time.Duration
+	initialDelay   time.Duration
+	maxDelay       time.Duration
+}
+
+var defaultCurrentRecoveryPolicy = currentRecoveryPolicy{
+	attemptTimeout: 2 * time.Minute,
+	idlePoll:       time.Second,
+	initialDelay:   5 * time.Second,
+	maxDelay:       time.Minute,
+}
+
 func main() { code := run(os.Args[1:]); os.Exit(code) }
 func run(arguments []string) int {
 	if len(arguments) == 0 {
@@ -78,6 +93,8 @@ func run(arguments []string) int {
 		return 0
 	case "self-update-watchdog":
 		err = selfUpdateWatchdogCommand(arguments[1:])
+	case "recover-current":
+		err = recoverCurrentCommand(arguments[1:])
 	default:
 		usage()
 		return 64
@@ -89,7 +106,7 @@ func run(arguments []string) int {
 	return 1
 }
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ubitech-manager <serve|preflight|install|status|check|update|restart|rollback|repair|logs|version> [options]")
+	fmt.Fprintln(os.Stderr, "usage: ubitech-manager <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|logs|version> [options]")
 }
 
 func commonFlags(name string) (*flag.FlagSet, *string) {
@@ -98,6 +115,93 @@ func commonFlags(name string) (*flag.FlagSet, *string) {
 	return set, path
 }
 func load(path string) (config.Config, error) { return config.Load(path) }
+
+func recoverCurrentCommand(arguments []string) error {
+	set, path := commonFlags("recover-current")
+	expectedSHA := set.String("expected-sha256", "", "expected SHA-256 of this recovery Manager executable")
+	confirmed := set.Bool("yes", false, "confirm the controlled Manager replacement")
+	if err := set.Parse(arguments); err != nil {
+		return err
+	}
+	if !*confirmed {
+		return errors.New("recover-current requires explicit --yes confirmation")
+	}
+	if *path == "" {
+		return errors.New("recover-current requires an explicit --config path")
+	}
+	if *expectedSHA == "" {
+		return errors.New("recover-current requires --expected-sha256")
+	}
+	if err := validateRecoveryConfigFile(*path); err != nil {
+		return err
+	}
+	cfg, err := load(*path)
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve recovery Manager executable: %w", err)
+	}
+	selfUpdater := &selfupdate.Manager{
+		Root:             filepath.Join(cfg.StateDir, "manager-binaries"),
+		StatePath:        filepath.Join(cfg.StateDir, "manager-binaries.json"),
+		InstallPath:      managerInstallPath(),
+		SocketPath:       cfg.SocketPath,
+		ControlTokenFile: cfg.ControlTokenFile(),
+		UnitName:         "ubitech-agent-manager.service",
+		RunningVersion:   version,
+	}
+	timeout := cfg.HealthTimeout
+	if timeout < 30*time.Second {
+		timeout = 2 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := selfUpdater.RecoverCurrent(
+		ctx,
+		filepath.Clean(executable),
+		filepath.Join(cfg.StateDir, "state.json"),
+		*expectedSHA,
+	); err != nil {
+		return err
+	}
+	fmt.Println("current Manager recovery completed")
+	return nil
+}
+
+func validateRecoveryConfigFile(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("recovery config path must be absolute and canonical")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve recovery config: %w", err)
+	}
+	if resolved != path {
+		return errors.New("recovery config path must not contain symbolic links")
+	}
+	parentInfo, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("inspect recovery config directory: %w", err)
+	}
+	parentMetadata, parentOwned := parentInfo.Sys().(*syscall.Stat_t)
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 || !parentOwned || parentMetadata.Uid != uint32(os.Getuid()) || parentInfo.Mode().Perm()&0o022 != 0 {
+		return errors.New("recovery config directory must be an owner-owned non-symlink directory")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect recovery config: %w", err)
+	}
+	metadata, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ok || metadata.Uid != uint32(os.Getuid()) {
+		return errors.New("recovery config must be an owner-owned non-symlink regular file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return errors.New("recovery config must be owner-only")
+	}
+	return nil
+}
 
 func build(path string) (*application, error) {
 	cfg, err := load(path)
@@ -147,7 +251,11 @@ func build(path string) (*application, error) {
 	ops.LocalActiveProcesses = processes.ActiveBackgroundCount
 	execution := &executor.Service{Audits: executor.AuditStore{Dir: filepath.Join(cfg.StateDir, "control"), Log: audit}, Processes: processes, Files: executor.FileService{Sandboxes: sandboxes, MaxBytes: 10 << 20}}
 	configs := config.NewManager(cfg)
-	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken}
+	runningSHA, err := runningExecutableSHA256()
+	if err != nil {
+		return nil, fmt.Errorf("identify running Manager executable: %w", err)
+	}
+	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken, ManagerVersion: version, ManagerSHA256: runningSHA}
 	return &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu}, nil
 }
 
@@ -231,13 +339,25 @@ func serveCommand(arguments []string) error {
 			return fmt.Errorf("wait for Manager watchdog commit: %w", err)
 		}
 	}
-	// On a self-update restart, recover durable operation state only after the
-	// active-binary watchdog has promoted the healthy candidate to Current.
-	if err := app.operations.Recover(context.Background()); err != nil {
-		return err
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Once the watchdog has promoted this binary to Current, a child-service or
+	// finalize failure can no longer be repaired by repeatedly killing the same
+	// Manager. Keep the owner-only control API and public maintenance gateway
+	// online while durable recovery retries in the background. Candidate startup
+	// above remains strict so the watchdog can still reject an unsafe binary.
+	initialRecoveryFailures := initialCurrentRecovery(
+		ctx,
+		defaultCurrentRecoveryPolicy,
+		app.recoverCurrent,
+	)
+	go runCurrentRecoveryLoop(
+		ctx,
+		initialRecoveryFailures,
+		defaultCurrentRecoveryPolicy,
+		app.operations.RecoveryPending,
+		app.recoverCurrent,
+	)
 	go app.background(ctx)
 	select {
 	case <-ctx.Done():
@@ -275,26 +395,134 @@ func selfUpdateWatchdogCommand(arguments []string) error {
 	return selfupdate.RunWatchdog(context.Background(), *plan, nil)
 }
 
-func (a *application) background(ctx context.Context) {
-	sandboxTicker := time.NewTicker(time.Minute)
-	firecrawlTimer := time.NewTimer(5 * time.Second)
-	updateTicker := time.NewTicker(time.Second)
-	lastUpdateCheck := time.Now()
-	firecrawlFailures := 0
-	defer sandboxTicker.Stop()
-	defer firecrawlTimer.Stop()
-	defer updateTicker.Stop()
+func runCurrentRecoveryAttempt(ctx context.Context, timeout time.Duration, recover func(context.Context) error) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return recover(attemptCtx)
+}
+
+// recoverCurrent keeps recovery failures visible without turning a current
+// Manager into a systemd crash loop. Candidate startup deliberately does not
+// use this wrapper: before watchdog promotion, recovery remains a strict gate.
+func (a *application) recoverCurrent(ctx context.Context) error {
+	err := a.operations.Recover(ctx)
+	if err == nil {
+		return nil
+	}
+	a.recordCurrentRecoveryFailure(err)
+	return err
+}
+
+func (a *application) recordCurrentRecoveryFailure(recoveryErr error) {
+	if recoveryErr == nil || a.state == nil {
+		return
+	}
+	diagnostic := journal.BoundDiagnostic(recoveryErr.Error())
+	state := a.state.State()
+	operationID := state.FinalizePendingOperationID
+	if operationID == "" {
+		operationID = state.ActiveOperationID
+	}
+	persistErr := error(nil)
+	if state.LastError != diagnostic {
+		_, persistErr = a.state.MutateState(time.Now().UTC(), func(value *model.ManagerState) error {
+			// Preserve the durable recovery intent exactly. This write exists only
+			// to expose a direct recovery error that the orchestrator could not
+			// persist itself.
+			value.LastError = diagnostic
+			return nil
+		})
+	}
+	if a.audit == nil {
+		return
+	}
+	auditErr := recoveryErr
+	if persistErr != nil {
+		auditErr = errors.Join(recoveryErr, fmt.Errorf("persist recovery diagnostic: %w", persistErr))
+	}
+	generationID := ""
+	if state.Current != nil {
+		generationID = state.Current.ID
+	}
+	_ = a.audit.Append(logstore.Event{
+		At:          time.Now().UTC(),
+		Type:        "manager.recovery_failed",
+		OperationID: operationID,
+		Details:     map[string]any{"generation": generationID},
+		Error:       journal.BoundDiagnostic(auditErr.Error()),
+	})
+}
+
+// initialCurrentRecovery deliberately returns a retry count rather than an
+// error. At this point the binary is already Current: recovery errors must keep
+// the Manager serving its control API instead of propagating to serveCommand.
+func initialCurrentRecovery(ctx context.Context, policy currentRecoveryPolicy, recover func(context.Context) error) int {
+	if err := runCurrentRecoveryAttempt(ctx, policy.attemptTimeout, recover); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func currentRecoveryRetryDelay(failures int, policy currentRecoveryPolicy) time.Duration {
+	if failures <= 0 {
+		return policy.idlePoll
+	}
+	delay := policy.initialDelay
+	for attempt := 1; attempt < failures && delay < policy.maxDelay; attempt++ {
+		if delay > policy.maxDelay/2 {
+			return policy.maxDelay
+		}
+		delay *= 2
+	}
+	if delay > policy.maxDelay {
+		return policy.maxDelay
+	}
+	return delay
+}
+
+func runCurrentRecoveryLoop(
+	ctx context.Context,
+	initialFailures int,
+	policy currentRecoveryPolicy,
+	pending func() bool,
+	recover func(context.Context) error,
+) {
+	failures := initialFailures
+	timer := time.NewTimer(currentRecoveryRetryDelay(failures, policy))
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-firecrawlTimer.C:
-			if err := a.reconcileFirecrawl(ctx); err != nil {
-				firecrawlFailures++
+		case <-timer.C:
+			nextDelay := policy.idlePoll
+			if pending() {
+				if err := runCurrentRecoveryAttempt(ctx, policy.attemptTimeout, recover); err != nil {
+					failures++
+					nextDelay = currentRecoveryRetryDelay(failures, policy)
+				} else {
+					failures = 0
+				}
 			} else {
-				firecrawlFailures = 0
+				failures = 0
 			}
-			firecrawlTimer.Reset(firecrawlRetryDelay(firecrawlFailures))
+			timer.Reset(nextDelay)
+		}
+	}
+}
+
+func (a *application) background(ctx context.Context) {
+	sandboxTicker := time.NewTicker(time.Minute)
+	updateTicker := time.NewTicker(time.Second)
+	lastUpdateCheck := time.Now()
+	defer sandboxTicker.Stop()
+	defer updateTicker.Stop()
+	go runReconciliationLoop(ctx, 2*time.Second, capabilityRetryDelay, a.reconcileCapabilities)
+	go runReconciliationLoop(ctx, 5*time.Second, firecrawlRetryDelay, a.reconcileFirecrawl)
+	for {
+		select {
+		case <-ctx.Done():
+			return
 		case now := <-sandboxTicker.C:
 			_, _ = a.sandboxes.Reap(ctx, now)
 			if current := a.state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
@@ -302,7 +530,6 @@ func (a *application) background(ctx context.Context) {
 			}
 		case now := <-updateTicker.C:
 			if a.operations.RecoveryPending() {
-				_ = a.operations.Recover(ctx)
 				continue
 			}
 			interval := a.configs.Config().UpdateInterval
@@ -310,6 +537,30 @@ func (a *application) background(ctx context.Context) {
 				lastUpdateCheck = now
 				a.autoUpdate(ctx)
 			}
+		}
+	}
+}
+
+func runReconciliationLoop(
+	ctx context.Context,
+	initialDelay time.Duration,
+	retryDelay func(int) time.Duration,
+	reconcile func(context.Context) error,
+) {
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if err := reconcile(ctx); err != nil {
+				failures++
+			} else {
+				failures = 0
+			}
+			timer.Reset(retryDelay(failures))
 		}
 	}
 }
@@ -346,6 +597,43 @@ func (a *application) reconcileFirecrawl(ctx context.Context) error {
 		})
 	}
 	return err
+}
+
+func (a *application) reconcileCapabilities(ctx context.Context) error {
+	if a.fixedStackMu != nil {
+		a.fixedStackMu.Lock()
+		defer a.fixedStackMu.Unlock()
+	}
+	manifest, ready := firecrawlManifest(a.state.State())
+	if !ready {
+		return nil
+	}
+	reconcileCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	err := a.docker.ReconcileCapabilities(reconcileCtx, manifest)
+	if err != nil && a.audit != nil {
+		_ = a.audit.Append(logstore.Event{
+			At:      time.Now().UTC(),
+			Type:    "capability.reconcile_failed",
+			Details: map[string]any{"generation": manifest.ID()},
+			Error:   journal.BoundDiagnostic(err.Error()),
+		})
+	}
+	return err
+}
+
+func capabilityRetryDelay(failures int) time.Duration {
+	if failures <= 0 {
+		return time.Minute
+	}
+	delay := 15 * time.Second
+	for attempt := 1; attempt < failures && delay < 10*time.Minute; attempt++ {
+		delay *= 2
+	}
+	if delay > 10*time.Minute {
+		return 10 * time.Minute
+	}
+	return delay
 }
 
 func firecrawlRetryDelay(failures int) time.Duration {
@@ -631,6 +919,25 @@ func stableKey(values ...string) string {
 		_, _ = hash.Write([]byte{0})
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func runningExecutableSHA256() (string, error) {
+	// /proc/self/exe keeps referring to the executing inode even if the stable
+	// path is atomically replaced by a later self-update.
+	file, err := os.Open("/proc/self/exe")
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	written, err := io.Copy(hash, io.LimitReader(file, (128<<20)+1))
+	if err != nil {
+		return "", err
+	}
+	if written > 128<<20 {
+		return "", errors.New("running Manager executable exceeds 128 MiB")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 func dockerLogSize(bytes int64) string {
 	mib := bytes / (1 << 20)

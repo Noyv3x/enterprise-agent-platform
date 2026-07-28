@@ -498,7 +498,7 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 			if selfErr := o.SelfUpdate.MarkPlatformCommitted(manifest); selfErr != nil {
 				return o.finalizeFailure("manager binary could not be committed", selfErr)
 			}
-			if selfErr := o.SelfUpdate.Activate(context.Background(), manifest); selfErr != nil {
+			if selfErr := o.SelfUpdate.Activate(ctx, manifest); selfErr != nil {
 				return o.finalizeFailure("manager activation is pending", selfErr)
 			}
 			committed, selfErr := o.SelfUpdate.ActivationCommitted(manifest)
