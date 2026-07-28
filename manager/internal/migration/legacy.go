@@ -70,6 +70,12 @@ type ArchiveReceipt struct {
 	VerifiedAt      time.Time     `json:"verified_at"`
 }
 
+const (
+	maxArchiveManifestJSONBytes int64 = 256 << 20
+	maxArchiveManifestEntries         = 2_000_000
+	maxArchiveManifestPathBytes       = 4096
+)
+
 type Plan struct {
 	SchemaVersion        int           `json:"schema_version"`
 	ID                   string        `json:"id"`
@@ -769,7 +775,7 @@ func (s *Service) archiveTree(ctx context.Context, name, source, archiveRoot str
 	target := filepath.Join(archiveRoot, name)
 	manifestPath := filepath.Join(archiveRoot, name+"-manifest.json")
 	var manifest ArchiveManifest
-	if err := atomicfile.ReadJSON(manifestPath, &manifest); err != nil {
+	if err := readArchiveManifest(manifestPath, &manifest); err != nil {
 		if !os.IsNotExist(err) {
 			return ArchiveTree{}, err
 		}
@@ -1369,7 +1375,7 @@ func archiveStandaloneFile(source, archiveDir, name string) (ArchiveFile, bool, 
 
 func restoreArchivedTree(ctx context.Context, tree ArchiveTree, migrationID string) error {
 	var manifest ArchiveManifest
-	if err := atomicfile.ReadJSON(tree.ManifestPath, &manifest); err != nil {
+	if err := readArchiveManifest(tree.ManifestPath, &manifest); err != nil {
 		return err
 	}
 	if manifest.Status != "archived" || manifest.Digest != tree.Digest || !samePath(manifest.ArchivePath, tree.ArchivePath) || !samePath(manifest.OriginalPath, tree.OriginalPath) {
@@ -1446,7 +1452,7 @@ func verifyRecoveryPack(plan Plan) error {
 			return errors.New("archive tree escapes the recovery pack")
 		}
 		var manifest ArchiveManifest
-		if err := atomicfile.ReadJSON(tree.ManifestPath, &manifest); err != nil {
+		if err := readArchiveManifest(tree.ManifestPath, &manifest); err != nil {
 			return err
 		}
 		count, total, digest := summarizeEntries(manifest.Entries)
@@ -1464,6 +1470,52 @@ func verifyRecoveryPack(plan Plan) error {
 		if err := verifyTree(filepath.Dir(file.ArchivePath), []FileRecord{file.Record}); err != nil {
 			return fmt.Errorf("archived standalone file %s: %w", file.Name, err)
 		}
+	}
+	return nil
+}
+
+func readArchiveManifest(path string, manifest *ArchiveManifest) error {
+	if err := atomicfile.ReadJSONWithLimit(path, manifest, maxArchiveManifestJSONBytes); err != nil {
+		return err
+	}
+	if len(manifest.Entries) > maxArchiveManifestEntries {
+		return fmt.Errorf("decode %s: archive manifest exceeds %d-entry limit", path, maxArchiveManifestEntries)
+	}
+	for index, entry := range manifest.Entries {
+		if err := validateArchiveFileRecord(entry); err != nil {
+			return fmt.Errorf("decode %s: archive manifest entry %d: %w", path, index, err)
+		}
+	}
+	return nil
+}
+
+func validateArchiveFileRecord(entry FileRecord) error {
+	cleanPath := filepath.Clean(entry.Path)
+	if entry.Path == "" || len(entry.Path) > maxArchiveManifestPathBytes || filepath.IsAbs(entry.Path) ||
+		cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath != entry.Path {
+		return errors.New("path is not a bounded clean relative path")
+	}
+	if entry.Mode == "" || len(entry.Mode) > 32 || entry.Size < 0 {
+		return errors.New("mode or size is invalid")
+	}
+	switch entry.Kind {
+	case "directory":
+		if entry.SHA256 != "" || entry.LinkTarget != "" {
+			return errors.New("directory contains file-only metadata")
+		}
+	case "file":
+		if len(entry.SHA256) != sha256.Size*2 || entry.LinkTarget != "" {
+			return errors.New("file digest metadata is invalid")
+		}
+		if _, err := hex.DecodeString(entry.SHA256); err != nil {
+			return errors.New("file digest metadata is invalid")
+		}
+	case "symlink":
+		if entry.SHA256 != "" || len(entry.LinkTarget) > maxArchiveManifestPathBytes {
+			return errors.New("symlink metadata is invalid")
+		}
+	default:
+		return errors.New("kind is invalid")
 	}
 	return nil
 }

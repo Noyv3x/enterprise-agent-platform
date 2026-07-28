@@ -462,6 +462,52 @@ func TestSourceRetirementRejectsTamperedArchiveBeforeIntent(t *testing.T) {
 	}
 }
 
+func TestSourceRetirementAcceptsLargeCheckoutManifest(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	var manifestPath string
+	for _, tree := range fixture.plan.ArchiveTrees {
+		if tree.Name == "checkout" {
+			manifestPath = tree.ManifestPath
+			break
+		}
+	}
+	if manifestPath == "" {
+		t.Fatal("fixture has no checkout manifest")
+	}
+	file, err := os.OpenFile(manifestPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := bytes.Repeat([]byte(" "), 1<<20)
+	for range 26 {
+		if _, err := file.Write(padding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(manifestPath); err != nil || info.Size() <= 8<<20 {
+		t.Fatalf("large checkout manifest was not constructed: size=%v err=%v", func() int64 {
+			if info == nil {
+				return 0
+			}
+			return info.Size()
+		}(), err)
+	}
+
+	if err := fixture.service.Retire(context.Background()); err != nil {
+		t.Fatalf("valid large checkout manifest blocked retirement: %v", err)
+	}
+	plan, err := fixture.service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Status != "purged" || plan.Retirement == nil || plan.Retirement.Status != "completed" {
+		t.Fatalf("large checkout manifest did not reach completed retirement: %#v", plan)
+	}
+}
+
 func TestSourceRetirementWaitsDurablyWithoutRewritingTheSameReadinessError(t *testing.T) {
 	fixture := newRetirementFixture(t)
 	ready := false

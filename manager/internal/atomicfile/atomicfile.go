@@ -1,7 +1,6 @@
 package atomicfile
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,19 +68,30 @@ func WriteJSON(path string, value any, mode os.FileMode) error {
 }
 
 func ReadJSON(path string, value any) error {
+	return ReadJSONWithLimit(path, value, maxJSONBytes)
+}
+
+// ReadJSONWithLimit decodes one JSON value directly from the opened file while
+// retaining an explicit byte budget. Callers with naturally larger immutable
+// artifacts can choose a domain-specific limit without weakening the small
+// state-file default used by ReadJSON.
+func ReadJSONWithLimit(path string, value any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return fmt.Errorf("decode %s: invalid JSON byte limit", path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxJSONBytes+1))
+	info, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return fmt.Errorf("stat %s: %w", path, err)
 	}
-	if int64(len(data)) > maxJSONBytes {
-		return fmt.Errorf("decode %s: JSON exceeds %d-byte limit", path, maxJSONBytes)
+	if info.Size() > maxBytes {
+		return fmt.Errorf("decode %s: JSON exceeds %d-byte limit", path, maxBytes)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
+	dec := json.NewDecoder(io.LimitReader(f, maxBytes+1))
 	if err := dec.Decode(value); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
