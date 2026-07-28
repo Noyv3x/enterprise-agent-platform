@@ -58,7 +58,7 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 源码首迁必须区分 `source_marker` 与 `manager` 预约所有者，marker 同步不得释放 Manager 预约。Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 id 确认 reserve 后才可执行破坏性操作；响应不确定时只有 release 明确成功才可回到非维护状态。Manager owner 释放时如果 source marker 已阻断，Platform 先重新建立 marker owner 再决定是否唤醒 worker。bridge worker 中断后的恢复先持有真实 repository flock，再核对 marker update id、完整桥接资产和 exact source revision；协调器启动不以当下能否取锁为条件，恢复入口不执行 fetch、merge、bootstrap 或 Git rollback。queued/failed handoff 冻结 checkout，普通 `begin --takeover` 也不能覆盖。Manager 暂不可达时源码只允许只读状态回退，管理写操作继续 fail closed。
 
-快照恢复、新 generation readiness 和管理器重启验证完成前不能删除旧源码或数据。首次迁移未知 ignored 文件随完整 checkout 进入至少保留七天的 recovery pack；清理只能处理迁移清单明确列出的路径，不能跟随符号链接或跨越配置根。
+快照恢复、新 generation readiness 和管理器重启验证完成前不能删除旧源码或数据。首次迁移未知 ignored 文件随完整 checkout 进入常规至少保留七天的 recovery pack；版本化退役活动只能在持久 intent 之后提前删除已经重新校验的旧恢复包，并且只能处理迁移清单与固定 allowlist 共同确认的路径，不能跟随符号链接或跨越配置根。同名 Docker resource 还必须同时匹配 Compose project/resource label 且没有 attachment；禁止全局 prune。迁移状态接口只投影活动 id、generation、阶段、完成位、有界错误与时间，不返回旧源码、数据、unit 或归档的宿主绝对路径。
 
 ## 文件与附件
 

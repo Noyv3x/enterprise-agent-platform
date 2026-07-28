@@ -26,6 +26,14 @@ type Snapshotter interface {
 	Restore(context.Context, string) error
 }
 
+type snapshotVerifier interface {
+	Verify(context.Context, string) error
+}
+
+type legacyRetirementProber interface {
+	ProbeLegacyRetirement(context.Context, release.Manifest) error
+}
+
 type LegacyMigrator interface {
 	Active() bool
 	RequiredSourceCommit() (string, bool, error)
@@ -202,6 +210,74 @@ func (o *Orchestrator) RecoveryPending() bool {
 	_, running := o.running[state.ActiveOperationID]
 	o.mu.Unlock()
 	return !running
+}
+
+// ProbeLegacyRetirement proves that source-deployment rollback can be retired
+// without weakening the current container rollback boundary. It is read-only
+// and is called only by the versioned background retirement campaign.
+func (o *Orchestrator) ProbeLegacyRetirement(ctx context.Context) (string, error) {
+	state := o.Store.State()
+	if state.ActiveOperationID != "" || state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
+		return "", errors.New("Manager is not idle")
+	}
+	if state.Current == nil || state.Current.ManifestPath == "" {
+		return "", errors.New("current generation is unavailable")
+	}
+	if state.Previous == nil || state.Previous.ManifestPath == "" || state.Current.RollbackSnapshotPath == "" {
+		return "", errors.New("container rollback generation or database snapshot is unavailable")
+	}
+	manifest, err := o.loadManifest(state.Current.ManifestPath)
+	if err != nil {
+		return "", fmt.Errorf("load current generation: %w", err)
+	}
+	if manifest.ID() != state.Current.ID {
+		return "", errors.New("current generation identity does not match its manifest")
+	}
+	previousManifest, err := o.loadManifest(state.Previous.ManifestPath)
+	if err != nil {
+		return "", fmt.Errorf("load previous rollback generation: %w", err)
+	}
+	if previousManifest.ID() != state.Previous.ID {
+		return "", errors.New("previous generation identity does not match its manifest")
+	}
+	verifier, ok := o.Snapshots.(snapshotVerifier)
+	if !ok {
+		return "", errors.New("database snapshot verifier is unavailable")
+	}
+	if err := verifier.Verify(ctx, state.Current.RollbackSnapshotPath); err != nil {
+		return "", fmt.Errorf("verify current rollback snapshot: %w", err)
+	}
+	prober, ok := o.Engine.(legacyRetirementProber)
+	if !ok {
+		return "", errors.New("legacy retirement Docker probe is unavailable")
+	}
+	if err := prober.ProbeLegacyRetirement(ctx, manifest); err != nil {
+		return "", fmt.Errorf("container retirement readiness: %w", err)
+	}
+	if o.PublicProbe == nil {
+		return "", errors.New("public gateway retirement probe is unavailable")
+	}
+	if err := o.PublicProbe(ctx); err != nil {
+		return "", fmt.Errorf("public gateway retirement readiness: %w", err)
+	}
+	if o.SelfUpdate == nil {
+		return "", errors.New("Manager activation verifier is unavailable")
+	}
+	committed, err := o.SelfUpdate.ActivationCommitted(manifest)
+	if err != nil {
+		return "", fmt.Errorf("verify current Manager activation: %w", err)
+	}
+	if !committed {
+		return "", errors.New("current Manager activation is not committed")
+	}
+	if o.LocalUpdateBlockers == nil {
+		return "", errors.New("Manager task inventory is unavailable")
+	}
+	running, _, _ := o.LocalUpdateBlockers()
+	if running != 0 {
+		return "", errors.New("Manager still has registered running tasks")
+	}
+	return manifest.ID(), nil
 }
 
 func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activationPreflight bool) error {

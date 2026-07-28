@@ -33,7 +33,15 @@ type fakeEngine struct {
 	failAt          string
 	diagnostic      string
 	diagnosticCalls int
+	retirementErr   error
+	retirementCalls int
+	retirementID    string
 }
+
+// engineWithoutRetirementProbe deliberately exposes only the baseline Engine
+// contract. It proves that source retirement fails closed when an alternate
+// backend cannot perform the stronger, irreversible-retirement probe.
+type engineWithoutRetirementProbe struct{ driver.Engine }
 
 type temporaryManifestTransport struct {
 	base     http.RoundTripper
@@ -81,6 +89,13 @@ func (e *fakeEngine) CandidateFailureDiagnostics(context.Context, release.Manife
 	}
 	return e.diagnostic
 }
+func (e *fakeEngine) ProbeLegacyRetirement(_ context.Context, manifest release.Manifest) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.retirementCalls++
+	e.retirementID = manifest.ID()
+	return e.retirementErr
+}
 func (e *fakeEngine) EnsureSandbox(context.Context, driver.SandboxSpec) error { return nil }
 func (e *fakeEngine) StopSandbox(context.Context, string) error               { return nil }
 func (e *fakeEngine) RemoveSandbox(context.Context, string) error             { return nil }
@@ -93,6 +108,18 @@ type fakeSnapshot struct{}
 
 func (fakeSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
 func (fakeSnapshot) Restore(context.Context, string) error          { return nil }
+
+type retirementSnapshot struct {
+	verifyErr error
+	verified  []string
+}
+
+func (*retirementSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
+func (*retirementSnapshot) Restore(context.Context, string) error          { return nil }
+func (s *retirementSnapshot) Verify(_ context.Context, path string) error {
+	s.verified = append(s.verified, path)
+	return s.verifyErr
+}
 
 type countingSnapshot struct {
 	store    snapshot.Store
@@ -253,6 +280,8 @@ type recordingSelfUpdate struct {
 	marked, activated   int
 	failActivateOnce    bool
 	pendingCommitChecks int
+	activationErr       error
+	commitChecks        int
 }
 
 func (s *recordingSelfUpdate) Prepare(context.Context, release.Manifest) error { return nil }
@@ -269,6 +298,10 @@ func (s *recordingSelfUpdate) Activate(context.Context, release.Manifest) error 
 	return nil
 }
 func (s *recordingSelfUpdate) ActivationCommitted(release.Manifest) (bool, error) {
+	s.commitChecks++
+	if s.activationErr != nil {
+		return false, s.activationErr
+	}
 	if s.pendingCommitChecks > 0 {
 		s.pendingCommitChecks--
 		return false, nil
@@ -2362,6 +2395,191 @@ func writeRollbackManifest(t *testing.T, dir, commit string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+type retirementProbeFixture struct {
+	store        *journal.Store
+	orchestrator *Orchestrator
+	engine       *fakeEngine
+	snapshots    *retirementSnapshot
+	selfUpdate   *recordingSelfUpdate
+	currentID    string
+	snapshotPath string
+	publicErr    error
+	publicCalls  int
+	running      int
+	blockerCalls int
+}
+
+func newRetirementProbeFixture(t *testing.T) *retirementProbeFixture {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentID, previousID := strings.Repeat("d", 40), strings.Repeat("c", 40)
+	currentPath := writeRollbackManifest(t, dir, currentID)
+	previousPath := writeRollbackManifest(t, dir, previousID)
+	snapshotPath := "/snapshots/before-current"
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID, ManifestPath: currentPath, RollbackSnapshotPath: snapshotPath}
+		state.Previous = &model.Generation{ID: previousID, ManifestPath: previousPath}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fixture := &retirementProbeFixture{
+		store:        store,
+		engine:       &fakeEngine{},
+		snapshots:    &retirementSnapshot{},
+		selfUpdate:   &recordingSelfUpdate{},
+		currentID:    currentID,
+		snapshotPath: snapshotPath,
+	}
+	fixture.orchestrator = &Orchestrator{
+		Store:      fixture.store,
+		Engine:     fixture.engine,
+		Snapshots:  fixture.snapshots,
+		SelfUpdate: fixture.selfUpdate,
+		Channel:    "main",
+		PublicProbe: func(context.Context) error {
+			fixture.publicCalls++
+			return fixture.publicErr
+		},
+		LocalUpdateBlockers: func() (running, blocking, terminable int) {
+			fixture.blockerCalls++
+			return fixture.running, fixture.running, 0
+		},
+	}
+	return fixture
+}
+
+func TestProbeLegacyRetirementRequiresIdleManager(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*model.ManagerState)
+	}{
+		{name: "active operation", mutate: func(state *model.ManagerState) { state.ActiveOperationID = "op_active" }},
+		{name: "finalize pending", mutate: func(state *model.ManagerState) { state.FinalizePendingOperationID = "op_pending" }},
+		{name: "maintenance", mutate: func(state *model.ManagerState) { state.Maintenance = true }},
+		{name: "non-idle public state", mutate: func(state *model.ManagerState) { state.PublicState = model.StateUpdating }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetirementProbeFixture(t)
+			if _, err := fixture.store.MutateState(time.Now(), func(state *model.ManagerState) error {
+				test.mutate(state)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), "not idle") {
+				t.Fatalf("non-idle Manager passed source retirement: generation=%q err=%v", generation, err)
+			}
+			if fixture.engine.retirementCalls != 0 || len(fixture.snapshots.verified) != 0 || fixture.publicCalls != 0 || fixture.selfUpdate.commitChecks != 0 || fixture.blockerCalls != 0 {
+				t.Fatalf("non-idle Manager ran downstream retirement probes: fixture=%#v", fixture)
+			}
+		})
+	}
+}
+
+func TestProbeLegacyRetirementRequiresRollbackGenerationAndSnapshot(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*model.ManagerState)
+		want   string
+	}{
+		{name: "current generation", mutate: func(state *model.ManagerState) { state.Current = nil }, want: "current generation is unavailable"},
+		{name: "previous generation", mutate: func(state *model.ManagerState) { state.Previous = nil }, want: "rollback generation or database snapshot is unavailable"},
+		{name: "rollback snapshot", mutate: func(state *model.ManagerState) { state.Current.RollbackSnapshotPath = "" }, want: "rollback generation or database snapshot is unavailable"},
+		{name: "current identity", mutate: func(state *model.ManagerState) { state.Current.ID = strings.Repeat("e", 40) }, want: "current generation identity"},
+		{name: "previous identity", mutate: func(state *model.ManagerState) { state.Previous.ID = strings.Repeat("e", 40) }, want: "previous generation identity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetirementProbeFixture(t)
+			if _, err := fixture.store.MutateState(time.Now(), func(state *model.ManagerState) error {
+				test.mutate(state)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("incomplete rollback boundary passed retirement: generation=%q err=%v", generation, err)
+			}
+		})
+	}
+}
+
+func TestProbeLegacyRetirementFailsClosedWhenReadinessCapabilitiesAreUnavailable(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*retirementProbeFixture)
+	}{
+		{name: "snapshot verifier", mutate: func(f *retirementProbeFixture) { f.orchestrator.Snapshots = fakeSnapshot{} }},
+		{name: "Docker retirement probe", mutate: func(f *retirementProbeFixture) {
+			f.orchestrator.Engine = engineWithoutRetirementProbe{Engine: f.engine}
+		}},
+		{name: "public gateway probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.PublicProbe = nil }},
+		{name: "Manager activation probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.SelfUpdate = nil }},
+		{name: "running task probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.LocalUpdateBlockers = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetirementProbeFixture(t)
+			test.mutate(fixture)
+			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" {
+				t.Fatalf("missing readiness capability passed retirement: generation=%q err=%v", generation, err)
+			}
+		})
+	}
+}
+
+func TestProbeLegacyRetirementPropagatesReadinessFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*retirementProbeFixture)
+		want   string
+	}{
+		{name: "snapshot", mutate: func(f *retirementProbeFixture) { f.snapshots.verifyErr = errors.New("snapshot corrupt") }, want: "verify current rollback snapshot"},
+		{name: "Docker", mutate: func(f *retirementProbeFixture) { f.engine.retirementErr = errors.New("Firecrawl unhealthy") }, want: "container retirement readiness"},
+		{name: "public gateway", mutate: func(f *retirementProbeFixture) { f.publicErr = errors.New("gateway unavailable") }, want: "public gateway retirement readiness"},
+		{name: "Manager activation check", mutate: func(f *retirementProbeFixture) {
+			f.selfUpdate.activationErr = errors.New("activation journal unreadable")
+		}, want: "verify current Manager activation"},
+		{name: "Manager activation pending", mutate: func(f *retirementProbeFixture) { f.selfUpdate.pendingCommitChecks = 1 }, want: "activation is not committed"},
+		{name: "running tasks", mutate: func(f *retirementProbeFixture) { f.running = 1 }, want: "registered running tasks"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetirementProbeFixture(t)
+			test.mutate(fixture)
+			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("failed readiness probe passed retirement: generation=%q err=%v", generation, err)
+			}
+		})
+	}
+}
+
+func TestProbeLegacyRetirementReturnsVerifiedCurrentGeneration(t *testing.T) {
+	fixture := newRetirementProbeFixture(t)
+	generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generation != fixture.currentID {
+		t.Fatalf("retirement bound the wrong generation: got %q want %q", generation, fixture.currentID)
+	}
+	if strings.Join(fixture.snapshots.verified, ",") != fixture.snapshotPath {
+		t.Fatalf("retirement verified the wrong database snapshot: %v", fixture.snapshots.verified)
+	}
+	fixture.engine.mu.Lock()
+	retirementCalls, retirementID := fixture.engine.retirementCalls, fixture.engine.retirementID
+	fixture.engine.mu.Unlock()
+	if retirementCalls != 1 || retirementID != fixture.currentID || fixture.publicCalls != 1 || fixture.selfUpdate.commitChecks != 1 || fixture.blockerCalls != 1 {
+		t.Fatalf("retirement did not prove every readiness boundary: engine=%d/%q public=%d manager=%d blockers=%d", retirementCalls, retirementID, fixture.publicCalls, fixture.selfUpdate.commitChecks, fixture.blockerCalls)
+	}
 }
 
 func TestConsecutiveRollbacksBindSnapshotToNewCurrentGeneration(t *testing.T) {

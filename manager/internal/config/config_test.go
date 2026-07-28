@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -178,5 +179,107 @@ func TestPatchPreservesPrivateManagerSettings(t *testing.T) {
 	}
 	if loaded.SocketPath != cfg.SocketPath || loaded.PlatformURL != cfg.PlatformURL || loaded.PlatformGateURL != cfg.PlatformGateURL || loaded.LegacyPlatformGateURL != cfg.LegacyPlatformGateURL || loaded.ComposeFile != cfg.ComposeFile || loaded.SandboxNetwork != cfg.SandboxNetwork || loaded.InternalTokenFile != cfg.InternalTokenFile {
 		t.Fatalf("private settings were lost: %#v", loaded)
+	}
+}
+
+func TestClearLegacyPlatformGateURLPreservesConfigurationAndIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	cfg, err := Defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConfigPath = filepath.Join(root, "manager.toml")
+	cfg.DataRoot = filepath.Join(root, "data-root")
+	cfg.StateDir = filepath.Join(cfg.DataRoot, "manager")
+	cfg.DataDir = filepath.Join(cfg.DataRoot, "data")
+	cfg.SocketPath = filepath.Join(cfg.StateDir, "control", "custom.sock")
+	cfg.GatewayAddress = "127.0.0.1:19090"
+	cfg.PlatformURL = "http://127.0.0.1:29090"
+	cfg.PlatformGateURL = "http://127.0.0.1:39090"
+	cfg.LegacyPlatformGateURL = "http://127.0.0.1:49090"
+	cfg.InternalTokenFile = filepath.Join(cfg.StateDir, "secrets", "manager-token")
+	cfg.ReleaseURL = "https://releases.example.invalid/main.json"
+	cfg.ReleaseChannel = "test"
+	cfg.UpdateEnabled = false
+	cfg.UpdateInterval = 7 * time.Minute
+	cfg.ComposeFile = filepath.Join(root, "compose.yaml")
+	cfg.ComposeProject = "custom-project"
+	cfg.DockerBinary = "/usr/bin/docker"
+	cfg.SandboxImage = "registry.example.invalid/sandbox@sha256:deadbeef"
+	cfg.SandboxNetwork = "custom-core"
+	cfg.SandboxIdle = 43 * time.Minute
+	cfg.HealthTimeout = 83 * time.Second
+	cfg.DrainTimeout = 11 * time.Minute
+	cfg.LogMaxBytes = 23 << 20
+	cfg.LogBackups = 9
+	cfg.CommandMaxBytes = 3 << 20
+	if err := os.WriteFile(cfg.ConfigPath, []byte(render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(cfg)
+	if err := manager.ClearLegacyPlatformGateURL(); err != nil {
+		t.Fatal(err)
+	}
+	want := cfg
+	want.LegacyPlatformGateURL = ""
+	if got := manager.Config(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("in-memory configuration changed beyond the legacy gate:\n got: %#v\nwant: %#v", got, want)
+	}
+	loaded, err := Load(cfg.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded, want) {
+		t.Fatalf("persisted configuration changed beyond the legacy gate:\n got: %#v\nwant: %#v", loaded, want)
+	}
+	contents, err := os.ReadFile(cfg.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), "legacy_platform_gate_url") {
+		t.Fatalf("retired legacy gate key remains in manager.toml:\n%s", contents)
+	}
+	before, err := os.Stat(cfg.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ClearLegacyPlatformGateURL(); err != nil {
+		t.Fatalf("idempotent retirement failed: %v", err)
+	}
+	after, err := os.Stat(cfg.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("idempotent retirement unexpectedly rewrote manager.toml")
+	}
+}
+
+func TestClearLegacyPlatformGateURLKeepsMemoryUnchangedWhenPersistenceFails(t *testing.T) {
+	root := t.TempDir()
+	cfg, err := Defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConfigPath = filepath.Join(root, "manager.toml")
+	cfg.LegacyPlatformGateURL = "http://127.0.0.1:18765"
+	if err := os.Mkdir(cfg.ConfigPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(cfg)
+	if err := manager.ClearLegacyPlatformGateURL(); err == nil {
+		t.Fatal("expected manager.toml replacement to fail")
+	}
+	if got := manager.Config(); !reflect.DeepEqual(got, cfg) {
+		t.Fatalf("failed persistence mutated in-memory configuration: %#v", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("failed atomic replacement left temporary files: %v", matches)
 	}
 }

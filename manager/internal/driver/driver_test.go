@@ -293,6 +293,127 @@ func TestProbeRejectsMissingDuplicateStoppedOrUnhealthyCoreContainer(t *testing.
 	}
 }
 
+func TestProbeLegacyRetirementRequiresCompleteHealthyFirecrawlStack(t *testing.T) {
+	services := []string{
+		"platform", "agent-runtime", "camofox", "searxng",
+		"firecrawl-foundationdb", "firecrawl-api", "firecrawl-foundationdb-init",
+	}
+	ids := map[string]string{}
+	states := map[string]string{}
+	idDigits := []string{"a", "b", "c", "d", "e", "f", "1"}
+	for index, service := range services {
+		id := strings.Repeat(idDigits[index], 64)
+		ids[service] = id
+		states[id] = "running healthy\n"
+	}
+	states[ids["firecrawl-foundationdb-init"]] = "exited 0\n"
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+			return Result{Stdout: ids[args[len(args)-1]] + "\n"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: states[args[len(args)-1]]}, nil
+		default:
+			return Result{}, nil
+		}
+	}}
+	docker := DockerCLI{
+		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
+		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
+	}
+	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+	if err := docker.ProbeLegacyRetirement(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != len(services)*2 {
+		t.Fatalf("retirement probe made %d calls, want %d: %#v", len(runner.calls), len(services)*2, runner.calls)
+	}
+	lastInspect := strings.Join(runner.calls[len(runner.calls)-1].args, " ")
+	if !strings.Contains(lastInspect, "{{.State.Status}} {{.State.ExitCode}}") ||
+		!strings.HasSuffix(lastInspect, ids["firecrawl-foundationdb-init"]) {
+		t.Fatalf("foundationdb init was not inspected for successful completion: %s", lastInspect)
+	}
+}
+
+func TestProbeLegacyRetirementRejectsMissingOrUnhealthyFirecrawlService(t *testing.T) {
+	const healthyID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const failingID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name        string
+		service     string
+		containerID string
+		state       string
+		want        string
+	}{
+		{
+			name: "foundationdb missing", service: "firecrawl-foundationdb",
+			want: "required service firecrawl-foundationdb must have exactly one container, found 0",
+		},
+		{
+			name: "api unhealthy", service: "firecrawl-api", containerID: failingID,
+			state: "running unhealthy", want: "required service firecrawl-api container health is unhealthy, want healthy",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				switch {
+				case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+					service := args[len(args)-1]
+					if service == test.service {
+						return Result{Stdout: test.containerID}, nil
+					}
+					return Result{Stdout: healthyID}, nil
+				case len(args) > 0 && args[0] == "inspect":
+					if args[len(args)-1] == test.containerID && test.state != "" {
+						return Result{Stdout: test.state}, nil
+					}
+					if strings.Contains(strings.Join(args, " "), ".State.ExitCode") {
+						return Result{Stdout: "exited 0"}, nil
+					}
+					return Result{Stdout: "running healthy"}, nil
+				default:
+					return Result{}, nil
+				}
+			}}
+			docker := DockerCLI{
+				Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
+				ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
+			}
+			manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+			err := docker.ProbeLegacyRetirement(context.Background(), manifest)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ProbeLegacyRetirement() error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestProbeLegacyRetirementRejectsFailedFoundationDBInit(t *testing.T) {
+	const healthyID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
+			return Result{Stdout: healthyID}, nil
+		case len(args) > 0 && args[0] == "inspect" && strings.Contains(strings.Join(args, " "), ".State.ExitCode"):
+			return Result{Stdout: "exited 23"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: "running healthy"}, nil
+		default:
+			return Result{}, nil
+		}
+	}}
+	docker := DockerCLI{
+		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
+		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
+	}
+	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+	err := docker.ProbeLegacyRetirement(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "required service firecrawl-foundationdb-init container exit code is 23, want 0") {
+		t.Fatalf("ProbeLegacyRetirement() error = %v", err)
+	}
+}
+
 func TestCandidateFailureDiagnosticsCapturesPlatformLogsAndHealthHistory(t *testing.T) {
 	const containerID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	root := t.TempDir()

@@ -35,6 +35,13 @@ type Store struct {
 	syncDir            func(string) error
 }
 
+// Verify validates a rollback snapshot without changing the live database.
+// The source-retirement gate uses it before giving up the legacy checkout.
+func (s Store) Verify(ctx context.Context, path string) error {
+	_, _, err := s.validateSnapshot(ctx, path)
+	return err
+}
+
 var managedFiles = []string{"platform.db", "platform.db-wal", "platform.db-shm", "bootstrap-admin-password.txt"}
 
 type validatedEntry struct {

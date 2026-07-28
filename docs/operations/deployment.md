@@ -131,6 +131,10 @@ Manager 的本地 control socket 仍是跨进程网络边界。CLI 对迁移 pla
 
 清理完成是不可逆提交点，此后只使用镜像和数据库快照回滚。
 
+对于 `source-v1-retirement-2026-07` 之前已经完成且未恢复的唯一存量源码迁移，下一次容器 release 会在普通更新完全提交、服务恢复空闲后自动执行一次源码部署退役。该活动是从“可恢复旧源码服务”到“只支持容器 generation/数据库快照回滚”的明确不可逆转换：它重新校验当前 Manager、核心容器、公网入口和 Firecrawl 完整链路，逐项核对迁移归档、systemd 文件、source retry/recovery 文件、宿主构建缓存及旧 Compose 标签后才删除。任一对象不能证明归属时只记录错误并后台重试，不扩大路径匹配，也不影响当前容器服务。
+
+退役活动完成的宿主机不得再保留可启动的 `enterprise-agent-platform.service`、迁移 timer/retry/guard、旧 checkout recovery pack、source updater marker/log、旧 Platform gate 值或旧 Firecrawl/SearXNG Compose 容器/network/volume。它仍必须保留所有业务数据、Agent 工作区/记忆/会话、浏览器状态、当前外部服务 bind mount、Manager 状态、当前与 previous generation、普通数据库快照以及回滚所需镜像。Manager 把活动结果压缩为不含旧绝对路径的 `purged` receipt；只有观察到该 receipt 后，后续版本才可删除源码桥接兼容实现。
+
 桥接版本在等待完整发布清单期间仍可用旧的源码进程运行。该兼容路径必须显式把 Runtime 设为 local executor，并使用宿主 workspace 绝对路径；它只用于迁移等待和开发测试，不能成为 Docker 生产拓扑的隐式回退。`UBITECH_SOURCE_MIGRATION_BRIDGE=1` 只能与绝对 Manager socket/token-file 路径同时启用，且不会把 Platform 切成 container execution。容器模式必须显式设置部署模式，缺少 Manager socket/token 或执行器时直接失败，不能静默切回宿主本地执行。
 
 ## 验证

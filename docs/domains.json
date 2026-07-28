@@ -110,6 +110,7 @@
         "docs/reference/data-layout.md"
       ],
       "code": [
+        "manager/internal/migration/**",
         "enterprise-agent-platform/enterprise_agent_platform/db.py",
         "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
         "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",

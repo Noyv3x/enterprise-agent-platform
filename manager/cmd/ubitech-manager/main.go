@@ -139,7 +139,7 @@ func build(path string) (*application, error) {
 	audit := logstore.New(filepath.Join(cfg.StateDir, "logs", "audit.jsonl"), cfg.LogMaxBytes, cfg.LogBackups)
 	dataDir := cfg.PlatformDataDir()
 	legacyClaimMu := &sync.Mutex{}
-	legacy := &migration.Service{StatePath: filepath.Join(cfg.StateDir, "migration.json"), DestinationData: dataDir, BackupRoot: filepath.Join(cfg.DataRoot, "backups"), QuarantineRoot: filepath.Join(cfg.DataRoot, "quarantine"), LegacyService: "enterprise-agent-platform.service", ClaimMu: legacyClaimMu}
+	legacy := &migration.Service{StatePath: filepath.Join(cfg.StateDir, "migration.json"), DestinationData: dataDir, BackupRoot: filepath.Join(cfg.DataRoot, "backups"), QuarantineRoot: filepath.Join(cfg.DataRoot, "quarantine"), LegacyService: "enterprise-agent-platform.service", DockerBinary: cfg.DockerBinary, ClaimMu: legacyClaimMu}
 	legacy.CanConfigure = func() bool {
 		current := state.State()
 		return current.ActiveOperationID == "" && current.FinalizePendingOperationID == ""
@@ -189,6 +189,8 @@ func build(path string) (*application, error) {
 	ops.LocalUpdateBlockers = processes.UpdateBlockers
 	execution := &executor.Service{Audits: executor.AuditStore{Dir: filepath.Join(cfg.StateDir, "control"), Log: audit}, Processes: processes, Files: executor.FileService{Sandboxes: sandboxes, MaxBytes: 10 << 20}}
 	configs := config.NewManager(cfg)
+	legacy.RetirementReady = ops.ProbeLegacyRetirement
+	legacy.RetireConfig = configs.ClearLegacyPlatformGateURL
 	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, Legacy: legacy, ControlToken: controlToken, ExecutorToken: executorToken}
 	return &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, legacy: legacy, selfUpdate: selfUpdater, processes: processes, api: api}, nil
 }
@@ -354,16 +356,21 @@ func selfUpdateWatchdogCommand(arguments []string) error {
 
 func (a *application) background(ctx context.Context) {
 	sandboxTicker := time.NewTicker(time.Minute)
+	retirementTimer := time.NewTimer(5 * time.Second)
 	updateTicker := time.NewTicker(time.Second)
 	lastUpdateCheck := time.Now()
 	defer sandboxTicker.Stop()
+	defer retirementTimer.Stop()
 	defer updateTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-retirementTimer.C:
+			_ = a.legacy.Retire(ctx)
 		case now := <-sandboxTicker.C:
 			_, _ = a.sandboxes.Reap(ctx, now)
+			_ = a.legacy.Retire(ctx)
 			_ = a.legacy.Prune(now, time.Duration(contract.MigrationBackupRetentionSeconds)*time.Second)
 			if current := a.state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
 				a.sandboxes.SetImage(current.Images["agent-sandbox"])

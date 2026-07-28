@@ -239,7 +239,7 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 func TestLegacyMigrationStatusReturnsOnlyBoundedProgressProjection(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "migration.json")
-	largeError := strings.Repeat("external migration failure\x1b\n", 100000)
+	largeError := strings.Repeat("external migration failure\x1b\n", 5000)
 	plan := migration.Plan{
 		SchemaVersion: 1,
 		ID:            "legacy-bounded-status",
@@ -248,8 +248,17 @@ func TestLegacyMigrationStatusReturnsOnlyBoundedProgressProjection(t *testing.T)
 		Entries:       make([]migration.FileRecord, 10000),
 		Quarantined:   make([]string, 10000),
 		Error:         largeError,
-		CreatedAt:     time.Unix(100, 0).UTC(),
-		UpdatedAt:     time.Unix(101, 0).UTC(),
+		Retirement: &migration.Retirement{
+			CampaignID:         "source-v1-retirement-2026-07",
+			GenerationID:       strings.Repeat("a", 40),
+			Status:             "source_state_removed",
+			SystemdRemoved:     true,
+			SourceStateRemoved: true,
+			Error:              largeError,
+			StartedAt:          time.Unix(100, 0).UTC(),
+		},
+		CreatedAt: time.Unix(100, 0).UTC(),
+		UpdatedAt: time.Unix(101, 0).UTC(),
 	}
 	for index := range plan.Entries {
 		plan.Entries[index].Path = strings.Repeat("inventory-path/", 5)
@@ -286,6 +295,18 @@ func TestLegacyMigrationStatusReturnsOnlyBoundedProgressProjection(t *testing.T)
 	}
 	if _, exists := projected["entries"]; exists {
 		t.Fatal("migration status exposed the unbounded inventory")
+	}
+	retirement, ok := projected["retirement"].(map[string]any)
+	if !ok || retirement["campaign_id"] != plan.Retirement.CampaignID || retirement["status"] != plan.Retirement.Status || retirement["systemd_removed"] != true {
+		t.Fatalf("retirement receipt was not safely projected: %#v", projected["retirement"])
+	}
+	if retirement["error"] != journal.BoundDiagnostic(largeError) {
+		t.Fatal("retirement diagnostic was not bounded")
+	}
+	for _, forbidden := range []string{"legacy_root", "legacy_data", "archive_path", "unit_path"} {
+		if _, exists := retirement[forbidden]; exists {
+			t.Fatalf("retirement projection exposed host path field %s", forbidden)
+		}
 	}
 	after, err := os.ReadFile(statePath)
 	if err != nil {

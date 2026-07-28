@@ -907,6 +907,13 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("coverage must include owned production probes", result.stderr)
         self.assertIn(".gitignore", result.stderr)
 
+    def test_repository_manifest_assigns_migration_state_to_data_domain(self) -> None:
+        manifest = json.loads(
+            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
+        )
+        data_domain = self.manifest_domain(manifest, "data-memory-sessions")
+        self.assertIn("manager/internal/migration/**", data_domain["code"])
+
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
         manifest = self.manifest()

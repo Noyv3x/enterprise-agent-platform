@@ -353,35 +353,99 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 	}
 	required := []string{"platform", "agent-runtime", "camofox", "searxng"}
 	for _, service := range required {
-		result, listErr := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "ps", "--all", "--quiet", service), nil)
-		if listErr != nil {
-			return fmt.Errorf("list required service %s containers: %w", service, listErr)
+		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
+			return err
 		}
-		ids := strings.Fields(result.Stdout)
-		if len(ids) != 1 {
-			return fmt.Errorf("required service %s must have exactly one container, found %d", service, len(ids))
+	}
+	return nil
+}
+
+// ProbeLegacyRetirement raises the readiness boundary used before permanently
+// deleting source-deployment recovery material. The ordinary serving path does
+// not block on Firecrawl because search can continue through SearXNG, but
+// retirement is irreversible and therefore requires the complete extraction
+// stack to have reached its intended steady state as well.
+func (d DockerCLI) ProbeLegacyRetirement(ctx context.Context, manifest release.Manifest) error {
+	if err := d.Probe(ctx, manifest); err != nil {
+		return err
+	}
+	env, err := d.writeGenerationEnvironment(manifest)
+	if err != nil {
+		return err
+	}
+	for _, service := range []string{"firecrawl-foundationdb", "firecrawl-api"} {
+		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
+			return err
 		}
-		if !validContainerID(ids[0]) {
-			return fmt.Errorf("required service %s returned an invalid container ID", service)
-		}
-		state, inspectErr := d.runner().Run(ctx, d.binary(), []string{
-			"inspect", "--format",
-			"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
-			ids[0],
-		}, nil)
-		if inspectErr != nil {
-			return fmt.Errorf("inspect required service %s container: %w", service, inspectErr)
-		}
-		fields := strings.Fields(state.Stdout)
-		if len(fields) != 2 {
-			return fmt.Errorf("required service %s returned an invalid container state", service)
-		}
-		if fields[0] != "running" {
-			return fmt.Errorf("required service %s container status is %s, want running", service, fields[0])
-		}
-		if fields[1] != "healthy" {
-			return fmt.Errorf("required service %s container health is %s, want healthy", service, fields[1])
-		}
+	}
+	return d.probeSuccessfulInitComposeService(ctx, env, "firecrawl-foundationdb-init")
+}
+
+func (d DockerCLI) composeServiceContainerID(ctx context.Context, env, service string) (string, error) {
+	result, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "ps", "--all", "--quiet", service), nil)
+	if err != nil {
+		return "", fmt.Errorf("list required service %s containers: %w", service, err)
+	}
+	ids := strings.Fields(result.Stdout)
+	if len(ids) != 1 {
+		return "", fmt.Errorf("required service %s must have exactly one container, found %d", service, len(ids))
+	}
+	if !validContainerID(ids[0]) {
+		return "", fmt.Errorf("required service %s returned an invalid container ID", service)
+	}
+	return ids[0], nil
+}
+
+func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service string) error {
+	id, err := d.composeServiceContainerID(ctx, env, service)
+	if err != nil {
+		return err
+	}
+	state, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+		id,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("inspect required service %s container: %w", service, err)
+	}
+	fields := strings.Fields(state.Stdout)
+	if len(fields) != 2 {
+		return fmt.Errorf("required service %s returned an invalid container state", service)
+	}
+	if fields[0] != "running" {
+		return fmt.Errorf("required service %s container status is %s, want running", service, fields[0])
+	}
+	if fields[1] != "healthy" {
+		return fmt.Errorf("required service %s container health is %s, want healthy", service, fields[1])
+	}
+	return nil
+}
+
+func (d DockerCLI) probeSuccessfulInitComposeService(ctx context.Context, env, service string) error {
+	id, err := d.composeServiceContainerID(ctx, env, service)
+	if err != nil {
+		return err
+	}
+	state, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", id,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("inspect required service %s container: %w", service, err)
+	}
+	fields := strings.Fields(state.Stdout)
+	if len(fields) != 2 {
+		return fmt.Errorf("required service %s returned an invalid container state", service)
+	}
+	if fields[0] != "exited" {
+		return fmt.Errorf("required service %s container status is %s, want exited", service, fields[0])
+	}
+	exitCode, parseErr := strconv.Atoi(fields[1])
+	if parseErr != nil {
+		return fmt.Errorf("required service %s returned an invalid exit code", service)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("required service %s container exit code is %d, want 0", service, exitCode)
 	}
 	return nil
 }

@@ -98,9 +98,27 @@ type Plan struct {
 	ComposeVolumes       []string      `json:"compose_volumes,omitempty"`
 	ComposeCleanupErrors []string      `json:"compose_cleanup_errors,omitempty"`
 	Quarantined          []string      `json:"quarantined,omitempty"`
+	Retirement           *Retirement   `json:"retirement,omitempty"`
 	Error                string        `json:"error,omitempty"`
 	CreatedAt            time.Time     `json:"created_at"`
 	UpdatedAt            time.Time     `json:"updated_at"`
+}
+
+// Retirement is the durable receipt for the one-time source-deployment
+// retirement campaign. Each result bit is written only after its exact,
+// allowlisted cleanup step has completed; a crash between deletion and the
+// result write is recovered by replaying the idempotent step.
+type Retirement struct {
+	CampaignID         string    `json:"campaign_id"`
+	GenerationID       string    `json:"generation_id,omitempty"`
+	Status             string    `json:"status"`
+	SystemdRemoved     bool      `json:"systemd_removed"`
+	SourceStateRemoved bool      `json:"source_state_removed"`
+	DockerRemoved      bool      `json:"docker_removed"`
+	RecoveryRemoved    bool      `json:"recovery_removed"`
+	StartedAt          time.Time `json:"started_at"`
+	CompletedAt        time.Time `json:"completed_at,omitempty"`
+	Error              string    `json:"error,omitempty"`
 }
 
 type Service struct {
@@ -115,6 +133,9 @@ type Service struct {
 	PreCutoverCheck                                        func(context.Context, Plan) error
 	CanRearm                                               func(Plan, string) bool
 	CanConfigure                                           func() bool
+	RetirementReady                                        func(context.Context) (string, error)
+	RetireConfig                                           func() error
+	DockerBinary                                           string
 	ClaimMu                                                *sync.Mutex
 	ArchiveRename                                          func(string, string) error
 	SyncDir                                                func(string) error
@@ -294,7 +315,7 @@ func (s *Service) Active() bool {
 		// A genuinely absent plan is the only inactive error case.
 		return !os.IsNotExist(err)
 	}
-	return plan.Status != "cleanup_pending" && plan.Status != "committed" && plan.Status != "rolled_back"
+	return plan.Status != "cleanup_pending" && plan.Status != "committed" && plan.Status != "rolled_back" && plan.Status != "purged"
 }
 
 // RequiredSourceCommit keeps every install bound to authoritative source data
@@ -309,7 +330,7 @@ func (s *Service) RequiredSourceCommit() (string, bool, error) {
 		}
 		return "", true, err
 	}
-	if plan.Status == "cleanup_pending" || plan.Status == "committed" {
+	if plan.Status == "cleanup_pending" || plan.Status == "committed" || plan.Status == "purged" {
 		return "", false, nil
 	}
 	if !validCommit(plan.ExpectedSourceCommit) {
@@ -569,6 +590,13 @@ func (s *Service) Prune(now time.Time, retention time.Duration) error {
 		return fmt.Errorf("read legacy migration before prune: %w", err)
 	}
 	if plan.Status != "committed" || !plan.ArchiveReady || plan.ArchivePath == "" {
+		return nil
+	}
+	// Eligible source-v1 migrations belong to the durable retirement campaign.
+	// Its intent/checkpoints, rather than mtime retention, own the irreversible
+	// archive deletion so readiness failures cannot silently consume the proof
+	// needed by a later retry.
+	if s.RetirementReady != nil && !plan.CreatedAt.IsZero() && plan.CreatedAt.Before(sourceRetirementCutoff) {
 		return nil
 	}
 	backupRoot, err := cleanRoot(s.BackupRoot)
@@ -900,6 +928,11 @@ func (s *Service) loadLocked() (Plan, error) {
 	if plan.SchemaVersion != 1 {
 		return Plan{}, errors.New("unsupported legacy migration schema")
 	}
+	if plan.Status == "purged" {
+		if err := validatePurgedPlan(plan); err != nil {
+			return Plan{}, fmt.Errorf("invalid source retirement receipt: %w", err)
+		}
+	}
 	return boundPlanDiagnostics(plan), nil
 }
 func (s *Service) persistLocked(plan Plan) error {
@@ -934,12 +967,21 @@ func clonePlan(plan Plan) Plan {
 	plan.ComposeVolumes = append([]string(nil), plan.ComposeVolumes...)
 	plan.ComposeCleanupErrors = append([]string(nil), plan.ComposeCleanupErrors...)
 	plan.Quarantined = append([]string(nil), plan.Quarantined...)
+	if plan.Retirement != nil {
+		retirement := *plan.Retirement
+		plan.Retirement = &retirement
+	}
 	return plan
 }
 
 func boundPlanDiagnostics(plan Plan) Plan {
 	plan.Error = journal.BoundDiagnostic(plan.Error)
 	plan.ComposeCleanupErrors = boundDiagnosticList(plan.ComposeCleanupErrors)
+	if plan.Retirement != nil {
+		retirement := *plan.Retirement
+		retirement.Error = journal.BoundDiagnostic(retirement.Error)
+		plan.Retirement = &retirement
+	}
 	return plan
 }
 
@@ -1140,7 +1182,11 @@ func (s *Service) cleanupLegacyCompose(ctx context.Context, plan Plan) []string 
 		// service and a Compose working directory under that runtime's data root.
 		// This preserves safe cleanup without treating a project-name collision as
 		// ownership. Named volumes and other project resources remain untouched.
-		result, err := s.runner().Run(ctx, "docker", []string{"ps", "-aq", "--filter", "label=com.docker.compose.project=" + target.Project}, nil)
+		dockerBinary := s.DockerBinary
+		if dockerBinary == "" {
+			dockerBinary = "docker"
+		}
+		result, err := s.runner().Run(ctx, dockerBinary, []string{"ps", "-aq", "--filter", "label=com.docker.compose.project=" + target.Project}, nil)
 		if err != nil {
 			failures = append(failures, target.Project+": "+err.Error())
 			continue
@@ -1151,7 +1197,7 @@ func (s *Service) cleanupLegacyCompose(ctx context.Context, plan Plan) []string 
 				failures = append(failures, target.Project+": invalid container id from Docker")
 				continue
 			}
-			inspect, inspectErr := s.runner().Run(ctx, "docker", []string{"inspect", "--format", "{{json .Config.Labels}}", id}, nil)
+			inspect, inspectErr := s.runner().Run(ctx, dockerBinary, []string{"inspect", "--format", "{{json .Config.Labels}}", id}, nil)
 			if inspectErr != nil {
 				failures = append(failures, target.Project+"/"+id+": "+inspectErr.Error())
 				continue
@@ -1165,7 +1211,7 @@ func (s *Service) cleanupLegacyCompose(ctx context.Context, plan Plan) []string 
 				failures = append(failures, target.Project+"/"+id+": "+err.Error())
 				continue
 			}
-			if _, err := s.runner().Run(ctx, "docker", []string{"rm", "-f", id}, nil); err != nil {
+			if _, err := s.runner().Run(ctx, dockerBinary, []string{"rm", "-f", id}, nil); err != nil {
 				failures = append(failures, target.Project+"/"+id+": "+err.Error())
 			}
 		}

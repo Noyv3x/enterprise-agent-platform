@@ -80,7 +80,9 @@ Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs �
 
 管理器状态根保存 current/previous/target release、generation、operation journal、心跳和 owner-only control socket。每个本地 `releases/<commit>/` 的 manifest 与 Compose 是不可变发布物；可变的 `compose.env` 只包含该宿主生成的路径与镜像 digest。`active-generation` 由 Manager 原子写入，明确指出停止、日志和恢复命令应使用的 Compose generation，不能按目录修改时间猜测。Platform 的业务数据库不得成为容器编排状态的唯一存储，否则 Platform 失败时无法恢复。
 
-首次迁移在 `backups/<operation-id>-legacy/` 保留可恢复的旧 checkout、配置、systemd unit、Compose 归属清单和未原地采用的外部 data，至少七天。归档清单记录每项类型、mode、大小、link target 和内容 hash，并记录迁移前后文件数、总字节数与集合摘要；归档只有在逐项校验完成后才可成为删除旧路径的依据。同文件系统优先以原子 rename 保存完整旧树，跨文件系统使用 staging copy、fsync、校验和原子发布。普通数据库 schema 更新也建立与 operation 绑定的快照，至少保留上一可回滚 generation。工作区、附件、Profile 已作为新数据目录权威内容且迁移前后对账一致时，只在旧部署归档中保存清单，不重复复制巨大数据树。
+首次迁移在 `backups/<operation-id>-legacy/` 保留可恢复的旧 checkout、配置、systemd unit、Compose 归属清单和未原地采用的外部 data，常规至少七天。归档清单记录每项类型、mode、大小、link target 和内容 hash，并记录迁移前后文件数、总字节数与集合摘要；归档只有在逐项校验完成后才可成为删除旧路径的依据。同文件系统优先以原子 rename 保存完整旧树，跨文件系统使用 staging copy、fsync、校验和原子发布。普通数据库 schema 更新也建立与 operation 绑定的快照，至少保留上一可回滚 generation。工作区、附件、Profile 已作为新数据目录权威内容且迁移前后对账一致时，只在旧部署归档中保存清单，不重复复制巨大数据树。
+
+已经由版本化源码退役活动覆盖的存量迁移可以提前结束上述七天源码恢复期，但必须先证明新 Manager activation、当前 generation、公网入口和迁移所需外部服务全部健康，重新验证 recovery receipt 与逐树 hash，并在删除前持久提交活动 intent。活动完成后 `migration.json` 只保留不含宿主绝对路径的 `purged` 凭据；这不会删除或缩短 current/previous generation 和普通数据库快照的保留期。数据库、工作区、附件、Agent session/approval/idempotency、记忆/知识、浏览器 Profile/Cookie/trace 及当前外部服务 bind-mount 数据不属于源码退役清单。
 
 旧 checkout 中无法识别的 ignored 内容随完整 checkout 一起进入 `backups/<operation-id>-legacy/` recovery pack，不能单独静默删除。Manager 的 legacy retention 只清理当前迁移 journal 明确提交、达到保留期并再次通过 receipt 与逐树 hash 校验的 recovery pack；未知、迁移中或 `cleanup_pending` 的 `*-legacy` 目录必须保留。它也不能误删仍被 current/previous generation 引用的普通数据库快照。
 

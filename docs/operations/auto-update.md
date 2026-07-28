@@ -105,6 +105,16 @@ Git 回滚边界以持久 marker 为准，不以 helper 进程的最终退出码
 
 桥接迁移成功并清理源码后，Git updater、dirty-tree、fast-forward 和 `git reset` 不再属于部署协议。仓库中的桥接兼容实现应在已部署实例完成迁移后的清理版本移除；新安装始终从管理器开始。
 
+## 源码部署退役活动
+
+唯一存量部署已经完成容器迁移后，后续容器 release 可以携带一个有固定标识和截止时间的一次性源码退役活动。活动只能由已经通过新 Manager watchdog 提交的版本执行；普通更新必须先完成、释放维护并恢复 `idle`，随后后台协调器自动运行并按分钟重试，不能为了删除旧大目录继续占用更新维护页。没有迁移计划、计划不属于活动截止时间之前、迁移未 `committed`、恢复包曾被恢复、仍有 active/finalize operation、维护仍开启、存在 Manager 登记的运行任务、当前 Manager activation 未提交，或当前容器 generation、公网入口及 Firecrawl FoundationDB/init/API 任一未就绪时，活动保持未开始且不得删除任何对象。
+
+活动采用持久 `prepared → systemd_removed → source_state_removed → docker_removed → recovery_removed → completed` 检查点。首次删除前必须先重新验证 recovery receipt、归档树 hash、旧路径与当前数据/Manager 根不重叠，并持久写入不可逆 intent；每一步只操作固定 allowlist，删除结果和错误写回 migration journal。进程在任一删除与结果落盘之间终止时，下一次运行根据已持久 intent 和对象是否仍存在幂等收敛；没有 intent 时看到缺失、替换、符号链接、错误 owner/type 或归属冲突必须 fail closed。活动错误只延后旧残留清理，不改变已经健康提交的当前 generation，也不把产品切回维护。
+
+允许删除的宿主对象仅限：经归档记录验证的 `enterprise-agent-platform.service` 及精确 wants 链接；`ubitech-agent-migrate.service/.timer`、三个固定 retry 脚本和已知 owner-only incoming/transition/rollback 恢复文件；新数据根中精确列出的源码 updater marker、日志和宿主构建缓存；迁移计划记录的旧 checkout recovery pack；以及同时匹配旧 Compose project、resource 名和 Compose label 且没有 attachment 的 Firecrawl/SearXNG 容器、network 与 named volume。活动不得执行 Docker 全局 prune，不删除镜像或 build cache，也不得触碰当前/previous generation、Manager 二进制与快照、`ubitech-agent_core`、`ubitech-agent-*`/`ubitech-sandbox-*`、数据库、附件、工作区、Skill、Agent session/approval/idempotency、记忆/知识、Camoufox Profile/Cookie/trace 或外部服务当前 bind-mount 数据。
+
+完成后 `manager.toml` 的旧 Platform gate 值被原子清空，完整迁移计划压缩为 `purged` 凭据，只保留迁移 id、源提交、install operation、活动 id 与完成时间，不再保留旧宿主绝对路径。该凭据使重复启动成为 no-op，并为后续彻底删除源码 bridge 兼容代码提供机器可验证的 fleet receipt。
+
 ## 管理接口与测试
 
 正常管理面板展示当前/目标版本、digest 摘要、operation、phase、下载与健康状态；失败恢复使用宿主 CLI。公共维护页只展示 operation id 和安全摘要。

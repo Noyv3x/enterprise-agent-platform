@@ -285,6 +285,21 @@ func (a *API) legacyPlan(response http.ResponseWriter) {
 }
 
 func migrationPlanProjection(plan migration.Plan) map[string]any {
+	var retirement any
+	if plan.Retirement != nil {
+		retirement = map[string]any{
+			"campaign_id":          plan.Retirement.CampaignID,
+			"generation_id":        plan.Retirement.GenerationID,
+			"status":               plan.Retirement.Status,
+			"systemd_removed":      plan.Retirement.SystemdRemoved,
+			"source_state_removed": plan.Retirement.SourceStateRemoved,
+			"docker_removed":       plan.Retirement.DockerRemoved,
+			"recovery_removed":     plan.Retirement.RecoveryRemoved,
+			"started_at":           plan.Retirement.StartedAt,
+			"completed_at":         plan.Retirement.CompletedAt,
+			"error":                journal.BoundDiagnostic(plan.Retirement.Error),
+		}
+	}
 	return map[string]any{
 		"schema_version":         plan.SchemaVersion,
 		"id":                     plan.ID,
@@ -305,6 +320,7 @@ func migrationPlanProjection(plan migration.Plan) map[string]any {
 		"compose_volume_count":   len(plan.ComposeVolumes),
 		"compose_error_count":    len(plan.ComposeCleanupErrors),
 		"quarantined_count":      len(plan.Quarantined),
+		"retirement":             retirement,
 		"error":                  journal.BoundDiagnostic(plan.Error),
 		"created_at":             plan.CreatedAt,
 		"updated_at":             plan.UpdatedAt,
