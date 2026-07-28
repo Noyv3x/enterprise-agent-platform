@@ -25,7 +25,7 @@ cd ..
 
 顶层测试脚本执行 Compose 静态校验时必须自行注入不可变的占位镜像引用和临时挂载路径，并忽略开发机的 `.env`；校验不能依赖生产部署变量，也不能连接或修改正在运行的容器。
 
-Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。Firecrawl 发布验证必须实际启动 FoundationDB、初始化任务和 API，确认挂载后的镜像入口存在、初始化不会与配置后健康检查形成依赖环、FoundationDB 健康、初始化任务成功退出且 API 健康；只执行 Compose `create` 或只检查镜像可拉取不能证明 entrypoint、启动顺序与 bind mount 契约兼容。
+Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。Firecrawl 发布验证必须实际启动 FoundationDB、初始化任务和 API，确认挂载后的镜像入口存在、初始化不会与配置后健康检查形成依赖环、FoundationDB 健康、初始化任务成功退出且 API 健康；随后必须先写入发布测试专用数据哨兵，保留同一 FoundationDB bind 数据、强制重建并再次运行 FDB/init/API，确认容器 id 已变化、哨兵值仍可精确读回，且 `Database already exists!` 场景以 init 退出 0、API 健康收敛。只执行 Compose `create`、只测试空数据首次启动、仅复用目录却不读回数据，或只检查镜像可拉取都不能证明 entrypoint、启动顺序、幂等初始化与 bind mount 契约兼容。
 
 ## Python 平台
 

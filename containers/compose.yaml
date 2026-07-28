@@ -248,7 +248,7 @@ services:
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/data:/var/fdb/data
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
     healthcheck:
-      test: [CMD-SHELL, 'fdbcli -C /var/fdb/cluster/fdb.cluster --exec status >/dev/null 2>&1']
+      test: [CMD-SHELL, 'status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null) && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null']
       interval: 10s
       timeout: 5s
       retries: 18
@@ -267,7 +267,7 @@ services:
         condition: service_started
     entrypoint: [/bin/bash, -eu, -o, pipefail, -c]
     command:
-      - 'last=""; for attempt in $$(seq 1 30); do if last=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then exit 0; fi; if printf "%s\n" "$$last" | grep -Eiq "already.*configured|database.*configured"; then exit 0; fi; sleep 2; done; printf "%s\n" "$$last" >&2; exit 1'
+      - 'last=""; for attempt in $$(seq 1 30); do if last=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then exit 0; fi; if status=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null) && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null; then exit 0; fi; sleep 2; done; printf "%s\n" "$$last" >&2; exit 1'
     volumes:
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
 

@@ -1,10 +1,12 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,37 +56,45 @@ func (s *Service) Retire(ctx context.Context) error {
 	if err := s.validateRetirementPlan(plan); err != nil {
 		return fmt.Errorf("validate source retirement plan: %w", err)
 	}
+	if plan.Retirement != nil {
+		if plan.Retirement.CampaignID != sourceRetirementCampaign {
+			return fmt.Errorf("source retirement belongs to unsupported campaign %q", plan.Retirement.CampaignID)
+		}
+		if err := validateRetirementCheckpoint(*plan.Retirement); err != nil {
+			return fmt.Errorf("validate source retirement checkpoint: %w", err)
+		}
+	}
 	if s.RetirementReady == nil {
-		return errors.New("source retirement readiness probe is not configured")
+		return s.retirementWait(&plan, errors.New("source retirement readiness probe is not configured"))
 	}
 	generationID, err := s.RetirementReady(ctx)
 	if err != nil {
-		return fmt.Errorf("source retirement readiness: %w", err)
+		return s.retirementWait(&plan, fmt.Errorf("source retirement readiness: %w", err))
 	}
 	if strings.TrimSpace(generationID) == "" {
-		return errors.New("source retirement readiness returned an empty generation")
+		return s.retirementWait(&plan, errors.New("source retirement readiness returned an empty generation"))
 	}
 
-	if plan.Retirement == nil {
+	if plan.Retirement == nil || plan.Retirement.Status == "waiting_readiness" {
 		// The verified recovery pack is the proof authorizing the irreversible
 		// transition. Persist intent before deleting even one source artifact.
 		if err := s.verifyRetirementArchive(plan, false); err != nil {
-			return fmt.Errorf("verify source recovery pack before retirement intent: %w", err)
+			return s.retirementWait(&plan, fmt.Errorf("verify source recovery pack before retirement intent: %w", err))
+		}
+		startedAt := s.now()
+		if plan.Retirement != nil {
+			startedAt = plan.Retirement.StartedAt
 		}
 		plan.Retirement = &Retirement{
 			CampaignID:   sourceRetirementCampaign,
 			GenerationID: generationID,
 			Status:       "prepared",
-			StartedAt:    s.now(),
+			StartedAt:    startedAt,
 		}
 		plan.Error = ""
 		if err := s.update(&plan); err != nil {
 			return fmt.Errorf("persist source retirement intent: %w", err)
 		}
-	} else if plan.Retirement.CampaignID != sourceRetirementCampaign {
-		return fmt.Errorf("source retirement belongs to unsupported campaign %q", plan.Retirement.CampaignID)
-	} else if err := validateRetirementCheckpoint(*plan.Retirement); err != nil {
-		return fmt.Errorf("validate source retirement checkpoint: %w", err)
 	}
 
 	if !plan.Retirement.SystemdRemoved {
@@ -133,6 +143,9 @@ func (s *Service) Retire(ctx context.Context) error {
 		if err := s.verifyRetirementArchive(plan, true); err != nil {
 			return s.retirementFail(&plan, "verify source recovery pack before removal", err)
 		}
+		if err := s.removeSupersededAttemptPacks(plan); err != nil {
+			return s.retirementFail(&plan, "remove superseded source recovery packs", err)
+		}
 		if err := removeOwnedTree(s.BackupRoot, plan.ArchivePath, s.syncDirectory); err != nil {
 			return s.retirementFail(&plan, "remove source recovery pack", err)
 		}
@@ -167,10 +180,11 @@ func (s *Service) Retire(ctx context.Context) error {
 }
 
 func validateRetirementCheckpoint(retirement Retirement) error {
-	if strings.TrimSpace(retirement.GenerationID) == "" || retirement.StartedAt.IsZero() {
+	if retirement.StartedAt.IsZero() {
 		return errors.New("retirement identity is incomplete")
 	}
 	want := map[string][4]bool{
+		"waiting_readiness":    {false, false, false, false},
 		"prepared":             {false, false, false, false},
 		"systemd_removed":      {true, false, false, false},
 		"source_state_removed": {true, true, false, false},
@@ -185,10 +199,44 @@ func validateRetirementCheckpoint(retirement Retirement) error {
 	if actual != expected {
 		return errors.New("retirement status and durable result bits disagree")
 	}
+	if retirement.Status == "waiting_readiness" {
+		if strings.TrimSpace(retirement.GenerationID) != "" {
+			return errors.New("retirement waiting for readiness already has a generation")
+		}
+		if strings.TrimSpace(retirement.Error) == "" {
+			return errors.New("retirement waiting for readiness has no diagnostic")
+		}
+	} else if strings.TrimSpace(retirement.GenerationID) == "" {
+		return errors.New("retirement identity is incomplete")
+	}
 	if !retirement.CompletedAt.IsZero() {
 		return errors.New("incomplete retirement has a completion timestamp")
 	}
 	return nil
+}
+
+// retirementWait makes a precondition failure observable without crossing the
+// irreversible intent boundary. Once intent is prepared, it records only the
+// latest diagnostic and preserves every durable cleanup result bit.
+func (s *Service) retirementWait(plan *Plan, cause error) error {
+	diagnostic := journal.BoundDiagnostic(cause.Error())
+	if plan.Retirement != nil && plan.Retirement.Error == diagnostic && plan.Error == diagnostic {
+		return cause
+	}
+	if plan.Retirement == nil {
+		plan.Retirement = &Retirement{
+			CampaignID: sourceRetirementCampaign,
+			Status:     "waiting_readiness",
+			StartedAt:  s.now(),
+		}
+	}
+	plan.Retirement.Error = diagnostic
+	plan.Error = diagnostic
+	plan.UpdatedAt = s.now()
+	if persistErr := s.persistLocked(*plan); persistErr != nil {
+		return fmt.Errorf("%v; persist source retirement readiness: %w", cause, persistErr)
+	}
+	return cause
 }
 
 func validatePurgedPlan(plan Plan) error {
@@ -273,6 +321,131 @@ func (s *Service) verifyRetirementArchive(plan Plan, allowMissing bool) error {
 		return err
 	}
 	return verifyRecoveryPack(plan)
+}
+
+// removeSupersededAttemptPacks removes only the small recovery packs produced
+// by backupLegacy for an earlier attempt of this exact migration. Directory
+// names alone are never ownership proof: the embedded plan, source identity,
+// and closed file vocabulary must all agree before a candidate is removed.
+func (s *Service) removeSupersededAttemptPacks(plan Plan) error {
+	backupRoot, err := cleanRoot(s.BackupRoot)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(backupRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	currentArchive, err := cleanRoot(plan.ArchivePath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, "-legacy") || name == "-legacy" {
+			continue
+		}
+		candidate := filepath.Join(backupRoot, name)
+		if samePath(candidate, currentArchive) {
+			continue
+		}
+		owned, inspectErr := isSupersededAttemptPack(plan, candidate, strings.TrimSuffix(name, "-legacy"))
+		if inspectErr != nil {
+			return fmt.Errorf("inspect possible superseded source recovery pack %s: %w", name, inspectErr)
+		}
+		if !owned {
+			// A malformed, foreign, or extended directory is not proof of
+			// ownership. Preserve it rather than broadening cleanup.
+			continue
+		}
+		if err := removeOwnedTree(backupRoot, candidate, s.syncDirectory); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isSupersededAttemptPack(current Plan, path, operationID string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, nil
+	}
+	if err := requireOwned(path, info); err != nil {
+		return false, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	allowed := map[string]bool{
+		"platform.db":                  true,
+		"platform.db-wal":              true,
+		"platform.db-shm":              true,
+		"bootstrap-admin-password.txt": true,
+		"migration-plan.json":          true,
+	}
+	for _, entry := range entries {
+		if !allowed[entry.Name()] {
+			return false, nil
+		}
+		entryPath := filepath.Join(path, entry.Name())
+		entryInfo, err := os.Lstat(entryPath)
+		if err != nil {
+			return false, err
+		}
+		if !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 {
+			return false, nil
+		}
+		if err := requireOwned(entryPath, entryInfo); err != nil {
+			return false, nil
+		}
+	}
+	manifestPath := filepath.Join(path, "migration-plan.json")
+	manifestInfo, err := os.Lstat(manifestPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if manifestInfo.Size() > 8<<20 {
+		return false, nil
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return false, err
+	}
+	var candidate Plan
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&candidate); err != nil {
+		return false, nil
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return false, nil
+	}
+	if operationID == "" || operationID == current.OperationID || candidate.OperationID != operationID ||
+		candidate.SchemaVersion != 1 || candidate.Status != "copying" || candidate.ID != current.ID ||
+		candidate.ID != migrationID(candidate.LegacyRoot, candidate.LegacyData, candidate.LegacyService) ||
+		candidate.ExpectedSourceCommit != current.ExpectedSourceCommit || candidate.LegacyService != current.LegacyService ||
+		!samePath(candidate.LegacyRoot, current.LegacyRoot) || !samePath(candidate.LegacyData, current.LegacyData) ||
+		!samePath(candidate.DestinationData, current.DestinationData) || !samePath(candidate.LegacyUnitPath, current.LegacyUnitPath) ||
+		!candidate.CreatedAt.Equal(current.CreatedAt) || candidate.ArchivePath != "" || candidate.ArchiveReady ||
+		candidate.ArchiveRestored || candidate.Retirement != nil || len(candidate.ArchiveTrees) != 0 ||
+		len(candidate.ArchiveFiles) != 0 || len(candidate.RetiredCaches) != 0 {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *Service) persistRetirementCheckpoint(plan *Plan) error {

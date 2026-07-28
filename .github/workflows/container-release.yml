@@ -674,8 +674,54 @@ jobs:
           test -n "$foundationdb_init"
           test "$(docker inspect --format '{{.State.Status}}' "$foundationdb_init")" = exited
           test "$(docker inspect --format '{{.State.ExitCode}}' "$foundationdb_init")" = 0
+          first_foundationdb_init="$foundationdb_init"
+          first_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
+          test -n "$first_foundationdb"
           docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            /bin/sh -eu -c 'test -x /var/fdb/scripts/fdb.bash; test -s /var/fdb/cluster/fdb.cluster'
+            /bin/sh -eu -c 'test -x /var/fdb/scripts/fdb.bash; test -s /var/fdb/cluster/fdb.cluster; status="$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null)"; test -n "$status"; printf "%s\n" "$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null'
+          sentinel_key=ubitech_ci_persistence
+          sentinel_value="retained_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
+            fdbcli -C /var/fdb/cluster/fdb.cluster \
+            --exec "writemode on; set $sentinel_key $sentinel_value"
+          docker compose -f containers/compose.yaml exec -T firecrawl-api \
+            node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+          docker compose -f containers/compose.yaml rm --stop --force \
+            firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
+          if ! docker compose -f containers/compose.yaml up --detach firecrawl-api; then
+            docker compose -f containers/compose.yaml ps --all
+            docker compose -f containers/compose.yaml logs --no-color --tail 200 \
+              firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
+            exit 1
+          fi
+          for service in firecrawl-foundationdb firecrawl-api; do
+            container="$(docker compose -f containers/compose.yaml ps -q "$service")"
+            test -n "$container"
+            for attempt in $(seq 1 60); do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
+              [[ "$status" == healthy ]] && break
+              [[ "$status" != unhealthy || "$attempt" -lt 60 ]] || {
+                docker compose -f containers/compose.yaml logs --no-color --tail 200 "$service"
+                exit 1
+              }
+              sleep 5
+            done
+            test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
+          done
+          second_foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
+          second_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
+          test -n "$second_foundationdb_init"
+          test -n "$second_foundationdb"
+          test "$second_foundationdb_init" != "$first_foundationdb_init"
+          test "$second_foundationdb" != "$first_foundationdb"
+          test "$(docker inspect --format '{{.State.Status}}' "$second_foundationdb_init")" = exited
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$second_foundationdb_init")" = 0
+          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
+            /bin/sh -eu -c 'status="$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null)"; test -n "$status"; printf "%s\n" "$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null'
+          read_output="$(docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
+            fdbcli -C /var/fdb/cluster/fdb.cluster --exec "get $sentinel_key")"
+          expected="\`${sentinel_key}' is \`${sentinel_value}'"
+          printf '%s\n' "$read_output" | grep -Fqx -- "$expected"
           docker compose -f containers/compose.yaml exec -T firecrawl-api \
             node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
           docker compose -f containers/compose.yaml stop \

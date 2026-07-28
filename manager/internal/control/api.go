@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,16 +82,15 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 
 func (a *API) status(response http.ResponseWriter) {
 	state := a.Store.State()
-	// Legacy journals may contain an error amplified by an old recovery loop.
-	// Project a bounded diagnostic without mutating the durable record merely
-	// because it was observed through the API.
-	state.LastError = journal.BoundDiagnostic(state.LastError)
-	operationID := state.ActiveOperationID
+	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
+	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
+	operationID := activeOperationID
 	if operationID == "" {
-		operationID = state.FinalizePendingOperationID
+		operationID = finalizeOperationID
 	}
+	publicState := safePublicState(state.PublicState)
 	services := map[string]any{"manager": map[string]any{"status": "healthy"}, "platform": map[string]any{"status": func() string {
-		if state.PublicState == model.StateFailed {
+		if publicState == model.StateFailed {
 			return "unavailable"
 		}
 		if state.Maintenance {
@@ -98,7 +98,197 @@ func (a *API) status(response http.ResponseWriter) {
 		}
 		return "running"
 	}()}}
-	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": state.Current, "previous": state.Previous, "target": state.Candidate, "public_state": state.PublicState, "phase": state.Phase, "services": services, "error": state.LastError, "maintenance": state.Maintenance, "active_operation_id": state.ActiveOperationID, "finalize_pending_operation_id": state.FinalizePendingOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt})
+	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt, "legacy_migration": a.legacyMigrationStatus()})
+}
+
+func generationStatusProjection(generation *model.Generation) any {
+	if generation == nil {
+		return nil
+	}
+	images := make(map[string]string, len(generation.Images))
+	for name, image := range generation.Images {
+		if safeStatusToken(name, 64) == "" || !safeImageReference(image) {
+			continue
+		}
+		images[name] = image
+	}
+	return map[string]any{
+		"id":               safeStatusToken(generation.ID, 160),
+		"source_commit":    safeCommit(generation.SourceCommit),
+		"database_version": generation.DatabaseVersion,
+		"images":           images,
+		"activated_at":     generation.ActivatedAt,
+	}
+}
+
+func safeManagerDiagnostic(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "manager operation requires attention"
+}
+
+func safePublicState(value model.PublicState) model.PublicState {
+	switch value {
+	case model.StateIdle, model.StateWaitingForTasks, model.StateUpdating, model.StateFailed:
+		return value
+	default:
+		return model.StateFailed
+	}
+}
+
+func safeOperationPhase(value model.OperationPhase) model.OperationPhase {
+	switch value {
+	case "", model.PhaseValidating, model.PhasePulling, model.PhasePreparing, model.PhaseDraining,
+		model.PhaseSnapshotting, model.PhaseMigrating, model.PhaseStarting, model.PhaseProbing,
+		model.PhaseCommitting, model.PhaseRollingBack:
+		return value
+	default:
+		return ""
+	}
+}
+
+func safeImageReference(value string) bool {
+	if len(value) > 512 || strings.ContainsAny(value, "\r\n\x00") {
+		return false
+	}
+	prefix, digest, found := strings.Cut(value, "@sha256:")
+	if !found || !safeImageName(prefix) || len(digest) != 64 {
+		return false
+	}
+	for _, character := range digest {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func safeImageName(value string) bool {
+	parts := strings.Split(value, "/")
+	if len(parts) == 0 {
+		return false
+	}
+	for index, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+		if index == 0 {
+			if host, port, found := strings.Cut(part, ":"); found {
+				if host == "" || port == "" {
+					return false
+				}
+				for _, character := range port {
+					if character < '0' || character > '9' {
+						return false
+					}
+				}
+				part = host
+			}
+		} else if strings.Contains(part, ":") {
+			return false
+		}
+		for _, character := range part {
+			if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' ||
+				character == '.' || character == '_' || character == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (a *API) legacyMigrationStatus() any {
+	if a.Legacy == nil {
+		return nil
+	}
+	plan, err := a.Legacy.Plan()
+	if err == nil {
+		return migrationStatusProjection(plan)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	// Status is an operationally safe projection, not a filesystem diagnostic.
+	// The concrete read error may contain an obsolete checkout or state path, so
+	// expose a fixed bounded signal and leave detailed evidence owner-local.
+	return map[string]any{
+		"status": "unavailable",
+		"error":  journal.BoundDiagnostic("legacy migration status is unavailable"),
+	}
+}
+
+func migrationStatusProjection(plan migration.Plan) map[string]any {
+	projection := migrationPlanProjection(plan)
+	projection["id"] = safeStatusToken(plan.ID, 160)
+	projection["operation_id"] = safeStatusToken(plan.OperationID, 160)
+	projection["expected_source_commit"] = safeCommit(plan.ExpectedSourceCommit)
+	projection["status"] = safeMigrationStatus(plan.Status)
+	projection["error"] = safeMigrationDiagnostic(plan)
+	if retirement, ok := projection["retirement"].(map[string]any); ok && plan.Retirement != nil {
+		retirement["campaign_id"] = safeStatusToken(plan.Retirement.CampaignID, 160)
+		retirement["generation_id"] = safeCommit(plan.Retirement.GenerationID)
+		retirement["status"] = safeRetirementStatus(plan.Retirement.Status)
+		retirement["error"] = safeMigrationDiagnostic(plan)
+	}
+	return projection
+}
+
+func safeMigrationDiagnostic(plan migration.Plan) string {
+	if plan.Error == "" && (plan.Retirement == nil || plan.Retirement.Error == "") {
+		return ""
+	}
+	if plan.Retirement == nil {
+		return "legacy migration requires attention"
+	}
+	if plan.Retirement.Status == "waiting_readiness" {
+		return "source retirement preconditions are not satisfied"
+	}
+	return "source retirement cleanup requires attention"
+}
+
+func safeMigrationStatus(value string) string {
+	switch value {
+	case "configured", "stopping_legacy", "copying", "installing_copy", "migrated", "cleanup_pending", "committed", "rolled_back", "failed", "purged":
+		return value
+	default:
+		return "unavailable"
+	}
+}
+
+func safeRetirementStatus(value string) string {
+	switch value {
+	case "waiting_readiness", "prepared", "systemd_removed", "source_state_removed", "docker_removed", "recovery_removed", "completed":
+		return value
+	default:
+		return "unavailable"
+	}
+}
+
+func safeCommit(value string) string {
+	if len(value) != 40 {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return ""
+		}
+	}
+	return value
+}
+
+func safeStatusToken(value string, limit int) string {
+	if value == "" || len(value) > limit {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '_' || character == '-' ||
+			character == '.' || character == '@' || character == ':') {
+			return ""
+		}
+	}
+	return value
 }
 func (a *API) patchConfig(response http.ResponseWriter, request *http.Request) {
 	var patch config.Patch

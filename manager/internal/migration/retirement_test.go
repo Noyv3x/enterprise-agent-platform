@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/driver"
+	"github.com/ubitech/agent-platform/manager/internal/journal"
 )
 
 type retirementDockerResourceState struct {
@@ -228,6 +230,15 @@ func writeRetirementFile(t *testing.T, path, contents string) {
 	}
 }
 
+func writeRetirementPlan(t *testing.T, path string, plan Plan) {
+	t.Helper()
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRetirementFile(t, path, string(append(data, '\n')))
+}
+
 func TestSourceRetirementPurgesOnlyAllowlistedLegacyArtifacts(t *testing.T) {
 	fixture := newRetirementFixture(t)
 	fixture.addOwnedDockerStorage()
@@ -286,6 +297,104 @@ func TestSourceRetirementPurgesOnlyAllowlistedLegacyArtifacts(t *testing.T) {
 	}
 }
 
+func TestSourceRetirementRemovesOnlyProvenSupersededAttemptPacks(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	oldAttempt := fixture.plan
+	oldAttempt.OperationID = "op-source-install-first-attempt"
+	oldAttempt.Status = "copying"
+	oldAttempt.ArchivePath = ""
+	oldAttempt.ArchiveReady = false
+	oldAttempt.ArchiveRestored = false
+	oldAttempt.ArchiveTrees = nil
+	oldAttempt.ArchiveFiles = nil
+	oldAttempt.RetiredCaches = nil
+	oldAttempt.Retirement = nil
+	oldAttempt.Error = ""
+	oldPack := filepath.Join(fixture.service.BackupRoot, oldAttempt.OperationID+"-legacy")
+	writeRetirementFile(t, filepath.Join(oldPack, "platform.db"), "first-attempt database")
+	writeRetirementPlan(t, filepath.Join(oldPack, "migration-plan.json"), oldAttempt)
+
+	extendedAttempt := oldAttempt
+	extendedAttempt.OperationID = "op-operator-extended"
+	extendedPack := filepath.Join(fixture.service.BackupRoot, extendedAttempt.OperationID+"-legacy")
+	writeRetirementFile(t, filepath.Join(extendedPack, "platform.db"), "operator database")
+	writeRetirementPlan(t, filepath.Join(extendedPack, "migration-plan.json"), extendedAttempt)
+	writeRetirementFile(t, filepath.Join(extendedPack, "operator-note.txt"), "must survive")
+
+	foreignAttempt := oldAttempt
+	foreignAttempt.OperationID = "op-foreign-migration"
+	foreignAttempt.LegacyRoot = filepath.Join(fixture.base, "other-source")
+	foreignAttempt.ID = migrationID(foreignAttempt.LegacyRoot, foreignAttempt.LegacyData, foreignAttempt.LegacyService)
+	foreignPack := filepath.Join(fixture.service.BackupRoot, foreignAttempt.OperationID+"-legacy")
+	writeRetirementFile(t, filepath.Join(foreignPack, "platform.db"), "foreign database")
+	writeRetirementPlan(t, filepath.Join(foreignPack, "migration-plan.json"), foreignAttempt)
+
+	if err := fixture.service.Retire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(oldPack); !os.IsNotExist(err) {
+		t.Fatalf("proven superseded attempt pack survived: %v", err)
+	}
+	for _, path := range []string{extendedPack, filepath.Join(extendedPack, "operator-note.txt"), foreignPack} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("unproven recovery data was removed at %s: %v", path, err)
+		}
+	}
+}
+
+func TestSourceRetirementRetriesUnreadableSupersededAttemptPack(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the permission failure used by this test")
+	}
+	fixture := newRetirementFixture(t)
+	oldAttempt := fixture.plan
+	oldAttempt.OperationID = "op-source-install-unreadable-attempt"
+	oldAttempt.Status = "copying"
+	oldAttempt.ArchivePath = ""
+	oldAttempt.ArchiveReady = false
+	oldAttempt.ArchiveRestored = false
+	oldAttempt.ArchiveTrees = nil
+	oldAttempt.ArchiveFiles = nil
+	oldAttempt.RetiredCaches = nil
+	oldAttempt.Retirement = nil
+	oldAttempt.Error = ""
+	oldPack := filepath.Join(fixture.service.BackupRoot, oldAttempt.OperationID+"-legacy")
+	writeRetirementFile(t, filepath.Join(oldPack, "platform.db"), "first-attempt database")
+	writeRetirementPlan(t, filepath.Join(oldPack, "migration-plan.json"), oldAttempt)
+	if err := os.Chmod(oldPack, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(oldPack, 0o700) })
+
+	err := fixture.service.Retire(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "inspect possible superseded source recovery pack") {
+		t.Fatalf("unreadable attempt pack did not block retirement: %v", err)
+	}
+	durable, planErr := fixture.service.Plan()
+	if planErr != nil {
+		t.Fatal(planErr)
+	}
+	if durable.Status == "purged" || durable.Retirement == nil || durable.Retirement.RecoveryRemoved {
+		t.Fatalf("unreadable attempt pack crossed recovery checkpoint: %#v", durable)
+	}
+	if _, statErr := os.Lstat(fixture.plan.ArchivePath); statErr != nil {
+		t.Fatalf("current recovery pack was removed after an inspection error: %v", statErr)
+	}
+	if err := os.Chmod(oldPack, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.Retire(context.Background()); err != nil {
+		t.Fatalf("retirement did not recover after the pack became readable: %v", err)
+	}
+	completed, planErr := fixture.service.Plan()
+	if planErr != nil || completed.Status != "purged" {
+		t.Fatalf("retirement did not converge after retry: %#v %v", completed, planErr)
+	}
+	if _, statErr := os.Lstat(oldPack); !os.IsNotExist(statErr) {
+		t.Fatalf("proven superseded pack survived retry: %v", statErr)
+	}
+}
+
 func TestSourceRetirementNoopsOutsideCampaignEligibility(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -331,14 +440,130 @@ func TestSourceRetirementRejectsTamperedArchiveBeforeIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Retirement != nil || plan.Status != "committed" || fixture.configRetireCalls != 0 {
+	if plan.Retirement == nil || plan.Retirement.Status != "waiting_readiness" ||
+		plan.Retirement.GenerationID != "" || plan.Retirement.SystemdRemoved ||
+		plan.Retirement.SourceStateRemoved || plan.Retirement.DockerRemoved ||
+		plan.Retirement.RecoveryRemoved || plan.Status != "committed" || fixture.configRetireCalls != 0 {
 		t.Fatalf("tamper failure crossed retirement intent: %#v config=%d", plan, fixture.configRetireCalls)
+	}
+	if !strings.Contains(plan.Retirement.Error, "verify source recovery pack before retirement intent") || plan.Error != plan.Retirement.Error {
+		t.Fatalf("tamper failure was not durably observable: %#v", plan)
 	}
 	if _, err := os.Lstat(fixture.unitPath); err != nil {
 		t.Fatalf("legacy unit changed before durable intent: %v", err)
 	}
 	if _, err := os.Lstat(fixture.plan.ArchivePath); err != nil {
 		t.Fatalf("tampered recovery evidence was deleted: %v", err)
+	}
+}
+
+func TestSourceRetirementWaitsDurablyWithoutRewritingTheSameReadinessError(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	ready := false
+	diagnostic := "container generation unavailable: " + strings.Repeat("x", journal.MaxDiagnosticBytes*2)
+	fixture.service.RetirementReady = func(context.Context) (string, error) {
+		if !ready {
+			return "", errors.New(diagnostic)
+		}
+		return "generation-after-wait", nil
+	}
+	runnerCalls := len(fixture.runner.calls)
+	persistCalls := 0
+	fixture.service.BeforePersist = func(Plan) error {
+		persistCalls++
+		return nil
+	}
+
+	if err := fixture.service.Retire(context.Background()); err == nil || !strings.Contains(err.Error(), "source retirement readiness") {
+		t.Fatalf("readiness failure was not returned: %v", err)
+	}
+	waiting, err := fixture.service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting.Status != "committed" || waiting.Retirement == nil || waiting.Retirement.Status != "waiting_readiness" ||
+		waiting.Retirement.GenerationID != "" || waiting.Retirement.SystemdRemoved ||
+		waiting.Retirement.SourceStateRemoved || waiting.Retirement.DockerRemoved || waiting.Retirement.RecoveryRemoved {
+		t.Fatalf("readiness failure crossed irreversible intent: %#v", waiting)
+	}
+	if len(waiting.Retirement.Error) > journal.MaxDiagnosticBytes || !strings.Contains(waiting.Retirement.Error, "diagnostic truncated") ||
+		waiting.Error != waiting.Retirement.Error {
+		t.Fatalf("readiness diagnostic was not bounded and mirrored: plan=%d retirement=%d %q", len(waiting.Error), len(waiting.Retirement.Error), waiting.Retirement.Error)
+	}
+	if persistCalls != 1 || len(fixture.runner.calls) != runnerCalls || fixture.configRetireCalls != 0 {
+		t.Fatalf("waiting state performed external work: persists=%d runner=%d/%d config=%d", persistCalls, len(fixture.runner.calls), runnerCalls, fixture.configRetireCalls)
+	}
+	beforeRetry, err := os.ReadFile(fixture.service.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.Retire(context.Background()); err == nil {
+		t.Fatal("unchanged readiness failure was accepted")
+	}
+	afterRetry, err := os.ReadFile(fixture.service.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistCalls != 1 || !bytes.Equal(beforeRetry, afterRetry) {
+		t.Fatalf("unchanged readiness failure rewrote durable state: persists=%d", persistCalls)
+	}
+
+	ready = true
+	if err := fixture.service.Retire(context.Background()); err != nil {
+		t.Fatalf("retirement did not resume after readiness recovered: %v", err)
+	}
+	completed, err := fixture.service.Plan()
+	if err != nil || completed.Status != "purged" || completed.Retirement == nil ||
+		completed.Retirement.Status != "completed" || completed.Retirement.GenerationID != "generation-after-wait" {
+		t.Fatalf("readiness recovery did not converge: %#v %v", completed, err)
+	}
+}
+
+func TestSourceRetirementPersistsReadinessFailureAfterPreparedCheckpoint(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	prepared, err := fixture.service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.Retirement = &Retirement{
+		CampaignID:   sourceRetirementCampaign,
+		GenerationID: "generation-prepared",
+		Status:       "prepared",
+		StartedAt:    fixture.service.now(),
+	}
+	prepared.Error = ""
+	prepared.UpdatedAt = fixture.service.now()
+	if err := fixture.service.persistLocked(prepared); err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.RetirementReady = func(context.Context) (string, error) {
+		return "", errors.New("generation health endpoint unavailable")
+	}
+	runnerCalls := len(fixture.runner.calls)
+
+	if err := fixture.service.Retire(context.Background()); err == nil || !strings.Contains(err.Error(), "generation health endpoint unavailable") {
+		t.Fatalf("prepared readiness failure was not returned: %v", err)
+	}
+	durable, err := fixture.service.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Retirement == nil || durable.Retirement.Status != "prepared" ||
+		durable.Retirement.GenerationID != "generation-prepared" || durable.Retirement.SystemdRemoved ||
+		durable.Retirement.SourceStateRemoved || durable.Retirement.DockerRemoved || durable.Retirement.RecoveryRemoved {
+		t.Fatalf("readiness failure changed the prepared checkpoint: %#v", durable)
+	}
+	if !strings.Contains(durable.Retirement.Error, "generation health endpoint unavailable") || durable.Error != durable.Retirement.Error {
+		t.Fatalf("prepared readiness failure was not persisted: %#v", durable)
+	}
+	if len(fixture.runner.calls) != runnerCalls || fixture.configRetireCalls != 0 {
+		t.Fatalf("prepared readiness failure performed cleanup: runner=%d/%d config=%d", len(fixture.runner.calls), runnerCalls, fixture.configRetireCalls)
+	}
+	if _, err := os.Lstat(fixture.unitPath); err != nil {
+		t.Fatalf("prepared readiness failure removed the legacy unit: %v", err)
+	}
+	if _, err := os.Lstat(fixture.plan.ArchivePath); err != nil {
+		t.Fatalf("prepared readiness failure removed the recovery pack: %v", err)
 	}
 }
 

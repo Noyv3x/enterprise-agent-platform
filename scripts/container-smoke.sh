@@ -114,9 +114,28 @@ for fragment in (
     'test -x /var/fdb/scripts/fdb.bash',
     'test -s /var/fdb/cluster/fdb.cluster',
     'http://127.0.0.1:3002/v0/health/liveness',
+    'first_foundationdb_init="$foundationdb_init"',
+    'first_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"',
+    'second_foundationdb_init=',
+    'second_foundationdb=',
+    'test "$second_foundationdb_init" != "$first_foundationdb_init"',
+    'test "$second_foundationdb" != "$first_foundationdb"',
+    'sentinel_key=ubitech_ci_persistence',
+    'writemode on; set $sentinel_key $sentinel_value',
+    'get $sentinel_key',
+    'grep -Fqx -- "$expected"',
+    'rm --stop --force',
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
+if compose_smoke.count("up --detach firecrawl-api") < 2:
+    raise SystemExit("compose-smoke does not recreate Firecrawl with retained bind data")
+if compose_smoke.count('status="$(timeout 5 fdbcli') < 2 or compose_smoke.count(
+    'test -n "$status"'
+) < 2:
+    raise SystemExit("compose-smoke FoundationDB probes do not reject failed or empty status output")
+if compose_smoke.count('jq -e -s "length == 1 and .[0].client.database_status.available == true"') < 2:
+    raise SystemExit("compose-smoke FoundationDB probes do not require one available status document")
 
 publish = job("publish")
 if "pattern: '*'" in publish or 'pattern: "*"' in publish:
@@ -320,8 +339,19 @@ if not str(server_cluster[0].get("source") or "").endswith(
 if server_cluster[0].get("read_only"):
     raise SystemExit("FoundationDB server must be able to write the shared cluster directory")
 healthcheck = foundationdb.get("healthcheck") or {}
-if cluster_file not in str(healthcheck.get("test") or ""):
+health_command = str(healthcheck.get("test") or "")
+available_filter = ".client.database_status.available == true"
+if cluster_file not in health_command:
     raise SystemExit("FoundationDB healthcheck must use the shared cluster file")
+if (
+    'status=$$(timeout 4 fdbcli' not in health_command
+    or 'test -n "$$status"' not in health_command
+    or 'status json' not in health_command
+    or 'jq -e -s' not in health_command
+    or 'length == 1' not in health_command
+    or available_filter not in health_command
+):
+    raise SystemExit("FoundationDB healthcheck must verify status JSON availability")
 foundationdb_init = services["firecrawl-foundationdb-init"]
 init_cluster = [
     volume for volume in foundationdb_init.get("volumes") or []
@@ -339,6 +369,19 @@ if cluster_file not in str(foundationdb_init.get("command") or ""):
 init_command = str(foundationdb_init.get("command") or "")
 if "timeout 5 fdbcli" not in init_command or "seq 1 30" not in init_command:
     raise SystemExit("FoundationDB init must use bounded command retries")
+if (
+    'configure new single ssd' not in init_command
+    or 'status=$$(timeout 5 fdbcli' not in init_command
+    or 'test -n "$$status"' not in init_command
+    or 'status json' not in init_command
+    or 'jq -e -s' not in init_command
+    or 'length == 1' not in init_command
+    or available_filter not in init_command
+    or init_command.index('status json') < init_command.index('configure new single ssd')
+):
+    raise SystemExit("FoundationDB init must verify database availability after configure-new fails")
+if "already.*configured" in init_command or "database.*configured" in init_command:
+    raise SystemExit("FoundationDB init must not infer readiness from error text")
 init_dependencies = foundationdb_init.get("depends_on") or {}
 if (init_dependencies.get("firecrawl-foundationdb") or {}).get("condition") != "service_started":
     raise SystemExit("FoundationDB init must not wait on the post-configuration healthcheck")

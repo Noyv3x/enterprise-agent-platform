@@ -62,7 +62,7 @@ main 的质量门完成后构建 linux/amd64 与 linux/arm64 镜像和对应管�
 
 管理器只按清单 digest 拉取，不使用 mutable tag 作为运行身份。部署机不拉取 Cognee/Firecrawl Git 源码：Cognee 在镜像构建阶段从精确契约 revision 安装；Firecrawl Compose 服务与 digest 在 CI 中对精确上游契约验证后进入发布清单。
 
-托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽镜像 entrypoint、脚本、库或默认配置根。FoundationDB 的持久数据挂载到 `/var/fdb/data`，共享 cluster 目录挂载到 `/var/fdb/cluster`，server、初始化任务和 Firecrawl API 必须显式使用同一个 `/var/fdb/cluster/fdb.cluster`；不得把空宿主目录直接挂到 `/var/fdb`，也不能依赖 named-volume 的首次镜像内容复制语义来补齐可执行脚本。FoundationDB 镜像已用 Tini 作为 PID 1，因此该服务关闭 Compose 的通用 `init` 包装，避免嵌套 Tini 和误导性的 subreaper 警告。FoundationDB 的配置健康检查以数据库已配置为前提，因此一次性初始化任务只等待 server 进入 started，并对配置命令执行有界重试；Firecrawl API 必须同时等待初始化成功和 FoundationDB 健康，不能让初始化反向等待由它自己建立的健康条件。
+托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽镜像 entrypoint、脚本、库或默认配置根。FoundationDB 的持久数据挂载到 `/var/fdb/data`，共享 cluster 目录挂载到 `/var/fdb/cluster`，server、初始化任务和 Firecrawl API 必须显式使用同一个 `/var/fdb/cluster/fdb.cluster`；不得把空宿主目录直接挂到 `/var/fdb`，也不能依赖 named-volume 的首次镜像内容复制语义来补齐可执行脚本。FoundationDB 镜像已用 Tini 作为 PID 1，因此该服务关闭 Compose 的通用 `init` 包装，避免嵌套 Tini 和误导性的 subreaper 警告。FoundationDB 的配置健康检查以数据库已配置为前提，因此一次性初始化任务只等待 server 进入 started，并对配置命令执行有界重试；首次 `configure new single ssd` 成功可直接通过。持久 cluster 已配置时，CLI 会以非零状态返回 `Database already exists!`，初始化任务不能依赖该报错文本，而必须再读取有界的 `status json`，仅当它是唯一 JSON 文档且 `.client.database_status.available == true` 时幂等收敛为成功，不得重建或改写数据库。命令失败、空白输出、无效或多个 JSON 文档、数据库不可用都继续重试并最终失败。Firecrawl API 必须同时等待初始化成功和 FoundationDB 健康，不能让初始化反向等待由它自己建立的健康条件。
 
 源码桥迁移使用 exact release 中的 Manager 二进制及其 SHA-256 sidecar，不扫描旧 checkout 中的任意 executable。`--manager-binary` 只作为运维显式指定的本地开发入口，永远不能由安装器从 `dist`、`.migration` 或其它旧目录自动发现。
 
@@ -133,7 +133,7 @@ Manager 的本地 control socket 仍是跨进程网络边界。CLI 对迁移 pla
 
 对于 `source-v1-retirement-2026-07` 之前已经完成且未恢复的唯一存量源码迁移，下一次容器 release 会在普通更新完全提交、服务恢复空闲后自动执行一次源码部署退役。该活动是从“可恢复旧源码服务”到“只支持容器 generation/数据库快照回滚”的明确不可逆转换：它重新校验当前 Manager、核心容器、公网入口和 Firecrawl 完整链路，逐项核对迁移归档、systemd 文件、source retry/recovery 文件、宿主构建缓存及旧 Compose 标签后才删除。任一对象不能证明归属时只记录错误并后台重试，不扩大路径匹配，也不影响当前容器服务。
 
-退役活动完成的宿主机不得再保留可启动的 `enterprise-agent-platform.service`、迁移 timer/retry/guard、旧 checkout recovery pack、source updater marker/log、旧 Platform gate 值或旧 Firecrawl/SearXNG Compose 容器/network/volume。它仍必须保留所有业务数据、Agent 工作区/记忆/会话、浏览器状态、当前外部服务 bind mount、Manager 状态、当前与 previous generation、普通数据库快照以及回滚所需镜像。Manager 把活动结果压缩为不含旧绝对路径的 `purged` receipt；只有观察到该 receipt 后，后续版本才可删除源码桥接兼容实现。
+退役活动完成的宿主机不得再保留可启动的 `enterprise-agent-platform.service`、迁移 timer/retry/guard、当前迁移恢复包、经同一 migration identity 与固定内容验证的 superseded attempt pack、source updater marker/log、旧 Platform gate 值或旧 Firecrawl/SearXNG Compose 容器/network/volume。不能证明归属的其它备份不因名称相似被删除。宿主机仍必须保留所有业务数据、Agent 工作区/记忆/会话、浏览器状态、当前外部服务 bind mount、Manager 状态、当前与 previous generation、普通数据库快照以及回滚所需镜像。Manager 把活动结果压缩为不含旧绝对路径的 `purged` receipt；只有观察到该 receipt 后，后续版本才可删除源码桥接兼容实现。
 
 桥接版本在等待完整发布清单期间仍可用旧的源码进程运行。该兼容路径必须显式把 Runtime 设为 local executor，并使用宿主 workspace 绝对路径；它只用于迁移等待和开发测试，不能成为 Docker 生产拓扑的隐式回退。`UBITECH_SOURCE_MIGRATION_BRIDGE=1` 只能与绝对 Manager socket/token-file 路径同时启用，且不会把 Platform 切成 container execution。容器模式必须显式设置部署模式，缺少 Manager socket/token 或执行器时直接失败，不能静默切回宿主本地执行。
 
