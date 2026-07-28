@@ -62,6 +62,8 @@ main 的质量门完成后构建 linux/amd64 与 linux/arm64 镜像和对应管�
 
 管理器只按清单 digest 拉取，不使用 mutable tag 作为运行身份。部署机不拉取 Cognee/Firecrawl Git 源码：Cognee 在镜像构建阶段从精确契约 revision 安装；Firecrawl Compose 服务与 digest 在 CI 中对精确上游契约验证后进入发布清单。
 
+托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽镜像 entrypoint、脚本、库或默认配置根。FoundationDB 的持久数据挂载到 `/var/fdb/data`，共享 cluster 目录挂载到 `/var/fdb/cluster`，server、初始化任务和 Firecrawl API 必须显式使用同一个 `/var/fdb/cluster/fdb.cluster`；不得把空宿主目录直接挂到 `/var/fdb`，也不能依赖 named-volume 的首次镜像内容复制语义来补齐可执行脚本。FoundationDB 镜像已用 Tini 作为 PID 1，因此该服务关闭 Compose 的通用 `init` 包装，避免嵌套 Tini 和误导性的 subreaper 警告。FoundationDB 的配置健康检查以数据库已配置为前提，因此一次性初始化任务只等待 server 进入 started，并对配置命令执行有界重试；Firecrawl API 必须同时等待初始化成功和 FoundationDB 健康，不能让初始化反向等待由它自己建立的健康条件。
+
 源码桥迁移使用 exact release 中的 Manager 二进制及其 SHA-256 sidecar，不扫描旧 checkout 中的任意 executable。`--manager-binary` 只作为运维显式指定的本地开发入口，永远不能由安装器从 `dist`、`.migration` 或其它旧目录自动发现。
 
 ## 健康与提交

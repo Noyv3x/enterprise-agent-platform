@@ -642,9 +642,45 @@ jobs:
             "$sandbox_image" \
             sh -eu -c 'test "$(id -u)" = 12345; test "$(id -g)" = 23456; test "$(sudo -n id -u)" = 0; test "$(stat -c %u /workspace/ownership-sentinel)" = "$UBITECH_SENTINEL_UID"; chmod 0755 /workspace /home/agent /opt/agent-env'
           test "$(stat -c %u "$sandbox_mount_root/workspace/ownership-sentinel")" = "$sentinel_uid"
-          docker compose -f containers/compose.yaml create \
+          docker compose -f containers/compose.yaml stop \
+            platform agent-runtime camofox searxng
+          docker compose -f containers/compose.yaml run --rm --no-deps \
+            --entrypoint /bin/sh firecrawl-foundationdb \
+            -eu -c 'test -x /var/fdb/scripts/fdb.bash'
+          if ! docker compose -f containers/compose.yaml up --detach firecrawl-api; then
+            docker compose -f containers/compose.yaml ps --all
+            docker compose -f containers/compose.yaml logs --no-color --tail 200 \
+              firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
+              firecrawl-postgres firecrawl-foundationdb firecrawl-foundationdb-init
+            exit 1
+          fi
+          for service in \
+            firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
+            firecrawl-postgres firecrawl-foundationdb firecrawl-api; do
+            container="$(docker compose -f containers/compose.yaml ps -q "$service")"
+            test -n "$container"
+            for attempt in $(seq 1 60); do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
+              [[ "$status" == healthy ]] && break
+              [[ "$status" != unhealthy || "$attempt" -lt 60 ]] || {
+                docker compose -f containers/compose.yaml logs --no-color --tail 200 "$service"
+                exit 1
+              }
+              sleep 5
+            done
+            test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
+          done
+          foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
+          test -n "$foundationdb_init"
+          test "$(docker inspect --format '{{.State.Status}}' "$foundationdb_init")" = exited
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$foundationdb_init")" = 0
+          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
+            /bin/sh -eu -c 'test -x /var/fdb/scripts/fdb.bash; test -s /var/fdb/cluster/fdb.cluster'
+          docker compose -f containers/compose.yaml exec -T firecrawl-api \
+            node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+          docker compose -f containers/compose.yaml stop \
             firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
-            firecrawl-postgres firecrawl-foundationdb firecrawl-foundationdb-init
+            firecrawl-postgres firecrawl-foundationdb
           docker run --detach \
             --name "$sandbox_container" \
             --network "$UBITECH_CORE_NETWORK" \

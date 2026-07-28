@@ -31,7 +31,7 @@ x-firecrawl-environment: &firecrawl-environment
   BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:-3}
   NUQ_RABBITMQ_URL: amqp://firecrawl-rabbitmq:5672
   NUQ_BACKEND: ${FIRECRAWL_NUQ_BACKEND:-}
-  FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+  FDB_CLUSTER_FILE: /var/fdb/cluster/fdb.cluster
   ENV: local
   LOGGING_LEVEL: ${FIRECRAWL_LOGGING_LEVEL:-info}
 
@@ -239,14 +239,16 @@ services:
   firecrawl-foundationdb:
     <<: *ubitech-service
     image: ${UBITECH_FIRECRAWL_FOUNDATIONDB_IMAGE:-foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48}
+    init: false
     environment:
       FDB_NETWORKING_MODE: container
       FDB_COORDINATOR_PORT: "4500"
+      FDB_CLUSTER_FILE: /var/fdb/cluster/fdb.cluster
     volumes:
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/data:/var/fdb/data
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
     healthcheck:
-      test: [CMD-SHELL, 'fdbcli -C /var/fdb/fdb.cluster --exec status >/dev/null 2>&1']
+      test: [CMD-SHELL, 'fdbcli -C /var/fdb/cluster/fdb.cluster --exec status >/dev/null 2>&1']
       interval: 10s
       timeout: 5s
       retries: 18
@@ -262,12 +264,12 @@ services:
       - no-new-privileges:true
     depends_on:
       firecrawl-foundationdb:
-        condition: service_healthy
+        condition: service_started
     entrypoint: [/bin/bash, -eu, -o, pipefail, -c]
     command:
-      - 'out=$$(fdbcli -C /var/fdb/fdb.cluster --exec "configure new single ssd" 2>&1) && exit 0; printf "%s\n" "$$out" | grep -Eiq "already.*configured|database.*configured"'
+      - 'last=""; for attempt in $$(seq 1 30); do if last=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then exit 0; fi; if printf "%s\n" "$$last" | grep -Eiq "already.*configured|database.*configured"; then exit 0; fi; sleep 2; done; printf "%s\n" "$$last" >&2; exit 1'
     volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
 
   firecrawl-api:
     <<: *ubitech-service
@@ -289,13 +291,15 @@ services:
         condition: service_healthy
       firecrawl-playwright:
         condition: service_healthy
+      firecrawl-foundationdb:
+        condition: service_healthy
       firecrawl-foundationdb-init:
         condition: service_completed_successfully
     entrypoint: [/bin/sh, -eu, -c]
     command:
       - 'export BULL_AUTH_KEY="$$(cat /run/secrets/ubitech/firecrawl-bull-auth-key)"; export POSTGRES_PASSWORD="$$(cat /run/secrets/ubitech/firecrawl-postgres-password)"; exec node dist/src/harness.js --start-docker'
     volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb:ro
+      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster:ro
       - ${UBITECH_SECRETS_DIR}/firecrawl-bull-auth-key:/run/secrets/ubitech/firecrawl-bull-auth-key:ro
       - ${UBITECH_SECRETS_DIR}/firecrawl-postgres-password:/run/secrets/ubitech/firecrawl-postgres-password:ro
     healthcheck:

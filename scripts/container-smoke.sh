@@ -109,6 +109,11 @@ for fragment in (
     'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"',
     '"$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;',
     'sudo -n rm -rf --one-file-system -- "$root"',
+    'up --detach firecrawl-api',
+    'run --rm --no-deps',
+    'test -x /var/fdb/scripts/fdb.bash',
+    'test -s /var/fdb/cluster/fdb.cluster',
+    'http://127.0.0.1:3002/v0/health/liveness',
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
@@ -287,6 +292,77 @@ if "/run/secrets/manager-executor-token" not in runtime_secret_targets or "/run/
 platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == "/var/lib/ubitech-agent"]
 if len(platform_data) != 1 or not str(platform_data[0].get("source") or "").endswith("/data"):
     raise SystemExit("Platform data must map <manager data root>/data to /var/lib/ubitech-agent")
+
+cluster_file = "/var/fdb/cluster/fdb.cluster"
+foundationdb = services["firecrawl-foundationdb"]
+if foundationdb.get("init") is not False:
+    raise SystemExit("FoundationDB image owns PID 1 and must not receive a nested Compose init")
+if (foundationdb.get("environment") or {}).get("FDB_CLUSTER_FILE") != cluster_file:
+    raise SystemExit("FoundationDB server must use the explicit shared cluster-file path")
+foundationdb_volumes = foundationdb.get("volumes") or []
+foundationdb_targets = {str(volume.get("target") or "") for volume in foundationdb_volumes}
+if "/var/fdb" in foundationdb_targets:
+    raise SystemExit("FoundationDB bind mounts must not hide the image entrypoint under /var/fdb")
+if not {"/var/fdb/data", "/var/fdb/cluster"}.issubset(foundationdb_targets):
+    raise SystemExit("FoundationDB data and cluster directories must be mounted separately")
+server_data = [volume for volume in foundationdb_volumes if volume.get("target") == "/var/fdb/data"]
+server_cluster = [volume for volume in foundationdb_volumes if volume.get("target") == "/var/fdb/cluster"]
+if len(server_data) != 1 or len(server_cluster) != 1:
+    raise SystemExit("FoundationDB must have exactly one data mount and one cluster mount")
+if server_data[0].get("type") != "bind" or server_cluster[0].get("type") != "bind":
+    raise SystemExit("FoundationDB persistent paths must be explicit host bind mounts")
+if server_data[0].get("source") == server_cluster[0].get("source"):
+    raise SystemExit("FoundationDB data and cluster mounts must use different host directories")
+if not str(server_cluster[0].get("source") or "").endswith(
+    "/data/runtimes/firecrawl/foundationdb/cluster"
+):
+    raise SystemExit("FoundationDB cluster mount must use the managed cluster directory")
+if server_cluster[0].get("read_only"):
+    raise SystemExit("FoundationDB server must be able to write the shared cluster directory")
+healthcheck = foundationdb.get("healthcheck") or {}
+if cluster_file not in str(healthcheck.get("test") or ""):
+    raise SystemExit("FoundationDB healthcheck must use the shared cluster file")
+foundationdb_init = services["firecrawl-foundationdb-init"]
+init_cluster = [
+    volume for volume in foundationdb_init.get("volumes") or []
+    if volume.get("target") == "/var/fdb/cluster"
+]
+if (
+    len(init_cluster) != 1
+    or init_cluster[0].get("type") != "bind"
+    or init_cluster[0].get("source") != server_cluster[0].get("source")
+    or init_cluster[0].get("read_only")
+):
+    raise SystemExit("FoundationDB init must write the same shared cluster directory")
+if cluster_file not in str(foundationdb_init.get("command") or ""):
+    raise SystemExit("FoundationDB init must configure the shared cluster file")
+init_command = str(foundationdb_init.get("command") or "")
+if "timeout 5 fdbcli" not in init_command or "seq 1 30" not in init_command:
+    raise SystemExit("FoundationDB init must use bounded command retries")
+init_dependencies = foundationdb_init.get("depends_on") or {}
+if (init_dependencies.get("firecrawl-foundationdb") or {}).get("condition") != "service_started":
+    raise SystemExit("FoundationDB init must not wait on the post-configuration healthcheck")
+firecrawl = services["firecrawl-api"]
+if (firecrawl.get("environment") or {}).get("FDB_CLUSTER_FILE") != cluster_file:
+    raise SystemExit("Firecrawl API must use the FoundationDB shared cluster-file path")
+api_cluster = [
+    volume for volume in firecrawl.get("volumes") or []
+    if volume.get("target") == "/var/fdb/cluster"
+]
+if (
+    len(api_cluster) != 1
+    or api_cluster[0].get("type") != "bind"
+    or api_cluster[0].get("source") != server_cluster[0].get("source")
+    or not api_cluster[0].get("read_only")
+):
+    raise SystemExit("Firecrawl API must read-only mount the shared cluster directory")
+api_dependencies = firecrawl.get("depends_on") or {}
+if (api_dependencies.get("firecrawl-foundationdb") or {}).get("condition") != "service_healthy":
+    raise SystemExit("Firecrawl API must wait for healthy FoundationDB")
+if (
+    api_dependencies.get("firecrawl-foundationdb-init") or {}
+).get("condition") != "service_completed_successfully":
+    raise SystemExit("Firecrawl API must wait for successful FoundationDB initialization")
 PY
 
 docker compose \
