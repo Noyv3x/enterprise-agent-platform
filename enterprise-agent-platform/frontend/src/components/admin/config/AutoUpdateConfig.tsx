@@ -96,14 +96,12 @@ export function AutoUpdateConfig() {
   const checking = pending.includes("admin:updates:check");
   const operationRunning = pending.some((item) => item.startsWith("admin:updates:") && item !== "admin:updates:save" && item !== "admin:updates:check");
   const busy = status.state === "updating" || operationRunning;
-  const updateControlsReadOnly = status.control_plane === "source_bridge" || status.manager_available === false;
   const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(config));
   const services = Object.entries(status.services || {});
   const images = Object.entries(status.images || {});
 
   const save = (event: React.FormEvent) => {
     event.preventDefault();
-    if (updateControlsReadOnly) return;
     void saveAutoUpdateConfig(store, {
       enabled: form.enabled,
       interval_seconds: form.interval,
@@ -112,12 +110,11 @@ export function AutoUpdateConfig() {
   };
 
   const operate = (operation: Exclude<ManagerOperation, "install">) => {
-    if (updateControlsReadOnly || typeof status.manager_generation !== "number") return;
+    if (typeof status.manager_generation !== "number") return;
     void runManagerOperation(store, operation, status.manager_generation);
   };
 
   const checkNow = () => {
-    if (updateControlsReadOnly) return;
     void checkAutoUpdateNow(store);
   };
 
@@ -136,17 +133,6 @@ export function AutoUpdateConfig() {
 
         {status.state === "updating" ? (
           <Progress percent={100} status="active" showInfo={false} aria-label={t("admin.updates.state.updating")} />
-        ) : null}
-        {updateControlsReadOnly ? (
-          <Alert
-            showIcon
-            type="warning"
-            message={t(
-              status.manager_available === false
-                ? "admin.updates.managerUnavailableReadOnly"
-                : "admin.updates.sourceBridgeReadOnly",
-            )}
-          />
         ) : null}
         {status.state === "waiting_for_tasks" ? <Alert showIcon type="info" message={t("admin.updates.waitingNotice")} /> : null}
         {status.last_error ? (
@@ -186,20 +172,20 @@ export function AutoUpdateConfig() {
         ) : null}
 
         <Space wrap className="eap-manager-actions">
-          <Button loading={checking} disabled={busy || updateControlsReadOnly} icon={<Icon name="refresh" size={15} />} onClick={checkNow}>
+          <Button loading={checking} disabled={busy} icon={<Icon name="refresh" size={15} />} onClick={checkNow}>
             {t("admin.updates.checkNow")}
           </Button>
-          <Button type="primary" disabled={updateControlsReadOnly || busy || !status.update_available || typeof status.manager_generation !== "number"} onClick={() => operate("update")}>
+          <Button type="primary" disabled={busy || !status.update_available || typeof status.manager_generation !== "number"} onClick={() => operate("update")}>
             {t("admin.updates.updateNow")}
           </Button>
           <Popconfirm title={t("admin.updates.restartConfirm")} onConfirm={() => operate("restart")}>
-            <Button disabled={updateControlsReadOnly || busy || typeof status.manager_generation !== "number"}>{t("admin.updates.restart")}</Button>
+            <Button disabled={busy || typeof status.manager_generation !== "number"}>{t("admin.updates.restart")}</Button>
           </Popconfirm>
           <Popconfirm title={t("admin.updates.rollbackConfirm")} onConfirm={() => operate("rollback")}>
-            <Button disabled={updateControlsReadOnly || busy || !status.previous_generation || typeof status.manager_generation !== "number"}>{t("admin.updates.rollback")}</Button>
+            <Button disabled={busy || !status.previous_generation || typeof status.manager_generation !== "number"}>{t("admin.updates.rollback")}</Button>
           </Popconfirm>
           {status.state === "failed" ? (
-            <Button danger disabled={updateControlsReadOnly || operationRunning || typeof status.manager_generation !== "number"} onClick={() => operate("repair")}>{t("admin.updates.repair")}</Button>
+            <Button danger disabled={operationRunning || typeof status.manager_generation !== "number"} onClick={() => operate("repair")}>{t("admin.updates.repair")}</Button>
           ) : null}
         </Space>
       </AdminCard>
@@ -208,26 +194,26 @@ export function AutoUpdateConfig() {
         <form onSubmit={save}>
           <div className="config-grid">
             <div className="check-row field--full">
-              <Switch disabled={updateControlsReadOnly} checked={form.enabled} aria-labelledby={enabledLabelId} onChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
+              <Switch checked={form.enabled} aria-labelledby={enabledLabelId} onChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
               <div className="check-row__text">
                 <strong id={enabledLabelId}>{t("admin.updates.enableWatcher")}</strong>
                 <span>{t("admin.updates.enableWatcherHint")}</span>
               </div>
             </div>
             <Field label={t("admin.updates.interval")}>
-              <Input disabled={updateControlsReadOnly} type="number" min="30" max="86400" value={form.interval} onChange={(event) => setForm((current) => ({ ...current, interval: event.target.value }))} />
+              <Input type="number" min="30" max="86400" value={form.interval} onChange={(event) => setForm((current) => ({ ...current, interval: event.target.value }))} />
             </Field>
             <Field label={t("admin.updates.channel")}>
               <Input value={config.release_channel || "main"} disabled />
             </Field>
             <div className="field--full">
               <Field label={t("admin.updates.manifestUrl")}>
-                <Input disabled={updateControlsReadOnly} value={form.manifestUrl} placeholder="https://…/main.json" onChange={(event) => setForm((current) => ({ ...current, manifestUrl: event.target.value }))} />
+                <Input value={form.manifestUrl} placeholder="https://…/main.json" onChange={(event) => setForm((current) => ({ ...current, manifestUrl: event.target.value }))} />
               </Field>
             </div>
           </div>
           <div className="form-actions">
-            <Button type="primary" htmlType="submit" disabled={updateControlsReadOnly || !dirty || busy} loading={saving}>{t("admin.updates.save")}</Button>
+            <Button type="primary" htmlType="submit" disabled={!dirty || busy} loading={saving}>{t("admin.updates.save")}</Button>
           </div>
         </form>
       </AdminCard>

@@ -1,9 +1,7 @@
 /* =====================================================================
-   Session lifecycle — boot / login / logout / handleSessionExpired / runBusy
-   (legacy boot, logout, handleSessionExpired, withBusy; legacy-app.js:3431-3541).
-
+   Session lifecycle — boot / login / logout / handleSessionExpired / runBusy.
    RESET_SESSION is centralized in resetSession(): it runs any registered
-   teardown callbacks (Phase 3 registers SSE/poll close here), revokes all
+   teardown callbacks, revokes all
    pending optimistic attachment blob URLs, then dispatches RESET_SESSION
    (which clears chat + admin + ui across the slice reducers). Both logout() and
    handleSessionExpired() route through it so the 401 path no longer leaks blobs.
@@ -17,15 +15,12 @@ import { hasPermission, isAdmin } from "../store/selectors";
 import { revokeAttachmentUrls } from "../utils/composerFiles";
 import type {
   ActiveView,
-  AuthMeResponse,
   LoginResponse,
-  SessionBootstrapResponse,
 } from "../types";
 import { clearChatCache } from "./chatCache";
 import {
   hydrateSessionBootstrap,
   clearRuntimeStatusRefresh,
-  loadInitial,
   loadPrivateTelegram,
   loadSessionBootstrap,
   type AppStore,
@@ -38,7 +33,7 @@ type SessionTeardown = () => void;
 const sessionTeardowns = new Set<SessionTeardown>();
 
 /** Register a callback (e.g. close SSE / stop the poll) to run on every session
- *  reset. Returns an unregister fn. Phase 3 realtime hooks use this. */
+ * reset. Returns an unregister function. */
 export function registerSessionTeardown(fn: SessionTeardown): () => void {
   sessionTeardowns.add(fn);
   return () => {
@@ -135,8 +130,7 @@ export async function runBusy(
 
 let busyOperationSequence = 0;
 
-/** Coerce the active view if the user lacks permission for it
- *  (legacy renderShell guard, legacy-app.js:408-409). */
+/** Coerce the active view if the user lacks permission for it. */
 function coerceActiveView(store: AppStore): void {
   const state = store.getState();
   let view: ActiveView = state.activeView;
@@ -151,54 +145,27 @@ export async function login(store: AppStore, username: string, password: string)
     body: JSON.stringify({ username, password }),
   });
   resetSession(store, { preservePendingOperations: true });
-  const embedded = result.bootstrap || (
-    Array.isArray(result.channels) &&
-    Array.isArray(result.mention_targets) &&
-    Array.isArray(result.messages)
-      ? result as SessionBootstrapResponse
-      : null
-  );
-  if (embedded) {
-    hydrateSessionBootstrap(store, embedded);
-    if (embedded.active_scope?.scope_type === "private") {
-      void loadPrivateTelegram(store).catch(() => undefined);
-    }
-  } else {
-    store.dispatch({ type: "SET_USER", payload: result.user });
-    try {
-      await loadSessionBootstrap(store);
-    } catch (error) {
-      if (isApiRequestCancelled(error)) throw error;
-      await loadInitial(store);
-    }
+  if (!result.user || !result.bootstrap) {
+    throw new Error(t("resource.loadFailed"));
+  }
+  hydrateSessionBootstrap(store, result.bootstrap);
+  if (result.bootstrap.active_scope?.scope_type === "private") {
+    void loadPrivateTelegram(store).catch(() => undefined);
   }
   coerceActiveView(store);
 }
 
-/** Boot the session: probe /api/auth/me, hydrate, and coerce the view.
+/** Boot the session from the authoritative bootstrap snapshot and coerce the view.
  *  The StrictMode-safe once-guard lives in <AppGate> (a useRef). */
 export type BootResult = "authenticated" | "anonymous" | "error";
 
 export async function boot(store: AppStore): Promise<BootResult> {
   try {
-    try {
-      await loadSessionBootstrap(store);
-    } catch (bootstrapError) {
-      if (isApiError(bootstrapError, 401) || isApiRequestCancelled(bootstrapError)) {
-        throw bootstrapError;
-      }
-      // Rolling deployments can briefly pair a new frontend with an older
-      // backend. Keep the established auth + loader path as a safe fallback.
-      const result = await api<AuthMeResponse>(endpoints.authMe.path(), {
-        skipAuthHandling: true,
-      });
-      store.dispatch({ type: "SET_USER", payload: result.user });
-      await loadInitial(store);
-    }
+    await loadSessionBootstrap(store);
     coerceActiveView(store);
     return "authenticated";
   } catch (error) {
-    const result = isApiError(error, 401) || isApiRequestCancelled(error) ? "anonymous" : "error";
+    const result = isApiError(error, 401) ? "anonymous" : "error";
     resetSession(store);
     return result;
   }

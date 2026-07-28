@@ -1,5 +1,5 @@
 /* <PrivateTelegramTrigger/> — the topbar Telegram action shown only on the
-   private view (legacy renderPrivateTelegramAction, legacy-app.js:538-559).
+   private view.
    Toggles privateTelegramExpanded; the active button and Ant badge communicate
    expanded and linked state. aria-controls ties to the link dialog. */
 

@@ -54,13 +54,12 @@ class DocsSyncTests(unittest.TestCase):
     @staticmethod
     def manifest() -> dict[str, object]:
         return {
-            "version": 1,
-            "legacy_top_level_files": ["AGENTS.md", "CLAUDE.md"],
+            "version": 2,
+            "forbidden_top_level_files": ["AGENTS.md", "CLAUDE.md"],
             "coverage": {
                 "code_include": [
                     ".gitignore",
                     ".github/**",
-                    "deploy.sh",
                     "manager/**",
                     "scripts/**",
                     "src/*.py",
@@ -98,7 +97,7 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "id": "deployment",
                     "documents": ["docs/design/deployment.md"],
-                    "code": ["deploy.sh", "manager/**"],
+                    "code": ["manager/**"],
                     "tests": [],
                 },
                 {
@@ -311,7 +310,6 @@ class DocsSyncTests(unittest.TestCase):
             "enterprise-agent-platform/agent-runtime/README.md": "# Runtime\n\n[Docs](../../docs/README.md)\n",
             ".gitignore": "data/\n/cognee/\n/firecrawl/\n",
             ".github/workflows/quality.yml": "name: fixture\n",
-            "deploy.sh": "#!/usr/bin/env bash\n",
             "scripts/policy.py": "POLICY = True\n",
             "enterprise-agent-platform/pyproject.toml": "[project]\nname = 'fixture'\nversion = '0'\n",
             "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": "HELPER = True\n",
@@ -370,14 +368,14 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("target must not be executable", executable.stderr)
         self.run_command("sync", expect=0)
 
-    def test_check_rejects_legacy_file_broken_link_and_unmapped_code(self) -> None:
+    def test_check_rejects_forbidden_file_broken_link_and_unmapped_code(self) -> None:
         self.initialize_git()
         self.write_fixture()
         self.run_command("sync", expect=0)
 
-        (self.root / "AGENTS.md").write_text("legacy\n", encoding="utf-8")
-        legacy = self.run_command("check", expect=1)
-        self.assertIn("legacy top-level instruction file is forbidden", legacy.stderr)
+        (self.root / "AGENTS.md").write_text("forbidden\n", encoding="utf-8")
+        forbidden = self.run_command("check", expect=1)
+        self.assertIn("top-level instruction file is forbidden", forbidden.stderr)
         (self.root / "AGENTS.md").unlink()
 
         feature = self.root / "docs/design/feature.md"
@@ -394,11 +392,11 @@ class DocsSyncTests(unittest.TestCase):
         unmapped = self.run_command("check", expect=1)
         self.assertIn("covered production path has no documentation domain", unmapped.stderr)
 
-    def test_manifest_cannot_remove_legacy_file_guards(self) -> None:
+    def test_manifest_cannot_remove_forbidden_file_guards(self) -> None:
         self.initialize_git()
         self.write_fixture()
         manifest = self.manifest()
-        manifest["legacy_top_level_files"] = ["CLAUDE.md"]
+        manifest["forbidden_top_level_files"] = ["CLAUDE.md"]
         (self.root / "docs/domains.json").write_text(
             json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
@@ -521,12 +519,12 @@ class DocsSyncTests(unittest.TestCase):
         help_result = self.run_command("check-change", "--help", expect=0)
         self.assertIn("INDEX", help_result.stdout)
 
-    def test_index_check_reads_staged_legacy_file_after_worktree_deletion(self) -> None:
+    def test_index_check_reads_staged_forbidden_file_after_worktree_deletion(self) -> None:
         base = self.ready_repository()
-        legacy = self.root / "AGENTS.md"
-        legacy.write_text("staged legacy instructions\n", encoding="utf-8")
+        forbidden = self.root / "AGENTS.md"
+        forbidden.write_text("staged forbidden instructions\n", encoding="utf-8")
         self.git("add", "AGENTS.md")
-        legacy.unlink()
+        forbidden.unlink()
 
         result = self.run_command(
             "check-change",
@@ -536,7 +534,7 @@ class DocsSyncTests(unittest.TestCase):
             "INDEX",
             expect=1,
         )
-        self.assertIn("legacy top-level instruction file is forbidden", result.stderr)
+        self.assertIn("top-level instruction file is forbidden", result.stderr)
 
     def test_index_check_reads_staged_manifest_after_worktree_repair(self) -> None:
         base = self.ready_repository()
@@ -577,7 +575,7 @@ class DocsSyncTests(unittest.TestCase):
         )
         self.assertIn("generated contract target is stale", result.stderr)
 
-    def test_index_snapshot_tolerates_legacy_gitlink_outside_owned_tree(self) -> None:
+    def test_index_snapshot_tolerates_historical_gitlink_outside_owned_tree(self) -> None:
         base = self.ready_repository()
         self.git("update-index", "--add", "--cacheinfo", "160000", base, "cognee")
 
@@ -733,11 +731,10 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("code changed in domain platform", result.stderr)
         self.assertIn("src/main.py", result.stderr)
 
-    def test_historical_v1_manifest_does_not_require_current_invariants(self) -> None:
+    def test_historical_manifest_does_not_require_current_invariants(self) -> None:
         self.initialize_git()
-        legacy_manifest = {
+        historical_manifest = {
             "version": 1,
-            "legacy_top_level_files": ["AGENTS.md", "CLAUDE.md"],
             "coverage": {
                 "code_include": ["src/*.py"],
                 "code_exclude": [],
@@ -755,7 +752,7 @@ class DocsSyncTests(unittest.TestCase):
             "contracts": [],
         }
         for relative, content in {
-            "docs/domains.json": json.dumps(legacy_manifest, indent=2) + "\n",
+            "docs/domains.json": json.dumps(historical_manifest, indent=2) + "\n",
             "docs/design/feature.md": "# Feature\n\nThe current feature design.\n",
             "src/main.py": "VALUE = 1\n",
             "src/keep.py": "KEEP = True\n",
@@ -763,7 +760,7 @@ class DocsSyncTests(unittest.TestCase):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-        legacy_base = self.commit("legacy v1 documentation policy")
+        historical_base = self.commit("historical documentation policy")
 
         self.write_fixture()
         self.run_command("sync", expect=0)
@@ -772,7 +769,7 @@ class DocsSyncTests(unittest.TestCase):
         self.run_command(
             "check-change",
             "--base",
-            legacy_base,
+            historical_base,
             "--head",
             current_head,
             expect=0,
@@ -907,13 +904,10 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("coverage must include owned production probes", result.stderr)
         self.assertIn(".gitignore", result.stderr)
 
-    def test_repository_manifest_assigns_migration_state_to_data_domain(self) -> None:
+    def test_repository_manifest_assigns_documentation_governance_ownership(self) -> None:
         manifest = json.loads(
             (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
         )
-        data_domain = self.manifest_domain(manifest, "data-memory-sessions")
-        self.assertIn("manager/internal/migration/**", data_domain["code"])
-
         governance = self.manifest_domain(manifest, "documentation-governance")
         self.assertIn("scripts/**", governance["code"])
         self.assertIn(

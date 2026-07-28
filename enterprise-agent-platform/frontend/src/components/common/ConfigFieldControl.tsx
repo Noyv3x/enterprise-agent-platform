@@ -1,5 +1,4 @@
-/* <ConfigFieldControl/> — port of legacy configFieldControl (legacy-app.js:
-   2586-2625). Renders the uncontrolled input/select/textarea for one config
+/* <ConfigFieldControl/> renders the uncontrolled input/select/textarea for one config
    descriptor, carrying its data-{yaml,env}-key + data-initial attributes so the
    parent <ConfigForm> can collect a changed-only diff on submit.
 
@@ -43,9 +42,8 @@ export function ConfigFieldControl({ item, attr }: ConfigFieldControlProps) {
 
   if (item.options?.length) {
     const raw = hasDisplayValue ? String(item.value ?? "") : "";
-    // Legacy set <select>.value first then read data-initial BACK from the live DOM
-    // value, which the browser coerces to "" when the value isn't a real option.
-    // Clamp the same way so data-initial agrees with the rendered value and an
+    // Browsers coerce <select>.value to "" when it is not a real option. Clamp
+    // the initial value the same way so it agrees with the rendered value and an
     // out-of-list stored value isn't mis-detected as a changed field on submit.
     const initial = item.options.some((option) => String(option) === raw) ? raw : "";
     return (
@@ -69,8 +67,8 @@ export function ConfigFieldControl({ item, attr }: ConfigFieldControlProps) {
 
   const rawInitial = !item.secret && hasDisplayValue ? String(item.value ?? "") : "";
   const type = item.secret ? "password" : item.kind === "number" ? "number" : "text";
-  // A type=number input rejects (→ "") a non-numeric value in the browser; legacy
-  // captured data-initial from that normalized value, so match it here to avoid a
+  // A type=number input rejects (→ "") a non-numeric value in the browser. Capture
+  // data-initial from that normalized value to avoid a
   // spurious changed-field diff that would blank the key on the next save.
   const initial =
     type === "number" && rawInitial !== "" && !Number.isFinite(Number(rawInitial)) ? "" : rawInitial;

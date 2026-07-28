@@ -1,5 +1,4 @@
-/* <CardHead title icon desc extra/> — reusable card header
-   (legacy cardHead(title, iconName, {desc, extra}), legacy-app.js:334-342). */
+/* <CardHead title icon desc extra/> — reusable card header. */
 
 import type { ReactNode } from "react";
 import type { IconName } from "../../types";

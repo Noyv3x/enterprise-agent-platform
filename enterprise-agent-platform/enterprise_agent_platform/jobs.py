@@ -38,35 +38,6 @@ class DurableJobStore:
 
     def __init__(self, db: Database):
         self.db = db
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with self.db.transaction() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS durable_jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL,
-                    scope_type TEXT NOT NULL DEFAULT '',
-                    scope_id TEXT NOT NULL DEFAULT '',
-                    dedupe_key TEXT NOT NULL,
-                    payload_json TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'queued'
-                        CHECK(status IN ('queued', 'running', 'succeeded', 'failed', 'needs_review')),
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    available_at INTEGER NOT NULL DEFAULT 0,
-                    lease_until INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    UNIQUE(kind, dedupe_key)
-                );
-                CREATE INDEX IF NOT EXISTS idx_durable_jobs_ready
-                    ON durable_jobs(kind, status, available_at, id);
-                CREATE INDEX IF NOT EXISTS idx_durable_jobs_scope
-                    ON durable_jobs(scope_type, scope_id, id);
-                """
-            )
 
     def enqueue(
         self,

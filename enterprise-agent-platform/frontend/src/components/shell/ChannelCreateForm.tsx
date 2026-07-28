@@ -1,5 +1,5 @@
-/* <ChannelCreateForm/> — the gated (manage_channels) new-channel form
-   (legacy-app.js:471-482). The empty guard trims, but the POST body sends the
+/* <ChannelCreateForm/> — the gated (manage_channels) new-channel form. The empty
+   guard trims, but the POST body sends the
    RAW (untrimmed) input value verbatim — preserve this to avoid backend drift. */
 
 import { Button, Form, Input } from "antd";
@@ -26,7 +26,7 @@ export function ChannelCreateForm() {
         void runBusy(store, "channel:create", async () => {
           await api(endpoints.createChannel.path(), {
             method: "POST",
-            body: JSON.stringify({ name }), // UNTRIMMED, verbatim legacy payload
+            body: JSON.stringify({ name }), // Untrimmed by API contract.
           });
           setName("");
           await loadChannels(store);

@@ -32,26 +32,3 @@ enterprise_agent_platform = [
   "bundled_skills/**/*.pyc",
   "bundled_skills/**/*.pyo",
 ]
-
-# The managed Node.js runtime is installed outside site-packages so npm can
-# materialize its locked dependencies and build it in the platform data
-# directory. Keep the source tree intact in both wheels and source archives.
-[tool.setuptools.data-files]
-"share/ubitech-agent/agent-runtime" = [
-  "agent-runtime/README.md",
-  "agent-runtime/package.json",
-  "agent-runtime/package-lock.json",
-  "agent-runtime/tsconfig.json",
-]
-"share/ubitech-agent/agent-runtime/src" = [
-  "agent-runtime/src/*.ts",
-]
-"share/ubitech-agent/agent-runtime/test" = [
-  "agent-runtime/test/*.ts",
-]
-"share/ubitech-agent/camofox-runtime" = [
-  "camofox-runtime/package.json",
-  "camofox-runtime/package-lock.json",
-  "camofox-runtime/loopback-preload.cjs",
-  "camofox-runtime/patch-runtime.cjs",
-]

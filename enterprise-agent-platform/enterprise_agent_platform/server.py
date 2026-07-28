@@ -252,13 +252,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._json(self.server.service.auto_update_public_status())
                 return
-            # The outer gateway owns authoritative admission/draining in normal
-            # deployments. Avoid re-reading the maintenance marker and querying
-            # active work for every proxied request; direct/foreground serving
-            # keeps this defense-in-depth check.
             if (
-                os.environ.get("ENTERPRISE_GATEWAY_ACTIVE") != "1"
-                and not path.startswith("/internal/manager/")
+                not path.startswith("/internal/manager/")
                 and self.server.service.platform_update_is_blocking()
             ):
                 self._json(
@@ -269,9 +264,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     status=503,
                     headers={"Retry-After": "2"},
                 )
-                return
-            if path.startswith("/api/auto-update/webhook/"):
-                self._handle_auto_update_webhook(method, path)
                 return
             if path.startswith("/api/telegram/webhook/"):
                 self._handle_telegram_webhook(method, path)
@@ -315,31 +307,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(403, "invalid Telegram webhook secret")
         body = self._body_json()
         self._json(self.server.service.telegram_gateway_update(body))
-
-    def _handle_auto_update_webhook(self, method: str, path: str) -> None:
-        if method != "POST":
-            self._json({"error": "method not allowed"}, status=405)
-            return
-        expected = self.server.service.auto_update_webhook_secret()
-        if not expected:
-            raise ServiceError(503, "auto update webhook secret is not configured")
-        supplied = urllib.parse.unquote(path.rsplit("/", 1)[-1])
-        header_secret = self.headers.get("X-Enterprise-Auto-Update-Secret", "").strip()
-        raw = self._body_bytes()
-        signed = self._valid_github_signature(expected, raw)
-        if not (
-            hmac.compare_digest(supplied, expected)
-            or (header_secret and hmac.compare_digest(header_secret, expected))
-            or signed
-        ):
-            raise ServiceError(403, "invalid auto update webhook secret")
-        try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError as exc:
-            raise ServiceError(400, "invalid JSON body") from exc
-        if not isinstance(payload, dict):
-            raise ServiceError(400, "JSON body must be an object")
-        self._json(self.server.service.auto_update_webhook(payload), status=202)
 
     def _handle_manager_internal(self, method: str, path: str) -> None:
         service = self.server.service
@@ -912,15 +879,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             self._json(service.complete_oauth_verification(actor, m.group(1), self._body_json()))
             return
-        m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/install", path)
-        if m and method == "POST":
-            self._json(service.install_runtime(actor, m.group(1)))
-            return
-        m = re.fullmatch(r"/api/system/runtime/([A-Za-z0-9_-]+)/restart", path)
-        if m and method == "POST":
-            self._json(service.restart_runtime(actor, m.group(1)))
-            return
-
         raise ServiceError(404, "endpoint not found")
 
     def _handle_agent_tool(self, method: str, path: str, query: dict[str, list[str]]) -> None:
@@ -960,7 +918,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid Agent runtime token")
         if method != "POST":
             raise ServiceError(405, "method not allowed")
-        if re.fullmatch(r"/internal/agent/tools/(?:memory|session|knowledge|web|browser|schedule|skill)", path):
+        if re.fullmatch(r"/internal/agent/tools/(?:web|browser|schedule|skill)", path):
             body = self._body_json()
             body["tool"] = path.rsplit("/", 1)[-1]
             self._json(service.invoke_agent_runtime_tool(body))
@@ -1588,14 +1546,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             return "unknown"
 
-    def _valid_github_signature(self, secret: str, raw: bytes) -> bool:
-        supplied = self.headers.get("X-Hub-Signature-256", "").strip()
-        if not supplied.startswith("sha256="):
-            return False
-        digest = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(supplied, f"sha256={digest}")
-
-
 def first(query: dict[str, list[str]], key: str, default: str) -> str:
     values = query.get(key)
     return values[0] if values else default
@@ -1634,18 +1584,14 @@ def optional_int_arg(
 def optional_preview_revision_arg(
     query: dict[str, list[str]],
     key: str,
-) -> int | str | None:
+) -> str | None:
     values = query.get(key)
     if not values:
         return None
     if len(values) != 1:
         raise ServiceError(400, f"invalid {key} parameter")
     value = values[0]
-    if re.fullmatch(r"(?:0|[1-9]\d*)", value):
-        parsed = int(value)
-        if parsed <= 9_007_199_254_740_991:
-            return parsed
-    elif re.fullmatch(r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}", value):
+    if re.fullmatch(r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}", value):
         return value
     raise ServiceError(400, f"invalid {key} parameter")
 

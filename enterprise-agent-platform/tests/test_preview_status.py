@@ -35,7 +35,6 @@ class PreviewStatusServiceTests(unittest.TestCase):
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _token, actor = service.authenticate("admin", "admin")
-                access_key_path = service.config.runtime_dir / "camofox" / "access-key"
                 with (
                     mock.patch.object(service.agent_scopes, "ensure_private_scope") as ensure_scope,
                     mock.patch.object(service.runtimes, "ensure_camofox_ready") as ensure_browser,
@@ -53,7 +52,6 @@ class PreviewStatusServiceTests(unittest.TestCase):
                     status,
                     {"browser_active": False, "running_terminal_count": 0},
                 )
-                self.assertFalse(access_key_path.exists())
                 self.assertEqual(agent.summary_calls, [])
                 ensure_scope.assert_not_called()
                 ensure_browser.assert_not_called()

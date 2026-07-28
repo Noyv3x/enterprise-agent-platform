@@ -37,7 +37,7 @@ async function copyText(value: string): Promise<boolean> {
       return true;
     }
   } catch {
-    // Fall through to the selection-based compatibility path.
+    // Fall through to the selection-based clipboard capability fallback.
   }
   let textarea: HTMLTextAreaElement | null = null;
   try {

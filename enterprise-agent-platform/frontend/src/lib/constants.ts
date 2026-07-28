@@ -1,6 +1,4 @@
-/* =====================================================================
-   Shared data constants, copied verbatim from legacy-app.js (66-67, 168-194).
-   ===================================================================== */
+/* Shared data constants. */
 
 import type { AdminPage, PermissionGroup, ThinkingDepthOption } from "../types";
 

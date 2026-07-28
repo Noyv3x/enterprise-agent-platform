@@ -51,7 +51,7 @@ export type BrowserPreviewResult = BrowserPreviewFrame | BrowserPreviewIdle | Pr
 export interface TerminalPreviewResult {
   kind: "snapshot" | "unchanged";
   etag?: string;
-  revision?: number | string;
+  revision?: string;
   processes?: TerminalPreviewProcess[];
   capturedAt?: string;
 }
@@ -201,14 +201,20 @@ function normalizeProcess(value: unknown, index: number): TerminalPreviewProcess
     typeof raw[key] === "number" && Number.isFinite(raw[key]) ? raw[key] as number : undefined;
   const boolean = (key: string): boolean | undefined =>
     typeof raw[key] === "boolean" ? raw[key] as boolean : undefined;
+  const status = string("status");
+  if (!status || !["running", "completed", "failed", "cancelled", "orphaned"].includes(status)) {
+    return null;
+  }
+  const running = boolean("running");
+  if (running === undefined || (status === "orphaned" && !running)) return null;
   return {
     id,
     title: string("title") || string("name") || `Terminal ${index + 1}`,
     command: string("command"),
     cwd: string("cwd"),
     output: string("output"),
-    status: string("status"),
-    running: boolean("running"),
+    status: status as TerminalPreviewProcess["status"],
+    running,
     updated_at: (string("updated_at") ?? number("updated_at")),
     started_at: (string("started_at") ?? number("started_at")),
     finished_at: (string("finished_at") ?? number("finished_at")),
@@ -217,14 +223,7 @@ function normalizeProcess(value: unknown, index: number): TerminalPreviewProcess
   };
 }
 
-function previewRevision(value: unknown): number | string | undefined {
-  if (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0
-  ) {
-    return value;
-  }
+function previewRevision(value: unknown): string | undefined {
   return typeof value === "string" &&
     /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/.test(value)
     ? value
@@ -234,7 +233,7 @@ function previewRevision(value: unknown): number | string | undefined {
 export async function fetchTerminalPreviews(
   scope: AgentPreviewScope,
   etag: string,
-  sinceRevision: number | string | undefined,
+  sinceRevision: string | undefined,
   signal: AbortSignal,
 ): Promise<TerminalPreviewResult> {
   const response = await fetch(
@@ -274,6 +273,7 @@ export async function fetchTerminalPreviews(
       revision,
     };
   }
+  if (revision === undefined) throw new Error(t("preview.loadFailed"));
   return {
     kind: "snapshot",
     etag: responseEtag,

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiRequestCancelledError, resetApiSession } from "../lib/api";
 import { createStore } from "../lib/store";
 import { initialAppState, rootReducer } from "../store/reducer";
-import type { User } from "../types";
+import type { RuntimeResponse, RuntimeState, User } from "../types";
 import {
   clearRuntimeStatusRefresh,
   loadMentionTargets,
@@ -70,15 +70,26 @@ describe("loadMentionTargets", () => {
 describe("loadRuntime", () => {
   it("publishes the cached snapshot immediately and refreshes stale health in the background", async () => {
     vi.useFakeTimers();
-    const rows = (stale: boolean, state: string) => ({
-      agent: { name: "agent", state, status_stale: stale },
-      cognee: { name: "cognee", state, status_stale: stale },
-      camofox: { name: "camofox", state, status_stale: stale },
-      searxng: { name: "searxng", state, status_stale: stale },
-      firecrawl: { name: "firecrawl", state, status_stale: stale },
-    });
+    const rows = (stale: boolean, state: RuntimeState): RuntimeResponse => {
+      const row = (name: string) => ({
+        name,
+        available: state === "running" || state === "available",
+        state,
+        detail: "",
+        error: "",
+        status_stale: stale,
+        status_checked_at: stale ? null : 1_784_600_400,
+      });
+      return {
+        agent: row("agent"),
+        cognee: row("cognee"),
+        camofox: row("camofox"),
+        searxng: row("searxng"),
+        firecrawl: row("firecrawl"),
+      };
+    };
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response(200, rows(true, "starting")))
+      .mockResolvedValueOnce(response(200, rows(true, "unavailable")))
       .mockResolvedValueOnce(response(200, rows(false, "running")));
     vi.stubGlobal("fetch", fetchMock);
     const store = createStore(rootReducer, {
@@ -91,8 +102,8 @@ describe("loadRuntime", () => {
     });
 
     await loadRuntime(store);
-    expect(store.getState().runtimes?.agent?.state).toBe("starting");
-    expect(store.getState().runtimes?.searxng?.state).toBe("starting");
+    expect(store.getState().runtimes?.agent?.state).toBe("unavailable");
+    expect(store.getState().runtimes?.searxng?.state).toBe("unavailable");
 
     await vi.advanceTimersByTimeAsync(1_500);
     expect(fetchMock).toHaveBeenCalledTimes(2);

@@ -45,18 +45,17 @@ test("public model catalogs are generated from the same trusted Runtime models",
   for (const retired of ["grok-3", "grok-3-fast", "grok-code-fast-1"]) {
     assert.equal(catalogs["xai-oauth"].models.some((model) => model.id === retired), false);
     assert.throws(
-      () => validateProductModelRequest({ provider: "grok", id: retired }),
+      () => validateProductModelRequest({ provider: "xai-oauth", id: retired }),
       /not allowed/,
     );
   }
 });
 
-test("codex and grok aliases resolve while canonical non-product aliases are rejected", () => {
+test("only canonical product provider ids resolve", () => {
   const gateway = new PlatformGateway();
-  assert.equal(resolveModel(request({ provider: "codex", id: "gpt-5.5" }), gateway).model.provider, "openai-codex");
+  assert.equal(resolveModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway).model.provider, "openai-codex");
   assert.equal(resolveModel(request({ provider: "xai-oauth", id: "grok-4.3" }), gateway).model.provider, "xai");
-  assert.equal(resolveModel(request({ provider: "grok", id: "grok-4.20-0309-reasoning" }), gateway).model.provider, "xai");
-  for (const provider of ["openai", "xai", "faux", "openrouter"]) {
+  for (const provider of ["codex", "grok", "openai", "xai", "faux", "openrouter"]) {
     assert.throws(
       () => validateProductModelRequest({ provider, id: "gpt-5.5" }),
       /model\.provider must be/,
@@ -84,19 +83,19 @@ test("caller-controlled model API and base URL are rejected before token resolut
   );
   assert.throws(
     () => validateProductModelRequest({ provider: "grok", id: "gpt-5.5" }),
-    /not allowed/,
+    /model\.provider must be/,
   );
   assert.throws(
     () => validateProductModelRequest({ provider: "grok", id: "grok-4.20-multi-agent-0309" }),
-    /not allowed/,
+    /model\.provider must be/,
   );
 });
 
-test("OAuth token lookup accepts the product alias without changing the fixed endpoint", async () => {
+test("OAuth token lookup keeps the canonical product provider on the fixed endpoint", async () => {
   const gateway = {
     token: async () => "short-lived-oauth-token",
   } as unknown as PlatformGateway;
-  const run = request({ provider: "grok", id: "grok-4.3" });
+  const run = request({ provider: "xai-oauth", id: "grok-4.3" });
   const resolved = resolveModel(run, gateway);
   assert.equal(await resolved.getApiKey(resolved.model.provider), "short-lived-oauth-token");
   assert.equal(resolved.model.baseUrl, "https://api.x.ai/v1");
@@ -115,7 +114,7 @@ test("image support follows locked model metadata without overriding Codex OAuth
 
 test("text-only Codex selects an allowed image companion on the same OAuth endpoint", () => {
   const gateway = new PlatformGateway();
-  const sparkRequest = request({ provider: "codex", id: "gpt-5.3-codex-spark" });
+  const sparkRequest = request({ provider: "openai-codex", id: "gpt-5.3-codex-spark" });
   const companion = resolveAuxiliaryVisionModel(sparkRequest, gateway);
 
   assert.ok(companion);
@@ -125,7 +124,7 @@ test("text-only Codex selects an allowed image companion on the same OAuth endpo
   assert.equal(companion.model.baseUrl, "https://chatgpt.com/backend-api");
   assert.equal(modelSupportsImages(companion.model), true);
   assert.equal(
-    resolveAuxiliaryVisionModel(request({ provider: "codex", id: "gpt-5.5" }), gateway),
+    resolveAuxiliaryVisionModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway),
     undefined,
   );
 });

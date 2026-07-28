@@ -104,7 +104,7 @@ function ep<Body = void, Res = unknown, Args extends unknown[] = []>(
   return { method, path };
 }
 
-/** Bodies sent as the literal string "{}" (legacy empty-POST convention). */
+/** Bodies sent as the literal string "{}" by the API contract. */
 export const EMPTY_BODY = "{}";
 
 export const endpoints = {
@@ -419,10 +419,6 @@ export const endpoints = {
 
   /* system: runtime */
   runtime: ep<void, RuntimeResponse>("GET", () => "/api/system/runtime"),
-  restartRuntime: ep<string, unknown, [string]>(
-    "POST",
-    (name) => `/api/system/runtime/${name}/restart`,
-  ),
   /* system: config */
   securityConfig: ep<void, SecurityConfigResponse>(
     "GET",

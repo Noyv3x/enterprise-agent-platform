@@ -1,5 +1,5 @@
-/* <Sidebar/> — brand head + workspace nav + channel list/create + user foot
-   (legacy renderSidebar, legacy-app.js:439-487). When off-canvas (mobile +
+/* <Sidebar/> — brand head, workspace nav, channel list/create and user footer.
+   When off-canvas (mobile +
    closed) the <aside> is inert + aria-hidden so its controls are neither
    focusable nor announced — recomputed across the 800px breakpoint by the
    caller's useMediaQuery. */

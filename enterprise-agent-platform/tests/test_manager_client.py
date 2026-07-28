@@ -83,15 +83,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
         elif self.path == "/v1/status":
-            legacy_error_bytes = getattr(
-                self.server, "legacy_status_error_bytes", 0
+            diagnostic_error_bytes = getattr(
+                self.server, "status_diagnostic_error_bytes", 0
             )
-            if legacy_error_bytes:
+            if diagnostic_error_bytes:
                 self._respond_chunked(
                     {
                         "public_state": "idle",
                         "generation": "g1",
-                        "error": "x" * legacy_error_bytes,
+                        "error": "x" * diagnostic_error_bytes,
                     }
                 )
             else:
@@ -154,7 +154,7 @@ class ManagerClientTests(unittest.TestCase):
             with self.assertRaisesRegex(ManagerClientError, "token is unavailable"):
                 client.status()
 
-    def test_chunked_legacy_status_larger_than_two_mib_is_accepted(self):
+    def test_chunked_status_larger_than_two_mib_is_accepted(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             socket_path = root / "manager.sock"
@@ -162,16 +162,16 @@ class ManagerClientTests(unittest.TestCase):
             token_path.write_text("test-token\n", encoding="utf-8")
             server = _Server(str(socket_path), _Handler)
             server.requests = []
-            server.legacy_status_error_bytes = 3 * 1024 * 1024
+            server.status_diagnostic_error_bytes = 3 * 1024 * 1024
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                self.assertGreater(server.legacy_status_error_bytes, 2 * 1024 * 1024)
-                self.assertLess(server.legacy_status_error_bytes, MAX_MANAGER_RESPONSE_BYTES)
+                self.assertGreater(server.status_diagnostic_error_bytes, 2 * 1024 * 1024)
+                self.assertLess(server.status_diagnostic_error_bytes, MAX_MANAGER_RESPONSE_BYTES)
                 response = ManagerClient(socket_path, token_path).status()
                 self.assertEqual(response["generation"], "g1")
                 self.assertEqual(
-                    len(response["error"]), server.legacy_status_error_bytes
+                    len(response["error"]), server.status_diagnostic_error_bytes
                 )
             finally:
                 server.shutdown()

@@ -299,66 +299,6 @@ class _CronExpression:
 class AgentScheduleStore:
     def __init__(self, db: Database):
         self.db = db
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with self.db.transaction() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS agent_schedules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    schedule_json TEXT NOT NULL,
-                    timezone TEXT NOT NULL DEFAULT 'UTC',
-                    delivery TEXT NOT NULL DEFAULT 'chat'
-                        CHECK(delivery IN ('chat', 'chat_and_telegram')),
-                    state TEXT NOT NULL DEFAULT 'active'
-                        CHECK(state IN ('active', 'paused', 'completed')),
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    next_run_at INTEGER,
-                    last_run_id INTEGER,
-                    revision INTEGER NOT NULL DEFAULT 1,
-                    retry_after INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    deleted_at INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_agent_schedules_due
-                    ON agent_schedules(enabled, next_run_at, id);
-                CREATE INDEX IF NOT EXISTS idx_agent_schedules_owner
-                    ON agent_schedules(owner_user_id, deleted_at, id);
-
-                CREATE TABLE IF NOT EXISTS agent_schedule_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    schedule_id INTEGER NOT NULL REFERENCES agent_schedules(id) ON DELETE CASCADE,
-                    schedule_revision INTEGER NOT NULL DEFAULT 1,
-                    occurrence_key TEXT,
-                    scheduled_for INTEGER NOT NULL,
-                    trigger TEXT NOT NULL DEFAULT 'scheduled'
-                        CHECK(trigger IN ('scheduled', 'manual')),
-                    status TEXT NOT NULL DEFAULT 'queued'
-                        CHECK(status IN ('queued', 'running', 'succeeded', 'failed',
-                                         'needs_review', 'blocked', 'skipped', 'cancelled')),
-                    durable_job_id INTEGER REFERENCES durable_jobs(id),
-                    source_message_id INTEGER REFERENCES messages(id),
-                    response_message_id INTEGER REFERENCES messages(id),
-                    started_at INTEGER,
-                    finished_at INTEGER,
-                    error TEXT NOT NULL DEFAULT '',
-                    delivery_warning TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    UNIQUE(schedule_id, schedule_revision, occurrence_key)
-                );
-                CREATE INDEX IF NOT EXISTS idx_agent_schedule_runs_schedule
-                    ON agent_schedule_runs(schedule_id, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_agent_schedule_runs_job
-                    ON agent_schedule_runs(durable_job_id);
-                """
-            )
 
     def get(self, owner_user_id: int, schedule_id: int) -> dict[str, Any] | None:
         return self.db.query_one(

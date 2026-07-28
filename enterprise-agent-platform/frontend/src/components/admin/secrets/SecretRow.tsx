@@ -1,5 +1,4 @@
-/* <SecretRow/> — one platform-internal secret with an inline set form (legacy
-   renderSecretsSettings per-row, legacy-app.js:2644-2660). The input is local
+/* <SecretRow/> — one platform-internal secret with an inline set form. The input is local
    controlled state; on submit PUT { value } then clear it + reload secrets.
    The save action becomes available after the local value changes and tracks
    only this secret's operation. The aria-label ties the key name to the

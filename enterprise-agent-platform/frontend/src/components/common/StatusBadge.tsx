@@ -1,5 +1,4 @@
-/* <StatusBadge ok label/> — a status pill (legacy statusBadge(ok, label),
-   legacy-app.js:343-348). */
+/* <StatusBadge ok label/> — a status pill. */
 
 import { Badge } from "antd";
 

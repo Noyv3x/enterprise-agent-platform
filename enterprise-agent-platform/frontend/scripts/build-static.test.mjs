@@ -10,7 +10,6 @@ import {
 import {
   atomicPublish,
   precompressStaticAssets,
-  retainedPreviousAssets,
   validateStagedBuild,
 } from "./build-static.mjs";
 
@@ -91,54 +90,6 @@ describe("static asset precompression", () => {
   });
 });
 
-describe("previous release retention", () => {
-  it("retains compressed variants together with their hashed source asset", () => {
-    const current = [
-      "app-current123.js",
-      "app-current123.js.br",
-      "app-current123.js.gz",
-    ];
-    const previous = {
-      current_assets: [
-        "app-previous1.js",
-        "app-previous1.js.br",
-        "app-previous1.js.gz",
-      ],
-      previous_assets: [],
-    };
-
-    expect(retainedPreviousAssets(current, previous)).toEqual([
-      "app-previous1.js",
-      "app-previous1.js.br",
-      "app-previous1.js.gz",
-    ]);
-  });
-
-  it("keeps the previous release when rebuilding identical current assets", () => {
-    expect(
-      retainedPreviousAssets(
-        ["app-current.js", "styles-current.css"],
-        {
-          current_assets: ["styles-current.css", "app-current.js"],
-          previous_assets: ["app-previous.js", "styles-previous.css"],
-        },
-      ),
-    ).toEqual(["app-previous.js", "styles-previous.css"]);
-  });
-
-  it("promotes the old current release when content hashes change", () => {
-    expect(
-      retainedPreviousAssets(
-        ["app-new.js", "styles-new.css"],
-        {
-          current_assets: ["app-old.js", "styles-old.css"],
-          previous_assets: ["app-older.js"],
-        },
-      ),
-    ).toEqual(["app-old.js", "styles-old.css"]);
-  });
-});
-
 describe("atomic static publication", () => {
   it("restores every touched live file when commit is interrupted", async () => {
     const root = await temporaryRoot();
@@ -150,13 +101,14 @@ describe("atomic static publication", () => {
       writeFile(join(live, "index.html"), "old index"),
       writeFile(join(live, "theme-init.js"), "old theme"),
       writeFile(join(live, "ubitech-logo.png"), "old logo"),
+      writeFile(join(live, "app-obsolete123.js"), "old bundle"),
     ]);
 
     await expect(
       atomicPublish(
         stage,
         live,
-        { version: 1, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"], previous_assets: [] },
+        { version: 2, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"] },
         { beforeCommit: () => { throw new Error("simulated commit failure"); } },
       ),
     ).rejects.toThrow("simulated commit failure");
@@ -164,7 +116,12 @@ describe("atomic static publication", () => {
     expect(await readFile(join(live, "index.html"), "utf8")).toBe("old index");
     expect(await readFile(join(live, "theme-init.js"), "utf8")).toBe("old theme");
     expect(await readFile(join(live, "ubitech-logo.png"), "utf8")).toBe("old logo");
-    expect((await readdir(live)).sort()).toEqual(["index.html", "theme-init.js", "ubitech-logo.png"]);
+    expect((await readdir(live)).sort()).toEqual([
+      "app-obsolete123.js",
+      "index.html",
+      "theme-init.js",
+      "ubitech-logo.png",
+    ]);
   });
 
   it("publishes the entry only after all release files are installed", async () => {
@@ -179,7 +136,7 @@ describe("atomic static publication", () => {
     await atomicPublish(
       stage,
       live,
-      { version: 1, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"], previous_assets: [] },
+      { version: 2, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"] },
       {
         beforeCommit: async () => {
           dependenciesReady =
@@ -191,6 +148,48 @@ describe("atomic static publication", () => {
 
     expect(dependenciesReady).toBe(true);
     expect(await readFile(join(live, "index.html"), "utf8")).toContain("app-AbCd1234.js");
+  });
+
+  it("removes every file that is not part of the current staged release", async () => {
+    const root = await temporaryRoot();
+    const stage = join(root, "stage");
+    const live = join(root, "live");
+    await writeFixture(stage);
+    await mkdir(live, { recursive: true });
+    await Promise.all([
+      writeFile(join(live, "index.html"), "old index"),
+      writeFile(join(live, "app-obsolete123.js"), "old bundle"),
+      writeFile(join(live, "untracked-static.txt"), "unknown residue"),
+    ]);
+    let staleClearedBeforeCommit = false;
+
+    await atomicPublish(
+      stage,
+      live,
+      { version: 2, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"] },
+      {
+        beforeCommit: async () => {
+          const names = await readdir(live);
+          staleClearedBeforeCommit =
+            !names.includes("app-obsolete123.js") &&
+            !names.includes("untracked-static.txt");
+        },
+      },
+    );
+
+    expect(staleClearedBeforeCommit).toBe(true);
+    expect((await readdir(live)).sort()).toEqual([
+      ".static-release.json",
+      "app-AbCd1234.js",
+      "index.html",
+      "styles-ZyXw9876.css",
+      "theme-init.js",
+      "ubitech-logo.png",
+    ]);
+    expect(JSON.parse(await readFile(join(live, ".static-release.json"), "utf8"))).toEqual({
+      version: 2,
+      current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"],
+    });
   });
 
   it("publishes encoded indexes after ordinary assets and identity index last", async () => {
@@ -210,7 +209,7 @@ describe("atomic static publication", () => {
     await atomicPublish(
       stage,
       live,
-      { version: 1, current_assets: [], previous_assets: [] },
+      { version: 2, current_assets: [] },
       { afterInstall: (relativePath) => installed.push(relativePath) },
     );
 

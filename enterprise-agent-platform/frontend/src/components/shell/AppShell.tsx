@@ -2,9 +2,8 @@
    sidebar and main column remain custom structure, while Ant Design Drawer owns
    the mobile overlay, focus, Escape, and mask-dismiss behavior.
 
-   The SSE stream + safety poll are shell-owned (legacy
-   syncScopeStream/startPolling ran globally from afterRender/boot, not per chat
-   view), so useRealtime + usePolling mount here and track the active scope.
+   The SSE stream and safety poll are shell-owned, so useRealtime and usePolling
+   mount here and track the active scope.
 
 */
 

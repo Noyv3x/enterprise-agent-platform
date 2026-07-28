@@ -1,5 +1,4 @@
-/* <ChannelAuditCard/> — channel-message audit + delete tools (legacy Card A in
-   renderMessageAuditManagement, legacy-app.js:1830-1879). Three tools (delete by
+/* <ChannelAuditCard/> — channel-message audit and delete tools. Three tools (delete by
    id / delete-before / clear-all) + the message list. Every delete confirms via
    the shared useConfirm() dialog (cancel = no-op), then runs the data-op which
    cascades reloads. The two tool inputs are local state, cleared on a confirmed

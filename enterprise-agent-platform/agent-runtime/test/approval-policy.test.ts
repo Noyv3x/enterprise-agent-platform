@@ -54,14 +54,6 @@ test("terminal approval keys and displays bind the exact raw command and executi
       base.approvalKey,
       (await classifyToolCall("terminal", { command: "printf ok", background: true }, workspace)).approvalKey,
     );
-    assert.notEqual(
-      (await classifyToolCall("terminal", { command: "printf ok", background: true }, workspace)).approvalKey,
-      (await classifyToolCall("terminal", {
-        command: "printf ok",
-        background: true,
-        update_behavior: "terminate",
-      }, workspace)).approvalKey,
-    );
     const background = await classifyToolCall("terminal", { command: "printf ok", background: true }, workspace, 12_345);
     const backgroundTimed = await classifyToolCall(
       "terminal",

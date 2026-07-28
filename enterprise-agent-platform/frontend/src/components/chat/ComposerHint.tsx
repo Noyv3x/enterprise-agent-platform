@@ -1,5 +1,4 @@
-/* <ComposerHint/> — the keyboard hint under the composer field (legacy composer
-   hint, :736-739). */
+/* <ComposerHint/> — the keyboard hint under the composer field. */
 
 import { useI18n } from "../../i18n";
 

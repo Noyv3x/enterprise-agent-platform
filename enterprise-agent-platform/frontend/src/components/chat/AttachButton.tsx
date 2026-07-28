@@ -1,5 +1,4 @@
-/* <AttachButton/> — the composer paperclip that opens the hidden file input
-   (legacy composer attach button, :721-728). */
+/* <AttachButton/> — the composer paperclip that opens the hidden file input. */
 
 import { useI18n } from "../../i18n";
 import { Button, Tooltip } from "antd";

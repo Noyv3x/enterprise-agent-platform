@@ -3,6 +3,9 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,12 +26,18 @@ import (
 )
 
 type ProcessManager struct {
-	Engine    driver.Engine
-	Sandboxes *sandbox.Manager
-	MaxOutput int64
-	mu        sync.Mutex
-	processes map[string]*managedProcess
-	revision  uint64
+	Engine              driver.Engine
+	Sandboxes           *sandbox.Manager
+	MaxOutput           int64
+	mu                  sync.Mutex
+	processes           map[string]*managedProcess
+	pendingByFamily     map[string]int
+	pendingGlobal       int
+	maxRunningPerFamily int
+	maxRunningGlobal    int
+	maxCompletedRecords int
+	completedRecordTTL  time.Duration
+	previewID           string
 }
 type managedProcess struct {
 	mu             sync.Mutex
@@ -93,9 +103,88 @@ func NewProcessManager(engine driver.Engine, sandboxes *sandbox.Manager, maxOutp
 	if maxOutput < 1024 {
 		maxOutput = 1 << 20
 	}
-	manager := &ProcessManager{Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput, processes: map[string]*managedProcess{}}
+	manager := &ProcessManager{
+		Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput,
+		processes:           map[string]*managedProcess{},
+		pendingByFamily:     map[string]int{},
+		maxRunningPerFamily: 16,
+		maxRunningGlobal:    128,
+		maxCompletedRecords: 64,
+		completedRecordTTL:  time.Hour,
+		previewID:           newPreviewID(),
+	}
 	manager.recoverSandboxProcesses()
+	manager.pruneCompleted(time.Now())
 	return manager
+}
+
+func newPreviewID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	// The cursor is not a capability, but it must still change across Manager
+	// restarts. Keep startup available if the host entropy source is transiently
+	// unavailable while retaining process/time/address separation.
+	fallback := sha256.Sum256([]byte(fmt.Sprintf(
+		"%d:%d:%p", time.Now().UnixNano(), os.Getpid(), &value,
+	)))
+	return hex.EncodeToString(fallback[:16])
+}
+
+func scopeFamilyRoot(scope string) string {
+	if index := strings.Index(scope, "/delegate/"); index >= 0 {
+		return scope[:index]
+	}
+	return scope
+}
+
+func (m *ProcessManager) reserveProcessSlot(scope string) error {
+	family := scopeFamilyRoot(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	runningGlobal := 0
+	runningFamily := 0
+	for _, process := range m.processes {
+		process.mu.Lock()
+		active := activeProcessStatus(process.snapshot.Status)
+		processScope := process.snapshot.ScopeKey
+		process.mu.Unlock()
+		if !active {
+			continue
+		}
+		runningGlobal++
+		if scopeFamilyRoot(processScope) == family {
+			runningFamily++
+		}
+	}
+	if runningFamily+m.pendingByFamily[family] >= m.maxRunningPerFamily {
+		return fmt.Errorf("Agent scope family already owns %d running processes", m.maxRunningPerFamily)
+	}
+	if runningGlobal+m.pendingGlobal >= m.maxRunningGlobal {
+		return fmt.Errorf("Manager already owns %d running processes", m.maxRunningGlobal)
+	}
+	m.pendingByFamily[family]++
+	m.pendingGlobal++
+	return nil
+}
+
+func (m *ProcessManager) releaseProcessSlot(scope string) {
+	m.mu.Lock()
+	m.releaseProcessSlotLocked(scope)
+	m.mu.Unlock()
+}
+
+func (m *ProcessManager) releaseProcessSlotLocked(scope string) {
+	family := scopeFamilyRoot(scope)
+	if count := m.pendingByFamily[family]; count > 1 {
+		m.pendingByFamily[family] = count - 1
+	} else {
+		delete(m.pendingByFamily, family)
+	}
+	if m.pendingGlobal > 0 {
+		m.pendingGlobal--
+	}
 }
 
 const sandboxProcessWrapper = `
@@ -183,12 +272,6 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	if args.TimeoutMS < 0 || args.TimeoutMS > 24*60*60*1000 {
 		return ProcessSnapshot{}, errors.New("timeout_ms is out of range")
 	}
-	if args.UpdateBehavior != "" && args.UpdateBehavior != "wait" && args.UpdateBehavior != "terminate" {
-		return ProcessSnapshot{}, errors.New("invalid update_behavior")
-	}
-	if !args.Background && args.UpdateBehavior != "" {
-		return ProcessSnapshot{}, errors.New("update_behavior requires background=true")
-	}
 	spec, err := m.Sandboxes.Ensure(requestContext, call.ExecutionContext.SandboxID, call.ExecutionContext.WorkspaceID, time.Now())
 	if err != nil {
 		return ProcessSnapshot{}, err
@@ -196,11 +279,26 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	if err := m.Sandboxes.BeginCall(call.ExecutionContext.SandboxID, time.Now()); err != nil {
 		return ProcessSnapshot{}, err
 	}
+	callOpen := true
+	defer func() {
+		if callOpen {
+			_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
+		}
+	}()
 	id, err := randomID("proc_")
 	if err != nil {
-		_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
 		return ProcessSnapshot{}, err
 	}
+	m.pruneCompleted(time.Now())
+	if err := m.reserveProcessSlot(call.ScopeID); err != nil {
+		return ProcessSnapshot{}, err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseProcessSlot(call.ScopeID)
+		}
+	}()
 	cwd := args.CWD
 	var name string
 	var commandArgs []string
@@ -214,7 +312,6 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 		}
 		processDir := filepath.Join(spec.Environment, "processes")
 		if err := os.MkdirAll(processDir, 0o700); err != nil {
-			_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
 			return ProcessSnapshot{}, err
 		}
 		hostPIDFile = filepath.Join(processDir, id+".pid")
@@ -258,7 +355,6 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		cancel()
-		_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
 		return ProcessSnapshot{}, err
 	}
 	now := time.Now().UTC()
@@ -266,10 +362,9 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	if call.Target == "sandbox" {
 		stateFile = filepath.Join(filepath.Dir(m.Sandboxes.StatePath), "processes", spec.AgentHash, id+".json")
 	}
-	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: args.Command, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background, UpdateBehavior: args.UpdateBehavior}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, stateFile: stateFile, stdout: stdout, stderr: stderr}
+	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: args.Command, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, stateFile: stateFile, stdout: stdout, stderr: stderr}
 	if err := command.Start(); err != nil {
 		cancel()
-		_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
 		return ProcessSnapshot{}, err
 	}
 	process.snapshot.PID = command.Process.Pid
@@ -277,25 +372,27 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 		if containerPID, waitErr := waitForPIDFile(hostPIDFile, 2*time.Second); waitErr != nil {
 			cancel()
 			_, _ = m.stopSandboxProcess(process)
-			_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, false, time.Now())
 			return ProcessSnapshot{}, waitErr
 		} else {
 			process.snapshot.PID = containerPID
 		}
 	}
 	m.mu.Lock()
+	m.releaseProcessSlotLocked(call.ScopeID)
 	m.processes[id] = process
-	m.revision++
 	m.mu.Unlock()
+	reserved = false
 	_ = m.persistProcess(process)
 	if args.Background {
 		_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, true, time.Now())
+		callOpen = false
 		go m.wait(process)
 		return m.snapshot(process), nil
 	}
 	m.wait(process)
 	snapshot := m.snapshot(process)
 	_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, snapshot.Status == "orphaned", time.Now())
+	callOpen = false
 	if snapshot.Status == "cancelled" {
 		return snapshot, context.Canceled
 	}
@@ -329,17 +426,11 @@ func (m *ProcessManager) wait(process *managedProcess) {
 		} else {
 			process.snapshot.Status = "orphaned"
 			process.snapshot.Background = true
-			if process.snapshot.UpdateBehavior == "" {
-				process.snapshot.UpdateBehavior = "wait"
-			}
 		}
 	} else if !confirmed {
 		process.snapshot.StopConfirmed = boolPointer(false)
 		process.snapshot.Status = "orphaned"
 		process.snapshot.Background = true
-		if process.snapshot.UpdateBehavior == "" {
-			process.snapshot.UpdateBehavior = "wait"
-		}
 	} else {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -356,13 +447,11 @@ func (m *ProcessManager) wait(process *managedProcess) {
 	if process.hostPIDFile != "" && !orphaned {
 		_ = os.Remove(process.hostPIDFile)
 	}
-	m.mu.Lock()
-	m.revision++
-	m.mu.Unlock()
 	_ = m.persistProcess(process)
 	if background && !orphaned {
 		_ = m.Sandboxes.ProcessExited(process.sandboxID, time.Now())
 	}
+	m.pruneCompleted(time.Now())
 }
 
 func waitForPIDFile(path string, timeout time.Duration) (int, error) {
@@ -399,6 +488,74 @@ func (m *ProcessManager) persistProcess(process *managedProcess) error {
 	return atomicfile.WriteJSON(process.stateFile, value, 0o600)
 }
 
+func (m *ProcessManager) pruneCompleted(now time.Time) {
+	type completedProcess struct {
+		id       string
+		finished time.Time
+		process  *managedProcess
+	}
+	candidates := make([]completedProcess, 0)
+	m.mu.Lock()
+	for id, process := range m.processes {
+		process.mu.Lock()
+		active := activeProcessStatus(process.snapshot.Status)
+		finished := process.snapshot.StartedAt
+		if process.snapshot.FinishedAt != nil {
+			finished = *process.snapshot.FinishedAt
+		}
+		process.mu.Unlock()
+		if !active {
+			candidates = append(candidates, completedProcess{id: id, finished: finished, process: process})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].finished.Equal(candidates[j].finished) {
+			return candidates[i].finished.After(candidates[j].finished)
+		}
+		return candidates[i].id > candidates[j].id
+	})
+	removed := make([]*managedProcess, 0)
+	for index, candidate := range candidates {
+		expired := m.completedRecordTTL > 0 && now.Sub(candidate.finished) > m.completedRecordTTL
+		if index >= m.maxCompletedRecords || expired {
+			delete(m.processes, candidate.id)
+			removed = append(removed, candidate.process)
+		}
+	}
+	m.mu.Unlock()
+	for _, process := range removed {
+		m.removeCompletedProcessFiles(process)
+	}
+}
+
+func removeFileWithin(root, path string) {
+	if root == "" || path == "" {
+		return
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+func (m *ProcessManager) removeCompletedProcessFiles(process *managedProcess) {
+	stateRoot := filepath.Join(filepath.Dir(m.Sandboxes.StatePath), "processes")
+	outputRoot := filepath.Join(process.spec.Environment, "processes")
+	removeFileWithin(stateRoot, process.stateFile)
+	removeFileWithin(outputRoot, process.hostPIDFile)
+	removeFileWithin(outputRoot, process.hostStdoutFile)
+	removeFileWithin(outputRoot, process.hostStderrFile)
+	if process.stateFile != "" {
+		_ = os.Remove(filepath.Dir(process.stateFile))
+	}
+	if process.spec.Environment != "" {
+		_ = os.Remove(outputRoot)
+	}
+}
+
 func (m *ProcessManager) recoverSandboxProcesses() {
 	counts := map[string]int{}
 	for _, record := range m.Sandboxes.Records() {
@@ -425,9 +582,6 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 				}
 				if running {
 					process.snapshot.Background = true
-					if process.snapshot.UpdateBehavior == "" {
-						process.snapshot.UpdateBehavior = "wait"
-					}
 					counts[state.SandboxID]++
 					go m.watchRecoveredProcess(process)
 				} else {
@@ -461,9 +615,7 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		process.mu.Unlock()
 		_ = m.persistProcess(process)
 		_ = m.Sandboxes.ProcessExited(process.sandboxID, now)
-		m.mu.Lock()
-		m.revision++
-		m.mu.Unlock()
+		m.pruneCompleted(now)
 		return
 	}
 }
@@ -610,6 +762,7 @@ func readTailFile(path string, limit int64) (string, error) {
 }
 
 func (m *ProcessManager) List(scope, lifecycle string, target ...string) []ProcessSnapshot {
+	m.pruneCompleted(time.Now())
 	m.mu.Lock()
 	values := make([]*managedProcess, 0, len(m.processes))
 	for _, p := range m.processes {
@@ -623,8 +776,45 @@ func (m *ProcessManager) List(scope, lifecycle string, target ...string) []Proce
 			result = append(result, s)
 		}
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].StartedAt.Before(result[j].StartedAt) })
+	sortProcessSnapshots(result)
 	return result
+}
+
+func (m *ProcessManager) listScopeFamily(scope, lifecycle string) []ProcessSnapshot {
+	m.pruneCompleted(time.Now())
+	m.mu.Lock()
+	values := make([]*managedProcess, 0, len(m.processes))
+	for _, process := range m.processes {
+		values = append(values, process)
+	}
+	m.mu.Unlock()
+	result := make([]ProcessSnapshot, 0)
+	for _, process := range values {
+		snapshot := m.snapshot(process)
+		if scopeFamilyOwns(scope, snapshot.ScopeKey) && (lifecycle == "" || snapshot.LifecycleID == lifecycle) {
+			result = append(result, snapshot)
+		}
+	}
+	sortProcessSnapshots(result)
+	return result
+}
+
+func sortProcessSnapshots(processes []ProcessSnapshot) {
+	sort.Slice(processes, func(i, j int) bool {
+		leftActive := activeProcessStatus(processes[i].Status)
+		rightActive := activeProcessStatus(processes[j].Status)
+		if leftActive != rightActive {
+			return leftActive
+		}
+		if !processes[i].StartedAt.Equal(processes[j].StartedAt) {
+			return processes[i].StartedAt.After(processes[j].StartedAt)
+		}
+		return processes[i].ID < processes[j].ID
+	})
+}
+
+func scopeFamilyOwns(root, candidate string) bool {
+	return candidate == root || (root != "" && strings.HasPrefix(candidate, root+"/delegate/"))
 }
 func (m *ProcessManager) Get(scope, lifecycle, target, id string) (ProcessSnapshot, error) {
 	m.mu.Lock()
@@ -707,7 +897,7 @@ func (m *ProcessManager) CleanupScope(scope, lifecycle string) bool {
 	matched := make([]*managedProcess, 0)
 	for _, p := range values {
 		s := m.snapshot(p)
-		if s.ScopeKey == scope && (lifecycle == "" || s.LifecycleID == lifecycle) && activeProcessStatus(s.Status) {
+		if scopeFamilyOwns(scope, s.ScopeKey) && (lifecycle == "" || s.LifecycleID == lifecycle) && activeProcessStatus(s.Status) {
 			if !m.stopProcess(p) {
 				return false
 			}
@@ -768,17 +958,19 @@ func confirmStopped(processes []*managedProcess, timeout time.Duration) bool {
 	}
 }
 func (m *ProcessManager) Preview(scope, lifecycle, since string) map[string]any {
-	list := m.List(scope, lifecycle)
-	m.mu.Lock()
-	revision := fmt.Sprintf("%d", m.revision)
-	m.mu.Unlock()
-	if since == revision {
-		return map[string]any{"processes": []any{}, "revision": revision, "unchanged": true}
-	}
+	list := m.listScopeFamily(scope, lifecycle)
 	previews := make([]map[string]any, 0, len(list))
 	if len(list) > 16 {
-		list = list[len(list)-16:]
+		list = list[:16]
 	}
+	fingerprint := sha256.New()
+	writeFingerprint := func(value string) {
+		_, _ = fmt.Fprintf(fingerprint, "%d:", len(value))
+		_, _ = fingerprint.Write([]byte(value))
+	}
+	writeFingerprint(scope)
+	writeFingerprint(lifecycle)
+	updatedAt := time.Now().UTC()
 	for _, p := range list {
 		output := p.Stdout
 		if p.Stderr != "" {
@@ -787,37 +979,62 @@ func (m *ProcessManager) Preview(scope, lifecycle, since string) map[string]any 
 		if len(output) > 16*1024 {
 			output = output[len(output)-16*1024:]
 		}
-		previews = append(previews, map[string]any{"id": p.ID, "title": p.Command, "command": p.Command, "cwd": p.CWD, "output": output, "status": p.Status, "running": activeProcessStatus(p.Status), "exit_code": p.ExitCode, "started_at": p.StartedAt, "updated_at": time.Now().UTC(), "finished_at": p.FinishedAt, "truncated": len(p.Stdout)+len(p.Stderr) > len(output)})
+		truncated := len(p.Stdout)+len(p.Stderr) > len(output)
+		exitCode := ""
+		if p.ExitCode != nil {
+			exitCode = strconv.Itoa(*p.ExitCode)
+		}
+		finishedAt := ""
+		if p.FinishedAt != nil {
+			finishedAt = p.FinishedAt.Format(time.RFC3339Nano)
+		}
+		for _, value := range []string{
+			p.ID, p.Command, p.CWD, output, p.Status,
+			strconv.FormatBool(activeProcessStatus(p.Status)),
+			exitCode, p.StartedAt.Format(time.RFC3339Nano), finishedAt,
+			strconv.FormatBool(truncated),
+		} {
+			writeFingerprint(value)
+		}
+		previews = append(previews, map[string]any{"id": p.ID, "title": p.Command, "command": p.Command, "cwd": p.CWD, "output": output, "status": p.Status, "running": activeProcessStatus(p.Status), "exit_code": p.ExitCode, "started_at": p.StartedAt, "updated_at": updatedAt, "finished_at": p.FinishedAt, "truncated": truncated})
+	}
+	digest := fingerprint.Sum(nil)
+	var revisionNumber uint64
+	for _, value := range digest[:8] {
+		revisionNumber = revisionNumber<<8 | uint64(value)
+	}
+	revision := fmt.Sprintf("preview_manager_%s:%d", m.previewID, revisionNumber)
+	if since == revision {
+		return map[string]any{"processes": []any{}, "revision": revision, "unchanged": true}
 	}
 	return map[string]any{"processes": previews, "revision": revision}
 }
 func (m *ProcessManager) RunningCount(scope, lifecycle string) int {
 	count := 0
-	for _, p := range m.List(scope, lifecycle) {
+	for _, p := range m.listScopeFamily(scope, lifecycle) {
 		if activeProcessStatus(p.Status) {
 			count++
 		}
 	}
 	return count
 }
-func (m *ProcessManager) UpdateBlockers() (int, int, int) {
+
+// ActiveBackgroundCount returns the number of managed background processes
+// that are still running or whose termination could not be confirmed. Every
+// such process delays an update; the Manager never terminates one for cutover.
+func (m *ProcessManager) ActiveBackgroundCount() int {
 	m.mu.Lock()
-	values := make([]*managedProcess, 0)
+	values := make([]*managedProcess, 0, len(m.processes))
 	for _, p := range m.processes {
 		values = append(values, p)
 	}
 	m.mu.Unlock()
-	running, blocking, terminable := 0, 0, 0
+	count := 0
 	for _, p := range values {
 		s := m.snapshot(p)
 		if s.Background && activeProcessStatus(s.Status) {
-			running++
-			if s.UpdateBehavior == "terminate" {
-				terminable++
-			} else {
-				blocking++
-			}
+			count++
 		}
 	}
-	return running, blocking, terminable
+	return count
 }

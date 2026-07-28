@@ -1,8 +1,6 @@
-/* =====================================================================
-   Change-detection fingerprints — ported from legacy-app.js:2875-2936.
-   Used by the realtime layer to suppress no-op re-renders (so identical
-   poll/SSE payloads don't disturb scroll/focus). Pure; no store reads.
-   ===================================================================== */
+/* Change-detection fingerprints used by the realtime layer to suppress no-op
+   re-renders, so identical poll/SSE payloads do not disturb scroll or focus.
+   Pure; no store reads. */
 
 import type { AgentStatus, ChatMode, Message, TypingUser } from "../types";
 
@@ -145,8 +143,8 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
   };
 }
 
-/** A deep JSON change-detector for the active chat scope (legacy chatSnapshot).
- *  Inputs are passed explicitly so this stays store-agnostic. */
+/** A deep JSON change detector for the active chat scope. Inputs are passed
+ * explicitly so this stays store-agnostic. */
 export function chatSnapshot(
   mode: ChatMode,
   scopeId: string,

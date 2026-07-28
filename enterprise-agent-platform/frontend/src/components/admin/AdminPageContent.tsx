@@ -1,6 +1,5 @@
-/* <AdminPageContent pageId/> — the admin page dispatch table (legacy
-   renderAdminPageSections, legacy-app.js:1410-1423). Maps each page id to its
-   section component(s).
+/* <AdminPageContent pageId/> — the admin page dispatch table. Maps each page id
+   to its section components.
 
    The Agent runtime page combines provider authorization with neutral runtime
    settings; managed service and platform settings remain on their own pages:

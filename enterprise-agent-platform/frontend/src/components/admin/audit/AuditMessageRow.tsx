@@ -1,5 +1,5 @@
-/* <AuditMessageRow/> — one message in an audit list (legacy renderAuditMessageRow,
-   legacy-app.js:1966-1985). Reuses the shared <MessageAttachments> atom (which runs
+/* <AuditMessageRow/> — one message in an audit list. Reuses the shared
+   <MessageAttachments> atom, which runs
    hrefs/srcs through safeUrl). The trash button shows only when deletable. */
 
 import { cx } from "../../../lib/cx";

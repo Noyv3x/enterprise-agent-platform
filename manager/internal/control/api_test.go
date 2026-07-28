@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,11 +13,20 @@ import (
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
+	"github.com/ubitech/agent-platform/manager/internal/driver"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/migration"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 	"github.com/ubitech/agent-platform/manager/internal/operation"
 )
+
+type statusReporter struct {
+	driver.Engine
+	services map[string]driver.FixedServiceState
+}
+
+func (s statusReporter) FixedServiceStatus(context.Context) map[string]driver.FixedServiceState {
+	return s.services
+}
 
 func TestAPICapabilityMatrix(t *testing.T) {
 	t.Parallel()
@@ -103,6 +113,61 @@ func TestStatusExposesDurableMaintenanceReservation(t *testing.T) {
 	}
 }
 
+func TestStatusReportsEveryCoreServiceWithoutAssumingUnknownIsHealthy(t *testing.T) {
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &API{
+		Store: store,
+		Engine: statusReporter{services: map[string]driver.FixedServiceState{
+			"platform":                    {Status: "healthy"},
+			"agent-runtime":               {Status: "healthy"},
+			"camofox":                     {Status: "healthy"},
+			"searxng":                     {Status: "healthy"},
+			"firecrawl-playwright":        {Status: "healthy"},
+			"firecrawl-redis":             {Status: "healthy"},
+			"firecrawl-rabbitmq":          {Status: "healthy"},
+			"firecrawl-postgres":          {Status: "healthy"},
+			"firecrawl-foundationdb":      {Status: "healthy"},
+			"firecrawl-foundationdb-init": {Status: "unavailable"},
+			"firecrawl-api":               {Status: "starting"},
+			"not-a-supported-service":     {Status: "healthy"},
+		}},
+		ControlToken: "control-token-0123456789abcdef",
+	}
+	status, _ := requestManagerStatus(t, api)
+	services, ok := status["services"].(map[string]any)
+	if !ok {
+		t.Fatalf("status services = %#v", status["services"])
+	}
+	if len(services) != 12 {
+		t.Fatalf("status exposed %d services, want Manager plus eleven core services: %#v", len(services), services)
+	}
+	for name, expected := range map[string]string{
+		"manager":                     "healthy",
+		"platform":                    "healthy",
+		"agent-runtime":               "healthy",
+		"camofox":                     "healthy",
+		"searxng":                     "healthy",
+		"firecrawl-playwright":        "healthy",
+		"firecrawl-redis":             "healthy",
+		"firecrawl-rabbitmq":          "healthy",
+		"firecrawl-postgres":          "healthy",
+		"firecrawl-foundationdb":      "healthy",
+		"firecrawl-foundationdb-init": "unavailable",
+		"firecrawl-api":               "starting",
+	} {
+		service, ok := services[name].(map[string]any)
+		if !ok || service["status"] != expected {
+			t.Fatalf("service %s = %#v, want status %s", name, services[name], expected)
+		}
+	}
+	if _, exists := services["not-a-supported-service"]; exists {
+		t.Fatal("status exposed an uncontracted service")
+	}
+}
+
 func requestManagerStatus(t *testing.T, api *API) (map[string]any, []byte) {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -118,66 +183,6 @@ func requestManagerStatus(t *testing.T, api *API) (map[string]any, []byte) {
 		t.Fatal(err)
 	}
 	return status, body
-}
-
-func TestStatusProjectsWaitingLegacyMigrationSafely(t *testing.T) {
-	dir := t.TempDir()
-	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	statePath := filepath.Join(dir, "migration.json")
-	legacyPath := filepath.Join(dir, "obsolete-source-checkout")
-	largeError := "inspect " + filepath.Join(legacyPath, "recovery-pack") + ": " + strings.Repeat("waiting\x1b\n", 5000)
-	plan := migration.Plan{
-		SchemaVersion:        1,
-		ID:                   "legacy-waiting",
-		LegacyRoot:           legacyPath,
-		LegacyData:           filepath.Join(legacyPath, "data"),
-		DestinationData:      filepath.Join(dir, "current-data"),
-		LegacyService:        "enterprise-agent-platform.service",
-		ExpectedSourceCommit: strings.Repeat("a", 40),
-		OperationID:          "op_install",
-		Status:               "committed",
-		Entries:              []migration.FileRecord{{Path: filepath.Join(legacyPath, "secret")}},
-		Retirement: &migration.Retirement{
-			CampaignID: "source-v1-retirement-2026-07",
-			Status:     "waiting_readiness",
-			StartedAt:  time.Unix(100, 0).UTC(),
-			Error:      largeError,
-		},
-		Error:     largeError,
-		CreatedAt: time.Unix(100, 0).UTC(),
-		UpdatedAt: time.Unix(101, 0).UTC(),
-	}
-	if err := atomicfile.WriteJSON(statePath, plan, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	api := &API{
-		Store:        store,
-		Legacy:       &migration.Service{StatePath: statePath},
-		ControlToken: "control-token-0123456789abcdef",
-	}
-	status, body := requestManagerStatus(t, api)
-	projected, ok := status["legacy_migration"].(map[string]any)
-	if !ok {
-		t.Fatalf("waiting migration projection is missing: %#v", status["legacy_migration"])
-	}
-	retirement, ok := projected["retirement"].(map[string]any)
-	if projected["status"] != "committed" || !ok || retirement["status"] != "waiting_readiness" ||
-		retirement["generation_id"] != "" || retirement["error"] != "source retirement preconditions are not satisfied" ||
-		projected["error"] != "source retirement preconditions are not satisfied" {
-		t.Fatalf("unexpected waiting migration projection: %#v", projected)
-	}
-	if bytes.Contains(body, []byte(legacyPath)) || bytes.Contains(body, []byte("obsolete-source-checkout")) {
-		t.Fatalf("status exposed a legacy host path: %s", body)
-	}
-	if status["public_state"] != string(model.StateIdle) || status["maintenance"] != false {
-		t.Fatalf("migration projection changed serving state: %#v", status)
-	}
-	if len(body) > 32<<10 {
-		t.Fatalf("bounded waiting migration expanded status to %d bytes", len(body))
-	}
 }
 
 func TestStatusOmitsGenerationHostPaths(t *testing.T) {
@@ -235,151 +240,7 @@ func TestStatusOmitsGenerationHostPaths(t *testing.T) {
 	}
 }
 
-func TestStatusBoundsMalformedLegacyMigrationScalars(t *testing.T) {
-	dir := t.TempDir()
-	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	statePath := filepath.Join(dir, "migration.json")
-	plan := migration.Plan{
-		SchemaVersion: 1,
-		ID:            strings.Repeat("<", 64<<10),
-		OperationID:   strings.Repeat("<", 64<<10),
-		Status:        strings.Repeat("<", 64<<10),
-		Retirement: &migration.Retirement{
-			CampaignID:   strings.Repeat("<", 64<<10),
-			GenerationID: strings.Repeat("<", 64<<10),
-			Status:       strings.Repeat("<", 64<<10),
-			StartedAt:    time.Unix(100, 0).UTC(),
-		},
-		CreatedAt: time.Unix(100, 0).UTC(),
-		UpdatedAt: time.Unix(101, 0).UTC(),
-	}
-	if err := atomicfile.WriteJSON(statePath, plan, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	status, body := requestManagerStatus(t, &API{
-		Store:        store,
-		Legacy:       &migration.Service{StatePath: statePath},
-		ControlToken: "control-token-0123456789abcdef",
-	})
-	projected, ok := status["legacy_migration"].(map[string]any)
-	if !ok || projected["status"] != "unavailable" || projected["id"] != "" || projected["operation_id"] != "" {
-		t.Fatalf("malformed migration scalars were exposed: %#v", status["legacy_migration"])
-	}
-	if len(body) > 32<<10 || bytes.Contains(body, []byte("\\u003c\\u003c\\u003c")) {
-		t.Fatalf("malformed migration amplified status to %d bytes", len(body))
-	}
-}
-
-func TestStatusProjectsCompletedLegacyRetirementReceipt(t *testing.T) {
-	dir := t.TempDir()
-	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	startedAt := time.Unix(100, 0).UTC()
-	completedAt := time.Unix(110, 0).UTC()
-	plan := migration.Plan{
-		SchemaVersion:        1,
-		ID:                   "legacy-purged",
-		ExpectedSourceCommit: strings.Repeat("a", 40),
-		OperationID:          "op_install",
-		Status:               "purged",
-		Retirement: &migration.Retirement{
-			CampaignID:         "source-v1-retirement-2026-07",
-			GenerationID:       strings.Repeat("b", 40),
-			Status:             "completed",
-			SystemdRemoved:     true,
-			SourceStateRemoved: true,
-			DockerRemoved:      true,
-			RecoveryRemoved:    true,
-			StartedAt:          startedAt,
-			CompletedAt:        completedAt,
-		},
-		CreatedAt: startedAt,
-		UpdatedAt: completedAt,
-	}
-	statePath := filepath.Join(dir, "migration.json")
-	if err := atomicfile.WriteJSON(statePath, plan, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	api := &API{
-		Store:        store,
-		Legacy:       &migration.Service{StatePath: statePath},
-		ControlToken: "control-token-0123456789abcdef",
-	}
-	status, _ := requestManagerStatus(t, api)
-	projected, ok := status["legacy_migration"].(map[string]any)
-	if !ok || projected["status"] != "purged" {
-		t.Fatalf("completed migration projection is missing: %#v", status["legacy_migration"])
-	}
-	retirement, ok := projected["retirement"].(map[string]any)
-	if !ok || retirement["status"] != "completed" || retirement["generation_id"] != strings.Repeat("b", 40) || retirement["recovery_removed"] != true {
-		t.Fatalf("completed retirement receipt changed: %#v", projected["retirement"])
-	}
-	if status["public_state"] != string(model.StateIdle) || status["maintenance"] != false {
-		t.Fatalf("completed retirement changed serving state: %#v", status)
-	}
-}
-
-func TestStatusProjectsNoLegacyMigrationAsNull(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		legacy *migration.Service
-	}{
-		{name: "integration disabled"},
-		{name: "journal absent", legacy: &migration.Service{StatePath: filepath.Join(t.TempDir(), "missing-migration.json")}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store, err := journal.Open(t.TempDir(), time.Now())
-			if err != nil {
-				t.Fatal(err)
-			}
-			api := &API{Store: store, Legacy: test.legacy, ControlToken: "control-token-0123456789abcdef"}
-			status, _ := requestManagerStatus(t, api)
-			value, exists := status["legacy_migration"]
-			if !exists || value != nil {
-				t.Fatalf("legacy_migration = %#v, want explicit null", value)
-			}
-		})
-	}
-}
-
-func TestStatusBoundsUnreadableLegacyMigrationWithoutExposingPath(t *testing.T) {
-	dir := t.TempDir()
-	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	secretRoot := filepath.Join(dir, "private-host-layout")
-	statePath := filepath.Join(secretRoot, "migration.json")
-	if err := os.MkdirAll(statePath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	api := &API{
-		Store:        store,
-		Legacy:       &migration.Service{StatePath: statePath},
-		ControlToken: "control-token-0123456789abcdef",
-	}
-	status, body := requestManagerStatus(t, api)
-	projected, ok := status["legacy_migration"].(map[string]any)
-	if !ok || projected["status"] != "unavailable" || projected["error"] != "legacy migration status is unavailable" {
-		t.Fatalf("unreadable migration was not safely projected: %#v", status["legacy_migration"])
-	}
-	if bytes.Contains(body, []byte(secretRoot)) || bytes.Contains(body, []byte(statePath)) || bytes.Contains(body, []byte("private-host-layout")) {
-		t.Fatalf("unreadable migration exposed its host path: %s", body)
-	}
-	if len(projected["error"].(string)) > journal.MaxDiagnosticBytes {
-		t.Fatalf("unreadable migration diagnostic is unbounded: %d", len(projected["error"].(string)))
-	}
-	if status["public_state"] != string(model.StateIdle) || status["maintenance"] != false {
-		t.Fatalf("unreadable migration changed serving state: %#v", status)
-	}
-}
-
-func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing.T) {
+func TestAPIProjectsOversizedDiagnosticsWithoutRewritingJournal(t *testing.T) {
 	dir := t.TempDir()
 	seed, err := journal.Open(dir, time.Unix(100, 0))
 	if err != nil {
@@ -387,23 +248,23 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 	}
 	op, _, err := seed.Begin(model.OperationRequest{
 		Kind:               model.OperationUpdate,
-		IdempotencyKey:     "legacy-oversized-diagnostic",
+		IdempotencyKey:     "oversized-diagnostic",
 		ExpectedGeneration: seed.State().Generation,
 	}, time.Unix(101, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyDiagnostic := strings.Repeat("retry reservation release\n", 110000)
+	diagnostic := strings.Repeat("retry reservation release\n", 110000)
 	completedAt := time.Unix(102, 0).UTC()
 	op.Status = model.OperationFailed
 	op.Finalized = true
-	op.Error = legacyDiagnostic
+	op.Error = diagnostic
 	op.CompletedAt = &completedAt
 	for i := 0; i < journal.MaxOperationHistoryEntries+20; i++ {
 		op.History = append(op.History, model.PhaseEvent{
 			Phase: model.PhaseDraining,
 			At:    time.Unix(int64(200+i), 0).UTC(),
-			Note:  strings.Repeat("legacy-history-note\x1b", 256),
+			Note:  strings.Repeat("history-note\x1b", 256),
 		})
 	}
 	state := seed.State()
@@ -412,7 +273,7 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 	state.Phase = ""
 	state.PublicState = model.StateIdle
 	state.Maintenance = false
-	state.LastError = legacyDiagnostic
+	state.LastError = diagnostic
 	statePath := filepath.Join(dir, "state.json")
 	opPath := filepath.Join(dir, "operations", op.ID+".json")
 	if err := atomicfile.WriteJSON(statePath, state, 0o600); err != nil {
@@ -452,7 +313,7 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 		api.ServeHTTP(response, req)
 		return response
 	}
-	wantDiagnostic := journal.BoundDiagnostic(legacyDiagnostic)
+	wantDiagnostic := journal.BoundDiagnostic(diagnostic)
 
 	statusResponse := request(http.MethodGet, "/v1/status", "")
 	if statusResponse.Code != http.StatusOK || statusResponse.Body.Len() >= 1<<20 {
@@ -489,7 +350,7 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 		}
 	}
 
-	postBody := `{"operation":"update","idempotency_key":"legacy-oversized-diagnostic","expected_generation":0}`
+	postBody := `{"operation":"update","idempotency_key":"oversized-diagnostic","expected_generation":0}`
 	startResponse := request(http.MethodPost, "/v1/operations", postBody)
 	if startResponse.Code != http.StatusAccepted || startResponse.Body.Len() >= 1<<20 {
 		t.Fatalf("oversized idempotent operation response: status=%d bytes=%d body=%s", startResponse.Code, startResponse.Body.Len(), startResponse.Body.String())
@@ -508,88 +369,7 @@ func TestAPIProjectsLegacyOversizedDiagnosticsWithoutRewritingJournal(t *testing
 	stateAfter, _ := os.ReadFile(statePath)
 	opAfter, _ := os.ReadFile(opPath)
 	if !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(opBefore, opAfter) {
-		t.Fatal("API observation rewrote legacy journal evidence")
-	}
-}
-
-func TestLegacyMigrationStatusReturnsOnlyBoundedProgressProjection(t *testing.T) {
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "migration.json")
-	largeError := strings.Repeat("external migration failure\x1b\n", 5000)
-	plan := migration.Plan{
-		SchemaVersion: 1,
-		ID:            "legacy-bounded-status",
-		OperationID:   "op_legacy",
-		Status:        "failed",
-		Entries:       make([]migration.FileRecord, 10000),
-		Quarantined:   make([]string, 10000),
-		Error:         largeError,
-		Retirement: &migration.Retirement{
-			CampaignID:         "source-v1-retirement-2026-07",
-			GenerationID:       strings.Repeat("a", 40),
-			Status:             "source_state_removed",
-			SystemdRemoved:     true,
-			SourceStateRemoved: true,
-			Error:              largeError,
-			StartedAt:          time.Unix(100, 0).UTC(),
-		},
-		CreatedAt: time.Unix(100, 0).UTC(),
-		UpdatedAt: time.Unix(101, 0).UTC(),
-	}
-	for index := range plan.Entries {
-		plan.Entries[index].Path = strings.Repeat("inventory-path/", 5)
-		plan.Quarantined[index] = strings.Repeat("quarantine-path/", 5)
-	}
-	if err := atomicfile.WriteJSON(statePath, plan, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	api := &API{
-		Legacy:       &migration.Service{StatePath: statePath},
-		ControlToken: "control-token-0123456789abcdef",
-	}
-	request := httptest.NewRequest(http.MethodGet, "/v1/migrations/legacy", nil)
-	request.Header.Set("Authorization", "Bearer control-token-0123456789abcdef")
-	response := httptest.NewRecorder()
-	api.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Body.Len() >= 1<<20 {
-		t.Fatalf("migration projection status=%d bytes=%d", response.Code, response.Body.Len())
-	}
-	var projected map[string]any
-	if err := json.NewDecoder(response.Body).Decode(&projected); err != nil {
-		t.Fatal(err)
-	}
-	if projected["id"] != plan.ID || projected["status"] != plan.Status || projected["entry_count"] != float64(len(plan.Entries)) || projected["quarantined_count"] != float64(len(plan.Quarantined)) {
-		t.Fatalf("migration progress semantics changed: %#v", projected)
-	}
-	errorText, _ := projected["error"].(string)
-	if errorText != journal.BoundDiagnostic(largeError) {
-		t.Fatalf("migration diagnostic was not bounded: %d bytes", len(errorText))
-	}
-	if _, exists := projected["entries"]; exists {
-		t.Fatal("migration status exposed the unbounded inventory")
-	}
-	retirement, ok := projected["retirement"].(map[string]any)
-	if !ok || retirement["campaign_id"] != plan.Retirement.CampaignID || retirement["status"] != plan.Retirement.Status || retirement["systemd_removed"] != true {
-		t.Fatalf("retirement receipt was not safely projected: %#v", projected["retirement"])
-	}
-	if retirement["error"] != journal.BoundDiagnostic(largeError) {
-		t.Fatal("retirement diagnostic was not bounded")
-	}
-	for _, forbidden := range []string{"legacy_root", "legacy_data", "archive_path", "unit_path"} {
-		if _, exists := retirement[forbidden]; exists {
-			t.Fatalf("retirement projection exposed host path field %s", forbidden)
-		}
-	}
-	after, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("migration status observation rewrote durable evidence")
+		t.Fatal("API observation rewrote journal evidence")
 	}
 }
 
@@ -606,25 +386,5 @@ func TestWriteJSONEncodesBeforeCommittingSuccess(t *testing.T) {
 	}
 	if failure["error"] != "encode manager response" {
 		t.Fatalf("unexpected failure response: %#v", failure)
-	}
-}
-
-func TestMigrationConfigurationAcknowledgementIsBounded(t *testing.T) {
-	t.Parallel()
-	plan := migration.Plan{
-		ID:                   "migration-1",
-		Status:               "configured",
-		ExpectedSourceCommit: strings.Repeat("a", 40),
-		Entries:              []migration.FileRecord{{Path: strings.Repeat("large-entry", 1<<18)}},
-	}
-	data, err := json.Marshal(migrationConfigurationAcknowledgement(plan))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(data, []byte("large-entry")) || bytes.Contains(data, []byte("entries")) {
-		t.Fatalf("configuration acknowledgement leaked the unbounded migration inventory")
-	}
-	if len(data) > 512 {
-		t.Fatalf("configuration acknowledgement is unexpectedly large: %d bytes", len(data))
 	}
 }

@@ -3,7 +3,11 @@ import { mkdir } from "node:fs/promises";
 import { redactCommandForApproval } from "./approval-policy.js";
 import { id, abortError, errorMessage, scopeOwns, throwIfAborted, truncate } from "./utils.js";
 
-export type ProcessUpdateBehavior = "wait" | "terminate";
+export type ProcessStatus = "running" | "completed" | "failed" | "cancelled" | "orphaned";
+
+export function processStatusActive(status: ProcessStatus): boolean {
+  return status === "running" || status === "orphaned";
+}
 
 export interface ProcessSnapshot {
   id: string;
@@ -13,14 +17,14 @@ export interface ProcessSnapshot {
   command: string;
   cwd: string;
   pid?: number;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: ProcessStatus;
+  stop_confirmed?: boolean;
   exit_code?: number | null;
   stdout: string;
   stderr: string;
   started_at: string;
   finished_at?: string;
   background: boolean;
-  update_behavior?: ProcessUpdateBehavior;
 }
 
 export interface ProcessPreview {
@@ -53,12 +57,6 @@ export interface ProcessPreviewSummary {
   running_terminal_count: number;
 }
 
-export interface UpdateBlockerSummary {
-  running_background_terminal_count: number;
-  update_blocking_terminal_count: number;
-  terminable_background_terminal_count: number;
-}
-
 interface ManagedProcess extends ProcessSnapshot {
   child: ChildProcessWithoutNullStreams;
   outputBytes: number;
@@ -88,7 +86,6 @@ export interface RunCommandOptions {
   env?: Record<string, string>;
   timeoutMs?: number;
   background?: boolean;
-  updateBehavior?: ProcessUpdateBehavior;
   signal?: AbortSignal;
   onUpdate?: (update: { stdout?: string; stderr?: string }) => void;
   onActivity?: () => void;
@@ -133,20 +130,16 @@ export class ProcessRegistry {
   async run(options: RunCommandOptions): Promise<ProcessSnapshot> {
     throwIfAborted(options.signal);
     const background = options.background ?? false;
-    if (!background && options.updateBehavior !== undefined) {
-      throw new Error("updateBehavior is supported only for background processes");
-    }
     if (
       options.activityHeartbeatMs !== undefined
       && (!Number.isSafeInteger(options.activityHeartbeatMs) || options.activityHeartbeatMs <= 0)
     ) {
       throw new Error("activityHeartbeatMs must be a positive integer");
     }
-    const updateBehavior = options.updateBehavior ?? "wait";
     this.pruneCompleted();
     await mkdir(options.cwd, { recursive: true });
     const runningForScope = [...this.processes.values()].filter(
-      (process) => process.scope_key === options.scopeKey && process.status === "running",
+      (process) => process.scope_key === options.scopeKey && processStatusActive(process.status),
     ).length;
     if (runningForScope >= this.maxRunningPerScope) {
       throw new Error(`Agent scope already owns ${this.maxRunningPerScope} running processes`);
@@ -174,7 +167,6 @@ export class ProcessRegistry {
       stderr: "",
       started_at: new Date().toISOString(),
       background,
-      ...(background ? { update_behavior: updateBehavior } : {}),
       child,
       outputBytes: 0,
       streamedBytes: 0,
@@ -276,7 +268,7 @@ export class ProcessRegistry {
     const processes = [...this.processes.values()]
       .filter((process) => scopeOwns(scopeKey, process.scope_key) && process.lifecycle_id === lifecycleId)
       .sort((left, right) => {
-        const running = Number(right.status === "running") - Number(left.status === "running");
+        const running = Number(processStatusActive(right.status)) - Number(processStatusActive(left.status));
         if (running !== 0) return running;
         const recency = Date.parse(right.started_at) - Date.parse(left.started_at);
         return recency || right.id.localeCompare(left.id);
@@ -296,29 +288,9 @@ export class ProcessRegistry {
     const runningTerminalCount = [...this.processes.values()].filter(
       (process) => scopeOwns(scopeKey, process.scope_key)
         && process.lifecycle_id === lifecycleId
-        && process.status === "running",
+        && processStatusActive(process.status),
     ).length;
     return { running_terminal_count: runningTerminalCount };
-  }
-
-  /**
-   * Return aggregate process counts used to decide whether an update may
-   * safely restart the runtime. No process identity, command, or output is
-   * included in this global summary.
-   */
-  updateBlockerSummary(): UpdateBlockerSummary {
-    this.pruneCompleted();
-    const runningBackground = [...this.processes.values()].filter(
-      (process) => process.background && process.status === "running",
-    );
-    const updateBlocking = runningBackground.filter(
-      (process) => process.update_behavior !== "terminate",
-    );
-    return {
-      running_background_terminal_count: runningBackground.length,
-      update_blocking_terminal_count: updateBlocking.length,
-      terminable_background_terminal_count: runningBackground.length - updateBlocking.length,
-    };
   }
 
   get(scopeKey: string, processId: string, lifecycleId?: string): ProcessSnapshot {
@@ -499,7 +471,7 @@ export class ProcessRegistry {
       cwd: boundedPlainText(process.cwd, PREVIEW_CWD_BYTES).value,
       output: output.value,
       status: process.status,
-      running: process.status === "running",
+      running: processStatusActive(process.status),
       started_at: process.started_at,
       updated_at: process.previewUpdatedAt,
       truncated: process.previewOutputTruncated || output.truncated,

@@ -1,7 +1,7 @@
-/* <ChatView mode/> — the chat view shell shared by channel + private modes
-   (legacy renderChat, legacy-app.js:588-743). Owns the per-scope derivations
+/* <ChatView mode/> — the chat view shell shared by channel and private modes.
+   Owns the per-scope derivations
    (scopeId, draftKey, gating, placeholder) and the two component-local render
-   tokens that replace the legacy _focusComposer / _scrollChatToBottom flags:
+   tokens used for focus and scroll requests:
 
    - focusToken: bumped on send, on scope/nav change, on attach-add, and on a
      send-failure restore; <ComposerTextarea> re-focuses on each bump.

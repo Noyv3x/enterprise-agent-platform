@@ -536,11 +536,6 @@ export class RunCoordinator {
     return await this.executor.previewSummary(this.scopeExecutionIdentity(scopeKey, lifecycleId));
   }
 
-  async updateBlockerSummary(): Promise<ReturnType<ProcessRegistry["updateBlockerSummary"]>> {
-    if (!this.executor?.managed) return this.processes.updateBlockerSummary();
-    return await this.executor.updateBlockerSummary();
-  }
-
   private scopeExecutionIdentity(scopeKey: string, lifecycleId: string): Required<ScopeExecutionIdentity> {
     const entry = [...this.scopeExecutionContexts.entries()].find(([key]) => {
       const parsed = parseScopeExecutionContextKey(key);
@@ -2028,9 +2023,7 @@ function acceptsInteractiveInputs(record: RunRecord): boolean {
 }
 
 function runInputFingerprint(request: RunInputRequest): string {
-  // Hash only fields that affect execution. Unknown top-level fields are
-  // intentionally ignored for forward-compatible callers, while attachment
-  // entries retain every field that buildPrompt() currently observes.
+  // Validation has already limited the request to the current protocol fields.
   const attachments = (request.attachments ?? []).map((attachment) => ({
     ...(attachment.path === undefined ? {} : { path: attachment.path }),
     ...(attachment.name === undefined ? {} : { name: attachment.name }),
@@ -2364,6 +2357,11 @@ function validateRunInputRequest(request: RunInputRequest): void {
     throw new RunValidationError("run input request must be an object");
   }
   try {
+    assertOnlyKeys(
+      request as unknown as Record<string, unknown>,
+      ["message_id", "scope_key", "lifecycle_id", "input", "attachments"],
+      "run input request",
+    );
     assertNonEmpty(request.message_id, "message_id");
     assertNonEmpty(request.scope_key, "scope_key");
     assertNonEmpty(request.lifecycle_id, "lifecycle_id");
@@ -2379,12 +2377,18 @@ function validateRunInputRequest(request: RunInputRequest): void {
           throw new Error("input content blocks must be objects");
         }
         const candidate = block as Record<string, unknown>;
-        if (candidate.type === "text" && typeof candidate.text === "string") continue;
+        if (candidate.type === "text" && typeof candidate.text === "string") {
+          assertOnlyKeys(candidate, ["type", "text"], "text input block");
+          continue;
+        }
         if (
           candidate.type === "image"
           && typeof candidate.data === "string"
           && typeof candidate.mimeType === "string"
-        ) continue;
+        ) {
+          assertOnlyKeys(candidate, ["type", "data", "mimeType"], "image input block");
+          continue;
+        }
         throw new Error("input content blocks must be valid text or image blocks");
       }
     }
@@ -2396,6 +2400,11 @@ function validateRunInputRequest(request: RunInputRequest): void {
         if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
           throw new Error("attachment entries must be objects");
         }
+        assertOnlyKeys(
+          attachment as Record<string, unknown>,
+          ["path", "name", "mime_type", "url"],
+          "attachment",
+        );
       }
     }
   } catch (error) {
@@ -2408,6 +2417,25 @@ function validateRunRequest(request: RunRequest): void {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
     throw new Error("run request must be an object");
   }
+  assertOnlyKeys(
+    request as unknown as Record<string, unknown>,
+    [
+      "scope_key",
+      "lifecycle_id",
+      "session_id",
+      "workspace",
+      "execution_context",
+      "system_prompt",
+      "input",
+      "history",
+      "attachments",
+      "model",
+      "thinking_level",
+      "gateway",
+      "metadata",
+    ],
+    "run request",
+  );
   assertNonEmpty(request.scope_key, "scope_key");
   assertNonEmpty(request.lifecycle_id, "lifecycle_id");
   assertNonEmpty(request.session_id, "session_id");
@@ -2442,12 +2470,18 @@ function validateRunRequest(request: RunRequest): void {
         throw new Error("input content blocks must be objects");
       }
       const candidate = block as Record<string, unknown>;
-      if (candidate.type === "text" && typeof candidate.text === "string") continue;
+      if (candidate.type === "text" && typeof candidate.text === "string") {
+        assertOnlyKeys(candidate, ["type", "text"], "text input block");
+        continue;
+      }
       if (
         candidate.type === "image"
         && typeof candidate.data === "string"
         && typeof candidate.mimeType === "string"
-      ) continue;
+      ) {
+        assertOnlyKeys(candidate, ["type", "data", "mimeType"], "image input block");
+        continue;
+      }
       throw new Error("input content blocks must be valid text or image blocks");
     }
   }
@@ -2460,6 +2494,11 @@ function validateRunRequest(request: RunRequest): void {
       if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
         throw new Error("attachment entries must be objects");
       }
+      assertOnlyKeys(
+        attachment as Record<string, unknown>,
+        ["path", "name", "mime_type", "url"],
+        "attachment",
+      );
     }
   }
   if (
@@ -2470,6 +2509,11 @@ function validateRunRequest(request: RunRequest): void {
     if (!request.gateway || typeof request.gateway !== "object" || Array.isArray(request.gateway)) {
       throw new Error("gateway must be an object");
     }
+    assertOnlyKeys(
+      request.gateway as unknown as Record<string, unknown>,
+      ["base_url", "token"],
+      "gateway",
+    );
     if (request.gateway.base_url !== undefined && typeof request.gateway.base_url !== "string") {
       throw new Error("gateway.base_url must be a string");
     }
@@ -2487,6 +2531,18 @@ function validateRunRequest(request: RunRequest): void {
     throw new Error("model.reasoning must be a boolean");
   }
   validateProductModelRequest(request.model);
+}
+
+function assertOnlyKeys(
+  value: Record<string, unknown>,
+  allowedKeys: readonly string[],
+  label: string,
+): void {
+  const allowed = new Set(allowedKeys);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${label} contains unsupported fields: ${unknown.join(", ")}`);
+  }
 }
 
 function assertMaximumLength(value: string, maximum: number, name: string): void {
@@ -2588,7 +2644,7 @@ function normalizeInitialHistory(messages: AgentMessage[], request: RunRequest, 
   return normalized;
 }
 
-const LEGACY_UNTRUSTED_TOOL_RESULT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
+const UNMARKED_UNTRUSTED_TOOL_RESULT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
   web: "web",
   browser: "browser",
   memory: "memory",
@@ -2597,15 +2653,15 @@ const LEGACY_UNTRUSTED_TOOL_RESULT_SOURCES: Readonly<Record<string, string>> = O
   session_search: "session_search",
   search_files: "workspace_search",
   schedule: "schedule",
-  // Legacy skill output cannot be promoted back into the controlled
+  // Unmarked skill output cannot be promoted into the controlled
   // procedural-guidance boundary used by newly generated skill.load results.
-  skill: "skill.legacy",
+  skill: "skill.unmarked",
 });
 
 /**
- * Upgrade legacy durable tool results only in the model-facing copy. The
+ * Secure unmarked/imported durable tool results only in the model-facing copy. The
  * runtime-owned entry marker is deliberately outside message/details data, so
- * attacker-controlled tool output cannot opt itself out of this migration.
+ * attacker-controlled tool output cannot opt itself out of this boundary.
  */
 export function prepareSessionHistoryForModel(
   entries: readonly TrackedSessionMessage[],
@@ -2633,7 +2689,7 @@ export function prepareSessionHistoryForModel(
       };
     }
     if (entry.message.role !== "toolResult") return entry;
-    const source = LEGACY_UNTRUSTED_TOOL_RESULT_SOURCES[entry.message.toolName];
+    const source = UNMARKED_UNTRUSTED_TOOL_RESULT_SOURCES[entry.message.toolName];
     if (!source) return entry;
 
     const content: Array<TextContent | ImageContent> = [];

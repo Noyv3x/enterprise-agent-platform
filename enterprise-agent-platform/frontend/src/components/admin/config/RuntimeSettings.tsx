@@ -1,29 +1,24 @@
-/* Managed-runtime health board with per-row restart or refresh actions. */
+/* Read-only health board; service lifecycle is owned exclusively by Manager. */
 
-import { Badge, Button } from "antd";
-import { restartRuntime } from "../../../data/adminActions";
+import { Badge } from "antd";
 import { cx } from "../../../lib/cx";
-import { useStore, useStoreHandle } from "../../../store/useStore";
+import { useStore } from "../../../store/useStore";
 import type { RuntimeRow } from "../../../types";
 import { CardHead } from "../../common/CardHead";
-import { Icon } from "../../common/Icon";
 import { AdminCard } from "../AdminCard";
 import { useI18n, type Translator } from "../../../i18n";
 
-function runtimeStateLabel(t: Translator, state: string | undefined, available: boolean): string {
-  switch (String(state || "").toLowerCase()) {
-    case "ready": case "running": return t("admin.runtime.ready");
-    case "down": case "stopped": return t("admin.runtime.down");
-    case "starting": return t("admin.runtime.starting");
-    case "error": case "failed": return t("admin.runtime.error");
-    case "external": return t("admin.runtime.external");
-    case "prepared": return t("admin.runtime.prepared");
+function runtimeStateLabel(t: Translator, state: RuntimeRow["state"]): string {
+  switch (state) {
+    case "running":
+    case "available":
+      return t("admin.runtime.ready");
+    case "unavailable":
+      return t("admin.runtime.down");
+    case "error":
+      return t("admin.runtime.error");
     case "missing": return t("admin.runtime.missing");
-    case "degraded": return t("admin.runtime.degraded");
-    case "installed": return t("admin.runtime.installed");
-    case "install_failed": return t("admin.runtime.installFailed");
     case "invalid_config": return t("admin.runtime.invalidConfig");
-    default: return state || t(available ? "admin.runtime.ready" : "admin.runtime.down");
   }
 }
 
@@ -39,17 +34,7 @@ function runtimeNameLabel(t: Translator, name: string): string {
 }
 
 function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
-  const store = useStoreHandle();
   const { t } = useI18n();
-  const restarting = useStore((state) =>
-    state.pendingOperations.includes(`admin:runtime:restart:${runtime.name}`),
-  );
-  const restartLabel = t(runtime.managed && runtime.name !== "cognee" ? "admin.runtime.restart" : "admin.common.refresh");
-  const restartLoadingLabel = t(
-    runtime.managed && runtime.name !== "cognee"
-      ? "admin.common.restarting"
-      : "resource.refreshing",
-  );
   return (
     <div className="runtime-row">
       <div className="runtime-row__main">
@@ -61,22 +46,12 @@ function RuntimeRowItem({ runtime }: { runtime: RuntimeRow }) {
           <Badge
             className="status"
             status={runtime.available ? "success" : "warning"}
-            text={runtimeStateLabel(t, runtime.state, !!runtime.available)}
+            text={runtimeStateLabel(t, runtime.state)}
           />
         </div>
         <div className="runtime-row__detail">
-          {runtime.detail || runtime.error || runtime.path || ""}
+          {runtime.detail || runtime.error}
         </div>
-      </div>
-      <div className="runtime-row__actions">
-        <Button
-          loading={restarting}
-          size="small"
-          icon={<Icon name="refresh" size={14} />}
-          onClick={() => void restartRuntime(store, runtime.name)}
-        >
-          {restarting ? restartLoadingLabel : restartLabel}
-        </Button>
       </div>
     </div>
   );

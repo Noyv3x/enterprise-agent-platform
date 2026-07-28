@@ -1,5 +1,4 @@
-/* <ComposerTextarea/> — the controlled, IME-aware composer textarea (legacy
-   renderChat textarea, :610-662). This is the #1 reconciliation hazard: it must
+/* <ComposerTextarea/> — the controlled, IME-aware composer textarea. It must
    NEVER remount (stable identity + a fixed position in the tree), and its value is
    controlled from the per-scope store draft. Because it is never torn down, Chinese
    IME composition is no longer interrupted; we still track isComposing
@@ -18,8 +17,7 @@ import { clipboardImageFiles } from "../../utils/composerFiles";
 import type { ChatMode } from "../../types";
 import type { MentionApi } from "../../hooks/useMention";
 
-/** Keys that drive mention nav themselves — they must NOT also trigger a generic
- *  menu recompute on keyup (legacy onkeyup guard, :638-640). */
+/** Keys that drive mention navigation must not trigger a second menu recompute. */
 const MENU_NAV_KEYS = ["ArrowDown", "ArrowUp", "Home", "End", "Enter", "Tab", "Escape"];
 
 export interface ComposerTextareaProps {

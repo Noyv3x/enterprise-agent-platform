@@ -1,6 +1,5 @@
 /* <OAuthSettings/> — card listing OAuth-verifiable model providers + global
-   import/export credential actions (legacy renderOAuthSettings, legacy-app.js:
-   2669-2702). Upload intercepts the selected JSON locally instead of issuing an
+   import/export credential actions. Upload intercepts the selected JSON locally instead of issuing an
    HTTP upload of its own; each transfer button tracks only its own operation. */
 
 import { Button, Upload } from "antd";

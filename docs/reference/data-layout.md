@@ -37,12 +37,16 @@
 │   │   ├── camofox/{profiles,cookies,traces,cache,logs}/
 │   │   ├── cognee/{data,system,cache,logs}/
 │   │   ├── searxng/{config,cache,logs}/
-│   │   └── firecrawl/{config,data,logs}/
+│   │   └── firecrawl/
+│   │       ├── redis/
+│   │       ├── rabbitmq/
+│   │       ├── postgres/
+│   │       └── foundationdb/{data,cluster}/
 │   └── logs/
 └── backups/
 ```
 
-`manager.toml` 位于 `~/.config/ubitech-agent/`，不属于数据根。`data_root` 是这个布局的唯一可配置根，Platform 权威数据目录始终是规范化后的 `$data_root/data`；Manager 不允许用独立 `data_dir` 把迁移、快照或 Sandbox 指向与容器 bind mount 不同的位置。明确配置在源码树外的旧 `$DATA` 仅在它本身就是目标 `$data_root/data` 时原地采用；否则由首次迁移复制到上述 `data/`。
+`manager.toml` 位于 `~/.config/ubitech-agent/`，不属于数据根。`data_root` 是这个布局的唯一可配置根，Platform 权威数据目录始终是规范化后的 `$data_root/data`；schema migration、快照、Sandbox registry 和容器 bind mount 必须引用同一数据目录，不接受第二个 `data_dir`。
 
 所有产品持久状态使用宿主 bind mount。Docker 镜像、container writable layer、Engine metadata 和有界容器日志不属于备份数据。不得使用匿名 volume 保存产品权威状态。
 
@@ -74,24 +78,20 @@ Agent Runtime 的 session、approval 和 idempotency 继续保存在 `runtimes/a
 
 Camoufox 使用共享服务和按 scope 派生的独立 Profile。浏览器二进制位于镜像；登录态、Cookie、Profile 和需要保留的 trace 位于 bind mount。
 
-Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs 与 `.env` 位于数据根。Firecrawl 与 SearXNG 的配置及服务数据全部映射到各自目录；旧 Docker named volumes 在一致迁移或确认可重建后移除。
+Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs 与 `.env` 位于数据根。SearXNG 的配置、缓存和日志映射到其目录；Firecrawl 的运行配置由 Compose 环境提供，Redis、RabbitMQ、Postgres 以及 FoundationDB 的数据与集群文件分别映射到上图所列目录。权威数据不得只存在于匿名 Docker volume。
 
-## 管理状态、快照和清理
+## 管理状态与 generation 快照
 
 管理器状态根保存 current/previous/target release、generation、operation journal、心跳和 owner-only control socket。每个本地 `releases/<commit>/` 的 manifest 与 Compose 是不可变发布物；可变的 `compose.env` 只包含该宿主生成的路径与镜像 digest。`active-generation` 由 Manager 原子写入，明确指出停止、日志和恢复命令应使用的 Compose generation，不能按目录修改时间猜测。Platform 的业务数据库不得成为容器编排状态的唯一存储，否则 Platform 失败时无法恢复。
 
-首次迁移在 `backups/<operation-id>-legacy/` 保留可恢复的旧 checkout、配置、systemd unit、Compose 归属清单和未原地采用的外部 data，常规至少七天。归档清单记录每项类型、mode、大小、link target 和内容 hash，并记录迁移前后文件数、总字节数与集合摘要；归档只有在逐项校验完成后才可成为删除旧路径的依据。同文件系统优先以原子 rename 保存完整旧树，跨文件系统使用 staging copy、fsync、校验和原子发布。普通数据库 schema 更新也建立与 operation 绑定的快照，至少保留上一可回滚 generation。工作区、附件、Profile 已作为新数据目录权威内容且迁移前后对账一致时，只在旧部署归档中保存清单，不重复复制巨大数据树。
+每次可能改变数据库或 sidecar 格式的 operation 都建立与目标 generation 绑定的一致快照，至少保留 previous generation 所需的回滚点。快照 manifest 记录受管文件的类型、mode、大小与内容 hash；只有文件和 manifest 全部同步、父目录也完成同步后，快照才能写入 operation journal。
 
-已经由版本化源码退役活动覆盖的存量迁移可以提前结束上述七天源码恢复期，但必须先证明新 Manager activation、当前 generation、公网入口和迁移所需外部服务全部健康，重新验证 recovery receipt 与逐树 hash，并在删除前持久提交活动 intent。intent 前的 readiness 或 recovery pack 验证失败必须持久为不含 generation 且不带任何完成位的 `waiting_readiness`，不得静默丢弃诊断或删除对象。恢复包树清单会随 checkout 文件数线性增长，不得套用小型 Manager 状态文件的 8 MiB JSON 上限；Manager 必须用专用的流式、有界解码路径读取清单，当前安全预算为单清单 256 MiB、两百万条记录，并约束单项路径、mode 与摘要字段，再以 receipt 汇总值和实际归档树逐项复核。超过专用安全预算的清单仍须安全停留并报告，不能通过取消全部边界来换取兼容。最终 recovery pack 删除前，Manager 还可删除经 migration id、源提交、旧路径、创建时间、operation id 与 `backupLegacy` 固定内容集共同证明的较早失败 attempt pack；结构或身份不匹配的目录保留，而瞬时读取或 I/O 错误必须阻止写入 `purged` 并在下次后台轮询重试。活动完成后 `migration.json` 只保留不含宿主绝对路径的 `purged` 凭据；这不会删除或缩短 current/previous generation 和普通数据库快照的保留期。数据库、工作区、附件、Agent session/approval/idempotency、记忆/知识、浏览器 Profile/Cookie/trace 及当前外部服务 bind-mount 数据不属于源码退役清单。
-
-退役对外验收只以 `migration.json` 及 Manager 安全状态投影中同时出现 `status=purged` 和 `retirement.status=completed` 为准；Manager 空闲、Platform 健康或 recovery 步骤前的其它完成位都不能替代该凭据。`manager/recovery/.download.<随机后缀>` 只表示旧受控恢复的临时下载 staging，不是用户数据目录；只有同时满足固定命名、owner-only 单层普通文件结构、Manager 发布资产内容类型、最多 8 项和 512 MiB 总量的目录才属于退役清单，结构不明的同名前缀目录继续保留。
-
-旧 checkout 中无法识别的 ignored 内容随完整 checkout 一起进入 `backups/<operation-id>-legacy/` recovery pack，不能单独静默删除。Manager 的 legacy retention 只清理当前迁移 journal 明确提交、达到保留期并再次通过 receipt 与逐树 hash 校验的 recovery pack；未知、迁移中或 `cleanup_pending` 的 `*-legacy` 目录必须保留。它也不能误删仍被 current/previous generation 引用的普通数据库快照。
+快照清理由 generation 引用和明确保留策略驱动。current、previous、活动或 finalize-pending operation 引用的快照绝不能删除；不得按目录名称或修改时间猜测归属，也不得对 `backups/` 使用全局递归清理。
 
 应用与容器日志必须轮转。默认限制和保留数量由管理器实现与测试约束；日志不得无限增长，也不得包含 secret、原始宿主执行凭据或 Docker registry 凭据。
 
 ## 备份与恢复
 
-一致备份至少包含 SQLite backup、attachments、workspaces、agent-envs、agent-skills、Runtime session/approval/idempotency 和管理器 release/operation state。需要保留网页登录态时包含 Camoufox Profile；Cognee 和 Firecrawl 数据按恢复成本纳入。
+一致备份至少包含 SQLite backup、attachments、workspaces、agent-envs、agent-skills、Runtime session/approval/idempotency 和 Manager release/operation state。需要保留网页登录态时包含 Camoufox Profile；Cognee 和 Firecrawl 数据按恢复成本纳入。
 
 恢复时先停止 Platform writer，再恢复数据与 manager generation，最后由管理器重建容器。数据库快照恢复必须在改动当前数据前完整校验 manifest、文件类型、大小与校验和，把全部目标文件复制并同步到数据目录同文件系统的 staging；提交时先把现有数据库、WAL、SHM 和快照包含的其它受管文件移入事务备份，再切换 staging 文件并同步目录。任一复制、rename 或目录同步失败都必须补偿恢复提交前的完整文件集合，不能留下缺失或跨 generation 混合的 SQLite 文件。不得手工编辑 Runtime JSONL、幂等记录或 manager operation journal。

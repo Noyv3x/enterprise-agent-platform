@@ -25,9 +25,7 @@ ENV NODE_ENV=production \
     AGENT_RUNTIME_HOST=0.0.0.0 \
     AGENT_RUNTIME_PORT=8766 \
     AGENT_RUNTIME_MAX_BODY_BYTES=33554432 \
-    AGENT_PLATFORM_INTERNAL_URL=http://platform:8765 \
-    CAMOFOX_URL=http://camofox:9377 \
-    FIRECRAWL_API_URL=http://firecrawl-api:3002
+    AGENT_PLATFORM_INTERNAL_URL=http://platform:8765
 RUN install -d -o node -g node -m 0700 /var/lib/ubitech-agent/runtime
 WORKDIR /opt/ubitech-agent-runtime
 COPY --from=runtime-build /build/agent-runtime/package.json ./

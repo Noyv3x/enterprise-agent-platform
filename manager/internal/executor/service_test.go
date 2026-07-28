@@ -92,7 +92,7 @@ func TestReceiptCannotBeReusedForDifferentTarget(t *testing.T) {
 
 func TestProcessReceiptCannotCrossFromSandboxToHostProcess(t *testing.T) {
 	service, _ := newTestService(t)
-	arguments, _ := json.Marshal(terminalArguments{Command: "sleep 30", Background: true, UpdateBehavior: "terminate"})
+	arguments, _ := json.Marshal(terminalArguments{Command: "sleep 30", Background: true})
 	hostAudit := AuditRequest{Identity: identity(), AuditID: "audit-host-terminal", Target: "host", Operation: "terminal", Action: "run", Arguments: arguments, Details: map[string]any{"command": "[redacted]"}}
 	hostReceipt, err := service.Audit(hostAudit)
 	if err != nil {
@@ -104,6 +104,9 @@ func TestProcessReceiptCannotCrossFromSandboxToHostProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	processID := response["result"].(ProcessSnapshot).ID
+	if got := service.Processes.ActiveBackgroundCount(); got != 1 {
+		t.Fatalf("active background process count = %d, want 1", got)
+	}
 
 	processArguments, _ := json.Marshal(processArguments{ProcessID: processID})
 	processAudit := AuditRequest{Identity: identity(), AuditID: "audit-sandbox-process", Target: "sandbox", Operation: "process", Action: "read", Arguments: processArguments, Details: map[string]any{"action": "read"}}
@@ -117,5 +120,8 @@ func TestProcessReceiptCannotCrossFromSandboxToHostProcess(t *testing.T) {
 	}
 	if _, err := service.Processes.Kill(hostAudit.ScopeID, hostAudit.LifecycleID, "host", processID); err != nil {
 		t.Fatal(err)
+	}
+	if got := service.Processes.ActiveBackgroundCount(); got != 0 {
+		t.Fatalf("active background process count after kill = %d, want 0", got)
 	}
 }

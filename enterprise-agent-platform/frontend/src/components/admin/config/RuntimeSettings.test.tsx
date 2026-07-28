@@ -2,29 +2,21 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../../i18n";
 import { createStore } from "../../../lib/store";
 import { initialAppState, rootReducer } from "../../../store/reducer";
 import { StoreContext } from "../../../store/StoreProvider";
 import { RuntimeSettings } from "./RuntimeSettings";
 
-const actions = vi.hoisted(() => ({
-  restartRuntime: vi.fn(),
-}));
-
-vi.mock("../../../data/adminActions", () => actions);
-
 describe("RuntimeSettings", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
   });
 
   afterEach(cleanup);
 
-  it("presents and restarts the managed search runtime explicitly", async () => {
+  it("presents managed runtime health without a direct lifecycle action", () => {
     const store = createStore(rootReducer, initialAppState);
     store.dispatch({
       type: "SET_RUNTIMES",
@@ -32,9 +24,11 @@ describe("RuntimeSettings", () => {
         searxng: {
           name: "searxng",
           available: true,
-          managed: true,
           state: "running",
           detail: "Managed search is ready",
+          error: "",
+          status_stale: false,
+          status_checked_at: 1_784_600_400,
         },
       },
     });
@@ -54,7 +48,6 @@ describe("RuntimeSettings", () => {
       ),
     ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Restart" }));
-    expect(actions.restartRuntime).toHaveBeenCalledWith(store, "searxng");
+    expect(screen.queryByRole("button", { name: "Restart" })).not.toBeInTheDocument();
   });
 });

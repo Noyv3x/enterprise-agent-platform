@@ -1,5 +1,4 @@
-/* <TypingUsers/> — the channel-only "X 正在输入" indicator (legacy
-   renderTypingUsers, :1175-1181). Up to 3 names joined by "、". */
+/* <TypingUsers/> — the channel-only "X 正在输入" indicator, with up to three names. */
 
 import type { TypingUser } from "../../types";
 import { useI18n } from "../../i18n";

@@ -222,6 +222,38 @@ test("PlatformGateway forwards typed platform session-search actions within the 
   }
 });
 
+test("PlatformGateway rejects removed action and argument aliases before transport", async () => {
+  const gateway = new PlatformGateway("http://127.0.0.1:1", "token");
+  const request = {
+    scope_key: "private:42",
+    lifecycle_id: "life",
+    session_id: "session",
+    workspace: "/workspace",
+    model: { provider: "openai-codex", id: "gpt-5" },
+  } as never;
+
+  await assert.rejects(
+    gateway.invoke(request, "run", "memory", "delete", { id: 1 }),
+    /memory action is not supported/,
+  );
+  await assert.rejects(
+    gateway.invoke(request, "run", "session", "get", {}),
+    /session action must be search, list, or read/,
+  );
+  await assert.rejects(
+    gateway.invoke(request, "run", "knowledge", "get", { id: 1 }),
+    /knowledge action must be search or read/,
+  );
+  await assert.rejects(
+    gateway.invoke(request, "run", "knowledge", "read", { document_id: "1" }),
+    /positive integer document_id/,
+  );
+  await assert.rejects(
+    gateway.invoke(request, "run", "web", "query", { query: "test" }),
+    /web action must be search or extract/,
+  );
+});
+
 test("PlatformGateway keeps Skill model arguments separate from authoritative run context", async () => {
   let body: Record<string, unknown> = {};
   let path = "";

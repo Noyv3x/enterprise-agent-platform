@@ -3,8 +3,8 @@ interface ClipboardEnvironment {
   document?: Document;
 }
 
-/** Copy text with a legacy DOM fallback for browsers where the async clipboard
- * API is unavailable or denied. The fallback node is removed immediately and
+/** Copy text with a DOM capability fallback when the async clipboard API is
+ * unavailable or denied. The fallback node is removed immediately and
  * focus is restored to the control that initiated the copy. */
 export async function copyText(value: string, environment?: ClipboardEnvironment): Promise<boolean> {
   const browserNavigator =

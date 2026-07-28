@@ -1,7 +1,7 @@
 /* <GrokOAuthFlow/> — manual-callback verification UI: open the authorize URL,
    show the redirect URI, paste the full callback URL, and complete verification
-   (legacy renderGrokOAuthFlow, legacy-app.js:2762-2780). The callback textarea is
-   controlled by store state (oauthCallbackUrls[providerId]) — the same place
+   from the callback textarea. It is controlled by store state
+   (oauthCallbackUrls[providerId]) — the same place
    completeOAuthVerification reads from. The backend-supplied authorize_url runs
    through safeUrl. */
 

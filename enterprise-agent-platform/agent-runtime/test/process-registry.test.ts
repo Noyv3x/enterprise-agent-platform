@@ -119,57 +119,21 @@ test("ProcessRegistry confirms scope cleanup only after the child close event", 
   }
 });
 
-test("ProcessRegistry protects background work from updates unless explicitly terminable", async () => {
-  const workspace = await temporaryDirectory("agent-process-update-blockers-");
+test("ProcessRegistry background snapshots contain only process lifecycle state", async () => {
+  const workspace = await temporaryDirectory("agent-process-background-state-");
   const registry = new ProcessRegistry();
   try {
-    const protectedByDefault = await registry.run({
-      runId: "default-wait",
+    const background = await registry.run({
+      runId: "background",
       scopeKey: "private:1",
       command: "sleep 30",
       cwd: workspace,
       background: true,
     });
-    const protectedExplicitly = await registry.run({
-      runId: "explicit-wait",
-      scopeKey: "private:2",
-      command: "sleep 30",
-      cwd: workspace,
-      background: true,
-      updateBehavior: "wait",
-    });
-    const terminable = await registry.run({
-      runId: "terminable",
-      scopeKey: "private:3",
-      command: "sleep 30",
-      cwd: workspace,
-      background: true,
-      updateBehavior: "terminate",
-    });
-
-    assert.equal(protectedByDefault.update_behavior, "wait");
-    assert.equal(protectedExplicitly.update_behavior, "wait");
-    assert.equal(terminable.update_behavior, "terminate");
-    assert.deepEqual(registry.updateBlockerSummary(), {
-      running_background_terminal_count: 3,
-      update_blocking_terminal_count: 2,
-      terminable_background_terminal_count: 1,
-    });
-    await assert.rejects(
-      registry.run({
-        runId: "foreground",
-        scopeKey: "private:1",
-        command: "true",
-        cwd: workspace,
-        updateBehavior: "terminate",
-      }),
-      /only for background processes/,
-    );
+    assert.equal(background.background, true);
   } finally {
-    for (const scope of ["private:1", "private:2", "private:3"]) registry.killScope(scope);
-    await Promise.all(
-      ["private:1", "private:2", "private:3"].map((scope) => registry.waitForScopeExit(scope)),
-    );
+    registry.killScope("private:1");
+    await registry.waitForScopeExit("private:1");
     await rm(workspace, { recursive: true, force: true });
   }
 });

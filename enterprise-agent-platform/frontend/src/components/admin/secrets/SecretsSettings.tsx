@@ -1,6 +1,5 @@
-/* <SecretsSettings/> — list + set platform-internal secrets, excluding OAuth
-   secrets (managed by the OAuth card). Legacy renderSecretsSettings,
-   legacy-app.js:2643-2666. */
+/* <SecretsSettings/> — list and set platform-internal secrets, excluding OAuth
+   secrets managed by the OAuth card. */
 
 import { Empty } from "antd";
 import { useStore } from "../../../store/useStore";

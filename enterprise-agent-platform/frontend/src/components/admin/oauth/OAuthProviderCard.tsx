@@ -1,6 +1,5 @@
 /* <OAuthProviderCard/> — one provider's verification status + action button + the
-   embedded device-code / manual-callback flow when active (legacy
-   renderOAuthProviderCard, legacy-app.js:2704-2738). Keyed by provider.id at the
+   embedded device-code or manual-callback flow when active. Keyed by provider.id at the
    call site so reconciliation never carries one provider's flow/textarea into
    another's slot. */
 

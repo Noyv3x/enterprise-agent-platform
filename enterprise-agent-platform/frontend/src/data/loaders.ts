@@ -1,6 +1,6 @@
 /* =====================================================================
-   Data layer — every legacy load* reborn as a typed thunk over the store
-   handle. Each calls api() then dispatches SET_* actions; loaders themselves
+   Data layer — typed thunks over the store handle. Each calls api() then
+   dispatches SET_* actions; loaders themselves
    never trigger a render (the store notifies subscribers). Endpoint → state
    mapping preserves the established ordering and guards (loadInitial fan-out,
    channel-switch race guard, mergePendingMessages,
@@ -62,8 +62,7 @@ const runtimeRefreshRetries = new WeakMap<AppStore, RuntimeRefreshRetry>();
 
 /* ----------------------------------------------------------- local helpers */
 
-/** Merge server messages with the still-pending optimistic items for a scope
- *  (legacy mergePendingMessages, legacy-app.js:2937-2940). */
+/** Merge server messages with the still-pending optimistic items for a scope. */
 function mergePending(
   state: AppState,
   mode: ChatMode,

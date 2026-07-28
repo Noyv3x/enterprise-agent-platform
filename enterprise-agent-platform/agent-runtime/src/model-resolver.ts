@@ -43,9 +43,8 @@ const PRODUCT_PROVIDERS: Readonly<Record<ProductProviderId, ProductProviderDefin
     defaultModel: "grok-4.3",
     api: "openai-completions",
     baseUrl: "https://api.x.ai/v1",
-    // xAI retired these model families on 2026-05-15. Pi keeps historical
-    // metadata for compatibility, but the product catalog must not offer
-    // models that the provider no longer serves.
+    // xAI retired these model families on 2026-05-15. Pi still catalogs them,
+    // but the product catalog must not offer models the provider no longer serves.
     excludedModelIds: new Set(["grok-3", "grok-3-fast", "grok-code-fast-1"]),
   },
 };
@@ -55,11 +54,9 @@ const AUXILIARY_VISION_MODEL_PREFERENCES: Readonly<Record<ProductProvider, reado
   xai: ["grok-4.3", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-reasoning"],
 };
 
-const PROVIDER_ALIASES: Readonly<Record<string, ProductProvider>> = {
+const PRODUCT_PROVIDER_RUNTIME: Readonly<Record<ProductProviderId, ProductProvider>> = {
   "openai-codex": "openai-codex",
-  codex: "openai-codex",
   "xai-oauth": "xai",
-  grok: "xai",
 };
 
 function definitionForRuntimeProvider(provider: ProductProvider): ProductProviderDefinition {
@@ -134,9 +131,14 @@ export function validateProductModelRequest(model: ModelRequest): ProductProvide
   if (Object.hasOwn(raw, "api")) {
     throw new ModelValidationError("model.api is controlled by the Agent runtime and must not be supplied");
   }
-  const provider = PROVIDER_ALIASES[model.provider];
+  const allowed = new Set(["provider", "id", "reasoning"]);
+  const unknown = Object.keys(raw).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new ModelValidationError(`model accepts only provider, id, and reasoning; received ${unknown.join(", ")}`);
+  }
+  const provider = PRODUCT_PROVIDER_RUNTIME[model.provider as ProductProviderId];
   if (!provider) {
-    throw new ModelValidationError("model.provider must be openai-codex, codex, xai-oauth, or grok");
+    throw new ModelValidationError("model.provider must be openai-codex or xai-oauth");
   }
   const definition = definitionForRuntimeProvider(provider);
   const lookup = getModel as unknown as (providerId: string, modelId: string) => Model<Api> | undefined;

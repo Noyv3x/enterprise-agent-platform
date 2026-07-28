@@ -29,7 +29,7 @@ import type {
 import { executionContext } from "./executor.js";
 import type { JsonObject, JsonValue, RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
-import { ProcessRegistry } from "./process-registry.js";
+import { ProcessRegistry, processStatusActive } from "./process-registry.js";
 import {
   frameUntrustedBlocks,
   frameUntrustedText,
@@ -152,12 +152,6 @@ const terminalSchema = Type.Object({
   background: Type.Optional(Type.Boolean({
     description: "Start a long-lived process and return its process id immediately.",
   })),
-  update_behavior: Type.Optional(Type.Union([
-    Type.Literal("wait"),
-    Type.Literal("terminate"),
-  ], {
-    description: "Update policy for a background process. Defaults to wait; use terminate only for disposable work that may stop during a platform update.",
-  })),
 }, { additionalProperties: false });
 
 const processSchema = Type.Object({
@@ -246,10 +240,75 @@ const searchFilesSchema = Type.Object({
   })),
 }, { additionalProperties: false });
 
-const gatewaySchema = Type.Object({
-  action: Type.String({ minLength: 1 }),
-  arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-});
+const runtimeSessionSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("search"),
+    arguments: Type.Object({
+      query: Type.String({ minLength: 1, maxLength: 4_000 }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("read"),
+    arguments: Type.Object({
+      index: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("list"),
+    arguments: Type.Optional(Type.Object({
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    }, { additionalProperties: false })),
+  }, { additionalProperties: false }),
+]);
+
+const knowledgeSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("search"),
+    arguments: Type.Object({
+      query: Type.String({ minLength: 1, maxLength: 4_096 }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("read"),
+    arguments: Type.Object({
+      document_id: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+]);
+
+const webExtractLimitsSchema = {
+  char_limit: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 500_000 })),
+};
+const webSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("search"),
+    arguments: Type.Object({
+      query: Type.String({ minLength: 1, maxLength: 4_096 }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      language: Type.Optional(Type.String({
+        pattern: "^(?:auto|all|[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,8})?)$",
+      })),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("extract"),
+    arguments: Type.Union([
+      Type.Object({
+        url: Type.String({ minLength: 1, maxLength: 8_192 }),
+        ...webExtractLimitsSchema,
+      }, { additionalProperties: false }),
+      Type.Object({
+        urls: Type.Array(Type.String({ minLength: 1, maxLength: 8_192 }), {
+          minItems: 1,
+          maxItems: 5,
+        }),
+        ...webExtractLimitsSchema,
+      }, { additionalProperties: false }),
+    ]),
+  }, { additionalProperties: false }),
+]);
 
 const memoryTargetSchema = Type.Union([
   Type.Literal("memory"),
@@ -627,9 +686,6 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, onUpdate) {
       const background = params.background ?? false;
-      if (!background && params.update_behavior !== undefined) {
-        throw new Error("update_behavior is supported only when background=true");
-      }
       context.markSideEffect();
       if (context.executor?.managed) {
         const binding = managedExecutionBinding(
@@ -653,8 +709,10 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
           );
           const result = response.result;
           return textResult(
-            result.status === "running"
-              ? `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
+            processStatusActive(result.status)
+              ? result.status === "orphaned"
+                ? `Process state needs attention and remains active: ${result.id} (pid ${result.pid ?? "unknown"}; termination not confirmed)`
+                : `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
               : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
             result as unknown as JsonValue,
           );
@@ -686,10 +744,9 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       const timeoutMs = params.timeout_ms
         ?? (background ? undefined : context.defaultTerminalTimeoutMs ?? TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS);
       if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
-      if (params.update_behavior !== undefined) options.updateBehavior = params.update_behavior;
       const result = await context.processes.run(options);
       return textResult(
-        result.status === "running"
+        processStatusActive(result.status)
           ? `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
           : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
         result as unknown as JsonValue,
@@ -1008,27 +1065,47 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     },
   };
 
-  const gatewayTools = (["knowledge", "web"] as const).map((name): AgentTool<typeof gatewaySchema, JsonValue> => ({
-    name,
-    label: name[0]!.toUpperCase() + name.slice(1),
-    description: gatewayDescription(name),
-    parameters: gatewaySchema,
+  const knowledgeTool: AgentTool<typeof knowledgeSchema, JsonValue> = {
+    name: "knowledge",
+    label: "Knowledge",
+    description: gatewayDescription("knowledge"),
+    parameters: knowledgeSchema,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
-      if (isGatewayMutation(name, params.action)) context.markSideEffect();
-      return await withUntrustedErrorBoundary(name, signal, async () => untrustedDataResult(
+      return await withUntrustedErrorBoundary("knowledge", signal, async () => untrustedDataResult(
         await context.gateway.invoke(
           context.request,
           context.runId,
-          name,
+          "knowledge",
           params.action,
           objectValue(params.arguments),
           signal,
         ),
-        name,
+        "knowledge",
       ));
     },
-  }));
+  };
+
+  const webTool: AgentTool<typeof webSchema, JsonValue> = {
+    name: "web",
+    label: "Web",
+    description: gatewayDescription("web"),
+    parameters: webSchema,
+    executionMode: "parallel",
+    async execute(_toolCallId, params, signal) {
+      return await withUntrustedErrorBoundary("web", signal, async () => untrustedDataResult(
+        await context.gateway.invoke(
+          context.request,
+          context.runId,
+          "web",
+          params.action,
+          objectValue(params.arguments),
+          signal,
+        ),
+        "web",
+      ));
+    },
+  };
 
   const browserTool: AgentTool<typeof browserSchema, JsonValue> = {
     name: "browser",
@@ -1075,11 +1152,11 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     },
   };
 
-  const sessionTool: AgentTool<typeof gatewaySchema, JsonValue> = {
+  const sessionTool: AgentTool<typeof runtimeSessionSchema, JsonValue> = {
     name: "session",
     label: "Session",
     description: gatewayDescription("session"),
-    parameters: gatewaySchema,
+    parameters: runtimeSessionSchema,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
@@ -1142,7 +1219,8 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     ...(canSearchPlatformSessions(context.request) ? [sessionSearchTool] : []),
     memoryTool,
     skillTool,
-    ...gatewayTools,
+    knowledgeTool,
+    webTool,
     browserTool,
     ...(isCanonicalPrivateScope(context.request.scope_key) ? [scheduleTool] : []),
     delegateTool,
@@ -1190,19 +1268,12 @@ export function managedExecutionBinding(
       throw new Error("Managed terminal command is required");
     }
     const background = values.background === true;
-    if (!background && values.update_behavior !== undefined) {
-      throw new Error("update_behavior is supported only when background=true");
-    }
     const arguments_: JsonObject = {
       command: values.command,
       cwd: typeof values.cwd === "string" && values.cwd ? values.cwd : workspace,
       background,
     };
-    if (background) {
-      arguments_.update_behavior = typeof values.update_behavior === "string"
-        ? values.update_behavior
-        : "wait";
-    } else {
+    if (!background) {
       arguments_.timeout_ms = typeof values.timeout_ms === "number"
         ? values.timeout_ms
         : defaultTerminalTimeoutMs;

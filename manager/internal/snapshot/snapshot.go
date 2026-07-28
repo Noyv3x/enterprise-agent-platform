@@ -36,7 +36,6 @@ type Store struct {
 }
 
 // Verify validates a rollback snapshot without changing the live database.
-// The source-retirement gate uses it before giving up the legacy checkout.
 func (s Store) Verify(ctx context.Context, path string) error {
 	_, _, err := s.validateSnapshot(ctx, path)
 	return err
@@ -286,7 +285,7 @@ func validateDataDirectory(path string) error {
 
 // ensureDataDirectoryForRestore permits one narrowly-scoped recreation path:
 // a rollback journal has already selected and fully validated the snapshot,
-// but an earlier legacy rollback attempt removed its uncommitted destination.
+// but an interrupted rollback removed its uncommitted destination.
 // Only the final data directory may be absent. Its existing parent remains the
 // trust anchor and must be a real directory owned by the Manager user.
 func (s Store) ensureDataDirectoryForRestore() error {

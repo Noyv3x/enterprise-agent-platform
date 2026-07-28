@@ -48,7 +48,7 @@ func TestBoundDiagnosticIsMarkedAndSafeForJSONExpansion(t *testing.T) {
 	}
 }
 
-func TestLegacyOversizedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) {
+func TestOversizedPersistedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) {
 	dir := t.TempDir()
 	seed, err := Open(dir, time.Unix(100, 0))
 	if err != nil {
@@ -56,16 +56,16 @@ func TestLegacyOversizedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) 
 	}
 	op, _, err := seed.Begin(model.OperationRequest{
 		Kind:               model.OperationUpdate,
-		IdempotencyKey:     "legacy-oversized-diagnostic",
+		IdempotencyKey:     "oversized-persisted-diagnostic",
 		ExpectedGeneration: seed.State().Generation,
 	}, time.Unix(101, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyDiagnostic := strings.Repeat("retry reservation release\n", 110000)
+	persistedDiagnostic := strings.Repeat("retry reservation release\n", 110000)
 	state := seed.State()
-	state.LastError = legacyDiagnostic
-	op.Error = legacyDiagnostic
+	state.LastError = persistedDiagnostic
+	op.Error = persistedDiagnostic
 	for i := 0; i < MaxOperationHistoryEntries+20; i++ {
 		op.History = append(op.History, model.PhaseEvent{
 			Phase: model.PhaseDraining,
@@ -94,16 +94,16 @@ func TestLegacyOversizedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := BoundDiagnostic(legacyDiagnostic)
+	want := BoundDiagnostic(persistedDiagnostic)
 	if got := reopened.State().LastError; got != want {
-		t.Fatalf("State did not bound the legacy diagnostic: %d bytes", len(got))
+		t.Fatalf("State did not bound the persisted diagnostic: %d bytes", len(got))
 	}
 	readOp, err := reopened.Operation(op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if readOp.Error != want || len(readOp.History) != MaxOperationHistoryEntries {
-		t.Fatalf("Operation did not bound legacy diagnostics: error=%d history=%d", len(readOp.Error), len(readOp.History))
+		t.Fatalf("Operation did not bound persisted diagnostics: error=%d history=%d", len(readOp.Error), len(readOp.History))
 	}
 	markedNotes := 0
 	for _, event := range readOp.History {
@@ -120,14 +120,14 @@ func TestLegacyOversizedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) 
 	stateAfterRead, _ := os.ReadFile(statePath)
 	opAfterRead, _ := os.ReadFile(opPath)
 	if !bytes.Equal(stateBefore, stateAfterRead) || !bytes.Equal(opBefore, opAfterRead) {
-		t.Fatal("opening or reading a legacy journal rewrote durable evidence")
+		t.Fatal("opening or reading a journal rewrote durable evidence")
 	}
 	recoveryOp, err := reopened.RecoverActive()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recoveryOp == nil || recoveryOp.Error != legacyDiagnostic {
-		t.Fatal("internal recovery lost the original legacy diagnostic before its first bounded write")
+	if recoveryOp == nil || recoveryOp.Error != persistedDiagnostic {
+		t.Fatal("internal recovery lost the original diagnostic before its first bounded write")
 	}
 
 	if _, err := reopened.MutateState(time.Unix(103, 0), func(*model.ManagerState) error { return nil }); err != nil {
@@ -205,11 +205,10 @@ func TestIdempotencyKeyRejectsDifferentOperationFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := model.OperationRequest{
-		Kind:                 model.OperationInstall,
-		IdempotencyKey:       "stable-key",
-		ExpectedGeneration:   store.State().Generation,
-		ManifestURL:          "https://releases.example/one.json",
-		ExpectedSourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Kind:               model.OperationInstall,
+		IdempotencyKey:     "stable-key",
+		ExpectedGeneration: store.State().Generation,
+		ManifestURL:        "https://releases.example/one.json",
 	}
 	if _, _, err := store.Begin(request, time.Now()); err != nil {
 		t.Fatal(err)
@@ -222,9 +221,6 @@ func TestIdempotencyKeyRejectsDifferentOperationFingerprint(t *testing.T) {
 	for _, mutate := range []func(*model.OperationRequest){
 		func(value *model.OperationRequest) { value.Kind = model.OperationUpdate },
 		func(value *model.OperationRequest) { value.ManifestURL = "https://releases.example/two.json" },
-		func(value *model.OperationRequest) {
-			value.ExpectedSourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		},
 	} {
 		conflict := request
 		conflict.ExpectedGeneration = store.State().Generation

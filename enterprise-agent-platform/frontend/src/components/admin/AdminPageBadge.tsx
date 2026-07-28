@@ -1,5 +1,5 @@
-/* <AdminPageBadge pageId/> — the per-tab count/string pill in the admin pager
-   (legacy adminPageBadge, legacy-app.js:1388-1408). Returns null when the value
+/* <AdminPageBadge pageId/> — the per-tab count/string pill in the admin pager.
+   Returns null when the value
    is falsy (0 / "" / undefined → no badge). Reads many shared state slices, so
    it derives its value via a single selector returning a primitive (Object.is
    keeps the subscription cheap). */

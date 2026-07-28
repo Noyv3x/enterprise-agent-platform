@@ -129,6 +129,14 @@ type Engine interface {
 	ExecArgs(SandboxSpec, string, string, []string) (string, []string)
 }
 
+type FixedServiceState struct {
+	Status string `json:"status"`
+}
+
+type FixedServiceReporter interface {
+	FixedServiceStatus(context.Context) map[string]FixedServiceState
+}
+
 // CandidateFailureDiagnoser is an optional Engine capability. Keeping it
 // separate from Engine lets non-Docker test engines and alternate backends omit
 // host-specific diagnostics while callers can still collect them when present.
@@ -141,7 +149,17 @@ const (
 	candidateLogsMaxBytes       = 32 << 10
 	candidateHealthMaxBytes     = 12 << 10
 	candidateDiagnosticTimeout  = 10 * time.Second
+	firecrawlComposeWaitSeconds = 600
 )
+
+var firecrawlHealthyServices = []string{
+	"firecrawl-playwright",
+	"firecrawl-redis",
+	"firecrawl-rabbitmq",
+	"firecrawl-postgres",
+	"firecrawl-foundationdb",
+	"firecrawl-api",
+}
 
 var candidateCredentialPatterns = []struct {
 	expression  *regexp.Regexp
@@ -277,8 +295,124 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 	if err != nil {
 		return err
 	}
-	_, _ = d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--detach", "firecrawl-api"), nil)
+	return d.reconcileFirecrawl(ctx, env)
+}
+
+// ReconcileFirecrawl converges the complete extraction stack for the active
+// generation.  It is safe to call again after Manager activation: Compose is
+// idempotent, and the only object removed on retry is the failed one-shot init
+// container.  Persistent FoundationDB data and the shared cluster file are
+// never removed or rewritten by the Manager.
+func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Manifest) error {
+	env, err := d.writeGenerationEnvironment(manifest)
+	if err != nil {
+		return err
+	}
+	return d.reconcileFirecrawl(ctx, env)
+}
+
+func (d DockerCLI) reconcileFirecrawl(ctx context.Context, env string) error {
+	startArgs := d.composeArgs(env, "up", "--detach", "--wait", "--wait-timeout", strconv.Itoa(firecrawlComposeWaitSeconds), "firecrawl-api")
+	_, firstErr := d.runner().Run(ctx, d.binary(), startArgs, nil)
+	if firstErr == nil {
+		return nil
+	}
+	firstErr = fmt.Errorf("initial Firecrawl start: %w", firstErr)
+
+	removeInit, restartFDB, planErr := d.firecrawlRepairPlan(ctx, env)
+	if planErr != nil {
+		return errors.Join(firstErr, planErr, errors.New(d.firecrawlFailureDiagnostics(env)))
+	}
+	if !removeInit && !restartFDB {
+		return errors.Join(
+			firstErr,
+			errors.New("Firecrawl failure is outside the FoundationDB/init repair boundary"),
+			errors.New(d.firecrawlFailureDiagnostics(env)),
+		)
+	}
+	if removeInit {
+		if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "rm", "--force", "--stop", "firecrawl-foundationdb-init"), nil); err != nil {
+			return errors.Join(firstErr, fmt.Errorf("remove failed Firecrawl init container: %w", err))
+		}
+	}
+	if restartFDB {
+		if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "restart", "--timeout", "30", "firecrawl-foundationdb"), nil); err != nil {
+			return errors.Join(firstErr, fmt.Errorf("restart unhealthy Firecrawl FoundationDB: %w", err))
+		}
+	}
+	if _, err := d.runner().Run(ctx, d.binary(), startArgs, nil); err != nil {
+		retryErr := fmt.Errorf("Firecrawl retry after init reconciliation: %w", err)
+		return errors.Join(firstErr, retryErr, errors.New(d.firecrawlFailureDiagnostics(env)))
+	}
 	return nil
+}
+
+func (d DockerCLI) firecrawlRepairPlan(ctx context.Context, env string) (bool, bool, error) {
+	initID, err := d.composeServiceContainerID(ctx, env, "firecrawl-foundationdb-init")
+	if err != nil {
+		return false, false, fmt.Errorf("inspect Firecrawl init repair state: %w", err)
+	}
+	initState, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", initID,
+	}, nil)
+	if err != nil {
+		return false, false, fmt.Errorf("inspect Firecrawl init repair state: %w", err)
+	}
+	initFields := strings.Fields(initState.Stdout)
+	if len(initFields) != 2 {
+		return false, false, errors.New("Firecrawl init returned an invalid repair state")
+	}
+	initExitCode, err := strconv.Atoi(initFields[1])
+	if err != nil {
+		return false, false, errors.New("Firecrawl init returned an invalid repair exit code")
+	}
+	removeInit := initFields[0] == "exited" && initExitCode != 0
+
+	foundationDBID, err := d.composeServiceContainerID(ctx, env, "firecrawl-foundationdb")
+	if err != nil {
+		return false, false, fmt.Errorf("inspect Firecrawl FoundationDB repair state: %w", err)
+	}
+	foundationDBState, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+		foundationDBID,
+	}, nil)
+	if err != nil {
+		return false, false, fmt.Errorf("inspect Firecrawl FoundationDB repair state: %w", err)
+	}
+	foundationDBFields := strings.Fields(foundationDBState.Stdout)
+	if len(foundationDBFields) != 2 {
+		return false, false, errors.New("Firecrawl FoundationDB returned an invalid repair state")
+	}
+	restartFoundationDB := foundationDBFields[0] != "running" || foundationDBFields[1] != "healthy"
+	return removeInit, restartFoundationDB, nil
+}
+
+func (d DockerCLI) firecrawlFailureDiagnostics(env string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateDiagnosticTimeout)
+	defer cancel()
+	logServices := append([]string{"logs", "--no-color", "--timestamps", "--tail", "120"}, firecrawlHealthyServices...)
+	logServices = append(logServices, "firecrawl-foundationdb-init")
+	logsResult, logsErr := d.runner().Run(
+		ctx,
+		d.binary(),
+		d.composeArgs(env, logServices...),
+		nil,
+	)
+	parts := []string{"Firecrawl compose logs:\n" + d.boundedCommandDiagnostic(logsResult, logsErr, candidateLogsMaxBytes)}
+	services := append([]string{}, firecrawlHealthyServices...)
+	services = append(services, "firecrawl-foundationdb-init")
+	for _, service := range services {
+		id, err := d.composeServiceContainerID(ctx, env, service)
+		if err != nil {
+			parts = append(parts, service+" Docker state:\n"+err.Error())
+			continue
+		}
+		state, inspectErr := d.runner().Run(ctx, d.binary(), []string{"inspect", "--format", "{{json .State}}", id}, nil)
+		parts = append(parts, service+" Docker state:\n"+d.boundedCommandDiagnostic(state, inspectErr, candidateHealthMaxBytes))
+	}
+	diagnostic := d.redactCandidateDiagnostic(strings.Join(parts, "\n"))
+	return journal.BoundDiagnosticWithLimit(diagnostic, candidateDiagnosticMaxBytes)
 }
 
 func (d DockerCLI) Migrate(ctx context.Context, manifest release.Manifest) error {
@@ -351,34 +485,102 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 	if err != nil {
 		return err
 	}
-	required := []string{"platform", "agent-runtime", "camofox", "searxng"}
+	required := []string{
+		"platform",
+		"agent-runtime",
+		"camofox",
+		"searxng",
+	}
+	required = append(required, firecrawlHealthyServices...)
 	for _, service := range required {
 		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
 			return err
 		}
 	}
-	return nil
+	return d.probeCompletedComposeService(ctx, env, "firecrawl-foundationdb-init")
 }
 
-// ProbeLegacyRetirement raises the readiness boundary used before permanently
-// deleting source-deployment recovery material. The ordinary serving path does
-// not block on Firecrawl because search can continue through SearXNG, but
-// retirement is irreversible and therefore requires the complete extraction
-// stack to have reached its intended steady state as well.
-func (d DockerCLI) ProbeLegacyRetirement(ctx context.Context, manifest release.Manifest) error {
-	if err := d.Probe(ctx, manifest); err != nil {
-		return err
+func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServiceState {
+	result := make(map[string]FixedServiceState, 11)
+	env, envErr := d.activeEnvironment()
+	if d.ComposeFile != "" {
+		env = ""
+		envErr = nil
 	}
-	env, err := d.writeGenerationEnvironment(manifest)
-	if err != nil {
-		return err
+	services := []string{
+		"platform",
+		"agent-runtime",
+		"camofox",
+		"searxng",
 	}
-	for _, service := range []string{"firecrawl-foundationdb", "firecrawl-api"} {
-		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
-			return err
+	services = append(services, firecrawlHealthyServices...)
+	for _, service := range services {
+		status := "unknown"
+		if envErr == nil {
+			status = d.healthyServiceStatus(ctx, env, service)
 		}
+		result[service] = FixedServiceState{Status: status}
 	}
-	return d.probeSuccessfulInitComposeService(ctx, env, "firecrawl-foundationdb-init")
+	initStatus := "unknown"
+	if envErr == nil {
+		initStatus = d.completedServiceStatus(ctx, env, "firecrawl-foundationdb-init")
+	}
+	result["firecrawl-foundationdb-init"] = FixedServiceState{Status: initStatus}
+	return result
+}
+
+func (d DockerCLI) healthyServiceStatus(ctx context.Context, env, service string) string {
+	id, err := d.composeServiceContainerID(ctx, env, service)
+	if err != nil {
+		return "unavailable"
+	}
+	state, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+		id,
+	}, nil)
+	if err != nil {
+		return "unavailable"
+	}
+	fields := strings.Fields(state.Stdout)
+	if len(fields) != 2 {
+		return "unknown"
+	}
+	if fields[0] == "running" && fields[1] == "healthy" {
+		return "healthy"
+	}
+	if fields[0] == "running" && fields[1] == "starting" {
+		return "starting"
+	}
+	return "unavailable"
+}
+
+func (d DockerCLI) completedServiceStatus(ctx context.Context, env, service string) string {
+	id, err := d.composeServiceContainerID(ctx, env, service)
+	if err != nil {
+		return "unavailable"
+	}
+	state, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", id,
+	}, nil)
+	if err != nil {
+		return "unavailable"
+	}
+	fields := strings.Fields(state.Stdout)
+	if len(fields) != 2 {
+		return "unknown"
+	}
+	exitCode, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return "unknown"
+	}
+	if fields[0] == "exited" && exitCode == 0 {
+		return "healthy"
+	}
+	if fields[0] == "created" || fields[0] == "running" {
+		return "starting"
+	}
+	return "unavailable"
 }
 
 func (d DockerCLI) composeServiceContainerID(ctx context.Context, env, service string) (string, error) {
@@ -422,7 +624,7 @@ func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service 
 	return nil
 }
 
-func (d DockerCLI) probeSuccessfulInitComposeService(ctx context.Context, env, service string) error {
+func (d DockerCLI) probeCompletedComposeService(ctx context.Context, env, service string) error {
 	id, err := d.composeServiceContainerID(ctx, env, service)
 	if err != nil {
 		return err
@@ -445,7 +647,7 @@ func (d DockerCLI) probeSuccessfulInitComposeService(ctx context.Context, env, s
 		return fmt.Errorf("required service %s returned an invalid exit code", service)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("required service %s container exit code is %d, want 0", service, exitCode)
+		return fmt.Errorf("required service %s container exited with %d, want 0", service, exitCode)
 	}
 	return nil
 }

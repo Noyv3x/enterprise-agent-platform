@@ -1,8 +1,6 @@
 /* =====================================================================
-   Token-usage 7-day curve geometry + normalization — ported from
-   legacy-app.js:1680-1753 (renderTokenUsageCurve / normalizeTokenDailyUsage /
-   tokenUsageDateLabel). Geometry is extracted so the curve can be redrawn in
-   JSX later with identical coordinates.
+   Token-usage 7-day curve geometry and normalization. Geometry is kept
+   separate so the curve can be redrawn in JSX with stable coordinates.
 
    Viewport: 640×170, padX 26, padY 18 → with 7 points the x-step is 98 and the
    baseline sits at y=152 (height-padY).

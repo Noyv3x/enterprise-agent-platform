@@ -9,7 +9,6 @@
 ├── docs/                         # 唯一设计真相源
 ├── manager/                      # 宿主管理器、Gateway、更新与执行路由
 ├── containers/                   # 镜像、Compose 与安装模板
-├── deploy.sh                     # 旧源码实例的一次性 Docker 桥接入口
 ├── enterprise-agent-platform/
 │   ├── enterprise_agent_platform/ # Python 平台与生成 static
 │   ├── frontend/                  # React/TypeScript 源码
@@ -44,6 +43,7 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 - Runtime 使用严格 TypeScript 和 Node 22.19+；模型、工具、审批、session、进程和委派逻辑归 `agent-runtime/src`。
 - Manager 使用 Go；公网 Gateway、Docker 编排、operation journal、release 校验和宿主执行归 `manager/`，业务容器不得复制这些职责。
 - 前端使用 React + TypeScript；组件按 chat、shell、admin、preview、memory、skills 等领域组织。
+- Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
 - `enterprise_agent_platform/static/` 是生成资源，禁止手改。
 - bundled skills 是产品资产，不是项目说明文档；只有技能功能变更才修改。
 
@@ -67,7 +67,7 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。一个可交付变更集应同时包含规范、实现、测试和必要生成产物，避免文档与代码跨提交长期漂移。代码域允许多重匹配；修改跨域文件时必须同步每个声明域，并由评审补充路径映射无法识别的真实语义域。
 
-不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、`install.sh` 及其 SHA-256 sidecar。重复发布同一 source commit 时必须逐项比较这些资产，main 通道提升前也必须重新校验 installer 与 sidecar；恢复冻结旧 bridge 时禁止直接执行未经校验的网络脚本。
+不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器及其校验文件和全部镜像 digest。重复发布同一 source commit 时必须逐项比较这些资产，main 通道提升前重新校验完整工件集合。安装器只能使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。
 
 提交前检查：
 

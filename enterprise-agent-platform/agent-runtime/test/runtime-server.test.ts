@@ -82,12 +82,33 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
       body: JSON.stringify({ model: { provider: "openai-codex", id: "gpt-5.5" } }),
     });
     assert.equal(malformed.status, 400);
+    const unknownRunField = await fetch(`${base}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: "Bearer secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        scope_key: "user:1",
+        lifecycle_id: "life",
+        session_id: "unknown-field",
+        workspace,
+        system_prompt: "system",
+        input: "hello",
+        model: { provider: "openai-codex", id: "gpt-5.5" },
+        unsupported_mode: true,
+      }),
+    });
+    assert.equal(unknownRunField.status, 400);
     const malformedCleanup = await fetch(`${base}/v1/scopes/cleanup`, {
       method: "POST",
       headers: { authorization: "Bearer secret", "content-type": "application/json" },
       body: JSON.stringify({ scope_key: "user:1", delete_sessions: "false" }),
     });
     assert.equal(malformedCleanup.status, 400);
+    const unknownCleanupField = await fetch(`${base}/v1/scopes/cleanup`, {
+      method: "POST",
+      headers: { authorization: "Bearer secret", "content-type": "application/json" },
+      body: JSON.stringify({ scope_key: "user:1", unknown_cleanup_option: true }),
+    });
+    assert.equal(unknownCleanupField.status, 400);
     const created = await fetch(`${base}/v1/runs`, {
       method: "POST",
       headers: { authorization: "Bearer secret", "content-type": "application/json" },
@@ -123,7 +144,7 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
   }
 });
 
-test("runtime approval endpoint accepts decision and rejects retired compatibility fields", async () => {
+test("runtime approval and joined-input endpoints reject unknown fields", async () => {
   const home = await temporaryDirectory("agent-server-approval-");
   const workspace = await temporaryDirectory("agent-server-approval-workspace-");
   const faux = fauxProvider();
@@ -171,6 +192,11 @@ test("runtime approval endpoint accepts decision and rejects retired compatibili
       headers,
       body: JSON.stringify({ ...inputBody, scope_key: "another-scope" }),
     })).status, 409);
+    assert.equal((await fetch(`${base}/v1/runs/${run.id}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...inputBody, unsupported_mode: true }),
+    })).status, 400);
     const joined = await fetch(`${base}/v1/runs/${run.id}/input`, {
       method: "POST",
       headers,
@@ -337,7 +363,7 @@ test("runtime exposes only bounded read-only processes owned by a root scope", a
       revision: body.revision,
       unchanged: true,
     });
-    for (const invalid of ["", "-1", "+1", "bad token", "slash/value", "x".repeat(129)]) {
+    for (const invalid of ["", "0", "1", "-1", "+1", "bad token", "slash/value", "x".repeat(129)]) {
       assert.equal((await fetch(`${base}/v1/scopes/processes?${query}&since_revision=${encodeURIComponent(invalid)}`, {
         headers: { authorization: "Bearer secret" },
       })).status, 400);
@@ -396,7 +422,6 @@ test("runtime exposes a lightweight live-process summary without terminal output
       command: "printf sibling-summary-secret; sleep 30",
       cwd: workspace,
       background: true,
-      updateBehavior: "terminate",
     });
     await coordinator.processes.run({
       runId: "old-life-live-run",
@@ -429,24 +454,6 @@ test("runtime exposes a lightweight live-process summary without terminal output
     assert.deepEqual(JSON.parse(raw), { running_terminal_count: 2 });
     assert.doesNotMatch(raw, /summary-secret|command|stdout|stderr|output|processes/);
 
-    assert.equal((await fetch(`${base}/v1/processes/update-blockers`)).status, 401);
-    assert.equal((await fetch(`${base}/v1/processes/update-blockers?scope_key=private%3A9`, {
-      headers: { authorization: "Bearer secret" },
-    })).status, 400);
-    const blockerResponse = await fetch(`${base}/v1/processes/update-blockers`, {
-      headers: { authorization: "Bearer secret" },
-    });
-    assert.equal(blockerResponse.status, 200);
-    const blockerRaw = await blockerResponse.text();
-    assert.deepEqual(JSON.parse(blockerRaw), {
-      running_background_terminal_count: 4,
-      update_blocking_terminal_count: 3,
-      terminable_background_terminal_count: 1,
-    });
-    assert.doesNotMatch(
-      blockerRaw,
-      /summary-secret|command|scope|lifecycle|pid|stdout|stderr|output|processes/,
-    );
   } finally {
     coordinator.processes.killScope("private:9");
     coordinator.processes.killScope("private:90");

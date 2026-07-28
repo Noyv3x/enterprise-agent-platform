@@ -209,13 +209,13 @@ test("ApprovalBroker timeout resolves fail-closed and emits a resolved event", a
   assert.deepEqual(resolutions, ["timeout"]);
 });
 
-test("version 1 broad always grants are invalidated instead of authorizing v2 objects", async () => {
-  const home = await temporaryDirectory("agent-approval-v1-");
+test("invalid broad always grants are discarded instead of authorizing current objects", async () => {
+  const home = await temporaryDirectory("agent-approval-invalid-");
   try {
     const directory = `${home}/approvals`;
     await mkdir(directory, { recursive: true });
     await writeFile(`${directory}/always.json`, JSON.stringify({
-      version: 1,
+      version: 999,
       grants: [{ scope_key: "scope", tool_name: "terminal", created_at: new Date().toISOString() }],
     }), "utf8");
     const store = new AlwaysApprovalStore(home);

@@ -6,7 +6,9 @@
 
 前端使用 React、TypeScript、Vite 和 Ant Design 6。可编辑源代码位于 `enterprise-agent-platform/frontend/`；`enterprise_agent_platform/static/` 是构建产物，只能通过前端构建脚本生成。
 
-构建脚本在同一文件系统的暂存目录中完成 Vite 构建、资源完整性验证、压缩和原子发布。带 hash 的依赖先安装，`index.html` 最后提交；同时保留上一版必要入口资源，降低慢链路和更新切换时的缓存错配。
+构建脚本在同一文件系统的暂存目录中完成 Vite 构建、资源完整性验证、压缩和原子发布。带 hash 的依赖先安装，`index.html` 最后提交。发布清单只声明当前构建资产；提交当前入口后必须删除所有不在当前清单中的受管文件，不保留上一代 bundle，也不提供跨 generation 的静态资源兼容层。
+
+前端数据类型以当前 API 实体名为唯一公开名称。不为已删除的规格名、旧组件名或旧响应形状保留未使用的 type alias；跨层名称改动与 API 类型在同一变更中完成。
 
 ## 组件与视觉系统
 
@@ -16,7 +18,7 @@ Ant Design 是整个浏览器界面的组件和交互语义基础，负责按钮
 
 产品图标必须具有稳定的默认尺寸；未显式指定尺寸时统一使用 `18px`，不能依赖浏览器对无尺寸 SVG 的默认宽高。组件库 semantic class 应直接约束图标节点，并覆盖其嵌套节点兼容形态，避免菜单、卡片和导航因图标退化为替换元素默认尺寸而变形。
 
-旧 `.btn`、`.icon-btn`、`.card`、`.modal`、`.empty`、`.spinner` 和普通原生表单不再是有效设计基础；完成迁移后应删除其无消费者规则和对应的自研基础组件。业务 CSS 只负责页面结构、内容排版和产品特有视觉，不以高优先级选择器覆盖组件库内部节点。应用主题上下文是深浅主题的唯一状态源，并映射为组件库的默认/暗色算法；桌面采用紧凑但可读的密度，触屏目标不得低于 44px。
+`.btn`、`.icon-btn`、`.card`、`.modal`、`.empty`、`.spinner` 和普通原生表单不属于有效设计系统；不得保留无消费者规则或对应的自研基础组件。业务 CSS 只负责页面结构、内容排版和产品特有视觉，不以高优先级选择器覆盖组件库内部节点。应用主题上下文是深浅主题的唯一状态源，并映射为组件库的默认/暗色算法；桌面采用紧凑但可读的密度，触屏目标不得低于 44px。
 
 Cognee 的 changed-only 动态配置收集器依赖真实原生字段及其 DOM 数据属性，是唯一允许保留原生控件的普通界面表单；其外层布局和操作仍须与统一设计系统一致。聊天 Composer 的自动增长 textarea、mention option 和隐藏文件 input 属于输入状态机的一部分，需要维持中文 IME、caret、焦点和分会话附件恢复，因此可以保留原生节点，但必须使用统一 Token、可访问性语义和组件级回归测试。除这两个明确边界外，文件选择使用组件库 Upload 语义，不能再新增原生交互控件。
 
@@ -74,6 +76,7 @@ Provider 层次必须保持以下职责：
 - 资源状态存在但帧或日志尚未到达时显示骨架/加载态；
 - 只有服务端确认资源不存在时才显示空状态；
 - 浏览器以低刷新率展示当前 viewport，终端按多个运行进程分组展示；
+- 终端状态 `orphaned` 表示终止结果尚未得到 Manager 确认，仍属于活动资源；侧栏继续显示该进程并以警告状态标明“需关注、仍占用”，不能将它表现为完成或隐藏；
 - 预览不可发送按键、鼠标或终端输入。
 
 ## 响应式布局
@@ -85,6 +88,8 @@ Provider 层次必须保持以下职责：
 管理面板是应用主侧栏内的二级布局，不能只根据浏览器 viewport 决定内部列数。只有管理内容容器至少可同时容纳 216px 二级菜单和 840px 正文时才显示常驻菜单，否则切换为紧凑分组选择器。页面标题、说明、主操作和刷新入口必须位于同一页头；一个页面最多保留一个高强调主操作，不能在正文卡片内重复标题和操作层级。
 
 账号等结构化数据在宽屏使用紧凑表格，状态必须同时显示文字和颜色，危险或低频动作收入下拉菜单；窄屏切换为无需横向滚动的列表。账号行桌面高度保持在 64–72px，操作不可换行撑高整行。创建和编辑使用抽屉，手机上占满可用宽度。配置表单、审计工具、会话审计和统计区根据管理页自身的容器宽度降列；宽表格和趋势图只允许在自身区域内滚动，不能扩大页面根布局。
+
+“底层服务”页面是只读健康视图，不是第二套服务生命周期控制器。Platform 只返回 `name`、`available`、`state`、`detail`、`error` 以及缓存新鲜度；不得向浏览器暴露内部 URL、宿主或容器路径、管理来源标记，也不得保留 `managed` 等已失去区分意义的字段。当前状态集合只有 `running`、`unavailable`、`available`、`missing`、`error` 和 `invalid_config`；界面和 i18n 不为旧安装、准备、外部运行或停止流程保留状态文案。
 
 ## i18n 与可访问性
 
@@ -98,9 +103,11 @@ Provider 层次必须保持以下职责：
 
 Manager 的数值 `generation` 是并发修改版本，必须单独透传为操作的 `expected_generation`；release `current/target/previous.id` 只用于展示，不能互相替代。RFC3339 `checked_at` 在 Platform 边界规范化为前端可解析的时间，每个 service 的 `status` 规范化为明确的 `available/state`，未知或 unavailable 状态不得默认显示为 ready。
 
+Manager 服务状态区必须逐项呈现当前固定服务目录：`platform`、`agent-runtime`、`camofox`、`searxng`，以及 `firecrawl-playwright`、`firecrawl-redis`、`firecrawl-rabbitmq`、`firecrawl-postgres`、`firecrawl-foundationdb`、`firecrawl-foundationdb-init`、`firecrawl-api`；Manager 自身状态可以并列展示。初始化容器退出成功是独立完成态，不能因其不是长期运行容器而显示为故障；Firecrawl 的每个必需依赖都必须独立展示，不能合并成一个模糊状态。
+
 候选镜像预拉取和 `waiting_for_tasks` 不阻断其它页面；进入 `updating` 后，全局 `UpdateGate` 禁止使用并显示管理器维护状态。失败时如果 Platform 仍可用，管理页展示 operation id 和使用宿主 CLI 的恢复提示；不得向普通页面泄露 Docker socket、registry 凭据、宿主绝对路径或完整管理日志。
 
-源码首迁期间 Manager socket 暂不可达不能伪造为 `idle`。只读状态和管理配置回退到 legacy marker，并标明 `source_bridge` 控制面及 Manager 可用性；`source_bridge_ready`、`container_migration_queued` 和 `container_migration_failed` 必须保留其真实 phase。当 `control_plane=source_bridge` 或 `manager_available=false` 时，管理页必须明确显示“迁移交接中，当前只读”，禁用保存配置、检查更新、更新、重启和回滚等所有变更入口，不能让用户点击后才收到 400/503。Manager 一旦报告 operation、maintenance 或 current/target generation，界面改用 Manager 状态。写操作不回退到 Git updater。
+Manager 状态不可达时不能伪造为 `idle`。管理页必须显示控制平面不可用，禁用保存配置、检查更新、更新、重启和回滚等所有变更入口，不能让用户点击后才收到 400/503；写操作不存在其它回退控制器。
 
 ## 验证
 

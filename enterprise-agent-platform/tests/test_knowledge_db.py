@@ -146,35 +146,6 @@ class KnowledgeDedupTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_hash_migration_preserves_historical_duplicate_ids(self):
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                ts = 1
-                for _ in range(2):
-                    db.insert(
-                        """
-                        INSERT INTO knowledge_documents(
-                            title, summary, content, source, created_by, created_at, updated_at
-                        ) VALUES ('Legacy', 'summary', 'same body', 'sync', NULL, ?, ?)
-                        """,
-                        (ts, ts),
-                    )
-                ids_before = [row["id"] for row in db.query("SELECT id FROM knowledge_documents ORDER BY id")]
-
-                kb = KnowledgeBase(db)
-                ids_after = [row["id"] for row in db.query("SELECT id FROM knowledge_documents ORDER BY id")]
-                document, created = kb.add_document_with_status(
-                    title="Legacy", content="same body", source="sync"
-                )
-
-                self.assertEqual(ids_after, ids_before)
-                self.assertFalse(created)
-                self.assertEqual(document["id"], ids_before[0])
-            finally:
-                db.close()
-
-
 class KnowledgeContentCapTests(unittest.TestCase):
     def test_content_exceeding_cap_raises(self):
         # MAX_CONTENT_CHARS is resolved at import time, so patch the module

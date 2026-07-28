@@ -20,7 +20,7 @@ import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
-test("legacy session tool results are framed in memory by source without changing current results", () => {
+test("unmarked imported session tool results are framed without changing current results", () => {
   const toolSources = [
     ["web", "web"],
     ["browser", "browser"],
@@ -30,10 +30,10 @@ test("legacy session tool results are framed in memory by source without changin
     ["session_search", "session_search"],
     ["search_files", "workspace_search"],
     ["schedule", "schedule"],
-    ["skill", "skill.legacy"],
+    ["skill", "skill.unmarked"],
   ] as const;
-  const legacy = toolSources.map(([toolName], index) => ({
-    entry_id: `legacy-${index}`,
+  const imported = toolSources.map(([toolName], index) => ({
+    entry_id: `unmarked-${index}`,
     message: {
       role: "toolResult" as const,
       toolCallId: `call-${index}`,
@@ -47,11 +47,11 @@ test("legacy session tool results are framed in memory by source without changin
       timestamp: index,
     },
   }));
-  const legacyBefore = structuredClone(legacy);
+  const importedBefore = structuredClone(imported);
 
-  const prepared = prepareSessionHistoryForModel(legacy);
+  const prepared = prepareSessionHistoryForModel(imported);
 
-  assert.deepEqual(legacy, legacyBefore, "model-load migration must not mutate the durable representation");
+  assert.deepEqual(imported, importedBefore, "model-load security wrapping must not mutate the durable representation");
   for (const [index, [, source]] of toolSources.entries()) {
     const message = prepared[index]?.message;
     assert.equal(message?.role, "toolResult");
@@ -117,7 +117,7 @@ test("legacy session tool results are framed in memory by source without changin
   );
 
   const terminal = {
-    entry_id: "legacy-terminal",
+    entry_id: "unmarked-terminal",
     message: {
       role: "toolResult" as const,
       toolCallId: "terminal-call",
@@ -131,14 +131,14 @@ test("legacy session tool results are framed in memory by source without changin
   assert.equal(
     prepareSessionHistoryForModel([terminal])[0],
     terminal,
-    "trusted/local tool classes are outside the legacy untrusted-result migration",
+    "trusted/local tool classes are outside unmarked untrusted-result wrapping",
   );
 });
 
-test("legacy session images receive an adjacent untrusted-data notice in the model copy", () => {
+test("unmarked imported session images receive an adjacent untrusted-data notice", () => {
   const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
   const entry = {
-    entry_id: "legacy-browser-image",
+    entry_id: "unmarked-browser-image",
     message: {
       role: "toolResult" as const,
       toolCallId: "browser-image-call",
@@ -162,20 +162,20 @@ test("legacy session images receive an adjacent untrusted-data notice in the mod
   assert.equal(entry.message.content.length, 1, "model-load migration must leave the journal value unchanged");
 });
 
-test("legacy assistant tool-call arguments are redacted only in the model-facing copy", () => {
+test("unmarked imported assistant tool-call arguments are redacted in the model copy", () => {
   const secret = `ghp_${"L".repeat(36)}`;
-  const legacy = {
-    entry_id: "legacy-assistant-tool-call",
+  const imported = {
+    entry_id: "unmarked-assistant-tool-call",
     message: fauxAssistantMessage(
       fauxToolCall("terminal", { command: `API_TOKEN=${secret} printf ok` }),
       { stopReason: "toolUse" },
     ),
   };
-  const before = structuredClone(legacy);
+  const before = structuredClone(imported);
 
-  const [prepared] = prepareSessionHistoryForModel([legacy], "/tmp/workspace");
+  const [prepared] = prepareSessionHistoryForModel([imported], "/tmp/workspace");
 
-  assert.deepEqual(legacy, before, "model-load migration must not rewrite legacy durable data");
+  assert.deepEqual(imported, before, "model-load security wrapping must not rewrite imported durable data");
   assert.doesNotMatch(JSON.stringify(prepared), new RegExp(secret));
   assert.match(JSON.stringify(prepared), /\[redacted\]/);
   assert.equal(
@@ -518,7 +518,6 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
       command: "touch approved.txt && stat approved.txt",
       cwd: workspace,
       background: false,
-      update_behavior: "foreground",
       timeout_ms: config.terminalTimeoutMs,
     });
     assert.equal(approved?.data.execution_started, true);
@@ -681,7 +680,6 @@ test("process write cannot inject a hardline command into a background shell", a
     fauxAssistantMessage(fauxToolCall("terminal", {
       command: "bash",
       background: true,
-      update_behavior: "terminate",
     }), { stopReason: "toolUse" }),
     (context) => {
       const match = /Process started: (process_[a-z0-9]+)/i.exec(JSON.stringify(context.messages));
@@ -1239,15 +1237,16 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
     const accepted = await coordinator.submitInput(run.id, first);
     assert.equal(accepted.state, "accepted");
     assert.deepEqual(await coordinator.submitInput(run.id, first), accepted);
-    const executionEquivalentRetry = {
+    const requestWithUnknownField = {
       ...first,
       attachments: [],
       client_trace: { attempt: 2 },
     };
-    assert.deepEqual(
-      await coordinator.submitInput(run.id, executionEquivalentRetry),
-      accepted,
+    await assert.rejects(
+      coordinator.submitInput(run.id, requestWithUnknownField as never),
+      /unsupported fields/,
     );
+    const executionEquivalentRetry = { ...first, attachments: [] };
     assert.deepEqual(
       await coordinator.submitInput(run.id, {
         input: first.input,
@@ -1975,9 +1974,9 @@ test("session tool searches the delegated Agent's own durable journal", async ()
   }
 });
 
-test("session read and search redact legacy assistant tool-call credentials", async () => {
-  const home = await temporaryDirectory("agent-session-legacy-redaction-");
-  const workspace = await temporaryDirectory("agent-session-legacy-redaction-workspace-");
+test("session read and search redact unmarked imported assistant credentials", async () => {
+  const home = await temporaryDirectory("agent-session-imported-redaction-");
+  const workspace = await temporaryDirectory("agent-session-imported-redaction-workspace-");
   const secret = `ghp_${"S".repeat(36)}`;
   const faux = fauxProvider();
   faux.setResponses([
@@ -1989,7 +1988,7 @@ test("session read and search redact legacy assistant tool-call credentials", as
       fauxToolCall("session", { action: "read", arguments: { index: 0 } }),
       { stopReason: "toolUse" },
     ),
-    fauxAssistantMessage("legacy history inspected safely"),
+    fauxAssistantMessage("imported history inspected safely"),
   ]);
   const contexts: AgentMessage[][] = [];
   const streamFn: StreamFn = (model, context, options) => {
@@ -2008,7 +2007,7 @@ test("session read and search redact legacy assistant tool-call credentials", as
       session_id: "parent:child",
       workspace,
       system_prompt: "You are ubitech agent.",
-      input: "inspect legacy history",
+      input: "inspect imported history",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
     assert.equal((await coordinator.wait(run.id)).status, "completed");

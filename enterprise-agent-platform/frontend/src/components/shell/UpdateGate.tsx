@@ -37,10 +37,8 @@ function normalizeStatus(value: unknown): PlatformUpdateStatus {
   if (!KNOWN_STATES.has(state)) throw new Error("Invalid platform update state");
   return {
     state,
-    ...(typeof raw.phase === "string" && KNOWN_STATES.has(raw.phase as PlatformUpdateState)
-      ? { phase: raw.phase as PlatformUpdateState }
-      : {}),
-    ...(typeof raw.instance_id === "string" ? { instance_id: raw.instance_id } : {}),
+    ...(typeof raw.phase === "string" ? { phase: raw.phase } : {}),
+    ...(typeof raw.operation_id === "string" ? { operation_id: raw.operation_id } : {}),
     retry_after_ms: normalizedRetryAfter(raw.retry_after_ms),
   };
 }
@@ -158,22 +156,22 @@ export function UpdateGate({
   const [status, setStatus] = useState<PlatformUpdateStatus | null>(null);
   const statusRef = useRef<PlatformUpdateStatus | null>(null);
   const maintenanceSeen = useRef(false);
-  const instanceChanged = useRef(false);
-  const baselineInstance = useRef("");
+  const operationChanged = useRef(false);
+  const baselineOperation = useRef("");
   const reloadRequested = useRef(false);
   const pollNow = useRef<() => void>(() => undefined);
   const maintenanceEpoch = useRef(0);
 
   const acceptStatus = useCallback((next: PlatformUpdateStatus) => {
-    const instanceId = String(next.instance_id || "");
-    if (!baselineInstance.current && instanceId) {
-      baselineInstance.current = instanceId;
+    const operationId = String(next.operation_id || "");
+    if (!baselineOperation.current && operationId) {
+      baselineOperation.current = operationId;
     } else if (
-      instanceId &&
-      baselineInstance.current &&
-      instanceId !== baselineInstance.current
+      operationId &&
+      baselineOperation.current &&
+      operationId !== baselineOperation.current
     ) {
-      instanceChanged.current = true;
+      operationChanged.current = true;
     }
 
     if (blocksPlatform(next.state)) maintenanceSeen.current = true;
@@ -182,7 +180,7 @@ export function UpdateGate({
 
     if (
       next.state === "idle" &&
-      (maintenanceSeen.current || instanceChanged.current) &&
+      (maintenanceSeen.current || operationChanged.current) &&
       !reloadRequested.current
     ) {
       reloadRequested.current = true;
@@ -246,7 +244,7 @@ export function UpdateGate({
       maintenanceSeen.current = true;
       const forced: PlatformUpdateStatus = {
         state: "updating",
-        instance_id: statusRef.current?.instance_id,
+        operation_id: statusRef.current?.operation_id,
         retry_after_ms: MIN_POLL_MS,
       };
       statusRef.current = forced;

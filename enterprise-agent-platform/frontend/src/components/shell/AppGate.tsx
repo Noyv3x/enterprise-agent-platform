@@ -3,8 +3,8 @@
    switches between <LoginView/> and <AppShell/> based on the store user.
 
    The SSE/poll visibility + pagehide lifecycle is NOT here: it lives in the
-   useRealtime / usePolling hooks mounted by <AppShell/> (only while a user is
-   present), matching the legacy "stop polling/stream when logged out" behavior. */
+   useRealtime / usePolling hooks mounted by <AppShell/> only while a user is
+   present. */
 
 import { Button } from "antd";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";

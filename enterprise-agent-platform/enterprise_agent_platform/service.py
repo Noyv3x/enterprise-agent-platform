@@ -28,7 +28,6 @@ from typing import Any, Callable, Deque, Iterable
 from .auth import TokenSigner, hash_password, verify_password
 from .agent_inputs import AgentRunInput, AgentRunInputStore
 from .agent_scopes import AgentExecutionScope, AgentScopeManager
-from .auto_update import AutoUpdateManager
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .container_contract_generated import CONTAINER_PATHS
@@ -54,7 +53,6 @@ from .knowledge import KnowledgeBase
 from .loopback_http import (
     open_loopback_url,
     open_private_service_url,
-    open_trusted_service_url,
     validate_http_base_url,
     validate_loopback_url,
 )
@@ -83,7 +81,6 @@ from .oauth_flows import (
 from .prompt_security import format_untrusted_context_data
 from .runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
-    AGENT_SETTING_MANAGED,
     AGENT_SETTING_MAX_CONCURRENCY,
     AGENT_SETTING_MODEL,
     AGENT_SETTING_PROVIDER,
@@ -227,6 +224,7 @@ MAX_BROWSER_PREVIEW_PIXELS = 50_000_000
 TERMINAL_PREVIEW_REVISION_RE = re.compile(
     r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}"
 )
+EMPTY_TERMINAL_PREVIEW_REVISION = "preview_none:0"
 # Global ceiling on concurrent in-flight Agent generations. Each conversation
 # still drains its own queue in FIFO order, while this bound prevents a burst of
 # distinct conversations from exhausting host threads and sockets.
@@ -308,11 +306,6 @@ TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
 TELEGRAM_SETTING_POLLING = "telegram_polling"
 TELEGRAM_SECRET_BOT_TOKEN = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
 TELEGRAM_SECRET_WEBHOOK_SECRET = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
-AUTO_UPDATE_SETTING_ENABLED = "auto_update_enabled"
-AUTO_UPDATE_SETTING_INTERVAL = "auto_update_interval_seconds"
-AUTO_UPDATE_SETTING_REMOTE = "auto_update_remote"
-AUTO_UPDATE_SETTING_BRANCH = "auto_update_branch"
-AUTO_UPDATE_SECRET_WEBHOOK_SECRET = "ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
@@ -365,28 +358,18 @@ class EnterpriseService:
         self,
         config: PlatformConfig,
         agent_client: AgentClient | None = None,
-        runtime_process_launcher=None,
-        runtime_command_runner=None,
         oauth_http_client=None,
-        auto_update_runner=None,
-        auto_update_launcher=None,
-        auto_update_repo_root: Path | None = None,
-        autostart_runtime: bool = True,
         manager_client: ManagerClient | None = None,
     ):
         self.config = config
         self.manager_client = manager_client or (
             ManagerClient(config.manager_socket, config.manager_token_file)
-            if config.manager_socket is not None
+            if config.manager_socket is not None and config.manager_token_file is not None
             else None
         )
         startup_reservation_id = ""
         startup_reservation_owner = ""
-        if self.config.deployment_mode == "container":
-            if self.manager_client is None:
-                raise RuntimeError(
-                    "container startup requires the Manager control socket"
-                )
+        if self.manager_client is not None:
             try:
                 startup_reservation_id = self._manager_startup_reservation_id(
                     self.manager_client.status()
@@ -397,23 +380,6 @@ class EnterpriseService:
                 ) from exc
             if startup_reservation_id:
                 startup_reservation_owner = "manager"
-        elif (
-            self.manager_client is not None
-            and os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
-        ):
-            # During source-to-container handoff the socket may not exist yet.
-            # If a Manager operation already owns maintenance, recover it
-            # before any worker starts; otherwise the legacy marker remains
-            # the source control plane until Manager becomes authoritative.
-            try:
-                manager_status = self.manager_client.status()
-                if bool((manager_status or {}).get("maintenance")):
-                    startup_reservation_id = self._manager_startup_reservation_id(
-                        manager_status
-                    )
-                    startup_reservation_owner = "manager"
-            except Exception:
-                pass
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
         self._instance_lock_finalizer: weakref.finalize | None = None
@@ -444,8 +410,6 @@ class EnterpriseService:
         self.runtimes = PlatformRuntimeManager(
             config,
             self.get_secret,
-            process_launcher=runtime_process_launcher,
-            command_runner=runtime_command_runner,
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
@@ -490,16 +454,12 @@ class EnterpriseService:
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_active_tasks: dict[str, dict[str, Any]] = {}
         # Admissions cover the short message-persist -> durable-job-enqueue
-        # boundary. The auto-updater reserves an idle platform under the same
+        # boundary. Manager reserves an idle platform under the same
         # lock, so a request either becomes durable work first or receives the
         # maintenance response; it can never be stranded between the two.
         self._agent_update_admissions = 0
-        self._agent_update_admission_epoch = 0
-        self._auto_update_probe_token = ""
-        self._auto_update_probe_id = ""
         self._auto_update_reserved = bool(startup_reservation_id)
         self._auto_update_reservation_id = startup_reservation_id
-        self._auto_update_reservation_durable = bool(startup_reservation_id)
         self._auto_update_reservation_owner = startup_reservation_owner
         self._auto_update_last_released_id = ""
         self._agent_scope_epochs: dict[str, int] = {}
@@ -541,22 +501,6 @@ class EnterpriseService:
         self._schedule_wakeup = threading.Event()
         self._schedule_dispatch_lock = threading.Lock()
         self._schedule_thread: threading.Thread | None = None
-        self._auto_updater = AutoUpdateManager(
-            self,
-            repo_root=auto_update_repo_root,
-            runner=auto_update_runner,
-            launcher=auto_update_launcher,
-        )
-        restored_update_id = self._auto_updater.blocking_update_id()
-        if (
-            self.config.deployment_mode == "source"
-            and not self._auto_update_reserved
-            and self._auto_updater.blocks_platform_use()
-        ):
-            self._auto_update_reserved = True
-            self._auto_update_reservation_id = restored_update_id
-            self._auto_update_reservation_durable = True
-            self._auto_update_reservation_owner = "source_marker"
         self._closed = False
         self._resources_closed = False
         self._close_lock = threading.Lock()
@@ -572,20 +516,9 @@ class EnterpriseService:
             self.agent_client = self._new_agent_runtime_client()
         self._cleanup_incomplete_attachment_messages()
         self._cleanup_orphan_attachment_files()
-        self.runtimes.prepare()
-        if autostart_runtime and agent_client is None:
-            prepare_agent_runtime = getattr(self.agent_client, "prepare_runtime", None)
-            if callable(prepare_agent_runtime):
-                try:
-                    prepare_agent_runtime()
-                except Exception as exc:
-                    print(f"Failed to prepare Agent runtime client: {exc}", file=sys.stderr)
-            self.runtimes.ensure_managed_tooling_ready(wait=False)
-            self.runtimes.ensure_agent_runtime_ready(wait=False)
         self._recover_durable_work()
         self._start_schedule_worker()
         self._start_telegram_gateway()
-        self._start_auto_update_listener()
 
     @staticmethod
     def _manager_startup_reservation_id(status: dict[str, Any]) -> str:
@@ -653,8 +586,8 @@ class EnterpriseService:
             "default_model": str(
                 runtime.get("model") or self.config.agent_runtime_model
             ),
-            "require_loopback": bool(runtime.get("managed")),
-            "managed_execution": self.config.deployment_mode == "container",
+            "require_loopback": False,
+            "managed_execution": True,
         }
         try:
             return AgentRuntimeClient(runtime_url, runtime_token, **client_kwargs)
@@ -678,30 +611,18 @@ class EnterpriseService:
             self.unregister_telegram_delivery_handler()
             if self._telegram_gateway is not None:
                 self._telegram_gateway.stop()
-            self._auto_updater.stop()
-            worker_thread_getter = getattr(self._auto_updater, "worker_thread", None)
-            auto_update_worker = (
-                worker_thread_getter()
-                if callable(worker_thread_getter)
-                else None
-            )
-            if not isinstance(auto_update_worker, threading.Thread):
-                auto_update_worker = None
             self._ingest_wakeup.set()
             self._telegram_delivery_wakeup.set()
             self._schedule_wakeup.set()
 
-            # First terminate scope-owned processes and the managed runtimes so
-            # blocked HTTP/Cognee calls return. The database deliberately stays
-            # open until every worker has observed shutdown and persisted its
-            # durable terminal state.
+            # First close scope-owned processes, the Agent client and runtime
+            # status adapters. The database deliberately stays open until every
+            # worker has observed shutdown and persisted its durable state.
             self._cleanup_all_agent_scopes()
-            close_agent_client = getattr(self.agent_client, "close", None)
-            if callable(close_agent_client):
-                try:
-                    close_agent_client()
-                except Exception:
-                    pass
+            try:
+                self.agent_client.close()
+            except Exception:
+                pass
             self.runtimes.close()
 
             with self._ingest_lock:
@@ -711,7 +632,6 @@ class EnterpriseService:
             schedule_worker = self._schedule_thread
             deadline = time.monotonic() + 15.0
             for worker in [
-                auto_update_worker,
                 ingest,
                 telegram_delivery,
                 schedule_worker,
@@ -724,7 +644,6 @@ class EnterpriseService:
             live_workers = [
                 worker
                 for worker in [
-                    auto_update_worker,
                     ingest,
                     telegram_delivery,
                     schedule_worker,
@@ -832,43 +751,21 @@ class EnterpriseService:
         delete_sessions: bool = False,
         strict: bool = False,
     ) -> None:
-        cleanup = getattr(self.agent_client, "cleanup_scope", None)
-        if callable(cleanup):
-            try:
-                try:
-                    cleanup(
-                        scope_key,
-                        lifecycle_id=lifecycle_id,
-                        delete_sessions=delete_sessions,
-                    )
-                except TypeError:
-                    try:
-                        # Test/local adapters and one-release third-party integrations
-                        # may still expose the pre-delete-sessions signature.
-                        cleanup(scope_key, lifecycle_id=lifecycle_id)
-                    except TypeError:
-                        # Older adapters may expose only the original scope signature.
-                        cleanup(scope_key)
-            except Exception as exc:
-                if not strict:
-                    print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
-                else:
-                    # A successful lifecycle mutation must not leave a known live run
-                    # capable of further host-side tool effects. Restarting the managed
-                    # runtime is the fail-closed fallback when targeted cancellation
-                    # cannot be confirmed.
-                    try:
-                        status = self.runtimes.restart_agent_runtime()
-                    except Exception as restart_exc:
-                        raise ServiceError(
-                            503,
-                            f"Agent scope was reset but runtime cancellation failed: {restart_exc}",
-                        ) from restart_exc
-                    if not status.available:
-                        raise ServiceError(
-                            503,
-                            f"Agent scope was reset but runtime cancellation could not be confirmed: {status.error or exc}",
-                        ) from exc
+        try:
+            self.agent_client.cleanup_scope(
+                scope_key,
+                lifecycle_id=lifecycle_id,
+                delete_sessions=delete_sessions,
+            )
+        except Exception as exc:
+            if not strict:
+                print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
+            else:
+                raise ServiceError(
+                    503,
+                    "Agent scope was reset but Runtime cancellation "
+                    f"could not be confirmed: {exc}",
+                ) from exc
 
         # Delegated Agents derive their own Camofox user identity from their
         # child scope.  Cleaning only the root leaves those browser profiles
@@ -1370,23 +1267,20 @@ class EnterpriseService:
     def _recover_agent_message_job_gaps(self) -> None:
         """Repair the narrow message-commit/job-enqueue crash window.
 
-        The first upgraded start records a high-water mark so historical chat
-        is never replayed. Every later start scans only messages created under
-        the durable-jobs release and recreates a missing idempotent job when no
-        Agent reply already targets that message.
+        The database baseline owns the high-water mark. Startup only validates
+        and consumes it, then recreates a missing idempotent job when no Agent
+        reply already targets that message.
         """
 
         raw_start = self.get_setting(_DURABLE_AGENT_START_MESSAGE_SETTING)
-        if raw_start is None:
-            high_water = int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") or 0)
-            self.set_setting(_DURABLE_AGENT_START_MESSAGE_SETTING, str(high_water))
-            return
         try:
-            start_id = max(0, int(raw_start))
+            start_id = int(raw_start) if raw_start is not None else -1
         except (TypeError, ValueError):
-            start_id = int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") or 0)
-            self.set_setting(_DURABLE_AGENT_START_MESSAGE_SETTING, str(start_id))
-            return
+            start_id = -1
+        if start_id < 0:
+            raise RuntimeError(
+                "database durable Agent message high-water mark is invalid"
+            )
 
         rows = self.db.query(
             """
@@ -1601,18 +1495,6 @@ class EnterpriseService:
             self._telegram_gateway = None
         self._start_telegram_gateway()
 
-    def _start_auto_update_listener(self) -> None:
-        if self.config.deployment_mode == "container":
-            return
-        if (
-            self.auto_update_enabled()
-            or os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
-            or self.manager_client is not None
-            or self._auto_updater.source_migration_recovery_required()
-            or self._auto_updater.source_migration_bootstrap_required()
-        ):
-            self._auto_updater.start()
-
     def ensure_bootstrap(self) -> None:
         if not self.db.scalar("SELECT COUNT(*) FROM channels"):
             ts = now_ts()
@@ -1684,14 +1566,11 @@ class EnterpriseService:
             "SELECT value FROM settings WHERE key = ? AND secret = 1",
             ("ENTERPRISE_SESSION_SECRET",),
         )
-        if self.config.deployment_mode == "container" and row and row["value"]:
+        if row and row["value"]:
             return str(row["value"])
         env_secret = os.getenv("ENTERPRISE_SESSION_SECRET")
         if env_secret:
-            if self.config.deployment_mode == "container":
-                self.set_setting(
-                    "ENTERPRISE_SESSION_SECRET", env_secret, secret=True
-                )
+            self.set_setting("ENTERPRISE_SESSION_SECRET", env_secret, secret=True)
             return env_secret
         if row and row["value"]:
             return str(row["value"])
@@ -1702,8 +1581,6 @@ class EnterpriseService:
     def _synchronize_container_internal_tokens(self) -> None:
         """Make Manager-mounted capabilities authoritative for this generation."""
 
-        if self.config.deployment_mode != "container":
-            return
         for key, configured in (
             ("agent_tool_token", self.config.agent_tool_token),
             ("agent_runtime_token", self.config.agent_runtime_token),
@@ -2272,8 +2149,8 @@ class EnterpriseService:
 
     def deactivate_user(self, actor: dict[str, Any], user_id: int) -> dict[str, Any]:
         result = self.update_user(actor, user_id, {"active": False})
-        # Host execution keeps the user's scoped workspace, memory and session
-        # so an administrator can reactivate the account without data loss.
+        # Account deactivation keeps the user's scoped workspace, memory and
+        # session so an administrator can reactivate it without data loss.
         try:
             self.agent_scopes.deactivate_private_scope(int(user_id))
         except Exception:
@@ -3433,37 +3310,6 @@ class EnterpriseService:
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
 
-    def auto_update_enabled(self) -> bool:
-        raw = self.get_setting(AUTO_UPDATE_SETTING_ENABLED)
-        if raw is None:
-            return bool(self.config.auto_update_enabled)
-        return parse_bool(raw)
-
-    def auto_update_interval_seconds(self) -> int:
-        raw = self.get_setting(AUTO_UPDATE_SETTING_INTERVAL)
-        value = self.config.auto_update_interval_seconds
-        if raw:
-            try:
-                value = int(raw)
-            except (TypeError, ValueError):
-                value = self.config.auto_update_interval_seconds
-        return max(5, min(int(value), 3600))
-
-    def auto_update_remote(self) -> str:
-        return (self.get_setting(AUTO_UPDATE_SETTING_REMOTE) or self.config.auto_update_remote or "origin").strip() or "origin"
-
-    def auto_update_branch(self) -> str:
-        return (self.get_setting(AUTO_UPDATE_SETTING_BRANCH) or self.config.auto_update_branch or "").strip()
-
-    def auto_update_webhook_secret(self) -> str:
-        return self.get_secret(AUTO_UPDATE_SECRET_WEBHOOK_SECRET) or self.config.auto_update_webhook_secret
-
-    def auto_update_webhook_url(self) -> str:
-        secret = self.auto_update_webhook_secret()
-        if not secret:
-            return ""
-        return f"{self.public_base_url()}/api/auto-update/webhook/{urllib.parse.quote(secret, safe='')}"
-
     def validate_manager_internal_token(self, token: str) -> bool:
         token_file = self.config.manager_token_file
         if self.manager_client is None or token_file is None:
@@ -3514,176 +3360,59 @@ class EnterpriseService:
         }
 
     def auto_update_public_status(self) -> dict[str, Any]:
-        legacy_status: dict[str, Any] | None = None
-        if self.config.deployment_mode == "source":
-            with self._conversation_lock:
-                self._sync_auto_update_reservation_locked()
-            public_status = getattr(self._auto_updater, "public_status", None)
-            legacy_status = (
-                public_status()
-                if callable(public_status)
-                else {
-                    "state": "updating" if self._auto_update_reserved else "idle",
-                    "instance_id": "",
-                    "retry_after_ms": 3000,
-                }
-            )
-            if str(legacy_status.get("state") or "") in {"updating", "failed"}:
-                return legacy_status
-        if self.manager_client is not None:
-            try:
-                status = self.manager_client.status()
-            except ManagerClientError:
-                if legacy_status is not None:
-                    return legacy_status
-                return {"state": "failed", "phase": "manager_unavailable", "retry_after_ms": 3000}
-            if (
-                legacy_status is not None
-                and not self._manager_update_status_is_authoritative(status)
-            ):
-                return legacy_status
-            state = str(status.get("public_state") or status.get("state") or "idle")
+        if self.manager_client is None:
             return {
-                "state": state,
-                "phase": str(status.get("phase") or state),
-                "instance_id": str(status.get("operation_id") or ""),
-                "retry_after_ms": 2000 if state in {"waiting_for_tasks", "updating"} else 5000,
+                "state": "failed",
+                "phase": "manager_unavailable",
+                "operation_id": "",
+                "retry_after_ms": 3000,
             }
-        return legacy_status or {
-            "state": "updating" if self._auto_update_reserved else "idle",
-            "instance_id": "",
-            "retry_after_ms": 3000,
+        try:
+            status = self.manager_client.status()
+        except ManagerClientError:
+            return {
+                "state": "failed",
+                "phase": "manager_unavailable",
+                "operation_id": "",
+                "retry_after_ms": 3000,
+            }
+        state = str(status.get("public_state") or status.get("state") or "idle")
+        return {
+            "state": state,
+            "phase": str(status.get("phase") or state),
+            "operation_id": str(status.get("operation_id") or ""),
+            "retry_after_ms": 2000 if state in {"waiting_for_tasks", "updating"} else 5000,
         }
 
-    @staticmethod
-    def _manager_update_status_is_authoritative(status: dict[str, Any]) -> bool:
-        if not isinstance(status, dict):
-            return False
-        if bool(status.get("maintenance")):
-            return True
-        if str(status.get("public_state") or status.get("state") or "idle") != "idle":
-            return True
-        if any(
-            str(status.get(field) or "")
-            for field in (
-                "operation_id",
-                "active_operation_id",
-                "finalize_pending_operation_id",
-            )
-        ):
-            return True
-        for field in ("current", "target", "previous"):
-            value = status.get(field)
-            if isinstance(value, dict) and value.get("id"):
-                return True
-        return False
-
     def platform_update_is_blocking(self) -> bool:
-        if self.config.deployment_mode == "container":
-            return self._auto_update_reserved
-        with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
-            return self._auto_update_reserved
+        return self._auto_update_reserved
 
     def try_reserve_auto_update(
         self,
         update_id: str,
-        *,
-        prepare: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Atomically reserve the first natural global Agent idle point."""
 
         clean_update_id = str(update_id or "").strip()
         if not clean_update_id:
             raise ValueError("update_id is required")
-        probe_token = secrets.token_urlsafe(18)
         with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
             result = self._auto_update_agent_blockers_locked()
             if self._auto_update_reserved:
                 result["reserved"] = self._auto_update_reservation_id == clean_update_id
                 if not result["reserved"]:
                     result["blocker_error"] = "another update already owns the platform"
                 return result
-            if self._auto_update_probe_token:
-                result["blocker_error"] = "another update readiness check is in progress"
+            if self._closed:
+                result["blocker_error"] = "service is shutting down"
                 return result
             if self._auto_update_has_agent_blockers(result):
                 return result
-            # Claim this readiness probe before performing the potentially
-            # slow runtime inventory request. The token only deduplicates
-            # update probes: normal Agent admissions remain usable and advance
-            # the epoch, causing the final commit below to yield and retry at a
-            # later natural idle boundary.
-            self._auto_update_probe_token = probe_token
-            self._auto_update_probe_id = clean_update_id
-            admission_epoch = self._agent_update_admission_epoch
-
-        # Query outside the global lock. If Agent work enters while this call
-        # is in flight, its epoch change invalidates the snapshot below.
-        process_result = (
-            {"protected_processes": 0, "terminable_processes": 0, "blocker_error": ""}
-            if self.config.deployment_mode == "container"
-            else self._auto_update_process_blockers()
-        )
-        result.update(process_result)
-
-        with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
-            result.update(self._auto_update_agent_blockers_locked())
-            result.update(process_result)
-            if self._auto_update_reserved:
-                self._clear_auto_update_probe_locked(probe_token)
-                result["reserved"] = self._auto_update_reservation_id == clean_update_id
-                if not result["reserved"]:
-                    result["blocker_error"] = "another update already owns the platform"
-                return result
-            if self._auto_update_probe_token != probe_token:
-                result["blocker_error"] = (
-                    result.get("blocker_error")
-                    or "update readiness reservation changed before commit"
-                )
-                return result
-            if (
-                self._closed
-                or self._agent_update_admission_epoch != admission_epoch
-                or self._auto_update_has_agent_blockers(result)
-                or result["protected_processes"]
-                or result["blocker_error"]
-            ):
-                if self._closed and not result["blocker_error"]:
-                    result["blocker_error"] = "service is shutting down"
-                elif (
-                    self._agent_update_admission_epoch != admission_epoch
-                    and not result["blocker_error"]
-                ):
-                    result["blocker_error"] = "Agent admission changed during update readiness check"
-                self._clear_auto_update_probe_locked(probe_token)
-                return result
-
-            try:
-                if prepare is not None:
-                    prepare()
-            except Exception:
-                self._clear_auto_update_probe_locked(probe_token)
-                raise
             self._auto_update_reserved = True
             self._auto_update_reservation_id = clean_update_id
-            self._auto_update_reservation_durable = prepare is not None
-            self._auto_update_reservation_owner = (
-                "source_marker"
-                if prepare is not None
-                else ("manager" if self.manager_client is not None else "ephemeral")
-            )
-            self._clear_auto_update_probe_locked(probe_token)
+            self._auto_update_reservation_owner = "manager"
             result["reserved"] = True
             return result
-
-    def _clear_auto_update_probe_locked(self, probe_token: str) -> None:
-        if self._auto_update_probe_token != probe_token:
-            return
-        self._auto_update_probe_token = ""
-        self._auto_update_probe_id = ""
 
     def _auto_update_agent_blockers_locked(self) -> dict[str, Any]:
         counts = {
@@ -3703,8 +3432,6 @@ class EnterpriseService:
             "queued_agent_jobs": counts.get("queued", 0),
             "running_agent_jobs": counts.get("running", 0),
             "admissions_in_progress": self._agent_update_admissions,
-            "protected_processes": 0,
-            "terminable_processes": 0,
             "blocker_error": "",
         }
 
@@ -3720,54 +3447,20 @@ class EnterpriseService:
             )
         )
 
-    def _auto_update_process_blockers(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "protected_processes": 0,
-            "terminable_processes": 0,
-            "blocker_error": "",
-        }
-        blocker_summary = getattr(self.agent_client, "update_blocker_summary", None)
-        if not callable(blocker_summary):
-            result["blocker_error"] = (
-                "Agent runtime does not expose the protected terminal inventory"
-            )
-            return result
-        try:
-            raw_summary = blocker_summary()
-            if not isinstance(raw_summary, dict):
-                raise RuntimeError("Agent runtime returned an invalid update blocker summary")
-            result["protected_processes"] = max(
-                0,
-                int(raw_summary.get("update_blocking_terminal_count") or 0),
-            )
-            result["terminable_processes"] = max(
-                0,
-                int(raw_summary.get("terminable_background_terminal_count") or 0),
-            )
-        except Exception as exc:
-            # Restarting while the process inventory is unknown can destroy a
-            # large transfer. Keep waiting until the runtime can prove that no
-            # protected terminal exists.
-            result["blocker_error"] = str(exc)[:500] or "could not query protected terminals"
-        return result
-
     def release_auto_update_reservation(
         self,
         update_id: str,
         *,
-        cleanup: Callable[[], None] | None = None,
         expected_owner: str = "",
     ) -> bool:
         clean_update_id = str(update_id or "").strip()
         resume_workers = False
         with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
             if expected_owner and self._auto_update_reservation_owner != expected_owner:
                 if not self._auto_update_reserved and clean_update_id:
                     # A Manager may be resolving an ambiguous Reserve response.
                     # Proving that this process has no reservation for any
-                    # owner is a successful idempotent release; an active
-                    # source_marker or different owner still fails closed.
+                    # owner is a successful idempotent release.
                     self._auto_update_last_released_id = clean_update_id
                     return True
                 return bool(
@@ -3785,20 +3478,12 @@ class EnterpriseService:
                 or self._auto_update_reservation_id != clean_update_id
             ):
                 return False
-            if cleanup is not None:
-                cleanup()
             self._auto_update_last_released_id = clean_update_id
             self._auto_update_reserved = False
             self._auto_update_reservation_id = ""
-            self._auto_update_reservation_durable = False
             self._auto_update_reservation_owner = ""
-            # A source marker can become blocking while a Manager reservation
-            # is being released. Re-adopt it under the same admission lock so
-            # workers are never woken in the owner-transition gap.
-            self._sync_auto_update_reservation_locked()
-            resume_workers = not self._auto_update_reserved
-            if resume_workers:
-                self._start_deferred_agent_workers_locked()
+            resume_workers = True
+            self._start_deferred_agent_workers_locked()
         if resume_workers:
             self._resume_deferred_background_workers()
         return True
@@ -3814,311 +3499,130 @@ class EnterpriseService:
         self._start_telegram_gateway()
         self._telegram_delivery_wakeup.set()
 
-    def _sync_auto_update_reservation_locked(self) -> None:
-        """Synchronize process-local admission with the durable update marker."""
-
-        if self.config.deployment_mode == "container":
-            return
-
-        blocking_update_id_getter = getattr(self._auto_updater, "blocking_update_id", None)
-        blocking_getter = getattr(self._auto_updater, "blocks_platform_use", None)
-        if not callable(blocking_update_id_getter) or not callable(blocking_getter):
-            return
-        blocking_update_id = blocking_update_id_getter()
-        blocking = blocking_getter()
-        if blocking and self._auto_update_reservation_owner != "manager":
-            self._auto_update_reserved = True
-            self._auto_update_reservation_id = blocking_update_id
-            self._auto_update_reservation_durable = True
-            self._auto_update_reservation_owner = "source_marker"
-            if self._auto_update_probe_token:
-                self._clear_auto_update_probe_locked(self._auto_update_probe_token)
-        elif (
-            self._auto_update_reserved
-            and self._auto_update_reservation_owner == "source_marker"
-        ):
-            released_id = self._auto_update_reservation_id
-            self._auto_update_reserved = False
-            self._auto_update_reservation_id = ""
-            self._auto_update_reservation_durable = False
-            self._auto_update_reservation_owner = ""
-            self._auto_update_last_released_id = released_id
-            self._start_deferred_agent_workers_locked()
-            self._resume_deferred_background_workers()
-
-    def sync_auto_update_reservation(self) -> None:
-        """Let the update coordinator reconcile a marker without API traffic."""
-
-        manager_reservation_id = ""
-        if self.config.deployment_mode == "source" and self.manager_client is not None:
-            try:
-                manager_status_client = self.manager_client
-                if isinstance(manager_status_client, ManagerClient):
-                    manager_status_client = ManagerClient(
-                        manager_status_client.socket_path,
-                        manager_status_client.token_file,
-                        timeout_seconds=1.0,
-                    )
-                manager_reservation_id = self._manager_startup_reservation_id(
-                    manager_status_client.status()
-                )
-            except Exception:
-                # The source bridge is intentionally usable before the
-                # Manager socket appears. If this process already adopted a
-                # Manager reservation, an unreadable status never releases it.
-                manager_reservation_id = ""
-        with self._conversation_lock:
-            if manager_reservation_id:
-                self._auto_update_reserved = True
-                self._auto_update_reservation_id = manager_reservation_id
-                self._auto_update_reservation_durable = True
-                self._auto_update_reservation_owner = "manager"
-                if self._auto_update_probe_token:
-                    self._clear_auto_update_probe_locked(
-                        self._auto_update_probe_token
-                    )
-            self._sync_auto_update_reservation_locked()
-
     def _begin_agent_update_admission(self) -> None:
         with self._conversation_lock:
-            self._sync_auto_update_reservation_locked()
             if self._auto_update_reserved:
                 raise ServiceError(503, "platform is updating; retry after maintenance")
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
             self._agent_update_admissions += 1
-            self._agent_update_admission_epoch += 1
 
     def _end_agent_update_admission(self) -> None:
         with self._conversation_lock:
             self._agent_update_admissions = max(0, self._agent_update_admissions - 1)
-        notify = getattr(self._auto_updater, "notify_work_state_changed", None)
-        if callable(notify):
-            notify()
 
     def auto_update_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        if (
-            self.config.deployment_mode == "source"
-            and self._auto_updater.blocks_platform_use()
-        ):
-            manager_available = False
-            if self.manager_client is not None:
-                try:
-                    self.manager_client.status()
-                    manager_available = True
-                except ManagerClientError:
-                    pass
-            return self._source_auto_update_config_payload(
-                manager_available=manager_available
-            )
-        if self.manager_client is not None:
-            try:
-                manager_config = self.manager_client.config()
-                manager_status = self.manager_client.status()
-            except ManagerClientError as exc:
-                if self.config.deployment_mode == "source":
-                    return self._source_auto_update_config_payload(
-                        manager_available=False
-                    )
-                raise ServiceError(503, str(exc)) from exc
-            if (
-                self.config.deployment_mode == "source"
-                and not self._manager_update_status_is_authoritative(manager_status)
-            ):
-                return self._source_auto_update_config_payload(manager_available=True)
-            current = manager_status.get("current")
-            target = manager_status.get("target")
-            previous = manager_status.get("previous")
-            current = current if isinstance(current, dict) else {}
-            target = target if isinstance(target, dict) else {}
-            previous = previous if isinstance(previous, dict) else {}
-            public_state = str(
-                manager_status.get("public_state") or manager_status.get("state") or "idle"
-            )
-            services: dict[str, dict[str, Any]] = {}
-            raw_services = manager_status.get("services")
-            if isinstance(raw_services, dict):
-                for name, raw_service in raw_services.items():
-                    service = raw_service if isinstance(raw_service, dict) else {}
-                    service_state = str(
-                        service.get("status") or service.get("state") or "unknown"
-                    ).strip().lower()
-                    services[str(name)] = {
-                        "available": service_state in {"healthy", "running", "ready"},
-                        "state": service_state,
-                    }
-                    if service.get("error"):
-                        services[str(name)]["error"] = str(service["error"])
-            return {
-                "config": {
-                    "enabled": bool(manager_config.get("update_enabled", True)),
-                    "interval_seconds": int(manager_config.get("update_interval") or 300),
-                    "release_manifest_url": str(manager_config.get("release_manifest_url") or ""),
-                    "release_channel": "main",
-                },
-                "status": {
-                    "state": public_state,
-                    "phase": str(manager_status.get("phase") or public_state),
-                    "control_plane": "manager",
-                    "manager_available": True,
-                    "manager_generation": int(manager_status.get("generation") or 0),
-                    "in_progress": public_state == "updating",
-                    "update_available": bool(
-                        target.get("id")
-                        and target.get("id") != current.get("id")
-                    ),
-                    "current_generation": str(current.get("id") or ""),
-                    "previous_generation": str(previous.get("id") or ""),
-                    "target_generation": str(target.get("id") or ""),
-                    "current_revision": str(
-                        current.get("source_commit") or manager_status.get("source_commit") or ""
-                    ),
-                    "remote_revision": str(target.get("source_commit") or ""),
-                    "images": current.get("images") or {},
-                    "services": services,
-                    "operation_id": str(manager_status.get("operation_id") or ""),
-                    "last_check_at": manager_status.get("checked_at"),
-                    "last_error": str(manager_status.get("error") or ""),
-                    "active_tasks": len(self._agent_active_tasks),
-                    "queued_tasks": int(
-                        self.db.scalar(
-                            "SELECT COUNT(*) FROM durable_jobs WHERE kind = 'agent' AND status = 'queued'"
-                        )
-                        or 0
-                    ),
-                    "protected_processes": 0,
-                },
-            }
-        return self._source_auto_update_config_payload(
-            manager_available=self.manager_client is not None
-        )
-
-    def _source_auto_update_config_payload(
-        self,
-        *,
-        manager_available: bool,
-    ) -> dict[str, Any]:
-        status = self._auto_updater.status()
-        status["control_plane"] = "source_bridge" if (
-            os.getenv("UBITECH_SOURCE_MIGRATION_BRIDGE", "0") == "1"
-            or (
-                self.config.deployment_mode == "source"
-                and self.manager_client is not None
-            )
-        ) else "source"
-        status["manager_available"] = bool(manager_available)
-        return {
-            "config": {
-                "enabled": self.auto_update_enabled(),
-                "interval_seconds": self.auto_update_interval_seconds(),
-                "remote": self.auto_update_remote(),
-                "branch": self.auto_update_branch(),
-                "webhook_secret_configured": bool(self.auto_update_webhook_secret()),
-                "webhook_url": self.auto_update_webhook_url(),
-            },
-            "status": status,
-        }
-
-    def _require_authoritative_manager_control_plane(self) -> None:
-        if self.config.deployment_mode != "source":
-            return
         if self.manager_client is None:
-            raise ServiceError(409, "container migration control plane is not active")
+            raise ServiceError(503, "container manager is not active")
         try:
-            status = self.manager_client.status()
+            manager_config = self.manager_client.config()
+            manager_status = self.manager_client.status()
         except ManagerClientError as exc:
             raise ServiceError(503, str(exc)) from exc
-        if not self._manager_update_status_is_authoritative(status):
-            raise ServiceError(
-                409,
-                "container migration handoff is read-only until Manager takes control",
-            )
+        current = manager_status.get("current")
+        target = manager_status.get("target")
+        previous = manager_status.get("previous")
+        current = current if isinstance(current, dict) else {}
+        target = target if isinstance(target, dict) else {}
+        previous = previous if isinstance(previous, dict) else {}
+        public_state = str(
+            manager_status.get("public_state") or manager_status.get("state") or "idle"
+        )
+        services: dict[str, dict[str, Any]] = {}
+        raw_services = manager_status.get("services")
+        if isinstance(raw_services, dict):
+            for name, raw_service in raw_services.items():
+                service = raw_service if isinstance(raw_service, dict) else {}
+                service_state = str(
+                    service.get("status") or service.get("state") or "unknown"
+                ).strip().lower()
+                services[str(name)] = {
+                    "available": service_state in {"healthy", "running", "ready"},
+                    "state": service_state,
+                }
+                if service.get("error"):
+                    services[str(name)]["error"] = str(service["error"])
+        return {
+            "config": {
+                "enabled": bool(manager_config.get("update_enabled", True)),
+                "interval_seconds": int(manager_config.get("update_interval") or 300),
+                "release_manifest_url": str(manager_config.get("release_manifest_url") or ""),
+                "release_channel": "main",
+            },
+            "status": {
+                "state": public_state,
+                "phase": str(manager_status.get("phase") or public_state),
+                "manager_generation": int(manager_status.get("generation") or 0),
+                "in_progress": public_state == "updating",
+                "update_available": bool(
+                    target.get("id") and target.get("id") != current.get("id")
+                ),
+                "current_generation": str(current.get("id") or ""),
+                "previous_generation": str(previous.get("id") or ""),
+                "target_generation": str(target.get("id") or ""),
+                "current_revision": str(
+                    current.get("source_commit") or manager_status.get("source_commit") or ""
+                ),
+                "remote_revision": str(target.get("source_commit") or ""),
+                "images": current.get("images") or {},
+                "services": services,
+                "operation_id": str(manager_status.get("operation_id") or ""),
+                "last_check_at": manager_status.get("checked_at"),
+                "last_error": str(manager_status.get("error") or ""),
+                "active_tasks": len(self._agent_active_tasks),
+                "queued_tasks": int(
+                    self.db.scalar(
+                        "SELECT COUNT(*) FROM durable_jobs WHERE kind = 'agent' AND status = 'queued'"
+                    )
+                    or 0
+                ),
+            },
+        }
 
     def update_auto_update_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        if self.manager_client is not None:
-            self._require_authoritative_manager_control_plane()
-            allowed = {"enabled", "interval_seconds", "release_manifest_url"}
-            unknown = sorted(set(body) - allowed)
-            if unknown:
-                raise ServiceError(400, f"unsupported manager config fields: {', '.join(unknown)}")
-            updates: dict[str, Any] = {}
-            if "enabled" in body:
-                updates["update_enabled"] = parse_bool(body.get("enabled"))
-            if "interval_seconds" in body:
-                try:
-                    interval = int(body.get("interval_seconds"))
-                except (TypeError, ValueError) as exc:
-                    raise ServiceError(400, "update interval must be an integer") from exc
-                if interval < 30 or interval > 86400:
-                    raise ServiceError(400, "update interval must be between 30 and 86400 seconds")
-                updates["update_interval"] = interval
-            if "release_manifest_url" in body:
-                manifest_url = str(body.get("release_manifest_url") or "").strip()
-                if not manifest_url.startswith("https://") or any(
-                    character in manifest_url for character in "\r\n"
-                ):
-                    raise ServiceError(400, "release manifest URL must use HTTPS")
-                updates["release_manifest_url"] = manifest_url
-            try:
-                self.manager_client.update_config(updates)
-            except ManagerClientError as exc:
-                raise ServiceError(503, str(exc)) from exc
-            return self.auto_update_config(actor)
+        if self.manager_client is None:
+            raise ServiceError(503, "container manager is not active")
+        allowed = {"enabled", "interval_seconds", "release_manifest_url"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            raise ServiceError(400, f"unsupported manager config fields: {', '.join(unknown)}")
+        updates: dict[str, Any] = {}
         if "enabled" in body:
-            requested_enabled = parse_bool(body.get("enabled"))
-            if not requested_enabled:
-                # Invalidate the listener lifecycle before persisting the
-                # disabled flag. A check finishing its reserved reinspection
-                # can therefore never win a setting-write -> stop() race.
-                self._auto_updater.stop()
-            self.set_setting(
-                AUTO_UPDATE_SETTING_ENABLED,
-                "1" if requested_enabled else "0",
-            )
+            updates["update_enabled"] = parse_bool(body.get("enabled"))
         if "interval_seconds" in body:
             try:
                 interval = int(body.get("interval_seconds"))
             except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "auto update interval must be an integer") from exc
-            if interval < 5 or interval > 3600:
-                raise ServiceError(400, "auto update interval must be between 5 and 3600 seconds")
-            self.set_setting(AUTO_UPDATE_SETTING_INTERVAL, str(interval))
-        if "remote" in body:
-            self.set_setting(AUTO_UPDATE_SETTING_REMOTE, self._validate_auto_update_git_name(str(body.get("remote") or "origin"), "remote"))
-        if "branch" in body:
-            branch = str(body.get("branch") or "").strip()
-            if branch:
-                branch = self._validate_auto_update_git_name(branch, "branch")
-            self.set_setting(AUTO_UPDATE_SETTING_BRANCH, branch)
-        if "webhook_secret" in body:
-            secret = str(body.get("webhook_secret") or "").strip()
-            if secret:
-                self.set_setting(AUTO_UPDATE_SECRET_WEBHOOK_SECRET, self._validate_auto_update_secret(secret), secret=True)
-        if self.auto_update_enabled() and not self.auto_update_webhook_secret():
-            self.set_setting(AUTO_UPDATE_SECRET_WEBHOOK_SECRET, secrets.token_urlsafe(32), secret=True)
-        if self.auto_update_enabled():
-            self._auto_updater.start()
-            self._auto_updater.trigger("config")
-        else:
-            self._auto_updater.stop()
+                raise ServiceError(400, "update interval must be an integer") from exc
+            if interval < 30 or interval > 86400:
+                raise ServiceError(400, "update interval must be between 30 and 86400 seconds")
+            updates["update_interval"] = interval
+        if "release_manifest_url" in body:
+            manifest_url = str(body.get("release_manifest_url") or "").strip()
+            if not manifest_url.startswith("https://") or any(
+                character in manifest_url for character in "\r\n"
+            ):
+                raise ServiceError(400, "release manifest URL must use HTTPS")
+            updates["release_manifest_url"] = manifest_url
+        try:
+            self.manager_client.update_config(updates)
+        except ManagerClientError as exc:
+            raise ServiceError(503, str(exc)) from exc
         return self.auto_update_config(actor)
 
     def trigger_auto_update_check(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        if self.manager_client is not None:
-            self._require_authoritative_manager_control_plane()
-            try:
-                result = self.manager_client.check(
-                    idempotency_key=f"ui-check-{int(time.time()) // 5}"
-                )
-            except ManagerClientError as exc:
-                raise ServiceError(503, str(exc)) from exc
-            return {"accepted": True, **result}
-        if not self.auto_update_enabled():
-            return {"accepted": False, "reason": "auto update is disabled", "status": self._auto_updater.status()}
-        return {"accepted": True, "status": self._auto_updater.trigger("manual")}
+        if self.manager_client is None:
+            raise ServiceError(503, "container manager is not active")
+        try:
+            result = self.manager_client.check(
+                idempotency_key=f"ui-check-{int(time.time()) // 5}"
+            )
+        except ManagerClientError as exc:
+            raise ServiceError(503, str(exc)) from exc
+        return {"accepted": True, **result}
 
     def trigger_manager_operation(
         self,
@@ -4128,8 +3632,7 @@ class EnterpriseService:
     ) -> dict[str, Any]:
         require_admin(actor)
         if self.manager_client is None:
-            raise ServiceError(409, "container manager is not active")
-        self._require_authoritative_manager_control_plane()
+            raise ServiceError(503, "container manager is not active")
         clean_operation = str(operation or "").strip()
         if clean_operation not in {"update", "restart", "rollback", "repair"}:
             raise ServiceError(400, "unsupported manager operation")
@@ -4154,61 +3657,6 @@ class EnterpriseService:
             )
         except ManagerClientError as exc:
             raise ServiceError(503, str(exc)) from exc
-
-    def auto_update_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.manager_client is not None:
-            self._require_authoritative_manager_control_plane()
-            try:
-                manager_config = self.manager_client.config()
-                if not bool(manager_config.get("update_enabled", True)):
-                    return {
-                        "accepted": False,
-                        "reason": "auto update is disabled",
-                        "status": self.manager_client.status(),
-                    }
-                ref = str(payload.get("ref") or "").strip()
-                # Docker production follows the Manager-owned main release
-                # channel; a migrated legacy branch setting must not regain
-                # influence over update routing.
-                branch = "main"
-                if (
-                    ref.startswith("refs/heads/")
-                    and ref.removeprefix("refs/heads/") != branch
-                ):
-                    return {
-                        "accepted": False,
-                        "reason": f"ignored ref {ref}",
-                        "status": self.manager_client.status(),
-                    }
-                result = self.manager_client.check(
-                    idempotency_key=(
-                        f"webhook-{time.time_ns()}-{secrets.token_hex(4)}"
-                    )
-                )
-            except ManagerClientError as exc:
-                raise ServiceError(503, str(exc)) from exc
-            return {"accepted": True, "status": result}
-        if not self.auto_update_enabled():
-            return {"accepted": False, "reason": "auto update is disabled", "status": self._auto_updater.status()}
-        ref = str(payload.get("ref") or "").strip()
-        branch = self.auto_update_branch()
-        if ref.startswith("refs/heads/") and branch and ref.removeprefix("refs/heads/") != branch:
-            return {"accepted": False, "reason": f"ignored ref {ref}", "status": self._auto_updater.status()}
-        return {"accepted": True, "status": self._auto_updater.trigger("webhook")}
-
-    @staticmethod
-    def _validate_auto_update_git_name(value: str, label: str) -> str:
-        clean = value.strip()
-        if not clean or not re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", clean) or clean.startswith("-") or ".." in clean:
-            raise ServiceError(400, f"auto update {label} is invalid")
-        return clean
-
-    @staticmethod
-    def _validate_auto_update_secret(value: str) -> str:
-        clean = value.strip()
-        if len(clean) < 16 or len(clean) > 160 or any(ch.isspace() for ch in clean):
-            raise ServiceError(400, "auto update webhook secret must be 16-160 non-space characters")
-        return clean
 
     @staticmethod
     def _validate_telegram_user_id(value: Any) -> str:
@@ -5807,10 +5255,8 @@ class EnterpriseService:
         with self._conversation_lock:
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
-            self._sync_auto_update_reservation_locked()
             if self._auto_update_reserved:
                 raise ServiceError(503, "platform is updating; scheduled task deferred")
-            self._agent_update_admission_epoch += 1
             # Permission/profile state must be read inside the same lifecycle
             # boundary used by revocation. Otherwise a completed downgrade can
             # race an earlier actor snapshot and still materialize new work.
@@ -6346,7 +5792,7 @@ class EnterpriseService:
         scope_type: str,
         scope_id: str,
         *,
-        since_revision: int | str | None = None,
+        since_revision: str | None = None,
     ) -> dict[str, Any]:
         """Return a bounded read-only terminal view for an authorized scope.
 
@@ -6368,45 +5814,28 @@ class EnterpriseService:
         )
         scope = self.agent_scopes.get_scope(scope_key)
         if scope is None:
-            return {"processes": [], "revision": 0}
-        preview = getattr(self.agent_client, "terminal_previews", None)
-        if not callable(preview):
-            return {"processes": [], "revision": 0}
+            return {"processes": [], "revision": EMPTY_TERMINAL_PREVIEW_REVISION}
         try:
-            supports_revision = False
-            if since_revision is not None:
-                try:
-                    parameters = inspect.signature(preview).parameters
-                    supports_revision = "since_revision" in parameters or any(
-                        parameter.kind == inspect.Parameter.VAR_KEYWORD
-                        for parameter in parameters.values()
-                    )
-                except (TypeError, ValueError):
-                    supports_revision = False
-            payload = (
-                preview(
-                    scope.scope_key,
-                    scope.lifecycle_id,
-                    since_revision=since_revision,
-                )
-                if supports_revision
-                else preview(scope.scope_key, scope.lifecycle_id)
+            payload = self.agent_client.terminal_previews(
+                scope.scope_key,
+                scope.lifecycle_id,
+                since_revision=since_revision,
             )
         except AgentRuntimeError:
             # Preview availability is not an execution trigger. A stopped or
-            # rolling-upgrade runtime therefore appears as an empty read-only
+            # temporarily unavailable runtime therefore appears as an empty read-only
             # view instead of being started by an observation request.
-            return {"processes": [], "revision": 0}
+            return {"processes": [], "revision": EMPTY_TERMINAL_PREVIEW_REVISION}
         raw_processes = payload.get("processes") if isinstance(payload, dict) else None
         if not isinstance(raw_processes, list):
-            return {"processes": [], "revision": 0}
+            return {"processes": [], "revision": EMPTY_TERMINAL_PREVIEW_REVISION}
         has_revision = "revision" in payload
         raw_revision = payload.get("revision")
-        if has_revision and not _valid_terminal_preview_revision(raw_revision):
-            return {"processes": [], "revision": 0}
+        if not has_revision or not _valid_terminal_preview_revision(raw_revision):
+            return {"processes": [], "revision": EMPTY_TERMINAL_PREVIEW_REVISION}
         if payload.get("unchanged") is True:
-            if raw_processes or not has_revision:
-                return {"processes": [], "revision": 0}
+            if raw_processes:
+                return {"processes": [], "revision": EMPTY_TERMINAL_PREVIEW_REVISION}
             return {
                 "processes": [],
                 "revision": raw_revision,
@@ -6418,12 +5847,12 @@ class EnterpriseService:
             if not isinstance(raw, dict):
                 continue
             status = str(raw.get("status") or "").strip().lower()
-            if status not in {"running", "completed", "failed", "cancelled"}:
-                status = "running" if raw.get("running") is True else "completed"
+            if status not in {"running", "completed", "failed", "cancelled", "orphaned"}:
+                continue
             # Completed process records remain in the runtime briefly so the
             # Agent can inspect them, but they are no longer live terminals and
             # must not keep the chat preview control visible.
-            if status != "running":
+            if status not in {"running", "orphaned"}:
                 continue
             process_id = _preview_text_head(raw.get("id"), 256)
             if not process_id:
@@ -6432,20 +5861,6 @@ class EnterpriseService:
             platform_output_truncated = (
                 len(_preview_plain_text(raw.get("output")).encode("utf-8")) > 16 * 1024
             )
-            if not output:
-                # Compatibility with runtimes from before the combined-output
-                # field became authoritative. Never expose the two streams as
-                # separate public fields.
-                stdout = _preview_text_tail(raw.get("stdout"), 8 * 1024)
-                stderr = _preview_text_tail(raw.get("stderr"), 8 * 1024)
-                platform_output_truncated = platform_output_truncated or (
-                    len(_preview_plain_text(raw.get("stdout")).encode("utf-8")) > 8 * 1024
-                    or len(_preview_plain_text(raw.get("stderr")).encode("utf-8")) > 8 * 1024
-                )
-                output = _preview_text_tail(
-                    f"{stdout}\n[stderr]\n{stderr}" if stdout and stderr else stdout or stderr,
-                    16 * 1024,
-                )
             process: dict[str, Any] = {
                 "id": process_id,
                 "title": _preview_text_head(raw.get("title"), 200),
@@ -6456,7 +5871,7 @@ class EnterpriseService:
                 "cwd": _preview_text_head(raw.get("cwd"), 2 * 1024),
                 "output": output,
                 "status": status,
-                "running": status == "running",
+                "running": True,
                 "started_at": _preview_text_head(raw.get("started_at"), 64),
                 "updated_at": _preview_text_head(raw.get("updated_at"), 64),
                 "truncated": raw.get("truncated") is True or platform_output_truncated,
@@ -6473,10 +5888,7 @@ class EnterpriseService:
             processes.append(process)
             if len(processes) >= 16:
                 break
-        result: dict[str, Any] = {"processes": processes}
-        if has_revision:
-            result["revision"] = raw_revision
-        return result
+        return {"processes": processes, "revision": raw_revision}
 
     def agent_preview_status(
         self,
@@ -6487,7 +5899,7 @@ class EnterpriseService:
         """Return lightweight live-preview availability for one chat scope.
 
         This is an observation-only path: it never ensures an Agent scope,
-        starts either managed runtime, creates a browser credential, captures a
+        starts any runtime service, creates a browser credential, captures a
         screenshot, or serializes terminal output.
         """
 
@@ -6509,10 +5921,12 @@ class EnterpriseService:
         )
         scope = self.agent_scopes.get_scope(scope_key)
         running_terminal_count = 0
-        summary = getattr(self.agent_client, "terminal_preview_summary", None)
-        if scope is not None and callable(summary):
+        if scope is not None:
             try:
-                payload = summary(scope.scope_key, scope.lifecycle_id)
+                payload = self.agent_client.terminal_preview_summary(
+                    scope.scope_key,
+                    scope.lifecycle_id,
+                )
             except AgentRuntimeError:
                 payload = None
             if isinstance(payload, dict):
@@ -6568,11 +5982,20 @@ class EnterpriseService:
     def update_agent_runtime_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
         with self._agent_runtime_config_lock:
-            updates: dict[str, str] = {}
-            if "managed" in body:
-                updates[AGENT_SETTING_MANAGED] = (
-                    "1" if parse_bool(body.get("managed")) else "0"
+            allowed = {
+                "provider",
+                "model",
+                "idle_timeout_seconds",
+                "max_concurrency",
+                "compaction_threshold",
+            }
+            unknown = sorted(set(body) - allowed)
+            if unknown:
+                raise ServiceError(
+                    400,
+                    f"unsupported Agent Runtime config fields: {', '.join(unknown)}",
                 )
+            updates: dict[str, str] = {}
             provider = None
             if "provider" in body:
                 provider = normalize_oauth_provider(str(body.get("provider") or ""))
@@ -6642,8 +6065,6 @@ class EnterpriseService:
                 self._agent_run_gate.resize(
                     int(updates[AGENT_SETTING_MAX_CONCURRENCY])
                 )
-            if self.runtimes._managed_agent_runtime_enabled():
-                self.runtimes.restart_agent_runtime()
             if updates:
                 self.runtimes.invalidate_status_cache()
             if self._uses_default_agent_client:
@@ -6683,61 +6104,6 @@ class EnterpriseService:
         self.cognee.refresh_status()
         self.runtimes.ensure_cognee_ready()
         return self.cognee_config(actor)
-
-    def restart_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
-        require_admin(actor)
-        clean = name.strip().lower()
-        if clean == "agent":
-            status = self.runtimes.restart_agent_runtime()
-            self.model_catalogs.invalidate_runtime()
-        elif clean == "camofox":
-            status = self.runtimes.restart_camofox()
-        elif clean == "searxng":
-            status = self.runtimes.restart_searxng()
-        elif clean == "firecrawl":
-            status = self.runtimes.restart_firecrawl()
-        elif clean == "cognee":
-            self.cognee.refresh_status()
-            status = self.runtimes.ensure_cognee_ready()
-        else:
-            raise ServiceError(404, "runtime not found")
-        self.runtimes.invalidate_status_cache()
-        return {"runtime": status.to_dict()}
-
-    def install_runtime(self, actor: dict[str, Any], name: str) -> dict[str, Any]:
-        require_admin(actor)
-        clean = name.strip().lower()
-        if clean == "agent":
-            install_status = self.runtimes.install_agent_runtime(force=True)
-            self.model_catalogs.invalidate_runtime()
-            result = {
-                "runtime": install_status.to_dict(),
-                "config": self.runtimes.agent_runtime_config(),
-            }
-        elif clean == "camofox":
-            installed = self.runtimes.install_camofox(force=True)
-            if not installed.available:
-                result = {"runtime": installed.to_dict()}
-            else:
-                result = {
-                    "runtime": self.runtimes.restart_camofox().to_dict()
-                }
-        elif clean == "searxng":
-            result = {
-                "runtime": self.runtimes.ensure_searxng_ready(
-                    wait=True
-                ).to_dict()
-            }
-        elif clean == "firecrawl":
-            result = {
-                "runtime": self.runtimes.ensure_firecrawl_ready(
-                    wait=True
-                ).to_dict()
-            }
-        else:
-            raise ServiceError(404, "runtime not found")
-        self.runtimes.invalidate_status_cache()
-        return result
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -6944,9 +6310,6 @@ class EnterpriseService:
         active_provider = normalize_oauth_provider(str(active_raw)) if active_raw else ""
         if active_provider in SUPPORTED_OAUTH_PROVIDERS and self._oauth_tokens_configured(active_provider):
             self._select_oauth_provider(active_provider)
-        else:
-            self.runtimes.prepare_agent_runtime()
-
         return {
             "imported": {
                 "providers": imported_providers,
@@ -7916,46 +7279,7 @@ class EnterpriseService:
         arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
         context = body.get("context") if isinstance(body.get("context"), dict) else {}
         scope_key = str(context.get("scope_key") or "").strip()
-        # Runtime context is authoritative. Tool arguments are model-controlled
-        # and must never be able to redirect a call into another Agent scope.
-        common = {
-            **arguments,
-            "scope_key": scope_key,
-            "owner_user_id": context.get("owner_user_id"),
-        }
-        if tool == "memory":
-            if action in {"search", "read", "list"}:
-                result = self.agent_memory_search(
-                    {
-                        **common,
-                        **({"id": arguments.get("id")} if action == "read" else {}),
-                    }
-                )
-            elif action == "propose":
-                result = self.agent_memory_propose(
-                    {
-                        **common,
-                        "source_run_id": context.get("run_id")
-                        or arguments.get("source_run_id"),
-                    }
-                )
-            else:
-                result = self.agent_memory_mutate({**common, "action": action})
-        elif tool == "session":
-            result = self.agent_session_search({
-                **common,
-                "action": action,
-                "current_session_id": context.get("session_id"),
-            })
-        elif tool == "knowledge":
-            if action in {"search", "query"}:
-                query = str(arguments.get("query") or arguments.get("q") or "").strip()
-                result = {"results": self.search_knowledge(query, int(arguments.get("limit") or 5))}
-            elif action in {"read", "get"}:
-                result = {"document": self.get_knowledge_document(int(arguments.get("document_id") or arguments.get("id")))}
-            else:
-                raise ServiceError(400, "knowledge action must be search or read")
-        elif tool == "web":
+        if tool == "web":
             result = self._agent_web_tool(action, arguments)
         elif tool == "browser":
             result = self._agent_browser_tool(scope_key, action, arguments)
@@ -8226,7 +7550,7 @@ class EnterpriseService:
         )
 
     def _agent_web_tool(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if action in {"search", "query"}:
+        if action == "search":
             query = str(arguments.get("query") or "").strip()
             if not query:
                 raise ServiceError(400, "web search query is required")
@@ -8323,22 +7647,15 @@ class EnterpriseService:
                     "Some managed search sources were unavailable; results may be incomplete."
                 ]
             return response
-        if action in {"extract", "scrape", "read"}:
-            firecrawl_url_getter = getattr(
-                getattr(self, "runtimes", None),
-                "firecrawl_loopback_url",
-                None,
-            )
+        if action == "extract":
             try:
                 base_url = str(
-                    firecrawl_url_getter()
-                    if callable(firecrawl_url_getter)
-                    else self.config.firecrawl_api_url
+                    self.runtimes.firecrawl_service_url()
                 ).strip().rstrip("/")
             except (TypeError, ValueError) as exc:
                 raise ServiceError(
                     503,
-                    "managed web extraction is unavailable because its "
+                    "web extraction is unavailable because its "
                     "endpoint configuration is invalid",
                 ) from exc
             try:
@@ -8351,26 +7668,10 @@ class EnterpriseService:
                 except ValueError as exc:
                     raise ServiceError(
                         503,
-                        "managed web extraction is unavailable because its "
+                        "web extraction is unavailable because its "
                         "endpoint configuration is invalid",
                     ) from exc
                 firecrawl_loopback = False
-            managed_firecrawl_getter = getattr(
-                getattr(self, "runtimes", None),
-                "_managed_firecrawl_enabled",
-                None,
-            )
-            managed_firecrawl = (
-                bool(managed_firecrawl_getter())
-                if callable(managed_firecrawl_getter)
-                else bool(self.config.manage_firecrawl)
-            )
-            if managed_firecrawl and not firecrawl_loopback:
-                raise ServiceError(
-                    503,
-                    "managed web extraction is unavailable because its "
-                    "endpoint configuration is invalid",
-                )
             headers: dict[str, str] = {}
             api_key = self.get_secret("FIRECRAWL_API_KEY")
             if api_key:
@@ -8418,30 +7719,20 @@ class EnterpriseService:
     ) -> str:
         """Build the one permitted direct-search endpoint.
 
-        SearXNG is platform-managed and intentionally loopback-only. Keeping
-        this validation next to the request prevents a configuration mistake
-        from turning the Agent gateway into a general-purpose SSRF primitive.
+        SearXNG is a Manager-owned private service. Keeping this validation next
+        to the request prevents a configuration mistake from turning the Agent
+        gateway into a general-purpose SSRF primitive.
         """
 
-        searxng_url_getter = getattr(
-            getattr(self, "runtimes", None),
-            "searxng_loopback_url",
-            None,
-        )
-        raw_base_url = str(
-            searxng_url_getter()
-            if callable(searxng_url_getter)
-            else self.config.searxng_api_url
-        ).strip()
         try:
+            raw_base_url = str(self.runtimes.searxng_service_url()).strip()
             parsed = validate_http_base_url(raw_base_url)
             hostname = str(parsed.hostname or "").rstrip(".").lower()
             if parsed.path not in {"", "/"} or parsed.port is None:
                 raise ValueError
-            if self.config.deployment_mode != "container" and not ipaddress.ip_address(
-                hostname
-            ).is_loopback:
-                raise ValueError
+            if hostname != "searxng":
+                if not ipaddress.ip_address(hostname).is_loopback:
+                    raise ValueError
         except (ValueError, TypeError) as exc:
             raise ServiceError(
                 503,
@@ -8534,7 +7825,7 @@ class EnterpriseService:
         """Return one low-rate, read-only Camofox frame for an authorized scope.
 
         This method intentionally does not call ``ensure_*`` for either the
-        Agent scope or managed runtime.  Merely opening the preview therefore
+        Agent scope or Camofox service.  Merely opening the preview therefore
         cannot create an Agent workspace, start Camofox, open a tab, navigate,
         or change which tab the Agent considers current.
         """
@@ -8580,11 +7871,6 @@ class EnterpriseService:
         candidate_scope_keys = candidate_scope_keys[:MAX_BROWSER_PREVIEW_FAMILY_SCOPES]
 
         try:
-            if (
-                not self.runtimes._managed_camofox_enabled()
-                and self.config.deployment_mode != "container"
-            ):
-                return self._browser_preview_idle("browser_unavailable")
             base_url = self.runtimes._effective_camofox_url().rstrip("/")
             access_key = self._browser_preview_existing_access_key()
             if not access_key:
@@ -8902,29 +8188,15 @@ class EnterpriseService:
             return ""
 
     def _browser_preview_existing_access_key(self) -> str:
-        # Unlike the Agent tool path, preview must not create runtime state. Do
-        # not call _camofox_access_key(), which generates the key file when it is
-        # absent; only consume a configured or already-materialized credential.
-        if (
-            not self.runtimes._managed_camofox_enabled()
-            and self.config.deployment_mode != "container"
-        ):
-            return ""
+        # Preview only consumes the Manager-injected credential and never
+        # creates service state.
         try:
-            value = self.runtimes._first_secret(
-                "CAMOFOX_ACCESS_KEY",
-                "CAMOFOX_API_KEY",
-            )
+            value = self.runtimes._camofox_access_key()
         except Exception:
             value = ""
         if value:
             return str(value)
-        path = self.config.runtime_dir / "camofox" / "access-key"
-        try:
-            existing = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
-        return existing if len(existing) >= 32 else ""
+        return ""
 
     @staticmethod
     def _agent_browser_user_id(scope_key: str) -> str:
@@ -8937,16 +8209,6 @@ class EnterpriseService:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         self._validated_agent_memory_scope(scope_key)
-        action = {
-            "tabs": "list",
-            "status": "list",
-            "open": "navigate",
-            "create": "new_tab",
-            "get_images": "images",
-            "reload": "refresh",
-            "close_tab": "close",
-            "close_session": "cleanup",
-        }.get(action, action)
         if action == "cleanup":
             status = self.runtimes.camofox_status(refresh=True)
             if not status.available:
@@ -8954,12 +8216,12 @@ class EnterpriseService:
                 return {"ok": True, "skipped": True, "detail": "browser runtime is not running"}
         ready = self.runtimes.ensure_camofox_ready(wait=True)
         if not ready.available:
-            raise ServiceError(503, ready.error or "managed Camoufox browser is unavailable")
+            raise ServiceError(503, ready.error or "Camoufox browser is unavailable")
         base_url = self.runtimes._effective_camofox_url().rstrip("/")
         user_id = self._agent_browser_user_id(scope_key)
         access_key = self.runtimes._camofox_access_key()
         headers = {"Authorization": f"Bearer {access_key}"}
-        tab_id = str(arguments.get("tab_id") or arguments.get("tabId") or "").strip()
+        tab_id = str(arguments.get("tab_id") or "").strip()
         if action == "cleanup":
             result = self._runtime_json_request(
                 f"{base_url}/sessions/{urllib.parse.quote(user_id, safe='')}",
@@ -8981,7 +8243,7 @@ class EnterpriseService:
             tabs = listed.get("tabs") if isinstance(listed.get("tabs"), list) else []
             for tab in tabs:
                 if not isinstance(tab, dict):
-                    raise ServiceError(502, "managed browser returned invalid tab metadata")
+                    raise ServiceError(502, "browser returned invalid tab metadata")
                 self._validate_browser_page_url(str(tab.get("url") or ""))
             return listed
 
@@ -9426,14 +8688,19 @@ class EnterpriseService:
             request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
-            if loopback_only is True:
+            parsed_url = urllib.parse.urlsplit(url)
+            origin = urllib.parse.urlunsplit(
+                (parsed_url.scheme, parsed_url.netloc, "", "", "")
+            )
+            try:
+                validate_loopback_url(origin, base_url=True)
+                literal_loopback = True
+            except ValueError:
+                literal_loopback = False
+            if loopback_only is True or (loopback_only is None and literal_loopback):
                 open_request = open_loopback_url
-            elif self.config.deployment_mode == "container":
-                open_request = open_private_service_url
-            elif loopback_only is False:
-                open_request = open_trusted_service_url
             else:
-                open_request = open_loopback_url
+                open_request = open_private_service_url
             with open_request(request, timeout=timeout) as response:
                 raw_bytes = response.read(10 * 1024 * 1024 + 1)
                 if len(raw_bytes) > 10 * 1024 * 1024:
@@ -9487,12 +8754,7 @@ class EnterpriseService:
             method="GET",
         )
         try:
-            open_request = (
-                open_private_service_url
-                if self.config.deployment_mode == "container"
-                else open_loopback_url
-            )
-            with open_request(request, timeout=timeout) as response:
+            with open_private_service_url(request, timeout=timeout) as response:
                 mime_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
                 if mime_type not in allowed_content_types:
                     raise ServiceError(502, f"managed browser returned unsupported content type: {mime_type or 'missing'}")
@@ -9643,7 +8905,7 @@ class EnterpriseService:
     @staticmethod
     def _memory_source_type(value: Any) -> str:
         source_type = str(value or "").strip().lower()
-        if source_type not in {"legacy", "manual", "tool", "candidate"}:
+        if source_type not in {"manual", "tool", "candidate"}:
             raise ServiceError(400, "memory source_type is invalid")
         return source_type
 
@@ -9780,12 +9042,6 @@ class EnterpriseService:
                     continue
                 if reply_id in row_by_id:
                     message_session[reply_id] = session_id
-
-        # Older platform rows predate session provenance metadata. Keep them
-        # searchable inside this already-isolated message scope instead of
-        # silently dropping valid history.
-        for row in eligible_rows:
-            message_session.setdefault(int(row["id"]), "legacy")
 
         sessions: dict[str, dict[str, Any]] = {}
         for row in eligible_rows:
@@ -10390,7 +9646,12 @@ class EnterpriseService:
             ),
             "created_at": int(row["created_at"]),
             "updated_at": int(row["updated_at"]),
-            "source_type": str(row.get("source_type") or "legacy"),
+            "source_type": (
+                str(row.get("source_type") or "manual")
+                if str(row.get("source_type") or "manual")
+                in {"manual", "tool", "candidate", "imported"}
+                else "manual"
+            ),
             "source_run_id": str(row.get("source_run_id") or ""),
             "source_message_id": str(row.get("source_message_id") or ""),
             "content_hash": str(
@@ -11111,18 +10372,15 @@ class EnterpriseService:
         return self.model_catalogs.catalog(provider)
 
     def _load_agent_runtime_model_catalog(self) -> dict[str, Any]:
-        loader = getattr(self.agent_client, "model_catalog", None)
-        if not callable(loader):
-            raise AgentRuntimeError("Agent client does not expose a model catalog")
         try:
-            return loader()
+            return self.agent_client.model_catalog()
         except AgentRuntimeError:
             if not self._uses_default_agent_client:
                 raise
             status = self.runtimes.ensure_agent_runtime_ready(wait=True)
             if not status.available:
                 raise
-            return loader()
+            return self.agent_client.model_catalog()
 
     def _oauth_credential_revision(self, provider: str) -> int:
         keys = OAUTH_PROVIDER_SECRET_KEYS.get(provider, ())
@@ -11295,8 +10553,7 @@ class EnterpriseService:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         if scope_type == "channel":
             require_permission(actor, PERMISSION_CHAT)
-        aliases = {"approve": "once", "approved": "once", "allow": "once"}
-        normalized_choice = aliases.get(str(choice or "").strip().lower(), str(choice or "").strip().lower())
+        normalized_choice = str(choice or "").strip().lower()
         if normalized_choice not in {"once", "session", "always", "deny"}:
             raise ServiceError(400, "invalid approval choice")
         key = self._conversation_key(scope_type, scope_id)
@@ -11308,11 +10565,8 @@ class EnterpriseService:
             raise ServiceError(409, "no pending approval for this conversation")
         approval_id = str(approval.get("approval_id") or "").strip()
         responder = self._actor_display_name(actor)
-        respond = getattr(self.agent_client, "respond_approval", None)
-        if not callable(respond):
-            raise ServiceError(503, "agent approval response is not supported")
         try:
-            approval_result = respond(
+            approval_result = self.agent_client.respond_approval(
                 run_id=run_id,
                 choice=normalized_choice,
                 approval_id=approval_id or None,
@@ -11725,14 +10979,6 @@ class EnterpriseService:
                 allowed_from=("reserved",),
                 runtime_run_id=runtime_run_id,
             )
-        steer = getattr(self.agent_client, "steer_run", None)
-        if not callable(steer):
-            self._fallback_joined_private_input(
-                parent,
-                child,
-                "Agent runtime does not support active-run input",
-            )
-            return "fallback"
         attachments = list(child.get("attachments") or [])
         prompt_content = self._agent_prompt_content(
             str(child.get("content") or ""),
@@ -11740,7 +10986,7 @@ class EnterpriseService:
             default="请处理这些附件。",
         )
         try:
-            acknowledgement = steer(
+            acknowledgement = self.agent_client.steer_run(
                 run_id=runtime_run_id,
                 message_id=str(message_id),
                 scope_key=str(parent.get("_agent_scope_key") or ""),
@@ -12367,10 +11613,6 @@ class EnterpriseService:
                     self._agent_workers.pop(key, None)
                     if not self._agent_queues.get(key):
                         self._agent_queues.pop(key, None)
-            notify = getattr(self._auto_updater, "notify_work_state_changed", None)
-            if callable(notify):
-                notify()
-
     def _update_schedule_run_for_task(
         self,
         task: dict[str, Any],
@@ -12703,14 +11945,6 @@ class EnterpriseService:
             if not delta:
                 return
             stream = dict(status.get("stream_message") or {})
-            if (
-                clean_turn_id
-                and stream.get("turn_id")
-                and str(stream.get("turn_id")) != clean_turn_id
-            ):
-                # Defense in depth for clients that provide turn metadata but do
-                # not emit the compatibility ``None`` reset callback.
-                stream = {}
             stream.setdefault(
                 "id",
                 f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}:"
@@ -12757,11 +11991,8 @@ class EnterpriseService:
                 or ""
             ).strip().lower()
             explicitly_blocked = event.get("unattended_authorization_required") is True
-            compatibility_prefix = reason.startswith(
-                ("unattended authorization required", "unattended_authorization_required")
-            )
             if schedule_event_type in {"tool.failed", "failed", "failure"} and (
-                explicitly_blocked or compatibility_prefix
+                explicitly_blocked
             ):
                 task["_unattended_authorization_required"] = True
                 task["_unattended_authorization_reason"] = (
@@ -13611,24 +12842,21 @@ class EnterpriseService:
         }
         if include_local_path:
             item["local_path"] = str(local_path)
-            if self.config.deployment_mode == "container":
-                parts = storage_path.parts
-                expected_prefix = (str(row["scope_type"]), str(row["scope_id"]))
-                if (
-                    storage_path.is_absolute()
-                    or len(parts) < 3
-                    or tuple(parts[:2]) != expected_prefix
-                    or any(part in {"", ".", ".."} for part in parts[2:])
-                ):
-                    raise RuntimeError("attachment storage path does not match its scope")
-                item["path"] = str(
-                    Path(CONTAINER_PATHS["workspace"])
-                    / ".ubitech"
-                    / "attachments"
-                    / Path(*parts[2:])
-                )
-            else:
-                item["path"] = str(local_path)
+            parts = storage_path.parts
+            expected_prefix = (str(row["scope_type"]), str(row["scope_id"]))
+            if (
+                storage_path.is_absolute()
+                or len(parts) < 3
+                or tuple(parts[:2]) != expected_prefix
+                or any(part in {"", ".", ".."} for part in parts[2:])
+            ):
+                raise RuntimeError("attachment storage path does not match its scope")
+            item["path"] = str(
+                Path(CONTAINER_PATHS["workspace"])
+                / ".ubitech"
+                / "attachments"
+                / Path(*parts[2:])
+            )
         return item
 
     def _attachment_root(self) -> Path:
@@ -13675,13 +12903,13 @@ class EnterpriseService:
         keys = ("id", "filename", "mime_type", "size_bytes", "sha256", "is_image", "path")
         return [{key: item[key] for key in keys if key in item} for item in attachments]
 
-    def _managed_media_tmp_dir(self) -> Path:
-        """Dedicated scratch dir for managed Agent-generated media.
+    def _agent_media_tmp_dir(self) -> Path:
+        """Dedicated scratch dir for Agent-generated media.
 
         Lives under the platform data dir (not the shared system temp dir) so
         runtime-generated files are isolated from shared system temporary data.
         """
-        return self.config.managed_agent_runtime_home / "tmp"
+        return self.config.agent_runtime_data_dir / "tmp"
 
     def _media_safe_data_subtrees(
         self,
@@ -13689,8 +12917,8 @@ class EnterpriseService:
         workspace_path: Path | None = None,
     ) -> list[Path]:
         """Subtrees under the platform data dir that ARE safe to read media from
-        (the agent's own workspace, the managed Agent generated-media cache, and
-        the dedicated managed media scratch dir), used to keep platform secrets
+        (the agent's own workspace, the Agent generated-media cache, and
+        the dedicated media scratch dir), used to keep platform secrets
         unreadable even when the data dir overlaps another allowed root."""
         if workspace_path is not None:
             workspace = workspace_path
@@ -13701,8 +12929,8 @@ class EnterpriseService:
         subtrees: list[Path] = []
         for path in (
             workspace,
-            self.config.managed_agent_runtime_home / "cache",
-            self._managed_media_tmp_dir(),
+            self.config.agent_runtime_data_dir / "cache",
+            self._agent_media_tmp_dir(),
         ):
             try:
                 subtrees.append(path.resolve())
@@ -13719,9 +12947,9 @@ class EnterpriseService:
 
         For a private conversation only the owning user's workspace is allowed;
         a channel response is restricted to that channel Agent's workspace.
-        The managed Agent runtime writes generated documents/images/audio under
+        The Agent Runtime writes generated documents/images/audio under
         its cache and the dedicated
-        managed media scratch dir, so those subtrees are allowed, plus any
+        media scratch dir, so those subtrees are allowed, plus any
         operator-configured ``ENTERPRISE_MEDIA_ROOTS``. The broad system temp dir
         is intentionally NOT allowed: it is shared with other processes/users on
         the host, so allowing it would let a prompt-injected agent exfiltrate
@@ -14078,25 +13306,14 @@ class EnterpriseService:
         )
 
     def _agent_runtime_workspace(self, scope: AgentExecutionScope) -> str:
-        """Return the path visible to the selected Runtime execution backend."""
+        """Return the workspace path visible inside the Agent Sandbox."""
 
-        if self.config.deployment_mode == "container":
-            return CONTAINER_PATHS["workspace"]
-        return str(scope.workspace_path)
+        return CONTAINER_PATHS["workspace"]
 
     def _agent_execution_metadata(self, scope: AgentExecutionScope) -> dict[str, Any]:
-        """Describe production Sandbox execution or the explicit source bridge."""
+        """Describe the current Sandbox execution contract."""
 
-        execution = scope.to_execution_dict()
-        if self.config.deployment_mode != "container":
-            execution.update(
-                {
-                    "backend": "host",
-                    "isolation": "logical",
-                    "workspace_path": str(scope.workspace_path),
-                }
-            )
-        return execution
+        return scope.to_execution_dict()
 
     @staticmethod
     def _passive_knowledge_prompt(suggestions) -> str:
@@ -14609,7 +13826,7 @@ def _safe_tool_path(value: Any) -> str:
 def _safe_terminal_command_preview(value: Any) -> str:
     """Return the approved command with useful arguments and secrets masked.
 
-    The preview mirrors the command-centric Hermes display instead of reducing
+    The preview preserves a command-centric terminal display instead of reducing
     a call to executable names. It stays bounded because this value is copied
     into live status and persisted message metadata. Newlines are preserved so
     compound commands remain readable in the UI.
@@ -14906,10 +14123,6 @@ def _preview_plain_text(value: Any) -> str:
 
 
 def _valid_terminal_preview_revision(value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return 0 <= value <= 9_007_199_254_740_991
     return bool(
         isinstance(value, str)
         and TERMINAL_PREVIEW_REVISION_RE.fullmatch(value)

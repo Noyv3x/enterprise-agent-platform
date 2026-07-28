@@ -1,5 +1,4 @@
-/* usePermissions — wraps the store permission selectors (isAdmin / hasPermission
-   / userPermissions, legacy-app.js:349-357) as a memoized hook. Admins
+/* usePermissions wraps the store permission selectors as a memoized hook. Admins
    implicitly hold every permission. */
 
 import { useMemo } from "react";

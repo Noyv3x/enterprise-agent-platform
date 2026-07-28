@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,7 +69,7 @@ class AgentScopeManager:
         self._workspace_root = self._workspace_root.resolve()
         self._scope_cache: dict[str, AgentExecutionScope] = {}
         self._scope_cache_lock = threading.RLock()
-        self._normalize_workspace_records()
+        self._assert_workspace_records()
 
     @staticmethod
     def private_scope_key(user_id: int) -> str:
@@ -124,23 +125,18 @@ class AgentScopeManager:
         ensure_private_directory(resolved)
         return resolved
 
-    def _normalize_workspace_records(self) -> None:
-        """Replace legacy absolute workspace values with relative identifiers."""
+    def _assert_workspace_records(self) -> None:
+        """Reject scope rows outside the current relative-workspace contract."""
 
         rows = self.db.query(
             "SELECT scope_key, scope_type, scope_id, workspace_path FROM agent_scopes"
         )
-        timestamp = now_ts()
-        updates: list[tuple[str, int, str]] = []
         for row in rows:
             expected = self._workspace_id(str(row["scope_type"]), str(row["scope_id"]))
             if str(row.get("workspace_path") or "") != expected:
-                updates.append((expected, timestamp, str(row["scope_key"])))
-        if updates:
-            with self.db.transaction() as conn:
-                conn.executemany(
-                    "UPDATE agent_scopes SET workspace_path = ?, updated_at = ? WHERE scope_key = ?",
-                    updates,
+                raise sqlite3.DatabaseError(
+                    "Agent scope workspace does not match the current baseline: "
+                    + str(row["scope_key"])
                 )
 
     def ensure_private_scope(self, user_id: int) -> AgentExecutionScope:
@@ -213,11 +209,10 @@ class AgentScopeManager:
                 """
                 INSERT INTO agent_scopes(
                     scope_key, scope_type, scope_id, session_id, lifecycle_id, workspace_path,
-                    sandbox_id, execution_backend, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'sandbox', ?, ?)
+                    sandbox_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scope_key) DO UPDATE SET
                     workspace_path=excluded.workspace_path,
-                    execution_backend='sandbox',
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -416,7 +411,6 @@ class AgentScopeManager:
                 "lifecycle_id": scope.lifecycle_id,
                 "sandbox_id": scope.sandbox_id,
                 "workspace_id": scope.workspace_id,
-                "execution_backend": "sandbox",
                 "isolation": "container-workspace",
             },
             ensure_ascii=False,
@@ -434,13 +428,21 @@ class AgentScopeManager:
             payload = json.loads(marker.read_text(encoding="utf-8"))
             return bool(
                 isinstance(payload, dict)
+                and set(payload) == {
+                    "scope_key",
+                    "scope_type",
+                    "scope_id",
+                    "lifecycle_id",
+                    "sandbox_id",
+                    "workspace_id",
+                    "isolation",
+                }
                 and payload.get("scope_key") == scope.scope_key
                 and payload.get("scope_type") == scope.scope_type
                 and str(payload.get("scope_id")) == scope.scope_id
                 and payload.get("lifecycle_id") == scope.lifecycle_id
                 and payload.get("sandbox_id") == scope.sandbox_id
                 and payload.get("workspace_id") == scope.workspace_id
-                and payload.get("execution_backend") == "sandbox"
                 and payload.get("isolation") == "container-workspace"
             )
         except (OSError, ValueError, TypeError):

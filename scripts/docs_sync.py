@@ -31,7 +31,7 @@ REQUIRED_RUNTIME_POLICIES = {
     "max_turns_per_run",
     "terminal_timeout",
 }
-REQUIRED_LEGACY_TOP_LEVEL_FILES = {"agents.md", "claude.md"}
+REQUIRED_FORBIDDEN_TOP_LEVEL_FILES = {"agents.md", "claude.md"}
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 DOMAIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 ZERO_SHA_RE = re.compile(r"^0+$")
@@ -69,7 +69,6 @@ REQUIRED_CONTAINER_PLATFORM_TARGETS = {
 REQUIRED_OWNED_CODE_PROBES = {
     ".gitignore": frozenset({"repository-development"}),
     ".github/workflows/quality.yml": frozenset({"repository-development"}),
-    "deploy.sh": frozenset({"deployment"}),
     "scripts/docs_sync.py": frozenset({"documentation-governance"}),
     "scripts/release.sh": frozenset({"documentation-governance"}),
     "enterprise-agent-platform/pyproject.toml": frozenset({"platform"}),
@@ -126,7 +125,7 @@ class Coverage:
 @dataclass(frozen=True)
 class Manifest:
     version: int
-    legacy_top_level_files: tuple[str, ...]
+    forbidden_top_level_files: tuple[str, ...]
     coverage: Coverage
     domains: tuple[Domain, ...]
     contracts: tuple[Contract, ...]
@@ -255,26 +254,26 @@ def load_manifest(root: Path) -> Manifest:
     )
     _reject_unknown_keys(
         raw,
-        {"version", "legacy_top_level_files", "coverage", "domains", "contracts"},
+        {"version", "forbidden_top_level_files", "coverage", "domains", "contracts"},
         "documentation manifest",
     )
-    if raw.get("version") != 1:
-        raise DocsSyncError("documentation manifest version must be 1")
+    if raw.get("version") != 2:
+        raise DocsSyncError("documentation manifest version must be 2")
 
-    legacy = _expect_string_list(
-        raw.get("legacy_top_level_files"),
-        "legacy_top_level_files",
+    forbidden = _expect_string_list(
+        raw.get("forbidden_top_level_files"),
+        "forbidden_top_level_files",
     )
-    for path in legacy:
+    for path in forbidden:
         if "/" in path or "\\" in path:
-            raise DocsSyncError("legacy_top_level_files may contain only top-level file names")
-    missing_legacy_guards = REQUIRED_LEGACY_TOP_LEVEL_FILES - {
-        path.casefold() for path in legacy
+            raise DocsSyncError("forbidden_top_level_files may contain only top-level file names")
+    missing_guards = REQUIRED_FORBIDDEN_TOP_LEVEL_FILES - {
+        path.casefold() for path in forbidden
     }
-    if missing_legacy_guards:
+    if missing_guards:
         raise DocsSyncError(
-            "legacy_top_level_files must permanently forbid: "
-            + ", ".join(sorted(missing_legacy_guards))
+            "forbidden_top_level_files must permanently forbid: "
+            + ", ".join(sorted(missing_guards))
         )
 
     coverage_raw = _expect_object(raw.get("coverage"), "coverage")
@@ -426,8 +425,8 @@ def load_manifest(root: Path) -> Manifest:
             )
 
     manifest = Manifest(
-        version=1,
-        legacy_top_level_files=legacy,
+        version=2,
+        forbidden_top_level_files=forbidden,
         coverage=coverage,
         domains=tuple(domains),
         contracts=tuple(contracts),
@@ -560,8 +559,9 @@ def load_manifest(root: Path) -> Manifest:
 
 def _parse_historical_manifest(raw: Any, label: str) -> Manifest:
     value = _expect_object(raw, label)
-    if value.get("version") != 1:
-        raise DocsSyncError(f"{label} version must be 1")
+    version = value.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise DocsSyncError(f"{label} version must be a positive integer")
 
     coverage_raw = _expect_object(value.get("coverage"), f"{label}.coverage")
     coverage = Coverage(
@@ -663,13 +663,15 @@ def _parse_historical_manifest(raw: Any, label: str) -> Manifest:
             Contract(identifier, source, contract_domains, tuple(targets))
         )
 
-    legacy_raw = value.get("legacy_top_level_files", [])
-    legacy = _expect_string_list(
-        legacy_raw,
-        f"{label}.legacy_top_level_files",
-        allow_empty=True,
+    # Historical manifests are used only to classify paths in a Git diff.
+    # Current repository guards never inherit policy fields from old commits.
+    return Manifest(
+        version,
+        (),
+        coverage,
+        tuple(domains),
+        tuple(contracts),
     )
-    return Manifest(1, legacy, coverage, tuple(domains), tuple(contracts))
 
 
 def load_manifest_at_revision(root: Path, revision: str) -> Manifest | None:
@@ -1478,10 +1480,10 @@ def validate_current_tree(
     repository_files: Sequence[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
-    legacy_names = {name.casefold() for name in manifest.legacy_top_level_files}
+    forbidden_names = {name.casefold() for name in manifest.forbidden_top_level_files}
     for entry in root.iterdir():
-        if entry.name.casefold() in legacy_names:
-            errors.append(f"legacy top-level instruction file is forbidden: {entry.name}")
+        if entry.name.casefold() in forbidden_names:
+            errors.append(f"top-level instruction file is forbidden: {entry.name}")
 
     files = (
         tuple(repository_files)

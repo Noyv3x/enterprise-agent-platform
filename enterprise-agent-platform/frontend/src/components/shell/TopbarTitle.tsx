@@ -1,5 +1,4 @@
-/* <TopbarTitle/> — the contextual title + subtitle (legacy topbarInfo +
-   renderTopbar title block, legacy-app.js:527-533, 561-571). Uses the topbarInfo
+/* <TopbarTitle/> — the contextual title and subtitle. Uses the topbarInfo
    selector with a shallow comparator so unrelated store changes don't re-render
    the title. When info.hash the prefix is a # span; otherwise an icon. */
 

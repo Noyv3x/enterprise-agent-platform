@@ -1,6 +1,4 @@
-/* <AgentWorkCard/> — the collapsible agent tool-call card (legacy
-   renderAgentWorkCard + step formatters, legacy-app.js:968-1029).
-
+/* <AgentWorkCard/> — the collapsible Agent tool-call card.
    Per-run open/closed memory lives in the store (expandedAgentRuns) keyed by runId:
    active runs default open, completed runs default closed, and once the user
    toggles, the choice persists (TOGGLE_AGENT_RUN). When the final response starts,
@@ -222,8 +220,8 @@ export function AgentWorkCard({
   const waiting = active ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1)) : 0;
   const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
 
-  // undefined = no stored preference → default open iff active (legacy hasStored
-  // / expanded rule). Subscribing to the single flag keeps re-renders scoped.
+  // undefined means no stored preference, so active runs default open.
+  // Subscribing to the single flag keeps re-renders scoped.
   const stored = useStore((state) => state.expandedAgentRuns[runId]);
   const [autoCollapsed, setAutoCollapsed] = useState(finalOutputStarted);
 

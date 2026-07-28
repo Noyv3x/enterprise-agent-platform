@@ -1,9 +1,7 @@
-/* <MessageList/> — the scrollable message column (legacy renderChat body, the
-   `.messages[data-chat-key]` container + message-body branch, :688-716).
-
+/* <MessageList/> — the scrollable message column.
    Sticky-scroll is delegated to useStickyScroll(ref, scopeKey, forceBottomToken):
    it snaps to the bottom on the user's own send (forceBottomToken bump), on a
-   scope switch (scopeKey change = the old data-chat-key behavior), or when the
+   scope switch (scopeKey change), or when the
    user was already near the bottom — otherwise it leaves scroll alone. The list
    subscribes to the messages / agent-status / typing slices only, so a composer
    keystroke never re-renders it. */
@@ -28,8 +26,9 @@ const EMPTY_TYPING: TypingUser[] = [];
 
 /** Steering starts a new model turn. If a status briefly contains buffers from
  * both turns, render only the newest turn so an obsolete draft never appears
- * beside the consolidated answer. Older servers omit turn fields, in which case
- * the existing segment behavior is preserved. */
+ * beside the consolidated answer. Untagged segments can occur while the active
+ * turn snapshot is being assembled, so they remain visible when no turn identity
+ * is available yet. */
 function currentTurnStreams(status: AgentStatus): StreamMsg[] {
   const active = status.stream_message?.content ? status.stream_message : null;
   const streams = [
@@ -39,9 +38,8 @@ function currentTurnStreams(status: AgentStatus): StreamMsg[] {
   const hasTurnMetadata = streams.some(
     (stream) => Number.isFinite(stream.turn_index) || !!stream.turn_id,
   );
-  // During a rolling transition an active stream can be the first item produced
-  // without the fields carried by older buffered segments (or vice versa).
-  // Prefer the live buffer instead of hiding it behind partially tagged history.
+  // The active stream can arrive before its turn fields while buffered segments
+  // are already tagged. Prefer the live buffer until the snapshot is complete.
   if (
     active &&
     hasTurnMetadata &&
@@ -72,8 +70,7 @@ function hasLiveFinalOutput(status: AgentStatus): boolean {
   return stream?.active !== false && !!stream?.content?.trim();
 }
 
-/** Synthesize pseudo-messages from a status's streaming buffers so they render
- *  through <MessageBubble> (legacy agentStreamingMessages, :948-966). */
+/** Synthesize pseudo-messages from streaming buffers for <MessageBubble>. */
 function agentStreamingMessages(
   status: AgentStatus,
   mode: ChatMode,
@@ -190,7 +187,7 @@ export function MessageList({
       }
     } else if (status && status.state === "error") {
       // Terminal failure that could not be persisted as a chat message: surface it
-      // inline rather than rendering nothing (legacy :703-709).
+      // inline rather than rendering nothing.
       if (hasAgentProcessSteps(status)) {
         items.push(
           <article key="agent-error" className="msg msg--agent msg--activity">

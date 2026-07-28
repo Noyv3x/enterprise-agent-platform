@@ -393,15 +393,7 @@ class OAuthFlowManager:
             self._sessions[session["flow_id"]] = session
 
 def normalize_oauth_provider(value: str | None) -> str:
-    clean = (value or "").strip().lower().replace("_", "-")
-    aliases = {
-        "codex": "openai-codex",
-        "openai-codex-oauth": "openai-codex",
-        "grok": "xai-oauth",
-        "grok-oauth": "xai-oauth",
-        "xai-grok-oauth": "xai-oauth",
-    }
-    return aliases.get(clean, clean)
+    return str(value or "").strip()
 
 
 def oauth_provider_info(provider: str) -> dict[str, Any]:

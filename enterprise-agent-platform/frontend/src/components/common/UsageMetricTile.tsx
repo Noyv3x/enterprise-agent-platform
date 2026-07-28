@@ -1,5 +1,4 @@
-/* <UsageMetricTile/> — port of legacy usageMetric(label, value, suffix)
-   (legacy-app.js:1671-1678). Shared by token-usage monitoring and the
+/* <UsageMetricTile/> — shared by token-usage monitoring and the
    auto-update status grid. String values render verbatim; numeric values run
    through formatNumber. */
 

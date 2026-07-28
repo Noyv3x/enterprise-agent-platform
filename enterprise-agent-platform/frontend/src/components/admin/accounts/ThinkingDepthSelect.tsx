@@ -1,5 +1,4 @@
-/* <ThinkingDepthSelect/> — controlled thinking-depth dropdown (legacy
-   thinkingDepthSelect, legacy-app.js:1552-1556) over THINKING_DEPTH_OPTIONS. */
+/* <ThinkingDepthSelect/> — controlled dropdown over THINKING_DEPTH_OPTIONS. */
 
 import { THINKING_DEPTH_OPTIONS } from "../../../lib/constants";
 import { useI18n } from "../../../i18n";

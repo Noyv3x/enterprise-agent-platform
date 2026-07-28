@@ -50,31 +50,29 @@ type Call struct {
 }
 
 type ProcessSnapshot struct {
-	ID             string     `json:"id"`
-	RunID          string     `json:"run_id"`
-	ScopeKey       string     `json:"scope_key"`
-	LifecycleID    string     `json:"lifecycle_id"`
-	Target         string     `json:"target"`
-	Command        string     `json:"command"`
-	CWD            string     `json:"cwd"`
-	PID            int        `json:"pid,omitempty"`
-	Status         string     `json:"status"`
-	StopConfirmed  *bool      `json:"stop_confirmed,omitempty"`
-	ExitCode       *int       `json:"exit_code,omitempty"`
-	Stdout         string     `json:"stdout"`
-	Stderr         string     `json:"stderr"`
-	StartedAt      time.Time  `json:"started_at"`
-	FinishedAt     *time.Time `json:"finished_at,omitempty"`
-	Background     bool       `json:"background"`
-	UpdateBehavior string     `json:"update_behavior,omitempty"`
+	ID            string     `json:"id"`
+	RunID         string     `json:"run_id"`
+	ScopeKey      string     `json:"scope_key"`
+	LifecycleID   string     `json:"lifecycle_id"`
+	Target        string     `json:"target"`
+	Command       string     `json:"command"`
+	CWD           string     `json:"cwd"`
+	PID           int        `json:"pid,omitempty"`
+	Status        string     `json:"status"`
+	StopConfirmed *bool      `json:"stop_confirmed,omitempty"`
+	ExitCode      *int       `json:"exit_code,omitempty"`
+	Stdout        string     `json:"stdout"`
+	Stderr        string     `json:"stderr"`
+	StartedAt     time.Time  `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	Background    bool       `json:"background"`
 }
 
 type terminalArguments struct {
-	Command        string `json:"command"`
-	CWD            string `json:"cwd,omitempty"`
-	TimeoutMS      int    `json:"timeout_ms,omitempty"`
-	Background     bool   `json:"background,omitempty"`
-	UpdateBehavior string `json:"update_behavior,omitempty"`
+	Command    string `json:"command"`
+	CWD        string `json:"cwd,omitempty"`
+	TimeoutMS  int    `json:"timeout_ms,omitempty"`
+	Background bool   `json:"background,omitempty"`
 }
 type processArguments struct {
 	ProcessID string `json:"process_id,omitempty"`

@@ -57,6 +57,42 @@ describe("AutoUpdateConfig manager state", () => {
     expect(screen.queryByText("Git remote")).not.toBeInTheDocument();
   });
 
+  it("shows every fixed Manager service, including all Firecrawl stages", () => {
+    const serviceNames = [
+      "platform",
+      "agent-runtime",
+      "camofox",
+      "searxng",
+      "firecrawl-playwright",
+      "firecrawl-redis",
+      "firecrawl-rabbitmq",
+      "firecrawl-postgres",
+      "firecrawl-foundationdb",
+      "firecrawl-foundationdb-init",
+      "firecrawl-api",
+    ];
+    renderConfig({
+      config: {
+        enabled: true,
+        interval_seconds: 300,
+        release_manifest_url: "https://releases.example/main.json",
+        release_channel: "main",
+      },
+      status: {
+        state: "idle",
+        manager_generation: 18,
+        services: Object.fromEntries(serviceNames.map((name) => [name, {
+          available: true,
+          state: "healthy",
+        }])),
+      },
+    });
+
+    for (const name of serviceNames) {
+      expect(screen.getByText(`${name}: healthy`)).toBeInTheDocument();
+    }
+  });
+
   it("uses the numeric manager generation for optimistic concurrency", async () => {
     renderConfig({
       config: {
@@ -118,46 +154,5 @@ describe("AutoUpdateConfig manager state", () => {
     ));
     await waitFor(() => expect(screen.getByText("Idle")).toBeInTheDocument());
     expect(manifestInput).toHaveValue("https://draft.example/main.json");
-  });
-
-  it.each([
-    {
-      name: "the source migration bridge owns the control plane",
-      status: { control_plane: "source_bridge" as const, manager_available: true },
-      message: "The source migration bridge is still handing over control",
-    },
-    {
-      name: "the manager is unavailable",
-      status: { control_plane: "source" as const, manager_available: false },
-      message: "The manager is temporarily unavailable",
-    },
-  ])("keeps update controls read-only when $name", ({ status, message }) => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    const { container } = renderConfig({
-      config: {
-        enabled: true,
-        interval_seconds: 300,
-      },
-      status: {
-        state: "idle",
-        phase: "source_bridge_ready",
-        ...status,
-      },
-    });
-
-    expect(screen.getByRole("alert")).toHaveTextContent(message);
-    expect(screen.getByRole("button", { name: "Check now" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Update now" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Restart services" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Rollback" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Save automatic update settings" })).toBeDisabled();
-    expect(screen.getByRole("switch")).toBeDisabled();
-    for (const input of container.querySelectorAll("input")) {
-      expect(input).toBeDisabled();
-    }
-
-    fireEvent.submit(container.querySelector("form")!);
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

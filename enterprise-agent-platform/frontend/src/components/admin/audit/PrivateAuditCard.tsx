@@ -1,5 +1,4 @@
-/* <PrivateAuditCard/> — private-agent conversation audit + delete tools (legacy
-   Card B in renderMessageAuditManagement, legacy-app.js:1880-1942). Mirrors the
+/* <PrivateAuditCard/> — private-Agent conversation audit and delete tools. Mirrors the
    channel card but is gated on a selected conversation; includes the conversation
    list + selected-thread subhead + message list. Deletes confirm via the shared
    useConfirm() dialog. */

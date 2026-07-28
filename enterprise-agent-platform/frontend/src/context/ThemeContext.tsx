@@ -1,12 +1,8 @@
-/* ThemeContext — the React port of the legacy theme system
-   (currentTheme/toggleTheme, legacy-app.js:230-244).
-
-   CSS stays attribute-driven: we write <html data-theme>, persist
+/* ThemeContext keeps CSS attribute-driven: it writes <html data-theme>, persists
    localStorage["eap-theme"], and resolve "light"/"dark". An UNSET attribute
-   means "follow OS"; we ADOPT the improvement of observing matchMedia
-   prefers-color-scheme changes while no explicit data-theme is pinned (the
-   legacy app only re-rendered on the mobile breakpoint). Theme lives in its own
-   context — toggling never re-renders the store-subscribed tree. */
+   means "follow OS" and observes prefers-color-scheme changes while no explicit
+   data-theme is pinned. Theme lives in its own context, so toggling never
+   re-renders the store-subscribed tree. */
 
 import { createContext, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 

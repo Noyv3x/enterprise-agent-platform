@@ -1,17 +1,7 @@
-/* =====================================================================
-   Admin data/actions — Phase 4c scope (accounts, token usage, message audit).
-
-   Every action mirrors the legacy admin handlers byte-for-byte (payloads,
-   endpoints, toasts, cascade reloads) and routes through runBusy (the withBusy
-   port) so the global busy flag disables admin buttons app-wide exactly like the
-   legacy double-render. The native window.confirm() prompts the legacy deletes
-   used are NOT here — they are a render concern handled by the audit components
-   via useConfirm(); these data-ops keep only the truthiness guards and assume
-   confirmation already happened.
-
-   Phase 4d ADDS the config/oauth/secrets actions to this same file — keep it
-   cleanly extensible (one section per concern).
-   ===================================================================== */
+/* Admin data and actions for accounts, token usage, message audit,
+   configuration, OAuth and secrets. Mutations route through runBusy so the
+   global busy state consistently gates admin controls. Confirmation remains a
+   render concern handled by audit components through useConfirm(). */
 
 import { api, downloadJson } from "../lib/api";
 import { EMPTY_BODY, endpoints } from "../lib/endpoints";
@@ -58,12 +48,9 @@ import type {
   UpdateUserRequest,
 } from "../types";
 
-const RUNTIME_RESTART_TIMEOUT_MS = 5 * 60_000;
-
 /* =============================================================== accounts */
 
-/** Create an account (legacy renderAccountManagement onsubmit,
- *  legacy-app.js:1438-1458). POST /api/users. `onSuccess` resets the form
+/** Create an account with POST /api/users. `onSuccess` resets the form
  *  fields and runs inside runBusy so it only fires on a successful POST. */
 export async function createAccount(
   store: AppStore,
@@ -81,8 +68,7 @@ export async function createAccount(
   });
 }
 
-/** Update an account (legacy renderAccountRow onsubmit,
- *  legacy-app.js:1496-1514). PUT /api/users/{id} (NOT PATCH). */
+/** Update an account with PUT /api/users/{id} (not PATCH). */
 export async function updateAccount(
   store: AppStore,
   userId: Id,
@@ -119,22 +105,20 @@ export async function impersonateAccount(store: AppStore, userId: Id): Promise<v
 
 /* ============================================================ token usage */
 
-/** Days-range change (legacy days select onchange, legacy-app.js:1566-1568):
- *  set tokenUsageDays first, then refetch (loadTokenUsage reads it). */
+/** Set tokenUsageDays first, then refetch; loadTokenUsage reads the new value. */
 export async function changeTokenUsageDays(store: AppStore, days: number): Promise<void> {
   store.dispatch({ type: "SET_TOKEN_USAGE_DAYS", payload: Number(days) || 30 });
   await runBusy(store, "admin:tokens:range", () => loadTokenUsage(store));
 }
 
-/** Manual refresh button (legacy onclick withBusy(loadTokenUsage)). */
+/** Refresh token usage under the shared busy state. */
 export async function refreshTokenUsage(store: AppStore): Promise<void> {
   await runBusy(store, "admin:tokens:refresh", () => loadTokenUsage(store));
 }
 
 /* =============================================================== paging */
 
-/** Pager tab switch (legacy renderAdminPager onclick, legacy-app.js:1374-1378):
- *  set the active page, then lazily load messages/tokens on each click. */
+/** Set the active page, then lazily load messages or tokens when selected. */
 export async function selectAdminPage(store: AppStore, pageId: AdminPageId): Promise<void> {
   store.dispatch({ type: "SET_ACTIVE_ADMIN_PAGE", payload: pageId });
   await ensureAdminPageResource(store, pageId);
@@ -142,32 +126,31 @@ export async function selectAdminPage(store: AppStore, pageId: AdminPageId): Pro
 
 /* ========================================================== audit: select */
 
-/** Channel select change (legacy channelSelect onchange, legacy-app.js:1798-1801). */
+/** Select the channel used by message audit. */
 export async function selectAuditChannel(store: AppStore, channelId: string): Promise<void> {
   store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditChannelId: channelId } });
   await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
 }
 
-/** Conversation select (legacy renderPrivateConversationItem onclick, :1952-1954). */
+/** Select a private conversation for audit. */
 export async function selectAuditConversation(store: AppStore, userId: Id): Promise<void> {
   store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditPrivateUserId: String(userId) } });
   await runBusy(store, `admin:audit:private:${userId}`, () => loadAuditPrivateMessages(store, userId));
 }
 
-/** Channel-card refresh button (legacy onclick withBusy(loadAuditChannelMessages)). */
+/** Refresh one audited channel. */
 export async function refreshAuditChannel(store: AppStore, channelId: string): Promise<void> {
   await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
 }
 
-/** Private-card refresh button (legacy onclick withBusy(loadMessageAudit)). */
+/** Refresh private-message audit data. */
 export async function refreshMessageAudit(store: AppStore): Promise<void> {
   await runBusy(store, "admin:audit:refresh", () => loadMessageAudit(store));
 }
 
 /* ===================================================== audit: cascade reloads */
 
-/** legacy reloadAfterChannelAuditChange (legacy-app.js:3137-3140): refresh the
- *  channel list + the audit list, and the LIVE channel view when it's active. */
+/** Refresh the channel list, audit list and active channel after an audit change. */
 async function reloadAfterChannelAuditChange(store: AppStore, channelId: Id): Promise<void> {
   await Promise.all([loadChannels(store), loadAuditChannelMessages(store, channelId)]);
   if (String(store.getState().activeChannelId || "") === String(channelId)) {
@@ -175,8 +158,7 @@ async function reloadAfterChannelAuditChange(store: AppStore, channelId: Id): Pr
   }
 }
 
-/** legacy reloadAfterPrivateAuditChange (legacy-app.js:3142-3145): refresh the
- *  conversations + the audit list, and the user's own private thread if it's theirs. */
+/** Refresh conversations, the audit list and the user's own private thread. */
 async function reloadAfterPrivateAuditChange(store: AppStore, userId: Id): Promise<void> {
   await Promise.all([loadPrivateConversations(store), loadAuditPrivateMessages(store, userId)]);
   if (String(store.getState().user?.id || "") === String(userId)) {
@@ -186,7 +168,7 @@ async function reloadAfterPrivateAuditChange(store: AppStore, userId: Id): Promi
 
 /* ===================================================== audit: channel deletes */
 
-/** legacy deleteChannelMessage (legacy-app.js:3065-3073). DELETE body "{}". */
+/** Delete one channel message with the API's literal empty JSON body. */
 export async function deleteChannelMessage(
   store: AppStore,
   channelId: Id,
@@ -203,7 +185,7 @@ export async function deleteChannelMessage(
   });
 }
 
-/** legacy deleteChannelMessagesBefore (legacy-app.js:3075-3086). */
+/** Delete channel messages before one message id. */
 export async function deleteChannelMessagesBefore(
   store: AppStore,
   channelId: Id,
@@ -221,7 +203,7 @@ export async function deleteChannelMessagesBefore(
   });
 }
 
-/** legacy clearChannelMessages (legacy-app.js:3088-3099). */
+/** Clear all messages in one channel. */
 export async function clearChannelMessages(store: AppStore, channelId: Id): Promise<void> {
   if (!channelId) return;
   await runBusy(store, `admin:audit:clear-channel:${channelId}`, async () => {
@@ -237,7 +219,7 @@ export async function clearChannelMessages(store: AppStore, channelId: Id): Prom
 
 /* ===================================================== audit: private deletes */
 
-/** legacy deletePrivateMessage (legacy-app.js:3101-3109). DELETE body "{}". */
+/** Delete one private message with the API's literal empty JSON body. */
 export async function deletePrivateMessage(
   store: AppStore,
   userId: Id,
@@ -254,7 +236,7 @@ export async function deletePrivateMessage(
   });
 }
 
-/** legacy deletePrivateMessagesBefore (legacy-app.js:3111-3122). */
+/** Delete private messages before one message id. */
 export async function deletePrivateMessagesBefore(
   store: AppStore,
   userId: Id,
@@ -272,7 +254,7 @@ export async function deletePrivateMessagesBefore(
   });
 }
 
-/** legacy clearPrivateMessages (legacy-app.js:3124-3135). */
+/** Clear a private conversation. */
 export async function clearPrivateMessages(store: AppStore, userId: Id): Promise<void> {
   if (!userId) return;
   await runBusy(store, `admin:audit:clear-private:${userId}`, async () => {
@@ -288,15 +270,14 @@ export async function clearPrivateMessages(store: AppStore, userId: Id): Promise
 
 /* ============================================================= config: PUTs
 
-   Phase 4d additions. Each mirrors the legacy form onsubmit handler byte-for-
-   byte: identical endpoint/method/body, numbers carried as STRINGS, empty
+   Configuration writes use the declared endpoint, method and body; numbers are
+   carried as strings, empty
    secrets dropped (callers send "" which the backend treats as "keep"), and the
    exact per-page refetch scope + toast. `onSuccess`
    runs only after a successful PUT (inside runBusy) and is used by the form to
    clear secret inputs. */
 
-/** legacy renderSecuritySettings onsubmit (legacy-app.js:2023-2048). The PUT
- *  response REPLACES securityConfig (no GET refetch); the restart flags drive
+/** The PUT response replaces securityConfig without a GET refetch; restart flags drive
  *  the toast message + title. */
 export async function saveSecurityConfig(
   store: AppStore,
@@ -338,8 +319,7 @@ export async function saveAgentRuntimeConfig(
   });
 }
 
-/** legacy renderTelegramAdminConfig onsubmit (legacy-app.js:2310-2327). Reloads
- *  ONLY telegram config. */
+/** Save and reload only Telegram configuration. */
 export async function saveTelegramConfig(
   store: AppStore,
   body: TelegramConfigUpdateRequest,
@@ -353,8 +333,7 @@ export async function saveTelegramConfig(
   });
 }
 
-/** legacy renderAutoUpdateConfig onsubmit (legacy-app.js:2393-2409). Reloads
- *  ONLY auto-update config. */
+/** Save and reload only automatic-update configuration. */
 export async function saveAutoUpdateConfig(
   store: AppStore,
   body: AutoUpdateConfigUpdateRequest,
@@ -371,7 +350,7 @@ export async function saveAutoUpdateConfig(
   });
 }
 
-/** legacy "立即检查" button (legacy-app.js:2435-2440). POST literal "{}". */
+/** Request an immediate update check with a literal empty JSON body. */
 export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
   await runBusy(store, "admin:updates:check", async () => {
     await api(endpoints.autoUpdateCheck.path(), { method: "POST", body: EMPTY_BODY });
@@ -395,8 +374,7 @@ export async function runManagerOperation(
   });
 }
 
-/** legacy renderCogneeInternalConfig onsubmit (legacy-app.js:2523-2529). Reloads
- *  cognee config AND runtime (env changes can affect Cognee health). */
+/** Save Cognee configuration and reload runtime health because env changes can affect it. */
 export async function saveCogneeEnv(
   store: AppStore,
   updates: Record<string, string>,
@@ -412,28 +390,11 @@ export async function saveCogneeEnv(
   });
 }
 
-/* =============================================================== runtime actions */
-
-/** legacy runtime restart/refresh button (legacy-app.js:2114-2118). POST "{}",
- *  then reload ALL settings (same endpoint regardless of the button label). */
-export async function restartRuntime(store: AppStore, name: string): Promise<void> {
-  await runBusy(store, `admin:runtime:restart:${name}`, async () => {
-    await api(endpoints.restartRuntime.path(name), {
-      method: "POST",
-      body: EMPTY_BODY,
-      timeoutMs: RUNTIME_RESTART_TIMEOUT_MS,
-    });
-    await loadSettings(store);
-  });
-}
-
 /* =============================================================== secrets */
 
-/** legacy renderSecretsSettings per-row onsubmit (legacy-app.js:2650-2657). PUT
- *  with body { value }; empty value still posts (backend treats it). On success
+/** Set one secret with body { value }; an empty value is still posted. On success,
  *  clear the input (onSuccess) + reload ONLY secrets. NOTE: the key is
- *  interpolated into the path verbatim (no encodeURIComponent), preserving the
- *  legacy request byte-for-byte. */
+ *  interpolated into the path verbatim by API contract (no encodeURIComponent). */
 export async function setSecret(
   store: AppStore,
   key: string,
@@ -450,13 +411,12 @@ export async function setSecret(
 
 /* =============================================================== oauth flows
 
-   The verification state machine (legacy-app.js:3366-3428). Every action
-   routes through runBusy + updateOAuthState (the
+   Every action routes through runBusy and updateOAuthState (the
    SET_OAUTH_STATE reducer case) and reloads the Agent runtime config. The
    start/check bodies are the literal "{}" / { flow_id }. No
    auto-poll exists — poll/complete are user-triggered. */
 
-/** Mirror of legacy updateOAuthState (legacy-app.js:3425-3428). */
+/** Merge a provider verification response into OAuth state. */
 function updateOAuthState(
   store: AppStore,
   providerId: string,
@@ -518,13 +478,12 @@ export async function completeOAuthVerification(
   });
 }
 
-/** Write the in-progress Grok callback URL (legacy textarea oninput). */
+/** Write the in-progress Grok callback URL. */
 export function setOAuthCallbackUrl(store: AppStore, providerId: string, value: string): void {
   store.dispatch({ type: "SET_OAUTH_CALLBACK_URL", payload: { providerId, value } });
 }
 
-/** legacy exportOAuthCredentials (legacy-app.js:3391-3405). GET (no body) →
- *  client-side JSON download; no state change. */
+/** Export OAuth credentials with GET to a client-side JSON download. */
 export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   await runBusy(store, "admin:oauth:export", async () => {
     const payload = await api(endpoints.exportOAuthCredentials.path());

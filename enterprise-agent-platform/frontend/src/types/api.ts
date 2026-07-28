@@ -1,7 +1,4 @@
-/* =====================================================================
-   Request / response payload types per endpoint. Shapes are verbatim from
-   the legacy code + specs — paths/methods/bodies are a backend contract.
-   ===================================================================== */
+/* Request and response payload types for the platform API contract. */
 
 import type {
   AgentApprovalChoice,
@@ -71,16 +68,7 @@ export interface LoginRequest {
 
 export interface LoginResponse {
   user: User;
-  /** New servers return this; older servers remain valid during rollout. */
-  bootstrap?: SessionBootstrapResponse;
-  channels?: Channel[];
-  mention_targets?: MentionTarget[];
-  active_scope?: SessionBootstrapScope | null;
-  messages?: Message[];
-  agent_status?: AgentStatus | null;
-  typing?: TypingUser[];
-  message_revision?: MessageRevision;
-  next_after_id?: Id;
+  bootstrap: SessionBootstrapResponse;
 }
 
 export interface UpdateCurrentUserRequest {
@@ -109,7 +97,7 @@ export interface ChannelsResponse {
 }
 
 export interface ChannelCreateRequest {
-  /** legacy sends the UNTRIMMED name verbatim. */
+  /** The API receives the untrimmed name verbatim. */
   name: string;
 }
 
@@ -454,6 +442,8 @@ export interface AgentPreviewStatusResponse {
   running_terminal_count: number;
 }
 
+export type TerminalProcessStatus = "running" | "completed" | "failed" | "cancelled" | "orphaned";
+
 export interface TerminalPreviewProcess {
   id: string;
   title?: string;
@@ -461,7 +451,7 @@ export interface TerminalPreviewProcess {
   cwd?: string;
   /** Bounded, plain-text combined terminal output returned by the platform. */
   output?: string;
-  status?: string;
+  status: TerminalProcessStatus;
   running?: boolean;
   updated_at?: number | string;
   started_at?: number | string;
@@ -473,6 +463,6 @@ export interface TerminalPreviewProcess {
 export interface TerminalPreviewsResponse {
   processes: TerminalPreviewProcess[];
   captured_at?: number | string;
-  revision?: number | string;
+  revision: string;
   unchanged?: true;
 }

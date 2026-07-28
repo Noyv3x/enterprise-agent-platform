@@ -1,8 +1,8 @@
-/* <KnowledgeCreateCard/> — the gated (manage_knowledge) "新增条目" form
-   (legacy-app.js:1267-1289). A plain structured-text form (title / source /
+/* <KnowledgeCreateCard/> — the gated (manage_knowledge) "新增条目" form.
+   A plain structured-text form (title / source /
    summary / content) — NO file upload (spec §0). The POST body sends the four
    field values verbatim; the response is ignored, the reload is the source of
-   truth. Submit order matches legacy exactly: POST → clear inputs → reload →
+   truth. Submit order is POST → clear inputs → reload →
    toast, all inside one runBusy (so inputs clear even if the reload fails). */
 
 import { Button, Form, Input } from "antd";

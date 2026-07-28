@@ -1,9 +1,7 @@
-/* <MessageAuditManagement/> — the message-audit view: channel card + private card
-   (legacy renderMessageAuditManagement, legacy-app.js:1792-1944). Owns a single
-   shared confirm dialog (useConfirm) passed to both cards, and computes the
-   effective channel id with the legacy fallback chain. The legacy code set the
-   default auditChannelId during render; here it's a useEffect (no render-time
-   store mutation). */
+/* <MessageAuditManagement/> — the message-audit view with channel and private cards.
+   It owns a shared confirmation dialog passed to both cards and computes the
+   effective channel id. The default auditChannelId is set in an effect to avoid
+   render-time store mutation. */
 
 import { useEffect } from "react";
 import { useConfirm } from "../../../hooks/useConfirm";
@@ -21,8 +19,7 @@ export function MessageAuditManagement() {
 
   const channelId = String(auditChannelId || activeChannelId || channels[0]?.id || "");
 
-  // Legacy set the default auditChannelId during render; do it in an effect so we
-  // never mutate the store while rendering.
+  // Set the default in an effect so rendering never mutates the store.
   useEffect(() => {
     if (!auditChannelId && channelId) {
       store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditChannelId: channelId } });

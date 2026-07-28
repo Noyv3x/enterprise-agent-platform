@@ -104,10 +104,6 @@ func (s *Service) Preview(identity ScopeIdentity) map[string]any {
 func (s *Service) Summary(identity ScopeIdentity) map[string]any {
 	return map[string]any{"running_terminal_count": s.Processes.RunningCount(identity.ScopeID, identity.LifecycleID)}
 }
-func (s *Service) UpdateBlockers() map[string]any {
-	running, blocking, terminable := s.Processes.UpdateBlockers()
-	return map[string]any{"running_background_terminal_count": running, "update_blocking_terminal_count": blocking, "terminable_background_terminal_count": terminable}
-}
 func decodeArguments(raw json.RawMessage, value any) error {
 	if len(raw) == 0 {
 		return errors.New("arguments are required")

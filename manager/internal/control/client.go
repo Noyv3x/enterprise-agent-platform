@@ -19,10 +19,10 @@ type Client struct {
 	Timeout    time.Duration
 }
 
-// A pre-bounded Manager returns far smaller control projections. Eight MiB is
-// retained only so a repair CLI can decode one valid journal-shaped response
-// from a legacy Manager whose on-disk JSON reader used the same ceiling.
-const maxManagerResponseBytes int64 = 8 << 20
+// Manager control responses are bounded at twice the default combined Docker
+// log budget so ordinary JSON escaping still fits. Status and operation
+// projections are substantially smaller.
+const maxManagerResponseBytes int64 = 4 << 20
 
 func (c Client) Do(ctx context.Context, method, path string, body, out any) error {
 	if strings.TrimSpace(c.Token) == "" || strings.ContainsAny(c.Token, " \t\r\n") {
@@ -58,9 +58,8 @@ func (c Client) Do(ctx context.Context, method, path string, body, out any) erro
 		return err
 	}
 	defer response.Body.Close()
-	// Some idempotent calls only need the HTTP commit status. Their caller opts
-	// out of a response value explicitly so an older Manager returning a large
-	// legacy plan cannot force the CLI to buffer an inventory it never uses.
+	// Callers that only need the HTTP commit status can explicitly skip response
+	// decoding and avoid buffering an unused body.
 	if response.StatusCode >= 200 && response.StatusCode < 300 && out == nil {
 		return nil
 	}

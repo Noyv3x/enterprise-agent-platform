@@ -149,7 +149,7 @@ export interface SessionEntry {
   scope_key: string;
   lifecycle_id: string;
   session_id: string;
-  /** Runtime-owned marker; absent on legacy/imported model content. */
+  /** Runtime-owned marker; absent on unmarked/imported model content. */
   model_content_security_version?: number;
   payload: JsonValue | AgentMessage;
 }

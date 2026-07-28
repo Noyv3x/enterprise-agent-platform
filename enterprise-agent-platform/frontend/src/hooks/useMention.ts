@@ -1,12 +1,8 @@
-/* useMention — the React port of the legacy @mention machine over a plain
-   <textarea> (legacy-app.js:1031-1173). Channel-only.
+/* useMention implements the channel-only @mention state machine over a plain
+   <textarea>. Live state stays in refs so event handlers read the latest values
+   synchronously, and a `forceRender` reducer re-renders the menu when those refs change.
 
-   The legacy code drove an imperatively-mutated module singleton (`mentionState`)
-   + a DOM menu. Here the live state lives in refs (so event handlers read the
-   latest values synchronously, exactly like the mutable singleton) and a
-   `forceRender` reducer re-renders the menu when those refs change.
-
-   Caret correctness (plan §1.4 hazard #2): applyMention sets the controlled draft
+   Caret correctness: applyMention sets the controlled draft
    and stashes the desired caret in a pending-caret ref; <ComposerTextarea> applies
    it in a useLayoutEffect AFTER the new value commits (else the caret jumps to the
    end). Option selection fires on onMouseDown + preventDefault (not onClick) so the
@@ -22,7 +18,7 @@ interface MentionRange {
   query: string;
 }
 
-/** Fallback single agent option when no targets are loaded (legacy :1042). */
+/** Fallback Agent option when no targets are loaded. */
 function fallbackTarget(): MentionTarget {
   return {
     kind: "agent",

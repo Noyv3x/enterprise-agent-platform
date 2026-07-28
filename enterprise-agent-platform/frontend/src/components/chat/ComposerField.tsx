@@ -1,6 +1,6 @@
 /* <ComposerField/> — the `.composer__field` row (focus-within ring) holding the
    hidden file input + attach button, the controlled textarea, the in-field mention
-   popover, and the send button (legacy composer__field, :719-734). Layout only;
+   popover and the send button. Layout only;
    all behavior is threaded down from <Composer>. */
 
 import { type ChangeEvent, type RefObject } from "react";

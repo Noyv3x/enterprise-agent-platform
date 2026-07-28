@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "legacy_top_level_files": [
+  "version": 2,
+  "forbidden_top_level_files": [
     "AGENTS.md",
     "CLAUDE.md"
   ],
@@ -9,7 +9,6 @@
       ".gitignore",
       ".github/**/*.yml",
       ".github/**/*.yaml",
-      "deploy.sh",
       "manager/go.mod",
       "manager/go.sum",
       "manager/**/*.go",
@@ -86,21 +85,14 @@
         "docs/operations/auto-update.md"
       ],
       "code": [
-        "deploy.sh",
         "manager/**",
         "containers/**",
-        "enterprise-agent-platform/enterprise_agent_platform/deployment.py",
-        "enterprise-agent-platform/enterprise_agent_platform/auto_update.py",
-        "enterprise-agent-platform/enterprise_agent_platform/update_state.py",
-        "enterprise-agent-platform/enterprise_agent_platform/gateway.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py"
       ],
       "tests": [
-        "enterprise-agent-platform/tests/test_deployment.py",
-        "enterprise-agent-platform/tests/test_auto_update_coordination.py",
-        "enterprise-agent-platform/tests/test_update_state.py"
+        "enterprise-agent-platform/tests/test_auto_update_coordination.py"
       ]
     },
     {
@@ -110,7 +102,6 @@
         "docs/reference/data-layout.md"
       ],
       "code": [
-        "manager/internal/migration/**",
         "enterprise-agent-platform/enterprise_agent_platform/db.py",
         "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
         "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",
@@ -139,7 +130,6 @@
         "enterprise-agent-platform/enterprise_agent_platform/loopback_http.py",
         "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
         "enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py",
-        "enterprise-agent-platform/enterprise_agent_platform/gateway.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
@@ -186,7 +176,7 @@
         "enterprise-agent-platform/tests/test_skill_integration.py",
         "enterprise-agent-platform/tests/test_searxng_search.py",
         "enterprise-agent-platform/tests/test_telegram_gateway_lifecycle.py",
-        "enterprise-agent-platform/tests/test_camofox_e2e.py"
+        "enterprise-agent-platform/tests/test_browser_preview.py"
       ]
     },
     {
@@ -235,7 +225,6 @@
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_platform.py",
-        "enterprise-agent-platform/tests/test_gateway.py",
         "enterprise-agent-platform/tests/test_http_config_worker.py"
       ]
     }

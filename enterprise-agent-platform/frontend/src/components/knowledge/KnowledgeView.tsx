@@ -1,7 +1,7 @@
-/* <KnowledgeView/> — the knowledge route view (legacy renderKnowledge,
-   legacy-app.js:1226-1329). The create card is gated on manage_knowledge; when
+/* <KnowledgeView/> — the knowledge route view. The create card is gated on
+   manage_knowledge; when
    absent the grid collapses to a single column. Data loading is owned by the
-   sidebar nav handler (navigateToView → loadDocuments) exactly as in legacy, so
+   sidebar nav handler (navigateToView → loadDocuments), so
    this view does not fetch on mount — it renders whatever the store holds. */
 
 import { Button, Space, Tag } from "antd";

@@ -1,8 +1,7 @@
-/* <MessageBubble/> — one chat message bubble, user or agent (legacy renderMessage,
-   legacy-app.js:871-899). React.memo'd and keyed by message.id at the list level;
+/* <MessageBubble/> — one user or Agent chat message. React.memo'd and keyed by
+   message.id at the list level;
    it re-renders only when a cheap fingerprint (content / streaming / attachments /
-   suggestions / agent_work) changes — the React replacement for the legacy
-   chatSnapshot no-op gate. Optimistic and synthetic streaming messages flow through
+   suggestions / agent_work) changes. Optimistic and synthetic streaming messages flow through
    here too (msg--pending / msg--streaming toggle the CSS badges + caret). */
 
 import { memo } from "react";

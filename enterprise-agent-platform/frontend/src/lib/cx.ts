@@ -1,6 +1,5 @@
-/* className join helper — accepts strings, falsey values, and nested arrays.
-   Replaces the legacy template-literal class concatenation while keeping the
-   exact global class-name contract intact. */
+/* className join helper — accepts strings, falsey values and nested arrays while
+   keeping the global class-name contract intact. */
 
 export type ClassValue = string | number | null | undefined | false | ClassValue[];
 

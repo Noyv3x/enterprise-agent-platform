@@ -1,5 +1,4 @@
-/* <SendButton/> — the composer submit button (legacy composer send button, :731).
-   type="submit" so it triggers the enclosing <form>'s onSubmit. */
+/* <SendButton/> — type="submit" triggers the enclosing form's onSubmit. */
 
 import { useI18n } from "../../i18n";
 import { Button, Tooltip } from "antd";

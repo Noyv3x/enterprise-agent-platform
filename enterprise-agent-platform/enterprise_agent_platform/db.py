@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import secrets
 import sqlite3
 import threading
 import time
@@ -11,14 +10,15 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .container_contract_generated import DATABASE_SCHEMA_VERSION
-from .memory_security import memory_content_hash
 from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
 
 
-_AGENT_SCOPES_SANDBOX_MIGRATION_VERSION = 2026072402
-_AGENT_SCOPES_SANDBOX_MIGRATION_NAME = "agent-scopes-container-sandbox-v2"
-if _AGENT_SCOPES_SANDBOX_MIGRATION_VERSION > DATABASE_SCHEMA_VERSION:
-    raise RuntimeError("Agent scope migration is newer than the database contract")
+_PREVIOUS_DATABASE_BASELINE_VERSION = 2026072402
+_PREVIOUS_DATABASE_BASELINE_NAME = "agent-scopes-container-sandbox-v2"
+_DATABASE_BASELINE_VERSION = 2026072801
+_DATABASE_BASELINE_NAME = "ubitech-agent-container-baseline-v1"
+if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
+    raise RuntimeError("Database baseline does not match the container contract")
 
 
 def now_ts() -> int:
@@ -124,10 +124,24 @@ class Database:
 
     def init_schema(self) -> None:
         with self._init_lock:
-            self._conn.executescript(
+            existing_tables = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            fresh_database = not existing_tables
+            if not fresh_database:
+                self._upgrade_previous_container_baseline(existing_tables)
+                self._assert_current_database_baseline(existing_tables)
+            if fresh_database:
+                try:
+                    self._conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
+                BEGIN IMMEDIATE;
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
@@ -175,6 +189,8 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope_type, scope_id, id);
+                CREATE INDEX IF NOT EXISTS idx_messages_visible_scope
+                    ON messages(scope_type, scope_id, hidden_at, id);
 
                 CREATE TABLE IF NOT EXISTS conversation_revisions (
                     scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
@@ -235,8 +251,6 @@ class Database:
                     lifecycle_id TEXT NOT NULL DEFAULT '',
                     workspace_path TEXT NOT NULL,
                     sandbox_id TEXT NOT NULL,
-                    execution_backend TEXT NOT NULL DEFAULT 'sandbox'
-                        CHECK(execution_backend = 'sandbox'),
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE(scope_type, scope_id)
@@ -272,7 +286,8 @@ class Database:
                     owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                     content TEXT NOT NULL,
                     tags_json TEXT NOT NULL DEFAULT '[]',
-                    source_type TEXT NOT NULL DEFAULT 'legacy',
+                    source_type TEXT NOT NULL DEFAULT 'manual'
+                        CHECK(source_type IN ('manual', 'tool', 'candidate', 'imported')),
                     source_run_id TEXT NOT NULL DEFAULT '',
                     source_message_id TEXT NOT NULL DEFAULT '',
                     content_hash TEXT NOT NULL DEFAULT '',
@@ -281,6 +296,13 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_memories_scope
                     ON agent_memories(scope_key, target, owner_user_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_agent_memories_content_hash
+                    ON agent_memories(scope_key, target, owner_user_id, content_hash);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_memories_dedupe
+                    ON agent_memories(
+                        scope_key, target, COALESCE(owner_user_id, 0), content_hash
+                    )
+                    WHERE content_hash != '';
 
                 CREATE TABLE IF NOT EXISTS agent_memory_candidates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,8 +334,11 @@ class Database:
                     source TEXT NOT NULL DEFAULT '',
                     created_by INTEGER REFERENCES users(id),
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT ''
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_content_hash
+                    ON knowledge_documents(content_hash) WHERE content_hash != '';
 
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -356,227 +381,806 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_updates_status
                     ON telegram_updates(status, update_id);
+
+                CREATE TABLE IF NOT EXISTS durable_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    scope_type TEXT NOT NULL DEFAULT '',
+                    scope_id TEXT NOT NULL DEFAULT '',
+                    dedupe_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'queued'
+                        CHECK(status IN ('queued', 'running', 'succeeded', 'failed', 'needs_review')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at INTEGER NOT NULL DEFAULT 0,
+                    lease_until INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(kind, dedupe_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_durable_jobs_ready
+                    ON durable_jobs(kind, status, available_at, id);
+                CREATE INDEX IF NOT EXISTS idx_durable_jobs_scope
+                    ON durable_jobs(scope_type, scope_id, id);
+
+                CREATE TABLE IF NOT EXISTS agent_run_inputs (
+                    message_id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL UNIQUE,
+                    parent_job_id INTEGER NOT NULL,
+                    input_group_id TEXT NOT NULL,
+                    runtime_run_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL
+                        CHECK(state IN (
+                            'running', 'reserved', 'submitting', 'accepted',
+                            'injected', 'unconsumed', 'succeeded', 'failed',
+                            'needs_review'
+                        )),
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    turn_index INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_group
+                    ON agent_run_inputs(input_group_id, message_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_parent
+                    ON agent_run_inputs(parent_job_id, message_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_runtime
+                    ON agent_run_inputs(runtime_run_id, message_id);
+
+                CREATE TABLE IF NOT EXISTS agent_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    schedule_json TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'UTC',
+                    delivery TEXT NOT NULL DEFAULT 'chat'
+                        CHECK(delivery IN ('chat', 'chat_and_telegram')),
+                    state TEXT NOT NULL DEFAULT 'active'
+                        CHECK(state IN ('active', 'paused', 'completed')),
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    next_run_at INTEGER,
+                    last_run_id INTEGER,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    retry_after INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    deleted_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_schedules_due
+                    ON agent_schedules(enabled, next_run_at, id);
+                CREATE INDEX IF NOT EXISTS idx_agent_schedules_owner
+                    ON agent_schedules(owner_user_id, deleted_at, id);
+
+                CREATE TABLE IF NOT EXISTS agent_schedule_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    schedule_id INTEGER NOT NULL REFERENCES agent_schedules(id) ON DELETE CASCADE,
+                    schedule_revision INTEGER NOT NULL DEFAULT 1,
+                    occurrence_key TEXT,
+                    scheduled_for INTEGER NOT NULL,
+                    trigger TEXT NOT NULL DEFAULT 'scheduled'
+                        CHECK(trigger IN ('scheduled', 'manual')),
+                    status TEXT NOT NULL DEFAULT 'queued'
+                        CHECK(status IN ('queued', 'running', 'succeeded', 'failed',
+                                         'needs_review', 'blocked', 'skipped', 'cancelled')),
+                    durable_job_id INTEGER REFERENCES durable_jobs(id),
+                    source_message_id INTEGER REFERENCES messages(id),
+                    response_message_id INTEGER REFERENCES messages(id),
+                    started_at INTEGER,
+                    finished_at INTEGER,
+                    error TEXT NOT NULL DEFAULT '',
+                    delivery_warning TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(schedule_id, schedule_revision, occurrence_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_schedule_runs_schedule
+                    ON agent_schedule_runs(schedule_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_agent_schedule_runs_job
+                    ON agent_schedule_runs(durable_job_id);
+
+                INSERT INTO schema_migrations(version, name, applied_at)
+                    VALUES (
+                        2026072801,
+                        'ubitech-agent-container-baseline-v1',
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    );
+                INSERT INTO settings(key, value, secret, updated_at)
+                    VALUES (
+                        'durable_agent_jobs_start_message_id',
+                        '0',
+                        0,
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    );
+
+                CREATE TRIGGER conversation_revision_ai
+                AFTER INSERT ON messages BEGIN
+                    INSERT INTO conversation_revisions(
+                        scope_type, scope_id, revision, reset_revision, updated_at
+                    ) VALUES (
+                        new.scope_type, new.scope_id, 1, 0,
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    )
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        revision = conversation_revisions.revision + 1,
+                        updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+                END;
+
+                CREATE TRIGGER conversation_revision_hidden_au
+                AFTER UPDATE OF hidden_at ON messages
+                WHEN old.hidden_at IS NOT new.hidden_at BEGIN
+                    INSERT INTO conversation_revisions(
+                        scope_type, scope_id, revision, reset_revision, updated_at
+                    ) VALUES (
+                        new.scope_type, new.scope_id, 1, 1,
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    )
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        revision = conversation_revisions.revision + 1,
+                        reset_revision = conversation_revisions.revision + 1,
+                        updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+                END;
+
+                CREATE TRIGGER conversation_revision_metadata_au
+                AFTER UPDATE OF metadata_json ON messages
+                WHEN old.metadata_json IS NOT new.metadata_json BEGIN
+                    INSERT INTO conversation_revisions(
+                        scope_type, scope_id, revision, reset_revision, updated_at
+                    ) VALUES (
+                        new.scope_type, new.scope_id, 1, 1,
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    )
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        revision = conversation_revisions.revision + 1,
+                        reset_revision = conversation_revisions.revision + 1,
+                        updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+                END;
+
+                CREATE TRIGGER conversation_revision_ad
+                AFTER DELETE ON messages BEGIN
+                    INSERT INTO conversation_revisions(
+                        scope_type, scope_id, revision, reset_revision, updated_at
+                    ) VALUES (
+                        old.scope_type, old.scope_id, 1, 1,
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                    )
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        revision = conversation_revisions.revision + 1,
+                        reset_revision = conversation_revisions.revision + 1,
+                        updated_at = CAST(strftime('%s', 'now') AS INTEGER);
+                END;
+                COMMIT;
                 """
-            )
-            self._migrate_agent_scopes_to_sandbox()
-            self._ensure_user_columns()
-            self._ensure_message_columns()
-            self._ensure_conversation_revisions()
-            self._ensure_agent_memory_columns()
-            self._ensure_agent_memory_candidate_columns()
-            self._ensure_agent_memory_dedupe()
-            self._ensure_agent_scope_columns()
-            self._ensure_agent_runtime_scopes()
-            self._normalize_attachment_sources()
-            self._ensure_telegram_update_columns()
+                    )
+                except BaseException:
+                    self._conn.rollback()
+                    raise
             self._ensure_fts()
             self._ensure_message_fts()
+            self._assert_current_database_baseline()
             self._conn.commit()
 
-    def _migrate_agent_scopes_to_sandbox(self) -> None:
-        """Version the host-to-Sandbox scope schema and retire rollback state."""
+    def _upgrade_previous_container_baseline(self, tables: set[str]) -> None:
+        """Upgrade exactly one declared container baseline, or reject the DB."""
 
-        version = _AGENT_SCOPES_SANDBOX_MIGRATION_VERSION
-        applied = self._conn.execute(
-            "SELECT name FROM schema_migrations WHERE version = ?", (version,)
-        ).fetchone()
-        if applied:
-            if str(applied["name"]) != _AGENT_SCOPES_SANDBOX_MIGRATION_NAME:
-                raise sqlite3.IntegrityError(
-                    f"database migration version {version} is owned by "
-                    f"{applied['name']!r}, expected "
-                    f"{_AGENT_SCOPES_SANDBOX_MIGRATION_NAME!r}"
-                )
+        markers = [
+            (int(row["version"]), str(row["name"]))
+            for row in self._conn.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ] if "schema_migrations" in tables else []
+        current = [(_DATABASE_BASELINE_VERSION, _DATABASE_BASELINE_NAME)]
+        if markers == current:
             return
-        named_version = self._conn.execute(
-            "SELECT version FROM schema_migrations WHERE name = ?",
-            (_AGENT_SCOPES_SANDBOX_MIGRATION_NAME,),
-        ).fetchone()
-        if named_version:
-            raise sqlite3.IntegrityError(
-                f"database migration {_AGENT_SCOPES_SANDBOX_MIGRATION_NAME!r} "
-                f"is recorded at version {named_version['version']}, expected {version}"
+        previous = [
+            (
+                _PREVIOUS_DATABASE_BASELINE_VERSION,
+                _PREVIOUS_DATABASE_BASELINE_NAME,
             )
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(agent_scopes)").fetchall()
-        }
-        table = self._conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_scopes'"
-        ).fetchone()
-        schema = str(table["sql"] or "").lower() if table else ""
-        needs_rebuild = "sandbox_id" not in columns or "execution_backend = 'host'" in schema
-        retired_sessions_exist = bool(
-            self._conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'agent_scope_sessions'"
-            ).fetchone()
+        ]
+        if markers != previous:
+            if not markers:
+                raise sqlite3.DatabaseError(
+                    "database is missing a supported baseline marker"
+                )
+            raise sqlite3.DatabaseError(
+                "database does not match a supported baseline marker"
+            )
+
+        self._assert_database_structure(
+            tables,
+            current_memory_sources=False,
+            previous_scope_backend=True,
         )
-        if needs_rebuild:
-            supported_dependents = {
-                "agent_scopes": {"agent_runtime_scopes", "agent_scope_sessions"},
-                "agent_runtime_scopes": {"agent_runtime_scope_sessions"},
-                "agent_runtime_scope_sessions": set(),
-                "agent_scope_sessions": set(),
-            }
-            for parent_name, supported_children in supported_dependents.items():
-                unsupported_children = sorted(
-                    self._foreign_key_dependents(parent_name) - supported_children
-                )
-                if unsupported_children:
-                    raise sqlite3.IntegrityError(
-                        f"scope migration found unsupported {parent_name} dependents: "
-                        + ", ".join(unsupported_children)
-                    )
-        elif retired_sessions_exist:
-            unsupported_children = sorted(
-                self._foreign_key_dependents("agent_scope_sessions")
+        unexpected_dependents = sorted(
+            self._foreign_key_dependents("agent_memories")
+            - {"agent_memory_candidates"}
+        )
+        if unexpected_dependents:
+            raise sqlite3.DatabaseError(
+                "database has unsupported memory dependents: "
+                + ", ".join(unexpected_dependents)
             )
-            if unsupported_children:
+
+        memory_count = int(
+            self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
+        )
+        scope_count = int(
+            self._conn.execute("SELECT count(*) FROM agent_scopes").fetchone()[0]
+        )
+        candidate_count = int(
+            self._conn.execute(
+                "SELECT count(*) FROM agent_memory_candidates"
+            ).fetchone()[0]
+        )
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                ALTER TABLE agent_scopes DROP COLUMN execution_backend;
+                DROP TRIGGER IF EXISTS agent_memory_ai;
+                DROP TRIGGER IF EXISTS agent_memory_ad;
+                DROP TRIGGER IF EXISTS agent_memory_au;
+                DROP TABLE IF EXISTS agent_memory_fts;
+                DROP INDEX IF EXISTS idx_agent_memory_candidates_scope;
+                DROP INDEX IF EXISTS idx_agent_memories_scope;
+                DROP INDEX IF EXISTS idx_agent_memories_content_hash;
+                DROP INDEX IF EXISTS uq_agent_memories_dedupe;
+                ALTER TABLE agent_memory_candidates
+                    RENAME TO agent_memory_candidates_baseline_source;
+                ALTER TABLE agent_memories
+                    RENAME TO agent_memories_baseline_source;
+
+                CREATE TABLE agent_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_key TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT 'memory'
+                        CHECK(target IN ('memory', 'user')),
+                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    source_type TEXT NOT NULL DEFAULT 'manual'
+                        CHECK(source_type IN ('manual', 'tool', 'candidate', 'imported')),
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_agent_memories_scope
+                    ON agent_memories(
+                        scope_key, target, owner_user_id, updated_at DESC
+                    );
+                CREATE INDEX idx_agent_memories_content_hash
+                    ON agent_memories(
+                        scope_key, target, owner_user_id, content_hash
+                    );
+                CREATE UNIQUE INDEX uq_agent_memories_dedupe
+                    ON agent_memories(
+                        scope_key, target, COALESCE(owner_user_id, 0), content_hash
+                    )
+                    WHERE content_hash != '';
+
+                CREATE TABLE agent_memory_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_key TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT 'memory'
+                        CHECK(target IN ('memory', 'user')),
+                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    memory_id INTEGER REFERENCES agent_memories(id) ON DELETE SET NULL,
+                    created_at INTEGER NOT NULL,
+                    decided_at INTEGER,
+                    decided_by_user_id INTEGER REFERENCES users(id)
+                );
+                CREATE INDEX idx_agent_memory_candidates_scope
+                    ON agent_memory_candidates(
+                        scope_key, owner_user_id, status, created_at DESC
+                    );
+
+                INSERT INTO agent_memories(
+                    id, scope_key, target, owner_user_id, content, tags_json,
+                    source_type, source_run_id, source_message_id, content_hash,
+                    created_at, updated_at
+                )
+                SELECT id, scope_key, target, owner_user_id, content, tags_json,
+                       CASE
+                           WHEN source_type IN ('manual', 'tool', 'candidate')
+                               THEN source_type
+                           ELSE 'imported'
+                       END,
+                       source_run_id, source_message_id, content_hash,
+                       created_at, updated_at
+                FROM agent_memories_baseline_source;
+                INSERT INTO agent_memory_candidates(
+                    id, scope_key, target, owner_user_id, content, tags_json,
+                    dedupe_key, source_run_id, source_message_id, status,
+                    memory_id, created_at, decided_at, decided_by_user_id
+                )
+                SELECT id, scope_key, target, owner_user_id, content, tags_json,
+                       dedupe_key, source_run_id, source_message_id, status,
+                       memory_id, created_at, decided_at, decided_by_user_id
+                FROM agent_memory_candidates_baseline_source;
+                DROP TABLE agent_memory_candidates_baseline_source;
+                DROP TABLE agent_memories_baseline_source;
+                DELETE FROM schema_migrations;
+                """
+            )
+            if int(
+                self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
+            ) != memory_count:
                 raise sqlite3.IntegrityError(
-                    "scope migration found unsupported agent_scope_sessions dependents: "
-                    + ", ".join(unsupported_children)
+                    "container baseline upgrade changed the memory row count"
                 )
-
-        if needs_rebuild or retired_sessions_exist:
-            self._conn.commit()
-            self._conn.execute("PRAGMA foreign_keys=OFF")
-            try:
-                if needs_rebuild:
-                    self._conn.executescript(
-                        """
-                    BEGIN IMMEDIATE;
-                    DROP INDEX IF EXISTS idx_agent_scope_sessions_lookup;
-                    DROP TABLE IF EXISTS agent_scope_sessions;
-                    ALTER TABLE agent_runtime_scope_sessions RENAME TO agent_runtime_scope_sessions_legacy;
-                    ALTER TABLE agent_runtime_scopes RENAME TO agent_runtime_scopes_legacy;
-                    ALTER TABLE agent_scopes RENAME TO agent_scopes_legacy;
-                    DROP INDEX IF EXISTS idx_agent_runtime_scope_sessions_lookup;
-                    DROP INDEX IF EXISTS idx_agent_scopes_type_id;
-
-                    CREATE TABLE agent_scopes (
-                        scope_key TEXT PRIMARY KEY,
-                        scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
-                        scope_id TEXT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        lifecycle_id TEXT NOT NULL DEFAULT '',
-                        workspace_path TEXT NOT NULL,
-                        sandbox_id TEXT NOT NULL,
-                        execution_backend TEXT NOT NULL DEFAULT 'sandbox'
-                            CHECK(execution_backend = 'sandbox'),
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL,
-                        UNIQUE(scope_type, scope_id)
-                    );
-                    CREATE INDEX idx_agent_scopes_type_id
-                        ON agent_scopes(scope_type, scope_id);
-                    CREATE TABLE agent_runtime_scopes (
-                        scope_key TEXT PRIMARY KEY REFERENCES agent_scopes(scope_key) ON DELETE CASCADE,
-                        session_id TEXT NOT NULL,
-                        lifecycle_id TEXT NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL
-                    );
-                    CREATE TABLE agent_runtime_scope_sessions (
-                        scope_key TEXT NOT NULL REFERENCES agent_runtime_scopes(scope_key) ON DELETE CASCADE,
-                        lifecycle_id TEXT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        PRIMARY KEY(scope_key, lifecycle_id, session_id)
-                    );
-                    CREATE INDEX idx_agent_runtime_scope_sessions_lookup
-                        ON agent_runtime_scope_sessions(scope_key, lifecycle_id, session_id);
-                    INSERT INTO agent_scopes(
-                        scope_key, scope_type, scope_id, session_id, lifecycle_id,
-                        workspace_path, sandbox_id, execution_backend, created_at, updated_at
-                    )
-                    SELECT scope_key, scope_type, scope_id, session_id, lifecycle_id,
-                           workspace_path, 'agent-' || lower(hex(randomblob(16))),
-                           'sandbox', created_at, updated_at
-                    FROM agent_scopes_legacy;
-                    INSERT INTO agent_runtime_scopes SELECT * FROM agent_runtime_scopes_legacy;
-                    INSERT INTO agent_runtime_scope_sessions SELECT * FROM agent_runtime_scope_sessions_legacy;
-                    DROP TABLE agent_runtime_scope_sessions_legacy;
-                    DROP TABLE agent_runtime_scopes_legacy;
-                    DROP TABLE agent_scopes_legacy;
-                    """
-                    )
-                else:
-                    # The first container release could leave an empty retired
-                    # table pointing at the already-dropped temporary parent.
-                    # It has no current Runtime owner, so remove it even when
-                    # the active Sandbox schema itself no longer needs rebuild.
-                    self._conn.executescript(
-                        """
-                        BEGIN IMMEDIATE;
-                        DROP INDEX IF EXISTS idx_agent_scope_sessions_lookup;
-                        DROP TABLE agent_scope_sessions;
-                        """
-                    )
-                stale_dependents = sorted(
-                    self._foreign_key_dependents("agent_scopes_legacy")
+            if int(
+                self._conn.execute("SELECT count(*) FROM agent_scopes").fetchone()[0]
+            ) != scope_count:
+                raise sqlite3.IntegrityError(
+                    "container baseline upgrade changed the Agent scope row count"
                 )
-                if stale_dependents:
-                    raise sqlite3.IntegrityError(
-                        "scope migration left stale agent_scopes foreign keys: "
-                        + ", ".join(stale_dependents)
-                    )
-                missing_parents = self._missing_foreign_key_parents()
-                if missing_parents:
-                    raise sqlite3.IntegrityError(
-                        "scope migration left missing foreign-key parents: "
-                        + ", ".join(missing_parents)
-                    )
-                violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
-                if violations:
-                    raise sqlite3.IntegrityError(
-                        "scope migration produced "
-                        f"{len(violations)} foreign-key violations"
-                    )
+            if int(
                 self._conn.execute(
-                    "INSERT INTO schema_migrations(version, name, applied_at) "
-                    "VALUES (?, ?, ?)",
-                    (version, _AGENT_SCOPES_SANDBOX_MIGRATION_NAME, now_ts()),
+                    "SELECT count(*) FROM agent_memory_candidates"
+                ).fetchone()[0]
+            ) != candidate_count:
+                raise sqlite3.IntegrityError(
+                    "container baseline upgrade changed the candidate row count"
                 )
-                self._conn.commit()
-            except Exception:
-                if self._conn.in_transaction:
-                    self._conn.rollback()
-                raise
-            finally:
-                self._conn.execute("PRAGMA foreign_keys=ON")
-            return
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    "container baseline upgrade produced foreign-key violations"
+                )
+            self._conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) "
+                "VALUES (?, ?, ?)",
+                (_DATABASE_BASELINE_VERSION, _DATABASE_BASELINE_NAME, now_ts()),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
+    def _assert_current_database_baseline(
+        self,
+        existing_tables: set[str] | None = None,
+    ) -> None:
+        """Reject every non-empty database outside the current product baseline."""
+
+        tables = existing_tables or self._database_tables()
+        markers = [
+            (int(row["version"]), str(row["name"]))
+            for row in self._conn.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ] if "schema_migrations" in tables else []
+        if markers != [(_DATABASE_BASELINE_VERSION, _DATABASE_BASELINE_NAME)]:
+            raise sqlite3.DatabaseError(
+                "database does not match the current baseline marker"
+            )
+        self._assert_database_structure(
+            tables,
+            current_memory_sources=True,
+            previous_scope_backend=False,
+        )
+
+    def _database_tables(self) -> set[str]:
+        return {
+            str(row["name"])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+
+    def _assert_database_structure(
+        self,
+        tables: set[str],
+        *,
+        current_memory_sources: bool,
+        previous_scope_backend: bool,
+    ) -> None:
+        forbidden = sorted(
+            {"agent_scope_sessions", "agent_memories_baseline_source",
+             "agent_memory_candidates_baseline_source"} & tables
+        )
+        if forbidden:
+            raise sqlite3.DatabaseError(
+                "database contains tables outside the current baseline: "
+                + ", ".join(forbidden)
+            )
+
+        agent_scope_columns = {
+            "scope_key", "scope_type", "scope_id", "session_id",
+            "lifecycle_id", "workspace_path", "sandbox_id", "created_at",
+            "updated_at",
+        }
+        if previous_scope_backend:
+            agent_scope_columns.add("execution_backend")
+
+        required_columns = {
+            "schema_migrations": {"version", "name", "applied_at"},
+            "users": {
+                "id", "username", "display_name", "password_hash", "role",
+                "position", "permission_group", "model_name", "thinking_depth",
+                "timezone", "active", "token_version", "created_at", "last_login_at",
+            },
+            "channels": {
+                "id", "name", "description", "created_by", "created_at", "archived",
+            },
+            "messages": {
+                "id", "scope_type", "scope_id", "author_type", "user_id",
+                "username", "content", "metadata_json", "hidden_at",
+                "hidden_by_user_id", "created_at",
+            },
+            "conversation_revisions": {
+                "scope_type", "scope_id", "revision", "reset_revision", "updated_at",
+            },
+            "attachments": {
+                "id", "message_id", "scope_type", "scope_id", "uploader_user_id",
+                "source", "filename", "storage_path", "mime_type", "size_bytes",
+                "sha256", "created_at",
+            },
+            "token_usage_events": {
+                "id", "user_id", "username", "display_name", "scope_type",
+                "scope_id", "scope_name", "request_message_id",
+                "response_message_id", "provider", "model", "input_tokens",
+                "output_tokens", "total_tokens", "raw_usage_json", "degraded",
+                "created_at",
+            },
+            "agent_scopes": agent_scope_columns,
+            "agent_runtime_scopes": {
+                "scope_key", "session_id", "lifecycle_id", "created_at", "updated_at",
+            },
+            "agent_runtime_scope_sessions": {
+                "scope_key", "lifecycle_id", "session_id", "created_at",
+            },
+            "agent_memories": {
+                "id", "scope_key", "target", "owner_user_id", "content",
+                "tags_json", "source_type", "source_run_id", "source_message_id",
+                "content_hash", "created_at", "updated_at",
+            },
+            "agent_memory_candidates": {
+                "id", "scope_key", "target", "owner_user_id", "content",
+                "tags_json", "dedupe_key", "source_run_id", "source_message_id",
+                "status", "memory_id", "created_at", "decided_at",
+                "decided_by_user_id",
+            },
+            "knowledge_documents": {
+                "id", "title", "summary", "content", "source", "created_by",
+                "created_at", "updated_at", "content_hash",
+            },
+            "settings": {"key", "value", "secret", "updated_at"},
+            "external_identities": {
+                "provider", "external_id", "user_id", "username",
+                "display_name", "metadata_json", "created_at", "updated_at",
+            },
+            "telegram_link_challenges": {
+                "user_id", "code_hash", "expires_at", "created_at", "updated_at",
+            },
+            "telegram_updates": {
+                "update_id", "status", "received_at", "processed_at",
+                "last_error", "result_json",
+            },
+            "durable_jobs": {
+                "id", "kind", "scope_type", "scope_id", "dedupe_key",
+                "payload_json", "status", "attempts", "available_at",
+                "lease_until", "last_error", "created_at", "updated_at",
+            },
+            "agent_run_inputs": {
+                "message_id", "job_id", "parent_job_id", "input_group_id",
+                "runtime_run_id", "state", "turn_id", "turn_index",
+                "last_error", "created_at", "updated_at",
+            },
+            "agent_schedules": {
+                "id", "owner_user_id", "name", "prompt", "schedule_json",
+                "timezone", "delivery", "state", "enabled", "next_run_at",
+                "last_run_id", "revision", "retry_after", "last_error",
+                "created_at", "updated_at", "deleted_at",
+            },
+            "agent_schedule_runs": {
+                "id", "schedule_id", "schedule_revision", "occurrence_key",
+                "scheduled_for", "trigger", "status", "durable_job_id",
+                "source_message_id", "response_message_id", "started_at",
+                "finished_at", "error", "delivery_warning", "created_at",
+                "updated_at",
+            },
+        }
+        fts_tables = {
+            f"{prefix}{suffix}"
+            for prefix in (
+                "knowledge_fts",
+                "agent_memory_fts",
+                "message_fts",
+                "message_fts_trigram",
+            )
+            for suffix in ("", "_data", "_idx", "_docsize", "_config")
+        }
+        unexpected_tables = sorted(tables - set(required_columns) - fts_tables)
+        if unexpected_tables:
+            raise sqlite3.DatabaseError(
+                "database contains tables outside the current baseline: "
+                + ", ".join(unexpected_tables)
+            )
+        for table_name, expected in required_columns.items():
+            if table_name not in tables:
+                raise sqlite3.DatabaseError(
+                    f"database is missing current baseline table {table_name}"
+                )
+            actual = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            }
+            if actual != expected:
+                missing = sorted(expected - actual)
+                extra = sorted(actual - expected)
+                differences = []
+                if missing:
+                    differences.append("missing " + ", ".join(missing))
+                if extra:
+                    differences.append("unexpected " + ", ".join(extra))
+                raise sqlite3.DatabaseError(
+                    f"database table {table_name} has non-current columns: "
+                    + "; ".join(differences)
+                )
+
+        if previous_scope_backend:
+            self._assert_table_sql(
+                "agent_scopes", "check(execution_backend='sandbox')"
+            )
+        self._assert_table_sql(
+            "attachments", "check(sourcein('upload','agent_generated'))"
+        )
+        self._assert_table_sql(
+            "durable_jobs",
+            "check(statusin('queued','running','succeeded','failed','needs_review'))",
+        )
+        self._assert_table_sql(
+            "agent_run_inputs",
+            "check(statein('running','reserved','submitting','accepted','injected','unconsumed','succeeded','failed','needs_review'))",
+        )
+        self._assert_table_sql(
+            "agent_schedules",
+            "check(deliveryin('chat','chat_and_telegram'))",
+        )
+        self._assert_table_sql(
+            "agent_schedules",
+            "check(statein('active','paused','completed'))",
+        )
+        self._assert_table_sql(
+            "agent_schedule_runs",
+            "check(triggerin('scheduled','manual'))",
+        )
+        self._assert_table_sql(
+            "agent_schedule_runs",
+            "check(statusin('queued','running','succeeded','failed','needs_review','blocked','skipped','cancelled'))",
+        )
+        if current_memory_sources:
+            self._assert_table_sql(
+                "agent_memories",
+                "check(source_typein('manual','tool','candidate','imported'))",
+            )
+            invalid_sources = int(
+                self._conn.execute(
+                    "SELECT count(*) FROM agent_memories "
+                    "WHERE source_type NOT IN ('manual', 'tool', 'candidate', 'imported')"
+                ).fetchone()[0]
+            )
+            if invalid_sources:
+                raise sqlite3.DatabaseError(
+                    "database contains invalid current memory sources"
+                )
+
+        required_indexes = {
+            "idx_messages_visible_scope",
+            "uq_agent_memories_dedupe",
+            "idx_knowledge_documents_content_hash",
+            "idx_durable_jobs_ready",
+            "idx_durable_jobs_scope",
+            "idx_agent_run_inputs_group",
+            "idx_agent_run_inputs_parent",
+            "idx_agent_run_inputs_runtime",
+            "idx_agent_schedules_due",
+            "idx_agent_schedules_owner",
+            "idx_agent_schedule_runs_schedule",
+            "idx_agent_schedule_runs_job",
+        }
+        indexes = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        missing_indexes = sorted(required_indexes - indexes)
+        if missing_indexes:
+            raise sqlite3.DatabaseError(
+                "database is missing current baseline indexes: "
+                + ", ".join(missing_indexes)
+            )
+        for index_name, table_name, columns in (
+            ("idx_durable_jobs_ready", "durable_jobs", ("kind", "status", "available_at", "id")),
+            ("idx_durable_jobs_scope", "durable_jobs", ("scope_type", "scope_id", "id")),
+            ("idx_agent_run_inputs_group", "agent_run_inputs", ("input_group_id", "message_id")),
+            ("idx_agent_run_inputs_parent", "agent_run_inputs", ("parent_job_id", "message_id")),
+            ("idx_agent_run_inputs_runtime", "agent_run_inputs", ("runtime_run_id", "message_id")),
+            ("idx_agent_schedules_due", "agent_schedules", ("enabled", "next_run_at", "id")),
+            ("idx_agent_schedules_owner", "agent_schedules", ("owner_user_id", "deleted_at", "id")),
+            ("idx_agent_schedule_runs_schedule", "agent_schedule_runs", ("schedule_id", "id")),
+            ("idx_agent_schedule_runs_job", "agent_schedule_runs", ("durable_job_id",)),
+        ):
+            self._assert_named_index(index_name, table_name, columns)
+        self._assert_unique_columns("durable_jobs", ("kind", "dedupe_key"))
+        self._assert_unique_columns("agent_run_inputs", ("job_id",))
+        self._assert_unique_columns(
+            "agent_schedule_runs",
+            ("schedule_id", "schedule_revision", "occurrence_key"),
+        )
+
+        self._assert_foreign_keys("durable_jobs", set())
+        self._assert_foreign_keys("agent_run_inputs", set())
+        self._assert_foreign_keys(
+            "agent_schedules",
+            {("owner_user_id", "users", "id", "CASCADE")},
+        )
+        self._assert_foreign_keys(
+            "agent_schedule_runs",
+            {
+                ("schedule_id", "agent_schedules", "id", "CASCADE"),
+                ("durable_job_id", "durable_jobs", "id", "NO ACTION"),
+                ("source_message_id", "messages", "id", "NO ACTION"),
+                ("response_message_id", "messages", "id", "NO ACTION"),
+            },
+        )
+
+        required_triggers = {
+            "conversation_revision_ai",
+            "conversation_revision_hidden_au",
+            "conversation_revision_metadata_au",
+            "conversation_revision_ad",
+        }
+        triggers = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        missing_triggers = sorted(required_triggers - triggers)
+        if missing_triggers:
+            raise sqlite3.DatabaseError(
+                "database is missing current baseline triggers: "
+                + ", ".join(missing_triggers)
+            )
+
+        durable_start = self._conn.execute(
+            "SELECT value FROM settings "
+            "WHERE key = 'durable_agent_jobs_start_message_id'"
+        ).fetchone()
+        try:
+            durable_start_id = int(durable_start["value"]) if durable_start else -1
+        except (TypeError, ValueError):
+            durable_start_id = -1
+        if durable_start_id < 0:
+            raise sqlite3.DatabaseError(
+                "database durable Agent message high-water mark is invalid"
+            )
+
         missing_parents = self._missing_foreign_key_parents()
         if missing_parents:
-            raise sqlite3.IntegrityError(
-                "scope migration found missing foreign-key parents: "
+            raise sqlite3.DatabaseError(
+                "database has missing foreign-key parents: "
                 + ", ".join(missing_parents)
             )
-        self._conn.execute(
-            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-            (version, _AGENT_SCOPES_SANDBOX_MIGRATION_NAME, now_ts()),
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"database has {len(violations)} foreign-key violations"
+            )
+
+    def _assert_table_sql(self, table_name: str, required_fragment: str) -> None:
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        normalized = "".join(str(row["sql"] or "").casefold().split()) if row else ""
+        if required_fragment not in normalized:
+            raise sqlite3.DatabaseError(
+                f"database table {table_name} is outside the current baseline"
+            )
+
+    def _assert_named_index(
+        self,
+        index_name: str,
+        table_name: str,
+        columns: tuple[str, ...],
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        actual_columns = tuple(
+            str(item["name"])
+            for item in self._conn.execute(
+                f'PRAGMA index_info("{index_name}")'
+            ).fetchall()
+        )
+        if row is None or str(row["tbl_name"]) != table_name or actual_columns != columns:
+            raise sqlite3.DatabaseError(
+                f"database index {index_name} is outside the current baseline"
+            )
+
+    def _assert_unique_columns(
+        self,
+        table_name: str,
+        columns: tuple[str, ...],
+    ) -> None:
+        for index in self._conn.execute(
+            f'PRAGMA index_list("{table_name}")'
+        ).fetchall():
+            if not int(index["unique"]):
+                continue
+            index_name = str(index["name"])
+            actual_columns = tuple(
+                str(item["name"])
+                for item in self._conn.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            )
+            if actual_columns == columns:
+                return
+        raise sqlite3.DatabaseError(
+            f"database table {table_name} is missing current unique constraint"
         )
 
-    def _foreign_key_dependents(self, parent_table: str) -> set[str]:
-        """Return user tables whose declared foreign keys target parent_table."""
-
-        dependents: set[str] = set()
-        normalized_parent = parent_table.casefold()
-        tables = self._conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-        for row in tables:
-            name = str(row["name"])
-            quoted_name = '"' + name.replace('"', '""') + '"'
-            foreign_keys = self._conn.execute(
-                f"PRAGMA foreign_key_list({quoted_name})"
+    def _assert_foreign_keys(
+        self,
+        table_name: str,
+        expected: set[tuple[str, str, str, str]],
+    ) -> None:
+        actual = {
+            (
+                str(row["from"]),
+                str(row["table"]),
+                str(row["to"]),
+                str(row["on_delete"]),
+            )
+            for row in self._conn.execute(
+                f'PRAGMA foreign_key_list("{table_name}")'
             ).fetchall()
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(
+                f"database table {table_name} has non-current foreign keys"
+            )
+
+    def _foreign_key_dependents(self, parent_name: str) -> set[str]:
+        dependents: set[str] = set()
+        for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall():
+            child_name = str(row["name"])
+            quoted_name = '"' + child_name.replace('"', '""') + '"'
             if any(
-                str(foreign_key["table"]).casefold() == normalized_parent
-                for foreign_key in foreign_keys
+                str(foreign_key["table"]) == parent_name
+                for foreign_key in self._conn.execute(
+                    f"PRAGMA foreign_key_list({quoted_name})"
+                ).fetchall()
             ):
-                dependents.add(name)
+                dependents.add(child_name)
         return dependents
 
     def _missing_foreign_key_parents(self) -> list[str]:
@@ -598,347 +1202,6 @@ class Database:
                 if parent_name.casefold() not in tables:
                     missing.add(f"{child_name}->{parent_name}")
         return sorted(missing)
-
-    def _ensure_user_columns(self) -> None:
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)").fetchall()}
-        additions = {
-            "position": "ALTER TABLE users ADD COLUMN position TEXT NOT NULL DEFAULT ''",
-            "permission_group": "ALTER TABLE users ADD COLUMN permission_group TEXT NOT NULL DEFAULT 'member'",
-            "model_name": "ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''",
-            "thinking_depth": "ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'",
-            "timezone": "ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''",
-            "token_version": "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1",
-        }
-        for name, sql in additions.items():
-            if name not in columns:
-                self._conn.execute(sql)
-        self._conn.execute(
-            """
-            UPDATE users
-            SET permission_group = CASE WHEN role = 'admin' THEN 'admin' ELSE 'member' END
-            WHERE permission_group IS NULL OR permission_group = ''
-            """
-        )
-        self._conn.execute(
-            "UPDATE users SET permission_group = 'admin' WHERE role = 'admin' AND permission_group != 'admin'"
-        )
-        self._conn.execute(
-            "UPDATE users SET thinking_depth = 'medium' WHERE thinking_depth IS NULL OR thinking_depth = ''"
-        )
-
-    def _ensure_message_columns(self) -> None:
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
-        if "hidden_at" not in columns:
-            self._conn.execute("ALTER TABLE messages ADD COLUMN hidden_at INTEGER")
-        if "hidden_by_user_id" not in columns:
-            self._conn.execute(
-                "ALTER TABLE messages ADD COLUMN hidden_by_user_id INTEGER REFERENCES users(id)"
-            )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_visible_scope "
-            "ON messages(scope_type, scope_id, hidden_at, id)"
-        )
-
-    def _ensure_conversation_revisions(self) -> None:
-        """Install durable, transactionally maintained conversation versions.
-
-        Existing conversations start at a reset boundary so a client carrying a
-        revision from a prior build is forced through one full synchronization.
-        The triggers cover every writer, including scheduled-task inserts and
-        administrative hides/deletes, instead of relying on each service path to
-        remember to update a parallel counter.
-        """
-
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO conversation_revisions(
-                scope_type, scope_id, revision, reset_revision, updated_at
-            )
-            SELECT scope_type, scope_id, MAX(id), MAX(id), MAX(created_at)
-            FROM messages
-            GROUP BY scope_type, scope_id
-            """
-        )
-        self._conn.executescript(
-            """
-            CREATE TRIGGER IF NOT EXISTS conversation_revision_ai
-            AFTER INSERT ON messages BEGIN
-                INSERT INTO conversation_revisions(
-                    scope_type, scope_id, revision, reset_revision, updated_at
-                ) VALUES (
-                    new.scope_type, new.scope_id, 1, 0,
-                    CAST(strftime('%s', 'now') AS INTEGER)
-                )
-                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
-                    revision = conversation_revisions.revision + 1,
-                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS conversation_revision_hidden_au
-            AFTER UPDATE OF hidden_at ON messages
-            WHEN old.hidden_at IS NOT new.hidden_at BEGIN
-                INSERT INTO conversation_revisions(
-                    scope_type, scope_id, revision, reset_revision, updated_at
-                ) VALUES (
-                    new.scope_type, new.scope_id, 1, 1,
-                    CAST(strftime('%s', 'now') AS INTEGER)
-                )
-                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
-                    revision = conversation_revisions.revision + 1,
-                    reset_revision = conversation_revisions.revision + 1,
-                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS conversation_revision_metadata_au
-            AFTER UPDATE OF metadata_json ON messages
-            WHEN old.metadata_json IS NOT new.metadata_json BEGIN
-                INSERT INTO conversation_revisions(
-                    scope_type, scope_id, revision, reset_revision, updated_at
-                ) VALUES (
-                    new.scope_type, new.scope_id, 1, 1,
-                    CAST(strftime('%s', 'now') AS INTEGER)
-                )
-                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
-                    revision = conversation_revisions.revision + 1,
-                    reset_revision = conversation_revisions.revision + 1,
-                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS conversation_revision_ad
-            AFTER DELETE ON messages BEGIN
-                INSERT INTO conversation_revisions(
-                    scope_type, scope_id, revision, reset_revision, updated_at
-                ) VALUES (
-                    old.scope_type, old.scope_id, 1, 1,
-                    CAST(strftime('%s', 'now') AS INTEGER)
-                )
-                ON CONFLICT(scope_type, scope_id) DO UPDATE SET
-                    revision = conversation_revisions.revision + 1,
-                    reset_revision = conversation_revisions.revision + 1,
-                    updated_at = CAST(strftime('%s', 'now') AS INTEGER);
-            END;
-            """
-        )
-
-    def _ensure_agent_memory_columns(self) -> None:
-        columns = {
-            row["name"]
-            for row in self._conn.execute("PRAGMA table_info(agent_memories)").fetchall()
-        }
-        additions = {
-            "source_type": (
-                "ALTER TABLE agent_memories "
-                "ADD COLUMN source_type TEXT NOT NULL DEFAULT 'legacy'"
-            ),
-            "source_run_id": (
-                "ALTER TABLE agent_memories "
-                "ADD COLUMN source_run_id TEXT NOT NULL DEFAULT ''"
-            ),
-            "source_message_id": (
-                "ALTER TABLE agent_memories "
-                "ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''"
-            ),
-            "content_hash": (
-                "ALTER TABLE agent_memories "
-                "ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
-            ),
-        }
-        for name, sql in additions.items():
-            if name not in columns:
-                self._conn.execute(sql)
-        # Recompute under a temporarily relaxed index so a legacy/wrong hash
-        # can safely converge with its canonical duplicate before the unique
-        # expression index is recreated below.
-        self._conn.execute("DROP INDEX IF EXISTS uq_agent_memories_dedupe")
-        rows = self._conn.execute(
-            "SELECT id, content, content_hash FROM agent_memories"
-        ).fetchall()
-        self._conn.executemany(
-            "UPDATE agent_memories SET content_hash = ? WHERE id = ?",
-            (
-                (computed, int(row["id"]))
-                for row in rows
-                if (computed := memory_content_hash(str(row["content"])))
-                != str(row["content_hash"] or "")
-            ),
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_memories_content_hash "
-            "ON agent_memories(scope_key, target, owner_user_id, content_hash)"
-        )
-
-    def _ensure_agent_memory_candidate_columns(self) -> None:
-        columns = {
-            row["name"]
-            for row in self._conn.execute(
-                "PRAGMA table_info(agent_memory_candidates)"
-            ).fetchall()
-        }
-        if "memory_id" not in columns:
-            self._conn.execute(
-                "ALTER TABLE agent_memory_candidates "
-                "ADD COLUMN memory_id INTEGER REFERENCES agent_memories(id) "
-                "ON DELETE SET NULL"
-            )
-
-    def _ensure_agent_memory_dedupe(self) -> None:
-        """Canonicalize legacy duplicates before enforcing idempotent writes."""
-
-        groups = self._conn.execute(
-            """
-            SELECT scope_key, target, COALESCE(owner_user_id, 0) AS owner_key,
-                   content_hash, MIN(id) AS canonical_id
-            FROM agent_memories
-            WHERE content_hash != ''
-            GROUP BY scope_key, target, COALESCE(owner_user_id, 0), content_hash
-            HAVING count(*) > 1
-            """
-        ).fetchall()
-        for group in groups:
-            duplicate_rows = self._conn.execute(
-                """
-                SELECT id FROM agent_memories
-                WHERE scope_key = ? AND target = ?
-                  AND COALESCE(owner_user_id, 0) = ?
-                  AND content_hash = ? AND id != ?
-                """,
-                (
-                    str(group["scope_key"]),
-                    str(group["target"]),
-                    int(group["owner_key"]),
-                    str(group["content_hash"]),
-                    int(group["canonical_id"]),
-                ),
-            ).fetchall()
-            duplicate_ids = [int(row["id"]) for row in duplicate_rows]
-            if not duplicate_ids:
-                continue
-            placeholders = ",".join("?" for _ in duplicate_ids)
-            self._conn.execute(
-                f"""
-                UPDATE agent_memory_candidates SET memory_id = ?
-                WHERE memory_id IN ({placeholders})
-                """,
-                (int(group["canonical_id"]), *duplicate_ids),
-            )
-            self._conn.execute(
-                f"DELETE FROM agent_memories WHERE id IN ({placeholders})",
-                duplicate_ids,
-            )
-        self._conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_memories_dedupe
-            ON agent_memories(
-                scope_key, target, COALESCE(owner_user_id, 0), content_hash
-            )
-            WHERE content_hash != ''
-            """
-        )
-
-    def _ensure_agent_scope_columns(self) -> None:
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(agent_scopes)").fetchall()}
-        if "lifecycle_id" not in columns:
-            self._conn.execute(
-                "ALTER TABLE agent_scopes ADD COLUMN lifecycle_id TEXT NOT NULL DEFAULT ''"
-            )
-        self._conn.execute(
-            "UPDATE agent_scopes SET lifecycle_id = lower(hex(randomblob(16))) WHERE lifecycle_id = ''"
-        )
-        if "sandbox_id" not in columns:
-            raise sqlite3.DatabaseError("agent_scopes sandbox migration did not complete")
-        self._conn.execute(
-            "UPDATE agent_scopes SET sandbox_id = 'agent-' || lower(hex(randomblob(16))) "
-            "WHERE sandbox_id = ''"
-        )
-
-    def _ensure_agent_runtime_scopes(self) -> None:
-        """Ensure every logical Agent scope has authoritative runtime state."""
-
-        rows = self._conn.execute("SELECT scope_key, scope_type FROM agent_scopes").fetchall()
-        timestamp = now_ts()
-        for row in rows:
-            scope_type = str(row["scope_type"] or "agent")
-            session_id = f"ubitech-{scope_type}-{secrets.token_urlsafe(18)}"
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO agent_runtime_scopes(
-                    scope_key, session_id, lifecycle_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    str(row["scope_key"]),
-                    session_id,
-                    secrets.token_hex(16),
-                    timestamp,
-                    timestamp,
-                ),
-            )
-
-    def _ensure_telegram_update_columns(self) -> None:
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(telegram_updates)").fetchall()}
-        if "result_json" not in columns:
-            self._conn.execute(
-                "ALTER TABLE telegram_updates ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
-            )
-
-    def _normalize_attachment_sources(self) -> None:
-        """Collapse non-upload attachment origins into the current schema."""
-
-        row = self._conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attachments'"
-        ).fetchone()
-        schema = str(row[0] or "") if row else ""
-        normalized_schema = "".join(schema.lower().split())
-        if "check(sourcein('upload','agent_generated'))" in normalized_schema:
-            return
-
-        self._conn.execute("SAVEPOINT normalize_attachment_sources")
-        try:
-            self._conn.execute("DROP TABLE IF EXISTS attachments_new")
-            self._conn.execute(
-                """
-                CREATE TABLE attachments_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                    scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'private')),
-                    scope_id TEXT NOT NULL,
-                    uploader_user_id INTEGER REFERENCES users(id),
-                    source TEXT NOT NULL DEFAULT 'upload'
-                        CHECK(source IN ('upload', 'agent_generated')),
-                    filename TEXT NOT NULL,
-                    storage_path TEXT NOT NULL UNIQUE,
-                    mime_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                INSERT INTO attachments_new(
-                    id, message_id, scope_type, scope_id, uploader_user_id, source,
-                    filename, storage_path, mime_type, size_bytes, sha256, created_at
-                )
-                SELECT id, message_id, scope_type, scope_id, uploader_user_id,
-                       CASE WHEN source = 'upload' THEN 'upload' ELSE 'agent_generated' END,
-                       filename, storage_path, mime_type, size_bytes, sha256, created_at
-                FROM attachments
-                """
-            )
-            self._conn.execute("DROP TABLE attachments")
-            self._conn.execute("ALTER TABLE attachments_new RENAME TO attachments")
-            self._conn.execute(
-                "CREATE INDEX idx_attachments_message ON attachments(message_id, id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX idx_attachments_scope ON attachments(scope_type, scope_id, id)"
-            )
-            self._conn.execute("RELEASE SAVEPOINT normalize_attachment_sources")
-        except Exception:
-            self._conn.execute("ROLLBACK TO SAVEPOINT normalize_attachment_sources")
-            self._conn.execute("RELEASE SAVEPOINT normalize_attachment_sources")
-            raise
 
     def _ensure_fts(self) -> None:
         try:

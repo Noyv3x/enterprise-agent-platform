@@ -41,14 +41,9 @@ def _config(**overrides) -> PlatformConfig:
         knowledge_backend="local",
         cognee_dataset="knowledge",
         cognee_ingest_background=False,
-        cognee_repo=Path("/tmp/ubitech-searxng-tests/cognee"),
-        manage_cognee=False,
-        manage_camofox=False,
-        manage_firecrawl=False,
         firecrawl_api_url="http://127.0.0.1:13002",
         searxng_api_url="http://127.0.0.1:13003",
         searxng_timeout_seconds=20.0,
-        manage_agent_runtime=False,
     )
     return replace(config, **overrides)
 
@@ -57,30 +52,33 @@ def _service(config: PlatformConfig | None = None) -> EnterpriseService:
     service = object.__new__(EnterpriseService)
     service.config = config or _config()
     service.runtimes = SimpleNamespace(
-        searxng_loopback_url=lambda: service.config.searxng_api_url,
+        searxng_service_url=lambda: service.config.searxng_api_url,
+        firecrawl_service_url=lambda: service.config.firecrawl_api_url,
     )
     return service
 
 
 class SearXNGConfigTests(unittest.TestCase):
     def test_from_env_has_private_search_defaults_and_explicit_overrides(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(
+            os.environ,
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
+            clear=True,
+        ):
             default = PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
-        self.assertTrue(default.manage_searxng)
-        self.assertEqual(default.searxng_api_url, "http://127.0.0.1:13003")
+        self.assertEqual(default.searxng_api_url, "http://searxng:8080")
         self.assertEqual(default.searxng_timeout_seconds, 20.0)
 
         with mock.patch.dict(
             os.environ,
             {
-                "ENTERPRISE_MANAGE_SEARXNG": "0",
+                "UBITECH_DEPLOYMENT_MODE": "container",
                 "ENTERPRISE_SEARXNG_API_URL": "http://127.0.0.1:14567/",
                 "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": "7.5",
             },
             clear=True,
         ):
             configured = PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
-        self.assertFalse(configured.manage_searxng)
         self.assertEqual(configured.searxng_api_url, "http://127.0.0.1:14567")
         self.assertEqual(configured.searxng_timeout_seconds, 7.5)
 
@@ -88,7 +86,10 @@ class SearXNGConfigTests(unittest.TestCase):
         for value in ("0", "121", "nan", "inf", "-inf"):
             with self.subTest(value=value), mock.patch.dict(
                 os.environ,
-                {"ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": value},
+                {
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": value,
+                },
                 clear=True,
             ):
                 with self.assertRaises(ValueError):
@@ -207,7 +208,7 @@ class SearXNGSearchTests(unittest.TestCase):
             ),
         ) as urlopen:
             result = service._agent_web_tool(
-                "query",
+                "search",
                 {"query": "nothing here"},
             )
 
@@ -384,10 +385,10 @@ class SearXNGSearchTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 19.0)
 
-    def test_runtime_loopback_endpoint_takes_precedence_over_static_config(self):
+    def test_runtime_service_endpoint_is_authoritative(self):
         service = _service(_config(searxng_api_url="https://invalid.example"))
         service.runtimes = SimpleNamespace(
-            searxng_loopback_url=lambda: "http://127.0.0.1:14567",
+            searxng_service_url=lambda: "http://127.0.0.1:14567",
         )
         with mock.patch(
             "enterprise_agent_platform.service.open_loopback_url",
@@ -634,9 +635,9 @@ class SearXNGSearchTests(unittest.TestCase):
         )
         self.assertEqual(result["results"][0]["content"], "# Extracted")
 
-    def test_extract_prefers_runtime_firecrawl_endpoint_when_available(self):
+    def test_extract_uses_runtime_firecrawl_endpoint(self):
         service = _service()
-        service.runtimes.firecrawl_loopback_url = (
+        service.runtimes.firecrawl_service_url = (
             lambda: "http://127.0.0.1:14566"
         )
         service.get_secret = lambda _key: ""
@@ -663,42 +664,13 @@ class SearXNGSearchTests(unittest.TestCase):
 
         self.assertEqual(calls, ["http://127.0.0.1:14566/v1/scrape"])
 
-    def test_external_firecrawl_uses_trusted_no_redirect_transport(self):
-        response = _HTTPResponse({"data": {"markdown": "Extracted"}})
-        service = _service()
-        with (
-            mock.patch(
-                "enterprise_agent_platform.service.open_trusted_service_url",
-                return_value=response,
-            ) as trusted_open,
-            mock.patch(
-                "enterprise_agent_platform.service.open_loopback_url",
-            ) as loopback_open,
-        ):
-            payload = service._runtime_json_request(
-                "https://firecrawl.example:3002/v1/scrape",
-                {"url": "https://example.test/page"},
-                headers={"Authorization": "Bearer firecrawl-key"},
-                timeout=60,
-                loopback_only=False,
-            )
-
-        self.assertEqual(payload["data"]["markdown"], "Extracted")
-        trusted_open.assert_called_once()
-        loopback_open.assert_not_called()
-
-    def test_container_services_use_direct_private_transport(self):
+    def test_services_use_direct_private_transport(self):
         response = _HTTPResponse({"results": []})
-        service = _service(_config(deployment_mode="container"))
-        with (
-            mock.patch(
-                "enterprise_agent_platform.service.open_private_service_url",
-                return_value=response,
-            ) as private_open,
-            mock.patch(
-                "enterprise_agent_platform.service.open_trusted_service_url",
-            ) as trusted_open,
-        ):
+        service = _service()
+        with mock.patch(
+            "enterprise_agent_platform.service.open_private_service_url",
+            return_value=response,
+        ) as private_open:
             payload = service._runtime_json_request(
                 "http://searxng:8080/search?q=test&format=json",
                 None,
@@ -709,7 +681,6 @@ class SearXNGSearchTests(unittest.TestCase):
 
         self.assertEqual(payload, {"results": []})
         private_open.assert_called_once()
-        trusted_open.assert_not_called()
 
 
 if __name__ == "__main__":

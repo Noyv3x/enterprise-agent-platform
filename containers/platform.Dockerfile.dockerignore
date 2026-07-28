@@ -4,6 +4,12 @@
 !containers/
 !containers/**
 enterprise-agent-platform/data/
+enterprise-agent-platform/build/
+enterprise-agent-platform/dist/
+enterprise-agent-platform/*.egg-info/
+enterprise-agent-platform/**/__pycache__/
+enterprise-agent-platform/**/*.pyc
+enterprise-agent-platform/.venv/
 enterprise-agent-platform/**/node_modules/
 enterprise-agent-platform/**/dist/
 enterprise-agent-platform/**/.cache/

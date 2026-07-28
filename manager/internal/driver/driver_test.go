@@ -153,6 +153,161 @@ func TestStopFixedRemovesManagedMigrationWriterBeforeCompose(t *testing.T) {
 	}
 }
 
+func TestReconcileFirecrawlRecreatesFailedInitWithoutRestartingHealthyFoundationDB(t *testing.T) {
+	const initID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const foundationDBID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	starts := 0
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, " up --detach --wait --wait-timeout 600 firecrawl-api"):
+			starts++
+			if starts == 1 {
+				return Result{Stderr: "dependency failed"}, errors.New("dependency failed")
+			}
+		case slicesContain(args, "ps") && args[len(args)-1] == "firecrawl-foundationdb-init":
+			return Result{Stdout: initID}, nil
+		case slicesContain(args, "ps") && args[len(args)-1] == "firecrawl-foundationdb":
+			return Result{Stdout: foundationDBID}, nil
+		case len(args) > 0 && args[0] == "inspect" && args[len(args)-1] == initID:
+			return Result{Stdout: "exited 1"}, nil
+		case len(args) > 0 && args[0] == "inspect" && args[len(args)-1] == foundationDBID:
+			return Result{Stdout: "running healthy"}, nil
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	if err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env"); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 2 {
+		t.Fatalf("Firecrawl start attempts = %d, want 2", starts)
+	}
+	var lifecycle []string
+	for _, call := range runner.calls {
+		lifecycle = append(lifecycle, strings.Join(call.args, " "))
+	}
+	if len(lifecycle) != 7 ||
+		!strings.Contains(lifecycle[0], "up --detach --wait --wait-timeout 600 firecrawl-api") ||
+		!strings.Contains(lifecycle[5], "rm --force --stop firecrawl-foundationdb-init") ||
+		!strings.Contains(lifecycle[6], "up --detach --wait --wait-timeout 600 firecrawl-api") {
+		t.Fatalf("unexpected Firecrawl reconciliation sequence: %#v", lifecycle)
+	}
+	for _, call := range lifecycle {
+		if strings.Contains(call, "restart --timeout 30 firecrawl-foundationdb") {
+			t.Fatalf("healthy FoundationDB was restarted: %#v", lifecycle)
+		}
+	}
+}
+
+func TestReconcileFirecrawlDoesNotMutateFoundationDBForAPIOnlyFailure(t *testing.T) {
+	const initID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const foundationDBID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	starts := 0
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, " up --detach --wait --wait-timeout 600 firecrawl-api"):
+			starts++
+			return Result{}, errors.New("Firecrawl API is unhealthy")
+		case slicesContain(args, "ps") && args[len(args)-1] == "firecrawl-foundationdb-init":
+			return Result{Stdout: initID}, nil
+		case slicesContain(args, "ps") && args[len(args)-1] == "firecrawl-foundationdb":
+			return Result{Stdout: foundationDBID}, nil
+		case len(args) > 0 && args[0] == "inspect" && args[len(args)-1] == initID:
+			return Result{Stdout: "exited 0"}, nil
+		case len(args) > 0 && args[0] == "inspect" && args[len(args)-1] == foundationDBID:
+			return Result{Stdout: "running healthy"}, nil
+		case slicesContain(args, "logs"):
+			return Result{Stdout: "api failed"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: `{}`}, nil
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env")
+	if err == nil || !strings.Contains(err.Error(), "outside the FoundationDB/init repair boundary") {
+		t.Fatalf("reconcileFirecrawl() error = %v", err)
+	}
+	if starts != 1 {
+		t.Fatalf("API-only failure was retried %d times, want one attempt", starts)
+	}
+	for _, call := range runner.calls {
+		joined := strings.Join(call.args, " ")
+		if strings.Contains(joined, " rm --force --stop ") || strings.Contains(joined, " restart ") {
+			t.Fatalf("API-only failure mutated FoundationDB/init state: %s", joined)
+		}
+	}
+}
+
+func TestStartFixedReturnsBothFirecrawlAttemptFailures(t *testing.T) {
+	const initID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const foundationDBID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const apiID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	root := t.TempDir()
+	generation := strings.Repeat("a", 40)
+	releaseDir := filepath.Join(root, "releases", generation)
+	stateDir := filepath.Join(root, "manager")
+	if err := os.MkdirAll(releaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"manifest.json", "compose.yaml"} {
+		if err := os.WriteFile(filepath.Join(releaseDir, name), []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	starts := 0
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case len(args) > 1 && args[0] == "network" && args[1] == "inspect":
+			return Result{Stdout: "bridge core\n"}, nil
+		case strings.Contains(joined, " up --detach --wait --wait-timeout 600 firecrawl-api"):
+			starts++
+			return Result{}, fmt.Errorf("dependency failure %d", starts)
+		case slicesContain(args, "ps"):
+			switch args[len(args)-1] {
+			case "firecrawl-foundationdb-init":
+				return Result{Stdout: initID}, nil
+			case "firecrawl-foundationdb":
+				return Result{Stdout: foundationDBID}, nil
+			case "firecrawl-api":
+				return Result{Stdout: apiID}, nil
+			}
+			return Result{}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			if strings.Contains(joined, ".State.ExitCode") {
+				return Result{Stdout: "exited 1"}, nil
+			}
+			if strings.Contains(joined, ".State.Health") {
+				return Result{Stdout: "running healthy"}, nil
+			}
+			return Result{Stdout: `{}`}, nil
+		default:
+			return Result{}, nil
+		}
+	}}
+	docker := DockerCLI{
+		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
+		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
+		StateDir: stateDir, CoreNetwork: "ubitech-agent-core",
+	}
+	err := docker.StartFixed(context.Background(), release.Manifest{SourceCommit: generation, Images: map[string]string{}})
+	if err == nil || !strings.Contains(err.Error(), "initial Firecrawl start: dependency failure 1") ||
+		!strings.Contains(err.Error(), "Firecrawl retry after init reconciliation: dependency failure 2") ||
+		!strings.Contains(err.Error(), "Firecrawl compose logs:") ||
+		!strings.Contains(err.Error(), "firecrawl-foundationdb Docker state:") {
+		t.Fatalf("StartFixed() error = %v, want both Firecrawl attempt failures", err)
+	}
+	if starts != 2 {
+		t.Fatalf("Firecrawl start attempts = %d, want 2", starts)
+	}
+}
+
 func TestMigrateUsesManagedIdentityAndCleansAfterRunnerFailure(t *testing.T) {
 	const migrationID = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 	psCalls := 0
@@ -211,14 +366,21 @@ func TestMigrateUsesManagedIdentityAndCleansAfterRunnerFailure(t *testing.T) {
 }
 
 func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing.T) {
-	services := []string{"platform", "agent-runtime", "camofox", "searxng"}
+	healthyServices := []string{
+		"platform", "agent-runtime", "camofox", "searxng",
+		"firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres",
+		"firecrawl-foundationdb", "firecrawl-api",
+	}
+	services := append(append([]string{}, healthyServices...), "firecrawl-foundationdb-init")
 	ids := map[string]string{}
 	states := map[string]string{}
+	hexDigits := "abcdef0123456789"
 	for index, service := range services {
-		id := strings.Repeat(string(rune('a'+index)), 64)
+		id := strings.Repeat(string(hexDigits[index]), 64)
 		ids[service] = id
 		states[id] = "running healthy\n"
 	}
+	states[ids["firecrawl-foundationdb-init"]] = "exited 0\n"
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		if len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps") {
 			return Result{Stdout: ids[args[len(args)-1]] + "\n"}, nil
@@ -247,6 +409,97 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 		inspect := runner.calls[index*2+1].args
 		if inspect[0] != "inspect" || inspect[len(inspect)-1] != ids[service] {
 			t.Fatalf("service %s container was not inspected directly: %v", service, inspect)
+		}
+	}
+}
+
+func TestProbeRejectsIncompleteOrFailedFirecrawlInit(t *testing.T) {
+	const healthyID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const initID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name  string
+		ids   string
+		state string
+		want  string
+	}{
+		{name: "missing", ids: "", state: "exited 0", want: "exactly one container, found 0"},
+		{name: "still running", ids: initID, state: "running 0", want: "status is running, want exited"},
+		{name: "failed", ids: initID, state: "exited 1", want: "exited with 1, want 0"},
+		{name: "invalid exit", ids: initID, state: "exited unknown", want: "invalid exit code"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				if len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps") {
+					if args[len(args)-1] == "firecrawl-foundationdb-init" {
+						return Result{Stdout: test.ids}, nil
+					}
+					return Result{Stdout: healthyID}, nil
+				}
+				if len(args) > 0 && args[0] == "inspect" {
+					if args[len(args)-1] == initID {
+						return Result{Stdout: test.state}, nil
+					}
+					return Result{Stdout: "running healthy"}, nil
+				}
+				return Result{}, nil
+			}}
+			docker := DockerCLI{
+				Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
+				ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
+			}
+			manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+			err := docker.Probe(context.Background(), manifest)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Probe() error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T) {
+	services := []string{
+		"platform", "agent-runtime", "camofox", "searxng",
+		"firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres",
+		"firecrawl-foundationdb", "firecrawl-api", "firecrawl-foundationdb-init",
+	}
+	ids := map[string]string{}
+	for index, service := range services {
+		ids[service] = strings.Repeat(string("abcdef0123456789"[index]), 64)
+	}
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if slicesContain(args, "ps") {
+			return Result{Stdout: ids[args[len(args)-1]]}, nil
+		}
+		if len(args) > 0 && args[0] == "inspect" {
+			id := args[len(args)-1]
+			switch id {
+			case ids["firecrawl-redis"]:
+				return Result{Stdout: "running unhealthy"}, nil
+			case ids["firecrawl-foundationdb"]:
+				return Result{Stdout: "running unhealthy"}, nil
+			case ids["firecrawl-foundationdb-init"]:
+				return Result{Stdout: "exited 1"}, nil
+			default:
+				return Result{Stdout: "running healthy"}, nil
+			}
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{
+		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
+		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
+	}
+	status := docker.FixedServiceStatus(context.Background())
+	if status["firecrawl-redis"].Status != "unavailable" ||
+		status["firecrawl-foundationdb"].Status != "unavailable" ||
+		status["firecrawl-foundationdb-init"].Status != "unavailable" ||
+		status["firecrawl-api"].Status != "healthy" {
+		t.Fatalf("independent Firecrawl service status = %#v", status)
+	}
+	for _, service := range []string{"platform", "agent-runtime", "camofox", "searxng", "firecrawl-playwright", "firecrawl-rabbitmq", "firecrawl-postgres"} {
+		if status[service].Status != "healthy" {
+			t.Fatalf("service %s status = %#v", service, status[service])
 		}
 	}
 }
@@ -290,127 +543,6 @@ func TestProbeRejectsMissingDuplicateStoppedOrUnhealthyCoreContainer(t *testing.
 				t.Fatalf("Probe() error = %v, want containing %q", err, test.want)
 			}
 		})
-	}
-}
-
-func TestProbeLegacyRetirementRequiresCompleteHealthyFirecrawlStack(t *testing.T) {
-	services := []string{
-		"platform", "agent-runtime", "camofox", "searxng",
-		"firecrawl-foundationdb", "firecrawl-api", "firecrawl-foundationdb-init",
-	}
-	ids := map[string]string{}
-	states := map[string]string{}
-	idDigits := []string{"a", "b", "c", "d", "e", "f", "1"}
-	for index, service := range services {
-		id := strings.Repeat(idDigits[index], 64)
-		ids[service] = id
-		states[id] = "running healthy\n"
-	}
-	states[ids["firecrawl-foundationdb-init"]] = "exited 0\n"
-	runner := &recordingRunner{results: func(args []string) (Result, error) {
-		switch {
-		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
-			return Result{Stdout: ids[args[len(args)-1]] + "\n"}, nil
-		case len(args) > 0 && args[0] == "inspect":
-			return Result{Stdout: states[args[len(args)-1]]}, nil
-		default:
-			return Result{}, nil
-		}
-	}}
-	docker := DockerCLI{
-		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
-		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
-	}
-	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
-	if err := docker.ProbeLegacyRetirement(context.Background(), manifest); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.calls) != len(services)*2 {
-		t.Fatalf("retirement probe made %d calls, want %d: %#v", len(runner.calls), len(services)*2, runner.calls)
-	}
-	lastInspect := strings.Join(runner.calls[len(runner.calls)-1].args, " ")
-	if !strings.Contains(lastInspect, "{{.State.Status}} {{.State.ExitCode}}") ||
-		!strings.HasSuffix(lastInspect, ids["firecrawl-foundationdb-init"]) {
-		t.Fatalf("foundationdb init was not inspected for successful completion: %s", lastInspect)
-	}
-}
-
-func TestProbeLegacyRetirementRejectsMissingOrUnhealthyFirecrawlService(t *testing.T) {
-	const healthyID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	const failingID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	tests := []struct {
-		name        string
-		service     string
-		containerID string
-		state       string
-		want        string
-	}{
-		{
-			name: "foundationdb missing", service: "firecrawl-foundationdb",
-			want: "required service firecrawl-foundationdb must have exactly one container, found 0",
-		},
-		{
-			name: "api unhealthy", service: "firecrawl-api", containerID: failingID,
-			state: "running unhealthy", want: "required service firecrawl-api container health is unhealthy, want healthy",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			runner := &recordingRunner{results: func(args []string) (Result, error) {
-				switch {
-				case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
-					service := args[len(args)-1]
-					if service == test.service {
-						return Result{Stdout: test.containerID}, nil
-					}
-					return Result{Stdout: healthyID}, nil
-				case len(args) > 0 && args[0] == "inspect":
-					if args[len(args)-1] == test.containerID && test.state != "" {
-						return Result{Stdout: test.state}, nil
-					}
-					if strings.Contains(strings.Join(args, " "), ".State.ExitCode") {
-						return Result{Stdout: "exited 0"}, nil
-					}
-					return Result{Stdout: "running healthy"}, nil
-				default:
-					return Result{}, nil
-				}
-			}}
-			docker := DockerCLI{
-				Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
-				ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
-			}
-			manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
-			err := docker.ProbeLegacyRetirement(context.Background(), manifest)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("ProbeLegacyRetirement() error = %v, want containing %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestProbeLegacyRetirementRejectsFailedFoundationDBInit(t *testing.T) {
-	const healthyID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	runner := &recordingRunner{results: func(args []string) (Result, error) {
-		switch {
-		case len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps"):
-			return Result{Stdout: healthyID}, nil
-		case len(args) > 0 && args[0] == "inspect" && strings.Contains(strings.Join(args, " "), ".State.ExitCode"):
-			return Result{Stdout: "exited 23"}, nil
-		case len(args) > 0 && args[0] == "inspect":
-			return Result{Stdout: "running healthy"}, nil
-		default:
-			return Result{}, nil
-		}
-	}}
-	docker := DockerCLI{
-		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
-		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
-	}
-	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
-	err := docker.ProbeLegacyRetirement(context.Background(), manifest)
-	if err == nil || !strings.Contains(err.Error(), "required service firecrawl-foundationdb-init container exit code is 23, want 0") {
-		t.Fatalf("ProbeLegacyRetirement() error = %v", err)
 	}
 }
 

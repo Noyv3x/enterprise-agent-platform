@@ -13,19 +13,12 @@ from .service import EnterpriseService
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ubitech agent")
-    sub = parser.add_subparsers(dest="cmd")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="Start the web platform")
     serve.add_argument("--host", default=None)
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument("--data", default=None)
-    serve.add_argument("--listen-host", default=None, help=argparse.SUPPRESS)
-    serve.add_argument("--listen-port", type=int, default=None, help=argparse.SUPPRESS)
-
-    gateway = sub.add_parser("gateway", help="Start the persistent platform gateway")
-    from .gateway import add_gateway_args
-
-    add_gateway_args(gateway)
 
     init_admin = sub.add_parser("init-admin", help="Create an admin user")
     init_admin.add_argument("username")
@@ -37,18 +30,8 @@ def main() -> None:
     token.add_argument("--data", default=None)
     migrate = sub.add_parser("migrate", help="Apply database migrations and exit")
     migrate.add_argument("--data", default=None)
-    deploy = sub.add_parser("deploy", help="Bootstrap one-command deployment")
-    from .deployment import add_bootstrap_args
-
-    add_bootstrap_args(deploy)
-
     args = parser.parse_args()
-    cmd = args.cmd or "serve"
-    if cmd == "deploy":
-        from .deployment import bootstrap_from_args
-
-        bootstrap_from_args(args)
-        return
+    cmd = args.cmd
 
     config = PlatformConfig.from_env(Path(__file__).resolve().parents[1])
     if getattr(args, "data", None):
@@ -59,16 +42,7 @@ def main() -> None:
         config = replace(config, port=args.port)
 
     if cmd == "serve":
-        run_server(
-            config,
-            listen_host=getattr(args, "listen_host", None),
-            listen_port=getattr(args, "listen_port", None),
-        )
-        return
-    if cmd == "gateway":
-        from .gateway import run_gateway
-
-        run_gateway(config, mode=args.mode)
+        run_server(config)
         return
     if cmd == "migrate":
         database = Database(config.db_path)
@@ -84,7 +58,7 @@ def main() -> None:
             database.close()
         return
 
-    service = EnterpriseService(config, autostart_runtime=False)
+    service = EnterpriseService(config)
     try:
         if cmd == "init-admin":
             user = service.create_user(

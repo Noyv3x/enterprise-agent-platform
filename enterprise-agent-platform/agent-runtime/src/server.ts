@@ -152,6 +152,10 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       config.maxBodyBytes,
       config.requestBodyTimeoutMs,
     );
+    const allowed = new Set(["scope_key", "lifecycle_id", "delete_sessions"]);
+    if (Object.keys(body).some((key) => !allowed.has(key))) {
+      throw httpError(400, "Scope cleanup accepts only scope_key, lifecycle_id, and delete_sessions");
+    }
     if (typeof body.scope_key !== "string" || !body.scope_key.trim() || body.scope_key.length > 512) {
       throw httpError(400, "scope_key must be a non-empty string of at most 512 characters");
     }
@@ -185,10 +189,8 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     let sinceRevision: string | undefined;
     if (sinceRevisions.length > 0) {
       const value = sinceRevisions.length === 1 ? sinceRevisions[0]! : "";
-      const legacyRevision = /^(?:0|[1-9]\d*)$/.test(value)
-        && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
       const opaqueRevision = /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/.test(value);
-      if (!legacyRevision && !opaqueRevision) {
+      if (!opaqueRevision) {
         throw httpError(400, "since_revision must be one opaque revision token");
       }
       sinceRevision = value;
@@ -213,14 +215,6 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
     }
     json(response, 200, await coordinator.previewProcessSummary(scopeKey, lifecycleId));
-    return;
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/processes/update-blockers") {
-    if ([...url.searchParams.keys()].length > 0) {
-      throw httpError(400, "Update blocker summary does not accept query parameters");
-    }
-    json(response, 200, await coordinator.updateBlockerSummary());
     return;
   }
 

@@ -15,18 +15,11 @@ function processOutput(process: TerminalPreviewProcess | null): string {
 
 export function terminalProcessRunning(process: TerminalPreviewProcess): boolean {
   if (typeof process.running === "boolean") return process.running;
-  return ![
-    "complete",
-    "completed",
-    "exited",
-    "finished",
-    "failed",
-    "closed",
-    "cancelled",
-    "canceled",
-  ].includes(
-    String(process.status || "").toLowerCase(),
-  );
+  return process.status === "running" || process.status === "orphaned";
+}
+
+function terminalProcessOrphaned(process: TerminalPreviewProcess): boolean {
+  return process.status === "orphaned";
 }
 
 function previewTime(value: string | number | null | undefined, locale: string): string {
@@ -62,6 +55,7 @@ export function TerminalPreviewView({ scope }: { scope: AgentPreviewScope }) {
     || runningProcesses[0]
     || null;
   const output = processOutput(process);
+  const orphaned = process ? terminalProcessOrphaned(process) : false;
 
   useEffect(() => {
     if (process && process.id !== selectedProcessId) setSelectedProcessId(process.id);
@@ -93,10 +87,17 @@ export function TerminalPreviewView({ scope }: { scope: AgentPreviewScope }) {
             process,
             t("terminalPreview.terminal", { number: Math.max(1, runningProcesses.indexOf(process) + 1) }),
           )}</strong>
-          <span className="terminal-preview__state is-running">{t("terminalPreview.running")}</span>
+          <span className={`terminal-preview__state ${orphaned ? "is-orphaned" : "is-running"}`}>
+            {t(orphaned ? "terminalPreview.orphaned" : "terminalPreview.running")}
+          </span>
         </div>
         {process.truncated ? <Tag color="warning">{t("terminalPreview.truncated")}</Tag> : null}
       </header>
+      {orphaned ? (
+        <InlineAlert className="terminal-preview__orphaned" variant="warning">
+          {t("terminalPreview.orphanedDetail")}
+        </InlineAlert>
+      ) : null}
       {process.cwd || process.command ? (
         <dl className="terminal-preview__facts">
           {process.cwd ? <><dt>{t("terminalPreview.cwd")}</dt><dd>{process.cwd}</dd></> : null}
@@ -154,8 +155,11 @@ export function TerminalPreviewView({ scope }: { scope: AgentPreviewScope }) {
               key: item.id,
               label: (
                 <span className="terminal-preview__tab-label">
-                  <Badge color="hsl(145 46% 62%)" />
-                  <span>{terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 }))}</span>
+                  <Badge color={terminalProcessOrphaned(item) ? "hsl(38 92% 58%)" : "hsl(145 46% 62%)"} />
+                  <span className="terminal-preview__tab-title">{terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 }))}</span>
+                  {terminalProcessOrphaned(item) ? (
+                    <span className="terminal-preview__tab-state">{t("terminalPreview.orphanedShort")}</span>
+                  ) : null}
                 </span>
               ),
               children: item.id === process.id ? terminalPanel : null,

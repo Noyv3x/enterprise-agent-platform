@@ -7,6 +7,8 @@
 - 集成适配器属于产品代码；上游 Git 仓库和缓存不属于产品运行数据。
 - Cognee 与 Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。CI 在隔离构建上下文中获取、验证和构建，部署机只按 release manifest 拉取镜像，不下载上游源码。
 - Platform、Runtime 和集成容器不得访问 Docker socket；生命周期由宿主管理器统一控制。
+- 容器模式下 Platform 只读取 Manager 注入的 Camoufox、SearXNG、Firecrawl 私有 service URL。SQLite 中任何 manage、URL、command 或 source repo 行都不参与解析，Platform API 也不提供安装或重启这些固定服务的入口；修复和重启通过 Manager operation 完成。
+- Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
@@ -61,4 +63,6 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 本仓库不包含 Cognee 或 Firecrawl 的 gitlink、vendored tree 或镜像副本。临时构建 checkout 不得承载产品修改或被推送。平台行为实现于 Python adapter、Agent Runtime、Manager 或平台生成配置；浏览器补丁实现于 `camofox-runtime/`。升级上游先修改源码契约并通过镜像集成验证。
 
-自动更新预约是所有有副作用集成 worker 的共同门：legacy source marker 或 Manager maintenance 生效时，Cognee 摄取、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。源码 marker 提交为非阻塞 bridge-ready 后，只有 `source_marker` 所有者的预约自动释放并统一唤醒这些 worker；Manager 所有的预约只能由匹配 operation id 的内部 release 解除。
+Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，Cognee 摄取、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
+
+开发环境同样通过外部 Compose/Manager 启动固定服务，再把私有 service URL 注入 Platform；Platform 不提供进程 runner、安装器、Compose 包装器或源码目录配置。测试替身只实现 HTTP 契约，不能重新引入第二套生命周期。

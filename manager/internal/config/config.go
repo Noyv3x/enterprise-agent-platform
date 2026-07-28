@@ -15,47 +15,30 @@ import (
 )
 
 type Config struct {
-	ConfigPath            string
-	DataRoot              string
-	StateDir              string
-	DataDir               string
-	SocketPath            string
-	GatewayAddress        string
-	PlatformURL           string
-	PlatformGateURL       string
-	LegacyPlatformGateURL string
-	InternalToken         string
-	InternalTokenFile     string
-	ReleaseURL            string
-	ReleaseChannel        string
-	UpdateEnabled         bool
-	UpdateInterval        time.Duration
-	ComposeFile           string
-	ComposeProject        string
-	DockerBinary          string
-	SandboxImage          string
-	SandboxNetwork        string
-	SandboxIdle           time.Duration
-	HealthTimeout         time.Duration
-	DrainTimeout          time.Duration
-	LogMaxBytes           int64
-	LogBackups            int
-	CommandMaxBytes       int64
-	dataDirExplicit       bool
-}
-
-// SourceMigrationExpectations are bridge-owned values that must agree with
-// the persisted Manager configuration before a source deployment hands over
-// control. Mutable tuning and secret values deliberately do not belong here;
-// the path of the shared control capability does.
-type SourceMigrationExpectations struct {
-	DataRoot           string
-	GatewayAddress     string
-	ReleaseManifestURL string
-	ReleaseChannel     string
-	LegacyPlatformURL  string
-	ControlSocketPath  string
-	ControlTokenFile   string
+	ConfigPath        string
+	DataRoot          string
+	StateDir          string
+	SocketPath        string
+	GatewayAddress    string
+	PlatformURL       string
+	PlatformGateURL   string
+	InternalToken     string
+	InternalTokenFile string
+	ReleaseURL        string
+	ReleaseChannel    string
+	UpdateEnabled     bool
+	UpdateInterval    time.Duration
+	ComposeFile       string
+	ComposeProject    string
+	DockerBinary      string
+	SandboxImage      string
+	SandboxNetwork    string
+	SandboxIdle       time.Duration
+	HealthTimeout     time.Duration
+	DrainTimeout      time.Duration
+	LogMaxBytes       int64
+	LogBackups        int
+	CommandMaxBytes   int64
 }
 
 func Defaults() (Config, error) {
@@ -73,12 +56,10 @@ func Defaults() (Config, error) {
 	}
 	dataRoot := filepath.Join(dataHome, "ubitech-agent")
 	stateDir := filepath.Join(dataRoot, "manager")
-	dataDir := filepath.Join(dataRoot, "data")
 	return Config{
 		ConfigPath:      filepath.Join(configHome, "ubitech-agent", "manager.toml"),
 		DataRoot:        dataRoot,
 		StateDir:        stateDir,
-		DataDir:         dataDir,
 		SocketPath:      filepath.Join(stateDir, "control", "manager.sock"),
 		GatewayAddress:  "127.0.0.1:8080",
 		PlatformURL:     "http://127.0.0.1:18080",
@@ -144,33 +125,21 @@ func set(c *Config, key, value string) error {
 		root := expandHome(value)
 		c.DataRoot = root
 		c.StateDir = filepath.Join(root, "manager")
-		if !c.dataDirExplicit {
-			c.DataDir = filepath.Join(root, "data")
-		}
 		c.SocketPath = filepath.Join(root, "manager", "control", "manager.sock")
 	case "state_dir":
 		c.StateDir = expandHome(value)
-	case "data_dir":
-		c.DataDir = expandHome(value)
-		c.dataDirExplicit = true
 	case "socket_path":
 		c.SocketPath = expandHome(value)
-	case "gateway_address":
-		c.GatewayAddress = value
 	case "listen":
 		c.GatewayAddress = value
 	case "platform_url":
 		c.PlatformURL = value
 	case "platform_gate_url":
 		c.PlatformGateURL = value
-	case "legacy_platform_gate_url":
-		c.LegacyPlatformGateURL = value
 	case "internal_token":
 		return errors.New("internal_token plaintext is not accepted; use internal_token_file")
 	case "internal_token_file":
 		c.InternalTokenFile = expandHome(value)
-	case "release_url":
-		c.ReleaseURL = value
 	case "release_manifest_url":
 		c.ReleaseURL = value
 	case "release_channel":
@@ -181,12 +150,6 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("update_enabled must be true or false")
 		}
 		c.UpdateEnabled = parsed
-	case "update_interval_seconds":
-		n, err := strconv.Atoi(value)
-		if err != nil || n < 30 || n > 86400 {
-			return fmt.Errorf("update_interval_seconds must be between 30 and 86400")
-		}
-		c.UpdateInterval = time.Duration(n) * time.Second
 	case "update_interval":
 		duration, err := time.ParseDuration(value)
 		if err != nil || duration < 30*time.Second || duration > 24*time.Hour {
@@ -203,12 +166,6 @@ func set(c *Config, key, value string) error {
 		c.SandboxImage = value
 	case "sandbox_network":
 		c.SandboxNetwork = value
-	case "sandbox_idle_seconds":
-		n, err := strconv.Atoi(value)
-		if err != nil || n < 1 {
-			return fmt.Errorf("sandbox_idle_seconds must be positive")
-		}
-		c.SandboxIdle = time.Duration(n) * time.Second
 	case "sandbox_idle":
 		duration, err := time.ParseDuration(value)
 		if err != nil || duration < time.Minute || duration > 24*time.Hour {
@@ -227,24 +184,12 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("drain_timeout_seconds must be positive")
 		}
 		c.DrainTimeout = time.Duration(n) * time.Second
-	case "log_max_bytes":
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || n < 1024 {
-			return fmt.Errorf("log_max_bytes must be at least 1024")
-		}
-		c.LogMaxBytes = n
 	case "log_max_size":
 		n, err := parseByteSize(value)
 		if err != nil || n < 1024 {
 			return fmt.Errorf("log_max_size is invalid")
 		}
 		c.LogMaxBytes = n
-	case "log_backups":
-		n, err := strconv.Atoi(value)
-		if err != nil || n < 1 {
-			return fmt.Errorf("log_backups must be positive")
-		}
-		c.LogBackups = n
 	case "log_max_files":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 || n > 100 {
@@ -264,13 +209,10 @@ func set(c *Config, key, value string) error {
 }
 
 func (c Config) Validate() error {
-	for name, path := range map[string]string{"data_root": c.DataRoot, "state_dir": c.StateDir, "data_dir": c.DataDir, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
+	for name, path := range map[string]string{"data_root": c.DataRoot, "state_dir": c.StateDir, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("%s must be absolute", name)
 		}
-	}
-	if filepath.Clean(c.DataDir) != c.PlatformDataDir() {
-		return fmt.Errorf("data_dir must equal data_root/data (%s)", c.PlatformDataDir())
 	}
 	if c.ReleaseChannel == "" || c.ComposeProject == "" || c.DockerBinary == "" {
 		return fmt.Errorf("release_channel, compose_project and docker_binary are required")
@@ -282,8 +224,7 @@ func (c Config) Validate() error {
 }
 
 // PlatformDataDir is the single authoritative host path mounted into the
-// Platform container. DataDir remains parseable only as a compatibility
-// assertion for older manager.toml files; Validate rejects any divergent value.
+// Platform container.
 func (c Config) PlatformDataDir() string {
 	return filepath.Join(filepath.Clean(c.DataRoot), "data")
 }
@@ -295,55 +236,6 @@ func (c Config) ControlTokenFile() string {
 		return filepath.Clean(c.InternalTokenFile)
 	}
 	return filepath.Join(filepath.Clean(c.StateDir), "secrets", "manager-token")
-}
-
-// ValidateSourceMigration compares values after manager.toml has passed
-// through the Manager's canonical parser. Paths are cleaned so harmless
-// trailing separators do not create false mismatches; network and catalog
-// values remain exact trust-boundary inputs.
-func (c Config) ValidateSourceMigration(expected SourceMigrationExpectations) error {
-	if err := c.Validate(); err != nil {
-		return fmt.Errorf("invalid effective Manager configuration: %w", err)
-	}
-	required := map[string]string{
-		"data_root":                expected.DataRoot,
-		"listen":                   expected.GatewayAddress,
-		"release_manifest_url":     expected.ReleaseManifestURL,
-		"release_channel":          expected.ReleaseChannel,
-		"legacy_platform_gate_url": expected.LegacyPlatformURL,
-		"socket_path":              expected.ControlSocketPath,
-		"internal_token_file":      expected.ControlTokenFile,
-	}
-	for name, value := range required {
-		if strings.TrimSpace(value) == "" {
-			return fmt.Errorf("source migration expectation %s is required", name)
-		}
-	}
-
-	configured := map[string]string{
-		"data_root":                filepath.Clean(c.DataRoot),
-		"listen":                   c.GatewayAddress,
-		"release_manifest_url":     c.ReleaseURL,
-		"release_channel":          c.ReleaseChannel,
-		"legacy_platform_gate_url": c.LegacyPlatformGateURL,
-		"socket_path":              filepath.Clean(c.SocketPath),
-		"internal_token_file":      c.ControlTokenFile(),
-	}
-	expectedValues := map[string]string{
-		"data_root":                filepath.Clean(expected.DataRoot),
-		"listen":                   expected.GatewayAddress,
-		"release_manifest_url":     expected.ReleaseManifestURL,
-		"release_channel":          expected.ReleaseChannel,
-		"legacy_platform_gate_url": expected.LegacyPlatformURL,
-		"socket_path":              filepath.Clean(expected.ControlSocketPath),
-		"internal_token_file":      filepath.Clean(expected.ControlTokenFile),
-	}
-	for _, name := range []string{"data_root", "listen", "release_manifest_url", "release_channel", "legacy_platform_gate_url", "socket_path", "internal_token_file"} {
-		if configured[name] != expectedValues[name] {
-			return fmt.Errorf("source migration config mismatch for %s: configured %q, expected %q", name, configured[name], expectedValues[name])
-		}
-	}
-	return nil
 }
 
 func parseByteSize(value string) (int64, error) {

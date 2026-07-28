@@ -11,9 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Every main commit can already be running on a source deployment waiting
-  # for its exact container release. Keep push generations independent; only
-  # supersede repeated validation for the same pull request.
+  # Keep push generations independent because each validated main commit may
+  # become an immutable container release. Supersede only repeated PR checks.
   group: quality-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -81,11 +80,6 @@ jobs:
           cache: pip
           cache-dependency-path: enterprise-agent-platform/pyproject.toml
 
-      - name: Set up Node.js for deployment checks
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-
       - name: Install platform
         run: python -m pip install --no-input --editable .
 
@@ -94,25 +88,6 @@ jobs:
 
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
-
-      - name: Verify fetchable managed upstream sources
-        shell: bash
-        run: |
-          data_dir="$(mktemp -d)"
-          trap 'rm -rf "$data_dir"' EXIT
-          python - "$data_dir" <<'PY'
-          import sys
-          from pathlib import Path
-
-          from enterprise_agent_platform.deployment import DeploymentManager, DeploymentPaths
-
-          repository_root = Path.cwd().parent.resolve()
-          paths = DeploymentPaths.from_root(
-              repository_root,
-              data_dir=Path(sys.argv[1]).resolve(),
-          )
-          DeploymentManager(paths).ensure_managed_sources(("cognee", "firecrawl"))
-          PY
 
   frontend:
     name: Node 24

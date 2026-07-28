@@ -1,5 +1,4 @@
-/* <MessageAttachments/> — port of legacy renderMessageAttachments
-   (legacy-app.js:901-932). Shared by the chat message bubbles and the admin
+/* <MessageAttachments/> — shared by the chat message bubbles and the admin
    message-audit rows. Every backend-supplied href/src runs through safeUrl
    (JSX does NOT block javascript: URLs); image src additionally allows
    data:/blob: for inline + optimistic previews. */

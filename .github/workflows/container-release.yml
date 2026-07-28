@@ -424,7 +424,7 @@ jobs:
       - images
       - public-images
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -647,7 +647,7 @@ jobs:
           docker compose -f containers/compose.yaml run --rm --no-deps \
             --entrypoint /bin/sh firecrawl-foundationdb \
             -eu -c 'test -x /var/fdb/scripts/fdb.bash'
-          if ! docker compose -f containers/compose.yaml up --detach firecrawl-api; then
+          if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
             docker compose -f containers/compose.yaml ps --all
             docker compose -f containers/compose.yaml logs --no-color --tail 200 \
               firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
@@ -688,7 +688,7 @@ jobs:
             node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
           docker compose -f containers/compose.yaml rm --stop --force \
             firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
-          if ! docker compose -f containers/compose.yaml up --detach firecrawl-api; then
+          if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
             docker compose -f containers/compose.yaml ps --all
             docker compose -f containers/compose.yaml logs --no-color --tail 200 \
               firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
@@ -721,6 +721,58 @@ jobs:
           read_output="$(docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
             fdbcli -C /var/fdb/cluster/fdb.cluster --exec "get $sentinel_key")"
           expected="\`${sentinel_key}' is \`${sentinel_value}'"
+          printf '%s\n' "$read_output" | grep -Fqx -- "$expected"
+          docker compose -f containers/compose.yaml exec -T firecrawl-api \
+            node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+          docker compose -f containers/compose.yaml rm --stop --force \
+            firecrawl-api firecrawl-foundationdb-init
+          if docker compose \
+            -f containers/compose.yaml \
+            -f containers/compose.firecrawl-init-failure.yaml \
+            up --detach --wait --wait-timeout 600 firecrawl-api; then
+            echo "Firecrawl unexpectedly ignored the injected init failure" >&2
+            exit 1
+          fi
+          failed_foundationdb_init="$(docker compose \
+            -f containers/compose.yaml \
+            -f containers/compose.firecrawl-init-failure.yaml \
+            ps --all -q firecrawl-foundationdb-init)"
+          test -n "$failed_foundationdb_init"
+          test "$(docker inspect --format '{{.State.Status}}' "$failed_foundationdb_init")" = exited
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$failed_foundationdb_init")" = 42
+          failed_recovery_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
+          test "$failed_recovery_foundationdb" = "$second_foundationdb"
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$failed_recovery_foundationdb")" = healthy
+          docker compose -f containers/compose.yaml rm --force --stop \
+            firecrawl-foundationdb-init
+          if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
+            docker compose -f containers/compose.yaml ps --all
+            docker compose -f containers/compose.yaml logs --no-color --tail 200 \
+              firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
+            exit 1
+          fi
+          reconciled_foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
+          test -n "$reconciled_foundationdb_init"
+          test "$reconciled_foundationdb_init" != "$failed_foundationdb_init"
+          test "$(docker inspect --format '{{.State.Status}}' "$reconciled_foundationdb_init")" = exited
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$reconciled_foundationdb_init")" = 0
+          test "$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)" = "$second_foundationdb"
+          for service in firecrawl-foundationdb firecrawl-api; do
+            container="$(docker compose -f containers/compose.yaml ps -q "$service")"
+            test -n "$container"
+            for attempt in $(seq 1 60); do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
+              [[ "$status" == healthy ]] && break
+              [[ "$status" != unhealthy || "$attempt" -lt 60 ]] || {
+                docker compose -f containers/compose.yaml logs --no-color --tail 200 "$service"
+                exit 1
+              }
+              sleep 5
+            done
+            test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
+          done
+          read_output="$(docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
+            fdbcli -C /var/fdb/cluster/fdb.cluster --exec "get $sentinel_key")"
           printf '%s\n' "$read_output" | grep -Fqx -- "$expected"
           docker compose -f containers/compose.yaml exec -T firecrawl-api \
             node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
@@ -860,7 +912,7 @@ jobs:
           data = json.load(open(sys.argv[1], encoding="utf-8"))
           if set(data) != {"schema_version", "channel", "source_commit", "generated_at", "protocol_version", "database_schema_version", "manager", "compose", "images"}:
               raise SystemExit("release manifest top-level shape mismatch")
-          if data["schema_version"] != 1 or data["channel"] != "main":
+          if data["schema_version"] != 1 or data["channel"] != "main" or data["protocol_version"] != 1:
               raise SystemExit("release manifest channel/schema mismatch")
           digest = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
           for name, image in data["images"].items():

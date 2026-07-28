@@ -49,11 +49,6 @@ services:
       UBITECH_DEPLOYMENT_MODE: container
       ENTERPRISE_PUBLIC_BASE_URL: ${UBITECH_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
       ENTERPRISE_TRUSTED_PROXY: "1"
-      ENTERPRISE_MANAGE_AGENT_RUNTIME: "0"
-      ENTERPRISE_MANAGE_CAMOFOX: "0"
-      ENTERPRISE_MANAGE_FIRECRAWL: "0"
-      ENTERPRISE_MANAGE_SEARXNG: "0"
-      ENTERPRISE_MANAGE_COGNEE: "0"
       ENTERPRISE_AGENT_RUNTIME_URL: http://agent-runtime:8766
       ENTERPRISE_CAMOFOX_URL: http://camofox:9377
       ENTERPRISE_SEARXNG_API_URL: http://searxng:8080
@@ -103,15 +98,11 @@ services:
       AGENT_PLATFORM_INTERNAL_TOKEN_FILE: /run/secrets/ubitech/agent-tool-token
       AGENT_MANAGER_EXECUTOR_SOCKET: /run/ubitech-manager/manager.sock
       AGENT_MANAGER_EXECUTOR_TOKEN_FILE: /run/secrets/manager-executor-token
-      CAMOFOX_URL: http://camofox:9377
-      CAMOFOX_API_KEY_FILE: /run/secrets/ubitech/camofox-access-key
-      FIRECRAWL_API_URL: http://firecrawl-api:3002
     volumes:
       - ${UBITECH_DATA_ROOT}/data/runtimes/agent:/var/lib/ubitech-agent/runtime
       - ${UBITECH_SECRETS_DIR}/agent-runtime-token:/run/secrets/ubitech/agent-runtime-token:ro
       - ${UBITECH_SECRETS_DIR}/agent-tool-token:/run/secrets/ubitech/agent-tool-token:ro
       - ${UBITECH_SECRETS_DIR}/manager-executor-token:/run/secrets/manager-executor-token:ro
-      - ${UBITECH_SECRETS_DIR}/camofox-access-key:/run/secrets/ubitech/camofox-access-key:ro
       - ${UBITECH_MANAGER_CONTROL_DIR}:/run/ubitech-manager:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
@@ -248,7 +239,7 @@ services:
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/data:/var/fdb/data
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
     healthcheck:
-      test: [CMD-SHELL, 'status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null) && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null']
+      test: [CMD-SHELL, 'status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>&1); rc=$$?; if test "$$rc" -eq 0 && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null 2>&1; then exit 0; fi; printf "FoundationDB status probe failed (exit %s):\n" "$$rc" >&2; printf "%s\n" "$$status" | head -c 8192 >&2; exit 1']
       interval: 10s
       timeout: 5s
       retries: 18
@@ -267,7 +258,7 @@ services:
         condition: service_started
     entrypoint: [/bin/bash, -eu, -o, pipefail, -c]
     command:
-      - 'last=""; for attempt in $$(seq 1 30); do if last=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then exit 0; fi; if status=$$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null) && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null; then exit 0; fi; sleep 2; done; printf "%s\n" "$$last" >&2; exit 1'
+      - 'last_configure="configure was not attempted"; last_configure_rc=125; last_status="status probe was not attempted"; last_status_rc=125; for attempt in $$(seq 1 20); do if last_configure=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then last_configure_rc=0; else last_configure_rc=$$?; fi; if last_status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>&1); then last_status_rc=0; if test -n "$$last_status" && printf "%s\n" "$$last_status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null 2>&1; then exit 0; fi; else last_status_rc=$$?; fi; sleep 2; done; printf "FoundationDB configure result (exit %s):\n%s\nFoundationDB status probe failed (exit %s):\n" "$$last_configure_rc" "$${last_configure:0:8192}" "$$last_status_rc" >&2; printf "%s\n" "$${last_status:0:8192}" >&2; exit 1'
     volumes:
       - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
 

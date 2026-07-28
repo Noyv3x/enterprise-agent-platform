@@ -1,12 +1,10 @@
-/* useTypingNotifier — the React port of legacy notifyTyping/sendTypingState
-   (legacy-app.js:3037-3063). Channel-only; no-op in private mode.
+/* useTypingNotifier sends channel typing state and is a no-op in private mode.
 
    typingState lives in a ref (mutable, not render state). The 1800ms throttle
    and 3500ms auto-stop windows are preserved verbatim; the POST /typing errors
    are swallowed. Returns notify(isTyping) which the composer fires on input,
    on submit, on emptying, and on compositionend. On unmount the stop timer is
-   cleared and the active flag reset (matching legacy stopPolling, which does NOT
-   send a final typing:false). */
+   cleared and the active flag reset without sending a final typing:false. */
 
 import { useCallback, useEffect, useRef } from "react";
 import { api } from "../lib/api";

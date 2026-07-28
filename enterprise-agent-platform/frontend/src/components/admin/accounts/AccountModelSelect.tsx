@@ -1,11 +1,10 @@
 /* <AccountModelSelect/> — per-account model dropdown driven by the active Agent
    runtime provider's catalog and a help line.
 
-   The legacy <select>'s effective value is COERCED to "" when the saved model
-   isn't in the current catalog, and the submit reads that coerced DOM value. The
-   legacy code re-derives this from the ORIGINAL user.model_name on every full
-   teardown, so a late catalog load recovers the selection. To match that exactly
-   (instead of mutating parent state, which a load race could clobber), we mirror
+   The effective value is coerced to "" when the saved model is not in the current
+   catalog, and submit reads that coerced value. It is re-derived from the original
+   user.model_name so a late catalog load recovers the selection. Instead of
+   mutating parent state, which a load race could clobber, we mirror
    the coerced value into `coercedRef` each render; the owning form submits
    `coercedRef.current`. The visible <select> is controlled by the coerced value
    so it always shows the correct option. */
@@ -81,7 +80,7 @@ export function AccountModelSelect({ id, value, onChange, coercedRef }: AccountM
 
   // Mirror the effective (coerced) value for the submit path. Re-derived from the
   // ORIGINAL `value` against the CURRENT catalog every render, so a late catalog
-  // load recovers the selection (matching the legacy per-teardown recompute);
+  // load recovers the selection;
   // the form reads coercedRef.current on submit (always after this effect flushes).
   useEffect(() => {
     if (coercedRef) coercedRef.current = selectValue;

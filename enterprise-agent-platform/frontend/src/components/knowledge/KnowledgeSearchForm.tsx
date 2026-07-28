@@ -1,8 +1,8 @@
-/* <KnowledgeSearchForm/> — the .search-field form (legacy-app.js:1293-1313).
-   The input is controlled by local state kept SEPARATE from the committed
+/* <KnowledgeSearchForm/> — the knowledge search form. The input is controlled
+   by local state kept separate from the committed
    knowledgeSearch.query. The committed query only changes when a request
    resolves (or on clear/reset), never during the in-flight render, which
-   eliminates the legacy value-flash quirk (spec §7) while a clear/post-create
+   prevents value flashes while a clear/post-create
    reset still empties the input via the sync effect below. */
 
 import { Button, Form, Input, Tooltip } from "antd";

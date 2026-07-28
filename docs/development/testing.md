@@ -10,7 +10,7 @@
 ./scripts/test.sh
 ```
 
-该命令先校验文档与生成契约，再运行 Manager、Python、Agent Runtime 和前端测试与构建。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。`./deploy.sh test` 在桥接版本中可以转发到该命令，但迁移后不再是运行管理入口。
+该命令先校验文档与生成契约，再运行 Manager、Python、Agent Runtime 和前端测试与构建。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。仓库不提供第二个顶层测试入口。
 
 ## Manager 与容器
 
@@ -25,7 +25,7 @@ cd ..
 
 顶层测试脚本执行 Compose 静态校验时必须自行注入不可变的占位镜像引用和临时挂载路径，并忽略开发机的 `.env`；校验不能依赖生产部署变量，也不能连接或修改正在运行的容器。
 
-Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。Firecrawl 发布验证必须实际启动 FoundationDB、初始化任务和 API，确认挂载后的镜像入口存在、初始化不会与配置后健康检查形成依赖环、FoundationDB 健康、初始化任务成功退出且 API 健康；随后必须先写入发布测试专用数据哨兵，保留同一 FoundationDB bind 数据、强制重建并再次运行 FDB/init/API，确认容器 id 已变化、哨兵值仍可精确读回，且 `Database already exists!` 场景以 init 退出 0、API 健康收敛。只执行 Compose `create`、只测试空数据首次启动、仅复用目录却不读回数据，或只检查镜像可拉取都不能证明 entrypoint、启动顺序、幂等初始化与 bind mount 契约兼容。
+Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。容器 smoke test 必须验证安装脚本可通过 stdin 配合显式 `--yes` 运行，并注入 preflight 失败确认本次创建的数据根、配置、二进制和 unit 均被清理、同一路径可重试。容器 smoke test 还必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。Firecrawl 发布验证必须使用与 Manager 相同的 `docker compose up --detach --wait --wait-timeout 600 firecrawl-api` 启动 FoundationDB、初始化任务和 API，确认挂载后的镜像入口存在、初始化不会与配置后健康检查形成依赖环、FoundationDB 健康、初始化任务成功退出且 API 健康；随后必须先写入发布测试专用数据哨兵，保留同一 FoundationDB bind 数据、强制重建并再次运行 FDB/init/API，确认容器 id 已变化、哨兵值仍可精确读回，且 `Database already exists!` 场景以 init 退出 0、API 健康收敛。发布测试还必须注入失败的 init，确认修复不重启健康 FoundationDB，再以同一生产等待命令恢复。只执行 Compose `create`、只测试空数据首次启动、仅复用目录却不读回数据，或只检查镜像可拉取都不能证明 entrypoint、启动顺序、幂等初始化、预算与 bind mount 契约兼容。
 
 ## Python 平台
 
@@ -90,7 +90,7 @@ npm run build
 - owner/scope/provider/browser identity 参数注入；
 - 超大 body、附件、工具输出或搜索响应；
 - 未审批工具、伪造 approval id、无人值守授权绕过；
-- dirty tree、非 fast-forward 和 rollback 覆盖竞态。
+- operation 幂等键、expected generation 和 rollback 覆盖竞态。
 
 ## 部署与冒烟
 
@@ -102,6 +102,8 @@ npm run build
 - 登录、普通 API、SSE 与附件；
 - 固定服务与 Agent Sandbox 启停不会遗留错误容器；
 - 更新期间维护页阻断，完成后恢复。
+
+容器构建上下文只能包含源码和明确的受管资产，必须排除本地 `build/`、`dist/`、`*.egg-info`、虚拟环境、缓存和测试产物，防止开发机旧工件被复制进生产镜像。发布测试必须检查构建上下文排除契约。
 
 发布冒烟会故意把 Agent Sandbox 挂载根映射为与 CI runner 不同的 UID/GID。测试退出路径必须先尝试停止并移除相关容器，再以 runner 的受控提权只清理 `RUNNER_TEMP` 下由 `mktemp` 创建且带固定产品前缀的单一临时树；不能用普通 runner 身份递归删除已重映射的目录，也不能对未经前缀约束的路径执行提权删除。受控临时树清理失败仍应让发布失败，避免把残留数据掩盖为成功。
 

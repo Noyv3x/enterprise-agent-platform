@@ -1,5 +1,5 @@
-/* <ChannelList/> — the sidebar channel buttons + empty hint (legacy channelButtons,
-   legacy-app.js:449-461). Clicking a channel switches to channel view, selects it,
+/* <ChannelList/> — the sidebar channel buttons and empty hint. Clicking a channel
+   switches to channel view, selects it,
    closes the drawer, and loads its messages via selectChannel. */
 
 import { Menu, type MenuProps } from "antd";

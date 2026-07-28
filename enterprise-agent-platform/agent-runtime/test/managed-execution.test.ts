@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { loadConfig } from "../src/config.js";
+import { ManagerExecutorClient } from "../src/executor.js";
 import { RunCoordinator, RunValidationError } from "../src/run-coordinator.js";
 import { createTools, managedExecutionBinding } from "../src/tools.js";
 import type { JsonObject, RunRequest } from "../src/types.js";
@@ -62,6 +63,36 @@ test("managed execution audit bindings exactly match Manager call projections", 
       managedExecutionBinding(toolName, { target: "sandbox", ...arguments_ }, workspace),
       { operation: toolName, action, arguments: arguments_ },
     );
+  }
+});
+
+test("Manager process snapshots preserve orphaned as an active, unconfirmed state", async () => {
+  const home = await temporaryDirectory("managed-orphaned-");
+  const socketPath = join(home, "manager.sock");
+  const manager = new FakeManager(socketPath);
+  manager.orphanTerminal = true;
+  await manager.listen();
+  try {
+    const client = new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 5_000);
+    const result = await client.terminal({
+      run_id: "run-orphaned",
+      scope_id: "private:42",
+      lifecycle_id: "life-42",
+      tool_call_id: "tool-orphaned",
+      execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
+      receipt: {
+        audit_id: "audit-orphaned",
+        executor_id: "executor-orphaned",
+        target: "sandbox",
+      },
+    }, { command: "sleep 60", cwd: "/workspace", background: false });
+
+    assert.equal(result.result.status, "orphaned");
+    assert.equal(result.result.background, true);
+    assert.equal(result.result.stop_confirmed, false);
+  } finally {
+    await manager.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -146,18 +177,15 @@ test("managed execution defaults to sandbox, audits before start, skips approval
     assert.equal(manager.requests.filter((request) => request.path === "/v1/executor/process").length, 1);
 
     const preview = await coordinator.previewProcesses("private:42", "life-42");
-    assert.equal(preview.revision, "preview-test:1");
+    assert.equal(preview.revision, "preview_manager_abcdef0123456789abcdef0123456789:1");
     assert.equal(preview.processes[0]?.title, "Terminal 1");
     assert.match(preview.processes[0]?.command || "", /\[redacted\]/);
     assert.match(preview.processes[0]?.output || "", /\[redacted\]/);
     assert.doesNotMatch(JSON.stringify(preview), /preview-secret/);
+    assert.equal(preview.processes[0]?.status, "orphaned");
+    assert.equal(preview.processes[0]?.running, true);
     assert.deepEqual(await coordinator.previewProcessSummary("private:42", "life-42"), {
-      running_terminal_count: 0,
-    });
-    assert.deepEqual(await coordinator.updateBlockerSummary(), {
-      running_background_terminal_count: 0,
-      update_blocking_terminal_count: 0,
-      terminable_background_terminal_count: 0,
+      running_terminal_count: 1,
     });
     assert.equal(await coordinator.cleanupScope("private:42", "life-42"), 0);
     assert.equal(
@@ -290,6 +318,7 @@ interface CapturedRequest {
 
 class FakeManager {
   readonly requests: CapturedRequest[] = [];
+  orphanTerminal = false;
   private readonly server = createServer((request, response) => void this.route(request, response));
 
   constructor(
@@ -335,6 +364,7 @@ class FakeManager {
       }
       if (path === "/v1/executor/terminal") {
         const arguments_ = body.arguments as JsonObject;
+        const now = new Date().toISOString();
         send(response, 200, {
           result: {
             id: `process-${this.requests.length}`,
@@ -343,13 +373,13 @@ class FakeManager {
             lifecycle_id: body.lifecycle_id,
             command: arguments_.command,
             cwd: arguments_.cwd,
-            status: "completed",
-            exit_code: 0,
+            status: this.orphanTerminal ? "orphaned" : "completed",
+            ...(this.orphanTerminal ? { stop_confirmed: false } : { exit_code: 0 }),
             stdout: `${String(arguments_.command)}\n`,
             stderr: "",
-            started_at: new Date().toISOString(),
-            finished_at: new Date().toISOString(),
-            background: false,
+            started_at: now,
+            finished_at: now,
+            background: this.orphanTerminal,
           },
         });
         return;
@@ -379,26 +409,18 @@ class FakeManager {
             command: "curl -H 'Authorization: Bearer preview-secret' https://example.test",
             cwd: "/workspace",
             output: "Authorization: Bearer preview-secret",
-            status: "running",
+            status: "orphaned",
             running: true,
             started_at: now,
             updated_at: now,
             truncated: false,
           }],
-          revision: "preview-test:1",
+          revision: "preview_manager_abcdef0123456789abcdef0123456789:1",
         });
         return;
       }
       if (path === "/v1/executor/scopes/process-summary") {
-        send(response, 200, { running_terminal_count: 0 });
-        return;
-      }
-      if (path === "/v1/executor/processes/update-blockers") {
-        send(response, 200, {
-          running_background_terminal_count: 0,
-          update_blocking_terminal_count: 0,
-          terminable_background_terminal_count: 0,
-        });
+        send(response, 200, { running_terminal_count: 1 });
         return;
       }
       send(response, 404, { error: "unsupported test endpoint" });

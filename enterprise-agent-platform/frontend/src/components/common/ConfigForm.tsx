@@ -1,11 +1,8 @@
-/* <ConfigForm/> — the generic descriptor-driven config editor, ported from
-   legacy renderConfigFieldsForm + groupedConfigFields + renderConfigField +
-   collectConfigUpdates (legacy-app.js:2541-2641). Used by managed service
-   configuration pages.
+/* <ConfigForm/> — the generic descriptor-driven config editor used by managed
+   service configuration pages.
 
    The form is uncontrolled (each field carries a data-initial attribute);
-   on submit we collect a CHANGED-ONLY diff via the DOM, preserving the legacy
-   skip rules verbatim:
+   on submit we collect a changed-only diff via the DOM with these skip rules:
      - skip if the value equals its data-initial,
      - skip empty password fields (keep existing secret),
      - for env attrs, skip empty values entirely,
@@ -102,7 +99,7 @@ export function ConfigForm({
     >
       <div className="config-groups">
         {groups.map((group, index) => (
-          // First two groups default open, mirroring the legacy `open: index < 2`.
+          // The first two groups default open.
           <details className="config-group" key={group.name} open={index < 2}>
             <summary>
               <span>{group.labelKey ? t(group.labelKey) : group.name || t("admin.config.group.configuration")}</span>

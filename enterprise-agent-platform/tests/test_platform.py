@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import http.client
 import hashlib
-import hmac
 import json
 import os
 import shutil
@@ -26,8 +25,6 @@ from enterprise_agent_platform.agent_runtime_client import (
     AgentRuntimeHTTPError,
     AgentRuntimeRunError,
 )
-from enterprise_agent_platform.auto_update import AutoUpdateManager
-from enterprise_agent_platform.update_state import clear_state
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.runtimes import (
@@ -100,8 +97,35 @@ class RecordingAgent:
             },
         }
 
+    def close(self):
+        return None
 
-class NeedsReviewAgent:
+    def cleanup_scope(self, _scope_key, *, lifecycle_id=None, delete_sessions=False):
+        return {"ok": True}
+
+    def terminal_previews(self, _scope_key, _lifecycle_id, *, since_revision=None):
+        return {"processes": [], "revision": "empty:0"}
+
+    def terminal_preview_summary(self, _scope_key, _lifecycle_id):
+        return {"running_terminal_count": 0}
+
+    def respond_approval(self, *, run_id, choice, approval_id=None):
+        return {
+            "run_id": run_id,
+            "choice": choice,
+            "approval_id": approval_id,
+            "resolved": 1,
+        }
+
+    def steer_run(self, **kwargs):
+        return {
+            "run_id": kwargs["run_id"],
+            "message_id": kwargs["message_id"],
+            "state": "accepted",
+        }
+
+
+class NeedsReviewAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
 
@@ -132,7 +156,7 @@ class ApprovalRecordingAgent(RecordingAgent):
         return {**payload, "resolved": 1}
 
 
-class UsageReportingAgent:
+class UsageReportingAgent(RecordingAgent):
     def __init__(self, usages):
         self.usages = list(usages)
         self.calls = []
@@ -166,7 +190,7 @@ class ContextUsageAgent(RecordingAgent):
         )
 
 
-class RotatingSessionAgent:
+class RotatingSessionAgent(RecordingAgent):
     def __init__(self, first_returned_session_id: str):
         self.first_returned_session_id = first_returned_session_id
         self.calls = []
@@ -181,7 +205,7 @@ class RotatingSessionAgent:
         )
 
 
-class MediaReturningAgent:
+class MediaReturningAgent(RecordingAgent):
     def __init__(self, media_path: Path):
         self.media_path = media_path
         self.calls = []
@@ -195,7 +219,7 @@ class MediaReturningAgent:
         )
 
 
-class BlockingAgent:
+class BlockingAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.started = threading.Event()
@@ -213,8 +237,11 @@ class BlockingAgent:
             raw={"ok": True},
         )
 
+    def steer_run(self, **_kwargs):
+        raise AgentRuntimeHTTPError(409, "run does not accept additional input")
 
-class SteeringBlockingAgent:
+
+class SteeringBlockingAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.steers = []
@@ -279,7 +306,7 @@ class OrderedSteeringAgent(SteeringBlockingAgent):
         return super().steer_run(**kwargs)
 
 
-class TerminalRacingRejectAgent:
+class TerminalRacingRejectAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.started = threading.Event()
@@ -314,7 +341,7 @@ class TerminalRacingRejectAgent:
         raise AgentRuntimeHTTPError(409, "run already completed")
 
 
-class RegistrationFailureAgent:
+class RegistrationFailureAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.steers = []
@@ -353,7 +380,7 @@ class RegistrationFailureAgent:
         }
 
 
-class ProgressAgent:
+class ProgressAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
 
@@ -428,7 +455,7 @@ class FakeTelegramBot:
         raise KeyError(file_path)
 
 
-class StreamingAgent:
+class StreamingAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.first_delta = threading.Event()
@@ -449,7 +476,7 @@ class StreamingAgent:
         )
 
 
-class TurnAwareStreamingAgent:
+class TurnAwareStreamingAgent(RecordingAgent):
     def __init__(self):
         self.new_turn_delta = threading.Event()
         self.release = threading.Event()
@@ -469,7 +496,7 @@ class TurnAwareStreamingAgent:
         )
 
 
-class ToolBoundaryStreamingAgent:
+class ToolBoundaryStreamingAgent(RecordingAgent):
     def __init__(self):
         self.calls = []
         self.first_delta = threading.Event()
@@ -503,58 +530,6 @@ class ToolBoundaryStreamingAgent:
             session_id=kwargs["session_id"],
             raw={"ok": True},
         )
-
-
-class FakeProcess:
-    pid = 43210
-
-    def __init__(self):
-        self.running = True
-
-    def poll(self):
-        return None if self.running else 0
-
-    def terminate(self):
-        self.running = False
-
-    def wait(self, timeout=None):
-        self.running = False
-        return 0
-
-    def kill(self):
-        self.running = False
-
-
-class RecordingLauncher:
-    def __init__(self):
-        self.calls = []
-        self.processes = []
-
-    def start(self, cmd, *, cwd, env, log_path):
-        process = FakeProcess()
-        self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path})
-        self.processes.append(process)
-        return process
-
-
-class RecordingCommandRunner:
-    def __init__(self):
-        self.calls = []
-
-    def run(self, cmd, *, cwd, env, log_path, timeout):
-        self.calls.append({"cmd": cmd, "cwd": cwd, "env": env, "log_path": log_path, "timeout": timeout})
-        if len(cmd) >= 4 and cmd[1:3] == ["-m", "venv"]:
-            venv_dir = Path(cmd[3])
-            python = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
-            python.parent.mkdir(parents=True, exist_ok=True)
-            python.write_text("", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0)
-
-
-
-
-
-
 
 
 class FakeOAuthHTTPClient:
@@ -619,253 +594,57 @@ def make_config(tmp: Path) -> PlatformConfig:
         knowledge_backend="local",
         cognee_dataset="enterprise_knowledge",
         cognee_ingest_background=True,
-        cognee_repo=tmp / "cognee",
-        manage_searxng=False,
-        firecrawl_repo=tmp / "firecrawl",
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
         runtime_startup_wait_seconds=0,
-        manage_agent_runtime=False,
         agent_runtime_url="http://127.0.0.1:8766",
         agent_runtime_token="runtime-token",
-        agent_runtime_home=tmp / "runtimes" / "agent",
         agent_runtime_model="gpt-5.5",
         agent_runtime_provider="openai-codex",
         agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
 
-
-
-
-def make_fake_cognee_repo(path: Path) -> None:
-    (path / "cognee").mkdir(parents=True, exist_ok=True)
-    (path / "cognee" / "__init__.py").write_text(
-        "class SearchType:\n    CHUNKS = 'chunks'\n",
-        encoding="utf-8",
-    )
-
-
-def make_fake_firecrawl_repo(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "docker-compose.yaml").write_text("services:\n  api:\n    image: firecrawl\n", encoding="utf-8")
-
-
-def git_run(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-
-def git_commit_all(cwd: Path, message: str) -> None:
-    git_run(cwd, "add", ".")
-    subprocess.run(
-        ["git", "-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "-m", message],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-
-class FakeAutoUpdateConfig:
-    def __init__(self, *, enabled=True, interval=30, remote="origin", branch="main"):
-        self.enabled = enabled
-        self.interval = interval
-        self.remote = remote
-        self.branch = branch
-
-    def auto_update_enabled(self):
-        return self.enabled
-
-    def auto_update_interval_seconds(self):
-        return self.interval
-
-    def auto_update_remote(self):
-        return self.remote
-
-    def auto_update_branch(self):
-        return self.branch
-
-
-class FakeAutoUpdater:
-    def __init__(self):
-        self.triggers = []
-
-    def status(self):
-        return {"trigger_count": len(self.triggers)}
-
-    def trigger(self, reason):
-        self.triggers.append(reason)
-        return self.status()
-
-    def stop(self):
-        pass
-
-
-class AutoUpdateLaunchTests(unittest.TestCase):
-    @staticmethod
-    def _manager(root: Path, runner) -> AutoUpdateManager:
-        deploy = root / "deploy.sh"
-        deploy.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        deploy.chmod(0o755)
-        service = FakeAutoUpdateConfig()
-        service.config = SimpleNamespace(
-            data_dir=root / "custom-state",
-            host="0.0.0.0",
-            port=9123,
-        )
-        return AutoUpdateManager(service, repo_root=root, runner=runner)
-
-    def test_systemd_handoff_uses_independent_unit_and_propagates_deployment_context(self):
-        calls = []
-
-        def runner(command, **kwargs):
-            calls.append(command)
-            return subprocess.CompletedProcess(command, 0)
-
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = self._manager(root, runner)
-            with mock.patch(
-                "enterprise_agent_platform.auto_update.shutil.which",
-                side_effect=lambda name: f"/usr/bin/{name}",
-            ), mock.patch.dict(
-                os.environ,
-                {"ENTERPRISE_SERVICE_NAME": "ubitech-custom.service", "INVOCATION_ID": "invocation"},
-                clear=False,
-            ):
-                command = manager._launch_update_command("poll")
-
-            self.assertEqual(command[0:3], ["systemd-run", "--user", "--collect"])
-            self.assertIn("--setenv=ENTERPRISE_PLATFORM_DATA=" + str(root / "custom-state"), command)
-            self.assertIn("--setenv=ENTERPRISE_SERVICE_NAME=ubitech-custom.service", command)
-            self.assertIn("--setenv=ENTERPRISE_PLATFORM_HOST=0.0.0.0", command)
-            self.assertIn("--setenv=ENTERPRISE_PLATFORM_PORT=9123", command)
-            self.assertIn(
-                f"--setenv=ENTERPRISE_AUTO_UPDATE_SOURCE_PID={os.getpid()}",
-                command,
-            )
-            self.assertIn(
-                "--setenv=ENTERPRISE_AUTO_UPDATE_SOURCE_MODE=service",
-                command,
-            )
-            self.assertEqual(command[-10:], [
-                str(root / "deploy.sh"),
-                "update",
-                "--data",
-                str(root / "custom-state"),
-                "--service-name",
-                "ubitech-custom.service",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "9123",
-            ])
-            self.assertTrue(any(call[:3] == ["systemctl", "--user", "show-environment"] for call in calls))
-
-    def test_systemd_handoff_failure_never_falls_back_to_service_cgroup_child(self):
-        def runner(command, **kwargs):
-            if command[0] == "systemd-run":
-                return subprocess.CompletedProcess(command, 1, stderr="transient launch failed")
-            return subprocess.CompletedProcess(command, 0)
-
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = self._manager(root, runner)
-            with mock.patch(
-                "enterprise_agent_platform.auto_update.shutil.which",
-                side_effect=lambda name: f"/usr/bin/{name}",
-            ), mock.patch.dict(os.environ, {"INVOCATION_ID": "invocation"}, clear=False), mock.patch(
-                "enterprise_agent_platform.auto_update.subprocess.Popen"
-            ) as popen:
-                with self.assertRaisesRegex(RuntimeError, "independent systemd unit"):
-                    manager._launch_update_command("webhook")
-            popen.assert_not_called()
-
-    def test_systemd_handoff_requires_transient_unit_tools(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = self._manager(root, lambda command, **kwargs: subprocess.CompletedProcess(command, 1))
-            with mock.patch(
-                "enterprise_agent_platform.auto_update.shutil.which",
-                return_value=None,
-            ), mock.patch.dict(os.environ, {"JOURNAL_STREAM": "8:123"}, clear=False), mock.patch(
-                "enterprise_agent_platform.auto_update.subprocess.Popen"
-            ) as popen:
-                with self.assertRaisesRegex(RuntimeError, "transient unit is unavailable"):
-                    manager._launch_update_command("poll")
-            popen.assert_not_called()
-
-    def test_standalone_handoff_may_use_detached_child_with_custom_data_log(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = self._manager(root, lambda command, **kwargs: subprocess.CompletedProcess(command, 1))
-            clean_env = {
-                key: value
-                for key, value in os.environ.items()
-                if key not in {"INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "ENTERPRISE_SERVICE_NAME"}
-            }
-            with mock.patch(
-                "enterprise_agent_platform.auto_update.shutil.which",
-                return_value=None,
-            ), mock.patch.dict(os.environ, clean_env, clear=True), mock.patch(
-                "enterprise_agent_platform.auto_update.subprocess.Popen"
-            ) as popen:
-                command = manager._launch_update_command("manual")
-
-            self.assertEqual(command[:2], [str(root / "deploy.sh"), "update"])
-            popen.assert_called_once()
-            child_env = popen.call_args.kwargs["env"]
-            self.assertEqual(
-                child_env["ENTERPRISE_AUTO_UPDATE_SOURCE_PID"],
-                str(os.getpid()),
-            )
-            self.assertEqual(
-                child_env["ENTERPRISE_AUTO_UPDATE_SOURCE_MODE"],
-                "foreground",
-            )
-            self.assertTrue((root / "custom-state" / "logs" / "auto-update.log").exists())
-
-
-
-
 class PlatformServiceTests(unittest.TestCase):
-    def test_container_takeover_preserves_sessions_and_synchronizes_internal_tokens(self):
+    def test_container_restart_preserves_sessions_and_synchronizes_internal_tokens(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            source = EnterpriseService(make_config(root), agent_client=RecordingAgent())
-            old_token, _ = source.authenticate("admin", "admin")
-            source.set_setting("agent_tool_token", "legacy-tool-token", secret=True)
-            source.set_setting("agent_runtime_token", "legacy-runtime-token", secret=True)
-            source.close()
-
-            container_config = replace(
+            manager = SimpleNamespace(
+                status=lambda: {
+                    "maintenance": False,
+                    "active_operation_id": "",
+                    "finalize_pending_operation_id": "",
+                    "operation_id": "",
+                }
+            )
+            initial_config = replace(
                 make_config(root),
-                deployment_mode="container",
+                manager_socket=root / "manager.sock",
+                manager_token_file=root / "manager-token",
+            )
+            initial = EnterpriseService(
+                initial_config,
+                agent_client=RecordingAgent(),
+                manager_client=manager,
+            )
+            previous_token, _ = initial.authenticate("admin", "admin")
+            initial.set_setting("agent_tool_token", "previous-tool-token", secret=True)
+            initial.set_setting("agent_runtime_token", "previous-runtime-token", secret=True)
+            initial.close()
+
+            restarted_config = replace(
+                initial_config,
                 token_secret="new-manager-session-secret",
                 agent_tool_token="new-manager-tool-token",
                 agent_runtime_token="new-manager-runtime-token",
             )
             service = EnterpriseService(
-                container_config,
+                restarted_config,
                 agent_client=RecordingAgent(),
-                autostart_runtime=False,
-                manager_client=SimpleNamespace(
-                    status=lambda: {
-                        "maintenance": False,
-                        "active_operation_id": "",
-                        "finalize_pending_operation_id": "",
-                        "operation_id": "",
-                    }
-                ),
+                manager_client=manager,
             )
             try:
-                self.assertIsNotNone(service.user_from_token(old_token))
+                self.assertIsNotNone(service.user_from_token(previous_token))
                 self.assertEqual(
                     service.get_secret("agent_tool_token"),
                     "new-manager-tool-token",
@@ -893,51 +672,6 @@ class PlatformServiceTests(unittest.TestCase):
             code,
             {"id": telegram_id, "username": username, "first_name": username},
         )
-
-    def test_auto_update_manager_detects_remote_commit_and_skips_dirty_tree(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            remote = root / "remote.git"
-            downstream = root / "downstream"
-            upstream = root / "upstream"
-            git_run(root, "init", "--bare", str(remote))
-            downstream.mkdir()
-            git_run(downstream, "init")
-            git_run(downstream, "checkout", "-b", "main")
-            (downstream / "README.md").write_text("initial\n", encoding="utf-8")
-            deploy = downstream / "deploy.sh"
-            deploy.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            deploy.chmod(0o755)
-            git_commit_all(downstream, "initial")
-            git_run(downstream, "remote", "add", "origin", str(remote))
-            git_run(downstream, "push", "-u", "origin", "main")
-
-            git_run(root, "clone", str(remote), str(upstream))
-            git_run(upstream, "checkout", "main")
-            (upstream / "README.md").write_text("updated\n", encoding="utf-8")
-            git_commit_all(upstream, "updated")
-            git_run(upstream, "push", "origin", "main")
-
-            launched = []
-            manager = AutoUpdateManager(
-                FakeAutoUpdateConfig(branch="main"),
-                repo_root=downstream,
-                launcher=lambda reason: launched.append(reason) or [str(deploy), "update"],
-            )
-            status = manager.check_once("webhook")
-            self.assertTrue(status["update_available"])
-            self.assertTrue(status["update_started"])
-            self.assertEqual(launched, ["webhook"])
-            self.assertEqual(status["branch"], "main")
-            # A successful deploy/rollback owns the durable maintenance marker;
-            # emulate that handoff completion before checking the next poll.
-            clear_state(manager._data_dir, update_id=status["update_id"])
-
-            (downstream / "local-change.txt").write_text("dirty\n", encoding="utf-8")
-            dirty = manager.check_once("poll")
-            self.assertTrue(dirty["dirty"])
-            self.assertFalse(dirty["update_started"])
-            self.assertEqual(launched, ["webhook"])
 
     def test_context_usage_is_saved_for_channel_and_private_agent_replies(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1120,6 +854,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["state"], "approval")
                 self.assertEqual(status["approval"]["run_id"], "run_42")
                 self.assertEqual(status["approval"]["command"], "rm -rf build")
+
+                with self.assertRaises(ServiceError) as alias_error:
+                    service.respond_agent_approval(admin, "channel", "1", "approve")
+                self.assertEqual(alias_error.exception.status, 400)
 
                 result = service.respond_agent_approval(admin, "channel", "1", "session")
 
@@ -1596,47 +1334,6 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 
-    def test_existing_admin_rows_migrate_to_admin_permission_group(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            conn = sqlite3.connect(tmp / "platform.db")
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT NOT NULL UNIQUE,
-                        display_name TEXT NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        role TEXT NOT NULL DEFAULT 'member',
-                        active INTEGER NOT NULL DEFAULT 1,
-                        created_at INTEGER NOT NULL,
-                        last_login_at INTEGER
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO users(username, display_name, password_hash, role, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    ("admin", "Administrator", "legacy", "admin", 1),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-            try:
-                user = service.get_user(1)
-                self.assertEqual(user["role"], "admin")
-                self.assertEqual(user["permission_group"], "admin")
-                self.assertIn("system_settings", user["permissions"])
-            finally:
-                service.close()
-
-
-
-
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
             agent = ProgressAgent()
@@ -1689,10 +1386,9 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertIn("使用 search 操作检索", agent.calls[-1]["system_prompt"])
             self.assertIn("使用 read 操作读取完整条目", agent.calls[-1]["system_prompt"])
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
-            workspace = Path(agent.calls[-1]["metadata"]["workspace"]["path"])
-            self.assertTrue(workspace.is_dir())
+            workspace = agent.calls[-1]["metadata"]["workspace"]
+            self.assertEqual(workspace["path"], "/workspace")
             self.assertEqual(agent.calls[-1]["metadata"]["workspace"]["scope"], "channel")
-            self.assertEqual(workspace.name, "channel-1")
             work = agent_message["metadata"]["agent_work"]
             self.assertEqual(work["state"], "complete")
             self.assertEqual(work["run_id"], f"channel:1:{result['user_message']['id']}")
@@ -2711,7 +2407,7 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_private_agent_creates_local_workspace_and_independent_session(self):
+    def test_private_agent_uses_sandbox_workspace_and_independent_session(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
@@ -2723,10 +2419,14 @@ class PlatformServiceTests(unittest.TestCase):
 
             status = service.private_status(user)
             execution = status["execution"]
-            self.assertEqual(execution["backend"], "host")
-            self.assertEqual(execution["isolation"], "logical")
+            self.assertEqual(execution["backend"], "sandbox")
+            self.assertEqual(execution["isolation"], "container-workspace")
             self.assertEqual(execution["scope_key"], "private:1")
-            self.assertTrue(Path(execution["workspace_path"]).exists())
+            self.assertEqual(execution["workspace_path"], "/workspace")
+            self.assertEqual(execution["workspace_id"], "user-1")
+            self.assertTrue(
+                Path(service.agent_scopes.get_scope("private:1").workspace_path).is_dir()
+            )
             self.assertNotIn("container", status)
             self.assertEqual(agent.calls[-1]["session_id"], "ubitech-private-u1")
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
@@ -4235,95 +3935,6 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 
-    def test_platform_manages_browser_and_firecrawl_process_lifecycle(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            make_fake_firecrawl_repo(tmp / "firecrawl")
-            config = replace(
-                make_config(tmp),
-                manage_agent_runtime=False,
-                manage_searxng=True,
-                runtime_startup_wait_seconds=0,
-                camofox_command="managed-camofox-test",
-            )
-            launcher = RecordingLauncher()
-            runner = RecordingCommandRunner()
-            service = EnterpriseService(config, runtime_process_launcher=launcher, runtime_command_runner=runner)
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                status = service.runtime_status(admin)
-                self.assertEqual(status["camofox"]["state"], "starting")
-                self.assertEqual(status["searxng"]["state"], "starting")
-                self.assertEqual(status["firecrawl"]["state"], "starting")
-                commands = [call["cmd"] for call in launcher.calls]
-                self.assertTrue(any(cmd == ["managed-camofox-test"] for cmd in commands))
-                self.assertTrue(any(cmd[:2] == ["docker", "compose"] and "up" in cmd for cmd in commands))
-                searxng_launch = next(
-                    call
-                    for call in launcher.calls
-                    if call["cmd"][:2] == ["docker", "compose"]
-                    and "ubitech-searxng-" in " ".join(call["cmd"])
-                )
-                firecrawl_launch = next(
-                    call
-                    for call in launcher.calls
-                    if call["cmd"][:2] == ["docker", "compose"]
-                    and "docker-compose.yaml" in call["cmd"]
-                )
-                override_path = config.firecrawl_runtime_dir / "docker-compose.ubitech.yaml"
-                self.assertIn(
-                    str(
-                        config.runtime_dir
-                        / "searxng"
-                        / "docker-compose.ubitech.yaml"
-                    ),
-                    searxng_launch["cmd"],
-                )
-                self.assertIn("docker-compose.yaml", firecrawl_launch["cmd"])
-                self.assertIn(str(override_path), firecrawl_launch["cmd"])
-                self.assertIn("--no-build", firecrawl_launch["cmd"])
-                self.assertIn("--pull", firecrawl_launch["cmd"])
-                self.assertIn("missing", firecrawl_launch["cmd"])
-                self.assertEqual(firecrawl_launch["env"]["DOCKER_BUILDKIT"], "1")
-                self.assertEqual(firecrawl_launch["env"]["COMPOSE_DOCKER_CLI_BUILD"], "1")
-                self.assertEqual(firecrawl_launch["env"]["PORT"], "127.0.0.1:13002")
-                override_text = override_path.read_text(encoding="utf-8")
-                self.assertIn("ghcr.io/firecrawl/firecrawl@sha256:", override_text)
-                self.assertIn("ghcr.io/firecrawl/playwright-service@sha256:", override_text)
-                self.assertIn("ghcr.io/firecrawl/nuq-postgres@sha256:", override_text)
-                self.assertNotIn(":latest", override_text)
-
-                service.restart_runtime(admin, "camofox")
-                service.restart_runtime(admin, "searxng")
-                service.restart_runtime(admin, "firecrawl")
-                self.assertGreaterEqual(len([call for call in launcher.calls if call["cmd"] == ["managed-camofox-test"]]), 2)
-                self.assertGreaterEqual(
-                    len(
-                        [
-                            call
-                            for call in launcher.calls
-                            if "ubitech-searxng-" in " ".join(call["cmd"])
-                            and "up" in call["cmd"]
-                        ]
-                    ),
-                    2,
-                )
-                self.assertGreaterEqual(
-                    len(
-                        [
-                            call
-                            for call in launcher.calls
-                            if "docker-compose.yaml" in call["cmd"]
-                            and "up" in call["cmd"]
-                        ]
-                    ),
-                    2,
-                )
-            finally:
-                service.close()
-
-            self.assertTrue(all(not process.running for process in launcher.processes))
-
     def test_runtime_service_reads_cached_health_without_blocking_probes(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -4397,40 +4008,15 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_searxng_runtime_actions_route_to_dedicated_lifecycle(self):
+    def test_platform_service_has_no_fixed_runtime_lifecycle_api(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
             )
-            runtime = SimpleNamespace(
-                to_dict=lambda: {
-                    "name": "searxng",
-                    "state": "running",
-                    "available": True,
-                }
-            )
             try:
-                _, admin = service.authenticate("admin", "admin")
-                with (
-                    mock.patch.object(
-                        service.runtimes,
-                        "restart_searxng",
-                        return_value=runtime,
-                    ) as restart,
-                    mock.patch.object(
-                        service.runtimes,
-                        "ensure_searxng_ready",
-                        return_value=runtime,
-                    ) as ensure,
-                ):
-                    restarted = service.restart_runtime(admin, "searxng")
-                    installed = service.install_runtime(admin, "searxng")
-
-                restart.assert_called_once_with()
-                ensure.assert_called_once_with(wait=True)
-                self.assertEqual(restarted["runtime"]["name"], "searxng")
-                self.assertEqual(installed["runtime"]["state"], "running")
+                self.assertFalse(hasattr(service, "restart_runtime"))
+                self.assertFalse(hasattr(service, "install_runtime"))
             finally:
                 service.close()
 
@@ -4438,7 +4024,6 @@ class PlatformServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
                 make_config(Path(td)),
-                autostart_runtime=False,
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -4462,7 +4047,6 @@ class PlatformServiceTests(unittest.TestCase):
     def test_cognee_internal_config_exposes_and_updates_managed_env(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_cognee_repo(tmp / "cognee")
             service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -4524,7 +4108,7 @@ class PlatformServiceTests(unittest.TestCase):
                 updated = service.update_agent_runtime_config(
                     admin,
                     {
-                        "provider": "grok-oauth",
+                        "provider": "xai-oauth",
                         "model": "grok-4.3",
                         "idle_timeout_seconds": 321,
                         "max_concurrency": 4,
@@ -4538,6 +4122,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(updated["max_concurrency"], 4)
                 self.assertEqual(updated["compaction_threshold"], 0.75)
                 self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
+
+                with self.assertRaises(ServiceError) as alias_error:
+                    service.update_agent_runtime_config(admin, {"provider": "grok-oauth"})
+                self.assertEqual(alias_error.exception.status, 400)
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
                 self.assertEqual(
                     service.get_setting(AGENT_SETTING_IDLE_TIMEOUT), "321.0"
@@ -4734,7 +4322,7 @@ class PlatformServiceTests(unittest.TestCase):
                         if item["id"] == "openai-codex"
                     )["configured"]
                 )
-                self.assertFalse((service.config.managed_agent_runtime_home / "auth.json").exists())
+                self.assertFalse((service.config.agent_runtime_data_dir / "auth.json").exists())
             finally:
                 service.close()
 
@@ -4770,7 +4358,7 @@ class PlatformServiceTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
 
-                started = service.start_oauth_verification(admin, "grok-oauth")
+                started = service.start_oauth_verification(admin, "xai-oauth")
                 flow = started["flow"]
                 self.assertEqual(flow["kind"], "manual_callback")
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(flow["authorize_url"]).query)
@@ -4800,12 +4388,10 @@ class PlatformServiceTests(unittest.TestCase):
             source = EnterpriseService(
                 make_config(source_dir),
                 agent_client=RecordingAgent(),
-                runtime_command_runner=RecordingCommandRunner(),
             )
             target = EnterpriseService(
                 make_config(target_dir),
                 agent_client=RecordingAgent(),
-                runtime_command_runner=RecordingCommandRunner(),
             )
             try:
                 _, source_admin = source.authenticate("admin", "admin")
@@ -4814,7 +4400,7 @@ class PlatformServiceTests(unittest.TestCase):
                 source.set_secret(source_admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
                 source.set_secret(source_admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
                 source.set_secret(source_admin, "GROK_OAUTH_ID_TOKEN", "grok-id")
-                source.update_agent_runtime_config(source_admin, {"provider": "grok-oauth"})
+                source.update_agent_runtime_config(source_admin, {"provider": "xai-oauth"})
 
                 exported = source.export_oauth_credentials(source_admin)
                 self.assertEqual(exported["kind"], "ubitech-agent.oauth-credentials")
@@ -5112,7 +4698,7 @@ class PlatformServiceTests(unittest.TestCase):
                 recovered.close()
 
     def test_startup_restores_failed_agent_error_message_after_transient_write_failure(self):
-        class FailingAgent:
+        class FailingAgent(RecordingAgent):
             def generate(self, **kwargs):
                 raise RuntimeError("provider unavailable")
 
@@ -5922,10 +5508,9 @@ class PlatformServiceTests(unittest.TestCase):
                 "https://internal.example/reset?token=signed-value&password=temporary"
             )
 
-    def test_managed_cognee_environment_is_seeded_from_platform(self):
+    def test_cognee_environment_is_seeded_from_platform_image_config(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            make_fake_cognee_repo(tmp / "cognee")
             old_env = {key: os.environ.get(key) for key in ("DATA_ROOT_DIRECTORY", "SYSTEM_ROOT_DIRECTORY", "CACHE_ROOT_DIRECTORY", "COGNEE_LOGS_DIR", "LLM_API_KEY")}
             for key in old_env:
                 os.environ.pop(key, None)
@@ -6047,59 +5632,6 @@ class PlatformHTTPTests(unittest.TestCase):
                 server.server_close()
                 service.close()
                 thread.join(timeout=2)
-
-    def test_auto_update_webhook_requires_secret_and_accepts_github_hmac(self):
-        with tempfile.TemporaryDirectory() as td:
-            config = make_config(Path(td))
-            service = EnterpriseService(config, agent_client=RecordingAgent())
-            fake_updater = FakeAutoUpdater()
-            # Source-mode services may own a migration listener even when
-            # periodic updates are disabled. Stop that owned worker before
-            # replacing the manager with this HTTP-only test double; otherwise
-            # close() cannot discover the original listener and it can wake up
-            # later against the test's already-closed SQLite connection.
-            owned_updater = service._auto_updater
-            owned_updater.stop()
-            service._auto_updater = fake_updater
-            secret = "auto-update-secret-value"
-            service.set_setting("auto_update_enabled", "1")
-            service.set_setting("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", secret, secret=True)
-            server, thread = serve_in_thread(config, service)
-            host, port = server.server_address
-            try:
-                body = json.dumps({"ref": "refs/heads/main"}).encode("utf-8")
-                conn = http.client.HTTPConnection(host, port, timeout=5)
-                conn.request(
-                    "POST",
-                    "/api/auto-update/webhook/wrong",
-                    body=body,
-                    headers={"Content-Type": "application/json"},
-                )
-                res = conn.getresponse()
-                denied = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(res.status, 403)
-                self.assertEqual(denied["error"], "invalid auto update webhook secret")
-
-                signature = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-                conn.request(
-                    "POST",
-                    "/api/auto-update/webhook/wrong",
-                    body=body,
-                    headers={"Content-Type": "application/json", "X-Hub-Signature-256": signature},
-                )
-                res = conn.getresponse()
-                accepted = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(res.status, 202)
-                self.assertTrue(accepted["accepted"])
-                self.assertEqual(fake_updater.triggers, ["webhook"])
-            finally:
-                server.shutdown()
-                server.server_close()
-                service._auto_updater = owned_updater
-                service.close()
-                thread.join(timeout=2)
-            worker = owned_updater.worker_thread()
-            self.assertFalse(worker is not None and worker.is_alive())
 
     def test_token_usage_api_is_admin_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -6676,7 +6208,6 @@ class PlatformHTTPTests(unittest.TestCase):
                 agent_config = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
                 self.assertIn("config", agent_config)
-                self.assertIn("runtime_home", agent_config["config"])
                 self.assertEqual(agent_config["config"]["provider"], "openai-codex")
 
                 conn.request("GET", "/api/permission-groups", headers={"Cookie": cookie})

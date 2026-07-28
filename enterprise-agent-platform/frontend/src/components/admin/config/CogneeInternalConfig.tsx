@@ -1,5 +1,4 @@
-/* <CogneeInternalConfig/> — edit Cognee .env via the shared descriptor field form
-   (legacy renderCogneeInternalConfig, legacy-app.js:2514-2533). On save the diff
+/* <CogneeInternalConfig/> — edit Cognee .env via the shared descriptor field form. On save the diff
    PUTs { env } then reloads BOTH cognee config and runtime (env changes can
    affect Cognee health). The <ConfigForm> is keyed by a descriptor signature so a
    post-save refetch remounts it with fresh data-initial values. */

@@ -157,6 +157,7 @@ describe("terminal preview transport", () => {
         cwd: "/workspace",
         command: "npm test",
         output: "ok\n",
+        status: "orphaned",
         running: true,
       }],
     }), {
@@ -176,7 +177,7 @@ describe("terminal preview transport", () => {
       etag: '"term-2"',
       revision: "preview_epoch:8",
       capturedAt: "1784060400000",
-      processes: [{ id: "term-1", title: "Build", output: "ok\n", running: true }],
+      processes: [{ id: "term-1", title: "Build", output: "ok\n", status: "orphaned", running: true }],
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/agent-previews/terminals?scope_type=private&scope_id=7&since_revision=preview_epoch%3A7",
@@ -187,25 +188,35 @@ describe("terminal preview transport", () => {
   it("returns unchanged for terminal 304 responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 304 })));
     await expect(
-      fetchTerminalPreviews(scope, '"term-2"', 8, new AbortController().signal),
+      fetchTerminalPreviews(
+        scope,
+        '"term-2"',
+        "preview_epoch:8",
+        new AbortController().signal,
+      ),
     ).resolves.toEqual({ kind: "unchanged" });
   });
 
   it("returns a revision-only unchanged response without replacing processes", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       processes: [],
-      revision: 8,
+      revision: "preview_epoch:8",
       unchanged: true,
     }), {
       status: 200,
       headers: { "Content-Type": "application/json", ETag: '"term-unchanged"' },
     })));
     await expect(
-      fetchTerminalPreviews(scope, '"term-2"', 8, new AbortController().signal),
+      fetchTerminalPreviews(
+        scope,
+        '"term-2"',
+        "preview_epoch:8",
+        new AbortController().signal,
+      ),
     ).resolves.toEqual({
       kind: "unchanged",
       etag: '"term-unchanged"',
-      revision: 8,
+      revision: "preview_epoch:8",
     });
   });
 });

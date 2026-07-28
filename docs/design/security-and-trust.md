@@ -54,15 +54,15 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 Manager control socket、配置、release manifest、operation journal 和 registry 凭据必须 owner-only。所有 install/update/restart/rollback/repair operation 带 idempotency key、期望 generation 和持久阶段；Manager 先核对 key 对应的不可变请求指纹，再判断 generation，使丢失响应后的原样重放只能观察原 operation，不能启动第二个变更或用同 key 替换请求。control 服务端先完整编码再提交成功状态，mutation 只返回有界确认；客户端把空、截断、超限或非法的 2xx 响应视为结果不确定并以原幂等身份对账，不能伪造成功或当作确定失败。外部错误正文属于不可信诊断数据：写入 state、operation 或 activation journal 前必须限制大小，重试只替换“最近一次失败”片段而不能递归拼接上一份完整错误；control API 也只返回有界诊断投影，不能让历史错误耗尽本地控制通道预算。候选 Platform readiness 失败时，Manager 在删除容器前先读取 healthcheck 再读取有界日志；两类内容必须先替换精确 Manager capability 和通用凭据模式、再截断并写入 operation，采集失败本身只能成为有界诊断，不能阻止回滚。
 
-发布清单锁定源 commit、数据库版本、管理器校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；旧 Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
+发布清单锁定 source commit、数据库版本、Manager 校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；current Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
 
-源码首迁必须区分 `source_marker` 与 `manager` 预约所有者，marker 同步不得释放 Manager 预约。Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 id 确认 reserve 后才可执行破坏性操作；响应不确定时只有 release 明确成功才可回到非维护状态。Manager owner 释放时如果 source marker 已阻断，Platform 先重新建立 marker owner 再决定是否唤醒 worker。bridge worker 中断后的恢复先持有真实 repository flock，再核对 marker update id、完整桥接资产和 exact source revision；协调器启动不以当下能否取锁为条件，恢复入口不执行 fetch、merge、bootstrap 或 Git rollback。queued/failed handoff 冻结 checkout，普通 `begin --takeover` 也不能覆盖。Manager 暂不可达时源码只允许只读状态回退，管理写操作继续 fail closed。
+Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 operation id 确认 reserve 后才可执行破坏性操作。响应不确定时只有明确 release 才能回到非维护状态；Manager 不可达或预约身份不一致时所有管理写操作 fail closed。Platform 启动任何有副作用 worker 前必须恢复同一持久预约状态。
 
-快照恢复、新 generation readiness 和管理器重启验证完成前不能删除旧源码或数据。首次迁移未知 ignored 文件随完整 checkout 进入常规至少保留七天的 recovery pack；版本化退役活动只能在持久 intent 之后提前删除已经重新校验的旧恢复包，并且只能处理迁移清单与固定 allowlist 共同确认的路径，不能跟随符号链接或跨越配置根。同名 Docker resource 还必须同时匹配 Compose project/resource label 且没有 attachment；禁止全局 prune。Manager `/v1/status` 中的 generation 只返回 id、源提交、数据库版本、镜像与激活时间，不投影 manifest 或回滚快照的宿主路径。其中的迁移状态只投影经限长验证的活动 id、generation、阶段、完成位、固定运维错误摘要与时间，不返回旧源码、数据、unit、归档、manifest 或快照的宿主绝对路径。
+快照完整验证、候选 generation readiness、Manager watchdog 提交和 reservation release 完成前不能开放业务。Docker 资源清理只能处理同时匹配 Manager ownership label、Compose project/resource label 且无 attachment 的对象，禁止全局 prune。Manager `/v1/status` 的 generation 只返回 id、source commit、数据库版本、镜像与激活时间，不投影 manifest、快照或其它宿主绝对路径。
 
 ## 文件与附件
 
-数据根、workspace、Runtime 根和 Agent env 必须由部署用户拥有、不是符号链接，并收紧权限。workspace 路径的每个组成部分都要重新检查符号链接。数据库保存相对 workspace 标识，不能把旧宿主绝对路径带入容器。
+数据根、workspace、Runtime 根和 Agent env 必须由部署用户拥有、不是符号链接，并收紧权限。workspace 路径的每个组成部分都要重新检查符号链接。数据库只保存相对 workspace 标识，不能写入宿主绝对路径。
 
 上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载 `/workspace/.ubitech/attachments` 访问。Platform 不得把自己的数据路径写进 prompt 或 Run，Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
@@ -80,7 +80,7 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 需要进入长期指令上下文的记忆、Skill 主指令和计划 prompt 在写入与加载/执行两个边界经过共享高置信威胁扫描。扫描有输入上限和有界模式，覆盖 NFKC 兼容字符、不可见/双向 Unicode、明确的指令覆盖、角色劫持、系统提示泄露和凭据外传；它是纵深防护，不能宣称识别所有注入。
 
-旧 session 中未带当前安全版本的 web、browser、memory、knowledge、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；旧 assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
+持久 session 中未带当前安全 envelope 的 web、browser、memory、knowledge、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
 
 ## 安全变更要求
 

@@ -1,13 +1,10 @@
-/* =====================================================================
-   OAuth-specific pure helpers — ported from legacy-app.js:2740-2746,
-   2803-2806, 1787-1790.
-   ===================================================================== */
+/* OAuth-specific pure helpers. */
 
 import { t } from "../i18n";
 import type { OAuthProvider } from "../types";
 
 /** Secrets whose key contains "_OAUTH_" are managed by the OAuth card, not the
- *  manual secrets list (legacy-app.js:2803). */
+ *  manual secrets list. */
 export function isOAuthSecret(key: string): boolean {
   return key.includes("_OAUTH_");
 }
@@ -32,8 +29,7 @@ export function oauthProviderErrorText(provider: OAuthProvider | null | undefine
   return authError.relogin_required ? t("oauth.reloginRequired", { message }) : message;
 }
 
-/** Label for a provider id, resolved against the loaded providers list
- *  (legacy-app.js:1787 read from global state; here the list is passed in). */
+/** Label for a provider id, resolved against the loaded providers list. */
 export function oauthProviderLabel(
   providerId: string,
   providers: OAuthProvider[] | null | undefined,

@@ -5,7 +5,6 @@ import type {
   ProcessPreviewResult,
   ProcessPreviewSummary,
   ProcessSnapshot,
-  UpdateBlockerSummary,
 } from "./process-registry.js";
 import type {
   ExecutionContext,
@@ -16,6 +15,7 @@ import type {
 import { abortError, errorMessage, safeEqual } from "./utils.js";
 
 const MAX_MANAGER_RESPONSE_BYTES = 2 * 1024 * 1024;
+const PROCESS_PREVIEW_REVISION = /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/;
 
 export interface ExecutionIdentity {
   run_id: string;
@@ -91,7 +91,6 @@ export interface ExecutionManager {
     sinceRevision?: string,
   ): Promise<ProcessPreviewResult>;
   previewSummary(identity: Required<ScopeExecutionIdentity>): Promise<ProcessPreviewSummary>;
-  updateBlockerSummary(): Promise<UpdateBlockerSummary>;
 }
 
 export class ManagerExecutorClient implements ExecutionManager {
@@ -189,7 +188,11 @@ export class ManagerExecutorClient implements ExecutionManager {
       ...identity,
       ...(sinceRevision === undefined ? {} : { since_revision: sinceRevision }),
     }));
-    if (!Array.isArray(response.processes) || typeof response.revision !== "string") {
+    if (
+      !Array.isArray(response.processes)
+      || typeof response.revision !== "string"
+      || !PROCESS_PREVIEW_REVISION.test(response.revision)
+    ) {
       throw new Error("Manager executor returned an invalid process preview");
     }
     const processes = response.processes.map((value, index) => processPreview(value, index));
@@ -203,24 +206,6 @@ export class ManagerExecutorClient implements ExecutionManager {
   async previewSummary(identity: Required<ScopeExecutionIdentity>): Promise<ProcessPreviewSummary> {
     const response = objectValue(await this.post("/v1/executor/scopes/process-summary", identity));
     return { running_terminal_count: boundedCount(response.running_terminal_count, "running_terminal_count") };
-  }
-
-  async updateBlockerSummary(): Promise<UpdateBlockerSummary> {
-    const response = objectValue(await this.post("/v1/executor/processes/update-blockers", {}));
-    return {
-      running_background_terminal_count: boundedCount(
-        response.running_background_terminal_count,
-        "running_background_terminal_count",
-      ),
-      update_blocking_terminal_count: boundedCount(
-        response.update_blocking_terminal_count,
-        "update_blocking_terminal_count",
-      ),
-      terminable_background_terminal_count: boundedCount(
-        response.terminable_background_terminal_count,
-        "terminable_background_terminal_count",
-      ),
-    };
   }
 
   private async post(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -339,13 +324,35 @@ function processSnapshot(value: unknown): ProcessSnapshot {
   if (typeof snapshot.background !== "boolean") {
     throw new Error("Manager executor process result is missing background");
   }
-  if (!["running", "completed", "failed", "cancelled"].includes(String(snapshot.status))) {
+  if (!["running", "completed", "failed", "cancelled", "orphaned"].includes(String(snapshot.status))) {
     throw new Error("Manager executor process result has an invalid status");
   }
-  return {
-    ...(snapshot as unknown as ProcessSnapshot),
+  if (
+    snapshot.status === "orphaned"
+    && (snapshot.background !== true || snapshot.stop_confirmed !== false)
+  ) {
+    throw new Error("Manager orphaned process result must remain active and unconfirmed");
+  }
+  const result: ProcessSnapshot = {
+    id: String(snapshot.id),
+    run_id: String(snapshot.run_id),
+    scope_key: String(snapshot.scope_key),
+    lifecycle_id: String(snapshot.lifecycle_id),
     command: redactCommandForApproval(String(snapshot.command)),
+    cwd: String(snapshot.cwd),
+    status: snapshot.status as ProcessSnapshot["status"],
+    stdout: String(snapshot.stdout),
+    stderr: String(snapshot.stderr),
+    started_at: String(snapshot.started_at),
+    background: snapshot.background,
   };
+  if (Number.isSafeInteger(snapshot.pid) && Number(snapshot.pid) > 0) result.pid = Number(snapshot.pid);
+  if (snapshot.exit_code === null || Number.isSafeInteger(snapshot.exit_code)) {
+    result.exit_code = snapshot.exit_code as number | null;
+  }
+  if (typeof snapshot.finished_at === "string") result.finished_at = snapshot.finished_at;
+  if (typeof snapshot.stop_confirmed === "boolean") result.stop_confirmed = snapshot.stop_confirmed;
+  return result;
 }
 
 function processPreview(value: unknown, index: number): import("./process-registry.js").ProcessPreview {
@@ -358,8 +365,11 @@ function processPreview(value: unknown, index: number): import("./process-regist
   if (typeof preview.running !== "boolean" || typeof preview.truncated !== "boolean") {
     throw new Error("Manager executor returned an invalid process preview state");
   }
-  if (!["running", "completed", "failed", "cancelled"].includes(String(preview.status))) {
+  if (!["running", "completed", "failed", "cancelled", "orphaned"].includes(String(preview.status))) {
     throw new Error("Manager executor process preview has an invalid status");
+  }
+  if (preview.status === "orphaned" && preview.running !== true) {
+    throw new Error("Manager orphaned process preview must remain active");
   }
   const result: import("./process-registry.js").ProcessPreview = {
     id: String(preview.id),

@@ -1,8 +1,7 @@
-/* useAutoGrow — the React port of legacy autoGrow (legacy-app.js:1183-1199).
-   A useLayoutEffect keyed on the textarea value resizes the element to its
-   content, capped at 200px, toggles the .is-scrollable class past the cap, and
+/* useAutoGrow resizes the textarea to its content in a layout effect keyed on
+   its value, capped at 200px. It toggles the .is-scrollable class past the cap and
    uses the previous-height reflow trick so the height change animates. The
-   first run (mount) does not animate (matches afterRender's {animate:false}). */
+   first run on mount does not animate. */
 
 import { useLayoutEffect, useRef, type RefObject } from "react";
 

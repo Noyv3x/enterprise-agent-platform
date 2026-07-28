@@ -1,5 +1,4 @@
-/* <CreateAccountForm/> — new-account form (legacy createForm in
-   renderAccountManagement, legacy-app.js:1427-1471). POST /api/users with the
+/* <CreateAccountForm/> — new-account form. POST /api/users with the
    exact JSON body; on success resets fields to defaults (member / medium / empty),
    reloads users, toasts. */
 

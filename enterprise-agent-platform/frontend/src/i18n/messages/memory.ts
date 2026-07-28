@@ -108,9 +108,9 @@ export const memoryMessages = defineMessages({
     "zh-TW": "已停止召回",
   },
   "memory.blockedMessage": {
-    "zh-CN": "这条旧记忆触发了安全检查，Agent 不会在对话中读取它。你可以编辑后重新保存，或直接删除。",
-    en: "This legacy memory failed a safety check, so the Agent will not read it in conversations. Edit and save it again, or delete it.",
-    "zh-TW": "這則舊記憶觸發了安全檢查，Agent 不會在對話中讀取它。你可以編輯後重新儲存，或直接刪除。",
+    "zh-CN": "这条记忆触发了安全检查，Agent 不会在对话中读取它。你可以编辑后重新保存，或直接删除。",
+    en: "This memory failed a safety check, so the Agent will not read it in conversations. Edit and save it again, or delete it.",
+    "zh-TW": "這則記憶觸發了安全檢查，Agent 不會在對話中讀取它。你可以編輯後重新儲存，或直接刪除。",
   },
   "memory.clearTarget.agent": { "zh-CN": "清空 Agent 记忆", en: "Clear Agent memory", "zh-TW": "清空 Agent 記憶" },
   "memory.clearTarget.user": { "zh-CN": "清空我的资料", en: "Clear About me", "zh-TW": "清空我的資料" },

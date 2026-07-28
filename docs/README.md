@@ -35,4 +35,3 @@
 
 - [架构决策记录](decisions/README.md)
 - [文档作为设计真相源](decisions/0001-documentation-is-design-source.md)
-- [安全审计（2026-07-13）](audits/security-2026-07-13.md)

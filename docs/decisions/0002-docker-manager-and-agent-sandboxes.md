@@ -5,7 +5,7 @@
 
 ## 背景
 
-旧部署直接运行 Git checkout，并由产品进程执行 fast-forward、venv/Node 构建、Gateway reload 和 rollback。数据默认位于源码目录，外部集成又混合宿主进程与 Compose，使部署机工作树、更新状态和运行状态互相耦合。
+产品需要把发布身份、更新状态、业务数据与开发工作树完全分离，并为应用容器之外的生命周期管理提供稳定控制平面。
 
 成员彼此可信，但 Agent 需要各自可安装环境的工作空间；少数任务又确实需要访问 U 盘等宿主资源。
 
@@ -19,8 +19,8 @@
 
 ## 后果
 
-- 部署机不再需要产品源码、Git 工作树、Python venv 或 Node build；
-- 更新由镜像 digest 和数据库快照回滚，不再由 Git reset 回滚；
+- 部署机不需要产品源码、Git 工作树、Python venv 或 Node build；
+- 更新只按镜像 digest 和数据库 generation 快照回滚；
 - 工作区、HOME 和环境目录成为显式 bind mount，可独立备份；
 - Docker socket 只暴露给管理器；
 - 宿主执行带来等同部署用户（包括免密 sudo）的风险，审计不能替代权限隔离；

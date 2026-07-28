@@ -27,7 +27,7 @@ rather than manufacturing a low-value test.
 ## Preserve existing work
 
 Do not delete an existing implementation merely to recreate a textbook RED
-state. In legacy or partially implemented code:
+state. In existing or partially implemented code:
 
 - add a characterization test for behavior that must remain;
 - add a focused regression test for the missing or incorrect behavior;

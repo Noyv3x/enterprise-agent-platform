@@ -1,7 +1,5 @@
-/* Pure selectors over AppState — ported from the legacy scope/permission/topbar
-   helpers (legacy-app.js:349-357, 561-571, 1363-1365, 2783-2873). The exact
-   String() id coercion is preserved (channel/private scope keys are coupled to
-   it). No store reads here — callers pass AppState in. */
+/* Pure selectors over AppState. Channel/private scope keys depend on the exact
+   String() id coercion. No store reads here — callers pass AppState in. */
 
 import { ADMIN_PAGES } from "../lib/constants";
 import { t as defaultTranslate, type Translator } from "../i18n";

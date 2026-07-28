@@ -9,7 +9,6 @@ COPY enterprise-agent-platform/frontend/package.json enterprise-agent-platform/f
 RUN --mount=type=cache,target=/root/.npm \
     cd frontend && npm ci
 COPY enterprise-agent-platform/frontend ./frontend
-COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform
 RUN cd frontend && npm run build
 
 FROM python:3.11-slim-bookworm AS python-build
@@ -32,7 +31,8 @@ RUN git init /tmp/cognee \
     && python -m pip install /tmp/cognee \
     && rm -rf /tmp/cognee
 WORKDIR /build/enterprise-agent-platform
-COPY enterprise-agent-platform .
+COPY enterprise-agent-platform/pyproject.toml enterprise-agent-platform/README.md ./
+COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform
 COPY --from=frontend-build /build/enterprise-agent-platform/enterprise_agent_platform/static ./enterprise_agent_platform/static
 RUN python -m pip install . \
     && python -m compileall -q "$VIRTUAL_ENV/lib/python3.11/site-packages/enterprise_agent_platform"
@@ -51,11 +51,6 @@ ENV PATH="/opt/venv/bin:$PATH" \
     ENTERPRISE_PLATFORM_DATA=/var/lib/ubitech-agent \
     ENTERPRISE_PLATFORM_HOST=0.0.0.0 \
     ENTERPRISE_PLATFORM_PORT=8765 \
-    ENTERPRISE_MANAGE_AGENT_RUNTIME=0 \
-    ENTERPRISE_MANAGE_CAMOFOX=0 \
-    ENTERPRISE_MANAGE_FIRECRAWL=0 \
-    ENTERPRISE_MANAGE_SEARXNG=0 \
-    ENTERPRISE_MANAGE_COGNEE=0 \
     ENTERPRISE_AGENT_RUNTIME_URL=http://agent-runtime:8766 \
     ENTERPRISE_CAMOFOX_URL=http://camofox:9377 \
     ENTERPRISE_SEARXNG_API_URL=http://searxng:8080 \

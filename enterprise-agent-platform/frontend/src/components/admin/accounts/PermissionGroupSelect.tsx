@@ -1,5 +1,4 @@
-/* <PermissionGroupSelect/> — controlled permission-group dropdown (legacy
-   permissionGroupSelect, legacy-app.js:1545-1550). Value is driven by props, not
+/* <PermissionGroupSelect/> — controlled permission-group dropdown. Value is driven by props, not
    set on the DOM after build. */
 
 import type { PermissionGroup } from "../../../types";

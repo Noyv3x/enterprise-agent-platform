@@ -1,5 +1,4 @@
-/* <AdminPanel/> — the top-level admin view (legacy renderAdminPanel,
-   legacy-app.js:1342-1361). Permission-gated (isAdmin), then pager + active page
+/* <AdminPanel/> — the top-level admin view. Permission-gated by isAdmin, then pager + active page
    header + content. ContentRouter renders this at the admin placeholder. */
 
 import { useEffect, useState } from "react";

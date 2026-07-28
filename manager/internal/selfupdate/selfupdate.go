@@ -170,9 +170,9 @@ func (m *Manager) MarkPlatformCommitted(manifest release.Manifest) error {
 }
 
 // Activate atomically switches the stable ExecStart path only after the
-// Platform generation has committed. A watchdog running from the immutable old
+// Platform generation has committed. A watchdog running from the immutable active
 // binary lives in a separate transient user-systemd unit, so it survives the
-// Manager service restart and restores the old binary if the candidate never
+// Manager service restart and restores the previous binary if the candidate never
 // acknowledges startup and passes the control-socket health check.
 func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error {
 	state, err := m.load()
@@ -265,7 +265,7 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 		return errors.New("manager activation plan does not match running binary")
 	}
 	if hash != state.Activation.CandidateSHA {
-		// Crash before the stable binary replacement: the old Manager is still
+		// Crash before the stable binary replacement: the active Manager is still
 		// authoritative, so abort the durable intent and leave the verified
 		// candidate available for a later retry.
 		if state.Current != nil && hash == state.Current.SHA256 && binaryMatches(plan.InstallPath, hash) {
@@ -426,9 +426,9 @@ func (m *Manager) PendingActivation() (bool, error) {
 	return err == nil && state.Activation != nil, err
 }
 
-// ActivationCommitted is the destructive-cleanup barrier. An activation
+// ActivationCommitted is the generation-finalization barrier. An activation
 // intent, an acknowledged process, or a replaced stable path is insufficient:
-// only the independent old-binary watchdog can promote Candidate to Current
+// only the independent active-binary watchdog can promote Candidate to Current
 // after repeated health checks.
 func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 	state, err := m.load()

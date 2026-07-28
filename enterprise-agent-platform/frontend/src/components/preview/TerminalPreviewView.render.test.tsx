@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
     error: "",
     capturedAt: "",
     checkedAt: null,
-    revision: 2,
+    revision: "preview_render:2",
     processes: [
       {
         id: "terminal-build",
@@ -24,12 +24,14 @@ const mocks = vi.hoisted(() => ({
         command: "npm run build",
         cwd: "/workspace",
         output: "building\ndone",
+        status: "running" as const,
         running: true,
       },
       {
         id: "terminal-tests",
         title: "Tests",
         output: "250 tests passed",
+        status: "orphaned" as const,
         running: true,
         truncated: true,
       },
@@ -66,11 +68,13 @@ describe("TerminalPreviewView rendering", () => {
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("building");
     expect(screen.getByText("Read only")).toBeVisible();
 
-    await user.click(screen.getByRole("tab", { name: "Tests" }));
+    await user.click(screen.getByRole("tab", { name: /Tests/ }));
 
-    expect(screen.getByRole("tab", { name: "Tests" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Tests/ })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("250 tests passed");
     expect(screen.getByText("Showing latest output only")).toBeVisible();
+    expect(screen.getByText("Needs attention · still active")).toBeVisible();
+    expect(screen.getByText(/has not confirmed that this process stopped/)).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Refresh now" }));
     expect(mocks.refresh).toHaveBeenCalledTimes(1);

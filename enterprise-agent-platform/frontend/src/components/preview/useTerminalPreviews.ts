@@ -12,7 +12,7 @@ export interface TerminalPreviewsState {
   error: string;
   capturedAt: string;
   checkedAt: number | null;
-  revision: number | string | null;
+  revision: string | null;
 }
 
 const initialState: TerminalPreviewsState = {
@@ -43,7 +43,7 @@ export function useTerminalPreviews(scope: AgentPreviewScope | null) {
     let stopped = false;
     let inFlight = false;
     let etag = "";
-    let revision: number | string | undefined;
+    let revision: string | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let controller: AbortController | null = null;
 
@@ -80,8 +80,6 @@ export function useTerminalPreviews(scope: AgentPreviewScope | null) {
             revision: revision ?? current.revision,
           }));
         } else {
-          // A legacy platform returns a full snapshot without revision.
-          // Clearing the cursor keeps subsequent polls on its ETag-only path.
           revision = result.revision;
           setState({
             connection: "connected",

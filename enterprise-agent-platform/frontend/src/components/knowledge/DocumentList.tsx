@@ -1,8 +1,6 @@
-/* <DocumentList/> — the .list of doc cards, or an empty/loading state
-   (legacy listSource/emptyCard, legacy-app.js:1254-1258, 1320). The list source
+/* <DocumentList/> — the list of document cards, or an empty/loading state. The list source
    is search results when searching, else the full library. A loading state is
-   shown only for the initial library load (the legacy "知识库为空" flash that
-   §7 flags as a migration opportunity); search keeps the prior list visible. */
+   shown only for the initial library load; search keeps the prior list visible. */
 
 import { List, Spin } from "antd";
 import type { ReactNode } from "react";

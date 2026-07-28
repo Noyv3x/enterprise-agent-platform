@@ -17,6 +17,7 @@ for path in \
   containers/agent-sandbox-entrypoint.sh \
   containers/compose.yaml \
   containers/compose.dev.yaml \
+  containers/compose.firecrawl-init-failure.yaml \
   containers/release-manifest.schema.json \
   install.sh; do
   [[ -s "$path" ]] || fail "$path is missing or empty"
@@ -24,18 +25,149 @@ done
 
 bash -n install.sh
 for expected in \
-  'Description=Retry ubitech agent source-to-container migration' \
-  'OnBootSec=2min' \
-  'OnUnitInactiveSec=2min' \
-  'Persistent=true' \
-  'Unit=ubitech-agent-migrate.service' \
-  'chmod 0600 "$retry_service_incoming"' \
-  'mv -f "$retry_service_incoming" "$retry_service"' \
-  'chmod 0600 "$retry_timer_incoming"' \
-  'mv -f "$retry_timer_incoming" "$retry_timer"' \
-  'systemctl --user enable --now ubitech-agent-migrate.timer'; do
-  grep -Fq "$expected" install.sh || fail "migration retry unit is missing: $expected"
+  'This installer supports fresh container installations only.' \
+  'docker compose version' \
+  'read -r answer </dev/tty' \
+  'systemctl --user enable --now ubitech-agent-manager.service' \
+  '"$stable_manager" preflight --config "$config_path"' \
+  'if ((status != 0 && manager_activated == 0)); then' \
+  'rm -rf --one-file-system -- "$data_root/manager"' \
+  '"$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"'; do
+  grep -Fq "$expected" install.sh || fail "fresh container installer contract is missing: $expected"
 done
+grep -Fq 'bash -s -- --yes' README.md \
+  || fail "README fresh-install command does not pass explicit non-interactive consent"
+for excluded in \
+  'enterprise-agent-platform/build/' \
+  'enterprise-agent-platform/dist/' \
+  'enterprise-agent-platform/*.egg-info/' \
+  'enterprise-agent-platform/**/__pycache__/' \
+  'enterprise-agent-platform/**/*.pyc' \
+  'enterprise-agent-platform/.venv/'; do
+  grep -Fxq "$excluded" containers/platform.Dockerfile.dockerignore \
+    || fail "Platform image context can include local build residue: $excluded"
+done
+if grep -Fxq 'COPY enterprise-agent-platform .' containers/platform.Dockerfile; then
+  fail "Platform Python build copies the whole mixed-language source tree"
+fi
+grep -Fq \
+  'COPY enterprise-agent-platform/pyproject.toml enterprise-agent-platform/README.md ./' \
+  containers/platform.Dockerfile \
+  || fail "Platform Python build does not copy an explicit package boundary"
+[[ "$(grep -Fxc 'COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform' containers/platform.Dockerfile)" -eq 1 ]] \
+  || fail "Platform package source must enter only the Python build stage"
+
+installer_test="$(mktemp -d)"
+installer_stubs="$installer_test/bin"
+mkdir -p "$installer_stubs"
+cat > "$installer_test/fake-manager" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  preflight)
+    if [[ "${FAKE_FAIL_STAGE:-preflight}" == preflight ]]; then
+      mkdir -p "$FAKE_DATA_ROOT/manager/secrets"
+      printf '%s\n' partial > "$FAKE_DATA_ROOT/manager/secrets/partial"
+      exit 42
+    fi
+    ;;
+  install)
+    mkdir -p "$FAKE_DATA_ROOT/manager/operations"
+    printf '%s\n' retained > "$FAKE_DATA_ROOT/manager/operations/install"
+    exit 43
+    ;;
+esac
+exit 0
+EOF
+chmod 0755 "$installer_test/fake-manager"
+cat > "$installer_stubs/curl" <<'EOF'
+#!/usr/bin/env bash
+output=""
+url=""
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == output ]]; then
+    output="$argument"
+    previous=""
+    continue
+  fi
+  if [[ "$argument" == --output ]]; then
+    previous=output
+  elif [[ "$argument" == https://* ]]; then
+    url="$argument"
+  fi
+done
+[[ -n "$output" && -n "$url" ]]
+if [[ "$url" == *.sha256 ]]; then
+  sha256sum "$FAKE_MANAGER" > "$output"
+else
+  cp "$FAKE_MANAGER" "$output"
+fi
+EOF
+cat > "$installer_stubs/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$installer_stubs/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "$installer_stubs/curl" "$installer_stubs/docker" "$installer_stubs/systemctl"
+installer_data="$installer_test/xdg-data/ubitech-agent"
+if cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_DATA_ROOT="$installer_data" \
+  XDG_DATA_HOME="$installer_test/xdg-data" \
+  XDG_CONFIG_HOME="$installer_test/xdg-config" \
+  XDG_BIN_HOME="$installer_test/xdg-bin" \
+  bash -s -- --yes \
+    --manifest-url https://example.invalid/release.json \
+    --manager-url https://example.invalid/manager \
+    --manager-checksum-url https://example.invalid/manager.sha256; then
+  fail "injected Manager preflight failure unexpectedly succeeded"
+fi
+[[ ! -e "$installer_data" ]] || fail "failed fresh install retained its data root"
+[[ ! -e "$installer_test/xdg-bin/ubitech-manager" ]] \
+  || fail "failed fresh install retained its Manager binary"
+[[ ! -e "$installer_test/xdg-config/ubitech-agent/manager.toml" ]] \
+  || fail "failed fresh install retained its Manager config"
+[[ ! -e "$installer_test/xdg-config/systemd/user/ubitech-agent-manager.service" ]] \
+  || fail "failed fresh install retained its systemd unit"
+
+activated_data="$installer_test/activated-data/ubitech-agent"
+activated_output="$installer_test/activated-install.log"
+set +e
+cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_DATA_ROOT="$activated_data" \
+  FAKE_FAIL_STAGE=install \
+  XDG_DATA_HOME="$installer_test/activated-data" \
+  XDG_CONFIG_HOME="$installer_test/activated-config" \
+  XDG_BIN_HOME="$installer_test/activated-bin" \
+  bash -s -- --yes \
+    --manifest-url https://example.invalid/release.json \
+    --manager-url https://example.invalid/manager \
+    --manager-checksum-url https://example.invalid/manager.sha256 \
+    >"$activated_output" 2>&1
+activated_status=$?
+set -e
+[[ "$activated_status" -eq 43 ]] \
+  || fail "post-activation install failure exit status was masked: $activated_status"
+grep -Fq 'Manager is active and owns the installation state' "$activated_output" \
+  || fail "post-activation failure has no Manager-owned recovery guidance"
+grep -Fq 'install --config' "$activated_output" \
+  || fail "post-activation failure has no exact retry command"
+[[ -f "$activated_data/manager/operations/install" ]] \
+  || fail "post-activation failure deleted Manager-owned operation state"
+[[ -x "$installer_test/activated-bin/ubitech-manager" ]] \
+  || fail "post-activation failure deleted the active Manager binary"
+[[ -f "$installer_test/activated-config/ubitech-agent/manager.toml" ]] \
+  || fail "post-activation failure deleted Manager config"
+[[ -f "$installer_test/activated-config/systemd/user/ubitech-agent-manager.service" ]] \
+  || fail "post-activation failure deleted Manager unit"
+rm -rf --one-file-system -- "$installer_test"
+
 for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do
   grep -Fq "$secret" containers/compose.yaml \
     || fail "Compose is missing Firecrawl secret $secret"
@@ -109,7 +241,6 @@ for fragment in (
     'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"',
     '"$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;',
     'sudo -n rm -rf --one-file-system -- "$root"',
-    'up --detach firecrawl-api',
     'run --rm --no-deps',
     'test -x /var/fdb/scripts/fdb.bash',
     'test -s /var/fdb/cluster/fdb.cluster',
@@ -125,11 +256,20 @@ for fragment in (
     'get $sentinel_key',
     'grep -Fqx -- "$expected"',
     'rm --stop --force',
+    'compose.firecrawl-init-failure.yaml',
+    'failed_foundationdb_init=',
+    'reconciled_foundationdb_init=',
+    'failed_foundationdb_init\")\" = 42',
+    'failed_recovery_foundationdb=',
+    'test \"$failed_recovery_foundationdb\" = \"$second_foundationdb\"',
+    'test \"$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)\" = \"$second_foundationdb\"',
+    'rm --force --stop',
+    '--wait --wait-timeout 600 firecrawl-api',
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
-if compose_smoke.count("up --detach firecrawl-api") < 2:
-    raise SystemExit("compose-smoke does not recreate Firecrawl with retained bind data")
+if compose_smoke.count('--wait --wait-timeout 600 firecrawl-api') < 4:
+    raise SystemExit("compose-smoke must use the production Firecrawl wait budget for cold, warm, failure, and recovery starts")
 if compose_smoke.count('status="$(timeout 5 fdbcli') < 2 or compose_smoke.count(
     'test -n "$status"'
 ) < 2:
@@ -166,6 +306,8 @@ from pathlib import Path
 schema = json.loads(Path("containers/release-manifest.schema.json").read_text(encoding="utf-8"))
 if schema.get("properties", {}).get("schema_version", {}).get("const") != 1:
     raise SystemExit("release manifest schema does not lock schema_version=1")
+if schema.get("properties", {}).get("protocol_version", {}).get("const") != 1:
+    raise SystemExit("release manifest schema does not lock protocol_version=1")
 required = set(schema.get("required", ()))
 expected = {
     "schema_version", "channel", "source_commit", "generated_at",
@@ -345,11 +487,14 @@ if cluster_file not in health_command:
     raise SystemExit("FoundationDB healthcheck must use the shared cluster file")
 if (
     'status=$$(timeout 4 fdbcli' not in health_command
+    or '2>&1); rc=$$?' not in health_command
     or 'test -n "$$status"' not in health_command
     or 'status json' not in health_command
     or 'jq -e -s' not in health_command
     or 'length == 1' not in health_command
     or available_filter not in health_command
+    or 'FoundationDB status probe failed (exit %s)' not in health_command
+    or 'head -c 8192' not in health_command
 ):
     raise SystemExit("FoundationDB healthcheck must verify status JSON availability")
 foundationdb_init = services["firecrawl-foundationdb-init"]
@@ -367,19 +512,24 @@ if (
 if cluster_file not in str(foundationdb_init.get("command") or ""):
     raise SystemExit("FoundationDB init must configure the shared cluster file")
 init_command = str(foundationdb_init.get("command") or "")
-if "timeout 5 fdbcli" not in init_command or "seq 1 30" not in init_command:
+if "timeout 4 fdbcli" not in init_command or "seq 1 20" not in init_command:
     raise SystemExit("FoundationDB init must use bounded command retries")
 if (
     'configure new single ssd' not in init_command
-    or 'status=$$(timeout 5 fdbcli' not in init_command
-    or 'test -n "$$status"' not in init_command
+    or 'last_status=$$(timeout 4 fdbcli' not in init_command
+    or 'test -n "$$last_status"' not in init_command
     or 'status json' not in init_command
     or 'jq -e -s' not in init_command
     or 'length == 1' not in init_command
     or available_filter not in init_command
     or init_command.index('status json') < init_command.index('configure new single ssd')
+    or 'then last_configure_rc=0' not in init_command
+    or 'FoundationDB configure result (exit %s):' not in init_command
+    or 'FoundationDB status probe failed (exit %s)' not in init_command
+    or '$${last_configure:0:8192}' not in init_command
+    or '$${last_status:0:8192}' not in init_command
 ):
-    raise SystemExit("FoundationDB init must verify database availability after configure-new fails")
+    raise SystemExit("FoundationDB init must verify database availability after every configure attempt")
 if "already.*configured" in init_command or "database.*configured" in init_command:
     raise SystemExit("FoundationDB init must not infer readiness from error text")
 init_dependencies = foundationdb_init.get("depends_on") or {}

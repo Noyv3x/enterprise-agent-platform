@@ -304,7 +304,7 @@ describe("MemoryPanel", () => {
   });
 
   it(
-    "marks blocked legacy memories and clears hidden unsafe tags on a safe edit",
+    "marks blocked memories and clears hidden unsafe tags on a safe edit",
     async () => {
       const user = userEvent.setup();
       mocks.loadAgentMemories.mockResolvedValueOnce({

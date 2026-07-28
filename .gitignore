@@ -25,8 +25,7 @@ enterprise-agent-platform/.env
 workspaces/
 logs/
 
-# Legacy upstream checkouts left behind when the former gitlinks are removed.
-# Production consumes CI-built images; these local repositories are references only.
+# Optional local upstream reference checkouts. Production consumes CI-built images.
 /cognee/
 /firecrawl/
 

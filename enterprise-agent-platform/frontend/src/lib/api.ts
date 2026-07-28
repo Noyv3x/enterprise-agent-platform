@@ -1,8 +1,5 @@
 /* =====================================================================
-   The single network primitive — ported byte-for-byte from legacy-app.js:73-94.
-   Plus safeUrl (legacy 100-114) and downloadJson (the OAuth export blob pattern,
-   legacy 3394-3403).
-
+   The single network primitive plus safeUrl and client-side JSON downloads.
    The 401 → session-expired hook is decoupled via registerSessionExpiredHandler
    so api.ts has no import cycle with the store; AppGate wires the real handler
    at boot.

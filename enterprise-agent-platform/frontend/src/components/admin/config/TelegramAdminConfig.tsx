@@ -1,6 +1,5 @@
 /* <TelegramAdminConfig/> — global Telegram bot gateway config + a read-only table
-   of users who linked their Telegram (legacy renderTelegramAdminConfig,
-   legacy-app.js:2274-2362). Two secret fields (bot_token / webhook_secret) are
+   of users who linked their Telegram. Two secret fields (bot_token / webhook_secret) are
    never seeded (empty = keep) and clear via the post-save re-seed
    (loadTelegramConfig replaces telegramConfig). */
 

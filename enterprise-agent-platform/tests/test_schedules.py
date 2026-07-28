@@ -15,6 +15,7 @@ from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.schedules import next_occurrence, normalize_schedule
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
+from test_platform import RecordingAgent as RuntimeAgentStub
 
 
 def make_config(tmp: Path) -> PlatformConfig:
@@ -29,15 +30,11 @@ def make_config(tmp: Path) -> PlatformConfig:
         knowledge_backend="local",
         cognee_dataset="test",
         cognee_ingest_background=True,
-        cognee_repo=tmp / "cognee",
-        firecrawl_repo=tmp / "firecrawl",
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
         runtime_startup_wait_seconds=0,
-        manage_agent_runtime=False,
         agent_runtime_url="http://127.0.0.1:8766",
         agent_runtime_token="runtime-token",
-        agent_runtime_home=tmp / "runtimes" / "agent",
         agent_runtime_model="gpt-5.5",
         agent_runtime_provider="openai-codex",
         agent_runtime_idle_timeout_seconds=2,
@@ -45,7 +42,7 @@ def make_config(tmp: Path) -> PlatformConfig:
     )
 
 
-class RecordingAgent:
+class RecordingAgent(RuntimeAgentStub):
     def __init__(self):
         self.calls: list[dict] = []
 
@@ -1020,7 +1017,7 @@ class ScheduleServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_recovery_blocks_legacy_queued_schedule_prompt_before_wakeup(self):
+    def test_recovery_blocks_unsafe_queued_schedule_prompt_before_wakeup(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
@@ -1081,7 +1078,7 @@ class ScheduleServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_gap_repair_blocks_legacy_scheduled_source_before_enqueue(self):
+    def test_gap_repair_blocks_unsafe_scheduled_source_before_enqueue(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)

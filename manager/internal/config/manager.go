@@ -62,32 +62,7 @@ func (m *Manager) Patch(update Patch) (Public, error) {
 	return Public{UpdateEnabled: next.UpdateEnabled, UpdateInterval: int(next.UpdateInterval / time.Second), ReleaseManifestURL: next.ReleaseURL}, nil
 }
 
-// ClearLegacyPlatformGateURL durably retires the source-migration Platform
-// endpoint. The in-memory configuration changes only after the atomically
-// replaced manager.toml has been synced, so a failed write remains retryable.
-func (m *Manager) ClearLegacyPlatformGateURL() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.value.LegacyPlatformGateURL == "" {
-		return nil
-	}
-	next := m.value
-	next.LegacyPlatformGateURL = ""
-	if err := next.Validate(); err != nil {
-		return err
-	}
-	if err := atomicfile.WriteFile(next.ConfigPath, []byte(render(next)), 0o600); err != nil {
-		return err
-	}
-	m.value = next
-	return nil
-}
-
 func render(c Config) string {
-	legacyPlatformGate := ""
-	if c.LegacyPlatformGateURL != "" {
-		legacyPlatformGate = fmt.Sprintf("legacy_platform_gate_url = %q\n", c.LegacyPlatformGateURL)
-	}
 	return fmt.Sprintf(`data_root = %q
 listen = %q
 release_manifest_url = %q
@@ -100,7 +75,7 @@ log_max_files = %d
 socket_path = %q
 platform_url = %q
 platform_gate_url = %q
-%sinternal_token_file = %q
+internal_token_file = %q
 compose_file = %q
 compose_project = %q
 docker_binary = %q
@@ -109,7 +84,7 @@ sandbox_network = %q
 health_timeout_seconds = %d
 drain_timeout_seconds = %d
 command_max_bytes = %d
-`, c.DataRoot, c.GatewayAddress, c.ReleaseURL, c.ReleaseChannel, c.UpdateEnabled, c.UpdateInterval.String(), c.SandboxIdle.String(), formatByteSize(c.LogMaxBytes), c.LogBackups, c.SocketPath, c.PlatformURL, c.PlatformGateURL, legacyPlatformGate, c.InternalTokenFile, c.ComposeFile, c.ComposeProject, c.DockerBinary, c.SandboxImage, c.SandboxNetwork, int(c.HealthTimeout/time.Second), int(c.DrainTimeout/time.Second), c.CommandMaxBytes)
+`, c.DataRoot, c.GatewayAddress, c.ReleaseURL, c.ReleaseChannel, c.UpdateEnabled, c.UpdateInterval.String(), c.SandboxIdle.String(), formatByteSize(c.LogMaxBytes), c.LogBackups, c.SocketPath, c.PlatformURL, c.PlatformGateURL, c.InternalTokenFile, c.ComposeFile, c.ComposeProject, c.DockerBinary, c.SandboxImage, c.SandboxNetwork, int(c.HealthTimeout/time.Second), int(c.DrainTimeout/time.Second), c.CommandMaxBytes)
 }
 func formatByteSize(value int64) string {
 	if value%(1<<30) == 0 {

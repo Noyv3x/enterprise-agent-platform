@@ -2,6 +2,8 @@
 
 本文说明 Docker 部署后的配置所有权、来源和生命周期。部署方式见[部署](../operations/deployment.md)，目录位置见[数据布局](data-layout.md)。Run 策略见 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器管理契约见 [`container-platform.json`](../contracts/container-platform.json)。
 
+Platform 只接受容器基线：`UBITECH_DEPLOYMENT_MODE` 必须显式为 `container`，Manager socket 与 token 文件必须是绝对路径。固定服务缺省地址使用 Compose DNS（`agent-runtime`、`camofox`、`searxng`、`firecrawl-api`）；产品代码不提供 development/source/宿主回环模式开关。
+
 ## 配置所有权
 
 | 来源 | 所有者 | 用途 |
@@ -32,12 +34,12 @@ log_max_size = "20MiB"
 log_max_files = 5
 ```
 
-- `data_root` 是 Manager、Platform 数据和恢复备份的唯一宿主根；展开后必须为绝对、非符号链接、部署用户可写路径。Platform 数据目录固定为规范化后的 `$data_root/data`，Manager 的迁移、快照、Sandbox registry、容器环境和 Compose bind mount 必须全部使用该同一路径。`data_dir` 不是独立可配置项；为兼容曾写入该字段的配置，解析器只能接受其规范化后恰好等于 `$data_root/data`，任何分叉路径都必须在启动、preflight 或停止旧服务前 fail closed。
+- `data_root` 是 Manager、Platform 数据和快照的唯一宿主根；展开后必须为绝对、非符号链接、部署用户可写路径。Platform 数据目录固定为规范化后的 `$data_root/data`，Manager 的 schema migration、快照、Sandbox registry、容器环境和 Compose bind mount 全部使用该路径。不存在独立 `data_dir` 配置。
 - `listen` 是唯一产品入口；生产反向代理连接此地址。Platform 容器端口由 Manager 动态选择，不单独配置公网监听。
-- `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。首次源码迁移可以用 `install.sh --manifest-url` 绑定精确引导 release，但长期值由 `--channel-manifest-url` 或 `UBITECH_RELEASE_CHANNEL_MANIFEST_URL` 提供，不能持久化精确 commit URL。运行身份永远使用 digest，不使用 tag。
+- `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。运行身份永远使用 digest，不使用 tag。
 - `update_enabled` 与 `update_interval` 控制检测；手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
 - `sandbox_idle` 默认值由机器契约生成；配置覆盖必须在受支持范围内，并同时作用于任务与后台进程判断。
-- 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。Platform 的 Manager control 客户端只为读取第一代 Manager 已持久化的历史大状态保留 8 MiB 有界兼容预算；新 Manager 的状态、operation 和迁移投影必须远小于该预算，不能把提高客户端上限当作允许诊断继续增长。
+- 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。Manager 状态、operation 和 API 投影都必须使用明确的小型读取预算；提高客户端上限不能代替服务端限制诊断大小。
 
 Manager 配置修改通过临时文件、fsync 和原子替换保存。常驻进程只热加载明确声明可热更新的字段；listen、data root 和 control socket 变化需要 restart operation。
 
@@ -50,7 +52,7 @@ Manager 为固定服务生成私有网络和下列路径：
 - Camoufox/SearXNG/Firecrawl：各自明确的 `$DATA_ROOT/data/runtimes/*` 子目录；
 - Sandbox：`/workspace`、`/home/agent`、`/opt/agent-env`，分别映射主 Agent 的 workspace、home 和 env。
 
-Platform 与 Runtime 内部 URL 使用 Compose service name，不接受部署用户提供的公网 base URL。内部 bearer 通过 owner-only token file 或 Docker secret 风格只读挂载传入，不能出现在 Compose 命令行、环境 dump 或 Manager 公共状态。Manager control 使用 `manager-token`，仅挂载给 Platform；Manager executor 使用独立的 `manager-executor-token`，仅挂载给 Runtime。宿主 CLI 从 Manager owner-only secret 读取 control token。两枚 token 即使共享同一个 owner-only Unix socket，也不能访问对方的路由集合。
+Platform 的集成服务 URL 与 Runtime 的 Platform URL 使用 Compose service name，不接受部署用户提供的公网 base URL。Runtime 不直接接收 Camoufox、SearXNG、Firecrawl URL 或这些服务的 secret，相关工具统一回调 Platform。Platform 在容器模式下不暴露固定服务的 install/restart API；这些容器只由 Manager operation 管理。内部 bearer 通过 owner-only token file 或 Docker secret 风格只读挂载传入，不能出现在 Compose 命令行、环境 dump 或 Manager 公共状态。Manager control 使用 `manager-token`，仅挂载给 Platform；Manager executor 使用独立的 `manager-executor-token`，仅挂载给 Runtime。宿主 CLI 从 Manager owner-only secret 读取 control token。两枚 token 即使共享同一个 owner-only Unix socket，也不能访问对方的路由集合。
 
 Manager 配置只记录 control token file 路径，不接受 TOML 中的 `internal_token` 明文值。读取 capability 前必须先完成 owner、普通文件、非符号链接与 mode 校验。
 
@@ -66,9 +68,11 @@ Platform 容器接受 Manager 生成的最小环境：
 - 对应内部 token file；
 - 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制。
 
-`ENTERPRISE_` 是现存环境前缀，不代表产品名称。它们是 Manager 到容器的内部兼容接口，不是生产部署的首选用户入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
+`ENTERPRISE_` 是现存内部环境前缀，不代表产品名称。它们是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
 
-若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。容器首次接管已有数据库时，数据库中已持久化的 session secret 优先于 Manager 新建文件，从而保留现有登录会话；新库才使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store，使 Platform 与 Runtime 不会因旧数据库残值使用不同 token。该同步不导出 OAuth、Telegram 或其它产品 secret。
+Platform 命令行只有当前容器入口使用的 `serve --host --port --data`、无业务 writer 的 `migrate --data`，以及明确的管理子命令。子命令必须显式提供；监听地址不提供隐藏别名；未知参数必须由参数解析器直接拒绝，不能静默映射到另一套启动接口。
+
+若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
 
 ## Platform 动态设置
 
@@ -78,7 +82,7 @@ Platform 容器接受 Manager 生成的最小环境：
 - `platform_trusted_proxy`
 - `platform_session_ttl_seconds`
 
-public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen 和容器端口属于 Manager，不再由 Platform 设置或数据库生成 systemd unit。
+public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen 和容器端口只属于 Manager，Platform 设置不能生成宿主 unit。
 
 ### Runtime 与模型
 
@@ -88,7 +92,7 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 - `agent_runtime_max_concurrency`
 - `agent_runtime_compaction_threshold`
 
-模型 provider 只接受受支持 OAuth 类型，model ID 必须来自 Runtime 实时目录。更新这些设置使用单一事务；需要 Runtime restart 时由 Platform 请求 Manager operation，不能自行启动 Node 进程。
+模型 provider 只接受受支持 OAuth 类型，model ID 必须来自 Runtime 实时目录。更新这些设置使用单一事务并作用于后续 Run；固定 Runtime 容器的生命周期只属于 Manager，Platform 不因模型设置变化重启它。
 
 ### 知识与集成
 
@@ -96,7 +100,7 @@ Cognee backend、dataset 与内部设置由管理入口持久化。托管 Cognee
 
 ### Telegram 与自动更新
 
-Telegram enabled、bot token、username、webhook secret 与 polling 仍属于 Platform。自动更新 enabled/interval/channel、当前/候选 generation 和 operation 则属于 Manager；Platform 只显示和提交受限 operation，不再保存 Git remote、branch、worktree 或 deploy command。旧部署已经保存的自动更新 webhook secret 可继续验证兼容 webhook，但验证成功后只能调用 Manager channel check，不能唤醒源码更新器；新部署以 Manager 轮询和管理界面手工检查为标准入口。
+Telegram enabled、bot token、username、webhook secret 与 polling 属于 Platform。自动更新 enabled/interval/channel、current/target/previous generation 和 operation 属于 Manager；Platform 只显示状态并提交受限 operation，不能保存 Git remote、branch、worktree 或部署命令。Manager 轮询、管理界面和宿主 CLI 是更新入口。
 
 ## Agent Runtime 环境
 
@@ -113,19 +117,9 @@ Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.j
 
 ## Secret
 
-Platform secret store保存 OAuth、session、Agent tool、Runtime、Firecrawl、Cognee、Telegram，以及迁移后仍需接受兼容更新 webhook 时的验证 secret。Manager secret目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
+Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Cognee 和 Telegram secret。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
 
 `secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限；界面不得宣称“加密存储”。secret 值不能进入文档、日志、Run metadata、release manifest、operation journal 或 Git。
-
-## 首次源码迁移输入
-
-桥接版本只迁移有明确所有权的有效配置，不把整个旧进程环境或 `deploy.env` 复制进容器。旧更新器把本次 handoff 实际使用的 data、service、host 和 port 原样交给安装器；SQLite 随数据迁移继续保存账号、OAuth、Telegram、模型、知识和其它 Platform 动态设置。Manager 为容器基础设施生成新的 capability 与 service 配置，不能让旧 source command、repo path 或任意环境覆盖镜像拓扑。
-
-Manager 的公网 `listen` 保留旧监听地址，`legacy_platform_gate_url` 使用通配监听对应的回环地址；长期 `platform_gate_url` 仍指向容器 Platform。桥接源码服务仅在 `UBITECH_SOURCE_MIGRATION_BRIDGE=1` 时接受 `UBITECH_MANAGER_SOCKET` 与 `UBITECH_MANAGER_TOKEN_FILE`，二者必须是绝对路径且 token file 由 Manager owner-only 创建。缺任一字段均拒绝启动桥接控制面，不能降级为未认证内部接口。无法归属到上述字段或 SQLite 的旧 unit 环境只进入七天恢复包，不自动注入新容器。
-
-若安装目标已经存在 `manager.toml`，安装器不得自行用 shell 提取或猜测字段，也不得静默沿用与本次源码桥输入不同的配置。它把桥接期望值交给下载并校验过的 Manager，由 Manager 正式解析器比较有效 `data_root`、`listen`、`release_manifest_url`、`release_channel`、`legacy_platform_gate_url`、`socket_path` 和 `internal_token_file`；任一有效值为空或不一致均在安装 unit 和切换服务前失败。未显式配置 `internal_token_file` 时，其有效值固定解析为 Manager state 根下的 `secrets/manager-token`。`socket_path` 同时承载 capability 分离的 control/executor API，两条路径都必须分别等于桥接源码服务实际连接和动态读取的路径。
-
-迁移成功后删除旧 unit、源码 checkout 和源码内数据；这些环境变量不再由宿主 systemd 直接启动产品。桥接读取器只服务首次迁移，不得成为长期双配置兼容层。
 
 ## 变更规则
 

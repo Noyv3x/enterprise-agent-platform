@@ -1,4 +1,4 @@
-/* <Brand/> — the logo + eyebrow lockup (legacy brand(), legacy-app.js:325-330). */
+/* <Brand/> — the logo and eyebrow lockup. */
 
 export function Brand() {
   return (

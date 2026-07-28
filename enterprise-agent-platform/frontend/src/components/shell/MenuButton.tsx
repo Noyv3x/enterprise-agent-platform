@@ -1,5 +1,5 @@
-/* <MenuButton/> — the mobile hamburger that opens the drawer (legacy-app.js:526).
-   Desktop CSS hides it (.menu-btn display:none). aria-expanded reflects the
+/* <MenuButton/> — the mobile hamburger that opens the drawer. Desktop CSS hides
+   it (.menu-btn display:none). aria-expanded reflects the
    drawer state; aria-controls ties it to the sidebar. Opening focus-moves into
    the drawer via the AppShell open/close effect. */
 

@@ -125,7 +125,7 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_memory_injection_is_rejected_and_legacy_rows_remain_user_manageable(self):
+    def test_memory_injection_is_rejected_and_blocked_rows_remain_user_manageable(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
             try:
@@ -439,88 +439,6 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_memory_dedupe_migration_repoints_candidate_before_deleting_duplicates(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            config = make_config(root)
-            first = EnterpriseService(config, agent_client=RecordingAgent())
-            try:
-                _, admin = first.authenticate("admin", "admin")
-                scope = first.agent_scopes.ensure_private_scope(int(admin["id"]))
-                first.db.execute("DROP INDEX uq_agent_memories_dedupe")
-                timestamp = now_ts()
-                content_hash = memory_content_hash("legacy duplicate")
-                first_id = first.db.insert(
-                    """
-                    INSERT INTO agent_memories(
-                        scope_key, target, owner_user_id, content, tags_json,
-                        content_hash, created_at, updated_at
-                    ) VALUES (?, 'memory', NULL, 'legacy duplicate', '[]', ?, ?, ?)
-                    """,
-                    (scope.scope_key, content_hash, timestamp, timestamp),
-                )
-                duplicate_id = first.db.insert(
-                    """
-                    INSERT INTO agent_memories(
-                        scope_key, target, owner_user_id, content, tags_json,
-                        content_hash, created_at, updated_at
-                    ) VALUES (?, 'memory', NULL, 'legacy duplicate', '[]', ?, ?, ?)
-                    """,
-                    (scope.scope_key, content_hash, timestamp, timestamp),
-                )
-                candidate_id = first.db.insert(
-                    """
-                    INSERT INTO agent_memory_candidates(
-                        scope_key, target, owner_user_id, content, tags_json,
-                        dedupe_key, status, memory_id, created_at, decided_at
-                    ) VALUES (
-                        ?, 'memory', ?, 'legacy duplicate', '[]',
-                        'legacy-duplicate-candidate', 'approved', ?, ?, ?
-                    )
-                    """,
-                    (
-                        scope.scope_key,
-                        admin["id"],
-                        duplicate_id,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-            finally:
-                first.close()
-
-            reopened = EnterpriseService(config, agent_client=RecordingAgent())
-            try:
-                self.assertEqual(
-                    reopened.db.scalar(
-                        """
-                        SELECT count(*) FROM agent_memories
-                        WHERE content_hash = ?
-                        """,
-                        (content_hash,),
-                    ),
-                    1,
-                )
-                self.assertEqual(
-                    reopened.db.scalar(
-                        """
-                        SELECT memory_id FROM agent_memory_candidates
-                        WHERE id = ?
-                        """,
-                        (candidate_id,),
-                    ),
-                    first_id,
-                )
-                index = reopened.db.query_one(
-                    """
-                    SELECT sql FROM sqlite_master
-                    WHERE type = 'index' AND name = 'uq_agent_memories_dedupe'
-                    """
-                )
-                self.assertIn("UNIQUE INDEX", str(index["sql"]).upper())
-            finally:
-                reopened.close()
-
     def test_user_profile_quota_and_candidate_size_are_bounded(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
@@ -576,7 +494,7 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_session_search_cross_lifecycle_hidden_legacy_and_scope_isolation(self):
+    def test_session_search_requires_session_provenance_and_preserves_scope_isolation(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
             try:
@@ -686,7 +604,7 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                         "reply_to": {"message_id": scheduled_source},
                     },
                 )
-                add(str(admin["id"]), "user", "legacy searchable note")
+                add(str(admin["id"]), "user", "orphaned-provenance-zeta")
                 add(str(other["id"]), "user", "alpha must stay isolated")
 
                 alpha = service.agent_session_search(
@@ -770,15 +688,14 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                     if "user-authored" in message["content"]
                 )
                 self.assertEqual(scheduled_message["role"], "user")
-                legacy = service.agent_session_search(
+                unprovenanced = service.agent_session_search(
                     {
                         "scope_key": scope.scope_key,
                         "action": "search",
-                        "query": "legacy searchable",
+                        "query": "orphaned-provenance-zeta",
                     }
                 )
-                self.assertTrue(legacy["found"])
-                self.assertEqual(legacy["results"][0]["session_id"], "legacy")
+                self.assertFalse(unprovenanced["found"])
                 missing = service.agent_session_search(
                     {
                         "scope_key": scope.scope_key,

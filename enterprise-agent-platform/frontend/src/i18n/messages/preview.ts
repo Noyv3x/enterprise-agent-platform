@@ -71,6 +71,13 @@ export const previewMessages = defineMessages({
   },
   "terminalPreview.terminal": { "zh-CN": "终端 {number}", en: "Terminal {number}", "zh-TW": "終端 {number}" },
   "terminalPreview.running": { "zh-CN": "运行中", en: "Running", "zh-TW": "執行中" },
+  "terminalPreview.orphaned": { "zh-CN": "需关注 · 仍占用", en: "Needs attention · still active", "zh-TW": "需關注 · 仍佔用" },
+  "terminalPreview.orphanedShort": { "zh-CN": "需关注", en: "Needs attention", "zh-TW": "需關注" },
+  "terminalPreview.orphanedDetail": {
+    "zh-CN": "Manager 尚未确认该进程已经终止。它仍被视为活动进程并占用执行资源。",
+    en: "Manager has not confirmed that this process stopped. It remains active and continues to occupy execution resources.",
+    "zh-TW": "Manager 尚未確認該程序已經終止。它仍被視為活動程序並佔用執行資源。",
+  },
   "terminalPreview.cwd": { "zh-CN": "工作目录", en: "Working directory", "zh-TW": "工作目錄" },
   "terminalPreview.command": { "zh-CN": "命令", en: "Command", "zh-TW": "命令" },
   "terminalPreview.output": { "zh-CN": "只读终端输出", en: "Read-only terminal output", "zh-TW": "唯讀終端輸出" },

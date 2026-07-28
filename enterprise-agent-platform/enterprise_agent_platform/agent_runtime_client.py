@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import inspect
 import json
 import os
 import re
@@ -17,19 +16,29 @@ from typing import Any, Callable, Protocol
 
 from .loopback_http import (
     open_loopback_url,
-    open_trusted_service_url,
+    open_private_service_url,
     validate_http_base_url,
     validate_loopback_url,
 )
 
 
 AgentProgressCallback = Callable[[dict[str, Any]], None]
-AgentContentCallback = Callable[..., None]
 AgentRunStartedCallback = Callable[[str], None]
-PreviewRevision = int | str
+PreviewRevision = str
 _PREVIEW_REVISION_RE = re.compile(
     r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}"
 )
+
+
+class AgentContentCallback(Protocol):
+    def __call__(
+        self,
+        content: str | None,
+        *,
+        turn_id: str,
+        turn_index: int,
+    ) -> None:
+        ...
 
 
 @dataclass(frozen=True)
@@ -112,10 +121,6 @@ class AgentClient(Protocol):
         lifecycle_id: str,
     ) -> dict[str, Any]:
         ...
-
-    def update_blocker_summary(self) -> dict[str, int]:
-        ...
-
 
 class AgentRuntimeError(RuntimeError):
     """Base error for the platform-owned Agent runtime client."""
@@ -695,33 +700,15 @@ class AgentRuntimeClient:
             )
             return result
 
-        try:
-            result = request(query_values)
-        except AgentRuntimeHTTPError as exc:
-            # During a rolling update, an older runtime rejects the new query
-            # parameter. Retry once without it so preview remains available;
-            # the missing revision below deliberately disables delta polling.
-            if since_revision is None or exc.status_code != 400:
-                raise
-            result = request(
-                {
-                    "scope_key": clean_scope_key,
-                    "lifecycle_id": clean_lifecycle_id,
-                }
-            )
+        result = request(query_values)
 
         processes = result.get("processes")
         if not isinstance(processes, list):
             raise AgentRuntimeProtocolError("Agent runtime process preview has no processes list")
-        # A runtime from before revision-based polling returned only
-        # ``processes``. Keep that shape so the platform/frontend continues
-        # using ETags without sending an unsupported since_revision forever.
         if "revision" not in result:
-            if "unchanged" in result:
-                raise AgentRuntimeProtocolError(
-                    "Agent runtime unchanged process preview has no revision"
-                )
-            return result
+            raise AgentRuntimeProtocolError(
+                "Agent runtime process preview has no revision"
+            )
         revision = result.get("revision")
         if not _valid_preview_revision(revision):
             raise AgentRuntimeProtocolError(
@@ -766,38 +753,6 @@ class AgentRuntimeClient:
                 "Agent runtime process summary has an invalid running terminal count"
             )
         return {"running_terminal_count": count}
-
-    def update_blocker_summary(self) -> dict[str, int]:
-        """Fetch global background-terminal counts without process details."""
-
-        result, _ = self._json_request(
-            "GET",
-            "/v1/processes/update-blockers",
-            None,
-            timeout=min(self.request_timeout_seconds, 5.0),
-            max_response_bytes=64 * 1024,
-        )
-        summary: dict[str, int] = {}
-        for field in (
-            "running_background_terminal_count",
-            "update_blocking_terminal_count",
-            "terminable_background_terminal_count",
-        ):
-            count = result.get(field)
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-                raise AgentRuntimeProtocolError(
-                    f"Agent runtime update blocker summary has an invalid {field}"
-                )
-            summary[field] = count
-        if (
-            summary["running_background_terminal_count"]
-            != summary["update_blocking_terminal_count"]
-            + summary["terminable_background_terminal_count"]
-        ):
-            raise AgentRuntimeProtocolError(
-                "Agent runtime update blocker summary has inconsistent counts"
-            )
-        return summary
 
     def _cancel_after_stream_failure(self, run_id: str) -> None:
         """Fail closed when the client can no longer observe a live run."""
@@ -1111,7 +1066,7 @@ class AgentRuntimeClient:
             open_request = (
                 open_loopback_url
                 if self._loopback_transport
-                else open_trusted_service_url
+                else open_private_service_url
             )
             return open_request(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
@@ -1290,7 +1245,6 @@ class AgentRuntimeClient:
             result = {"id": model_id} if model_id else {}
         provider = str(
             metadata.get("provider")
-            or metadata.get("model_provider")
             or self.default_provider
             or ""
         ).strip()
@@ -1307,18 +1261,12 @@ class AgentRuntimeClient:
             value = execution.get("lifecycle_id")
             if value:
                 return str(value).strip()
-        return str(metadata.get("lifecycle_id") or "").strip()
+        return ""
 
     @staticmethod
     def _workspace(metadata: dict[str, Any]) -> str:
         workspace = metadata.get("workspace")
-        if isinstance(workspace, dict):
-            value = workspace.get("path")
-        else:
-            value = workspace
-        if not value:
-            execution = metadata.get("execution")
-            value = execution.get("workspace_path") if isinstance(execution, dict) else ""
+        value = workspace.get("path") if isinstance(workspace, dict) else ""
         return str(value or "").strip()
 
     @staticmethod
@@ -1364,30 +1312,15 @@ class AgentRuntimeClient:
         if callback is None:
             return
         try:
-            signature = inspect.signature(callback)
-            parameters = signature.parameters
-            supports_turn_metadata = (
-                "turn_id" in parameters
-                and "turn_index" in parameters
-            ) or any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
+            try:
+                clean_turn_index = max(0, int(turn_index or 0))
+            except (TypeError, ValueError):
+                clean_turn_index = 0
+            callback(
+                content,
+                turn_id=str(turn_id or ""),
+                turn_index=clean_turn_index,
             )
-        except (TypeError, ValueError):
-            supports_turn_metadata = False
-        try:
-            if supports_turn_metadata:
-                try:
-                    clean_turn_index = max(0, int(turn_index or 0))
-                except (TypeError, ValueError):
-                    clean_turn_index = 0
-                callback(
-                    content,
-                    turn_id=str(turn_id or ""),
-                    turn_index=clean_turn_index,
-                )
-            else:
-                callback(content)
         except Exception:
             return
 
@@ -1460,13 +1393,6 @@ def _callback_timestamp(value: Any) -> Any:
 
 
 def _valid_preview_revision(value: Any) -> bool:
-    """Accept legacy safe integers and restart-safe opaque runtime tokens."""
+    """Accept restart-safe opaque runtime tokens."""
 
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return 0 <= value <= 9_007_199_254_740_991
-    return bool(
-        isinstance(value, str)
-        and _PREVIEW_REVISION_RE.fullmatch(value)
-    )
+    return bool(isinstance(value, str) and _PREVIEW_REVISION_RE.fullmatch(value))

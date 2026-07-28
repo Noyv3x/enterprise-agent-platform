@@ -375,8 +375,8 @@ export function MemoryPanel() {
       () => updateAgentMemory(memory.id, {
         target: memory.target,
         content,
-        // A blocked legacy record may carry an unsafe tag that this compact
-        // editor does not expose. Clear its tags so a safe edit can restore it.
+        // A blocked record may carry an unsafe tag that this compact editor does
+        // not expose. Clear its tags so a safe edit can restore it.
         tags: memory.blocked ? [] : memory.tags || [],
       }),
       t("memory.updateSuccess"),

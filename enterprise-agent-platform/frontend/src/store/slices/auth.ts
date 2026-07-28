@@ -1,5 +1,4 @@
-/* Auth slice — user, busy, error. Cross-cutting SET_BUSY/SET_ERROR live here.
-   Stubbed for Phase 1: plain setters + the session reset; later phases extend. */
+/* Auth slice — user, busy and error state. Cross-cutting SET_BUSY/SET_ERROR live here. */
 
 import type { Action, AppState, AuthSliceState } from "../../types";
 

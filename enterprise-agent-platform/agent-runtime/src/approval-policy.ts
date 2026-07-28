@@ -514,21 +514,17 @@ export function terminalApprovalObject(
   const requestedCwd = stringValue(args.cwd) || ".";
   const cwd = resolve(workspace ? resolve(workspace) : process.cwd(), requestedCwd);
   const background = args.background === true;
-  const updateBehavior = background
-    ? (args.update_behavior === "terminate" ? "terminate" : "wait")
-    : "foreground";
   // Foreground execution always has an effective deadline. Background work
   // has no implicit deadline, but an explicitly requested auto-kill deadline
   // is execution-relevant and therefore belongs to the approval identity.
   const timeoutMs = background && args.timeout_ms === undefined
     ? undefined
     : effectiveTerminalTimeout(args.timeout_ms, defaultTimeoutMs);
-  const identity: JsonObject = { command, cwd, background, update_behavior: updateBehavior };
+  const identity: JsonObject = { command, cwd, background };
   const displayArguments: JsonObject = {
     command: redactCommand(command),
     cwd,
     background,
-    update_behavior: updateBehavior,
   };
   if (timeoutMs !== undefined) {
     identity.timeout_ms = timeoutMs;

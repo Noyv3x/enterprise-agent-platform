@@ -1,12 +1,11 @@
-/* <SecuritySettings/> — public-facing security config form + read-only status
-   board (legacy renderSecuritySettings, legacy-app.js:1988-2093).
+/* <SecuritySettings/> — public-facing security config form and read-only status board.
 
    Numbers (port / session_ttl_seconds) are kept as STRING state and sent raw —
    the backend parses them; coercing to Number would change the payload. The
    session secret is never seeded (empty = keep existing) and clears after save.
    Form state re-seeds whenever the loaded securityConfig object changes (initial
-   async load + the PUT response that replaces it), mirroring the legacy
-   full-teardown re-seed without clobbering in-progress typing. */
+   async load and the PUT response that replaces it) without clobbering
+   in-progress typing. */
 
 import { Button, Input, Switch } from "antd";
 import { useEffect, useId, useState } from "react";

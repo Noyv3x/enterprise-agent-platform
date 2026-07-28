@@ -1,5 +1,5 @@
-/* <DocumentCard/> — one entry in the .list (legacy docCard, legacy-app.js:1237-1252).
-   "查看正文" fetches the full document by id. The button is disabled for hits
+/* <DocumentCard/> — one entry in the document list. "查看正文" fetches the full
+   document by id. The button is disabled for hits
    whose id is non-numeric (Cognee graph hits): the by-id route is numeric-only,
    so calling it would 404 — disabling it is the documented improvement (spec §7). */
 

@@ -1,5 +1,4 @@
-/* <MessageMeta/> — the bubble meta row (legacy renderMessage meta, :884-889):
-   author name, optional pending/streaming badges, and the formatted time. */
+/* <MessageMeta/> — author name, optional pending/streaming badges and formatted time. */
 
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";

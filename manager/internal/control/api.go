@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +18,6 @@ import (
 	"github.com/ubitech/agent-platform/manager/internal/executor"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/logstore"
-	"github.com/ubitech/agent-platform/manager/internal/migration"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 	"github.com/ubitech/agent-platform/manager/internal/operation"
 	"github.com/ubitech/agent-platform/manager/internal/release"
@@ -32,7 +30,6 @@ type API struct {
 	Executor      *executor.Service
 	Config        *config.Manager
 	AuditLog      *logstore.Store
-	Legacy        *migration.Service
 	ControlToken  string
 	ExecutorToken string
 	mu            sync.Mutex
@@ -56,7 +53,7 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	}
 	switch {
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
-		a.status(response)
+		a.status(response, request.Context())
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
 		writeJSON(response, http.StatusOK, a.Config.Public())
 	case request.Method == http.MethodPatch && request.URL.Path == "/v1/config":
@@ -71,16 +68,12 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 		a.operation(response, strings.TrimPrefix(request.URL.Path, "/v1/operations/"))
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/logs":
 		a.logs(response, request)
-	case request.Method == http.MethodPost && request.URL.Path == "/v1/migrations/legacy":
-		a.configureLegacy(response, request)
-	case request.Method == http.MethodGet && request.URL.Path == "/v1/migrations/legacy":
-		a.legacyPlan(response)
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}
 }
 
-func (a *API) status(response http.ResponseWriter) {
+func (a *API) status(response http.ResponseWriter, requestContext context.Context) {
 	state := a.Store.State()
 	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
 	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
@@ -89,16 +82,41 @@ func (a *API) status(response http.ResponseWriter) {
 		operationID = finalizeOperationID
 	}
 	publicState := safePublicState(state.PublicState)
-	services := map[string]any{"manager": map[string]any{"status": "healthy"}, "platform": map[string]any{"status": func() string {
-		if publicState == model.StateFailed {
-			return "unavailable"
+	services := map[string]any{"manager": map[string]any{"status": "healthy"}}
+	for _, name := range []string{
+		"platform",
+		"agent-runtime",
+		"camofox",
+		"searxng",
+		"firecrawl-playwright",
+		"firecrawl-redis",
+		"firecrawl-rabbitmq",
+		"firecrawl-postgres",
+		"firecrawl-foundationdb",
+		"firecrawl-foundationdb-init",
+		"firecrawl-api",
+	} {
+		services[name] = map[string]any{"status": "unknown"}
+	}
+	if reporter, ok := a.Engine.(driver.FixedServiceReporter); ok {
+		probeContext, cancel := context.WithTimeout(requestContext, 5*time.Second)
+		for name, service := range reporter.FixedServiceStatus(probeContext) {
+			if _, expected := services[name]; expected {
+				services[name] = map[string]any{"status": safeServiceStatus(service.Status)}
+			}
 		}
-		if state.Maintenance {
-			return "maintenance"
-		}
-		return "running"
-	}()}}
-	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt, "legacy_migration": a.legacyMigrationStatus()})
+		cancel()
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt})
+}
+
+func safeServiceStatus(value string) string {
+	switch value {
+	case "healthy", "starting", "unavailable", "unknown":
+		return value
+	default:
+		return "unknown"
+	}
 }
 
 func generationStatusProjection(generation *model.Generation) any {
@@ -198,73 +216,6 @@ func safeImageName(value string) bool {
 	return true
 }
 
-func (a *API) legacyMigrationStatus() any {
-	if a.Legacy == nil {
-		return nil
-	}
-	plan, err := a.Legacy.Plan()
-	if err == nil {
-		return migrationStatusProjection(plan)
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	// Status is an operationally safe projection, not a filesystem diagnostic.
-	// The concrete read error may contain an obsolete checkout or state path, so
-	// expose a fixed bounded signal and leave detailed evidence owner-local.
-	return map[string]any{
-		"status": "unavailable",
-		"error":  journal.BoundDiagnostic("legacy migration status is unavailable"),
-	}
-}
-
-func migrationStatusProjection(plan migration.Plan) map[string]any {
-	projection := migrationPlanProjection(plan)
-	projection["id"] = safeStatusToken(plan.ID, 160)
-	projection["operation_id"] = safeStatusToken(plan.OperationID, 160)
-	projection["expected_source_commit"] = safeCommit(plan.ExpectedSourceCommit)
-	projection["status"] = safeMigrationStatus(plan.Status)
-	projection["error"] = safeMigrationDiagnostic(plan)
-	if retirement, ok := projection["retirement"].(map[string]any); ok && plan.Retirement != nil {
-		retirement["campaign_id"] = safeStatusToken(plan.Retirement.CampaignID, 160)
-		retirement["generation_id"] = safeCommit(plan.Retirement.GenerationID)
-		retirement["status"] = safeRetirementStatus(plan.Retirement.Status)
-		retirement["error"] = safeMigrationDiagnostic(plan)
-	}
-	return projection
-}
-
-func safeMigrationDiagnostic(plan migration.Plan) string {
-	if plan.Error == "" && (plan.Retirement == nil || plan.Retirement.Error == "") {
-		return ""
-	}
-	if plan.Retirement == nil {
-		return "legacy migration requires attention"
-	}
-	if plan.Retirement.Status == "waiting_readiness" {
-		return "source retirement preconditions are not satisfied"
-	}
-	return "source retirement cleanup requires attention"
-}
-
-func safeMigrationStatus(value string) string {
-	switch value {
-	case "configured", "stopping_legacy", "copying", "installing_copy", "migrated", "cleanup_pending", "committed", "rolled_back", "failed", "purged":
-		return value
-	default:
-		return "unavailable"
-	}
-}
-
-func safeRetirementStatus(value string) string {
-	switch value {
-	case "waiting_readiness", "prepared", "systemd_removed", "source_state_removed", "docker_removed", "recovery_removed", "completed":
-		return value
-	default:
-		return "unavailable"
-	}
-}
-
 func safeCommit(value string) string {
 	if len(value) != 40 {
 		return ""
@@ -315,9 +266,8 @@ func (a *API) preflight(response http.ResponseWriter, request *http.Request) {
 }
 func (a *API) check(response http.ResponseWriter, request *http.Request) {
 	var body struct {
-		IdempotencyKey       string `json:"idempotency_key"`
-		ManifestURL          string `json:"manifest_url,omitempty"`
-		ExpectedSourceCommit string `json:"expected_source_commit,omitempty"`
+		IdempotencyKey string `json:"idempotency_key"`
+		ManifestURL    string `json:"manifest_url,omitempty"`
 	}
 	if err := decode(request, &body); err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
@@ -331,16 +281,12 @@ func (a *API) check(response http.ResponseWriter, request *http.Request) {
 	cached, ok := a.checks[body.IdempotencyKey]
 	a.mu.Unlock()
 	if ok {
-		if body.ExpectedSourceCommit != "" && cached.SourceCommit != body.ExpectedSourceCommit {
-			writeError(response, http.StatusConflict, "source migration release mismatch")
-			return
-		}
 		writeJSON(response, http.StatusOK, map[string]any{"manifest": cached, "reused": true})
 		return
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
 	defer cancel()
-	manifest, err := a.Operations.CheckExpected(ctx, body.ManifestURL, body.ExpectedSourceCommit)
+	manifest, err := a.Operations.Check(ctx, body.ManifestURL)
 	if err != nil {
 		writeError(response, http.StatusBadGateway, err.Error())
 		return
@@ -355,11 +301,10 @@ func (a *API) check(response http.ResponseWriter, request *http.Request) {
 }
 func (a *API) startOperation(response http.ResponseWriter, request *http.Request) {
 	var body struct {
-		Operation            model.OperationKind `json:"operation"`
-		IdempotencyKey       string              `json:"idempotency_key"`
-		ExpectedGeneration   *uint64             `json:"expected_generation,omitempty"`
-		ManifestURL          string              `json:"manifest_url,omitempty"`
-		ExpectedSourceCommit string              `json:"expected_source_commit,omitempty"`
+		Operation          model.OperationKind `json:"operation"`
+		IdempotencyKey     string              `json:"idempotency_key"`
+		ExpectedGeneration *uint64             `json:"expected_generation,omitempty"`
+		ManifestURL        string              `json:"manifest_url,omitempty"`
 	}
 	if err := decode(request, &body); err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
@@ -369,21 +314,7 @@ func (a *API) startOperation(response http.ResponseWriter, request *http.Request
 	if body.ExpectedGeneration != nil {
 		expected = *body.ExpectedGeneration
 	}
-	if body.Operation == model.OperationInstall && a.Legacy != nil {
-		expectedCommit, required, planErr := a.Legacy.RequiredSourceCommit()
-		if planErr != nil {
-			writeError(response, http.StatusConflict, "source migration is missing its expected source commit")
-			return
-		}
-		if required && body.ExpectedSourceCommit != "" && body.ExpectedSourceCommit != expectedCommit {
-			writeError(response, http.StatusConflict, "install expected source commit does not match the legacy migration plan")
-			return
-		}
-		if required {
-			body.ExpectedSourceCommit = expectedCommit
-		}
-	}
-	op, reused, err := a.Operations.Start(model.OperationRequest{Kind: body.Operation, IdempotencyKey: body.IdempotencyKey, ExpectedGeneration: expected, ManifestURL: body.ManifestURL, ExpectedSourceCommit: body.ExpectedSourceCommit})
+	op, reused, err := a.Operations.Start(model.OperationRequest{Kind: body.Operation, IdempotencyKey: body.IdempotencyKey, ExpectedGeneration: expected, ManifestURL: body.ManifestURL})
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, journal.ErrGenerationConflict) || errors.Is(err, journal.ErrOperationInProgress) || errors.Is(err, journal.ErrIdempotencyConflict) {
@@ -427,96 +358,6 @@ func (a *API) logs(response http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(response, http.StatusOK, map[string]any{"content": content})
 }
-func (a *API) configureLegacy(response http.ResponseWriter, request *http.Request) {
-	if a.Legacy == nil {
-		writeError(response, http.StatusNotImplemented, "legacy migration is unavailable")
-		return
-	}
-	var body struct {
-		LegacyRoot           string `json:"legacy_root"`
-		LegacyData           string `json:"legacy_data,omitempty"`
-		LegacyService        string `json:"legacy_service,omitempty"`
-		ExpectedSourceCommit string `json:"expected_source_commit"`
-	}
-	if err := decode(request, &body); err != nil {
-		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	if body.ExpectedSourceCommit == "" {
-		writeError(response, http.StatusBadRequest, "expected_source_commit is required")
-		return
-	}
-	plan, err := a.Legacy.Configure(body.LegacyRoot, body.LegacyData, body.LegacyService, body.ExpectedSourceCommit)
-	if err != nil {
-		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(response, http.StatusOK, migrationConfigurationAcknowledgement(plan))
-}
-
-func migrationConfigurationAcknowledgement(plan migration.Plan) map[string]any {
-	return map[string]any{
-		"id":                     plan.ID,
-		"status":                 plan.Status,
-		"expected_source_commit": plan.ExpectedSourceCommit,
-	}
-}
-func (a *API) legacyPlan(response http.ResponseWriter) {
-	if a.Legacy == nil {
-		writeError(response, http.StatusNotImplemented, "legacy migration is unavailable")
-		return
-	}
-	plan, err := a.Legacy.Plan()
-	if err != nil {
-		writeError(response, http.StatusNotFound, "legacy migration is not configured")
-		return
-	}
-	writeJSON(response, http.StatusOK, migrationPlanProjection(plan))
-}
-
-func migrationPlanProjection(plan migration.Plan) map[string]any {
-	var retirement any
-	if plan.Retirement != nil {
-		retirement = map[string]any{
-			"campaign_id":          plan.Retirement.CampaignID,
-			"generation_id":        plan.Retirement.GenerationID,
-			"status":               plan.Retirement.Status,
-			"systemd_removed":      plan.Retirement.SystemdRemoved,
-			"source_state_removed": plan.Retirement.SourceStateRemoved,
-			"docker_removed":       plan.Retirement.DockerRemoved,
-			"recovery_removed":     plan.Retirement.RecoveryRemoved,
-			"started_at":           plan.Retirement.StartedAt,
-			"completed_at":         plan.Retirement.CompletedAt,
-			"error":                journal.BoundDiagnostic(plan.Retirement.Error),
-		}
-	}
-	return map[string]any{
-		"schema_version":         plan.SchemaVersion,
-		"id":                     plan.ID,
-		"operation_id":           plan.OperationID,
-		"status":                 plan.Status,
-		"expected_source_commit": plan.ExpectedSourceCommit,
-		"copied":                 plan.Copied,
-		"copy_prepared":          plan.CopyPrepared,
-		"old_service_stopped":    plan.OldServiceStopped,
-		"unit_state_recorded":    plan.UnitStateRecorded,
-		"archive_ready":          plan.ArchiveReady,
-		"archive_restored":       plan.ArchiveRestored,
-		"entry_count":            len(plan.Entries),
-		"archive_tree_count":     len(plan.ArchiveTrees),
-		"archive_file_count":     len(plan.ArchiveFiles),
-		"retired_cache_count":    len(plan.RetiredCaches),
-		"compose_project_count":  len(plan.ComposeProjects),
-		"compose_volume_count":   len(plan.ComposeVolumes),
-		"compose_error_count":    len(plan.ComposeCleanupErrors),
-		"quarantined_count":      len(plan.Quarantined),
-		"retirement":             retirement,
-		"error":                  journal.BoundDiagnostic(plan.Error),
-		"created_at":             plan.CreatedAt,
-		"updated_at":             plan.UpdatedAt,
-	}
-}
-
 func (a *API) executorRoute(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		writeError(response, http.StatusMethodNotAllowed, "method not allowed")
@@ -575,16 +416,6 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 			return
 		}
 		writeJSON(response, http.StatusOK, a.Executor.Summary(body))
-	case "/v1/executor/processes/update-blockers":
-		var body map[string]any
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		if len(body) > 0 {
-			writeError(response, http.StatusBadRequest, "request body must be empty")
-			return
-		}
-		writeJSON(response, http.StatusOK, a.Executor.UpdateBlockers())
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}

@@ -1,6 +1,5 @@
 /* <CodexOAuthFlow/> — device-code verification UI: verification URL, user code, a
-   manual "检查状态" poll button, and the status label (legacy renderCodexOAuthFlow,
-   legacy-app.js:2748-2760). No auto-poll — the user clicks to poll. The
+   manual "检查状态" poll button and the status label. No auto-poll — the user clicks to poll. The
    backend-supplied verification_url is run through safeUrl (JSX does not block
    javascript: hrefs). */
 

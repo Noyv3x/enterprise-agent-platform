@@ -1,10 +1,9 @@
-/* <ContentRouter/> — the main content-area router (legacy renderContent,
-   legacy-app.js:573-585). Switches on activeView and applies the per-view
+/* <ContentRouter/> — the main content-area router. Switches on activeView and applies the per-view
    .view-enter entrance animation (replayed by keying the section on the view, so
    the CSS keyframe runs once per view change; reduced-motion is handled in CSS).
 
-   Permission view-fallback guard (legacy renderShell guard, legacy-app.js:408-409):
-   a demoted/limited user must never be stuck on a forbidden view. We render the
+   Permission view guard: a demoted or limited user must never be stuck on a
+   forbidden view. We render the
    COERCED ("effective") view immediately, and persist the coercion to the store
    in an effect so the rest of the tree (nav highlight, topbar) follows.
 

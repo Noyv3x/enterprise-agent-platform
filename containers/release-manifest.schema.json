@@ -20,7 +20,7 @@
     "channel": { "const": "main" },
     "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "generated_at": { "type": "string", "format": "date-time" },
-    "protocol_version": { "type": "integer", "minimum": 1 },
+    "protocol_version": { "const": 1 },
     "database_schema_version": { "type": "integer", "minimum": 1 },
     "manager": {
       "type": "object",

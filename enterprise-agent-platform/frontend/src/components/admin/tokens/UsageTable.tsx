@@ -1,5 +1,4 @@
-/* <UsageTable/> — a generic responsive Ant table (legacy renderUsageTable,
-   legacy-app.js:1755-1765). Its labelled wrapper keeps wide analytics data in
+/* <UsageTable/> — a generic responsive Ant table. Its labelled wrapper keeps wide analytics data in
    its own scroll region while Ant owns column semantics and empty state. */
 
 import { Table, type TableProps } from "antd";

@@ -1,18 +1,16 @@
-/* useRealtime — the EventSource lifecycle for the active chat scope, replacing
-   the legacy per-render syncScopeStream/closeScopeStream (legacy-app.js:3304-3363).
-
+/* useRealtime — the EventSource lifecycle for the active chat scope.
    One stream per active scope. The effect is keyed on
    [user?.id, view, activeChannelId, url] (+ the stable store handle), so it only
    re-opens when the scope URL actually changes — no per-render thrash. Cleanup
    closes the stream and clears the reconnect timer.
 
-   Preserved semantics:
+   Current semantics:
    - "update" events apply ephemeral status/typing directly and synchronize
      messages only when the persisted conversation revision changes;
    - on a terminal close (readyState === 2) we probe GET /api/auth/me (NOT
      skipAuthHandling, so a 401 drops to login) and, if still authed + visible,
      schedule a single 3s reconnect;
-   - hidden tabs close the stream and reopen on visible (legacy visibility pause);
+   - hidden tabs close the stream and reopen when visible;
    - pagehide closes the stream and pageshow restores it after BFCache resume;
    - logout/401 close it via the session teardown. */
 

@@ -1,5 +1,4 @@
-/* <KnowledgeSuggestions/> — the inline knowledge-suggestion chips under an agent
-   message (legacy renderMessage suggest block, :892-895). */
+/* <KnowledgeSuggestions/> — inline knowledge-suggestion chips under an Agent message. */
 
 import type { KnowledgeSuggestion } from "../../types";
 import { Tag } from "antd";

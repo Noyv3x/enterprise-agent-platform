@@ -12,8 +12,6 @@ from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
     RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
 )
-from .upstream_sources_generated import UPSTREAM_SOURCES
-
 OAUTH_SECRET_KEYS = (
     "CODEX_OAUTH_ACCESS_TOKEN",
     "CODEX_OAUTH_REFRESH_TOKEN",
@@ -35,20 +33,12 @@ class PlatformConfig:
     knowledge_backend: str
     cognee_dataset: str
     cognee_ingest_background: bool
-    cognee_repo: Path
-    manage_cognee: bool = True
     runtime_startup_wait_seconds: float = 8.0
-    manage_camofox: bool = True
-    camofox_url: str = "http://127.0.0.1:9377"
-    camofox_command: str = ""
-    manage_firecrawl: bool = True
-    firecrawl_repo: Path | None = None
-    firecrawl_api_url: str = "http://127.0.0.1:3002"
-    firecrawl_command: str = ""
-    # Web search talks directly to a private, loopback-only SearXNG instance.
+    camofox_url: str = "http://camofox:9377"
+    firecrawl_api_url: str = "http://firecrawl-api:3002"
+    # Web search talks directly to the private SearXNG service.
     # Firecrawl remains responsible only for scraping/extracting result pages.
-    manage_searxng: bool = True
-    searxng_api_url: str = "http://127.0.0.1:13003"
+    searxng_api_url: str = "http://searxng:8080"
     searxng_timeout_seconds: float = 20.0
     allow_insecure_bootstrap_password: bool = False
     trust_forwarded_headers: bool = False
@@ -57,23 +47,14 @@ class PlatformConfig:
     telegram_bot_username: str = ""
     telegram_webhook_secret: str = ""
     telegram_polling: bool = True
-    auto_update_enabled: bool = False
-    auto_update_interval_seconds: int = 30
-    auto_update_remote: str = "origin"
-    auto_update_branch: str = ""
-    auto_update_webhook_secret: str = ""
-    # Platform-owned Agent runtime.
-    manage_agent_runtime: bool = True
-    agent_runtime_url: str = "http://127.0.0.1:8766"
+    agent_runtime_url: str = "http://agent-runtime:8766"
     agent_runtime_token: str = ""
-    agent_runtime_home: Path | None = None
     agent_runtime_model: str = "gpt-5.5"
     agent_runtime_provider: str = "openai-codex"
     agent_runtime_idle_timeout_seconds: float = float(
         RUN_IDLE_TIMEOUT_DEFAULT_SECONDS
     )
-    deployment_mode: str = "source"
-    platform_internal_url: str = ""
+    platform_internal_url: str = "http://platform:8765"
     manager_socket: Path | None = None
     manager_token_file: Path | None = None
 
@@ -90,81 +71,31 @@ class PlatformConfig:
         return self.data_dir / "runtimes"
 
     @property
-    def managed_agent_runtime_home(self) -> Path:
-        return (self.agent_runtime_home or self.runtime_dir / "agent").expanduser()
+    def agent_runtime_data_dir(self) -> Path:
+        return self.runtime_dir / "agent"
 
     @property
     def cognee_runtime_dir(self) -> Path:
         return self.runtime_dir / "cognee"
 
-    @property
-    def firecrawl_runtime_dir(self) -> Path:
-        return self.runtime_dir / "firecrawl"
-
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
         base = base_dir or Path.cwd()
-        deployment_mode = os.getenv("UBITECH_DEPLOYMENT_MODE", "source").strip().lower()
-        if deployment_mode not in {"source", "container"}:
-            raise ValueError("UBITECH_DEPLOYMENT_MODE must be 'source' or 'container'")
-        containerized = deployment_mode == "container"
-        source_migration_bridge = _env_bool(
-            "UBITECH_SOURCE_MIGRATION_BRIDGE", False
-        )
-        if containerized and source_migration_bridge:
-            raise ValueError(
-                "UBITECH_SOURCE_MIGRATION_BRIDGE cannot be enabled in container mode"
-            )
-        manager_socket: Path | None = None
-        manager_token_file: Path | None = None
-        if containerized or source_migration_bridge:
-            manager_socket = Path(
-                os.getenv(
-                    "UBITECH_MANAGER_SOCKET",
-                    "/run/ubitech-manager/manager.sock" if containerized else "",
-                )
-            ).expanduser()
-            manager_token_file = Path(
-                os.getenv(
-                    "UBITECH_MANAGER_TOKEN_FILE",
-                    "/run/secrets/manager-token" if containerized else "",
-                )
-            ).expanduser()
-            if not manager_socket.is_absolute() or not manager_token_file.is_absolute():
-                raise ValueError(
-                    "Manager socket and token file paths must be absolute"
-                )
+        if os.getenv("UBITECH_DEPLOYMENT_MODE", "").strip().lower() != "container":
+            raise ValueError("UBITECH_DEPLOYMENT_MODE must be 'container'")
+        manager_socket = Path(
+            os.getenv("UBITECH_MANAGER_SOCKET", "/run/ubitech-manager/manager.sock")
+        ).expanduser()
+        manager_token_file = Path(
+            os.getenv("UBITECH_MANAGER_TOKEN_FILE", "/run/secrets/manager-token")
+        ).expanduser()
+        if not manager_socket.is_absolute() or not manager_token_file.is_absolute():
+            raise ValueError("Manager socket and token file paths must be absolute")
         data_dir = Path(os.getenv("ENTERPRISE_PLATFORM_DATA", base / "data")).expanduser()
         host = os.getenv("ENTERPRISE_PLATFORM_HOST", "127.0.0.1")
         port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
         token_secret = os.getenv("ENTERPRISE_SESSION_SECRET") or secrets.token_urlsafe(32)
-        manage_cognee = _env_bool("ENTERPRISE_MANAGE_COGNEE", True)
-        manage_firecrawl = False if containerized else _env_bool("ENTERPRISE_MANAGE_FIRECRAWL", True)
-        managed_cognee_repo = (
-            data_dir
-            / "runtimes"
-            / "cognee"
-            / "source"
-            / str(UPSTREAM_SOURCES["cognee"]["revision"])
-        )
-        managed_firecrawl_repo = (
-            data_dir
-            / "runtimes"
-            / "firecrawl"
-            / "source"
-            / str(UPSTREAM_SOURCES["firecrawl"]["revision"])
-        )
-        cognee_repo = managed_cognee_repo
-        firecrawl_repo = managed_firecrawl_repo
-        if not manage_cognee:
-            cognee_repo = Path(
-                os.getenv("ENTERPRISE_COGNEE_REPO", managed_cognee_repo)
-            ).expanduser()
-        if not manage_firecrawl:
-            firecrawl_repo = Path(
-                os.getenv("ENTERPRISE_FIRECRAWL_REPO", managed_firecrawl_repo)
-            ).expanduser()
         return cls(
             data_dir=data_dir,
             host=host,
@@ -177,27 +108,18 @@ class PlatformConfig:
             cognee_dataset=os.getenv("ENTERPRISE_COGNEE_DATASET", "enterprise_knowledge"),
             cognee_ingest_background=os.getenv("ENTERPRISE_COGNEE_INGEST_BACKGROUND", "1").strip().lower()
             in {"1", "true", "yes", "on"},
-            cognee_repo=cognee_repo,
-            manage_cognee=manage_cognee,
             runtime_startup_wait_seconds=_env_float("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS", 8.0, minimum=0.0),
-            manage_camofox=(False if containerized else os.getenv("ENTERPRISE_MANAGE_CAMOFOX", "1").strip().lower()
-            in {"1", "true", "yes", "on"}),
             camofox_url=os.getenv(
                 "ENTERPRISE_CAMOFOX_URL",
-                "http://camofox:9377" if containerized else "http://127.0.0.1:9377",
+                "http://camofox:9377",
             ).strip().rstrip("/"),
-            camofox_command=os.getenv("ENTERPRISE_CAMOFOX_COMMAND", "").strip(),
-            manage_firecrawl=manage_firecrawl,
-            firecrawl_repo=firecrawl_repo,
             firecrawl_api_url=os.getenv(
                 "ENTERPRISE_FIRECRAWL_API_URL",
-                "http://firecrawl:3002" if containerized else "http://127.0.0.1:3002",
+                "http://firecrawl-api:3002",
             ).strip().rstrip("/"),
-            firecrawl_command=os.getenv("ENTERPRISE_FIRECRAWL_COMMAND", "").strip(),
-            manage_searxng=False if containerized else _env_bool("ENTERPRISE_MANAGE_SEARXNG", True),
             searxng_api_url=os.getenv(
                 "ENTERPRISE_SEARXNG_API_URL",
-                "http://searxng:8080" if containerized else "http://127.0.0.1:13003",
+                "http://searxng:8080",
             ).strip().rstrip("/"),
             searxng_timeout_seconds=_env_float(
                 "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS",
@@ -212,20 +134,11 @@ class PlatformConfig:
             telegram_bot_username=os.getenv("ENTERPRISE_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
             telegram_webhook_secret=os.getenv("ENTERPRISE_TELEGRAM_WEBHOOK_SECRET", "").strip(),
             telegram_polling=_env_bool("ENTERPRISE_TELEGRAM_POLLING", True),
-            auto_update_enabled=_env_bool("ENTERPRISE_AUTO_UPDATE_ENABLED", False),
-            auto_update_interval_seconds=_env_int("ENTERPRISE_AUTO_UPDATE_INTERVAL_SECONDS", 30, minimum=5),
-            auto_update_remote=os.getenv("ENTERPRISE_AUTO_UPDATE_REMOTE", "origin").strip() or "origin",
-            auto_update_branch=os.getenv("ENTERPRISE_AUTO_UPDATE_BRANCH", "").strip(),
-            auto_update_webhook_secret=os.getenv("ENTERPRISE_AUTO_UPDATE_WEBHOOK_SECRET", "").strip(),
-            manage_agent_runtime=False if containerized else _env_bool("ENTERPRISE_MANAGE_AGENT_RUNTIME", True),
             agent_runtime_url=os.getenv(
                 "ENTERPRISE_AGENT_RUNTIME_URL",
-                "http://agent-runtime:8766" if containerized else "http://127.0.0.1:8766",
+                "http://agent-runtime:8766",
             ).strip().rstrip("/"),
             agent_runtime_token=os.getenv("ENTERPRISE_AGENT_RUNTIME_TOKEN", "").strip(),
-            agent_runtime_home=Path(
-                os.getenv("ENTERPRISE_AGENT_RUNTIME_HOME", data_dir / "runtimes" / "agent")
-            ).expanduser(),
             agent_runtime_model=os.getenv("ENTERPRISE_AGENT_RUNTIME_MODEL", "gpt-5.5").strip() or "gpt-5.5",
             agent_runtime_provider=os.getenv(
                 "ENTERPRISE_AGENT_RUNTIME_PROVIDER", "openai-codex"
@@ -236,10 +149,9 @@ class PlatformConfig:
                 minimum=float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
                 maximum=float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS),
             ),
-            deployment_mode=deployment_mode,
             platform_internal_url=os.getenv(
                 "ENTERPRISE_PLATFORM_INTERNAL_URL",
-                "http://platform:8765" if containerized else "",
+                "http://platform:8765",
             ).strip().rstrip("/"),
             manager_socket=manager_socket,
             manager_token_file=manager_token_file,

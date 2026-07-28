@@ -1,5 +1,4 @@
-/* <TokenUsageCurve/> — the 7-day token consumption SVG curve (legacy
-   renderTokenUsageCurve, legacy-app.js:1680-1724). Geometry comes from
+/* <TokenUsageCurve/> — the 7-day token consumption SVG curve. Geometry comes from
    utils/tokenCurve (640×170, padX 26, padY 18, x-step 98, baseline y 152),
    computed once per data change via useMemo. The SVG keeps the source aspect
    ratio so the trend is never visually distorted by a narrow container. */

@@ -1,11 +1,6 @@
-/* =====================================================================
-   Composer attachment / clipboard helpers — ported from legacy-app.js:
-   839-869 (clipboard) and 2941-2962 (optimistic attachments + blob revoke).
-
-   `optimisticAttachments` takes the monotonic seq explicitly (the legacy code
-   read the module-level `localMessageSeq`); the chat send action owns the
-   counter and passes it in so this stays pure.
-   ===================================================================== */
+/* Composer attachment and clipboard helpers. `optimisticAttachments` receives
+   the monotonic sequence explicitly; the chat send action owns the counter and
+   passes it in so this module stays pure. */
 
 import type { Attachment } from "../types";
 

@@ -1,6 +1,5 @@
-/* useMediaQuery — subscribe to a CSS media query via matchMedia + a change
-   listener. Used for the 800px mobile-drawer breakpoint (legacy mobileQuery,
-   legacy-app.js:3497-3500). Implemented over useSyncExternalStore so the value
+/* useMediaQuery subscribes to a CSS media query via matchMedia and a change
+   listener. Implemented over useSyncExternalStore so the value
    never tears. */
 
 import { useCallback, useSyncExternalStore } from "react";

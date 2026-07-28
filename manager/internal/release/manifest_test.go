@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ubitech/agent-platform/manager/internal/contract"
 )
 
 func validManifest(base string, compose []byte) Manifest {
@@ -21,7 +23,7 @@ func validManifest(base string, compose []byte) Manifest {
 	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"} {
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
-	return Manifest{SchemaVersion: 1, Channel: "main", SourceCommit: strings.Repeat("b", 40), GeneratedAt: time.Now().UTC(), ProtocolVersion: 1, DatabaseSchemaVersion: 1, Manager: ManagerRelease{Version: "v1", Artifacts: map[string]Artifact{runtime.GOARCH: {URL: base + "/manager", SHA256: hex.EncodeToString(binary[:])}}}, Compose: artifact, Images: images}
+	return Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: time.Now().UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 1, Manager: ManagerRelease{Version: "v1", Artifacts: map[string]Artifact{runtime.GOARCH: {URL: base + "/manager", SHA256: hex.EncodeToString(binary[:])}}}, Compose: artifact, Images: images}
 }
 func TestFetchValidatesManifestAndArtifactChecksum(t *testing.T) {
 	compose := []byte("services: {}\n")

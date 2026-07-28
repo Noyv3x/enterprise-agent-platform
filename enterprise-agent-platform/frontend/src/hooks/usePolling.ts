@@ -1,5 +1,4 @@
-/* usePolling — the safety-net poll behind the SSE stream (legacy startPolling/
-   stopPolling, legacy-app.js:3285-3302). The caller selects a fast reconnect
+/* usePolling — the safety-net poll behind the SSE stream. The caller selects a fast reconnect
    interval or a low-frequency connected watchdog. It is gated on an
    authenticated user and tab visibility; the re-entrancy mutex lives inside
    refreshActiveChat. Hidden tabs clear the interval; becoming visible does an

@@ -1,13 +1,9 @@
-/* =====================================================================
-   Domain models — faithfully reverse-engineered from legacy-app.js and the
-   migration specs. These mirror the server payload shapes the legacy code
-   consumed. Field names are part of the backend contract and must not drift.
-   ===================================================================== */
+/* Domain models for server payloads. Field names are part of the backend
+   contract and must not drift. */
 
 import type { PublicUpdateState as PlatformUpdateState } from "../container-contract.generated";
 
-/** Ids come back from the server as numbers but are compared with String()
- *  coercion throughout the legacy code, so callers may hold either. */
+/** Ids can arrive as numbers or strings; scope comparisons normalize them. */
 export type Id = string | number;
 
 /** Icon names registered in the shared SVG icon map. */
@@ -55,7 +51,7 @@ export type ActiveView =
   | "settings"
   | "admin";
 
-/** Chat scope. Both names are used in the legacy code interchangeably. */
+/** Chat scope and display mode share the same two values. */
 export type ScopeType = "channel" | "private";
 export type ChatMode = ScopeType;
 
@@ -126,7 +122,7 @@ export interface Attachment {
   local_preview?: boolean;
 }
 
-/** A single line in an agent activity / work log (legacy-app.js:1014-1029). */
+/** A single line in an Agent activity or work log. */
 export interface ActivityStep {
   source?: string;
   stage?: string;
@@ -155,7 +151,7 @@ export interface AgentApprovalRequest {
   requested_at?: number;
 }
 
-/** A streaming agent message fragment (legacy-app.js:948, 2910-2917). */
+/** A streaming Agent message fragment. */
 export interface StreamMsg {
   id?: Id;
   content?: string;
@@ -178,7 +174,7 @@ export interface AgentInputGroup {
   last_message_id?: Id;
 }
 
-/** Who the agent is currently replying to (legacy-app.js:2918-2925). */
+/** Who the Agent is currently replying to. */
 export interface AgentReplyTarget {
   id?: Id;
   username?: string;
@@ -269,7 +265,7 @@ export interface Message {
   created_at?: number;
 }
 
-/** @-mention autocomplete candidate (legacy-app.js:1041-1047). */
+/** @-mention autocomplete candidate. */
 export interface MentionTarget {
   kind?: string;
   handle: string;
@@ -277,7 +273,7 @@ export interface MentionTarget {
   description?: string;
 }
 
-/** Other users typing in a channel (legacy-app.js:1175). */
+/** Other users typing in a channel. */
 export interface TypingUser {
   user_id?: Id;
   username?: string;
@@ -368,7 +364,7 @@ export interface AgentMemory {
   tags: string[];
   created_at: number | string;
   updated_at: number | string;
-  source_type: "legacy" | "manual" | "tool" | "candidate";
+  source_type: "manual" | "tool" | "candidate" | "imported";
   blocked: boolean;
   blocked_reasons: string[];
 }
@@ -416,9 +412,6 @@ export interface KnowledgeDocument {
   updated_at: number;
 }
 
-/** Alias kept for spec parity (the list shape). */
-export type Document = KnowledgeDocument;
-
 export interface FullDocument extends KnowledgeDocument {
   content: string;
 }
@@ -446,17 +439,23 @@ export interface Secret {
 
 /* --------------------------------------------------------------- runtime */
 
+export type RuntimeState =
+  | "running"
+  | "unavailable"
+  | "available"
+  | "missing"
+  | "error"
+  | "invalid_config";
+
 export interface RuntimeRow {
   name: string;
-  available?: boolean;
-  state?: string;
-  detail?: string;
-  error?: string;
-  path?: string;
-  managed?: boolean;
+  available: boolean;
+  state: RuntimeState;
+  detail: string;
+  error: string;
   /** Cache freshness used to schedule a non-blocking health recheck. */
-  status_stale?: boolean;
-  status_checked_at?: number | null;
+  status_stale: boolean;
+  status_checked_at: number | null;
 }
 
 export type RuntimeMap = Record<string, RuntimeRow>;
@@ -617,7 +616,7 @@ export interface AdminPage {
   description: string;
 }
 
-/** [value, label] tuple as in legacy THINKING_DEPTH_OPTIONS. */
+/** [value, label] tuple used by THINKING_DEPTH_OPTIONS. */
 export type ThinkingDepthOption = [value: string, label: string];
 
 /** Descriptor-driven config field used by managed service editors. */
@@ -734,32 +733,23 @@ export interface AutoUpdateConfigValues {
 /** Public, deliberately redacted update state used before authentication. */
 export interface PlatformUpdateStatus {
   state: PlatformUpdateState;
-  /** Accepted temporarily while older/newer backend revisions overlap. */
-  phase?: PlatformUpdateState;
-  instance_id?: string;
+  phase?: string;
+  operation_id?: string;
   retry_after_ms?: number;
 }
 
 export interface AutoUpdateStatus {
   state?: PlatformUpdateState;
   phase?: string;
-  control_plane?: "manager" | "source_bridge" | "source";
-  manager_available?: boolean;
   in_progress?: boolean;
-  update_started?: boolean;
   update_available?: boolean;
-  dirty?: boolean;
   current_revision?: string;
   remote_revision?: string;
   last_check_at?: number | string;
-  last_trigger?: string;
   last_error?: string;
-  dirty_summary?: string;
   active_tasks?: number;
   queued_tasks?: number;
-  protected_processes?: number;
   manager_generation?: number;
-  waiting_since?: number | string;
   current_generation?: string;
   previous_generation?: string;
   target_generation?: string;

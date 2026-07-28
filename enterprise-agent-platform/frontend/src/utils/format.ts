@@ -1,7 +1,4 @@
-/* =====================================================================
-   Pure formatters — ported verbatim from legacy-app.js:2797-2849. Same
-   rounding/locale behavior. No hooks, no store reads.
-   ===================================================================== */
+/* Pure formatters with stable rounding and locale behavior. No hooks or store reads. */
 
 import { getCurrentLocale } from "../i18n";
 

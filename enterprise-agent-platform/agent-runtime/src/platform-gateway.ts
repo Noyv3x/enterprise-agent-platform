@@ -117,6 +117,9 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     run_id: request.context.run_id,
   };
   if (request.tool === "memory") {
+    if (!["search", "read", "list", "store", "replace", "forget", "clear", "propose"].includes(request.action)) {
+      throw new Error("memory action is not supported");
+    }
     if (["search", "read", "list"].includes(request.action)) {
       return {
         method: "POST",
@@ -124,14 +127,17 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
         body: { ...flattened, action: request.action },
       };
     }
-    const aliases: Record<string, string> = { store: "add", delete: "remove", forget: "remove" };
+    const actions: Record<string, string> = { store: "add", forget: "remove" };
     return {
       method: "POST",
       url: `${baseUrl}/api/agent/tools/memory`,
-      body: { ...flattened, action: aliases[request.action] ?? request.action },
+      body: { ...flattened, action: actions[request.action] ?? request.action },
     };
   }
   if (request.tool === "session") {
+    if (!["search", "list", "read"].includes(request.action)) {
+      throw new Error("session action must be search, list, or read");
+    }
     const requestedSession = request.arguments.session_id;
     return {
       method: "POST",
@@ -146,15 +152,21 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     };
   }
   if (request.tool === "knowledge") {
-    if (["read", "document", "get"].includes(request.action)) {
-      const documentId = request.arguments.document_id ?? request.arguments.id;
-      if (typeof documentId !== "number" && typeof documentId !== "string") throw new Error("knowledge read requires document_id");
+    if (request.action === "read") {
+      const documentId = request.arguments.document_id;
+      if (typeof documentId !== "number" || !Number.isSafeInteger(documentId) || documentId <= 0) {
+        throw new Error("knowledge read requires a positive integer document_id");
+      }
       return { method: "GET", url: `${baseUrl}/api/agent/tools/knowledge/documents/${encodeURIComponent(String(documentId))}` };
     }
+    if (request.action !== "search") throw new Error("knowledge action must be search or read");
     const query = new URLSearchParams();
     if (request.arguments.query !== undefined) query.set("q", String(request.arguments.query));
     if (request.arguments.limit !== undefined) query.set("limit", String(request.arguments.limit));
     return { method: "GET", url: `${baseUrl}/api/agent/tools/knowledge/search?${query}` };
+  }
+  if (request.tool === "web" && !["search", "extract"].includes(request.action)) {
+    throw new Error("web action must be search or extract");
   }
   return { method: "POST", url: `${baseUrl}/internal/agent/tools/${request.tool}`, body: request as unknown as JsonObject };
 }

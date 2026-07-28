@@ -21,10 +21,9 @@ var ErrOperationInProgress = errors.New("another mutation operation is already a
 var ErrGenerationConflict = errors.New("manager generation changed")
 var ErrIdempotencyConflict = errors.New("idempotency key belongs to a different operation request")
 
-// MaxDiagnosticBytes keeps a diagnostic comfortably below the legacy Manager
-// client's response limit even when JSON escaping expands every retained byte.
-// The marker preserves the original size and a stable identity for forensic
-// correlation without allowing journal records to grow without bound.
+// MaxDiagnosticBytes keeps operation projections compact even when JSON
+// escaping expands every retained byte. The marker preserves the original size
+// and a stable identity for forensic correlation without unbounded journals.
 const MaxDiagnosticBytes = 64 << 10
 const MaxHistoryNoteBytes = 2 << 10
 const MaxOperationHistoryEntries = 64
@@ -184,7 +183,7 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	op := model.Operation{
 		SchemaVersion: 1, ID: id, Kind: req.Kind, IdempotencyKey: req.IdempotencyKey,
 		Attempt:            attempt,
-		ExpectedGeneration: req.ExpectedGeneration, TargetManifestURL: req.ManifestURL, ExpectedSourceCommit: req.ExpectedSourceCommit,
+		ExpectedGeneration: req.ExpectedGeneration, TargetManifestURL: req.ManifestURL,
 		Status: model.OperationPending, Phase: model.PhaseValidating,
 		History: []model.PhaseEvent{{Phase: model.PhaseValidating, At: now.UTC()}}, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
@@ -206,8 +205,7 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 
 func sameOperationRequest(existing model.Operation, request model.OperationRequest) bool {
 	return existing.Kind == request.Kind &&
-		existing.TargetManifestURL == request.ManifestURL &&
-		existing.ExpectedSourceCommit == request.ExpectedSourceCommit
+		existing.TargetManifestURL == request.ManifestURL
 }
 
 func (s *Store) Operation(id string) (model.Operation, error) {

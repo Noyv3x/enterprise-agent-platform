@@ -1,4 +1,4 @@
-/* Chat-only presentation layered after the legacy global stylesheet. */
+/* Chat-only presentation layered after global product styles. */
 
 .telegram-link-dialog {
   width: min(560px, 100%);

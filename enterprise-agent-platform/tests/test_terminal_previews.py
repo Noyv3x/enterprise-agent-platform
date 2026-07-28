@@ -14,14 +14,15 @@ from enterprise_agent_platform.agent_runtime_client import (
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
+from test_platform import RecordingAgent
 
 
-class PreviewAgent:
+class PreviewAgent(RecordingAgent):
     def __init__(self) -> None:
-        self.preview_calls: list[tuple[str, str, int | str | None]] = []
+        self.preview_calls: list[tuple[str, str, str | None]] = []
         self.summary_calls: list[tuple[str, str]] = []
         self.processes: list[dict] = []
-        self.revision = 7
+        self.revision = "preview_test:7"
         self.preview_error = False
 
     def generate(self, **kwargs):
@@ -35,7 +36,7 @@ class PreviewAgent:
         self,
         scope_key: str,
         lifecycle_id: str,
-        since_revision: int | str | None = None,
+        since_revision: str | None = None,
     ) -> dict:
         self.preview_calls.append((scope_key, lifecycle_id, since_revision))
         if self.preview_error:
@@ -54,7 +55,7 @@ class PreviewAgent:
             "running_terminal_count": sum(
                 1
                 for process in self.processes
-                if process.get("status") == "running" or process.get("running") is True
+                if process.get("status") in {"running", "orphaned"}
             )
         }
 
@@ -71,16 +72,9 @@ def make_config(root: Path) -> PlatformConfig:
         knowledge_backend="local",
         cognee_dataset="knowledge",
         cognee_ingest_background=False,
-        cognee_repo=root / "cognee",
-        manage_cognee=False,
-        manage_camofox=False,
-        manage_firecrawl=False,
-        firecrawl_repo=root / "firecrawl",
         allow_insecure_bootstrap_password=True,
-        manage_agent_runtime=False,
         agent_runtime_url="http://127.0.0.1:18766",
         agent_runtime_token="runtime-token",
-        agent_runtime_home=root / "runtimes" / "agent",
         runtime_startup_wait_seconds=0,
     )
 
@@ -97,7 +91,7 @@ class TerminalPreviewTests(unittest.TestCase):
 
                 self.assertEqual(
                     service.agent_terminal_previews(admin, "private", str(admin["id"])),
-                    {"processes": [], "revision": 0},
+                    {"processes": [], "revision": "preview_none:0"},
                 )
                 self.assertIsNone(service.agent_scopes.get_scope(scope_key))
                 self.assertEqual(agent.preview_calls, [])
@@ -120,7 +114,8 @@ class TerminalPreviewTests(unittest.TestCase):
                         "stdout": "\x1b]0;unsafe-title\x07\x1b[31mhello\x1b[0m\x01",
                         "stderr": "warning",
                         "output": "hello\n[stderr]\nwarning",
-                        "status": "running",
+                        "status": "orphaned",
+                        "running": True,
                         "started_at": "2026-07-15T00:00:00Z",
                         "updated_at": "2026-07-15T00:00:01Z",
                         "truncated": True,
@@ -154,7 +149,9 @@ class TerminalPreviewTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(process["output"], "hello\n[stderr]\nwarning")
-                self.assertEqual(result["revision"], 7)
+                self.assertEqual(process["status"], "orphaned")
+                self.assertIs(process["running"], True)
+                self.assertEqual(result["revision"], agent.revision)
                 self.assertLessEqual(len(process["title"].encode("utf-8")), 200)
                 self.assertLessEqual(len(process["command"].encode("utf-8")), 4 * 1024)
                 self.assertLessEqual(len(process["cwd"].encode("utf-8")), 2 * 1024)
@@ -217,7 +214,10 @@ class TerminalPreviewTests(unittest.TestCase):
                     str(admin["id"]),
                     since_revision=agent.revision,
                 )
-                self.assertEqual(failed, {"processes": [], "revision": 0})
+                self.assertEqual(
+                    failed,
+                    {"processes": [], "revision": "preview_none:0"},
+                )
             finally:
                 service.close()
 
@@ -253,7 +253,7 @@ class TerminalPreviewTests(unittest.TestCase):
                     "stdout": "live",
                     "stderr": "",
                     "output": "live" + ("x" * 2_048),
-                    "status": "running",
+                    "status": "orphaned",
                     "running": True,
                     "started_at": "2026-07-15T00:00:02Z",
                     "updated_at": "2026-07-15T00:00:03Z",
@@ -293,6 +293,8 @@ class TerminalPreviewTests(unittest.TestCase):
                     [process["id"] for process in body["processes"]],
                     ["process-running"],
                 )
+                self.assertEqual(body["processes"][0]["status"], "orphaned")
+                self.assertIs(body["processes"][0]["running"], True)
                 self.assertEqual(
                     body["processes"][0]["output"],
                     "live" + ("x" * 2_048),

@@ -104,6 +104,32 @@ describe("compact session bootstrap", () => {
     });
   });
 
+  it("treats an unauthenticated bootstrap as an anonymous session", async () => {
+    const fetchMock = vi.fn(async (_path: string) =>
+      response(401, { error: "authentication required" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, initialAppState);
+
+    await expect(boot(store)).resolves.toBe("anonymous");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/session/bootstrap");
+    expect(store.getState().user).toBeNull();
+  });
+
+  it("fails boot when the bootstrap endpoint fails without probing older endpoints", async () => {
+    const fetchMock = vi.fn(async (_path: string) =>
+      response(503, { error: "bootstrap unavailable" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, initialAppState);
+
+    await expect(boot(store)).resolves.toBe("error");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/session/bootstrap");
+    expect(store.getState().user).toBeNull();
+  });
+
   it("hydrates an embedded login bootstrap without follow-up reads", async () => {
     const fetchMock = vi.fn(async () => response(200, {
       user: bootstrap.user,
@@ -116,5 +142,22 @@ describe("compact session bootstrap", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(store.getState().messages).toEqual(bootstrap.messages);
+  });
+
+  it("rejects a login response without the required bootstrap", async () => {
+    const fetchMock = vi.fn(async (_path: string) => response(200, {
+      user: bootstrap.user,
+      channels: bootstrap.channels,
+      mention_targets: bootstrap.mention_targets,
+      messages: bootstrap.messages,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, initialAppState);
+
+    await expect(login(store, "alice", "secret")).rejects.toThrow();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/auth/login");
+    expect(store.getState().user).toBeNull();
   });
 });

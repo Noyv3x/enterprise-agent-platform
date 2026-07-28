@@ -19,12 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ubitech/agent-platform/manager/internal/contract"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/migration"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 	"github.com/ubitech/agent-platform/manager/internal/release"
-	"github.com/ubitech/agent-platform/manager/internal/snapshot"
 )
 
 type fakeEngine struct {
@@ -33,15 +32,26 @@ type fakeEngine struct {
 	failAt          string
 	diagnostic      string
 	diagnosticCalls int
-	retirementErr   error
-	retirementCalls int
-	retirementID    string
 }
 
-// engineWithoutRetirementProbe deliberately exposes only the baseline Engine
-// contract. It proves that source retirement fails closed when an alternate
-// backend cannot perform the stronger, irreversible-retirement probe.
-type engineWithoutRetirementProbe struct{ driver.Engine }
+type observedLocker struct {
+	mu        sync.Mutex
+	attempted chan struct{}
+	once      sync.Once
+}
+
+func newObservedHeldLocker() *observedLocker {
+	locker := &observedLocker{attempted: make(chan struct{})}
+	locker.mu.Lock()
+	return locker
+}
+
+func (l *observedLocker) Lock() {
+	l.once.Do(func() { close(l.attempted) })
+	l.mu.Lock()
+}
+
+func (l *observedLocker) Unlock() { l.mu.Unlock() }
 
 type temporaryManifestTransport struct {
 	base     http.RoundTripper
@@ -89,13 +99,6 @@ func (e *fakeEngine) CandidateFailureDiagnostics(context.Context, release.Manife
 	}
 	return e.diagnostic
 }
-func (e *fakeEngine) ProbeLegacyRetirement(_ context.Context, manifest release.Manifest) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.retirementCalls++
-	e.retirementID = manifest.ID()
-	return e.retirementErr
-}
 func (e *fakeEngine) EnsureSandbox(context.Context, driver.SandboxSpec) error { return nil }
 func (e *fakeEngine) StopSandbox(context.Context, string) error               { return nil }
 func (e *fakeEngine) RemoveSandbox(context.Context, string) error             { return nil }
@@ -108,47 +111,6 @@ type fakeSnapshot struct{}
 
 func (fakeSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
 func (fakeSnapshot) Restore(context.Context, string) error          { return nil }
-
-type retirementSnapshot struct {
-	verifyErr error
-	verified  []string
-}
-
-func (*retirementSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
-func (*retirementSnapshot) Restore(context.Context, string) error          { return nil }
-func (s *retirementSnapshot) Verify(_ context.Context, path string) error {
-	s.verified = append(s.verified, path)
-	return s.verifyErr
-}
-
-type countingSnapshot struct {
-	store    snapshot.Store
-	creates  int
-	restores int
-}
-
-func (s *countingSnapshot) Create(ctx context.Context, operationID string) (string, error) {
-	s.creates++
-	return s.store.Create(ctx, operationID)
-}
-
-func (s *countingSnapshot) Restore(ctx context.Context, path string) error {
-	s.restores++
-	return s.store.Restore(ctx, path)
-}
-
-type legacySystemdRunner struct {
-	calls []string
-}
-
-func (r *legacySystemdRunner) Run(_ context.Context, name string, args []string, _ []string) (driver.Result, error) {
-	call := name + " " + strings.Join(args, " ")
-	r.calls = append(r.calls, call)
-	if strings.Contains(call, "--property=UnitFileState") {
-		return driver.Result{Stdout: "enabled\n"}, nil
-	}
-	return driver.Result{}, nil
-}
 
 type scriptedSnapshot struct {
 	creates      []string
@@ -309,54 +271,6 @@ func (s *recordingSelfUpdate) ActivationCommitted(release.Manifest) (bool, error
 	return true, nil
 }
 
-type retryLegacy struct {
-	commits   int
-	failOnce  bool
-	committed bool
-}
-
-func (*retryLegacy) Active() bool                                { return false }
-func (*retryLegacy) RequiredSourceCommit() (string, bool, error) { return "", false, nil }
-func (*retryLegacy) Rearm(string) error                          { return nil }
-func (*retryLegacy) PreCutover(context.Context, string) error    { return nil }
-func (*retryLegacy) Cutover(context.Context, string) error       { return nil }
-func (*retryLegacy) Rollback(context.Context, string) error      { return nil }
-func (l *retryLegacy) FinalizeCleanup(context.Context, string) error {
-	if l.committed {
-		return nil
-	}
-	l.commits++
-	if l.failOnce {
-		l.failOnce = false
-		return errors.New("injected legacy cleanup failure")
-	}
-	l.committed = true
-	return nil
-}
-
-type preflightLegacy struct {
-	preflightErr error
-	preflights   int
-	cutovers     int
-	rollbacks    int
-}
-
-func (*preflightLegacy) Active() bool                                { return true }
-func (*preflightLegacy) RequiredSourceCommit() (string, bool, error) { return "", false, nil }
-func (*preflightLegacy) Rearm(string) error                          { return nil }
-func (l *preflightLegacy) PreCutover(context.Context, string) error {
-	l.preflights++
-	return l.preflightErr
-}
-func (l *preflightLegacy) Cutover(context.Context, string) error { l.cutovers++; return nil }
-func (l *preflightLegacy) Rollback(context.Context, string) error {
-	l.rollbacks++
-	return nil
-}
-func (*preflightLegacy) FinalizeCleanup(context.Context, string) error {
-	return nil
-}
-
 func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	compose := []byte("services: {}\n")
@@ -373,7 +287,7 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"} {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
-		manifest := release.Manifest{SchemaVersion: 1, Channel: "main", SourceCommit: strings.Repeat("b", 40), GeneratedAt: generatedAt, ProtocolVersion: 1, DatabaseSchemaVersion: 2, Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}}, Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images}
+		manifest := release.Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: generatedAt, ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2, Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}}, Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images}
 		_ = json.NewEncoder(w).Encode(manifest)
 	}))
 	return server, server.URL + "/manifest"
@@ -402,6 +316,52 @@ func TestInstallWaitsWhenManagerExistsBeforeManifestPublication(t *testing.T) {
 	}
 	if completed.Status != model.OperationSucceeded || !completed.Finalized || transport.attempts < 2 {
 		t.Fatalf("temporary manifest absence was not retried: operation=%#v requests=%d", completed, transport.attempts)
+	}
+}
+
+func TestOperationExecutionWaitsForFixedStackMutex(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	fixedStackMu := newObservedHeldLocker()
+	locked := true
+	defer func() {
+		if locked {
+			fixedStackMu.mu.Unlock()
+		}
+	}()
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main",
+		ReleaseClient: release.Client{HTTP: server.Client()}, FixedStackMu: fixedStackMu,
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "fixed-stack-lock", ExpectedGeneration: store.State().Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixedStackMu.attempted:
+	case <-time.After(time.Second):
+		t.Fatal("operation did not attempt to acquire the fixed-stack mutex")
+	}
+	engine.mu.Lock()
+	callsWhileLocked := append([]string(nil), engine.calls...)
+	engine.mu.Unlock()
+	if len(callsWhileLocked) != 0 {
+		t.Fatalf("operation touched the fixed stack while reconciliation held its mutex: %v", callsWhileLocked)
+	}
+	fixedStackMu.mu.Unlock()
+	locked = false
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.OperationSucceeded {
+		t.Fatalf("operation did not resume after fixed-stack mutex release: %#v", completed)
 	}
 }
 
@@ -498,7 +458,7 @@ func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
 		manifest := release.Manifest{
-			SchemaVersion: 1, Channel: "main", SourceCommit: strings.Repeat("c", 40), GeneratedAt: time.Now(), ProtocolVersion: 1, DatabaseSchemaVersion: 2,
+			SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("c", 40), GeneratedAt: time.Now(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
 			Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}},
 			Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images,
 		}
@@ -572,14 +532,14 @@ func TestReserveWaitsForLocalHostAndSandboxTerminalsBeforePlatformGate(t *testin
 	orchestrator := &Orchestrator{
 		Store: store,
 		Gate:  gate,
-		LocalUpdateBlockers: func() (running, blocking, terminable int) {
+		LocalActiveProcesses: func() int {
 			checks++
 			if checks == 1 {
-				// One protected host terminal and one terminable Sandbox terminal
-				// both delay cutover. The Manager never kills either one.
-				return 2, 1, 1
+				// Both the host and Sandbox terminals delay cutover. The Manager
+				// never kills either one to make an update proceed.
+				return 2
 			}
-			return 0, 0, 0
+			return 0
 		},
 		Sleep: func(context.Context, time.Duration) error {
 			waits++
@@ -593,7 +553,7 @@ func TestReserveWaitsForLocalHostAndSandboxTerminalsBeforePlatformGate(t *testin
 			return nil
 		},
 	}
-	if err := orchestrator.reserve(context.Background(), op.ID, false); err != nil {
+	if err := orchestrator.reserve(context.Background(), op.ID); err != nil {
 		t.Fatal(err)
 	}
 	if checks != 3 || waits != 1 || gate.reservations != 2 {
@@ -618,12 +578,12 @@ func TestReserveRechecksLocalProcessesAfterPlatformAdmissionIsFrozen(t *testing.
 	orchestrator := &Orchestrator{
 		Store: store,
 		Gate:  gate,
-		LocalUpdateBlockers: func() (running, blocking, terminable int) {
+		LocalActiveProcesses: func() int {
 			checks++
 			if checks == 2 {
-				return 1, 1, 0
+				return 1
 			}
-			return 0, 0, 0
+			return 0
 		},
 		Sleep: func(context.Context, time.Duration) error {
 			waits++
@@ -633,7 +593,7 @@ func TestReserveRechecksLocalProcessesAfterPlatformAdmissionIsFrozen(t *testing.
 			return nil
 		},
 	}
-	if err := orchestrator.reserve(context.Background(), op.ID, false); err != nil {
+	if err := orchestrator.reserve(context.Background(), op.ID); err != nil {
 		t.Fatal(err)
 	}
 	if checks != 4 || waits != 1 || len(gate.reserveIDs) != 3 || len(gate.releaseIDs) != 1 {
@@ -644,14 +604,13 @@ func TestReserveRechecksLocalProcessesAfterPlatformAdmissionIsFrozen(t *testing.
 	}
 }
 
-func TestUpdateAndLegacyInstallConfirmReservationBeforeCutover(t *testing.T) {
-	for _, kind := range []model.OperationKind{model.OperationUpdate, model.OperationInstall} {
+func TestUpdateConfirmsReservationBeforeCutover(t *testing.T) {
+	for _, kind := range []model.OperationKind{model.OperationUpdate} {
 		t.Run(string(kind), func(t *testing.T) {
 			server, url := testReleaseServer(t)
 			defer server.Close()
 			store, _ := journal.Open(t.TempDir(), time.Now())
 			engine := &fakeEngine{}
-			legacy := &preflightLegacy{}
 			var observation string
 			gate := &scriptedGate{onReserve: func(call int) {
 				if call != 2 {
@@ -665,17 +624,11 @@ func TestUpdateAndLegacyInstallConfirmReservationBeforeCutover(t *testing.T) {
 					observation = fmt.Sprintf("second reserve preceded durable maintenance: %#v", state)
 				} else if strings.Contains(strings.Join(calls, ","), "stop") {
 					observation = fmt.Sprintf("destructive engine work preceded confirmation: %v", calls)
-				} else if kind == model.OperationInstall && (legacy.preflights != 0 || legacy.cutovers != 0) {
-					observation = fmt.Sprintf("legacy cutover work preceded confirmation: %#v", legacy)
 				}
 			}}
 			orchestrator := &Orchestrator{
 				Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(),
 				ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
-			}
-			if kind == model.OperationInstall {
-				orchestrator.Legacy = legacy
-				orchestrator.LegacyGate = gate
 			}
 			op, _, err := orchestrator.Start(model.OperationRequest{Kind: kind, IdempotencyKey: "two-stage-" + string(kind), ExpectedGeneration: store.State().Generation})
 			if err != nil {
@@ -690,9 +643,6 @@ func TestUpdateAndLegacyInstallConfirmReservationBeforeCutover(t *testing.T) {
 			}
 			if len(gate.reserveIDs) != 2 || gate.reserveIDs[0] != op.ID || gate.reserveIDs[1] != op.ID {
 				t.Fatalf("reservation was not confirmed with the same operation id: %v", gate.reserveIDs)
-			}
-			if kind == model.OperationInstall && (legacy.preflights != 1 || legacy.cutovers != 1) {
-				t.Fatalf("legacy cutover did not run after confirmation: %#v", legacy)
 			}
 		})
 	}
@@ -872,7 +822,7 @@ func TestReservationResponseUncertaintyIsReleasedBeforeFailure(t *testing.T) {
 	}
 }
 
-func TestInitialSourceMigrationAuthenticationRejectionIsPermanent(t *testing.T) {
+func TestUpdateReservationAuthenticationRejectionIsPermanent(t *testing.T) {
 	releaseServer, manifestURL := testReleaseServer(t)
 	defer releaseServer.Close()
 	var reserveCalls, releaseCalls int
@@ -895,16 +845,15 @@ func TestInitialSourceMigrationAuthenticationRejectionIsPermanent(t *testing.T) 
 		t.Fatal(err)
 	}
 	engine := &fakeEngine{}
-	legacy := &preflightLegacy{}
 	gate := HTTPGate{BaseURL: gateServer.URL, Token: "wrong-manager-token", Client: gateServer.Client()}
 	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy,
+		Store: store, Engine: engine, Gate: gate,
 		Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: manifestURL,
 		Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
 	}
 	op, _, err := orchestrator.Start(model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "source-auth-rejection",
-		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40),
+		Kind: model.OperationUpdate, IdempotencyKey: "update-auth-rejection",
+		ExpectedGeneration: store.State().Generation,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -924,9 +873,6 @@ func TestInitialSourceMigrationAuthenticationRejectionIsPermanent(t *testing.T) 
 	}
 	if reserveCalls != 1 || releaseCalls != 0 {
 		t.Fatalf("definitive first-reserve rejection used the uncertainty release path: reserve=%d release=%d", reserveCalls, releaseCalls)
-	}
-	if legacy.preflights != 0 || legacy.cutovers != 0 || legacy.rollbacks != 0 {
-		t.Fatalf("authentication failure crossed the source cutover boundary: %#v", legacy)
 	}
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
@@ -999,7 +945,7 @@ func TestConfirmationAuthenticationRejectionStillReleasesFailClosed(t *testing.T
 	}
 }
 
-func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextInstallAttempt(t *testing.T) {
+func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextAttempt(t *testing.T) {
 	releaseServer, manifestURL := testReleaseServer(t)
 	defer releaseServer.Close()
 
@@ -1062,20 +1008,19 @@ func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextInstallAt
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := &preflightLegacy{}
 	gate := HTTPGate{BaseURL: gateServer.URL, Token: token, Client: gateServer.Client()}
 	orchestrator := &Orchestrator{
-		Store: store, Engine: &fakeEngine{}, Gate: gate, LegacyGate: gate, Legacy: legacy,
+		Store: store, Engine: &fakeEngine{}, Gate: gate,
 		Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: manifestURL,
 		Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
 	}
 	request := model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "source-auth-incident-recovery",
-		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40),
+		Kind: model.OperationUpdate, IdempotencyKey: "auth-incident-recovery",
+		ExpectedGeneration: store.State().Generation,
 	}
 	first, reused, err := store.Begin(request, time.Now())
 	if err != nil || reused {
-		t.Fatalf("begin first install: operation=%#v reused=%v err=%v", first, reused, err)
+		t.Fatalf("begin first operation: operation=%#v reused=%v err=%v", first, reused, err)
 	}
 	orchestrator.runUpdate(context.Background(), first)
 	pending, err := store.Operation(first.ID)
@@ -1129,13 +1074,13 @@ func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextInstallAt
 	request.ExpectedGeneration = state.Generation
 	second, reused, err := orchestrator.Start(request)
 	if err != nil || reused || second.ID == first.ID || second.Attempt != first.Attempt+1 {
-		t.Fatalf("recovered install did not start a new idempotent attempt: first=%#v second=%#v reused=%v err=%v", first, second, reused, err)
+		t.Fatalf("recovered operation did not start a new idempotent attempt: first=%#v second=%#v reused=%v err=%v", first, second, reused, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	retried, err := orchestrator.Await(ctx, second.ID)
 	if err != nil || retried.Status != model.OperationSucceeded || !retried.Finalized {
-		t.Fatalf("recovered install attempt did not complete: operation=%#v err=%v", retried, err)
+		t.Fatalf("recovered operation attempt did not complete: operation=%#v err=%v", retried, err)
 	}
 }
 
@@ -1244,8 +1189,8 @@ func TestRepeatedReservationRecoveryReplacesLatestErrorWithoutGrowth(t *testing.
 	}
 }
 
-func TestReservationRecoveryBoundsTheOriginalLegacyDiagnosticOnce(t *testing.T) {
-	original := strings.Repeat("legacy reservation response was lost\n", 100000)
+func TestReservationRecoveryBoundsTheOriginalDiagnosticOnce(t *testing.T) {
+	original := strings.Repeat("reservation response was lost\n", 100000)
 	latest := "retry reservation release: current connection failure"
 	bounded := reservationRetryDiagnostic(original, latest)
 	if len(bounded) > journal.MaxDiagnosticBytes {
@@ -1471,130 +1416,6 @@ func TestPullFailureNeverEntersMaintenance(t *testing.T) {
 	}
 }
 
-func TestSourceMigrationManifestMismatchFailsBeforePullAndMaintenance(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	engine := &fakeEngine{}
-	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	expected := strings.Repeat("c", 40)
-	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "source-mismatch", ExpectedGeneration: store.State().Generation, ManifestURL: url, ExpectedSourceCommit: expected})
-	if err != nil {
-		t.Fatal(err)
-	}
-	completed, err := orchestrator.Await(context.Background(), op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.Status != model.OperationFailed || completed.ExpectedSourceCommit != expected || !strings.Contains(completed.Error, "source migration release mismatch") {
-		t.Fatalf("mismatched source release was not durably rejected: %#v", completed)
-	}
-	state := store.State()
-	if state.Maintenance || state.Candidate != nil || state.PublicState != model.StateIdle {
-		t.Fatalf("source mismatch entered maintenance or saved a candidate: %#v", state)
-	}
-	engine.mu.Lock()
-	calls := append([]string(nil), engine.calls...)
-	engine.mu.Unlock()
-	if len(calls) != 0 {
-		t.Fatalf("source mismatch reached image or cutover operations: %v", calls)
-	}
-}
-
-func TestSourceMigrationRechecksPreflightAfterReservationBeforeCutover(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	engine := &fakeEngine{}
-	gate := &recordingGate{}
-	legacy := &preflightLegacy{preflightErr: errors.New("configuration fingerprint changed")}
-	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "stale-source-preflight", ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	completed, err := orchestrator.Await(context.Background(), op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := store.State()
-	if completed.Status != model.OperationFailed || !strings.Contains(completed.Error, "configuration fingerprint changed") || state.Maintenance || state.PublicState != model.StateIdle {
-		t.Fatalf("stale preflight did not fail at the reversible boundary: operation=%#v state=%#v", completed, state)
-	}
-	if legacy.preflights != 1 || legacy.cutovers != 0 || gate.releases != 1 {
-		t.Fatalf("unexpected cutover preflight sequence: preflights=%d cutovers=%d releases=%d", legacy.preflights, legacy.cutovers, gate.releases)
-	}
-	engine.mu.Lock()
-	calls := append([]string(nil), engine.calls...)
-	engine.mu.Unlock()
-	if strings.Contains(strings.Join(calls, ","), "stop") || strings.Contains(strings.Join(calls, ","), "migrate") {
-		t.Fatalf("failed cutover preflight reached destructive engine work: %v", calls)
-	}
-}
-
-func TestSourcePreCutoverFailureWithUnconfirmedReleaseNeverStartsRollback(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	engine := &fakeEngine{}
-	gate := &scriptedGate{releaseErr: errors.New("release response lost")}
-	legacy := &preflightLegacy{preflightErr: errors.New("configuration fingerprint changed")}
-	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "uncertain-pre-cutover-release", ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: strings.Repeat("b", 40)}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	orchestrator.runUpdate(context.Background(), op)
-	pending, err := store.Operation(op.ID)
-	state := store.State()
-	if err != nil || pending.Status != model.OperationRunning || pending.ReservationStatus != model.ReservationReleaseUncertain || state.PublicState != model.StateFailed || !state.Maintenance {
-		t.Fatalf("uncertain pre-cutover release was not held closed: state=%#v operation=%#v err=%v", state, pending, err)
-	}
-	if legacy.preflights != 1 || legacy.cutovers != 0 || legacy.rollbacks != 0 || len(gate.releaseIDs) != 1 || !gate.releaseHasBound {
-		t.Fatalf("pre-cutover failure crossed the mutation boundary: legacy=%#v gate=%#v", legacy, gate)
-	}
-	engine.mu.Lock()
-	calls := strings.Join(engine.calls, ",")
-	engine.mu.Unlock()
-	if strings.Contains(calls, "stop") {
-		t.Fatalf("pre-cutover release uncertainty stopped workloads: %s", calls)
-	}
-}
-
-func TestRecoveredSourceMigrationRetainsExpectedCommit(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	dir := t.TempDir()
-	store, _ := journal.Open(dir, time.Now())
-	expected := strings.Repeat("d", 40)
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "source-recovery", ExpectedGeneration: store.State().Generation, ManifestURL: url, ExpectedSourceCommit: expected}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := journal.Open(dir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	engine := &fakeEngine{}
-	orchestrator := &Orchestrator{Store: reopened, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	completed, err := orchestrator.Await(context.Background(), op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.Status != model.OperationFailed || completed.ExpectedSourceCommit != expected {
-		t.Fatalf("recovery lost source commit binding: %#v", completed)
-	}
-	engine.mu.Lock()
-	calls := append([]string(nil), engine.calls...)
-	engine.mu.Unlock()
-	if len(calls) != 0 {
-		t.Fatalf("recovered mismatch executed destructive work: %v", calls)
-	}
-}
-
 func TestPublicGatewayFailurePreventsGenerationCommit(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -1668,355 +1489,6 @@ func TestCandidateDiagnosticsArePersistedBeforeFailedContainerRemoval(t *testing
 	}
 }
 
-func TestSourceRollbackCheckpointsSurviveDeletedDestinationAndReleaseRetry(t *testing.T) {
-	releaseServer, manifestURL := testReleaseServer(t)
-	defer releaseServer.Close()
-
-	root := t.TempDir()
-	legacyRoot := filepath.Join(root, "legacy-checkout")
-	legacyData := filepath.Join(legacyRoot, "enterprise-agent-platform", "data")
-	if err := os.MkdirAll(legacyData, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("authoritative-legacy-db"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	dataRoot := filepath.Join(root, "managed")
-	destination := filepath.Join(dataRoot, "data")
-	stateDir := filepath.Join(dataRoot, "manager")
-	backups := filepath.Join(dataRoot, "backups")
-	runner := &legacySystemdRunner{}
-	legacy := &migration.Service{
-		StatePath:       filepath.Join(stateDir, "migration.json"),
-		DestinationData: destination,
-		BackupRoot:      backups,
-		QuarantineRoot:  filepath.Join(dataRoot, "quarantine"),
-		LegacyService:   "enterprise-agent-platform.service",
-		Runner:          runner,
-	}
-	expectedCommit := strings.Repeat("b", 40)
-	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
-		t.Fatal(err)
-	}
-	store, err := journal.Open(stateDir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshots := &countingSnapshot{store: snapshot.Store{DataDir: destination, BackupDir: backups}}
-	engine := &fakeEngine{failAt: "probe"}
-	gate := &retryGate{failOnce: true}
-	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: gate, LegacyGate: gate, Legacy: legacy,
-		Snapshots: snapshots, ReleasesDir: filepath.Join(stateDir, "releases"),
-		ManifestURL: manifestURL, Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
-	}
-	op, _, err := store.Begin(model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "source-rollback-checkpoints",
-		ExpectedGeneration: store.State().Generation, ManifestURL: manifestURL,
-		ExpectedSourceCommit: expectedCommit,
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	orchestrator.runUpdate(context.Background(), op)
-	pending, err := store.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pendingState := store.State()
-	if pending.Status != model.OperationRunning || pending.Phase != model.PhaseRollingBack ||
-		!pending.SnapshotRestored || !pending.LegacyRestored || pending.ReservationReleased ||
-		pendingState.ActiveOperationID != op.ID || !pendingState.Maintenance {
-		t.Fatalf("first rollback attempt did not persist its completed substeps: operation=%#v state=%#v", pending, pendingState)
-	}
-	if snapshots.creates != 1 || snapshots.restores != 1 || gate.releases != 1 {
-		t.Fatalf("unexpected first rollback work: creates=%d restores=%d releases=%d", snapshots.creates, snapshots.restores, gate.releases)
-	}
-	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
-		t.Fatalf("legacy rollback retained its uncommitted destination: %v", err)
-	}
-	legacyDB, err := os.ReadFile(filepath.Join(legacyData, "platform.db"))
-	if err != nil || string(legacyDB) != "authoritative-legacy-db" {
-		t.Fatalf("legacy source changed during rollback: %q %v", legacyDB, err)
-	}
-
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	completed, err := store.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	finalState := store.State()
-	if completed.Status != model.OperationFailed || !completed.Finalized ||
-		!completed.SnapshotRestored || !completed.LegacyRestored || !completed.ReservationReleased ||
-		finalState.ActiveOperationID != "" || finalState.Maintenance || finalState.PublicState != model.StateIdle {
-		t.Fatalf("checkpointed rollback did not converge: operation=%#v state=%#v", completed, finalState)
-	}
-	if snapshots.restores != 1 {
-		t.Fatalf("recovery replayed an already committed snapshot restore: %d", snapshots.restores)
-	}
-	if gate.releases != 2 {
-		t.Fatalf("recovery did not retry only the unfinished reservation release: %d", gate.releases)
-	}
-	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
-		t.Fatalf("recovery recreated the discarded source-migration destination: %v", err)
-	}
-}
-
-func TestRolledBackSourceInstallIsBoundAndRearmedOnlyAfterActiveClaim(t *testing.T) {
-	releaseServer, manifestURL := testReleaseServer(t)
-	defer releaseServer.Close()
-	root := t.TempDir()
-	legacyRoot := filepath.Join(root, "legacy-checkout")
-	legacyData := filepath.Join(legacyRoot, "data")
-	if err := os.MkdirAll(legacyData, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("legacy-db"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	dataRoot := filepath.Join(root, "managed")
-	stateDir := filepath.Join(dataRoot, "manager")
-	expectedCommit := strings.Repeat("b", 40)
-	legacy := &migration.Service{
-		StatePath: filepath.Join(stateDir, "migration.json"), DestinationData: filepath.Join(dataRoot, "data"),
-		BackupRoot: filepath.Join(dataRoot, "backups"), QuarantineRoot: filepath.Join(dataRoot, "quarantine"),
-		LegacyService: "enterprise-agent-platform.service", Runner: &legacySystemdRunner{},
-	}
-	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
-		t.Fatal(err)
-	}
-	if err := legacy.Cutover(context.Background(), "previous-attempt"); err != nil {
-		t.Fatal(err)
-	}
-	if err := legacy.Rollback(context.Background(), "previous-attempt"); err != nil {
-		t.Fatal(err)
-	}
-	store, err := journal.Open(stateDir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy.CanRearm = func(plan migration.Plan, operationID string) bool {
-		state := store.State()
-		if state.ActiveOperationID != operationID || state.FinalizePendingOperationID != "" {
-			return false
-		}
-		active, readErr := store.Operation(operationID)
-		return readErr == nil && active.Kind == model.OperationInstall && active.Status == model.OperationRunning && active.ExpectedSourceCommit == plan.ExpectedSourceCommit
-	}
-	engine := &fakeEngine{failAt: "pull"}
-	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: fakeGate{}, LegacyGate: fakeGate{}, Legacy: legacy,
-		Snapshots: fakeSnapshot{}, ReleasesDir: filepath.Join(stateDir, "releases"),
-		ManifestURL: manifestURL, Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
-	}
-	op, _, err := orchestrator.Start(model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "claimed-source-retry",
-		ExpectedGeneration: store.State().Generation,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	completed, err := orchestrator.Await(context.Background(), op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.ExpectedSourceCommit != expectedCommit || completed.Status != model.OperationFailed {
-		t.Fatalf("rolled-back source install escaped its source binding: %#v", completed)
-	}
-	plan, err := legacy.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Status != "configured" || plan.OperationID != "" || !legacy.Active() {
-		t.Fatalf("active install did not rearm the exact rolled-back plan: %#v", plan)
-	}
-}
-
-func TestFreshInstallClaimPreventsConcurrentFirstLegacyConfigure(t *testing.T) {
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "manager")
-	store, err := journal.Open(stateDir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimMu := &sync.Mutex{}
-	legacy := &migration.Service{
-		StatePath: filepath.Join(stateDir, "migration.json"), DestinationData: filepath.Join(root, "managed-data"),
-		BackupRoot: filepath.Join(root, "backups"), QuarantineRoot: filepath.Join(root, "quarantine"),
-		LegacyService: "enterprise-agent-platform.service", ClaimMu: claimMu,
-	}
-	legacy.CanConfigure = func() bool {
-		state := store.State()
-		return state.ActiveOperationID == "" && state.FinalizePendingOperationID == ""
-	}
-	releaseStarted := make(chan struct{})
-	releaseFinish := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		select {
-		case <-releaseStarted:
-		default:
-			close(releaseStarted)
-		}
-		<-releaseFinish
-		response.Header().Set("Content-Type", "application/json")
-		_, _ = response.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-	orchestrator := &Orchestrator{
-		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Legacy: legacy, LegacyClaimMu: claimMu,
-		Snapshots: fakeSnapshot{}, ReleasesDir: filepath.Join(stateDir, "releases"),
-		ManifestURL: server.URL, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
-		PollInterval: time.Millisecond,
-	}
-	op, _, err := orchestrator.Start(model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "fresh-install-claim",
-		ExpectedGeneration: store.State().Generation,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-releaseStarted:
-	case <-time.After(time.Second):
-		t.Fatal("fresh install did not retain its active claim")
-	}
-	legacyRoot := filepath.Join(root, "legacy")
-	legacyData := filepath.Join(legacyRoot, "data")
-	if err := os.MkdirAll(legacyData, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", strings.Repeat("b", 40)); err == nil || !strings.Contains(err.Error(), "operation is active") {
-		t.Fatalf("concurrent Configure changed a claimed fresh install: %v", err)
-	}
-	if _, err := os.Lstat(legacy.StatePath); !os.IsNotExist(err) {
-		t.Fatalf("rejected Configure persisted a migration plan: %v", err)
-	}
-	close(releaseFinish)
-	completed, err := orchestrator.Await(context.Background(), op.ID)
-	if err != nil || completed.Status != model.OperationFailed {
-		t.Fatalf("fresh install did not settle after test release failure: %#v %v", completed, err)
-	}
-}
-
-func TestRecoverLegacyRollbackJournalWithoutCheckpointsRecreatesMissingDataSafely(t *testing.T) {
-	root := t.TempDir()
-	legacyRoot := filepath.Join(root, "legacy-checkout")
-	legacyData := filepath.Join(legacyRoot, "data")
-	if err := os.MkdirAll(legacyData, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacyData, "platform.db"), []byte("legacy-db"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	dataRoot := filepath.Join(root, "managed")
-	destination := filepath.Join(dataRoot, "data")
-	stateDir := filepath.Join(dataRoot, "manager")
-	backups := filepath.Join(dataRoot, "backups")
-	runner := &legacySystemdRunner{}
-	legacy := &migration.Service{
-		StatePath:       filepath.Join(stateDir, "migration.json"),
-		DestinationData: destination,
-		BackupRoot:      backups,
-		QuarantineRoot:  filepath.Join(dataRoot, "quarantine"),
-		LegacyService:   "enterprise-agent-platform.service",
-		Runner:          runner,
-	}
-	expectedCommit := strings.Repeat("b", 40)
-	if _, err := legacy.Configure(legacyRoot, legacyData, "enterprise-agent-platform.service", expectedCommit); err != nil {
-		t.Fatal(err)
-	}
-	store, err := journal.Open(stateDir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{
-		Kind: model.OperationInstall, IdempotencyKey: "legacy-rollback-without-checkpoints",
-		ExpectedGeneration: store.State().Generation, ExpectedSourceCommit: expectedCommit,
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := legacy.Cutover(context.Background(), op.ID); err != nil {
-		t.Fatal(err)
-	}
-	snapshots := &countingSnapshot{store: snapshot.Store{DataDir: destination, BackupDir: backups}}
-	snapshotPath, err := snapshots.Create(context.Background(), op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := legacy.Rollback(context.Background(), op.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
-		t.Fatalf("test did not reproduce the deleted rollback destination: %v", err)
-	}
-	// Reproduce the old retry timer racing the still-active operation: legacy
-	// Configure used to turn rolled_back back into configured and clear the
-	// operation binding even though the operation journal remained rolling_back.
-	legacy.CanRearm = func(migration.Plan, string) bool { return true }
-	if err := legacy.Rearm("old-timer-rearm"); err != nil {
-		t.Fatal(err)
-	}
-	rearmed, err := legacy.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rearmed.Status != "configured" || rearmed.OperationID != "" {
-		t.Fatalf("test did not reproduce the legacy timer rearm: %#v", rearmed)
-	}
-	if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationRunning
-		value.Phase = model.PhaseRollingBack
-		value.ReservationStatus = model.ReservationMutationStarted
-		value.SnapshotPath = snapshotPath
-		value.Error = "container platform is unhealthy"
-		value.UpdatedAt = time.Now().UTC()
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.MutateState(time.Now(), func(value *model.ManagerState) error {
-		value.Phase = model.PhaseRollingBack
-		value.PublicState = model.StateFailed
-		value.Maintenance = true
-		value.LastError = "container platform is unhealthy; rollback failed: inspect data directory"
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	orchestrator := &Orchestrator{
-		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, LegacyGate: fakeGate{},
-		Legacy: legacy, Snapshots: snapshots,
-	}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	completed, err := store.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := store.State()
-	if completed.Status != model.OperationFailed || !completed.Finalized ||
-		!completed.SnapshotRestored || !completed.LegacyRestored || !completed.ReservationReleased ||
-		state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
-		t.Fatalf("legacy checkpoint-free rollback did not recover: operation=%#v state=%#v", completed, state)
-	}
-	if snapshots.restores != 1 {
-		t.Fatalf("missing destination was not restored exactly once: %d", snapshots.restores)
-	}
-	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
-		t.Fatalf("recovered legacy rollback retained the uncommitted destination: %v", err)
-	}
-	legacyDB, err := os.ReadFile(filepath.Join(legacyData, "platform.db"))
-	if err != nil || string(legacyDB) != "legacy-db" {
-		t.Fatalf("checkpoint-free recovery changed authoritative legacy data: %q %v", legacyDB, err)
-	}
-}
-
 func TestCheckClearsCandidateWhenReleaseMatchesCurrentGeneration(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -2032,33 +1504,6 @@ func TestCheckClearsCandidateWhenReleaseMatchesCurrentGeneration(t *testing.T) {
 	}
 	if candidate := store.State().Candidate; candidate != nil {
 		t.Fatalf("same-generation check left a false update target: %#v", candidate)
-	}
-}
-
-func TestCheckExpectedRejectsSourceMismatchBeforeStateMutation(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.LastError = "retain historical failure until exact release is proven"
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	orchestrator := &Orchestrator{
-		Store: store, Engine: &fakeEngine{}, ReleasesDir: t.TempDir(), Channel: "main",
-		ReleaseClient: release.Client{HTTP: server.Client()},
-	}
-	_, err = orchestrator.CheckExpected(context.Background(), url, strings.Repeat("a", 40))
-	if err == nil || !strings.Contains(err.Error(), "source migration release mismatch") {
-		t.Fatalf("mismatched source release was accepted: %v", err)
-	}
-	state := store.State()
-	if state.Candidate != nil || state.LastError != "retain historical failure until exact release is proven" {
-		t.Fatalf("mismatched check changed Manager state: %#v", state)
 	}
 }
 
@@ -2190,144 +1635,6 @@ func TestRecoverRetriesDurableFinalizePendingAfterStateCommit(t *testing.T) {
 	}
 }
 
-func TestRecoverFinalizeWaitsForGateLegacyCleanupAndSelfUpdate(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	gate := &retryGate{failOnce: true}
-	legacy := &retryLegacy{failOnce: true}
-	selfUpdate := &recordingSelfUpdate{failActivateOnce: true, pendingCommitChecks: 1}
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Legacy: legacy, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	manifest, err := orchestrator.Check(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "all-finalize-hooks", ExpectedGeneration: store.State().Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationSucceeded
-		value.TargetGeneration = manifest.ID()
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.MutateState(time.Now(), func(value *model.ManagerState) error {
-		value.ActiveOperationID = ""
-		value.Current = value.Candidate
-		value.Candidate = nil
-		value.FinalizePendingOperationID = op.ID
-		value.PublicState = model.StateUpdating
-		value.Maintenance = true
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Each injected hook failure must leave a closed, durable pending state. A
-	// later startup retries idempotently from the beginning of the hook chain.
-	for attempt := 1; attempt <= 4; attempt++ {
-		if err := orchestrator.Recover(context.Background()); err == nil {
-			t.Fatalf("attempt %d unexpectedly finalized", attempt)
-		}
-		state := store.State()
-		if state.FinalizePendingOperationID != op.ID || !state.Maintenance {
-			t.Fatalf("attempt %d lost durable finalize state: %#v", attempt, state)
-		}
-		current, readErr := store.Operation(op.ID)
-		if readErr != nil || current.Finalized {
-			t.Fatalf("attempt %d acknowledged incomplete hooks: %#v %v", attempt, current, readErr)
-		}
-		switch attempt {
-		case 1, 2:
-			if legacy.commits != 0 || gate.releases != 0 {
-				t.Fatalf("finalize cleanup or reservation release ran before watchdog commit on attempt %d: cleanup=%d release=%d", attempt, legacy.commits, gate.releases)
-			}
-		case 3:
-			if legacy.commits != 1 || legacy.committed || gate.releases != 0 {
-				t.Fatalf("failed cleanup released admission on attempt %d: cleanup=%d committed=%v release=%d", attempt, legacy.commits, legacy.committed, gate.releases)
-			}
-		case 4:
-			if legacy.commits != 2 || !legacy.committed || gate.releases != 1 {
-				t.Fatalf("reservation was not attempted strictly after durable cleanup: cleanup=%d committed=%v release=%d", legacy.commits, legacy.committed, gate.releases)
-			}
-		}
-	}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	state := store.State()
-	completed, err := store.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || !completed.Finalized {
-		t.Fatalf("finalize protocol did not acknowledge every hook: state=%#v op=%#v", state, completed)
-	}
-	if gate.releases != 2 || legacy.commits != 2 || !legacy.committed || selfUpdate.marked != 5 || selfUpdate.activated != 5 {
-		t.Fatalf("unexpected retry sequence: gate=%d legacy=%d self=%#v", gate.releases, legacy.commits, selfUpdate)
-	}
-}
-
-func TestSourceCleanupIsDurableBeforeReservationRelease(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	gate := &recordingGate{}
-	legacy := &retryLegacy{failOnce: true}
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Legacy: legacy, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
-	manifest, err := orchestrator.Check(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "cleanup-before-release", ExpectedGeneration: store.State().Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationSucceeded
-		value.TargetGeneration = manifest.ID()
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.MutateState(time.Now(), func(value *model.ManagerState) error {
-		value.ActiveOperationID = ""
-		value.Current = value.Candidate
-		value.Candidate = nil
-		value.FinalizePendingOperationID = op.ID
-		value.PublicState = model.StateUpdating
-		value.Maintenance = true
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := orchestrator.Recover(context.Background()); err == nil {
-		t.Fatal("expected injected cleanup persistence failure")
-	}
-	pending := store.State()
-	if gate.releases != 0 || legacy.committed || pending.FinalizePendingOperationID != op.ID || !pending.Maintenance {
-		t.Fatalf("cleanup failure released admission: gate=%d legacy=%#v state=%#v", gate.releases, legacy, pending)
-	}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	final := store.State()
-	completed, err := store.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !legacy.committed || legacy.commits != 2 || gate.releases != 1 || final.FinalizePendingOperationID != "" || final.Maintenance || !completed.Finalized {
-		t.Fatalf("cleanup recovery did not release exactly after durable completion: gate=%d legacy=%#v state=%#v operation=%#v", gate.releases, legacy, final, completed)
-	}
-}
-
 func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -2382,7 +1689,7 @@ func writeRollbackManifest(t *testing.T, dir, commit string) string {
 		images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
 	manifest := release.Manifest{
-		SchemaVersion: 1, Channel: "main", SourceCommit: commit, GeneratedAt: time.Now(), ProtocolVersion: 1, DatabaseSchemaVersion: 2,
+		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: commit, GeneratedAt: time.Now(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
 		Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: "http://127.0.0.1/manager", SHA256: strings.Repeat("b", 64)}}},
 		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("c", 64)}, Images: images,
 	}
@@ -2395,191 +1702,6 @@ func writeRollbackManifest(t *testing.T, dir, commit string) string {
 		t.Fatal(err)
 	}
 	return path
-}
-
-type retirementProbeFixture struct {
-	store        *journal.Store
-	orchestrator *Orchestrator
-	engine       *fakeEngine
-	snapshots    *retirementSnapshot
-	selfUpdate   *recordingSelfUpdate
-	currentID    string
-	snapshotPath string
-	publicErr    error
-	publicCalls  int
-	running      int
-	blockerCalls int
-}
-
-func newRetirementProbeFixture(t *testing.T) *retirementProbeFixture {
-	t.Helper()
-	dir := t.TempDir()
-	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentID, previousID := strings.Repeat("d", 40), strings.Repeat("c", 40)
-	currentPath := writeRollbackManifest(t, dir, currentID)
-	previousPath := writeRollbackManifest(t, dir, previousID)
-	snapshotPath := "/snapshots/before-current"
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: currentID, ManifestPath: currentPath, RollbackSnapshotPath: snapshotPath}
-		state.Previous = &model.Generation{ID: previousID, ManifestPath: previousPath}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	fixture := &retirementProbeFixture{
-		store:        store,
-		engine:       &fakeEngine{},
-		snapshots:    &retirementSnapshot{},
-		selfUpdate:   &recordingSelfUpdate{},
-		currentID:    currentID,
-		snapshotPath: snapshotPath,
-	}
-	fixture.orchestrator = &Orchestrator{
-		Store:      fixture.store,
-		Engine:     fixture.engine,
-		Snapshots:  fixture.snapshots,
-		SelfUpdate: fixture.selfUpdate,
-		Channel:    "main",
-		PublicProbe: func(context.Context) error {
-			fixture.publicCalls++
-			return fixture.publicErr
-		},
-		LocalUpdateBlockers: func() (running, blocking, terminable int) {
-			fixture.blockerCalls++
-			return fixture.running, fixture.running, 0
-		},
-	}
-	return fixture
-}
-
-func TestProbeLegacyRetirementRequiresIdleManager(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*model.ManagerState)
-	}{
-		{name: "active operation", mutate: func(state *model.ManagerState) { state.ActiveOperationID = "op_active" }},
-		{name: "finalize pending", mutate: func(state *model.ManagerState) { state.FinalizePendingOperationID = "op_pending" }},
-		{name: "maintenance", mutate: func(state *model.ManagerState) { state.Maintenance = true }},
-		{name: "non-idle public state", mutate: func(state *model.ManagerState) { state.PublicState = model.StateUpdating }},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fixture := newRetirementProbeFixture(t)
-			if _, err := fixture.store.MutateState(time.Now(), func(state *model.ManagerState) error {
-				test.mutate(state)
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), "not idle") {
-				t.Fatalf("non-idle Manager passed source retirement: generation=%q err=%v", generation, err)
-			}
-			if fixture.engine.retirementCalls != 0 || len(fixture.snapshots.verified) != 0 || fixture.publicCalls != 0 || fixture.selfUpdate.commitChecks != 0 || fixture.blockerCalls != 0 {
-				t.Fatalf("non-idle Manager ran downstream retirement probes: fixture=%#v", fixture)
-			}
-		})
-	}
-}
-
-func TestProbeLegacyRetirementRequiresRollbackGenerationAndSnapshot(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*model.ManagerState)
-		want   string
-	}{
-		{name: "current generation", mutate: func(state *model.ManagerState) { state.Current = nil }, want: "current generation is unavailable"},
-		{name: "previous generation", mutate: func(state *model.ManagerState) { state.Previous = nil }, want: "rollback generation or database snapshot is unavailable"},
-		{name: "rollback snapshot", mutate: func(state *model.ManagerState) { state.Current.RollbackSnapshotPath = "" }, want: "rollback generation or database snapshot is unavailable"},
-		{name: "current identity", mutate: func(state *model.ManagerState) { state.Current.ID = strings.Repeat("e", 40) }, want: "current generation identity"},
-		{name: "previous identity", mutate: func(state *model.ManagerState) { state.Previous.ID = strings.Repeat("e", 40) }, want: "previous generation identity"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fixture := newRetirementProbeFixture(t)
-			if _, err := fixture.store.MutateState(time.Now(), func(state *model.ManagerState) error {
-				test.mutate(state)
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("incomplete rollback boundary passed retirement: generation=%q err=%v", generation, err)
-			}
-		})
-	}
-}
-
-func TestProbeLegacyRetirementFailsClosedWhenReadinessCapabilitiesAreUnavailable(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*retirementProbeFixture)
-	}{
-		{name: "snapshot verifier", mutate: func(f *retirementProbeFixture) { f.orchestrator.Snapshots = fakeSnapshot{} }},
-		{name: "Docker retirement probe", mutate: func(f *retirementProbeFixture) {
-			f.orchestrator.Engine = engineWithoutRetirementProbe{Engine: f.engine}
-		}},
-		{name: "public gateway probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.PublicProbe = nil }},
-		{name: "Manager activation probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.SelfUpdate = nil }},
-		{name: "running task probe", mutate: func(f *retirementProbeFixture) { f.orchestrator.LocalUpdateBlockers = nil }},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fixture := newRetirementProbeFixture(t)
-			test.mutate(fixture)
-			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" {
-				t.Fatalf("missing readiness capability passed retirement: generation=%q err=%v", generation, err)
-			}
-		})
-	}
-}
-
-func TestProbeLegacyRetirementPropagatesReadinessFailures(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*retirementProbeFixture)
-		want   string
-	}{
-		{name: "snapshot", mutate: func(f *retirementProbeFixture) { f.snapshots.verifyErr = errors.New("snapshot corrupt") }, want: "verify current rollback snapshot"},
-		{name: "Docker", mutate: func(f *retirementProbeFixture) { f.engine.retirementErr = errors.New("Firecrawl unhealthy") }, want: "container retirement readiness"},
-		{name: "public gateway", mutate: func(f *retirementProbeFixture) { f.publicErr = errors.New("gateway unavailable") }, want: "public gateway retirement readiness"},
-		{name: "Manager activation check", mutate: func(f *retirementProbeFixture) {
-			f.selfUpdate.activationErr = errors.New("activation journal unreadable")
-		}, want: "verify current Manager activation"},
-		{name: "Manager activation pending", mutate: func(f *retirementProbeFixture) { f.selfUpdate.pendingCommitChecks = 1 }, want: "activation is not committed"},
-		{name: "running tasks", mutate: func(f *retirementProbeFixture) { f.running = 1 }, want: "registered running tasks"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fixture := newRetirementProbeFixture(t)
-			test.mutate(fixture)
-			if generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background()); err == nil || generation != "" || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("failed readiness probe passed retirement: generation=%q err=%v", generation, err)
-			}
-		})
-	}
-}
-
-func TestProbeLegacyRetirementReturnsVerifiedCurrentGeneration(t *testing.T) {
-	fixture := newRetirementProbeFixture(t)
-	generation, err := fixture.orchestrator.ProbeLegacyRetirement(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if generation != fixture.currentID {
-		t.Fatalf("retirement bound the wrong generation: got %q want %q", generation, fixture.currentID)
-	}
-	if strings.Join(fixture.snapshots.verified, ",") != fixture.snapshotPath {
-		t.Fatalf("retirement verified the wrong database snapshot: %v", fixture.snapshots.verified)
-	}
-	fixture.engine.mu.Lock()
-	retirementCalls, retirementID := fixture.engine.retirementCalls, fixture.engine.retirementID
-	fixture.engine.mu.Unlock()
-	if retirementCalls != 1 || retirementID != fixture.currentID || fixture.publicCalls != 1 || fixture.selfUpdate.commitChecks != 1 || fixture.blockerCalls != 1 {
-		t.Fatalf("retirement did not prove every readiness boundary: engine=%d/%q public=%d manager=%d blockers=%d", retirementCalls, retirementID, fixture.publicCalls, fixture.selfUpdate.commitChecks, fixture.blockerCalls)
-	}
 }
 
 func TestConsecutiveRollbacksBindSnapshotToNewCurrentGeneration(t *testing.T) {

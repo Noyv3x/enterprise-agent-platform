@@ -31,7 +31,7 @@ from enterprise_agent_platform.service import EnterpriseService
 from test_platform import RecordingAgent, make_config
 
 
-class FailingThenRecoveringAgent:
+class FailingThenRecoveringAgent(RecordingAgent):
     """Raises on the first generate() call and succeeds afterwards so the
     worker's error-recovery path (surface last_error, then drain next task) can
     be exercised deterministically."""
@@ -296,7 +296,17 @@ class InternalConfigTests(unittest.TestCase):
                 self.assertEqual(values.get(key), expected, key)
 
 class ConfigFromEnvTests(unittest.TestCase):
-    def test_source_migration_bridge_requires_and_exposes_absolute_manager_paths(self):
+    def setUp(self):
+        self._container_env = mock.patch.dict(
+            os.environ,
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
+        )
+        self._container_env.start()
+
+    def tearDown(self):
+        self._container_env.stop()
+
+    def test_container_mode_requires_and_exposes_absolute_manager_paths(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             socket_path = root / "manager" / "control" / "manager.sock"
@@ -304,22 +314,21 @@ class ConfigFromEnvTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UBITECH_DEPLOYMENT_MODE": "source",
-                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_DEPLOYMENT_MODE": "container",
                     "UBITECH_MANAGER_SOCKET": str(socket_path),
                     "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
                 },
                 clear=True,
             ):
                 config = PlatformConfig.from_env(root)
-            self.assertEqual(config.deployment_mode, "source")
             self.assertEqual(config.manager_socket, socket_path)
             self.assertEqual(config.manager_token_file, token_path)
+            self.assertEqual(config.firecrawl_api_url, "http://firecrawl-api:3002")
 
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UBITECH_SOURCE_MIGRATION_BRIDGE": "1",
+                    "UBITECH_DEPLOYMENT_MODE": "container",
                     "UBITECH_MANAGER_SOCKET": "relative.sock",
                     "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
                 },
@@ -328,34 +337,10 @@ class ConfigFromEnvTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be absolute"):
                     PlatformConfig.from_env(root)
 
-    def test_source_mode_ignores_manager_paths_without_explicit_migration_bridge(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "UBITECH_DEPLOYMENT_MODE": "source",
-                "UBITECH_MANAGER_SOCKET": "/tmp/untrusted.sock",
-                "UBITECH_MANAGER_TOKEN_FILE": "/tmp/untrusted-token",
-            },
-            clear=True,
-        ):
-            config = PlatformConfig.from_env(Path("/tmp"))
-        self.assertIsNone(config.manager_socket)
-        self.assertIsNone(config.manager_token_file)
-
-    def test_host_execution_defaults_enable_agent_runtime_and_ignore_removed_container_env(self):
-        key = "ENTERPRISE_CONTAINER_BACKEND"
-        previous = os.environ.get(key)
-        os.environ[key] = "docker"
-        try:
-            config = PlatformConfig.from_env(Path("/tmp"))
-            self.assertTrue(config.manage_agent_runtime)
-            self.assertEqual(config.agent_runtime_url, "http://127.0.0.1:8766")
-            self.assertFalse(hasattr(config, "container_backend"))
-        finally:
-            if previous is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = previous
+    def test_missing_container_mode_is_rejected(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be 'container'"):
+                PlatformConfig.from_env(Path("/tmp"))
 
     def test_non_numeric_port_raises_descriptive_value_error(self):
         previous = os.environ.get("ENTERPRISE_PLATFORM_PORT")

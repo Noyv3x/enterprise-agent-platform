@@ -1,12 +1,7 @@
 /* Chat slice — channels, view/scope, messages, drafts, agent statuses, mentions,
-   typing, private-telegram. Phase 1 stubs the plain field setters + the session
-   reset; the optimistic-message lifecycle, agent-status writes, and run toggles
-   are filled by Phase 4a (default: return state here).
-
-   Phase 3 adds the permission coercion to SET_ACTIVE_VIEW (legacy renderShell
-   guard, legacy-app.js:408-409): a user lacking access to admin/private is
-   silently redirected to channel. The reactive demotion case (permissions change
-   while viewing) is handled by <ContentRouter>'s coercion effect. */
+   typing and private Telegram state. SET_ACTIVE_VIEW redirects users without
+   access to admin/private back to a channel; <ContentRouter> handles permission
+   changes that occur while a restricted view is open. */
 
 import { hasPermission, isAdmin } from "../selectors";
 import { mergeAgentStatus, mergeAgentStatuses } from "../agentStatus";
@@ -125,9 +120,8 @@ export function chatReducer(state: AppState, action: Action): AppState {
     case "SET_PRIVATE_TELEGRAM_EXPANDED":
       return { ...state, privateTelegramExpanded: action.payload };
 
-    /* ------------------- optimistic message lifecycle (Phase 4a) -------------
-       appendOptimisticMessage / replaceOptimisticMessage / removeOptimisticMessage
-       (legacy-app.js:2963-3005). The optimistic message object is pushed by
+    /* ------------------------- optimistic message lifecycle ------------------
+       The optimistic message object is pushed by
        reference into BOTH pendingMessages and the visible list, so revoking its
        blob: preview URLs once (in the REPLACE/REMOVE transition that drops it)
        frees every attachment. The "only touch the visible list if the scope is
@@ -160,7 +154,7 @@ export function chatReducer(state: AppState, action: Action): AppState {
           }
         }
         // The visible scope may have changed or a refresh may have omitted the
-        // optimistic row. Preserve the legacy append fallback in that case.
+        // optimistic row. Append the saved message when replacement is impossible.
         if (
           saved &&
           !savedAlreadyPresent &&
@@ -199,8 +193,8 @@ export function chatReducer(state: AppState, action: Action): AppState {
       return { ...state, pendingMessages };
     }
 
-    /* Per-scope agent-status write (legacy setAgentStatus, :2862-2866): no-op on a
-       falsy status; otherwise replace just that scope's entry. */
+    /* Per-scope Agent status write: no-op on a falsy status; otherwise replace
+       just that scope's entry. */
     case "SET_AGENT_STATUS": {
       const { mode, scopeId, status, authoritative } = action.payload;
       if (!status) return state;
@@ -229,8 +223,7 @@ export function chatReducer(state: AppState, action: Action): AppState {
       };
     }
 
-    /* Per-run <details> open/closed memory (legacy renderAgentWorkCard summary
-       onclick, :981-985). */
+    /* Per-run <details> open/closed memory. */
     case "TOGGLE_AGENT_RUN":
       return {
         ...state,

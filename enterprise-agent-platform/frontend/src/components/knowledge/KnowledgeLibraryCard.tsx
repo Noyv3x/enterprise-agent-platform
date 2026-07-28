@@ -1,5 +1,5 @@
-/* <KnowledgeLibraryCard/> — the "条目库" card (legacy-app.js:1291-1322): search
-   form, the search-result note, the document list, and the inline viewer. Owns
+/* <KnowledgeLibraryCard/> — the "条目库" card: search form, the search-result note,
+   the document list and the inline viewer. Owns
    the doc-view trigger reference so closing the viewer restores focus to the
    exact "查看正文" button that opened it (the focus handoff on close). */
 

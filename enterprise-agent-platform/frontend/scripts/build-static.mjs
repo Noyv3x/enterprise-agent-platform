@@ -31,14 +31,9 @@ const FIXED_FILES = new Set([
   "index.html",
   "theme-init.js",
   "ubitech-logo.png",
-  "app.js",
-  "styles.css",
   RELEASE_MANIFEST,
 ]);
 const HASHED_ASSET_RE = /-[A-Za-z0-9_-]{8,}\.(?:js|css)$/;
-const MANAGED_ASSET_RE = /^(?:.*\/)?(?:app-|chunk-|styles-|asset-).+/;
-const FIXED_VARIANT_RE = /^(?:index\.html|theme-init\.js|app\.js|styles\.css)\.(?:br|gz)$/;
-const LEGACY_ASSETS = new Set(["app.js", "styles.css"]);
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const COMPRESSIBLE_ASSET_RE = /\.(?:css|html|js|json|map|svg|txt|xml)$/i;
 const PRECOMPRESS_MIN_BYTES = 512;
@@ -186,13 +181,27 @@ export async function atomicPublish(
     ...files.filter((name) => !entrySet.has(name)),
     ...entryFiles.filter((name) => files.includes(name)),
   ];
+  const stagedFiles = new Set(files);
+  const staleFiles = (await listFiles(liveDir)).filter((name) => !stagedFiles.has(name));
   const releaseId = `${process.pid}-${Date.now()}`;
   const rollbackDir = join(stageDir, ".rollback");
   const installed = [];
   let committed = false;
+  let staleFilesRemoved = false;
 
   try {
     for (const relativePath of ordered) {
+      if (entrySet.has(relativePath) && !staleFilesRemoved) {
+        for (const stalePath of staleFiles) {
+          const destination = assertInside(liveDir, stalePath);
+          const backup = join(rollbackDir, stalePath);
+          await mkdir(dirname(backup), { recursive: true });
+          await copyFile(destination, backup);
+          await rm(destination, { force: true });
+          installed.push({ relativePath: stalePath, destination, backup });
+        }
+        staleFilesRemoved = true;
+      }
       if (relativePath === "index.html") await beforeCommit?.();
       const source = assertInside(stageDir, relativePath);
       const destination = assertInside(liveDir, relativePath);
@@ -233,60 +242,6 @@ export async function atomicPublish(
   }
 }
 
-async function readManifest(liveDir) {
-  try {
-    const parsed = JSON.parse(await readFile(join(liveDir, RELEASE_MANIFEST), "utf8"));
-    return Array.isArray(parsed?.current_assets) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function assetsReferencedByLiveIndex(liveDir) {
-  try {
-    const indexHtml = await readFile(join(liveDir, "index.html"), "utf8");
-    const { scripts, styles } = extractEntryAssets(indexHtml);
-    return [...scripts, ...styles];
-  } catch {
-    return [];
-  }
-}
-
-function isManagedAsset(relativePath) {
-  return LEGACY_ASSETS.has(relativePath)
-    || FIXED_VARIANT_RE.test(relativePath)
-    || MANAGED_ASSET_RE.test(relativePath);
-}
-
-export function retainedPreviousAssets(currentAssets, previousManifest, discoveredAssets = []) {
-  const current = new Set(currentAssets);
-  const oldCurrent = Array.isArray(previousManifest?.current_assets)
-    ? previousManifest.current_assets
-    : discoveredAssets;
-  const sameRelease =
-    !!previousManifest &&
-    current.size === new Set(oldCurrent).size &&
-    oldCurrent.every((name) => current.has(name));
-  const candidates = sameRelease
-    ? previousManifest.previous_assets || []
-    : oldCurrent;
-  return [...new Set(candidates)].filter((name) => !current.has(name));
-}
-
-async function removeStaleAssets(liveDir, keep, previousManifest) {
-  const files = await listFiles(liveDir);
-  const known = new Set([
-    ...(previousManifest?.current_assets || []),
-    ...(previousManifest?.previous_assets || []),
-  ]);
-  for (const relativePath of files) {
-    if (FIXED_FILES.has(relativePath) || keep.has(relativePath)) continue;
-    if (isManagedAsset(relativePath) || known.has(relativePath)) {
-      await rm(join(liveDir, relativePath), { force: true });
-    }
-  }
-}
-
 function runVite(stageDir) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(
@@ -309,17 +264,6 @@ async function copyLogoIntoStage(stageDir) {
     throw new Error("ubitech-logo.png is missing from both frontend/public and live static");
   }
   await copyFile(source, join(stageDir, "ubitech-logo.png"));
-}
-
-async function writeLegacyEntrypoints(stageDir, validated) {
-  // Keep the pre-hashed entry URLs valid across the first migration release.
-  // Older index.html responses may still request these names while a deploy is
-  // replacing the live tree; the tiny shims always point at the new build.
-  if (validated.scripts.length !== 1 || validated.styles.length !== 1) {
-    throw new Error("legacy entrypoint shims require exactly one JavaScript and CSS entry");
-  }
-  await writeFile(join(stageDir, "app.js"), `import "/${validated.scripts[0]}";\n`, "utf8");
-  await writeFile(join(stageDir, "styles.css"), `@import url("/${validated.styles[0]}");\n`, "utf8");
 }
 
 export async function precompressStaticAssets(stageDir) {
@@ -366,32 +310,18 @@ async function main() {
     if (stageDevice !== liveParentDevice) throw new Error("static staging must share the live filesystem");
     await runVite(stageDir);
     await copyLogoIntoStage(stageDir);
-    const validated = await validateStagedBuild(stageDir);
-    await writeLegacyEntrypoints(stageDir, validated);
+    await validateStagedBuild(stageDir);
     await precompressStaticAssets(stageDir);
-    const previousManifest = await readManifest(liveStaticDir);
-    const discoveredPrevious = await assetsReferencedByLiveIndex(liveStaticDir);
     // Re-read the staged tree after precompression. The release manifest is
-    // also the post-publish cleanup allowlist, so omitting .br/.gz sidecars
-    // here would cause removeStaleAssets() to delete the new variants
-    // immediately after a successful publication.
+    // the authoritative inventory, so it must include .br/.gz sidecars.
     const currentAssets = (await listFiles(stageDir)).filter(
       (name) => !FIXED_FILES.has(name),
     );
-    const previousAssets = retainedPreviousAssets(currentAssets, previousManifest, discoveredPrevious);
     const manifest = {
-      version: 1,
+      version: 2,
       current_assets: currentAssets,
-      previous_assets: previousAssets,
     };
     await atomicPublish(stageDir, liveStaticDir, manifest);
-
-    // Keep one previous content-hashed release for already-open pages. Cleanup
-    // is post-commit and best-effort; publication is already complete here.
-    const keep = new Set([...currentAssets, ...previousAssets]);
-    await removeStaleAssets(liveStaticDir, keep, previousManifest).catch((error) => {
-      process.stderr.write(`Static build published; stale-asset cleanup skipped: ${error?.message || error}\n`);
-    });
     process.stdout.write(`Static build published atomically to ${liveStaticDir}\n`);
   } finally {
     await rm(stageDir, { recursive: true, force: true });

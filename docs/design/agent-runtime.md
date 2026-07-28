@@ -4,7 +4,7 @@
 
 ## 所有权
 
-Runtime 直接依赖 lockfile 中精确版本的 Pi Core 与 Pi AI，不使用 Pi CLI、Pi submodule 或 Hermes 执行路径。它拥有：
+Runtime 直接依赖 lockfile 中精确版本的 Pi Core 与 Pi AI，不经由外部 CLI 或源码子模块执行。它拥有：
 
 - 模型与工具循环、流式增量和 Run 状态机；
 - 工具策略、执行目标选择和审计事件；
@@ -43,7 +43,7 @@ Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化�
 
 来自网页、浏览器、知识、记忆、session 和技能附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
 
-terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进程立即返回并由对应 Sandbox 登记。进程输出、历史记录和同时运行数量有界。Run 空闲、模型轮次和 terminal 默认超时的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
+terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进程立即返回并由对应 Sandbox 登记。Manager 是生产进程清单的唯一权威：同一主 scope 与其 `/delegate/` 子 scope 组成一个进程 family，共享同时运行上限，root cleanup 必须停止整个 family；单进程读写和终止仍要求精确 scope，不允许越权访问子 Agent 句柄。进程输出、历史记录和同时运行数量有界；终态记录按时间和数量双重裁剪，但不得裁剪 `running` 或 `orphaned`。预览优先返回活动进程，其不透明 revision 在状态或输出变化时必须变化，Manager 重启后旧 revision 必须失效。Run 空闲、模型轮次和 terminal 默认超时的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
 
 ## 会话与压缩
 
@@ -64,7 +64,5 @@ terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进
 ## 停止与恢复
 
 用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台进程属于 Sandbox 生命周期，不因单个 Run 完成而停止；管理器根据任务和进程登记决定空闲回收。
-
-源码到容器的桥接期间，Platform 仍须查询宿主 Runtime 的受保护终端清单；Manager socket 已配置并不表示旧 Runtime 已由容器接管。只有容器 deployment mode 才能跳过宿主清单。迁移安装器下载和预检保持业务可用，真正切换前的空闲预约由 Manager 建立，源码恢复协调器不得提前占用同一预约。
 
 Runtime 没有活动任务的固定墙钟上限。无进展保护、模型轮次上限和 terminal 默认超时的精确跨层值由 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义。审批、请求体、清理和保留等其它边界由[配置参考](../reference/configuration.md)列出，并由 Runtime 配置测试校验。

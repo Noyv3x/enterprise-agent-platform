@@ -107,14 +107,14 @@ func TestClientKeepsStructuredHTTPFailureDeterministic(t *testing.T) {
 	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		response.WriteHeader(http.StatusBadRequest)
-		_, _ = response.Write([]byte(`{"error":"invalid migration input"}`))
+		_, _ = response.Write([]byte(`{"error":"invalid operation input"}`))
 	})}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
 
 	client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: time.Second}
 	var result map[string]any
-	err = client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{}, &result)
+	err = client.Do(context.Background(), http.MethodPost, "/v1/operations", map[string]any{}, &result)
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
 		t.Fatalf("error = %v, want HTTP 400", err)
@@ -141,7 +141,7 @@ func TestClientDetectsOversizedSuccessfulResponse(t *testing.T) {
 
 	client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: 10 * time.Second}
 	var result map[string]any
-	err = client.Do(context.Background(), http.MethodPost, "/v1/migrations/legacy", map[string]any{}, &result)
+	err = client.Do(context.Background(), http.MethodPost, "/v1/operations", map[string]any{}, &result)
 	var ambiguous *AmbiguousResponseError
 	if !errors.As(err, &ambiguous) || !IsUnavailable(err) {
 		t.Fatalf("oversized success error = %v, want ambiguous unavailable response", err)
@@ -151,7 +151,7 @@ func TestClientDetectsOversizedSuccessfulResponse(t *testing.T) {
 	}
 }
 
-func TestClientDecodesValidJSONAcrossLegacyCompatibilityRange(t *testing.T) {
+func TestClientDecodesValidJSONAcrossSupportedResponseSizes(t *testing.T) {
 	for _, responseBytes := range []int{(2 << 20) + 1, int(maxManagerResponseBytes)} {
 		responseBytes := responseBytes
 		t.Run(fmt.Sprintf("bytes_%d", responseBytes), func(t *testing.T) {

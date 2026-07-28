@@ -54,7 +54,7 @@ test("SessionStore reads an existing journal with unknown header metadata withou
         payload: {
           version: 1,
           unknown_extension: {
-            owner: "retired-importer",
+            owner: "external-importer",
             version: 7,
             digest: "opaque-metadata",
           },
@@ -81,27 +81,27 @@ test("SessionStore reads an existing journal with unknown header metadata withou
   }
 });
 
-test("SessionStore distinguishes legacy/imported messages from runtime-secured messages", async () => {
+test("SessionStore distinguishes unmarked imported messages from runtime-secured messages", async () => {
   const home = await temporaryDirectory("agent-session-content-security-version-");
   try {
     const store = new SessionStore(home);
     const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const legacy: ToolResultMessage = {
+    const imported: ToolResultMessage = {
       role: "toolResult",
-      toolCallId: "legacy-web-call",
+      toolCallId: "imported-web-call",
       toolName: "web",
-      content: [{ type: "text", text: "legacy search result" }],
+      content: [{ type: "text", text: "imported search result" }],
       details: null,
       isError: false,
       timestamp: 1,
     };
     const current: ToolResultMessage = {
-      ...legacy,
+      ...imported,
       toolCallId: "current-web-call",
       content: [{ type: "text", text: "current framed search result" }],
       timestamp: 2,
     };
-    const [legacyTracked] = await store.initializeTracked(identity, [legacy]);
+    const [importedTracked] = await store.initializeTracked(identity, [imported]);
     const currentEntryId = await store.appendMessage(
       identity,
       current,
@@ -111,8 +111,8 @@ test("SessionStore distinguishes legacy/imported messages from runtime-secured m
 
     const reloaded = await store.initializeTracked(identity);
 
-    assert.equal(legacyTracked?.model_content_security_version, undefined);
-    assert.equal(reloaded.find((entry) => entry.entry_id === legacyTracked?.entry_id)?.model_content_security_version, undefined);
+    assert.equal(importedTracked?.model_content_security_version, undefined);
+    assert.equal(reloaded.find((entry) => entry.entry_id === importedTracked?.entry_id)?.model_content_security_version, undefined);
     assert.equal(
       reloaded.find((entry) => entry.entry_id === currentEntryId)?.model_content_security_version,
       CURRENT_MODEL_CONTENT_SECURITY_VERSION,
@@ -120,7 +120,7 @@ test("SessionStore distinguishes legacy/imported messages from runtime-secured m
     assert.equal(
       await readFile(store.path(identity), "utf8"),
       beforeReload,
-      "loading version metadata must not rewrite legacy JSONL",
+      "loading version metadata must not rewrite imported JSONL",
     );
   } finally {
     await rm(home, { recursive: true, force: true });

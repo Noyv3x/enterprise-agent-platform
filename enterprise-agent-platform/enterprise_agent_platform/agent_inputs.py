@@ -41,38 +41,6 @@ class AgentRunInputStore:
 
     def __init__(self, db: Database):
         self.db = db
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with self.db.transaction() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS agent_run_inputs (
-                    message_id INTEGER PRIMARY KEY,
-                    job_id INTEGER NOT NULL UNIQUE,
-                    parent_job_id INTEGER NOT NULL,
-                    input_group_id TEXT NOT NULL,
-                    runtime_run_id TEXT NOT NULL DEFAULT '',
-                    state TEXT NOT NULL
-                        CHECK(state IN (
-                            'running', 'reserved', 'submitting', 'accepted',
-                            'injected', 'unconsumed', 'succeeded', 'failed',
-                            'needs_review'
-                        )),
-                    turn_id TEXT NOT NULL DEFAULT '',
-                    turn_index INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_group
-                    ON agent_run_inputs(input_group_id, message_id);
-                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_parent
-                    ON agent_run_inputs(parent_job_id, message_id);
-                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_runtime
-                    ON agent_run_inputs(runtime_run_id, message_id);
-                """
-            )
 
     def start_root(
         self,

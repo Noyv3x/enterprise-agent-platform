@@ -72,7 +72,7 @@ describe("chat translations", () => {
     expect(hasAgentProcessSteps(status)).toBe(false);
   });
 
-  it("compacts legacy tool noise and preserves distinct real tool calls", () => {
+  it("compacts generic tool noise and preserves distinct real tool calls", () => {
     const status: AgentStatus = {
       state: "replying",
       activity: [

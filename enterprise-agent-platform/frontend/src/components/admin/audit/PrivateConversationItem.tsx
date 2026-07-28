@@ -1,5 +1,4 @@
-/* <PrivateConversationItem/> — one selectable private-conversation entry in the
-   audit list (legacy renderPrivateConversationItem, legacy-app.js:1946-1963). */
+/* <PrivateConversationItem/> — one selectable private-conversation entry in the audit list. */
 
 import { cx } from "../../../lib/cx";
 import { Button } from "antd";

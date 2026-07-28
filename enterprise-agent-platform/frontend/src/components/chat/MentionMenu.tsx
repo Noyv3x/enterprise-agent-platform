@@ -1,10 +1,10 @@
-/* <MentionMenu/> — the in-field @mention autocomplete popover (legacy
-   renderMentionMenu, :1075-1109). role=listbox; channel-only (in private mode the
+/* <MentionMenu/> — the in-field @mention autocomplete popover. role=listbox;
+   channel-only (in private mode the
    mention API is never active so this stays hidden). Positioned absolutely within
    `.composer__field` by CSS (bottom: calc(100% + 8px)).
 
    Option selection fires on onMouseDown + preventDefault (NOT onClick) so the
-   textarea keeps focus and the blur-hide timer never wins first (plan §1.4). */
+   textarea keeps focus and the blur-hide timer never wins first. */
 
 import { cx } from "../../lib/cx";
 import { useI18n } from "../../i18n";

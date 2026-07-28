@@ -1,6 +1,6 @@
 /* =====================================================================
-   The ICONS registry — ported verbatim from legacy-app.js:135-166. Each
-   entry is a list of SVG primitives ([tag, attrs]); the hand-tuned path/coord
+   The ICONS registry. Each entry is a list of SVG primitives ([tag, attrs]);
+   the hand-tuned path and coordinate
    data is the source of truth and must not drift. Rendered by <Icon/>.
    ===================================================================== */
 

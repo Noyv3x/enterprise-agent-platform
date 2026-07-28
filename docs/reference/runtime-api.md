@@ -23,13 +23,12 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 | `POST /v1/scopes/cleanup` | 取消 scope Run、进程并可删除 session |
 | `GET /v1/scopes/processes` | 读取一个 scope/lifecycle 的终端预览 |
 | `GET /v1/scopes/process-summary` | 读取进程摘要 |
-| `GET /v1/processes/update-blockers` | 读取自动更新终端阻塞摘要 |
 
-未知路径以及多数既有路径上的不支持方法返回 404。模型目录、预览与部分控制 endpoint 会严格拒绝未知 query/body 字段；Run、Input 和 Cleanup 的兼容请求目前只校验实际消费字段，不承诺统一拒绝所有额外 JSON 字段。新增协议不得依赖未记录字段，收紧兼容解析前必须先更新本文和双方测试。
+未知路径和不支持的方法返回 404。模型目录、预览、Run、Input、Cleanup 与控制 endpoint 严格拒绝未知 query/body 字段。调用方不得依赖未记录字段；新增字段必须先更新本文、类型和双方测试。
 
 ## 模型目录
 
-`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。
+`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。
 
 目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 可以将目录与当前 OAuth 账号可见模型合并，但不能创造目录外模型。
 
@@ -125,18 +124,20 @@ terminal、process 和文件工具不使用审批。它们必须带 `target=sand
 
 `POST /v1/scopes/cleanup` 要求 `scope_key`，可带 `lifecycle_id` 和 `delete_sessions`。Runtime 取消匹配 Run和审批，并请求 Manager 清理对应前台执行；后台进程仍由 Sandbox 生命周期管理，只有显式 scope reset 才停止。响应返回取消数量、Manager 清理结果和 session 删除结果。
 
-终端预览要求同时提供 scope 和 lifecycle，并可携带不透明 `since_revision`。revision 是服务端游标，客户端不得解析其内部结构。响应只用于只读展示。
+终端预览要求同时提供 root scope 和 lifecycle，并可携带不透明 `since_revision`。预览、`running_terminal_count` 和 scope cleanup 都覆盖 root scope 本身及以 `root + "/delegate/"` 开头的委派 scope family；其它相似前缀不属于该 family。revision 是服务端游标，客户端不得解析其内部结构；游标必须随可展示输出或进程状态变化，并包含 Manager 进程实例身份，因此 Manager 重启后的旧游标必然失效。响应只用于只读展示。
 
-进程预览和 blocker 数据来自 Manager executor，由 Runtime按 scope/lifecycle 过滤和脱敏后返回。Platform 更新不停止独立 Sandbox 后台进程；目标版本需要刷新某个 Sandbox 时，只延迟该 Sandbox。库存不可确定时不能销毁容器。
+进程预览数据来自 Manager executor，由 Runtime 按 scope/lifecycle 过滤和脱敏后返回。进程列表先展示活动状态（`running`、`orphaned`），同组再按 `started_at` 倒序排列。Platform 更新不停止独立 Sandbox 后台进程；目标版本需要刷新某个 Sandbox 时，只延迟该 Sandbox。库存不可确定时不能销毁容器。
+
+Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`failed`、`cancelled` 和 `orphaned`。`orphaned` 表示 Manager 无法确认进程已经终止或仍由原执行器可靠持有，不是完成态；它必须保持 `running: true`，计入运行中终端和更新阻塞，并保留对应 Sandbox，直至 Manager 明确确认终态。Runtime 与 Platform 必须原样接受该状态，不能拒绝响应，也不能把它降级为 `completed`。前端只读预览将其展示为“需关注、仍占用”，不提供交互或强制清理入口。
 
 ## Python 内部工具 Gateway
 
 Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
-Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。
+Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule 和 skill；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
 
 Gateway 中网页、浏览器、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
 
-## 兼容规则
+## 协议演进
 
-协议变更必须先更新本文和相关机器契约，再同步 TypeScript 类型、Python client、事件映射和双方测试。删除字段或改变状态语义需要显式版本迁移；不能用静默 fallback 重新引入旧 Runtime 路径。
+协议变更必须先更新本文和相关机器契约，再同步 TypeScript 类型、Python client、事件映射和双方测试。删除字段或改变状态语义需要提升协议版本并原子升级双方；不提供未声明字段、状态或执行路径的静默 fallback。

@@ -59,7 +59,7 @@ test("tool descriptions route semantic file work away from terminal scripts", ()
   assert.match(writeFile.description, /do not create files by terminal heredoc/);
 });
 
-test("terminal forwards an explicit background update policy and defaults to protected work", async () => {
+test("terminal forwards background and command-specific timeout behavior", async () => {
   const invocations: Array<Record<string, unknown>> = [];
   const tools = createTools({
     runId: "run",
@@ -90,39 +90,20 @@ test("terminal forwards an explicit background update policy and defaults to pro
   });
   const terminal = tools.find((tool) => tool.name === "terminal");
   assert.ok(terminal);
-  const schema = JSON.stringify(terminal.parameters);
-  assert.match(schema, /update_behavior/);
-  assert.match(schema, /"const":"wait"/);
-  assert.match(schema, /"const":"terminate"/);
 
   await terminal.execute("default", { command: "sleep 30", background: true }, undefined);
-  await terminal.execute("terminable", {
-    command: "sleep 30",
-    background: true,
-    update_behavior: "terminate",
-  }, undefined);
   await terminal.execute("background-deadline", {
     command: "sleep 30",
     background: true,
     timeout_ms: 500,
   }, undefined);
   assert.equal(invocations[0]?.background, true);
-  assert.equal(invocations[0]?.updateBehavior, undefined);
   assert.equal(invocations[0]?.timeoutMs, undefined);
-  assert.equal(invocations[1]?.updateBehavior, "terminate");
-  assert.equal(invocations[1]?.timeoutMs, undefined);
-  assert.equal(invocations[2]?.timeoutMs, 500);
+  assert.equal(invocations[1]?.timeoutMs, 500);
   await terminal.execute("foreground-default-timeout", { command: "true" }, undefined);
   await terminal.execute("foreground-explicit-timeout", { command: "true", timeout_ms: 500 }, undefined);
-  assert.equal(invocations[3]?.timeoutMs, 12_345);
-  assert.equal(invocations[4]?.timeoutMs, 500);
-  await assert.rejects(
-    terminal.execute("foreground", {
-      command: "true",
-      update_behavior: "terminate",
-    }, undefined),
-    /only when background=true/,
-  );
+  assert.equal(invocations[2]?.timeoutMs, 12_345);
+  assert.equal(invocations[3]?.timeoutMs, 500);
 });
 
 test("process write rechecks hardline input at execution", async () => {
@@ -539,6 +520,47 @@ test("memory schema strictly describes committed-memory and candidate actions", 
   }
   assert.match(memory.description, /at most 4,000 characters/);
   assert.equal(collectObjectSchemas(memory.parameters).every((entry) => entry.additionalProperties === false), true);
+});
+
+test("session, knowledge, and web schemas expose only current actions and argument names", () => {
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1" } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const session = tools.find((tool) => tool.name === "session");
+  const knowledge = tools.find((tool) => tool.name === "knowledge");
+  const web = tools.find((tool) => tool.name === "web");
+  assert.ok(session && knowledge && web);
+
+  const sessionSchema = JSON.stringify(session.parameters);
+  for (const action of ["search", "read", "list"]) {
+    assert.match(sessionSchema, new RegExp(`"const":"${action}"`));
+  }
+
+  const knowledgeSchema = JSON.stringify(knowledge.parameters);
+  for (const action of ["search", "read"]) {
+    assert.match(knowledgeSchema, new RegExp(`"const":"${action}"`));
+  }
+  for (const removed of ["query", "document", "get"]) {
+    assert.doesNotMatch(knowledgeSchema, new RegExp(`"const":"${removed}"`));
+  }
+  const knowledgeRead = actionArgumentsSchema(knowledge.parameters, "read");
+  const knowledgeReadProperties = knowledgeRead.properties as Record<string, unknown>;
+  assert.ok(knowledgeReadProperties.document_id);
+  assert.equal(knowledgeReadProperties.id, undefined);
+
+  const webSchema = JSON.stringify(web.parameters);
+  for (const action of ["search", "extract"]) {
+    assert.match(webSchema, new RegExp(`"const":"${action}"`));
+  }
+  for (const removed of ["query", "scrape", "read"]) {
+    assert.doesNotMatch(webSchema, new RegExp(`"const":"${removed}"`));
+  }
 });
 
 test("memory propose is approval-free but hard-limited to top-level interactive private runs", async () => {

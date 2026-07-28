@@ -1,5 +1,4 @@
-/* <TokenUsageMonitoring/> — the token-usage dashboard (legacy
-   renderTokenUsageMonitoring, legacy-app.js:1559-1669): overview card with the
+/* <TokenUsageMonitoring/> — the token-usage dashboard: overview card with the
    days filter + refresh, 8 metric tiles, the 7-day SVG curve, and 4 usage tables
    (by account, detail, by scope, by model). */
 

@@ -106,7 +106,7 @@ class _FakeRuntime:
                     self._json(
                         200,
                         {
-                            "revision": 3,
+                            "revision": "preview_test:3",
                             "processes": [
                                 {
                                     "id": "process-1",
@@ -119,25 +119,19 @@ class _FakeRuntime:
                     return
                 if self.path == (
                     "/v1/scopes/processes?scope_key=private%3A7"
-                    "&lifecycle_id=life-7&since_revision=3"
+                    "&lifecycle_id=life-7&since_revision=preview_test%3A3"
                 ):
                     self._json(
                         200,
-                        {"processes": [], "revision": 3, "unchanged": True},
+                        {
+                            "processes": [],
+                            "revision": "preview_test:3",
+                            "unchanged": True,
+                        },
                     )
                     return
                 if self.path == "/v1/scopes/process-summary?scope_key=private%3A7&lifecycle_id=life-7":
                     self._json(200, {"running_terminal_count": 2})
-                    return
-                if self.path == "/v1/processes/update-blockers":
-                    self._json(
-                        200,
-                        {
-                            "running_background_terminal_count": 3,
-                            "update_blocking_terminal_count": 2,
-                            "terminable_background_terminal_count": 1,
-                        },
-                    )
                     return
                 if self.path == "/v1/runs/run-1/events":
                     self.send_response(200)
@@ -294,7 +288,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             ):
                 AgentRuntimeClient(url, "runtime-secret")
 
-    def test_external_runtime_transport_rejects_redirects_before_forwarding_auth(self):
+    def test_private_runtime_transport_rejects_redirects_before_forwarding_auth(self):
         client = AgentRuntimeClient(
             "https://runtime.example:8766",
             "runtime-secret",
@@ -303,15 +297,15 @@ class AgentRuntimeClientTests(unittest.TestCase):
         request = mock.MagicMock()
         with (
             mock.patch(
-                "enterprise_agent_platform.agent_runtime_client.open_trusted_service_url",
+                "enterprise_agent_platform.agent_runtime_client.open_private_service_url",
                 return_value=response,
-            ) as trusted_open,
+            ) as private_open,
             mock.patch(
                 "enterprise_agent_platform.agent_runtime_client.open_loopback_url",
             ) as loopback_open,
         ):
             self.assertIs(client._open(request, timeout=2), response)
-        trusted_open.assert_called_once_with(request, timeout=2)
+        private_open.assert_called_once_with(request, timeout=2)
         loopback_open.assert_not_called()
 
     def test_generate_posts_run_and_consumes_completion_events(self):
@@ -352,7 +346,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             thinking_depth="high",
             reasoning_config={"enabled": True},
             progress_callback=progress.append,
-            content_callback=content.append,
+            content_callback=lambda value, **_turn: content.append(value),
             run_started_callback=started.append,
         )
 
@@ -923,7 +917,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         result = self.client.terminal_previews("private:7", "life-7")
 
         self.assertEqual(result["processes"][0]["id"], "process-1")
-        self.assertEqual(result["revision"], 3)
+        self.assertEqual(result["revision"], "preview_test:3")
         request = self.runtime.request(
             "GET",
             "/v1/scopes/processes?scope_key=private%3A7&lifecycle_id=life-7",
@@ -934,16 +928,20 @@ class AgentRuntimeClientTests(unittest.TestCase):
         unchanged = self.client.terminal_previews(
             "private:7",
             "life-7",
-            since_revision=3,
+            since_revision="preview_test:3",
         )
         self.assertEqual(
             unchanged,
-            {"processes": [], "revision": 3, "unchanged": True},
+            {
+                "processes": [],
+                "revision": "preview_test:3",
+                "unchanged": True,
+            },
         )
         self.runtime.request(
             "GET",
             "/v1/scopes/processes?scope_key=private%3A7"
-            "&lifecycle_id=life-7&since_revision=3",
+            "&lifecycle_id=life-7&since_revision=preview_test%3A3",
         )
 
     def test_terminal_previews_validate_revision_schema(self):
@@ -1004,17 +1002,14 @@ class AgentRuntimeClientTests(unittest.TestCase):
             request.call_args.args[1],
         )
 
-    def test_terminal_previews_accept_a_legacy_snapshot_without_revision(self):
-        legacy = {"processes": [{"id": "process-1", "output": "legacy"}]}
+    def test_terminal_previews_reject_a_snapshot_without_revision(self):
+        payload = {"processes": [{"id": "process-1", "output": "current"}]}
         with mock.patch.object(
             self.client,
             "_json_request",
-            return_value=(legacy, {}),
-        ):
-            self.assertEqual(
-                self.client.terminal_previews("private:7", "life-7"),
-                legacy,
-            )
+            return_value=(payload, {}),
+        ), self.assertRaisesRegex(AgentRuntimeProtocolError, "no revision"):
+            self.client.terminal_previews("private:7", "life-7")
 
     def test_terminal_preview_summary_uses_the_lightweight_scope_endpoint(self):
         result = self.client.terminal_preview_summary("private:7", "life-7")
@@ -1026,48 +1021,6 @@ class AgentRuntimeClientTests(unittest.TestCase):
         )
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
         self.assertEqual(request["accept"], "application/json")
-
-    def test_update_blocker_summary_uses_the_global_metadata_only_endpoint(self):
-        result = self.client.update_blocker_summary()
-
-        self.assertEqual(
-            result,
-            {
-                "running_background_terminal_count": 3,
-                "update_blocking_terminal_count": 2,
-                "terminable_background_terminal_count": 1,
-            },
-        )
-        request = self.runtime.request("GET", "/v1/processes/update-blockers")
-        self.assertEqual(request["authorization"], "Bearer runtime-secret")
-        self.assertEqual(request["accept"], "application/json")
-
-    def test_update_blocker_summary_rejects_invalid_or_inconsistent_counts(self):
-        cases = [
-            {
-                "running_background_terminal_count": True,
-                "update_blocking_terminal_count": 0,
-                "terminable_background_terminal_count": 1,
-            },
-            {
-                "running_background_terminal_count": 2,
-                "update_blocking_terminal_count": -1,
-                "terminable_background_terminal_count": 3,
-            },
-            {
-                "running_background_terminal_count": 4,
-                "update_blocking_terminal_count": 2,
-                "terminable_background_terminal_count": 1,
-            },
-        ]
-        for payload in cases:
-            with self.subTest(payload=payload), mock.patch.object(
-                self.client,
-                "_json_request",
-                return_value=(payload, {}),
-            ):
-                with self.assertRaises(AgentRuntimeProtocolError):
-                    self.client.update_blocker_summary()
 
     def test_http_error_exposes_status_and_runtime_message(self):
         self.runtime.errors["/health"] = (503, {"error": {"message": "runtime is warming up"}})

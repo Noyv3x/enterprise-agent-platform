@@ -342,8 +342,8 @@ export class SessionStore {
     const grants = new Set<string>();
     for (const entry of entries) {
       if (entry.type === "clear") grants.clear();
-      // Legacy entries contain only tool_name and are intentionally ignored:
-      // those grants were too broad to map safely to a concrete v2 object.
+      // Unscoped entries contain only tool_name and are intentionally ignored:
+      // those grants are too broad to map safely to a concrete current object.
       else if (entry.session_id && entry.approval_key?.startsWith("v2:")) {
         grants.add(`${entry.session_id}\0${entry.approval_key}`);
       }

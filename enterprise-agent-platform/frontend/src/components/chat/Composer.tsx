@@ -1,5 +1,4 @@
-/* <Composer/> — the `<form class="composer">` host (legacy renderChat composer +
-   submit + addDraftFiles, :664-743, 818-837). Owns the refs and per-scope draft
+/* <Composer/> — the `<form class="composer">` host. Owns refs and per-scope draft
    plumbing; the textarea below it is never remounted.
 
    State ownership:
@@ -12,7 +11,7 @@
    Focus/scroll are owned by <ChatView> via tokens: onBumpFocus re-focuses the
    textarea, onBumpForceBottom snaps the list to the bottom. The send pipeline lives
    in data/chatActions.sendMessage; on failure we restore the draft + files and
-   re-focus (legacy submit restore, :677-685). */
+   re-focus. */
 
 import { useCallback, useRef, type ChangeEvent } from "react";
 import { useI18n } from "../../i18n";
@@ -95,8 +94,7 @@ export function Composer({
     notify,
   });
 
-  /* legacy addDraftFiles (:818-837): reject >50MB (toast), append + cap at 10
-     (toast on overflow), then re-focus the composer. */
+  /* Reject files over 50 MB, cap the queue at 10 and re-focus the composer. */
   const addDraftFiles = useCallback(
     (incoming: File[]) => {
       const current = store.getState().draftFiles[draftKey] || EMPTY_FILES;

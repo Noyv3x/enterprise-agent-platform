@@ -183,7 +183,7 @@ class SkillStoreTests(unittest.TestCase):
                     "unsafe_skill_instructions",
                 )
 
-        created = self.create_skill(name="Legacy Safe")
+        created = self.create_skill(name="Injection Safe")
         package = self.scope_dir("private:user-1") / created["id"]
         document = (package / "SKILL.md").read_text(encoding="utf-8")
         document = document.replace(

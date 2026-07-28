@@ -1,8 +1,5 @@
 /* Admin slice — accounts, permission groups, audit, token usage, secrets,
-   runtimes, every config blob, and OAuth state. Phase 1 stubs the plain field
-   setters, the simple OAuth flow/callback merges, message-audit patching, and
-   the session reset. The compound OAuth merge (SET_OAUTH_STATE, mirroring
-   legacy updateOAuthState) is filled by Phase 4d (default: return state). */
+   runtimes, configuration and OAuth state. */
 
 import type { Action, AdminSliceState, AppState, MessageAudit } from "../../types";
 
@@ -68,8 +65,7 @@ export function adminReducer(state: AppState, action: Action): AppState {
     case "SET_OAUTH_PROVIDERS":
       return { ...state, oauthProviders: action.payload };
     case "SET_OAUTH_STATE": {
-      // Mirrors legacy updateOAuthState (legacy-app.js:3425-3428): REPLACE
-      // oauthProviders with { providers, active_provider }, and MERGE the flow
+      // Replace oauthProviders with { providers, active_provider }, and merge the flow
       // (keyed by providerId) only when one is present. Completed flows are
       // never deleted here — they linger (driving the "验证完成" banner) until the
       // next full loadOAuthProviders.

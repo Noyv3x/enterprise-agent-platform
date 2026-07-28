@@ -1,19 +1,15 @@
 /* =====================================================================
-   Chat data/realtime actions (Phase 3 scope).
-
+   Chat data and realtime actions.
    This file owns:
    - refreshActiveChat(store): the SSE "update" + 4s poll target. Re-fetches the
      active scope's messages and dispatches ONLY when a cheap fingerprint differs
-     (the legacy chatSnapshot no-op gate, legacy-app.js:3263-3284), so identical
+     so identical
      poll/SSE payloads cause zero state change and never disturb scroll/focus.
-   - currentScopeStreamUrl(state): the SSE URL by view (legacy-app.js:3309-3313).
-   - navigateToView / selectChannel: the nav -> loader wiring (legacy navItem +
-     channel button onclick, legacy-app.js:453-501).
+   - currentScopeStreamUrl(state): the SSE URL by view.
+   - navigateToView / selectChannel: navigation and loader wiring.
    - pollInFlight mutex shared by SSE + poll.
 
-   sendMessage (the optimistic send lifecycle, spec §7-8) and the typing notifier
-   are filled in Phase 4a — see the TODO stub at the bottom (the typing notifier
-   already lives in hooks/useTypingNotifier.ts).
+   - sendMessage: the optimistic send lifecycle.
    ===================================================================== */
 
 import {
@@ -69,8 +65,8 @@ import type {
   TypingUser,
 } from "../types";
 
-/* The cross-source re-entrancy mutex (legacy module-level `pollInFlight`): SSE
-   update handlers and the 4s poll both call refreshActiveChat and must not
+/* Cross-source re-entrancy mutex: SSE update handlers and the safety poll both
+   call refreshActiveChat and must not
    overlap. */
 let pollInFlight = false;
 let pendingRefresh: {
@@ -131,7 +127,7 @@ async function runStatusMutation<T extends { agent_status?: AgentStatus | null }
 
 /* ----------------------------------------------------------- scope stream */
 
-/** The active scope's SSE URL (legacy currentScopeStreamUrl). */
+/** The active scope's SSE URL. */
 export function currentScopeStreamUrl(state: AppState): string | null {
   if (state.activeView === "channel" && state.activeChannelId) {
     return endpoints.channelEvents.path(state.activeChannelId);
@@ -400,8 +396,8 @@ export async function refreshActiveChat(
 
 /* ---------------------------------------------------------- nav -> loader */
 
-/** Switch the workspace view + close the drawer, then fire the view's loader
- *  (legacy navItem onclick, legacy-app.js:489-501). Channel view loads via
+/** Switch the workspace view, close the drawer, then fire the view's loader.
+ *  Channel view loads via
  *  selectChannel / existing state, so it has no loader here. */
 export async function navigateToView(store: AppStore, view: ActiveView): Promise<void> {
   cacheVisibleChat(store);
@@ -422,8 +418,7 @@ export async function navigateToView(store: AppStore, view: ActiveView): Promise
   }
 }
 
-/** Select a channel + close the drawer, then load its messages (legacy channel
- *  button onclick, legacy-app.js:453-459). */
+/** Select a channel, close the drawer, then load its messages. */
 export async function selectChannel(store: AppStore, channelId: Id): Promise<void> {
   cacheVisibleChat(store);
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
@@ -439,8 +434,7 @@ export async function selectChannel(store: AppStore, channelId: Id): Promise<voi
 
 /* ----------------------------------------------------- optimistic send */
 
-/* Monotonic counter for optimistic tmp ids + attachment ids (legacy module-level
-   localMessageSeq, legacy-app.js:65). */
+/* Monotonic counter for optimistic temporary ids and attachment ids. */
 let localMessageSeq = 0;
 
 /* Private messages are shown optimistically but their POSTs are serialized per
@@ -473,8 +467,8 @@ function enqueuePrivatePost<T>(
   return result;
 }
 
-/** Build the optimistic user message (legacy appendOptimisticMessage, :2963-2981).
- *  optimisticAttachments mints blob: preview URLs that are revoked in the slice's
+/** Build the optimistic user message. optimisticAttachments mints blob: preview
+ *  URLs that are revoked in the slice's
  *  REPLACE/REMOVE transition (and on logout). */
 function buildOptimisticMessage(
   state: AppState,
@@ -498,8 +492,8 @@ function buildOptimisticMessage(
   };
 }
 
-/** The core send mutation (legacy postChatMessage, :3006-3036). Optimistic insert
- *  -> POST (multipart with files, else JSON {content}) -> replace temp with the
+/** The core send mutation: optimistic insert -> POST (multipart with files, else
+ *  JSON {content}) -> replace temp with the
  *  saved user_message (SSE dedupe-guarded in the reducer) + set agent_status ->
  *  refresh; on error remove the temp message + toast "发送失败" and return false.
  *  Private POSTs use a per-scope FIFO while channel POSTs retain their existing

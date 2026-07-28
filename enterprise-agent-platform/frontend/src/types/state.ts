@@ -1,13 +1,6 @@
-/* =====================================================================
-   The canonical store shape (mirrors the legacy module-level `state`,
-   legacy-app.js:8-59) and the complete Action discriminated union every
-   slice reducer is filled against.
-
-   Differences from legacy `state`, per the migration plan §2.1:
-   - the dead field `sending` is dropped;
-   - the render-side-effect flags `_lastView` / `_focusComposer` /
-     `_scrollChatToBottom` are NOT store fields (they become component refs).
-   ===================================================================== */
+/* The canonical store shape and complete Action discriminated union used by
+   every slice reducer. Render-only state such as focus and scroll requests stays
+   in component refs rather than the shared store. */
 
 import type {
   ActiveView,
@@ -377,7 +370,7 @@ interface SetOAuthProvidersAction {
   type: "SET_OAUTH_PROVIDERS";
   payload: OAuthProvidersState | null;
 }
-/** Mirrors legacy updateOAuthState(providerId, result). */
+/** Merge an OAuth provider state response for one provider. */
 interface SetOAuthStateAction {
   type: "SET_OAUTH_STATE";
   payload: {

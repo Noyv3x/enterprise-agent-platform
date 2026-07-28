@@ -10,9 +10,9 @@ import { UpdateGate } from "./UpdateGate";
 
 function status(
   state: PlatformUpdateStatus["state"],
-  instanceId = "instance-a",
+  operationId = "operation-a",
 ): PlatformUpdateStatus {
-  return { state, instance_id: instanceId, retry_after_ms: 1_000 };
+  return { state, operation_id: operationId, retry_after_ms: 1_000 };
 }
 
 function renderGate(
@@ -109,7 +109,7 @@ describe("UpdateGate", () => {
   it("reloads once after maintenance returns to idle", async () => {
     const loadStatus = vi.fn()
       .mockResolvedValueOnce(status("updating"))
-      .mockResolvedValue(status("idle", "instance-b"));
+      .mockResolvedValue(status("idle", "operation-b"));
     const { reload } = renderGate(loadStatus);
     expect(await screen.findByRole("heading", { name: "Updating ubitech agent" })).toBeInTheDocument();
 
@@ -122,10 +122,10 @@ describe("UpdateGate", () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  it("reloads when a new idle backend instance is detected", async () => {
+  it("reloads when a new idle update operation is detected", async () => {
     const loadStatus = vi.fn()
-      .mockResolvedValueOnce(status("idle", "instance-a"))
-      .mockResolvedValue(status("idle", "instance-b"));
+      .mockResolvedValueOnce(status("idle", "operation-a"))
+      .mockResolvedValue(status("idle", "operation-b"));
     const { reload } = renderGate(loadStatus);
     expect(await screen.findByText("Application content")).toBeInTheDocument();
 

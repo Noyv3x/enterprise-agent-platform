@@ -1,5 +1,4 @@
-/* useConfirm — a promise-based confirm() backed by <ConfirmDialog>, replacing
-   the blocking window.confirm() the legacy admin deletes used. The owning
+/* useConfirm — a promise-based confirm() backed by <ConfirmDialog>. The owning
    component renders the returned `dialog` element and awaits `confirm(message)`,
    which resolves true on confirm and false on cancel (cancel is a no-op).
 

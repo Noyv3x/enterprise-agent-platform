@@ -1,5 +1,5 @@
-/* <ComposerFiles/> — the row of selected-but-unsent attachment chips with remove
-   buttons (legacy renderComposerFiles, :1201-1223). `files` are raw File objects
+/* <ComposerFiles/> — selected-but-unsent attachment chips with remove buttons.
+   `files` are raw File objects
    from the per-scope draftFiles store entry. */
 
 import { formatFileSize } from "../../utils/format";

@@ -38,9 +38,8 @@ export class AlwaysApprovalStore {
         this.grants.set(this.key(grant.scope_key, grant.approval_key), grant);
       }
     } else if (existsSync(this.file)) {
-      // Version 1 grants were keyed only by tool name. Carrying a broad
-      // `terminal` grant forward would silently authorize unrelated commands,
-      // so replace legacy/invalid state with an empty v2 store.
+      // Any unscoped or invalid grant could authorize unrelated commands.
+      // Fail closed by replacing it with an empty current store.
       this.flush();
     }
   }
