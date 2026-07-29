@@ -915,6 +915,16 @@ class DocsSyncTests(unittest.TestCase):
             governance["tests"],
         )
 
+    def test_repository_manifest_assigns_manager_selfupdate_security_ownership(self) -> None:
+        manifest = json.loads(
+            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
+        )
+        deployment = self.manifest_domain(manifest, "deployment")
+        security = self.manifest_domain(manifest, "security-and-trust")
+
+        self.assertIn("manager/**", deployment["code"])
+        self.assertIn("manager/internal/selfupdate/**", security["code"])
+
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
         manifest = self.manifest()

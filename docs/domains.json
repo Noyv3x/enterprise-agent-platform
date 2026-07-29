@@ -142,7 +142,8 @@
         "enterprise-agent-platform/agent-runtime/src/tools.ts",
         "manager/internal/control/**",
         "manager/internal/driver/**",
-        "manager/internal/executor/**"
+        "manager/internal/executor/**",
+        "manager/internal/selfupdate/**"
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_security_hardening.py",
