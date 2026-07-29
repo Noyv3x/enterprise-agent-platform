@@ -66,3 +66,7 @@ terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进
 用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台进程属于 Sandbox 生命周期，不因单个 Run 完成而停止；管理器根据任务和进程登记决定空闲回收。
 
 Runtime 没有活动任务的固定墙钟上限。无进展保护、模型轮次上限和 terminal 默认超时的精确跨层值由 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义。审批、请求体、清理和保留等其它边界由[配置参考](../reference/configuration.md)列出，并由 Runtime 配置测试校验。
+
+## 验证稳定性
+
+Runtime 的 Node 测试文件并发数固定为 4，避免共享 CI runner 的调度竞争饿死短时异步观测。等待 journal 事件等测试条件的观测预算可以高于产品超时，但测试不得借此放宽产品配置值或删除对应时序与终态断言。

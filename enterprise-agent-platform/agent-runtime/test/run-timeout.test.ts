@@ -101,7 +101,7 @@ test("active foreground terminal work can exceed the run idle duration", async (
     const run = coordinator.createRun(baseRequest(workspace));
     const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
       (event) => event.type === "approval.requested",
-    ));
+    ), 10_000);
     await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed");
@@ -134,7 +134,7 @@ test("foreground terminal uses the runtime default deadline when timeout_ms is o
     const run = coordinator.createRun(baseRequest(workspace));
     const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
       (event) => event.type === "approval.requested",
-    ));
+    ), 10_000);
     await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed");
@@ -178,7 +178,7 @@ test("background terminal output does not keep a later hung model turn active", 
     const run = coordinator.createRun(baseRequest(workspace));
     const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
       (event) => event.type === "approval.requested",
-    ));
+    ), 10_000);
     await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "needs_review");
