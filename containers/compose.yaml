@@ -155,7 +155,7 @@ services:
     environment:
       FORCE_OWNERSHIP: "false"
     volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/searxng/config/settings.yml:/etc/searxng/settings.yml:ro
+      - ${UBITECH_DATA_ROOT}/data/runtimes/searxng/config:/etc/searxng:ro
       - ${UBITECH_DATA_ROOT}/data/runtimes/searxng/cache:/var/cache/searxng
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m

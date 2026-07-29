@@ -9,6 +9,27 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainerDataLayoutTests(unittest.TestCase):
+    def test_searxng_mounts_the_managed_config_root(self) -> None:
+        compose = (REPOSITORY_ROOT / "containers" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        development = (
+            REPOSITORY_ROOT / "containers" / "compose.dev.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "${UBITECH_DATA_ROOT}/data/runtimes/searxng/config:/etc/searxng:ro",
+            compose,
+        )
+        self.assertNotIn(
+            "/data/runtimes/searxng/config/settings.yml:/etc/searxng/settings.yml",
+            compose,
+        )
+        self.assertIn("./searxng:/etc/searxng:ro", development)
+        self.assertNotIn(
+            "./searxng/settings.yml:/etc/searxng/settings.yml", development
+        )
+
     def test_firecrawl_uses_only_the_postgresql_baseline_data_roots(self) -> None:
         compose = (REPOSITORY_ROOT / "containers" / "compose.yaml").read_text(
             encoding="utf-8"

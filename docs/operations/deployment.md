@@ -18,6 +18,8 @@
 - `searxng` 与 Firecrawl 受管服务；
 - `agent-sandbox`：按主 Agent 动态创建，不属于固定 Compose 数量。
 
+固定服务的持久路径必须由 Compose 显式绑定到 Manager 数据根，不能接受镜像 `VOLUME` 自动创建的匿名卷。SearXNG 必须把受管 `config/` 目录整体只读绑定到 `/etc/searxng`，而不是只覆盖其中的 `settings.yml`；候选 generation 的真实容器探针必须确认 `/etc/searxng` 是该宿主目录的只读 bind，且没有额外 volume mount。
+
 ## 宿主要求与安装位置
 
 宿主需要 Linux、Docker Engine、Docker Compose v2、user-systemd，以及能够使用 Docker 的部署用户。标准安装不依赖宿主 Python、Node、npm 或 Git。

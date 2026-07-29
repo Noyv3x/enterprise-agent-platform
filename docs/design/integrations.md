@@ -23,7 +23,7 @@ Runtime 的锁定 Pi 元数据是可执行模型的唯一能力目录。供应�
 
 网页搜索直接请求受管 SearXNG JSON `/search`，不经过 Firecrawl。请求固定为 general 类别，可带语言和页码；平台在统一预算内读取若干页，过滤重复、格式错误、本地地址和含敏感参数的 URL，直到达到请求数量。
 
-返回给 Agent 的搜索项包括标题、URL、描述和稳定位置。搜索不会自动获取完整正文；部分搜索源失败时返回 warning，而不是丢弃已有结果。SearXNG 镜像与配置由发布清单锁定，只接入私有容器网络。SearXNG 容器必须显式以宿主部署用户 UID/GID 运行，使 Manager 创建的 `0600` settings 与 `0700` cache/config 根可以直接读写；不得依赖锁定镜像当前以 root 启动或由上游 entrypoint 递归改写 bind mount 所有权。
+返回给 Agent 的搜索项包括标题、URL、描述和稳定位置。搜索不会自动获取完整正文；部分搜索源失败时返回 warning，而不是丢弃已有结果。SearXNG 镜像与配置由发布清单锁定，只接入私有容器网络。SearXNG 容器必须显式以宿主部署用户 UID/GID 运行，使 Manager 创建的 `0600` settings 与 `0700` cache/config 根可以直接读写；不得依赖锁定镜像当前以 root 启动或由上游 entrypoint 递归改写 bind mount 所有权。Compose 必须把受管 `config/` 根整体只读挂载到 `/etc/searxng`，覆盖镜像声明的 volume 边界；单文件挂载会额外创建匿名卷，不能作为受支持的运行方式。
 
 ## Firecrawl 提取
 

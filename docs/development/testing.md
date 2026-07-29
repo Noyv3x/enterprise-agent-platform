@@ -27,6 +27,8 @@ cd ..
 
 Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 digest 校验、operation 幂等和阶段恢复、任务等待、维护 Gateway、Unix socket 权限、Sandbox identity、host/sandbox 执行审计、数据迁移、快照与回滚。镜像拉取测试必须覆盖精确 digest 本地命中、持续进度、无进展超时、绝对上限和可重试恢复，并证明预拉取不占用固定栈锁、能力 registry 故障不阻止核心 generation 提交。发布静态测试必须证明生成清单只有当前 Schema 的精确镜像键集合，并证明锁定的上游 revision 至少包含全部现役受管服务而不要求未采用的实验服务。容器 smoke test 必须验证安装脚本可通过 stdin 配合显式 `--yes` 运行，并注入 preflight 失败确认本次创建的数据根、配置、二进制和 unit 均被清理、同一路径可重试。容器 smoke test 还必须在临时数据根验证固定服务 readiness，不能连接开发数据库；启动容器模式 Platform 前必须运行能够校验 control token 并返回规范空闲状态的 Unix-socket Manager contract stub，不能只创建一个无人监听的 socket 文件。Firecrawl 发布验证必须使用与 Manager 相同的 `docker compose up --detach --wait --wait-timeout 600 firecrawl-api` 启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API，确认没有 FoundationDB 服务、环境或挂载；随后写入发布测试专用 PostgreSQL 数据哨兵，保留同一 bind 数据、强制重建 Firecrawl 服务并精确读回哨兵，同时验证 API liveness 和真实 `/v1/scrape`。只执行 Compose `create`、只测试空数据首次启动、仅复用目录却不读回数据，或只检查镜像可拉取都不能证明 entrypoint、启动顺序、幂等初始化、预算与 bind mount 契约兼容。
 
+真实启动 SearXNG 后还必须检查容器 Mounts，证明 `/etc/searxng` 来自受管 config 根的只读 bind，且镜像声明没有额外生成匿名 volume；只检查 Compose 文本不足以覆盖镜像自身的 `VOLUME` 行为。
+
 ## Python 平台
 
 ```bash

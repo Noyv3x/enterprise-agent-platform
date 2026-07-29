@@ -28,4 +28,4 @@ services:
 
   searxng:
     volumes:
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./searxng:/etc/searxng:ro

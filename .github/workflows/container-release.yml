@@ -610,6 +610,20 @@ jobs:
             done
             test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
           done
+          searxng_container="$(docker compose -f containers/compose.yaml ps -q searxng)"
+          docker inspect "$searxng_container" | jq -e \
+            --arg source "$UBITECH_DATA_ROOT/data/runtimes/searxng/config" '
+              [.[0].Mounts[] | select(.Destination == "/etc/searxng")] as $config |
+              ($config | length) == 1 and
+              $config[0].Type == "bind" and
+              $config[0].Source == $source and
+              $config[0].RW == false and
+              ([.[0].Mounts[] | select(.Type == "volume")] | length) == 0
+            ' >/dev/null
+          docker compose -f containers/compose.yaml exec -T searxng sh -eu -c '
+            test -r /etc/searxng/settings.yml
+            test "$(stat -c %u /etc/searxng/settings.yml)" = "$(id -u)"
+          '
           curl --fail --silent --show-error http://127.0.0.1:18080/healthz | jq -e '.service == "ubitech-agent-platform"'
           docker compose -f containers/compose.yaml exec -T camofox node --input-type=module - <<'NODE'
           import { readFileSync } from 'node:fs';

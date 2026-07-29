@@ -448,8 +448,27 @@ for name, service in services.items():
         raise SystemExit(f"private service {name} publishes a host port")
 
 platform = services["platform"]
-if services["searxng"].get("user") != "1000:1000":
+searxng = services["searxng"]
+if searxng.get("user") != "1000:1000":
     raise SystemExit("SearXNG must run as the deployment UID/GID")
+searxng_config = [
+    volume for volume in searxng.get("volumes") or []
+    if volume.get("target") == "/etc/searxng"
+]
+if (
+    len(searxng_config) != 1
+    or searxng_config[0].get("type") != "bind"
+    or not searxng_config[0].get("read_only")
+    or not str(searxng_config[0].get("source") or "").endswith(
+        "/data/runtimes/searxng/config"
+    )
+):
+    raise SystemExit("SearXNG must read-only bind its complete managed config root")
+if any(
+    volume.get("target") == "/etc/searxng/settings.yml"
+    for volume in searxng.get("volumes") or []
+):
+    raise SystemExit("SearXNG single-file settings mounts leak anonymous volumes")
 environment = platform.get("environment") or {}
 if environment.get("UBITECH_DEPLOYMENT_MODE") != "container":
     raise SystemExit("Platform is not explicitly in container deployment mode")
