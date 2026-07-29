@@ -205,9 +205,9 @@ grep -Fq 'https://ghcr.io/v2/${owner}/${package}/manifests/${digest}' .github/wo
   || fail "release does not verify final digest metadata through the anonymous GHCR registry contract"
 grep -Fq 'docker pull "$image"' .github/workflows/container-release.yml \
   || fail "release does not anonymously pull each final image digest"
-grep -Fq '"firecrawl-foundationdb": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"' \
-  .github/workflows/container-release.yml \
-  || fail "bridge release does not provide the old Manager with the inert PostgreSQL image alias"
+if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then
+  fail "container release still publishes a retired FoundationDB image key"
+fi
 if grep -Fq 'foundationdb/foundationdb@sha256:' .github/workflows/container-release.yml; then
   fail "container release still publishes or validates a FoundationDB image"
 fi
@@ -240,6 +240,12 @@ for dependent in ("compose-smoke", "publish"):
 for component in ("platform", "agent-runtime", "camofox", "agent-sandbox"):
     if component not in public_images:
         raise SystemExit(f"public-image gate omits {component}")
+
+upstream_contracts = job("upstream-contracts")
+if 'grep -Fxq "$service" "$root/actual-services"' not in upstream_contracts:
+    raise SystemExit("upstream contract does not verify every managed Firecrawl service")
+if 'diff -u "$root/expected-services" "$root/actual-services"' in upstream_contracts:
+    raise SystemExit("upstream contract still requires unrelated upstream Compose services")
 
 compose_smoke = job("compose-smoke")
 if "    timeout-minutes: 45\n" not in compose_smoke:
@@ -290,6 +296,7 @@ for fragment in (
     "cancel-in-progress: false",
     'image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")',
     "if not image_name.fullmatch(name):",
+    'if set(data["images"]) != expected_images:',
 ):
     if fragment not in publish:
         raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")
@@ -308,6 +315,7 @@ import json
 from pathlib import Path
 
 schema = json.loads(Path("containers/release-manifest.schema.json").read_text(encoding="utf-8"))
+upstream = json.loads(Path("docs/contracts/upstream-sources.json").read_text(encoding="utf-8"))
 if schema.get("properties", {}).get("schema_version", {}).get("const") != 1:
     raise SystemExit("release manifest schema does not lock schema_version=1")
 if schema.get("properties", {}).get("protocol_version", {}).get("const") != 1:
@@ -333,8 +341,15 @@ expected_images = {
 }
 if required_images != expected_images:
     raise SystemExit(f"unexpected required release images: {sorted(required_images)}")
+images_schema = schema.get("properties", {}).get("images", {})
+if images_schema.get("minProperties") != len(expected_images) or images_schema.get("maxProperties") != len(expected_images):
+    raise SystemExit("release image directory is not constrained to the exact current service set")
 if "firecrawl-foundationdb" in required_images:
     raise SystemExit("the current release schema still requires FoundationDB")
+managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
+expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
+if managed_firecrawl_services != expected_firecrawl_services:
+    raise SystemExit(f"unexpected managed Firecrawl upstream services: {sorted(managed_firecrawl_services)}")
 PY
 
 for dockerfile in containers/*.Dockerfile; do

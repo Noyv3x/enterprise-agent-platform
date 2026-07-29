@@ -116,7 +116,7 @@ main 质量门构建受支持架构的镜像与 Manager 二进制。release mani
 
 部署机不拉取 Cognee 或 Firecrawl Git 源码。Cognee 在镜像构建阶段从精确契约 revision 安装；Firecrawl Compose 服务和 digest 在 CI 中对上游契约验证后进入发布清单。
 
-托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽 entrypoint、脚本、库或默认配置。Firecrawl 固定注入 `NUQ_BACKEND=pg`，Postgres、Redis 与 RabbitMQ 分别使用明确的宿主 bind 数据目录；部署环境不能覆盖队列后端。不得注入 `FDB_CLUSTER_FILE`、启动 FoundationDB 或让 API 等待实验性 FoundationDB 后端。旧 generation 曾创建的 FoundationDB 容器在固定栈切换时随旧 Compose 精确停止并移除；自动更新不删除其旧宿主目录，也不把该目录继续挂载给现役服务。
+托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽 entrypoint、脚本、库或默认配置。Firecrawl 固定注入 `NUQ_BACKEND=pg`，Postgres、Redis 与 RabbitMQ 分别使用明确的宿主 bind 数据目录；部署环境不能覆盖队列后端。不得注入 `FDB_CLUSTER_FILE`、启动 FoundationDB、声明其镜像或数据目录，或让 API 等待实验性 FoundationDB 后端。
 
 ## 健康与提交
 

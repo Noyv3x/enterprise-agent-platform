@@ -48,7 +48,7 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 顶层 `scripts/test.sh` 必须可以在没有生产部署变量的开发机或 CI 工作区中直接运行。它对 Compose 做静态解析时使用隔离环境、不可变占位镜像引用和无副作用的占位挂载路径，不读取项目 `.env`，也不连接或修改正在运行的产品容器。
 
-部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须确认 PostgreSQL 是唯一队列基线、Compose 不含 FoundationDB 服务或注入，并真实启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API。随后在保留同一 PostgreSQL bind 数据的前提下重建服务，以容器 id 变化、精确读回首轮数据哨兵和真实提取请求共同证明持久与运行契约；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。
+部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。发布器生成的镜像键必须与当前 JSON Schema 的必需集合精确相等；上游 Firecrawl Compose 验证只要求源码契约列出的现役受管服务存在，不能把未采用的上游实验服务重新带入产品契约。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须确认 PostgreSQL 是唯一队列基线、Compose 不含 FoundationDB 服务或注入，并真实启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API。随后在保留同一 PostgreSQL bind 数据的前提下重建服务，以容器 id 变化、精确读回首轮数据哨兵和真实提取请求共同证明持久与运行契约；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。
 
 `documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。仓库级回归测试直接锁定这些 owner 关系，避免调整 manifest 时使迁移或发布验收失去规范文档。
 

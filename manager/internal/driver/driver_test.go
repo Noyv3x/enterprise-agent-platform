@@ -69,6 +69,39 @@ func pullTestManifest() release.Manifest {
 	}}
 }
 
+func TestGenerationEnvironmentExcludesOpaqueExtraImages(t *testing.T) {
+	root := t.TempDir()
+	platform := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
+	opaque := "registry.example/future@sha256:" + strings.Repeat("b", 64)
+	docker := DockerCLI{
+		GenerationDir: filepath.Join(root, "releases"),
+		DataRoot:      filepath.Join(root, "data"),
+		StateDir:      filepath.Join(root, "manager"),
+		UID:           os.Getuid(),
+		GID:           os.Getgid(),
+	}
+	path, err := docker.writeGenerationEnvironment(release.Manifest{
+		SourceCommit: strings.Repeat("c", 40),
+		Images: map[string]string{
+			"platform":       platform,
+			"future-service": opaque,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "UBITECH_PLATFORM_IMAGE="+platform+"\n") {
+		t.Fatalf("managed platform image is absent from Compose environment: %s", content)
+	}
+	if strings.Contains(string(content), "FUTURE_SERVICE") || strings.Contains(string(content), opaque) {
+		t.Fatalf("opaque image metadata entered Compose environment: %s", content)
+	}
+}
+
 func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	manifest := pullTestManifest()
 	runner := &pullTestRunner{present: map[string]bool{manifest.Images["platform"]: true}}

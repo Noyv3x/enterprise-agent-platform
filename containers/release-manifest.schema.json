@@ -43,6 +43,7 @@
     "images": {
       "type": "object",
       "minProperties": 10,
+      "maxProperties": 10,
       "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
       "additionalProperties": { "$ref": "#/$defs/image" },
       "required": [

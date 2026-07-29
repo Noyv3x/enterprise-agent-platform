@@ -29,7 +29,7 @@ Runtime 的锁定 Pi 元数据是可执行模型的唯一能力目录。供应�
 
 `web extract/read` 调用受管 Firecrawl `/v1/scrape`，请求 markdown 与 HTML并优先返回 markdown。每个原始 URL 和最终 URL 都经过公开 URL 与 DNS 感知 SSRF 校验；内容按调用预算裁剪。
 
-CI 从源码契约指定的 Compose 文件确认上游能力与默认后端，再构建或锁定当前受管服务的全部镜像 digest。Firecrawl 当前唯一基线为 PostgreSQL 队列；上游标记为实验性且仅在 `NUQ_BACKEND=fdb` 使用的 FoundationDB 不进入受管服务、Compose 或健康目录。协议交接 release 可以按[自动更新](../operations/auto-update.md)携带一次不被运行路径引用的同名额外 digest，唯一部署实例升级后立即删除。Manager 用稳定 project label、显式 bind mount 和私有网络启动当前服务；Compose 成功后仍需 HTTP 探测，停止旧 generation 时移除其受管容器。部署机不保留 Firecrawl checkout。
+CI 从源码契约指定的 revision 和 Compose 文件确认平台实际使用的上游服务，再构建或锁定当前受管服务的全部镜像 digest。Firecrawl 唯一基线为 PostgreSQL 队列；上游标记为实验性且仅在 `NUQ_BACKEND=fdb` 使用的 FoundationDB 不进入源码契约的受管服务集合、release manifest、Compose 或健康目录。release manifest 只接受当前服务的精确镜像键集合。Manager 用稳定 project label、显式 bind mount 和私有网络启动当前服务；Compose 成功后仍需 HTTP 探测，停止上一 generation 时移除其受管容器。部署机不保留 Firecrawl checkout。
 
 Firecrawl API key 作为 Platform secret 注入调用方，不写入 Compose 文件、Manager journal 或 URL；携带 key 的请求拒绝重定向。
 

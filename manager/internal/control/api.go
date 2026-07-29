@@ -145,7 +145,7 @@ func generationStatusProjection(generation *model.Generation) any {
 	}
 	images := make(map[string]string, len(generation.Images))
 	for name, image := range generation.Images {
-		if safeStatusToken(name, 64) == "" || !safeImageReference(image) {
+		if !release.IsManagedImageName(name) || safeStatusToken(name, 64) == "" || !safeImageReference(image) {
 			continue
 		}
 		images[name] = image

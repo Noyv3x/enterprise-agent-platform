@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +22,29 @@ const maxManifestBytes = 1 << 20
 var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var digestPattern = regexp.MustCompile(`^[^@[:space:]]+@sha256:[0-9a-f]{64}$`)
 var imageNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+var managedImageNames = []string{
+	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+	"firecrawl-redis", "firecrawl-rabbitmq",
+}
+
+var managedImageNameSet = func() map[string]struct{} {
+	result := make(map[string]struct{}, len(managedImageNames))
+	for _, name := range managedImageNames {
+		result[name] = struct{}{}
+	}
+	return result
+}()
+
+// IsManagedImageName identifies image entries that the current product may
+// pull, expose to Compose, or project through its status API. Manifest parsing
+// accepts safe opaque extension entries for forward compatibility, but those
+// entries must never cross this execution boundary.
+func IsManagedImageName(name string) bool {
+	_, ok := managedImageNameSet[name]
+	return ok
+}
 
 type Artifact struct {
 	URL    string `json:"url"`
@@ -67,8 +89,7 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	required := []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"}
-	for _, name := range required {
+	for _, name := range managedImageNames {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q must use a complete registry sha256 digest", name)
@@ -108,18 +129,6 @@ func (a Artifact) Validate() error {
 		return errors.New("sha256 is not hexadecimal")
 	}
 	return nil
-}
-func (m Manifest) CanonicalImages() []string {
-	names := make([]string, 0, len(m.Images))
-	for name := range m.Images {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	result := make([]string, 0, len(names))
-	for _, name := range names {
-		result = append(result, m.Images[name])
-	}
-	return result
 }
 func (m Manifest) Digest() (string, error) {
 	data, err := json.Marshal(m)

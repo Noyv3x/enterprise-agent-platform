@@ -1044,7 +1044,9 @@ func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string
 	path := filepath.Join(dir, "compose.env")
 	names := make([]string, 0, len(manifest.Images))
 	for name := range manifest.Images {
-		names = append(names, name)
+		if release.IsManagedImageName(name) {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	var content strings.Builder

@@ -58,7 +58,7 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 更新预拉取只把 Platform 与 Agent Runtime 作为切换前核心镜像。Manager 先用本地精确 RepoDigest 判断是否已经存在，不能为本地命中无条件访问 registry；缺失镜像的命令输出只用于刷新内存中的空闲期限，原始 registry 输出不得写入 operation、公共状态或长期日志。无进展和绝对超时都在 maintenance 前结束为可重试失败。Camoufox、SearXNG、Firecrawl 与 Sandbox 镜像由各自受限路径拉取，第三方 registry 故障不能扩展核心更新的信任或锁边界。
 
-Manager 服务状态使用当前固定服务白名单投影；已经退出 Compose 的服务不能因旧 journal、额外 manifest 键或 Docker 残留重新出现在控制 API。滚动 schema 交接中的额外镜像键必须是完整 digest、不得被 Compose 引用，并在新 Manager 接管后删除。
+Manager 只把当前镜像白名单写入 Compose 环境和服务状态投影；未被当前契约命名的 manifest 扩展项即使通过格式校验，也只能保留为不可执行的 opaque metadata，不能获得环境变量、Compose 引用、镜像拉取或控制 API 可见性。已经退出当前 Compose 的服务不能因 journal、额外 manifest 键或 Docker 残留重新进入运行边界。
 
 Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 operation id 确认 reserve 后才可执行破坏性操作。响应不确定时只有明确 release 才能回到非维护状态；Manager 不可达或预约身份不一致时所有管理写操作 fail closed。Platform 启动任何有副作用 worker 前必须恢复同一持久预约状态。
 

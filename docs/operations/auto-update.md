@@ -10,7 +10,7 @@ CI 只有在文档门禁、Python、Runtime、前端、Manager、容器构建、
 
 Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Compose 先下载到同目录 staging，完整验证并同步后原子发布。相同 commit 的工件必须逐字节一致；缺件或内容漂移视为 immutable-ID collision，必须在拉取镜像和进入维护前失败。
 
-删除旧 Manager 曾强制要求的 manifest 字段时使用单代滚动交接：交接 release 可携带一个不被 Compose、运行逻辑或健康目录引用的额外 digest，且该 digest 必须别名到仍受管的现役镜像，不能继续拉取已退役镜像。新 Manager 必须把该字段降为可选；唯一部署实例确认运行新 Manager 后，下一个 release 删除额外字段。该交接不能恢复已退役服务或延长为长期兼容路径。
+当前通道发布出的 release manifest 镜像目录必须与当前契约定义的服务集合精确相等；缺少必需镜像或由发布器携带未知、退役服务键都在发布前失败。JSON Schema、发布组装和静态验收共用同一集合，不能通过额外字段保留第二套运行基线。Manager 解析器只为协议前向演进接受名称和 digest 格式安全的额外镜像项，并将其视为不可执行的 opaque metadata；只有当前契约显式命名的镜像能够被拉取、启动或展示。
 
 ## 检测与预拉取
 

@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  # A bridge may have pulled any qualified main commit, so a newer workflow
+  # A deployment may have pulled any qualified main commit, so a newer workflow
   # must not evict its pending exact release. Channel monotonicity is enforced
   # separately when the immutable release is made public.
   group: container-release-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
@@ -119,8 +119,13 @@ jobs:
           test "$(git -C "$root/firecrawl" rev-parse HEAD)" = '${{ needs.prepare.outputs.firecrawl_revision }}'
           test -f "$root/firecrawl/docker-compose.yaml"
           docker compose -f "$root/firecrawl/docker-compose.yaml" config --services | sort > "$root/actual-services"
-          jq -r '.sources.firecrawl.compose_services[]' docs/contracts/upstream-sources.json | sort > "$root/expected-services"
-          diff -u "$root/expected-services" "$root/actual-services"
+          jq -r '.sources.firecrawl.compose_services[]' docs/contracts/upstream-sources.json |
+            while IFS= read -r service; do
+              grep -Fxq "$service" "$root/actual-services" || {
+                echo "Managed Firecrawl service is absent from the locked upstream revision: $service" >&2
+                exit 1
+              }
+            done
 
       - name: Verify immutable integration image indexes exist
         shell: bash
@@ -891,8 +896,7 @@ jobs:
                 "firecrawl-playwright": "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2",
                 "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
                 "firecrawl-redis": "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
-                "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69",
-                "firecrawl-foundationdb": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"
+                "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
               }
             }' > "$stage/release.json"
           python3 - "$stage/release.json" <<'PY'
@@ -904,12 +908,13 @@ jobs:
               raise SystemExit("release manifest top-level shape mismatch")
           if data["schema_version"] != 1 or data["channel"] != "main" or data["protocol_version"] != 1:
               raise SystemExit("release manifest channel/schema mismatch")
-          # One-release handoff: the deployed e758 Manager still requires the
-          # old key. It aliases the already-required PostgreSQL digest, so the
-          # bridge neither pulls nor runs a FoundationDB image. New Managers do
-          # not require the key; the next clean release removes it.
-          if data["images"].get("firecrawl-foundationdb") != data["images"].get("firecrawl-postgres"):
-              raise SystemExit("legacy Firecrawl image key must alias PostgreSQL during the bridge release")
+          expected_images = {
+              "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+              "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+              "firecrawl-redis", "firecrawl-rabbitmq",
+          }
+          if set(data["images"]) != expected_images:
+              raise SystemExit(f"release image directory mismatch: {sorted(data['images'])}")
           image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
           digest = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
           for name, image in data["images"].items():

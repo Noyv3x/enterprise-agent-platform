@@ -246,6 +246,7 @@ func TestStatusOmitsGenerationHostPaths(t *testing.T) {
 			DatabaseVersion: 7,
 			Images: map[string]string{
 				"platform":       "ghcr.io/ubitech/platform@sha256:" + strings.Repeat("b", 64),
+				"future-service": "registry.example/future@sha256:" + strings.Repeat("a", 64),
 				"absolute-path":  snapshotPath,
 				"file-uri":       "file:///home/ubitech/private@sha256:" + strings.Repeat("c", 64),
 				"embedded-path":  "notice:/home/ubitech/private@sha256:" + strings.Repeat("d", 64),
@@ -272,8 +273,9 @@ func TestStatusOmitsGenerationHostPaths(t *testing.T) {
 		t.Fatalf("generation status exposed rollback_snapshot_path: %#v", current)
 	}
 	images, ok := current["images"].(map[string]any)
-	if !ok || images["platform"] == nil || images["registry-port"] == nil || images["official-image"] == nil ||
-		images["absolute-path"] != nil || images["file-uri"] != nil || images["embedded-path"] != nil {
+	if !ok || images["platform"] == nil || len(images) != 1 || images["future-service"] != nil ||
+		images["registry-port"] != nil || images["official-image"] != nil || images["absolute-path"] != nil ||
+		images["file-uri"] != nil || images["embedded-path"] != nil {
 		t.Fatalf("generation status did not constrain image references: %#v", current["images"])
 	}
 	if status["error"] != "manager operation requires attention" {

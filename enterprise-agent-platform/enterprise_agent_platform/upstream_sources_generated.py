@@ -15,8 +15,6 @@ UPSTREAM_SOURCES = {
     "firecrawl": {
         "compose_services": [
             "api",
-            "foundationdb",
-            "foundationdb-init",
             "nuq-postgres",
             "playwright-service",
             "rabbitmq",
