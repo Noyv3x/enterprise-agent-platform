@@ -66,9 +66,6 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	if err != nil {
 		return err
 	}
-	if state.Candidate != nil || state.Activation != nil {
-		return errors.New("refusing external recovery while a Manager candidate or activation is active")
-	}
 	if state.Current == nil {
 		return errors.New("external recovery requires a registered Current Manager")
 	}
@@ -102,6 +99,45 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	}
 	if !pathWithin(filepath.Join(m.Root, "versions"), oldCurrent.Path) {
 		return errors.New("registered Current Manager path is outside the Manager versions directory")
+	}
+	activationRequest := recoveryActivationRequest{
+		executablePath:    executablePath,
+		platformStatePath: platformStatePath,
+		platformCommit:    platformCommit,
+		expectedSHA:       expectedSHA256,
+		newBinary:         newBinary,
+		newSHA:            newSHA,
+		unit:              unit,
+		originalStateData: originalStateData,
+		state:             state,
+		oldCurrent:        oldCurrent,
+		oldBinary:         oldBinary,
+	}
+	journalPath := m.recoveryTakeoverJournalPath(platformCommit, newSHA)
+	if journal, exists, journalErr := m.readRecoveryTakeoverJournal(journalPath); journalErr != nil {
+		return journalErr
+	} else if exists {
+		terminalPhase, completed, completeErr := m.completeRecoveryTerminalCheckpoint(ctx, journal)
+		if completeErr != nil {
+			return completeErr
+		}
+		if completed {
+			if terminalPhase == recoveryTakeoverRolledBack {
+				return errors.New("current recovery activation was rolled back by its watchdog")
+			}
+			return m.verifyCommittedRecovery(ctx, activationRequest, journal)
+		}
+		if journal.Phase == recoveryTakeoverCommitted {
+			return m.verifyCommittedRecovery(ctx, activationRequest, journal)
+		}
+		evidence, evidenceErr := readRecoveryFinalizeEvidence(platformStatePath, platformCommit)
+		if evidenceErr != nil {
+			return evidenceErr
+		}
+		return m.driveRecoveryTakeoverJournal(ctx, activationRequest, evidence, journal)
+	}
+	if state.Candidate != nil || state.Activation != nil {
+		return m.recoverCurrentActivation(ctx, activationRequest)
 	}
 
 	stableBinary, _, err := readRecoveryRegularFile(m.InstallPath, recoveryMaxBinaryBytes, false)
@@ -626,6 +662,18 @@ func (m *Manager) verifyRecoveryServiceProcess(ctx context.Context, unit, expect
 	if err != nil || pid <= 1 {
 		return errors.New("Manager service has no valid MainPID")
 	}
+	controlPIDText, err := recoverySystemdProperty(ctx, unit, "ControlPID")
+	if err != nil {
+		return err
+	}
+	controlPID, err := strconv.Atoi(controlPIDText)
+	if err != nil || controlPID != 0 {
+		return errors.New("Manager service has a nonzero or invalid ControlPID")
+	}
+	controlGroup, err := recoverySystemdProperty(ctx, unit, "ControlGroup")
+	if err != nil || controlGroup == "" || controlGroup == "/" {
+		return errors.New("Manager service has no valid systemd control group")
+	}
 	processExecutable := filepath.Join("/proc", strconv.Itoa(pid), "exe")
 	processSHA, err := fileSHA256(processExecutable)
 	if err != nil {
@@ -644,6 +692,10 @@ func (m *Manager) verifyRecoveryServiceProcess(ctx context.Context, unit, expect
 	}
 	if !os.SameFile(stableInfo, processInfo) {
 		return errors.New("Manager service MainPID is not executing the stable candidate inode")
+	}
+	cgroupData, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	if err != nil || !recoveryProcessInExactControlGroup(cgroupData, controlGroup) {
+		return errors.New("Manager service MainPID is outside its exact systemd control group")
 	}
 	return nil
 }

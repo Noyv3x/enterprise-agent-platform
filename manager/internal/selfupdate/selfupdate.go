@@ -45,24 +45,31 @@ type State struct {
 }
 
 type Plan struct {
-	SchemaVersion    int       `json:"schema_version"`
-	PlanPath         string    `json:"plan_path"`
-	Status           string    `json:"status"`
-	StatePath        string    `json:"state_path"`
-	InstallPath      string    `json:"install_path"`
-	SocketPath       string    `json:"socket_path"`
-	ControlTokenFile string    `json:"control_token_file"`
-	UnitName         string    `json:"unit_name"`
-	CandidateVersion string    `json:"candidate_version"`
-	CandidateSHA     string    `json:"candidate_sha256"`
-	PreviousPath     string    `json:"previous_path"`
-	Activated        bool      `json:"activated"`
-	Acknowledged     bool      `json:"acknowledged"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	HealthTimeoutMS  int       `json:"health_timeout_ms"`
-	BootID           string    `json:"boot_id,omitempty"`
-	Error            string    `json:"error,omitempty"`
+	SchemaVersion         int       `json:"schema_version"`
+	Mode                  string    `json:"mode,omitempty"`
+	PlanPath              string    `json:"plan_path"`
+	Status                string    `json:"status"`
+	StatePath             string    `json:"state_path"`
+	InstallPath           string    `json:"install_path"`
+	SocketPath            string    `json:"socket_path"`
+	ControlTokenFile      string    `json:"control_token_file"`
+	UnitName              string    `json:"unit_name"`
+	CandidateVersion      string    `json:"candidate_version"`
+	CandidateSHA          string    `json:"candidate_sha256"`
+	CandidatePath         string    `json:"candidate_path,omitempty"`
+	PlatformCommit        string    `json:"platform_commit,omitempty"`
+	RecoveryTransactionID string    `json:"recovery_transaction_id,omitempty"`
+	RecoveryJournalPath   string    `json:"recovery_journal_path,omitempty"`
+	SupersededPlanPath    string    `json:"superseded_plan_path,omitempty"`
+	SupersededPlanSHA     string    `json:"superseded_plan_sha256,omitempty"`
+	PreviousPath          string    `json:"previous_path"`
+	Activated             bool      `json:"activated"`
+	Acknowledged          bool      `json:"acknowledged"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	HealthTimeoutMS       int       `json:"health_timeout_ms"`
+	BootID                string    `json:"boot_id,omitempty"`
+	Error                 string    `json:"error,omitempty"`
 }
 
 type Runner interface {
@@ -80,18 +87,23 @@ func (CommandRunner) Run(ctx context.Context, name string, args ...string) error
 }
 
 type Manager struct {
-	Root                    string
-	StatePath               string
-	InstallPath             string
-	SocketPath              string
-	ControlTokenFile        string
-	UnitName                string
-	RunningVersion          string
-	Client                  release.Client
-	Runner                  Runner
-	Now                     func() time.Time
-	BootID                  func() string
-	RecoveryProcessVerifier func(context.Context, string, string, string) error
+	Root                     string
+	StatePath                string
+	InstallPath              string
+	SocketPath               string
+	ControlTokenFile         string
+	UnitName                 string
+	RunningVersion           string
+	Client                   release.Client
+	Runner                   Runner
+	Now                      func() time.Time
+	BootID                   func() string
+	RecoveryProcessVerifier  func(context.Context, string, string, string) error
+	RecoveryUnitQuiescer     func(context.Context, string, []string, string) error
+	RecoveryUnitActive       func(context.Context, string) (bool, error)
+	RecoveryUnitEnabled      func(context.Context, string) (bool, error)
+	RecoveryUnitFencer       func(context.Context, string, bool) error
+	RecoveryWatchdogVerifier func(context.Context, string, string, string, string) error
 }
 
 // ProbeTransientUnit proves that the current user-systemd session can host
@@ -272,6 +284,9 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 		return errors.New("manager activation plan does not match running binary")
 	}
 	if hash != state.Activation.CandidateSHA {
+		if plan.Mode == recoveryActivationMode {
+			return errors.New("current recovery activation can only be settled by its recovery watchdog")
+		}
 		// Crash before the stable binary replacement: the active Manager is still
 		// authoritative, so abort the durable intent and leave the verified
 		// candidate available for a later retry.
@@ -288,6 +303,12 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 		}
 		plan.Error = "running Manager matches neither activation candidate nor previous binary"
 		return restorePrevious(plan, m.runner())
+	}
+	if plan.Mode == recoveryActivationMode {
+		if plan.InstallPath != m.InstallPath || plan.UnitName != m.recoveryUnitName() {
+			return errors.New("current recovery activation does not match Manager service configuration")
+		}
+		return m.acknowledgeRecoveryExecutable(plan)
 	}
 	// Crash after atomic replacement but before plan.Activated was durable is a
 	// safe roll-forward: the candidate itself proves the persisted intent by its
@@ -311,6 +332,63 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 	return nil
 }
 
+func (m *Manager) acknowledgeRecoveryExecutable(plan Plan) error {
+	ownership, err := readRecoveryTakeoverOwnership(plan)
+	if err != nil {
+		return fmt.Errorf("validate current recovery activation ownership: %w", err)
+	}
+	return withRecoveryTakeoverMutationLock(ownership.Path, func() error {
+		latestOwnership, readErr := readRecoveryTakeoverOwnership(plan)
+		if readErr != nil {
+			return readErr
+		}
+		if recoveryPhaseBefore(latestOwnership.Phase, recoveryTakeoverWatchdogOwned) ||
+			latestOwnership.Phase == recoveryTakeoverRolledBack || latestOwnership.Phase == recoveryTakeoverCommitted {
+			return errors.New("current recovery activation watchdog has not retained acknowledgement ownership")
+		}
+		_, state, readErr := readRecoverySelfUpdateState(plan.StatePath)
+		if readErr != nil {
+			return readErr
+		}
+		_, durablePlan, readErr := readRecoveryActivationPlan(plan.PlanPath)
+		if readErr != nil {
+			return readErr
+		}
+		if err := validateRecoveryPlanOwnership(durablePlan, latestOwnership); err != nil {
+			return err
+		}
+		if !recoveryStateHasOriginalBase(state, latestOwnership) || !recoveryCandidateMatches(state.Candidate, latestOwnership) ||
+			!recoveryActivationMatches(state.Activation, latestOwnership) {
+			return errors.New("current recovery activation state does not match its transaction")
+		}
+		if durablePlan.Status != "activated" && durablePlan.Status != "acknowledged" {
+			return errors.New("current recovery activation plan is not ready for acknowledgement")
+		}
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := m.verifyRecoveryServiceProcess(verifyCtx, durablePlan.UnitName, durablePlan.CandidateSHA); err != nil {
+			return fmt.Errorf("verify current recovery activation process: %w", err)
+		}
+		if durablePlan.BootID != m.bootID() {
+			if err := m.ensureRecoveryWatchdog(verifyCtx, latestOwnership); err != nil {
+				return fmt.Errorf("re-arm current recovery watchdog after reboot: %w", err)
+			}
+		}
+		durablePlan.Activated = true
+		durablePlan.Acknowledged = true
+		durablePlan.Status = "acknowledged"
+		durablePlan.UpdatedAt = m.now()
+		return persistActivationPlan(durablePlan.PlanPath, durablePlan)
+	})
+}
+
+func (m *Manager) recoveryUnitName() string {
+	if m.UnitName != "" {
+		return m.UnitName
+	}
+	return "ubitech-agent-manager.service"
+}
+
 func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 	if runner == nil {
 		runner = CommandRunner{}
@@ -328,6 +406,9 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 	for time.Now().Before(deadline) {
 		if err := atomicfile.ReadJSON(planPath, &plan); err != nil {
 			break
+		}
+		if plan.Status == recoverySupersededStatus {
+			return errors.New("activation ownership was superseded by controlled Current recovery")
 		}
 		if plan.Activated && plan.Acknowledged && managerHealthy(ctx, plan.SocketPath, plan.ControlTokenFile, plan.CandidateVersion, plan.CandidateSHA) && binaryMatches(plan.InstallPath, plan.CandidateSHA) {
 			consecutive++
@@ -351,12 +432,59 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 }
 
 func commitActivation(planPath string, plan Plan) error {
+	if plan.Mode == recoveryActivationMode {
+		journal, err := readRecoveryTakeoverOwnership(plan)
+		if err != nil {
+			return err
+		}
+		return withRecoveryTakeoverMutationLock(journal.Path, func() error {
+			latest, readErr := readRecoveryTakeoverOwnership(plan)
+			if readErr != nil {
+				return readErr
+			}
+			if recoveryPhaseBefore(latest.Phase, recoveryTakeoverWatchdogOwned) || latest.Phase == recoveryTakeoverRolledBack {
+				return errors.New("current recovery watchdog does not own activation commit")
+			}
+			return commitActivationWithOwnership(planPath, plan, &latest)
+		})
+	}
+	return commitActivationWithOwnership(planPath, plan, nil)
+}
+
+func commitActivationWithOwnership(planPath string, plan Plan, ownership *recoveryTakeoverJournal) error {
+	var durablePlan Plan
+	if err := atomicfile.ReadJSON(planPath, &durablePlan); err != nil {
+		return err
+	}
+	if durablePlan.Status == recoverySupersededStatus {
+		return errors.New("activation plan was superseded before watchdog commit")
+	}
+	if plan.Mode == recoveryActivationMode {
+		if err := validateRecoveryPlanOwnership(durablePlan, *ownership); err != nil {
+			return err
+		}
+	}
 	var state State
 	if err := atomicfile.ReadJSON(plan.StatePath, &state); err != nil {
 		return err
 	}
+	if ownership != nil && recoveryCommittedStateMatches(state, *ownership) {
+		// Crash replay after the atomic self-update state commit but before the
+		// plan/journal terminal writes. Complete only the missing metadata; never
+		// rotate Current/Previous a second time.
+		durablePlan.Status = "committed"
+		durablePlan.UpdatedAt = time.Now().UTC()
+		if err := persistActivationPlan(planPath, durablePlan); err != nil {
+			return err
+		}
+		return persistRecoveryTakeoverTerminalLocked(*ownership, recoveryTakeoverCommitted)
+	}
 	if state.Activation == nil || state.Candidate == nil || state.Candidate.SHA256 != plan.CandidateSHA {
 		return errors.New("activation state changed before watchdog commit")
+	}
+	if ownership != nil && (!recoveryStateHasOriginalBase(state, *ownership) ||
+		!recoveryCandidateMatches(state.Candidate, *ownership) || !recoveryActivationMatches(state.Activation, *ownership)) {
+		return errors.New("current recovery activation state lost transaction ownership")
 	}
 	state.Previous = state.Current
 	state.Current = state.Candidate
@@ -366,13 +494,44 @@ func commitActivation(planPath string, plan Plan) error {
 	if err := atomicfile.WriteJSON(plan.StatePath, state, 0o600); err != nil {
 		return err
 	}
-	plan.Status = "committed"
-	plan.UpdatedAt = time.Now().UTC()
-	return persistActivationPlan(planPath, plan)
+	durablePlan.Status = "committed"
+	durablePlan.UpdatedAt = time.Now().UTC()
+	if err := persistActivationPlan(planPath, durablePlan); err != nil {
+		return err
+	}
+	if ownership != nil {
+		return persistRecoveryTakeoverTerminalLocked(*ownership, recoveryTakeoverCommitted)
+	}
+	return nil
 }
 
 func restorePrevious(plan Plan, runner Runner) error {
 	plan.Error = journal.BoundDiagnostic(plan.Error)
+	if plan.Mode == recoveryActivationMode {
+		ownership, err := readRecoveryTakeoverOwnership(plan)
+		if err != nil {
+			return err
+		}
+		return withRecoveryTakeoverMutationLock(ownership.Path, func() error {
+			latest, readErr := readRecoveryTakeoverOwnership(plan)
+			if readErr != nil {
+				return readErr
+			}
+			if recoveryPhaseBefore(latest.Phase, recoveryTakeoverWatchdogOwned) || latest.Phase == recoveryTakeoverCommitted {
+				return errors.New("current recovery watchdog does not own activation rollback")
+			}
+			return restoreRecoveryActivationPrevious(plan, runner, latest)
+		})
+	}
+	var durablePlan Plan
+	if plan.PlanPath != "" {
+		if err := atomicfile.ReadJSON(plan.PlanPath, &durablePlan); err != nil {
+			return fmt.Errorf("revalidate activation ownership before rollback: %w", err)
+		}
+		if durablePlan.Status == recoverySupersededStatus {
+			return errors.New("activation rollback was superseded by controlled Current recovery")
+		}
+	}
 	previous, readErr := os.ReadFile(plan.PreviousPath)
 	if readErr != nil {
 		return fmt.Errorf("read previous Manager for rollback: %w", readErr)

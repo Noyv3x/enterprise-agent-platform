@@ -70,9 +70,37 @@ CLI 通过 owner-only Unix socket 连接常驻 Manager，并从 owner-only secre
 
 只有 Manager 因已知启动缺陷持续退出、owner-only 控制 socket 无法稳定提供服务，因而普通更新和 `repair` 均不可达时，才允许使用发布二进制自带的 `recover-current` 宿主命令。该入口不是第二套平台更新器：它只替换并登记 Manager 二进制，不修改 Platform generation、operation journal、SQLite、容器或能力服务数据。
 
-操作方先从同一个不可变 release 下载当前架构的 Manager 与 `.sha256` sidecar，核对 HTTPS 来源后把期望 SHA-256 显式传给候选二进制。命令固定要求 `--config`、`--expected-sha256` 与 `--yes`。它必须验证执行用户、配置、stable 路径、数据根、当前 Platform generation、Manager 自更新状态及文件类型；存在普通 activation、未归属文件、符号链接、hash 不一致或候选版本无法验证时拒绝执行。
+操作方先从同一个不可变 release 下载当前架构的 Manager 与 `.sha256` sidecar，核对 HTTPS 来源后把期望 SHA-256 显式传给候选二进制。命令固定要求 `--config`、`--expected-sha256` 与 `--yes`。它必须验证执行用户、配置、stable 路径、数据根、当前 Platform generation、Manager 自更新状态及文件类型；存在未归属文件、符号链接、hash 不一致或候选版本无法验证时拒绝执行。普通 activation 只有在满足下述受控接管契约时才可处理，不能通过删除字段或覆盖 stable 绕过。
 
-恢复命令把候选复制到 owner-only 不可变版本目录，停止同一 user-systemd Manager unit，原子替换 stable 二进制并重新启动。健康检查使用经过 control capability 认证、完全不查询 Docker 或下游服务的轻量身份端点；它必须连续返回候选 release version 与当前运行可执行文件 SHA-256，并确认 systemd unit 的主进程确实来自 stable 候选，不能用可能受慢容器探针影响的完整 `/v1/status` 代替。只有这些身份检查通过后，才原子登记新的 Manager `Current`；登记时 `SourceCommit` 保持当前 Platform generation，旧 Manager `Current` 保留为 `Previous`，使当前 `finalize_pending` 可以继续收敛，下一次正常 release 仍能通过 watchdog 更新两者。候选启动、健康检查或登记失败时恢复原 stable 二进制，Manager 状态保持原值并重新启动旧服务。进程在 stable 替换后意外中断时允许原命令以相同期望 hash 重跑并继续收敛，不能要求人工编辑状态文件。
+Manager 状态没有 Candidate/Activation 时，恢复命令把候选复制到 owner-only 不可变版本目录，停止同一 user-systemd Manager unit，原子替换 stable 二进制并重新启动。健康检查使用经过 control capability 认证、完全不查询 Docker 或下游服务的轻量身份端点；它必须连续返回候选 release version 与当前运行可执行文件 SHA-256，并确认 systemd unit 的主进程确实来自 stable 候选，不能用可能受慢容器探针影响的完整 `/v1/status` 代替。只有这些身份检查通过后，才原子登记新的 Manager `Current`；登记时 `SourceCommit` 保持当前 Platform generation，旧 Manager `Current` 保留为 `Previous`。
+
+若故障位于 Platform 已提交、Manager Candidate 已标记 `platform_committed`、普通 activation/watchdog 尚未提交的窗口，恢复命令只能接管一条可完整证明的 finalize 链：Platform 必须处于维护状态且没有 active operation，唯一 `finalize_pending` operation 必须是已成功但未 finalized 的 install/update，operation target、Platform Current 与 Candidate source commit 必须完全一致；Current、Candidate、Activation 与 plan 的 version、SHA、受管路径、previous path、unit、socket、token path、boot id 和时间字段必须内部一致，stable 只能匹配登记 Current 或 Candidate。任何不一致都拒绝，不能猜测。
+
+接管先停止 Manager 主 unit，并枚举、停止该 activation 精确派生的 normal/recovery watchdog transient unit；必须证明所有相关 unit inactive、MainPID 与 ControlPID 为零、cgroup 无残留进程，且不存在仍持有同一 plan 或身份未知的同用户 watchdog 进程。出现未知同名前缀 unit、停止结果不确定或任一 journal/hash 在隔离期间改变时，必须重新分类或拒绝。确认隔离并完成二次校验后，必须在第一次修改旧 stable、plan、state 或 unit 启用状态之前持久化并同步一个确定路径的 owner-only takeover journal；它绑定 recovery version/SHA/path、Platform state 与 operation 身份及摘要、原 Manager state 身份及摘要、旧 plan 路径与原始摘要、Manager state/stable/socket/token/unit 配置、unit 初始启用状态、初始 boot id、初始 stable SHA 和事务阶段，事务摘要覆盖全部不可变绑定。旧 plan 后续内容变化不能覆盖 takeover journal 中保存的原始身份。
+
+takeover journal 落盘后，先禁用 Manager 主 unit 的自动启动并证明其保持 disabled，再按普通 watchdog 回滚语义把 stable 恢复为登记 Current、把旧 plan 标记为受控 superseded，最后清除旧 Activation；旧 Candidate 和 plan 暂时保留为审计证据。主 unit 在恢复 plan 激活以前始终保持 fenced，因此主机在任何跨文件边界重启都不会让旧 Current 或旧 Candidate 越过事务自行启动。
+
+随后先把 stable 原子替换为 recovery 不可变二进制，再以当前 Platform commit 建立带 `recover_current` 标记的新 activation plan。plan 绑定 takeover transaction id、recovery version/SHA/path、Platform commit、被接管 plan 的路径与原始摘要以及 journal 固化的全部 Manager 配置；新的 Candidate/Activation intent 必须在 stable 已为 recovery 后持久化，并从 recovery 不可变路径启动独立 watchdog。只有 state 已引用该 plan，且 systemd 已证明 recovery watchdog 的 PID、可执行文件、参数、cgroup 和 plan 完全匹配时，commit/rollback 及 current/previous 的唯一写权限才移交给 watchdog。外部命令此后只保留 activation bootstrap 权限，按 takeover journal 的单调阶段验证 stable、激活 plan、恢复主 unit enabled、启动 Manager；它不得直接提交或回滚，完成主 unit 启动后只能观察 watchdog 终态。跨 boot 重放必须检测当前 boot id 与 journal 固化的初始 boot id 不同，并从同一 recovery 不可变路径重新武装和证明唯一 watchdog；初始 boot id 仍是不可变事务绑定，不能通过改写 plan 形成第二个所有者。
+
+恢复 Manager 仍走标准 pending-activation 协议，但其预提交探针只检查核心 Platform/Runtime 与公网入口，不检查 Firecrawl 等能力服务；启动确认还必须证明 systemd MainPID 执行的文件与 stable 为同一 inode。只有 recovery watchdog 经过认证身份连续确认后，才按标准切换 `Previous=旧 Current`、`Current=recovery` 并清除 Candidate/Activation。recovery watchdog 的 commit 与 rollback 都必须先条件校验 state 中的 plan path、transaction id、mode、Candidate path/SHA 仍归自己所有；失去所有权的旧 watchdog 不得写 stable、state、plan 或重启服务。
+
+旧 activation 结算前失败保持原 state/stable；结算后任何失败统一回到登记 Current，不恢复已证明会循环的旧 Candidate，也不把失败的 recovery Candidate 留给普通 finalize 自动重激活。回滚先清空 Candidate/Activation、恢复 stable=Current、持久化 plan/journal 终态，再恢复主 unit enabled 并验证 Current 的 PID、inode、SHA 与轻量身份健康；终态写入和服务恢复之间中断时，同一命令只补做服务收敛。恢复进程在 plan、intent、stable 替换、服务重启、watchdog 提交，或 Manager state 已提交但 Platform 已先完成 finalize 的边界中断时，同一不可变二进制和期望 hash 必须识别 `recover_current` 事务并只补齐缺失阶段，不能要求人工编辑 journal，也不能再次移动 Current/Previous。一次 recovery 已明确 `rolled_back` 后不得用同一终态 journal 暗中重开；应先诊断失败原因并使用新的已验证 recovery release 建立新事务。恢复成功后由原 `finalize_pending` 补完 reservation release，再恢复普通自动更新。
+
+受控接管使用以下单调阶段；每次阶段更新都在对应副作用已经原子落盘并同步后发生，重放时先检查副作用再补记阶段，不能重复执行未经所有权校验的写操作。
+
+| Takeover phase | 写权限所有者 | 已持久化事实 | 中断后的唯一合法收敛 |
+|---|---|---|---|
+| `prepared` | 外部恢复命令 | takeover journal 已绑定全部原始 journal、plan、manifest、operation、Manager 配置、unit 初始状态与 hash | 禁用主 unit 自动启动、重新隔离旧 unit 并验证原始证据，尚不可改旧状态 |
+| `stable_current` | 外部恢复命令 | 主 unit 已 fenced；stable 已恢复并验证为登记 Current | 继续标记旧 plan；不得恢复旧 Candidate |
+| `plan_superseded` | 外部恢复命令 | 旧 plan 已终态化并反向绑定 takeover transaction | 清除旧 Activation；原始 plan SHA 仍取自 takeover journal |
+| `activation_cleared` | 外部恢复命令 | 旧 Activation 已清除，旧 Candidate 身份已保存在 takeover journal，主 unit 仍 fenced | 先把 stable 替换为 recovery，再建立或重放 recovery intent |
+| `recovery_intent_persisted` | 外部恢复命令 | stable 已验证为 recovery；recovery plan、Candidate 与 Activation 已绑定，主 unit 仍 fenced | 启动并证明 recovery watchdog；中断时不得启动旧 Current |
+| `watchdog_owned` | watchdog 独占 commit/rollback；外部命令仅保留 bootstrap 权限 | recovery watchdog 的 PID、可执行文件、参数、cgroup、plan 与 transaction 已证明 | 外部命令只可继续验证 stable、激活 plan、恢复 unit 并启动 main，任何失败由 watchdog 回滚 |
+| `stable_replaced` | 同上 | 对 intent 阶段已完成的 stable=recovery 做了幂等验证并补记 | 标记 plan activated；watchdog 超时则恢复登记 Current |
+| `plan_activated` | 同上 | recovery plan 已允许候选确认 | 启动 Manager 主 unit；watchdog 仍是唯一回滚者 |
+| `main_started` | watchdog；外部命令只读观察 | Manager 主 unit 已恢复 enabled 并启动，等待同 inode 确认和身份连续探测 | watchdog 条件式 commit 或条件式 rollback |
+| `committed` | 当前 Manager | `Previous=原 Current`、`Current=recovery`，Candidate/Activation 已清除 | 补记 plan/journal 终态并继续原 finalize，不可再次移动 Previous |
+| `rolled_back` | 登记 Current | stable 已恢复 Current，Candidate/Activation 已清除，失败 recovery 身份由审计 journal 保留，主 unit 已恢复 enabled | 幂等启动并验证 Current 控制面；不得自动重激活失败候选或伪报成功 |
 
 ## 公网入口与维护
 
