@@ -1,4 +1,0 @@
-services:
-  firecrawl-foundationdb-init:
-    command:
-      - 'printf "intentional Firecrawl init failure for release smoke\n" >&2; exit 42'

@@ -40,8 +40,7 @@
 │   │   └── firecrawl/
 │   │       ├── redis/
 │   │       ├── rabbitmq/
-│   │       ├── postgres/
-│   │       └── foundationdb/{data,cluster}/
+│   │       └── postgres/
 │   └── logs/
 └── backups/
 ```
@@ -78,7 +77,7 @@ Agent Runtime 的 session、approval 和 idempotency 继续保存在 `runtimes/a
 
 Camoufox 使用共享服务和按 scope 派生的独立 Profile。浏览器二进制位于镜像；登录态、Cookie、Profile 和需要保留的 trace 位于 bind mount。
 
-Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs 与 `.env` 位于数据根。SearXNG 的配置、缓存和日志映射到其目录；Firecrawl 的运行配置由 Compose 环境提供，Redis、RabbitMQ、Postgres 以及 FoundationDB 的数据与集群文件分别映射到上图所列目录。权威数据不得只存在于匿名 Docker volume。
+Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs 与 `.env` 位于数据根。SearXNG 的配置、缓存和日志映射到其目录；Firecrawl 的运行配置由 Compose 环境提供，Redis、RabbitMQ 与 PostgreSQL 数据分别映射到上图所列目录。当前基线不使用 FoundationDB。升级不会自动删除未被当前 Compose 引用的旧集成目录；这类目录也不再属于运行依赖。权威数据不得只存在于匿名 Docker volume。
 
 ## 管理状态与 generation 快照
 

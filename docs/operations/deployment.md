@@ -116,15 +116,13 @@ main 质量门构建受支持架构的镜像与 Manager 二进制。release mani
 
 部署机不拉取 Cognee 或 Firecrawl Git 源码。Cognee 在镜像构建阶段从精确契约 revision 安装；Firecrawl Compose 服务和 digest 在 CI 中对上游契约验证后进入发布清单。
 
-托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽 entrypoint、脚本、库或默认配置。FoundationDB 持久数据挂载到 `/var/fdb/data`，共享 cluster 目录挂载到 `/var/fdb/cluster`；server、初始化任务和 Firecrawl API 必须使用其中同一个 `/var/fdb/cluster/fdb.cluster` 文件。
-
-FoundationDB 初始化必须幂等：每次 `configure new single ssd` 尝试后，无论 CLI 的文本和退出码如何，都以有界 `status json` 验证 `.client.database_status.available == true`；只有该真实可用性条件成立才退出 0。不得因 `Database already exists!` 重建、清空或改写数据库。命令失败、无效 JSON、多个 JSON 文档或 database unavailable 继续有界重试并最终失败；初始化自身最多执行 20 轮、约 200 秒，Firecrawl 后台收敛提供 600 秒等待预算。最终诊断必须同时保留最后一次 configure 退出码/有界输出和 status 退出码/有界输出，不得只显示 `Database already exists!` 而隐去真实 readiness 失败。Firecrawl API 在自身能力栈内等待初始化成功和 FoundationDB 健康，但该等待不占用整个平台维护门。
+托管集成的 bind mount 只能覆盖镜像声明的数据路径，不能遮蔽 entrypoint、脚本、库或默认配置。Firecrawl 固定注入 `NUQ_BACKEND=pg`，Postgres、Redis 与 RabbitMQ 分别使用明确的宿主 bind 数据目录；部署环境不能覆盖队列后端。不得注入 `FDB_CLUSTER_FILE`、启动 FoundationDB 或让 API 等待实验性 FoundationDB 后端。旧 generation 曾创建的 FoundationDB 容器在固定栈切换时随旧 Compose 精确停止并移除；自动更新不删除其旧宿主目录，也不把该目录继续挂载给现役服务。
 
 ## 健康与提交
 
 Platform generation 的核心提交门为：Manager 存活并持有公网入口与控制接口、Platform readiness 和 Agent Runtime readiness。核心门通过后可以提交 generation 并退出维护；Camoufox、SearXNG、Firecrawl 与 Cognee 的状态独立显示为 healthy、starting 或 degraded，任何单项故障都不能让 Manager 退出或把健康的 Platform 锁成 503。
 
-Manager 启动固定栈时先等待核心服务，再异步收敛能力服务。Firecrawl 收敛逐项检查 Playwright、Redis、RabbitMQ、Postgres、FoundationDB、一次性 init 与 API。init 已非零退出时可以精确移除该 one-shot；FoundationDB 容器未运行或 Docker 健康状态明确为非 healthy 时才允许重启原容器。API、Redis、RabbitMQ、Postgres、Playwright 或配置故障不得触发 FoundationDB 重启。修复不得删除或改写持久数据，失败后记录有界诊断并指数退避。该预算只约束 Firecrawl 能力收敛，不是更新维护时间或 Agent run 执行超时。
+Manager 启动固定栈时先等待核心服务，再异步收敛能力服务。Firecrawl 收敛以 `docker compose up --detach --wait firecrawl-api` 幂等启动 Playwright、Redis、RabbitMQ、Postgres 与 API；失败后记录有界诊断并指数退避，不自行删除或改写持久数据。该预算只约束 Firecrawl 能力收敛，不是更新维护时间或 Agent run 执行超时。
 
 任何时刻最多一个可写 Platform 打开 SQLite。候选镜像先运行无业务 writer 的 preflight；Manager 在维护门关闭并停止 current writer 后，使用同一 Platform 镜像执行：
 
@@ -155,7 +153,7 @@ Sandbox entrypoint 只允许在启动映射 UID/GID 时短暂以 root 运行，�
 - 登录、首页、普通消息、SSE 与附件可用；
 - Agent Sandbox 能按需创建、停止并保留工作区；
 - terminal 路径可用；搜索、浏览器和网页提取分别报告实际能力状态，故障时不影响普通消息与 Agent Runtime；
-- Firecrawl 在空数据首次启动与保留数据重建两种场景均完成 init，API 健康；若暂时 degraded，Manager 保持在线并继续有界自愈；
+- Firecrawl 在空数据首次启动与保留 PostgreSQL 数据重建两种场景均健康，并通过真实提取请求；若暂时 degraded，Manager 保持在线并继续有界自愈；
 - 数据库完整性检查通过，current generation 与 Manager journal 一致。
 
 生产故障只能通过 Manager operation、当前数据库快照和 current/previous generation 处理。不得手工编辑 journal、切换镜像 tag、直接运行 Platform 或创建第二套 Compose 栈。

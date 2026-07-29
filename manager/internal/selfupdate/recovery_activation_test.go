@@ -1452,7 +1452,7 @@ func activationTakeoverImages() map[string]string {
 	names := []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis",
-		"firecrawl-rabbitmq", "firecrawl-foundationdb",
+		"firecrawl-rabbitmq",
 	}
 	images := make(map[string]string, len(names))
 	for index, name := range names {

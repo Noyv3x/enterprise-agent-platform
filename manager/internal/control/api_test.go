@@ -169,18 +169,16 @@ func TestStatusReportsEveryCoreServiceWithoutAssumingUnknownIsHealthy(t *testing
 	api := &API{
 		Store: store,
 		Engine: statusReporter{services: map[string]driver.FixedServiceState{
-			"platform":                    {Status: "healthy"},
-			"agent-runtime":               {Status: "healthy"},
-			"camofox":                     {Status: "healthy"},
-			"searxng":                     {Status: "healthy"},
-			"firecrawl-playwright":        {Status: "healthy"},
-			"firecrawl-redis":             {Status: "healthy"},
-			"firecrawl-rabbitmq":          {Status: "healthy"},
-			"firecrawl-postgres":          {Status: "healthy"},
-			"firecrawl-foundationdb":      {Status: "healthy"},
-			"firecrawl-foundationdb-init": {Status: "unavailable"},
-			"firecrawl-api":               {Status: "starting"},
-			"not-a-supported-service":     {Status: "healthy"},
+			"platform":                {Status: "healthy"},
+			"agent-runtime":           {Status: "healthy"},
+			"camofox":                 {Status: "healthy"},
+			"searxng":                 {Status: "healthy"},
+			"firecrawl-playwright":    {Status: "healthy"},
+			"firecrawl-redis":         {Status: "healthy"},
+			"firecrawl-rabbitmq":      {Status: "healthy"},
+			"firecrawl-postgres":      {Status: "healthy"},
+			"firecrawl-api":           {Status: "starting"},
+			"not-a-supported-service": {Status: "healthy"},
 		}},
 		ControlToken: "control-token-0123456789abcdef",
 	}
@@ -189,22 +187,20 @@ func TestStatusReportsEveryCoreServiceWithoutAssumingUnknownIsHealthy(t *testing
 	if !ok {
 		t.Fatalf("status services = %#v", status["services"])
 	}
-	if len(services) != 12 {
-		t.Fatalf("status exposed %d services, want Manager plus eleven core services: %#v", len(services), services)
+	if len(services) != 10 {
+		t.Fatalf("status exposed %d services, want Manager plus nine fixed services: %#v", len(services), services)
 	}
 	for name, expected := range map[string]string{
-		"manager":                     "healthy",
-		"platform":                    "healthy",
-		"agent-runtime":               "healthy",
-		"camofox":                     "healthy",
-		"searxng":                     "healthy",
-		"firecrawl-playwright":        "healthy",
-		"firecrawl-redis":             "healthy",
-		"firecrawl-rabbitmq":          "healthy",
-		"firecrawl-postgres":          "healthy",
-		"firecrawl-foundationdb":      "healthy",
-		"firecrawl-foundationdb-init": "unavailable",
-		"firecrawl-api":               "starting",
+		"manager":              "healthy",
+		"platform":             "healthy",
+		"agent-runtime":        "healthy",
+		"camofox":              "healthy",
+		"searxng":              "healthy",
+		"firecrawl-playwright": "healthy",
+		"firecrawl-redis":      "healthy",
+		"firecrawl-rabbitmq":   "healthy",
+		"firecrawl-postgres":   "healthy",
+		"firecrawl-api":        "starting",
 	} {
 		service, ok := services[name].(map[string]any)
 		if !ok || service["status"] != expected {

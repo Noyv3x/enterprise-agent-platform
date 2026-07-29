@@ -103,7 +103,7 @@ Provider 层次必须保持以下职责：
 
 Manager 的数值 `generation` 是并发修改版本，必须单独透传为操作的 `expected_generation`；release `current/target/previous.id` 只用于展示，不能互相替代。RFC3339 `checked_at` 在 Platform 边界规范化为前端可解析的时间，每个 service 的 `status` 规范化为明确的 `available/state`，未知或 unavailable 状态不得默认显示为 ready。
 
-Manager 服务状态区必须逐项呈现当前固定服务目录：`platform`、`agent-runtime`、`camofox`、`searxng`，以及 `firecrawl-playwright`、`firecrawl-redis`、`firecrawl-rabbitmq`、`firecrawl-postgres`、`firecrawl-foundationdb`、`firecrawl-foundationdb-init`、`firecrawl-api`；Manager 自身状态可以并列展示。初始化容器退出成功是独立完成态，不能因其不是长期运行容器而显示为故障；Firecrawl 的每个必需依赖都必须独立展示，不能合并成一个模糊状态。
+Manager 服务状态区必须逐项呈现当前固定服务目录：`platform`、`agent-runtime`、`camofox`、`searxng`，以及 `firecrawl-playwright`、`firecrawl-redis`、`firecrawl-rabbitmq`、`firecrawl-postgres`、`firecrawl-api`；Manager 自身状态可以并列展示。Firecrawl 的每个当前必需依赖都必须独立展示，不能合并成一个模糊状态，也不能继续展示已退出当前基线的 FoundationDB 项。
 
 候选镜像预拉取和 `waiting_for_tasks` 不阻断其它页面；进入 `updating` 后，全局 `UpdateGate` 禁止使用并显示管理器维护状态。失败时如果 Platform 仍可用，管理页展示 operation id 和使用宿主 CLI 的恢复提示；不得向普通页面泄露 Docker socket、registry 凭据、宿主绝对路径或完整管理日志。
 

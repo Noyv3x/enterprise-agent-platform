@@ -925,6 +925,29 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("manager/**", deployment["code"])
         self.assertIn("manager/internal/selfupdate/**", security["code"])
 
+    def test_repository_manifest_assigns_precise_container_integration_and_data_ownership(self) -> None:
+        manifest = json.loads(
+            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
+        )
+        deployment = self.manifest_domain(manifest, "deployment")
+        integrations = self.manifest_domain(manifest, "integrations")
+        data = self.manifest_domain(manifest, "data-memory-sessions")
+
+        self.assertIn("containers/**", deployment["code"])
+        self.assertIn("containers/compose.yaml", data["code"])
+        self.assertNotIn("containers/**", integrations["code"])
+        for path in (
+            "containers/compose.yaml",
+            "containers/compose.dev.yaml",
+            "containers/dev.env.example",
+            "containers/platform.Dockerfile",
+            "containers/platform-entrypoint.sh",
+            "containers/camofox.Dockerfile",
+            "containers/camofox-entrypoint.sh",
+            "containers/release-manifest.schema.json",
+        ):
+            self.assertIn(path, integrations["code"])
+
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
         manifest = self.manifest()

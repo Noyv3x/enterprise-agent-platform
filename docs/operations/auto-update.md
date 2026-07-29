@@ -10,9 +10,11 @@ CI 只有在文档门禁、Python、Runtime、前端、Manager、容器构建、
 
 Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Compose 先下载到同目录 staging，完整验证并同步后原子发布。相同 commit 的工件必须逐字节一致；缺件或内容漂移视为 immutable-ID collision，必须在拉取镜像和进入维护前失败。
 
+删除旧 Manager 曾强制要求的 manifest 字段时使用单代滚动交接：交接 release 可携带一个不被 Compose、运行逻辑或健康目录引用的额外 digest，且该 digest 必须别名到仍受管的现役镜像，不能继续拉取已退役镜像。新 Manager 必须把该字段降为可选；唯一部署实例确认运行新 Manager 后，下一个 release 删除额外字段。该交接不能恢复已退役服务或延长为长期兼容路径。
+
 ## 检测与预拉取
 
-管理员可以启用 Manager 轮询、从管理界面提交检查，或使用宿主 CLI。其它进程不得实现第二套更新器。发现更新时，Manager 先校验 HTTPS、协议版本、宿主架构、数据库版本、磁盘空间、Manager 工件和全部镜像 digest，再在平台仍可使用时预拉取候选工件。下载或验证失败只记录候选错误，不进入维护。
+管理员可以启用 Manager 轮询、从管理界面提交检查，或使用宿主 CLI。其它进程不得实现第二套更新器。发现更新时，Manager 先校验 HTTPS、协议版本、宿主架构、数据库版本、磁盘空间、Manager 工件和全部镜像 digest，再在平台仍可使用时准备候选工件。切换前只强制预拉取 Platform 与 Agent Runtime 的精确 digest；本地已经存在的 digest 不访问 registry。每个缺失核心镜像的拉取同时受无输出空闲时限和较大的绝对上限约束，超时在进入维护前记录为可重试失败，继续保留 current generation。Camoufox、SearXNG、Firecrawl 与 Agent Sandbox 镜像由各自的后台收敛或首次使用独立拉取，不能因第三方 registry 缓慢阻塞核心更新。
 
 镜像就绪后公开状态进入 `waiting_for_tasks`。Platform 继续服务，直到没有以下活动：
 
@@ -21,7 +23,7 @@ Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Com
 - Manager 登记的 Sandbox 或 host 后台终端；
 - 其它不能安全跨 generation 切换的写操作。
 
-Manager 不为更新强行终止任务。任务自然结束后，排队更新自动继续。只有 Manager 本地进程登记为空闲后，它才请求 Platform 在对话锁内原子复核业务状态并建立 reservation。
+Manager 不为更新强行终止任务。任务自然结束后，排队更新自动继续。只有 Manager 本地进程登记为空闲后，它才请求 Platform 在对话锁内原子复核业务状态并建立 reservation。候选校验、下载和任务等待期间不持有固定容器切换锁；只要 `maintenance=false`，current generation 的能力后台仍可修复。Manager 取得 reservation 后才与能力收敛互斥并进入固定栈切换边界。
 
 ## 原子准入与维护
 
@@ -54,9 +56,9 @@ operation 为 `install`、`update`、`restart`、`rollback` 或 `repair`；phase
 8. 明确释放 reservation，恢复公网入口和后台 worker；
 9. 各 Sandbox 空闲时独立刷新其基础镜像。
 
-Platform 与 Agent Runtime 属于 generation 的核心 readiness；Manager 自身还必须持续持有公网入口和 owner-only 控制接口。Camoufox、SearXNG、Firecrawl 与 Cognee 是能力级服务：候选启动时应尽力拉起并逐项报告健康状态，但它们未收敛时只降级浏览器、搜索、网页提取或知识能力，不能回滚已经健康的核心 generation、阻止 finalize、让整个平台进入长期维护，或终止 Manager。release 若因不可分割的数据迁移确实依赖某项能力服务，必须在发布契约中显式声明本次临时门禁，并提供不依赖该服务自身健康的恢复路径，部署机不能临时猜测。
+Platform 与 Agent Runtime 属于 generation 的核心 readiness；Manager 自身还必须持续持有公网入口和 owner-only 控制接口。Camoufox、SearXNG、Firecrawl 与 Cognee 是能力级服务：核心 generation 提交后由后台收敛器逐项拉取和启动，它们未收敛时只降级浏览器、搜索、网页提取或知识能力，不能回滚已经健康的核心 generation、阻止 finalize、让整个平台进入长期维护，或终止 Manager。Agent Sandbox 镜像在对应 Sandbox 首次创建时执行相同的本地 digest 检查和有界按需拉取。release 若因不可分割的数据迁移确实依赖某项能力服务，必须在发布契约中显式声明本次临时门禁，并提供不依赖该服务自身健康的恢复路径，部署机不能临时猜测。
 
-Firecrawl 后台收敛分别检查 Playwright、Redis、RabbitMQ、Postgres、FoundationDB、一次性 init 与 API，并把结果投影为独立服务状态。修复只可操作状态明确异常的组件，不能以 API 或其它依赖故障为由重启健康 FoundationDB，也不能仅因一次短探针超时就重启仍在恢复的有状态进程。失败后使用有界指数退避；Manager、Platform 与 Runtime 正常时，Firecrawl 修复不得占用全局维护门。
+Firecrawl 显式使用 `NUQ_BACKEND=pg` 的 PostgreSQL 队列基线。后台收敛检查 Playwright、Redis、RabbitMQ、Postgres 与 API，并把结果投影为独立服务状态；FoundationDB 及其初始化任务不属于当前发布、运行或健康目录。收敛使用有界等待和指数退避，失败只把网页提取标记为 degraded。只要 Manager、Platform 与 Runtime 正常且未进入维护，Firecrawl 修复可与候选校验、核心镜像预拉取和任务等待并行，不能占用全局维护门。
 
 ## 数据库迁移
 
@@ -68,7 +70,7 @@ Firecrawl 后台收敛分别检查 Playwright、Redis、RabbitMQ、Postgres、Fo
 
 候选 readiness 失败时，Manager 停止候选容器，验证并恢复 previous generation 对应的数据库与 sidecar 快照，再启动 previous generation。快照创建只有在内容、manifest 与父目录全部同步后才算成功。恢复必须先验证文件类型、大小和 hash，在独立 staging 准备完整集合，再以可补偿的原子切换替换数据库、WAL 和 SHM；失败时必须保持恢复前数据完整或同步补偿。
 
-每次显式 rollback 先为当前 generation 创建一致快照。交换 current/previous 时，镜像 generation 和对应数据 generation 必须一起交换，使连续 A→B→A→B 始终使用正确数据。
+每次显式 rollback 在进入维护前先按本地精确 digest 检查并有界准备 previous 的 Platform/Runtime 镜像；准备失败保持 current 在线并作为可重试操作结束。镜像就绪后才建立 reservation，并为当前 generation 创建一致快照。交换 current/previous 时，镜像 generation 和对应数据 generation 必须一起交换，使连续 A→B→A→B 始终使用正确数据。
 
 Manager 在任一 phase 被终止、宿主重启或 Docker 重启后，从 operation journal 幂等收敛。数据库迁移 one-off 容器使用确定名称、Manager ownership label 和 Compose project label；恢复数据库前必须先清除已证明归属的残留迁移 writer。无法证明数据库和容器 generation 一致时保持维护，`repair` 不能绕过未完成的 `rolling_back`。
 
@@ -95,12 +97,12 @@ control API 在提交 2xx 前完整编码响应。mutation 只返回有界身份
 - 全新数据根安装与启动；
 - 多个正常任务跨过轮询周期时继续排队更新；
 - 数据库 schema 迁移成功、失败与外键回滚；
-- 候选镜像、核心 readiness 和 Manager 自更新失败；
+- 核心镜像拉取空闲/绝对超时、核心 readiness 和 Manager 自更新失败；
 - Platform 已提交但旧 Candidate/Activation/watchdog 循环时，受控恢复能隔离旧 watchdog、结算到 Current checkpoint，并以新 recovery activation 完成或标准回滚；
 - 受控恢复在 unit fence、stable 替换、intent、watchdog handoff、重新启用主 unit 和 terminal journal 的每个持久边界重启后均只能继续同一事务；
 - watchdog 已提交 Manager state、Platform 已完成 finalize 但 recovery plan/journal 尚未终态化时，只补齐缺失元数据，不得再次移动 Current/Previous；
 - operation 在每个持久 phase 被终止后的幂等恢复；
 - current Manager 在 `finalize_pending` 核心探针暂时失败时保持控制接口在线、带退避重试，并在服务恢复后只 finalize 一次；
-- Firecrawl 整体不可用时 Platform 与 Runtime 仍完成 finalize、退出维护并将网页提取标记为 degraded；
+- Firecrawl 整体不可用或能力镜像 registry 卡住时 Platform 与 Runtime 仍完成 finalize、退出维护并将网页提取标记为 degraded；
 - current/previous 镜像与数据 generation 的往返回滚；
-- Firecrawl FoundationDB 首次初始化和保留同一数据后的幂等重建。
+- Firecrawl PostgreSQL 首次启动、保留同一 bind 数据后的幂等重建和真实提取请求。

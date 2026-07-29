@@ -288,10 +288,6 @@ func (o *Orchestrator) probeCommittedGeneration(ctx context.Context, manifest re
 }
 
 func (o *Orchestrator) run(ctx context.Context, op model.Operation) {
-	if o.FixedStackMu != nil {
-		o.FixedStackMu.Lock()
-		defer o.FixedStackMu.Unlock()
-	}
 	switch op.Kind {
 	case model.OperationInstall, model.OperationUpdate:
 		o.runUpdate(ctx, op)
@@ -300,11 +296,20 @@ func (o *Orchestrator) run(ctx context.Context, op model.Operation) {
 	case model.OperationRollback:
 		o.runRollback(ctx, op)
 	case model.OperationRepair:
-		o.runRepair(ctx, op)
+		o.withFixedStack(func() { o.runRepair(ctx, op) })
 	default:
 		o.failBeforeMaintenance(op, fmt.Errorf("unsupported operation %q", op.Kind))
 	}
 }
+
+func (o *Orchestrator) withFixedStack(run func()) {
+	if o.FixedStackMu != nil {
+		o.FixedStackMu.Lock()
+		defer o.FixedStackMu.Unlock()
+	}
+	run()
+}
+
 func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	url := op.TargetManifestURL
 	if url == "" {
@@ -400,6 +405,10 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			o.failReservation(op, err)
 			return
 		}
+	}
+	if o.FixedStackMu != nil {
+		o.FixedStackMu.Lock()
+		defer o.FixedStackMu.Unlock()
 	}
 	if freshInstall {
 		if _, err = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "fresh install entering maintenance", o.now()); err != nil {
@@ -583,6 +592,10 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 		o.failReservation(op, err)
 		return
 	}
+	if o.FixedStackMu != nil {
+		o.FixedStackMu.Lock()
+		defer o.FixedStackMu.Unlock()
+	}
 	if err = o.beginReservedMutation(op.ID); err != nil {
 		o.failReservation(op, err)
 		return
@@ -644,9 +657,21 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		return
 	}
 	op.TargetGeneration = state.Previous.ID
+	if _, err = o.Store.SetPhase(op.ID, model.PhasePulling, model.StateIdle, false, "ensuring previous core image digests", o.now()); err != nil {
+		o.failBeforeMaintenance(op, fmt.Errorf("persist rollback image phase: %w", err))
+		return
+	}
+	if err = o.Engine.Pull(ctx, manifest); err != nil {
+		o.failBeforeMaintenanceRetryable(op, fmt.Errorf("prepare previous generation images: %w", err))
+		return
+	}
 	if err = o.reserve(ctx, op.ID); err != nil {
 		o.failReservation(op, err)
 		return
+	}
+	if o.FixedStackMu != nil {
+		o.FixedStackMu.Lock()
+		defer o.FixedStackMu.Unlock()
 	}
 	if err = o.beginReservedMutation(op.ID); err != nil {
 		o.failReservation(op, err)

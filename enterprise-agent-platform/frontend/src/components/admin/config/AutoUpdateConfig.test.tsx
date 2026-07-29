@@ -57,7 +57,7 @@ describe("AutoUpdateConfig manager state", () => {
     expect(screen.queryByText("Git remote")).not.toBeInTheDocument();
   });
 
-  it("shows every fixed Manager service, including all Firecrawl stages", () => {
+  it("shows every fixed Manager service in the PostgreSQL Firecrawl baseline", () => {
     const serviceNames = [
       "platform",
       "agent-runtime",
@@ -67,8 +67,6 @@ describe("AutoUpdateConfig manager state", () => {
       "firecrawl-redis",
       "firecrawl-rabbitmq",
       "firecrawl-postgres",
-      "firecrawl-foundationdb",
-      "firecrawl-foundationdb-init",
       "firecrawl-api",
     ];
     renderConfig({

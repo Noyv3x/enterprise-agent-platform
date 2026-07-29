@@ -17,7 +17,6 @@ for path in \
   containers/agent-sandbox-entrypoint.sh \
   containers/compose.yaml \
   containers/compose.dev.yaml \
-  containers/compose.firecrawl-init-failure.yaml \
   containers/release-manifest.schema.json \
   install.sh; do
   [[ -s "$path" ]] || fail "$path is missing or empty"
@@ -206,6 +205,12 @@ grep -Fq 'https://ghcr.io/v2/${owner}/${package}/manifests/${digest}' .github/wo
   || fail "release does not verify final digest metadata through the anonymous GHCR registry contract"
 grep -Fq 'docker pull "$image"' .github/workflows/container-release.yml \
   || fail "release does not anonymously pull each final image digest"
+grep -Fq '"firecrawl-foundationdb": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"' \
+  .github/workflows/container-release.yml \
+  || fail "bridge release does not provide the old Manager with the inert PostgreSQL image alias"
+if grep -Fq 'foundationdb/foundationdb@sha256:' .github/workflows/container-release.yml; then
+  fail "container release still publishes or validates a FoundationDB image"
+fi
 if rg -n 'gh api[^\n]*(--method|-X)[[:space:]]+PATCH|gh api[[:space:]]+--method[[:space:]]+PATCH' .github/workflows/container-release.yml; then
   fail "release relies on an unsupported GitHub package visibility mutation"
 fi
@@ -237,45 +242,42 @@ for component in ("platform", "agent-runtime", "camofox", "agent-sandbox"):
         raise SystemExit(f"public-image gate omits {component}")
 
 compose_smoke = job("compose-smoke")
+if "    timeout-minutes: 45\n" not in compose_smoke:
+    raise SystemExit("compose-smoke must reserve the 45-minute cold/warm Firecrawl budget")
 for fragment in (
     'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"',
     '"$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;',
     'sudo -n rm -rf --one-file-system -- "$root"',
-    'run --rm --no-deps',
-    'test -x /var/fdb/scripts/fdb.bash',
-    'test -s /var/fdb/cluster/fdb.cluster',
     'http://127.0.0.1:3002/v0/health/liveness',
-    'first_foundationdb_init="$foundationdb_init"',
-    'first_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"',
-    'second_foundationdb_init=',
-    'second_foundationdb=',
-    'test "$second_foundationdb_init" != "$first_foundationdb_init"',
-    'test "$second_foundationdb" != "$first_foundationdb"',
+    "url: 'https://example.com/'",
+    "fetch('http://127.0.0.1:3002/v1/scrape'",
+    'signal: AbortSignal.timeout(120000)',
+    'firecrawl_scrape() {',
+    'for attempt in 1 2 3; do',
+    'Firecrawl ${phase} scrape failed after 3 attempts',
+    'firecrawl_scrape cold',
+    'firecrawl_scrape warm',
     'sentinel_key=ubitech_ci_persistence',
-    'writemode on; set $sentinel_key $sentinel_value',
-    'get $sentinel_key',
-    'grep -Fqx -- "$expected"',
+    'CREATE TABLE IF NOT EXISTS ubitech_release_smoke',
+    'INSERT INTO ubitech_release_smoke',
+    'SELECT value FROM ubitech_release_smoke',
+    'first_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
+    'second_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
+    'test "$second_postgres" != "$first_postgres"',
+    'test "$read_output" = "$sentinel_value"',
     'rm --stop --force',
-    'compose.firecrawl-init-failure.yaml',
-    'failed_foundationdb_init=',
-    'reconciled_foundationdb_init=',
-    'failed_foundationdb_init\")\" = 42',
-    'failed_recovery_foundationdb=',
-    'test \"$failed_recovery_foundationdb\" = \"$second_foundationdb\"',
-    'test \"$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)\" = \"$second_foundationdb\"',
-    'rm --force --stop',
     '--wait --wait-timeout 600 firecrawl-api',
 ):
     if fragment not in compose_smoke:
-        raise SystemExit(f"compose-smoke lacks guarded remapped-UID cleanup: {fragment}")
-if compose_smoke.count('--wait --wait-timeout 600 firecrawl-api') < 4:
-    raise SystemExit("compose-smoke must use the production Firecrawl wait budget for cold, warm, failure, and recovery starts")
-if compose_smoke.count('status="$(timeout 5 fdbcli') < 2 or compose_smoke.count(
-    'test -n "$status"'
-) < 2:
-    raise SystemExit("compose-smoke FoundationDB probes do not reject failed or empty status output")
-if compose_smoke.count('jq -e -s "length == 1 and .[0].client.database_status.available == true"') < 2:
-    raise SystemExit("compose-smoke FoundationDB probes do not require one available status document")
+        raise SystemExit(f"compose-smoke lacks PostgreSQL Firecrawl acceptance coverage: {fragment}")
+if compose_smoke.count('--wait --wait-timeout 600 firecrawl-api') < 2:
+    raise SystemExit("compose-smoke must use the production Firecrawl wait budget for cold and warm starts")
+if compose_smoke.count("fetch('http://127.0.0.1:3002/v1/scrape'") != 1 or compose_smoke.count(
+    'signal: AbortSignal.timeout(120000)'
+) != 1:
+    raise SystemExit("compose-smoke must centralize the bounded real scrape in its retry helper")
+if "foundationdb/foundationdb@sha256:" in compose_smoke:
+    raise SystemExit("compose-smoke still pulls or runs the retired FoundationDB image")
 
 publish = job("publish")
 if "pattern: '*'" in publish or 'pattern: "*"' in publish:
@@ -286,6 +288,8 @@ for fragment in ("pattern: image-*", "pattern: manager-*"):
 for fragment in (
     "group: container-publish-${{ needs.prepare.outputs.source_commit }}",
     "cancel-in-progress: false",
+    'image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")',
+    "if not image_name.fullmatch(name):",
 ):
     if fragment not in publish:
         raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")
@@ -318,6 +322,19 @@ if required != expected:
 image_pattern = schema.get("$defs", {}).get("image", {}).get("pattern", "")
 if "@sha256:" not in image_pattern:
     raise SystemExit("release images are not constrained to immutable digests")
+required_images = set(schema.get("properties", {}).get("images", {}).get("required", ()))
+image_name_pattern = schema.get("properties", {}).get("images", {}).get("propertyNames", {}).get("pattern", "")
+if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
+    raise SystemExit("release image property names are not constrained to lowercase kebab-case")
+expected_images = {
+    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+    "firecrawl-redis", "firecrawl-rabbitmq",
+}
+if required_images != expected_images:
+    raise SystemExit(f"unexpected required release images: {sorted(required_images)}")
+if "firecrawl-foundationdb" in required_images:
+    raise SystemExit("the current release schema still requires FoundationDB")
 PY
 
 for dockerfile in containers/*.Dockerfile; do
@@ -387,7 +404,7 @@ if core.get("name") != "ubitech-agent-validation-core" or core.get("external") i
 required = {
     "platform", "agent-runtime", "camofox", "searxng", "firecrawl-api",
     "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq",
-    "firecrawl-postgres", "firecrawl-foundationdb", "firecrawl-foundationdb-init",
+    "firecrawl-postgres",
 }
 if set(services) != required:
     raise SystemExit(f"fixed Compose service set mismatch: {sorted(set(services) ^ required)}")
@@ -454,108 +471,38 @@ platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == 
 if len(platform_data) != 1 or not str(platform_data[0].get("source") or "").endswith("/data"):
     raise SystemExit("Platform data must map <manager data root>/data to /var/lib/ubitech-agent")
 
-cluster_file = "/var/fdb/cluster/fdb.cluster"
-foundationdb = services["firecrawl-foundationdb"]
-if foundationdb.get("init") is not False:
-    raise SystemExit("FoundationDB image owns PID 1 and must not receive a nested Compose init")
-if (foundationdb.get("environment") or {}).get("FDB_CLUSTER_FILE") != cluster_file:
-    raise SystemExit("FoundationDB server must use the explicit shared cluster-file path")
-foundationdb_volumes = foundationdb.get("volumes") or []
-foundationdb_targets = {str(volume.get("target") or "") for volume in foundationdb_volumes}
-if "/var/fdb" in foundationdb_targets:
-    raise SystemExit("FoundationDB bind mounts must not hide the image entrypoint under /var/fdb")
-if not {"/var/fdb/data", "/var/fdb/cluster"}.issubset(foundationdb_targets):
-    raise SystemExit("FoundationDB data and cluster directories must be mounted separately")
-server_data = [volume for volume in foundationdb_volumes if volume.get("target") == "/var/fdb/data"]
-server_cluster = [volume for volume in foundationdb_volumes if volume.get("target") == "/var/fdb/cluster"]
-if len(server_data) != 1 or len(server_cluster) != 1:
-    raise SystemExit("FoundationDB must have exactly one data mount and one cluster mount")
-if server_data[0].get("type") != "bind" or server_cluster[0].get("type") != "bind":
-    raise SystemExit("FoundationDB persistent paths must be explicit host bind mounts")
-if server_data[0].get("source") == server_cluster[0].get("source"):
-    raise SystemExit("FoundationDB data and cluster mounts must use different host directories")
-if not str(server_cluster[0].get("source") or "").endswith(
-    "/data/runtimes/firecrawl/foundationdb/cluster"
-):
-    raise SystemExit("FoundationDB cluster mount must use the managed cluster directory")
-if server_cluster[0].get("read_only"):
-    raise SystemExit("FoundationDB server must be able to write the shared cluster directory")
-healthcheck = foundationdb.get("healthcheck") or {}
-health_command = str(healthcheck.get("test") or "")
-available_filter = ".client.database_status.available == true"
-if cluster_file not in health_command:
-    raise SystemExit("FoundationDB healthcheck must use the shared cluster file")
-if (
-    'status=$$(timeout 4 fdbcli' not in health_command
-    or '2>&1); rc=$$?' not in health_command
-    or 'test -n "$$status"' not in health_command
-    or 'status json' not in health_command
-    or 'jq -e -s' not in health_command
-    or 'length == 1' not in health_command
-    or available_filter not in health_command
-    or 'FoundationDB status probe failed (exit %s)' not in health_command
-    or 'head -c 8192' not in health_command
-):
-    raise SystemExit("FoundationDB healthcheck must verify status JSON availability")
-foundationdb_init = services["firecrawl-foundationdb-init"]
-init_cluster = [
-    volume for volume in foundationdb_init.get("volumes") or []
-    if volume.get("target") == "/var/fdb/cluster"
-]
-if (
-    len(init_cluster) != 1
-    or init_cluster[0].get("type") != "bind"
-    or init_cluster[0].get("source") != server_cluster[0].get("source")
-    or init_cluster[0].get("read_only")
-):
-    raise SystemExit("FoundationDB init must write the same shared cluster directory")
-if cluster_file not in str(foundationdb_init.get("command") or ""):
-    raise SystemExit("FoundationDB init must configure the shared cluster file")
-init_command = str(foundationdb_init.get("command") or "")
-if "timeout 4 fdbcli" not in init_command or "seq 1 20" not in init_command:
-    raise SystemExit("FoundationDB init must use bounded command retries")
-if (
-    'configure new single ssd' not in init_command
-    or 'last_status=$$(timeout 4 fdbcli' not in init_command
-    or 'test -n "$$last_status"' not in init_command
-    or 'status json' not in init_command
-    or 'jq -e -s' not in init_command
-    or 'length == 1' not in init_command
-    or available_filter not in init_command
-    or init_command.index('status json') < init_command.index('configure new single ssd')
-    or 'then last_configure_rc=0' not in init_command
-    or 'FoundationDB configure result (exit %s):' not in init_command
-    or 'FoundationDB status probe failed (exit %s)' not in init_command
-    or '$${last_configure:0:8192}' not in init_command
-    or '$${last_status:0:8192}' not in init_command
-):
-    raise SystemExit("FoundationDB init must verify database availability after every configure attempt")
-if "already.*configured" in init_command or "database.*configured" in init_command:
-    raise SystemExit("FoundationDB init must not infer readiness from error text")
-init_dependencies = foundationdb_init.get("depends_on") or {}
-if (init_dependencies.get("firecrawl-foundationdb") or {}).get("condition") != "service_started":
-    raise SystemExit("FoundationDB init must not wait on the post-configuration healthcheck")
 firecrawl = services["firecrawl-api"]
-if (firecrawl.get("environment") or {}).get("FDB_CLUSTER_FILE") != cluster_file:
-    raise SystemExit("Firecrawl API must use the FoundationDB shared cluster-file path")
-api_cluster = [
-    volume for volume in firecrawl.get("volumes") or []
-    if volume.get("target") == "/var/fdb/cluster"
+firecrawl_environment = firecrawl.get("environment") or {}
+if firecrawl_environment.get("NUQ_BACKEND") != "pg":
+    raise SystemExit("Firecrawl must explicitly use the PostgreSQL queue backend")
+if "FDB_CLUSTER_FILE" in firecrawl_environment:
+    raise SystemExit("Firecrawl must not receive a FoundationDB cluster file")
+for service_name, service in services.items():
+    if "foundationdb" in service_name.lower():
+        raise SystemExit(f"retired FoundationDB service remains: {service_name}")
+    for volume in service.get("volumes") or []:
+        source = str(volume.get("source") or "").lower()
+        target = str(volume.get("target") or "").lower()
+        if "foundationdb" in source or "foundationdb" in target or target.startswith("/var/fdb"):
+            raise SystemExit(f"{service_name} still mounts retired FoundationDB state")
+api_dependencies = firecrawl.get("depends_on") or {}
+expected_dependencies = {
+    "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres",
+}
+if set(api_dependencies) != expected_dependencies:
+    raise SystemExit(f"Firecrawl API dependency set mismatch: {sorted(api_dependencies)}")
+postgres_volumes = [
+    volume for volume in services["firecrawl-postgres"].get("volumes") or []
+    if volume.get("target") == "/var/lib/postgresql/data"
 ]
 if (
-    len(api_cluster) != 1
-    or api_cluster[0].get("type") != "bind"
-    or api_cluster[0].get("source") != server_cluster[0].get("source")
-    or not api_cluster[0].get("read_only")
+    len(postgres_volumes) != 1
+    or postgres_volumes[0].get("type") != "bind"
+    or not str(postgres_volumes[0].get("source") or "").endswith(
+        "/data/runtimes/firecrawl/postgres"
+    )
 ):
-    raise SystemExit("Firecrawl API must read-only mount the shared cluster directory")
-api_dependencies = firecrawl.get("depends_on") or {}
-if (api_dependencies.get("firecrawl-foundationdb") or {}).get("condition") != "service_healthy":
-    raise SystemExit("Firecrawl API must wait for healthy FoundationDB")
-if (
-    api_dependencies.get("firecrawl-foundationdb-init") or {}
-).get("condition") != "service_completed_successfully":
-    raise SystemExit("Firecrawl API must wait for successful FoundationDB initialization")
+    raise SystemExit("Firecrawl PostgreSQL data must use its managed host bind")
 PY
 
 docker compose \

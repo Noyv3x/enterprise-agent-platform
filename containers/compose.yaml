@@ -30,8 +30,7 @@ x-firecrawl-environment: &firecrawl-environment
   MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_CONCURRENT_JOBS:-3}
   BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:-3}
   NUQ_RABBITMQ_URL: amqp://firecrawl-rabbitmq:5672
-  NUQ_BACKEND: ${FIRECRAWL_NUQ_BACKEND:-}
-  FDB_CLUSTER_FILE: /var/fdb/cluster/fdb.cluster
+  NUQ_BACKEND: "pg"
   ENV: local
   LOGGING_LEVEL: ${FIRECRAWL_LOGGING_LEVEL:-info}
 
@@ -227,41 +226,6 @@ services:
       retries: 18
       start_period: 15s
 
-  firecrawl-foundationdb:
-    <<: *ubitech-service
-    image: ${UBITECH_FIRECRAWL_FOUNDATIONDB_IMAGE:-foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48}
-    init: false
-    environment:
-      FDB_NETWORKING_MODE: container
-      FDB_COORDINATOR_PORT: "4500"
-      FDB_CLUSTER_FILE: /var/fdb/cluster/fdb.cluster
-    volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/data:/var/fdb/data
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
-    healthcheck:
-      test: [CMD-SHELL, 'status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>&1); rc=$$?; if test "$$rc" -eq 0 && test -n "$$status" && printf "%s\n" "$$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null 2>&1; then exit 0; fi; printf "FoundationDB status probe failed (exit %s):\n" "$$rc" >&2; printf "%s\n" "$$status" | head -c 8192 >&2; exit 1']
-      interval: 10s
-      timeout: 5s
-      retries: 18
-      start_period: 20s
-
-  firecrawl-foundationdb-init:
-    image: ${UBITECH_FIRECRAWL_FOUNDATIONDB_IMAGE:-foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48}
-    restart: "no"
-    networks:
-      - core
-    logging: *ubitech-logging
-    security_opt:
-      - no-new-privileges:true
-    depends_on:
-      firecrawl-foundationdb:
-        condition: service_started
-    entrypoint: [/bin/bash, -eu, -o, pipefail, -c]
-    command:
-      - 'last_configure="configure was not attempted"; last_configure_rc=125; last_status="status probe was not attempted"; last_status_rc=125; for attempt in $$(seq 1 20); do if last_configure=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "configure new single ssd" 2>&1); then last_configure_rc=0; else last_configure_rc=$$?; fi; if last_status=$$(timeout 4 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>&1); then last_status_rc=0; if test -n "$$last_status" && printf "%s\n" "$$last_status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null 2>&1; then exit 0; fi; else last_status_rc=$$?; fi; sleep 2; done; printf "FoundationDB configure result (exit %s):\n%s\nFoundationDB status probe failed (exit %s):\n" "$$last_configure_rc" "$${last_configure:0:8192}" "$$last_status_rc" >&2; printf "%s\n" "$${last_status:0:8192}" >&2; exit 1'
-    volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster
-
   firecrawl-api:
     <<: *ubitech-service
     image: ${UBITECH_FIRECRAWL_API_IMAGE:-ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c}
@@ -282,15 +246,10 @@ services:
         condition: service_healthy
       firecrawl-playwright:
         condition: service_healthy
-      firecrawl-foundationdb:
-        condition: service_healthy
-      firecrawl-foundationdb-init:
-        condition: service_completed_successfully
     entrypoint: [/bin/sh, -eu, -c]
     command:
       - 'export BULL_AUTH_KEY="$$(cat /run/secrets/ubitech/firecrawl-bull-auth-key)"; export POSTGRES_PASSWORD="$$(cat /run/secrets/ubitech/firecrawl-postgres-password)"; exec node dist/src/harness.js --start-docker'
     volumes:
-      - ${UBITECH_DATA_ROOT}/data/runtimes/firecrawl/foundationdb/cluster:/var/fdb/cluster:ro
       - ${UBITECH_SECRETS_DIR}/firecrawl-bull-auth-key:/run/secrets/ubitech/firecrawl-bull-auth-key:ro
       - ${UBITECH_SECRETS_DIR}/firecrawl-postgres-password:/run/secrets/ubitech/firecrawl-postgres-password:ro
     healthcheck:

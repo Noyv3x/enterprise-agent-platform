@@ -566,7 +566,7 @@ func runReconciliationLoop(
 }
 
 func firecrawlManifest(state model.ManagerState) (release.Manifest, bool) {
-	if state.Current == nil || state.ActiveOperationID != "" || state.FinalizePendingOperationID != "" || state.Maintenance {
+	if state.Current == nil || state.FinalizePendingOperationID != "" || state.Maintenance {
 		return release.Manifest{}, false
 	}
 	images := make(map[string]string, len(state.Current.Images))
@@ -574,6 +574,38 @@ func firecrawlManifest(state model.ManagerState) (release.Manifest, bool) {
 		images[name] = image
 	}
 	return release.Manifest{SourceCommit: state.Current.ID, Images: images}, true
+}
+
+const reconciliationStatePollInterval = 100 * time.Millisecond
+
+// reconciliationContext lets current-generation capability repair continue
+// throughout validation, image pulling and task waiting, but promptly cancels
+// it once a durable maintenance reservation begins. That cancellation releases
+// the fixed-stack mutex before the updater waits to enter its cutover section.
+func (a *application) reconciliationContext(parent context.Context, generation string, timeout time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(reconciliationStatePollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				state := a.state.State()
+				if state.Current == nil || state.Current.ID != generation || state.FinalizePendingOperationID != "" || state.Maintenance {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-stopped
+	}
 }
 
 func (a *application) reconcileFirecrawl(ctx context.Context) error {
@@ -585,9 +617,12 @@ func (a *application) reconcileFirecrawl(ctx context.Context) error {
 	if !ready {
 		return nil
 	}
-	reconcileCtx, cancel := context.WithTimeout(ctx, 25*time.Minute)
-	defer cancel()
+	reconcileCtx, finish := a.reconciliationContext(ctx, manifest.ID(), 25*time.Minute)
+	defer finish()
 	err := a.docker.ReconcileFirecrawl(reconcileCtx, manifest)
+	if errors.Is(reconcileCtx.Err(), context.Canceled) {
+		return nil
+	}
 	if err != nil && a.audit != nil {
 		_ = a.audit.Append(logstore.Event{
 			At:      time.Now().UTC(),
@@ -608,9 +643,12 @@ func (a *application) reconcileCapabilities(ctx context.Context) error {
 	if !ready {
 		return nil
 	}
-	reconcileCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	reconcileCtx, finish := a.reconciliationContext(ctx, manifest.ID(), 2*time.Minute)
+	defer finish()
 	err := a.docker.ReconcileCapabilities(reconcileCtx, manifest)
+	if errors.Is(reconcileCtx.Err(), context.Canceled) {
+		return nil
+	}
 	if err != nil && a.audit != nil {
 		_ = a.audit.Append(logstore.Event{
 			At:      time.Now().UTC(),

@@ -56,6 +56,10 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 发布清单锁定 source commit、数据库版本、Manager 校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；current Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
 
+更新预拉取只把 Platform 与 Agent Runtime 作为切换前核心镜像。Manager 先用本地精确 RepoDigest 判断是否已经存在，不能为本地命中无条件访问 registry；缺失镜像的命令输出只用于刷新内存中的空闲期限，原始 registry 输出不得写入 operation、公共状态或长期日志。无进展和绝对超时都在 maintenance 前结束为可重试失败。Camoufox、SearXNG、Firecrawl 与 Sandbox 镜像由各自受限路径拉取，第三方 registry 故障不能扩展核心更新的信任或锁边界。
+
+Manager 服务状态使用当前固定服务白名单投影；已经退出 Compose 的服务不能因旧 journal、额外 manifest 键或 Docker 残留重新出现在控制 API。滚动 schema 交接中的额外镜像键必须是完整 digest、不得被 Compose 引用，并在新 Manager 接管后删除。
+
 Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再用同一 operation id 确认 reserve 后才可执行破坏性操作。响应不确定时只有明确 release 才能回到非维护状态；Manager 不可达或预约身份不一致时所有管理写操作 fail closed。Platform 启动任何有副作用 worker 前必须恢复同一持久预约状态。
 
 快照完整验证、候选 generation 核心 readiness、Manager watchdog 提交和 reservation release 完成前不能开放业务。核心 readiness 只包含 Manager 控制面、Platform 与 Agent Runtime；Camoufox、SearXNG、Firecrawl 和 Cognee 失败时保持能力级 degraded，不能终止 Manager、关闭控制接口或阻止健康核心 generation 完成 finalize。Manager 自更新的 activation plan 与独立 watchdog 是持久安全所有者；外部恢复不能仅凭主 unit 停止或 recovery lock 抢占它，必须验证完整提交链、停止并证明相关 watchdog 退出，再通过新的持久 recovery activation 转移所有权。Docker 资源清理只能处理同时匹配 Manager ownership label、Compose project/resource label 且无 attachment 的对象，禁止全局 prune。Manager `/v1/status` 的 generation 只返回 id、source commit、数据库版本、镜像与激活时间，不投影 manifest、快照或其它宿主绝对路径。

@@ -114,8 +114,6 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		"firecrawl-redis",
 		"firecrawl-rabbitmq",
 		"firecrawl-postgres",
-		"firecrawl-foundationdb",
-		"firecrawl-foundationdb-init",
 		"firecrawl-api",
 	} {
 		services[name] = map[string]any{"status": "unknown"}

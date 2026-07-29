@@ -207,8 +207,8 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	if !pending.Maintenance || pending.PublicState != model.StateUpdating || pending.FinalizePendingOperationID != operationID {
 		t.Fatalf("control API did not expose the recoverable finalize state: %#v", pending)
 	}
-	if got := pending.Services["firecrawl-foundationdb"].Status; got != "unavailable" {
-		t.Fatalf("auxiliary FoundationDB status = %q, want unavailable", got)
+	if got := pending.Services["firecrawl-api"].Status; got != "unavailable" {
+		t.Fatalf("auxiliary Firecrawl status = %q, want unavailable", got)
 	}
 	if status := httpStatus(t, "http://"+gatewayAddress+"/"); status != http.StatusServiceUnavailable {
 		t.Fatalf("maintenance gateway status = %d, want 503", status)
@@ -271,8 +271,8 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	if completed.PublicState != model.StateIdle || completed.Maintenance || completed.FinalizePendingOperationID != "" {
 		t.Fatalf("background recovery did not finish finalize: %#v", completed)
 	}
-	if got := completed.Services["firecrawl-foundationdb"].Status; got != "unavailable" {
-		t.Fatalf("completed service projection hid degraded FoundationDB: %q", got)
+	if got := completed.Services["firecrawl-api"].Status; got != "unavailable" {
+		t.Fatalf("completed service projection hid degraded Firecrawl: %q", got)
 	}
 	if status := httpStatus(t, "http://"+gatewayAddress+"/"); status != http.StatusOK {
 		t.Fatalf("gateway did not resume proxying after finalize: HTTP %d", status)
@@ -377,7 +377,7 @@ func writeRecoveryManifest(t *testing.T, stateDir, generationID string) (string,
 	for index, name := range []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb",
+		"firecrawl-redis", "firecrawl-rabbitmq",
 	} {
 		digit := fmt.Sprintf("%x", (index%15)+1)
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(digit, 64)
@@ -498,7 +498,6 @@ case " $* " in
       agent-runtime) printf '%064d\n' 0 | tr 0 b ;;
       camofox) printf '%064d\n' 0 | tr 0 c ;;
       searxng) printf '%064d\n' 0 | tr 0 d ;;
-      firecrawl-foundationdb-init) printf '%064d\n' 0 | tr 0 9 ;;
       *) printf '%064d\n' 0 | tr 0 e ;;
     esac
     exit 0
@@ -507,7 +506,6 @@ esac
 if [ "${1:-}" = inspect ]; then
   case "$last" in
     a*|b*) printf 'running healthy\n' ;;
-    9*) printf 'exited 1\n' ;;
     *) printf 'running unhealthy\n' ;;
   esac
   exit 0

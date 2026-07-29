@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,12 +36,33 @@ type Runner interface {
 	Run(ctx context.Context, name string, args []string, env []string) (Result, error)
 }
 
+// ActivityRunner exposes command output activity without requiring callers to
+// retain or persist the command's raw output. Docker pull uses it to distinguish
+// a slow transfer that is still making progress from a registry request that has
+// gone silent. CommandRunner implements this interface; the narrower Runner
+// interface remains useful for deterministic unit fakes.
+type ActivityRunner interface {
+	RunWithActivity(ctx context.Context, name string, args []string, env []string, activity func()) (Result, error)
+}
+
 type CommandRunner struct {
 	MaxOutputBytes int64
 }
 
 func (r CommandRunner) Run(ctx context.Context, name string, args []string, env []string) (Result, error) {
+	return r.run(ctx, name, args, env, nil)
+}
+
+func (r CommandRunner) RunWithActivity(ctx context.Context, name string, args []string, env []string, activity func()) (Result, error) {
+	return r.run(ctx, name, args, env, activity)
+}
+
+func (r CommandRunner) run(ctx context.Context, name string, args []string, env []string, activity func()) (Result, error) {
 	command := exec.CommandContext(ctx, name, args...)
+	// Bound the post-cancellation reap window as well as inherited pipe cleanup.
+	// This keeps a cancelled Docker CLI from retaining the Manager's operation
+	// goroutine merely because a helper process kept a descriptor open.
+	command.WaitDelay = 5 * time.Second
 	if env != nil {
 		command.Env = append(os.Environ(), env...)
 	}
@@ -49,7 +71,12 @@ func (r CommandRunner) Run(ctx context.Context, name string, args []string, env 
 		limit = 2 << 20
 	}
 	stdout, stderr := &limitedBuffer{limit: limit}, &limitedBuffer{limit: limit}
-	command.Stdout, command.Stderr = stdout, stderr
+	if activity != nil {
+		command.Stdout = activityWriter{Writer: stdout, Activity: activity}
+		command.Stderr = activityWriter{Writer: stderr, Activity: activity}
+	} else {
+		command.Stdout, command.Stderr = stdout, stderr
+	}
 	err := command.Run()
 	result := Result{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err == nil {
@@ -61,6 +88,18 @@ func (r CommandRunner) Run(ctx context.Context, name string, args []string, env 
 		return result, fmt.Errorf("%s exited with %d: %s", name, result.ExitCode, strings.TrimSpace(result.Stderr))
 	}
 	return result, fmt.Errorf("run %s: %w", name, err)
+}
+
+type activityWriter struct {
+	io.Writer
+	Activity func()
+}
+
+func (w activityWriter) Write(value []byte) (int, error) {
+	if len(value) > 0 {
+		w.Activity()
+	}
+	return w.Writer.Write(value)
 }
 
 type limitedBuffer struct {
@@ -150,14 +189,19 @@ const (
 	candidateHealthMaxBytes     = 12 << 10
 	candidateDiagnosticTimeout  = 10 * time.Second
 	firecrawlComposeWaitSeconds = 600
+	defaultPullIdleTimeout      = 15 * time.Minute
+	defaultPullAbsoluteTimeout  = 6 * time.Hour
+	imageInspectTimeout         = 30 * time.Second
+	pullDiagnosticMaxBytes      = 8 << 10
 )
+
+var coreUpdateImageNames = []string{"platform", "agent-runtime"}
 
 var firecrawlHealthyServices = []string{
 	"firecrawl-playwright",
 	"firecrawl-redis",
 	"firecrawl-rabbitmq",
 	"firecrawl-postgres",
-	"firecrawl-foundationdb",
 	"firecrawl-api",
 }
 
@@ -176,20 +220,22 @@ var candidateCredentialPatterns = []struct {
 }
 
 type DockerCLI struct {
-	Runner         Runner
-	Binary         string
-	ComposeFile    string
-	ComposeProject string
-	GenerationDir  string
-	DataRoot       string
-	StateDir       string
-	GatewayAddress string
-	PlatformBind   string
-	CoreNetwork    string
-	LogMaxSize     string
-	LogMaxFiles    int
-	UID            int
-	GID            int
+	Runner              Runner
+	Binary              string
+	ComposeFile         string
+	ComposeProject      string
+	GenerationDir       string
+	DataRoot            string
+	StateDir            string
+	GatewayAddress      string
+	PlatformBind        string
+	CoreNetwork         string
+	LogMaxSize          string
+	LogMaxFiles         int
+	UID                 int
+	GID                 int
+	PullIdleTimeout     time.Duration
+	PullAbsoluteTimeout time.Duration
 }
 
 func (d DockerCLI) runner() Runner {
@@ -227,12 +273,165 @@ func (d DockerCLI) Preflight(ctx context.Context) error {
 }
 
 func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
-	for _, image := range manifest.CanonicalImages() {
-		if _, err := d.runner().Run(ctx, d.binary(), []string{"pull", image}, nil); err != nil {
-			return fmt.Errorf("pull %s: %w", image, err)
+	for _, name := range coreUpdateImageNames {
+		image := manifest.Images[name]
+		if image == "" {
+			return fmt.Errorf("core image %s is missing from the release manifest", name)
+		}
+		if err := d.ensureImage(ctx, name, image); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (d DockerCLI) ensureImage(ctx context.Context, name, image string) error {
+	present, err := d.imagePresent(ctx, name, image)
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	return d.pullImage(ctx, name, image)
+}
+
+func (d DockerCLI) imagePresent(ctx context.Context, name, image string) (bool, error) {
+	inspectCtx, cancel := context.WithTimeout(ctx, imageInspectTimeout)
+	defer cancel()
+	result, err := d.runner().Run(inspectCtx, d.binary(), []string{"image", "inspect", "--format", "{{json .RepoDigests}}", image}, nil)
+	if err != nil {
+		if inspectCtx.Err() != nil {
+			return false, fmt.Errorf("inspect managed image %s (%s): %w", name, image, inspectCtx.Err())
+		}
+		if imageInspectMissing(result) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect managed image %s (%s): %w", name, image, err)
+	}
+	var digests []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &digests); err != nil {
+		return false, fmt.Errorf("inspect managed image %s (%s): decode RepoDigests: %w", name, image, err)
+	}
+	for _, digest := range digests {
+		if digest == image {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func imageInspectMissing(result Result) bool {
+	if result.ExitCode != 1 {
+		return false
+	}
+	diagnostic := strings.ToLower(result.Stderr + "\n" + result.Stdout)
+	return strings.Contains(diagnostic, "no such image") || strings.Contains(diagnostic, "no such object")
+}
+
+type pullResult struct {
+	result Result
+	err    error
+}
+
+func (d DockerCLI) pullFailure(name, image string, outcome pullResult) error {
+	diagnostic := d.redactCandidateDiagnostic(outcome.err.Error())
+	diagnostic = journal.BoundDiagnosticWithLimit(diagnostic, pullDiagnosticMaxBytes)
+	return fmt.Errorf("pull managed image %s (%s): %s", name, image, diagnostic)
+}
+
+func (d DockerCLI) pullImage(ctx context.Context, name, image string) error {
+	idleTimeout := d.PullIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultPullIdleTimeout
+	}
+	absoluteTimeout := d.PullAbsoluteTimeout
+	if absoluteTimeout <= 0 {
+		absoluteTimeout = defaultPullAbsoluteTimeout
+	}
+	if absoluteTimeout < idleTimeout {
+		return fmt.Errorf("pull managed image %s (%s): absolute timeout %s is shorter than idle timeout %s", name, image, absoluteTimeout, idleTimeout)
+	}
+
+	pullCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	activity := make(chan struct{}, 1)
+	notifyActivity := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	completed := make(chan pullResult, 1)
+	runner := d.runner()
+	go func() {
+		var result Result
+		var err error
+		if observed, ok := runner.(ActivityRunner); ok {
+			result, err = observed.RunWithActivity(pullCtx, d.binary(), []string{"pull", image}, nil, notifyActivity)
+		} else {
+			result, err = runner.Run(pullCtx, d.binary(), []string{"pull", image}, nil)
+		}
+		completed <- pullResult{result: result, err: err}
+	}()
+
+	idleTimer := time.NewTimer(idleTimeout)
+	absoluteTimer := time.NewTimer(absoluteTimeout)
+	defer idleTimer.Stop()
+	defer absoluteTimer.Stop()
+	resetIdle := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
+	waitAfterCancel := func() { <-completed }
+
+	for {
+		select {
+		case outcome := <-completed:
+			if outcome.err != nil {
+				return d.pullFailure(name, image, outcome)
+			}
+			return nil
+		case <-activity:
+			resetIdle()
+		case <-idleTimer.C:
+			select {
+			case outcome := <-completed:
+				if outcome.err != nil {
+					return d.pullFailure(name, image, outcome)
+				}
+				return nil
+			case <-activity:
+				resetIdle()
+				continue
+			default:
+			}
+			cancel()
+			waitAfterCancel()
+			return fmt.Errorf("pull managed image %s (%s): no output for %s", name, image, idleTimeout)
+		case <-absoluteTimer.C:
+			select {
+			case outcome := <-completed:
+				if outcome.err != nil {
+					return d.pullFailure(name, image, outcome)
+				}
+				return nil
+			default:
+			}
+			cancel()
+			waitAfterCancel()
+			return fmt.Errorf("pull managed image %s (%s): exceeded absolute limit %s", name, image, absoluteTimeout)
+		case <-ctx.Done():
+			cancel()
+			waitAfterCancel()
+			return fmt.Errorf("pull managed image %s (%s): %w", name, image, ctx.Err())
+		}
+	}
 }
 
 func (d DockerCLI) Prepare(ctx context.Context, manifest release.Manifest) error {
@@ -297,12 +496,9 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 	if err != nil {
 		return err
 	}
-	// Capability services are intentionally outside the generation commit gate.
-	// Start the lightweight services independently so one broken integration
-	// cannot prevent another from starting or keep a healthy Platform in
-	// maintenance. Firecrawl has its own bounded background reconciler because
-	// its dependency graph can take minutes to converge.
-	_ = d.reconcileCapabilities(ctx, env)
+	// Capability services are intentionally left to the post-commit background
+	// reconcilers. Starting them here could make a slow third-party registry hold
+	// the fixed-stack lock and the public maintenance gate.
 	return nil
 }
 
@@ -329,11 +525,9 @@ func (d DockerCLI) reconcileCapabilities(ctx context.Context, env string) error 
 	return errors.Join(failures...)
 }
 
-// ReconcileFirecrawl converges the complete extraction stack for the active
-// generation.  It is safe to call again after Manager activation: Compose is
-// idempotent, and the only object removed on retry is the failed one-shot init
-// container.  Persistent FoundationDB data and the shared cluster file are
-// never removed or rewritten by the Manager.
+// ReconcileFirecrawl converges the PostgreSQL-backed extraction stack for the
+// active generation. It is safe to call again after Manager activation because
+// Compose is idempotent and the Manager never removes or rewrites service data.
 func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Manifest) error {
 	env, err := d.writeGenerationEnvironment(manifest)
 	if err != nil {
@@ -344,86 +538,23 @@ func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Mani
 
 func (d DockerCLI) reconcileFirecrawl(ctx context.Context, env string) error {
 	startArgs := d.composeArgs(env, "up", "--detach", "--wait", "--wait-timeout", strconv.Itoa(firecrawlComposeWaitSeconds), "firecrawl-api")
-	_, firstErr := d.runner().Run(ctx, d.binary(), startArgs, nil)
-	if firstErr == nil {
+	_, err := d.runner().Run(ctx, d.binary(), startArgs, nil)
+	if err == nil {
 		return nil
 	}
-	firstErr = fmt.Errorf("initial Firecrawl start: %w", firstErr)
-
-	removeInit, restartFDB, planErr := d.firecrawlRepairPlan(ctx, env)
-	if planErr != nil {
-		return errors.Join(firstErr, planErr, errors.New(d.firecrawlFailureDiagnostics(env)))
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	if !removeInit && !restartFDB {
-		return errors.Join(
-			firstErr,
-			errors.New("Firecrawl failure is outside the FoundationDB/init repair boundary"),
-			errors.New(d.firecrawlFailureDiagnostics(env)),
-		)
-	}
-	if removeInit {
-		if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "rm", "--force", "--stop", "firecrawl-foundationdb-init"), nil); err != nil {
-			return errors.Join(firstErr, fmt.Errorf("remove failed Firecrawl init container: %w", err))
-		}
-	}
-	if restartFDB {
-		if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs(env, "restart", "--timeout", "30", "firecrawl-foundationdb"), nil); err != nil {
-			return errors.Join(firstErr, fmt.Errorf("restart unhealthy Firecrawl FoundationDB: %w", err))
-		}
-	}
-	if _, err := d.runner().Run(ctx, d.binary(), startArgs, nil); err != nil {
-		retryErr := fmt.Errorf("Firecrawl retry after init reconciliation: %w", err)
-		return errors.Join(firstErr, retryErr, errors.New(d.firecrawlFailureDiagnostics(env)))
-	}
-	return nil
-}
-
-func (d DockerCLI) firecrawlRepairPlan(ctx context.Context, env string) (bool, bool, error) {
-	initID, err := d.composeServiceContainerID(ctx, env, "firecrawl-foundationdb-init")
-	if err != nil {
-		return false, false, fmt.Errorf("inspect Firecrawl init repair state: %w", err)
-	}
-	initState, err := d.runner().Run(ctx, d.binary(), []string{
-		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", initID,
-	}, nil)
-	if err != nil {
-		return false, false, fmt.Errorf("inspect Firecrawl init repair state: %w", err)
-	}
-	initFields := strings.Fields(initState.Stdout)
-	if len(initFields) != 2 {
-		return false, false, errors.New("Firecrawl init returned an invalid repair state")
-	}
-	initExitCode, err := strconv.Atoi(initFields[1])
-	if err != nil {
-		return false, false, errors.New("Firecrawl init returned an invalid repair exit code")
-	}
-	removeInit := initFields[0] == "exited" && initExitCode != 0
-
-	foundationDBID, err := d.composeServiceContainerID(ctx, env, "firecrawl-foundationdb")
-	if err != nil {
-		return false, false, fmt.Errorf("inspect Firecrawl FoundationDB repair state: %w", err)
-	}
-	foundationDBState, err := d.runner().Run(ctx, d.binary(), []string{
-		"inspect", "--format",
-		"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
-		foundationDBID,
-	}, nil)
-	if err != nil {
-		return false, false, fmt.Errorf("inspect Firecrawl FoundationDB repair state: %w", err)
-	}
-	foundationDBFields := strings.Fields(foundationDBState.Stdout)
-	if len(foundationDBFields) != 2 {
-		return false, false, errors.New("Firecrawl FoundationDB returned an invalid repair state")
-	}
-	restartFoundationDB := foundationDBFields[0] != "running" || foundationDBFields[1] != "healthy"
-	return removeInit, restartFoundationDB, nil
+	return errors.Join(
+		fmt.Errorf("start Firecrawl PostgreSQL stack: %w", err),
+		errors.New(d.firecrawlFailureDiagnostics(env)),
+	)
 }
 
 func (d DockerCLI) firecrawlFailureDiagnostics(env string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), candidateDiagnosticTimeout)
 	defer cancel()
 	logServices := append([]string{"logs", "--no-color", "--timestamps", "--tail", "120"}, firecrawlHealthyServices...)
-	logServices = append(logServices, "firecrawl-foundationdb-init")
 	logsResult, logsErr := d.runner().Run(
 		ctx,
 		d.binary(),
@@ -432,7 +563,6 @@ func (d DockerCLI) firecrawlFailureDiagnostics(env string) string {
 	)
 	parts := []string{"Firecrawl compose logs:\n" + d.boundedCommandDiagnostic(logsResult, logsErr, candidateLogsMaxBytes)}
 	services := append([]string{}, firecrawlHealthyServices...)
-	services = append(services, "firecrawl-foundationdb-init")
 	for _, service := range services {
 		id, err := d.composeServiceContainerID(ctx, env, service)
 		if err != nil {
@@ -526,7 +656,7 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 }
 
 func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServiceState {
-	result := make(map[string]FixedServiceState, 11)
+	result := make(map[string]FixedServiceState, 9)
 	env, envErr := d.activeEnvironment()
 	if d.ComposeFile != "" {
 		env = ""
@@ -546,11 +676,6 @@ func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServi
 		}
 		result[service] = FixedServiceState{Status: status}
 	}
-	initStatus := "unknown"
-	if envErr == nil {
-		initStatus = d.completedServiceStatus(ctx, env, "firecrawl-foundationdb-init")
-	}
-	result["firecrawl-foundationdb-init"] = FixedServiceState{Status: initStatus}
 	return result
 }
 
@@ -575,34 +700,6 @@ func (d DockerCLI) healthyServiceStatus(ctx context.Context, env, service string
 		return "healthy"
 	}
 	if fields[0] == "running" && fields[1] == "starting" {
-		return "starting"
-	}
-	return "unavailable"
-}
-
-func (d DockerCLI) completedServiceStatus(ctx context.Context, env, service string) string {
-	id, err := d.composeServiceContainerID(ctx, env, service)
-	if err != nil {
-		return "unavailable"
-	}
-	state, err := d.runner().Run(ctx, d.binary(), []string{
-		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", id,
-	}, nil)
-	if err != nil {
-		return "unavailable"
-	}
-	fields := strings.Fields(state.Stdout)
-	if len(fields) != 2 {
-		return "unknown"
-	}
-	exitCode, err := strconv.Atoi(fields[1])
-	if err != nil {
-		return "unknown"
-	}
-	if fields[0] == "exited" && exitCode == 0 {
-		return "healthy"
-	}
-	if fields[0] == "created" || fields[0] == "running" {
 		return "starting"
 	}
 	return "unavailable"
@@ -645,34 +742,6 @@ func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service 
 	}
 	if fields[1] != "healthy" {
 		return fmt.Errorf("required service %s container health is %s, want healthy", service, fields[1])
-	}
-	return nil
-}
-
-func (d DockerCLI) probeCompletedComposeService(ctx context.Context, env, service string) error {
-	id, err := d.composeServiceContainerID(ctx, env, service)
-	if err != nil {
-		return err
-	}
-	state, err := d.runner().Run(ctx, d.binary(), []string{
-		"inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", id,
-	}, nil)
-	if err != nil {
-		return fmt.Errorf("inspect required service %s container: %w", service, err)
-	}
-	fields := strings.Fields(state.Stdout)
-	if len(fields) != 2 {
-		return fmt.Errorf("required service %s returned an invalid container state", service)
-	}
-	if fields[0] != "exited" {
-		return fmt.Errorf("required service %s container status is %s, want exited", service, fields[0])
-	}
-	exitCode, parseErr := strconv.Atoi(fields[1])
-	if parseErr != nil {
-		return fmt.Errorf("required service %s returned an invalid exit code", service)
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("required service %s container exited with %d, want 0", service, exitCode)
 	}
 	return nil
 }
@@ -812,6 +881,9 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 			return SandboxEnsureResult{}, err
 		}
 		return SandboxEnsureResult{Started: true}, nil
+	}
+	if err := d.ensureImage(ctx, "agent-sandbox", spec.Image); err != nil {
+		return SandboxEnsureResult{}, fmt.Errorf("prepare sandbox image: %w", err)
 	}
 	args := []string{"create", "--name", spec.ContainerName, "--label", "org.ubitech.agent.sandbox=true", "--label", "org.ubitech.agent.id=" + spec.AgentHash,
 		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("UBITECH_AGENT_UID=%d", spec.UID), "--env", fmt.Sprintf("UBITECH_AGENT_GID=%d", spec.GID), "--workdir", contract.ContainerWorkspace,

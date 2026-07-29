@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -284,7 +285,7 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 			return
 		}
 		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"} {
+		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
 		manifest := release.Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: generatedAt, ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2, Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}}, Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images}
@@ -319,14 +320,21 @@ func TestInstallWaitsWhenManagerExistsBeforeManifestPublication(t *testing.T) {
 	}
 }
 
-func TestOperationExecutionWaitsForFixedStackMutex(t *testing.T) {
+func TestUpdatePreparesAndReservesBeforeTakingFixedStackMutex(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
 	store, err := journal.Open(t.TempDir(), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	engine := &fakeEngine{}
+	gate := &reserveCountingGate{}
 	fixedStackMu := newObservedHeldLocker()
 	locked := true
 	defer func() {
@@ -335,11 +343,11 @@ func TestOperationExecutionWaitsForFixedStackMutex(t *testing.T) {
 		}
 	}()
 	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{},
 		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main",
 		ReleaseClient: release.Client{HTTP: server.Client()}, FixedStackMu: fixedStackMu,
 	}
-	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "fixed-stack-lock", ExpectedGeneration: store.State().Generation})
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "fixed-stack-lock", ExpectedGeneration: store.State().Generation})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,8 +359,14 @@ func TestOperationExecutionWaitsForFixedStackMutex(t *testing.T) {
 	engine.mu.Lock()
 	callsWhileLocked := append([]string(nil), engine.calls...)
 	engine.mu.Unlock()
-	if len(callsWhileLocked) != 0 {
-		t.Fatalf("operation touched the fixed stack while reconciliation held its mutex: %v", callsWhileLocked)
+	if !reflect.DeepEqual(callsWhileLocked, []string{"pull", "prepare"}) {
+		t.Fatalf("pre-maintenance work under an unavailable fixed-stack mutex = %v, want pull and prepare", callsWhileLocked)
+	}
+	if gate.reservations != 2 || !store.State().Maintenance {
+		t.Fatalf("fixed-stack lock was attempted before durable reservation: reservations=%d state=%#v", gate.reservations, store.State())
+	}
+	if strings.Contains(strings.Join(callsWhileLocked, ","), "stop") {
+		t.Fatalf("update crossed the destructive boundary before taking the fixed-stack mutex: %v", callsWhileLocked)
 	}
 	fixedStackMu.mu.Unlock()
 	locked = false
@@ -362,6 +376,95 @@ func TestOperationExecutionWaitsForFixedStackMutex(t *testing.T) {
 	}
 	if completed.Status != model.OperationSucceeded {
 		t.Fatalf("operation did not resume after fixed-stack mutex release: %#v", completed)
+	}
+}
+
+func TestRestartWaitsForTasksBeforeTakingFixedStackMutex(t *testing.T) {
+	dir := t.TempDir()
+	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentID := strings.Repeat("a", 40)
+	currentPath := writeRollbackManifest(t, dir, currentID)
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID, ManifestPath: currentPath}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting := make(chan struct{})
+	continueReservation := make(chan struct{})
+	var waitingOnce sync.Once
+	gate := &scriptedGate{steps: []gateStep{
+		{reservation: Reservation{Reserved: false, RetryAfterSeconds: 1}},
+		{reservation: Reservation{Reserved: true}},
+		{reservation: Reservation{Reserved: true}},
+	}}
+	engine := &fakeEngine{}
+	locker := &observedLocker{attempted: make(chan struct{})}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{},
+		FixedStackMu: locker, Channel: "main",
+		Sleep: func(ctx context.Context, _ time.Duration) error {
+			waitingOnce.Do(func() { close(waiting) })
+			select {
+			case <-continueReservation:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationRestart, IdempotencyKey: "restart-lock-handoff",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("restart did not enter the task-waiting phase")
+	}
+
+	// Acquire the same mutex through its underlying test lock, representing a
+	// current-generation capability reconciler. This must remain possible until
+	// the admission reservation has durably entered maintenance.
+	reconcilerHeldLock := locker.mu.TryLock()
+	close(continueReservation)
+	if reconcilerHeldLock {
+		select {
+		case <-locker.attempted:
+		case <-time.After(time.Second):
+			locker.mu.Unlock()
+			t.Fatal("restart did not request the fixed-stack lock after reservation")
+		}
+		state := store.State()
+		engine.mu.Lock()
+		callsWhileReconcilerHeldLock := append([]string(nil), engine.calls...)
+		engine.mu.Unlock()
+		if !state.Maintenance || state.PublicState != model.StateUpdating {
+			locker.mu.Unlock()
+			t.Fatalf("restart requested the fixed-stack lock before durable maintenance: %#v", state)
+		}
+		if len(callsWhileReconcilerHeldLock) != 0 {
+			locker.mu.Unlock()
+			t.Fatalf("restart mutated the fixed stack before the reconciler yielded: %v", callsWhileReconcilerHeldLock)
+		}
+		locker.mu.Unlock()
+	}
+
+	awaitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	completed, awaitErr := orchestrator.Await(awaitCtx, op.ID)
+	if awaitErr != nil || completed.Status != model.OperationSucceeded {
+		t.Fatalf("restart did not complete after fixed-stack handoff: operation=%#v err=%v", completed, awaitErr)
+	}
+	if !reconcilerHeldLock {
+		t.Fatal("restart held the fixed-stack mutex while it was still waiting for tasks")
 	}
 }
 
@@ -454,7 +557,7 @@ func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 			return
 		}
 		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"} {
+		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
 		manifest := release.Manifest{
@@ -1685,7 +1788,7 @@ func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
 func writeRollbackManifest(t *testing.T, dir, commit string) string {
 	t.Helper()
 	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"} {
+	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
 		images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
 	manifest := release.Manifest{
@@ -1740,6 +1843,49 @@ func TestConsecutiveRollbacksBindSnapshotToNewCurrentGeneration(t *testing.T) {
 	wantRestores := []string{"/snapshots/a", "/snapshots/b"}
 	if strings.Join(snapshots.restores, ",") != strings.Join(wantRestores, ",") {
 		t.Fatalf("unexpected restore sequence: got %v want %v", snapshots.restores, wantRestores)
+	}
+}
+
+func TestRollbackImagePreparationFailureKeepsCurrentOnlineAndRetryable(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := journal.Open(filepath.Join(dir, "state"), time.Now())
+	previousID, currentID := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	previousPath := writeRollbackManifest(t, dir, previousID)
+	currentPath := writeRollbackManifest(t, dir, currentID)
+	_, _ = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID, ManifestPath: currentPath, RollbackSnapshotPath: "/snapshots/previous"}
+		state.Previous = &model.Generation{ID: previousID, ManifestPath: previousPath}
+		return nil
+	})
+	engine := &fakeEngine{failAt: "pull"}
+	gate := &reserveCountingGate{}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, Channel: "main"}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationRollback, IdempotencyKey: "rollback-image-failure",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.runRollback(context.Background(), op)
+	state := store.State()
+	completed, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Current == nil || state.Current.ID != currentID || state.Maintenance || state.PublicState != model.StateIdle || state.ActiveOperationID != "" {
+		t.Fatalf("rollback image failure disturbed the current generation: %#v", state)
+	}
+	if completed.Status != model.OperationFailed || !completed.Retryable || !strings.Contains(completed.Error, "prepare previous generation images") {
+		t.Fatalf("rollback image failure was not retryable: %#v", completed)
+	}
+	if gate.reservations != 0 {
+		t.Fatalf("rollback reserved maintenance before images were ready: %d", gate.reservations)
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if !reflect.DeepEqual(engine.calls, []string{"pull"}) {
+		t.Fatalf("rollback mutated the fixed stack after image failure: %v", engine.calls)
 	}
 }
 

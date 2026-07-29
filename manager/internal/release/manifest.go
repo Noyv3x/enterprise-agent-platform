@@ -22,6 +22,7 @@ const maxManifestBytes = 1 << 20
 
 var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var digestPattern = regexp.MustCompile(`^[^@[:space:]]+@sha256:[0-9a-f]{64}$`)
+var imageNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 type Artifact struct {
 	URL    string `json:"url"`
@@ -66,7 +67,7 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	required := []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-foundationdb"}
+	required := []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"}
 	for _, name := range required {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
@@ -74,7 +75,10 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 		}
 	}
 	for name, digest := range m.Images {
-		if name == "" || !digestPattern.MatchString(digest) {
+		if !imageNamePattern.MatchString(name) {
+			return fmt.Errorf("image name %q must use lowercase kebab-case", name)
+		}
+		if !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q has invalid digest", name)
 		}
 	}

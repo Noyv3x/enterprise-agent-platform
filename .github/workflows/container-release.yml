@@ -133,7 +133,6 @@ jobs:
             'ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6'
             'redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
             'rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
-            'foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48'
           )
           for image in "${images[@]}"; do
             raw="$(docker buildx imagetools inspect "$image" --raw)"
@@ -424,7 +423,7 @@ jobs:
       - images
       - public-images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: read
@@ -644,19 +643,16 @@ jobs:
           test "$(stat -c %u "$sandbox_mount_root/workspace/ownership-sentinel")" = "$sentinel_uid"
           docker compose -f containers/compose.yaml stop \
             platform agent-runtime camofox searxng
-          docker compose -f containers/compose.yaml run --rm --no-deps \
-            --entrypoint /bin/sh firecrawl-foundationdb \
-            -eu -c 'test -x /var/fdb/scripts/fdb.bash'
           if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
             docker compose -f containers/compose.yaml ps --all
             docker compose -f containers/compose.yaml logs --no-color --tail 200 \
               firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
-              firecrawl-postgres firecrawl-foundationdb firecrawl-foundationdb-init
+              firecrawl-postgres
             exit 1
           fi
           for service in \
             firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
-            firecrawl-postgres firecrawl-foundationdb firecrawl-api; do
+            firecrawl-postgres firecrawl-api; do
             container="$(docker compose -f containers/compose.yaml ps -q "$service")"
             test -n "$container"
             for attempt in $(seq 1 60); do
@@ -670,31 +666,78 @@ jobs:
             done
             test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
           done
-          foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
-          test -n "$foundationdb_init"
-          test "$(docker inspect --format '{{.State.Status}}' "$foundationdb_init")" = exited
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$foundationdb_init")" = 0
-          first_foundationdb_init="$foundationdb_init"
-          first_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
-          test -n "$first_foundationdb"
-          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            /bin/sh -eu -c 'test -x /var/fdb/scripts/fdb.bash; test -s /var/fdb/cluster/fdb.cluster; status="$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null)"; test -n "$status"; printf "%s\n" "$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null'
+          firecrawl_scrape() {
+            local phase="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if docker compose -f containers/compose.yaml exec -T firecrawl-api \
+                node --input-type=module - "$phase" <<'NODE'
+          const phase = process.argv[2] || 'unknown';
+          const response = await fetch('http://127.0.0.1:3002/v1/scrape', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({url: 'https://example.com/', formats: ['markdown']}),
+            signal: AbortSignal.timeout(120000),
+          });
+          const text = await response.text();
+          let body;
+          try {
+            body = JSON.parse(text);
+          } catch (error) {
+            throw new Error(`Firecrawl ${phase} scrape returned non-JSON: ${response.status} ${text.slice(0, 2000)}`, {cause: error});
+          }
+          if (!response.ok || body.success !== true || !body.data?.markdown?.includes('Example Domain')) {
+            throw new Error(`Firecrawl ${phase} scrape failed: ${response.status} ${text.slice(0, 2000)}`);
+          }
+          NODE
+              then
+                return 0
+              fi
+              if [[ "$attempt" -lt 3 ]]; then
+                echo "Firecrawl ${phase} scrape attempt ${attempt}/3 failed; retrying" >&2
+                sleep $((attempt * 5))
+              fi
+            done
+            echo "Firecrawl ${phase} scrape failed after 3 attempts" >&2
+            docker compose -f containers/compose.yaml ps --all >&2
+            docker compose -f containers/compose.yaml logs --no-color --timestamps --tail 200 \
+              firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
+              firecrawl-postgres >&2
+            return 1
+          }
           sentinel_key=ubitech_ci_persistence
           sentinel_value="retained_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            fdbcli -C /var/fdb/cluster/fdb.cluster \
-            --exec "writemode on; set $sentinel_key $sentinel_value"
+          first_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"
+          test -n "$first_postgres"
+          docker compose -f containers/compose.yaml exec -T \
+            -e "UBITECH_SENTINEL_KEY=$sentinel_key" \
+            -e "UBITECH_SENTINEL_VALUE=$sentinel_value" \
+            firecrawl-postgres sh -eu -c '
+              export PGPASSWORD="$(cat /run/secrets/ubitech/firecrawl-postgres-password)"
+              psql --host 127.0.0.1 --username postgres --dbname postgres \
+                --set ON_ERROR_STOP=1 --command "
+                  CREATE TABLE IF NOT EXISTS ubitech_release_smoke (
+                    key text PRIMARY KEY,
+                    value text NOT NULL
+                  );
+                  INSERT INTO ubitech_release_smoke (key, value)
+                  VALUES ('"'"'$UBITECH_SENTINEL_KEY'"'"', '"'"'$UBITECH_SENTINEL_VALUE'"'"')
+                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+                "
+            '
           docker compose -f containers/compose.yaml exec -T firecrawl-api \
             node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+          firecrawl_scrape cold
           docker compose -f containers/compose.yaml rm --stop --force \
-            firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
+            firecrawl-api firecrawl-postgres
           if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
             docker compose -f containers/compose.yaml ps --all
             docker compose -f containers/compose.yaml logs --no-color --tail 200 \
-              firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
+              firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
+              firecrawl-postgres
             exit 1
           fi
-          for service in firecrawl-foundationdb firecrawl-api; do
+          for service in firecrawl-postgres firecrawl-api; do
             container="$(docker compose -f containers/compose.yaml ps -q "$service")"
             test -n "$container"
             for attempt in $(seq 1 60); do
@@ -708,77 +751,24 @@ jobs:
             done
             test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
           done
-          second_foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
-          second_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
-          test -n "$second_foundationdb_init"
-          test -n "$second_foundationdb"
-          test "$second_foundationdb_init" != "$first_foundationdb_init"
-          test "$second_foundationdb" != "$first_foundationdb"
-          test "$(docker inspect --format '{{.State.Status}}' "$second_foundationdb_init")" = exited
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$second_foundationdb_init")" = 0
-          docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            /bin/sh -eu -c 'status="$(timeout 5 fdbcli -C /var/fdb/cluster/fdb.cluster --exec "status json" 2>/dev/null)"; test -n "$status"; printf "%s\n" "$status" | jq -e -s "length == 1 and .[0].client.database_status.available == true" >/dev/null'
-          read_output="$(docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            fdbcli -C /var/fdb/cluster/fdb.cluster --exec "get $sentinel_key")"
-          expected="\`${sentinel_key}' is \`${sentinel_value}'"
-          printf '%s\n' "$read_output" | grep -Fqx -- "$expected"
+          second_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"
+          test -n "$second_postgres"
+          test "$second_postgres" != "$first_postgres"
+          read_output="$(docker compose -f containers/compose.yaml exec -T \
+            -e "UBITECH_SENTINEL_KEY=$sentinel_key" \
+            firecrawl-postgres sh -eu -c '
+              export PGPASSWORD="$(cat /run/secrets/ubitech/firecrawl-postgres-password)"
+              psql --host 127.0.0.1 --username postgres --dbname postgres \
+                --tuples-only --no-align --set ON_ERROR_STOP=1 \
+                --command "SELECT value FROM ubitech_release_smoke WHERE key = '"'"'$UBITECH_SENTINEL_KEY'"'"';"
+            ')"
+          test "$read_output" = "$sentinel_value"
           docker compose -f containers/compose.yaml exec -T firecrawl-api \
             node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
-          docker compose -f containers/compose.yaml rm --stop --force \
-            firecrawl-api firecrawl-foundationdb-init
-          if docker compose \
-            -f containers/compose.yaml \
-            -f containers/compose.firecrawl-init-failure.yaml \
-            up --detach --wait --wait-timeout 600 firecrawl-api; then
-            echo "Firecrawl unexpectedly ignored the injected init failure" >&2
-            exit 1
-          fi
-          failed_foundationdb_init="$(docker compose \
-            -f containers/compose.yaml \
-            -f containers/compose.firecrawl-init-failure.yaml \
-            ps --all -q firecrawl-foundationdb-init)"
-          test -n "$failed_foundationdb_init"
-          test "$(docker inspect --format '{{.State.Status}}' "$failed_foundationdb_init")" = exited
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$failed_foundationdb_init")" = 42
-          failed_recovery_foundationdb="$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)"
-          test "$failed_recovery_foundationdb" = "$second_foundationdb"
-          test "$(docker inspect --format '{{.State.Health.Status}}' "$failed_recovery_foundationdb")" = healthy
-          docker compose -f containers/compose.yaml rm --force --stop \
-            firecrawl-foundationdb-init
-          if ! docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api; then
-            docker compose -f containers/compose.yaml ps --all
-            docker compose -f containers/compose.yaml logs --no-color --tail 200 \
-              firecrawl-api firecrawl-foundationdb firecrawl-foundationdb-init
-            exit 1
-          fi
-          reconciled_foundationdb_init="$(docker compose -f containers/compose.yaml ps --all -q firecrawl-foundationdb-init)"
-          test -n "$reconciled_foundationdb_init"
-          test "$reconciled_foundationdb_init" != "$failed_foundationdb_init"
-          test "$(docker inspect --format '{{.State.Status}}' "$reconciled_foundationdb_init")" = exited
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$reconciled_foundationdb_init")" = 0
-          test "$(docker compose -f containers/compose.yaml ps -q firecrawl-foundationdb)" = "$second_foundationdb"
-          for service in firecrawl-foundationdb firecrawl-api; do
-            container="$(docker compose -f containers/compose.yaml ps -q "$service")"
-            test -n "$container"
-            for attempt in $(seq 1 60); do
-              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
-              [[ "$status" == healthy ]] && break
-              [[ "$status" != unhealthy || "$attempt" -lt 60 ]] || {
-                docker compose -f containers/compose.yaml logs --no-color --tail 200 "$service"
-                exit 1
-              }
-              sleep 5
-            done
-            test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
-          done
-          read_output="$(docker compose -f containers/compose.yaml exec -T firecrawl-foundationdb \
-            fdbcli -C /var/fdb/cluster/fdb.cluster --exec "get $sentinel_key")"
-          printf '%s\n' "$read_output" | grep -Fqx -- "$expected"
-          docker compose -f containers/compose.yaml exec -T firecrawl-api \
-            node -e 'fetch("http://127.0.0.1:3002/v0/health/liveness").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+          firecrawl_scrape warm
           docker compose -f containers/compose.yaml stop \
             firecrawl-api firecrawl-playwright firecrawl-redis firecrawl-rabbitmq \
-            firecrawl-postgres firecrawl-foundationdb
+            firecrawl-postgres
           docker run --detach \
             --name "$sandbox_container" \
             --network "$UBITECH_CORE_NETWORK" \
@@ -902,7 +892,7 @@ jobs:
                 "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
                 "firecrawl-redis": "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
                 "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69",
-                "firecrawl-foundationdb": "foundationdb/foundationdb@sha256:df1a2310c6dbe0d56def526b73606cc8fd414ecc42c50fba2588f13292f82d48"
+                "firecrawl-foundationdb": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6"
               }
             }' > "$stage/release.json"
           python3 - "$stage/release.json" <<'PY'
@@ -914,8 +904,17 @@ jobs:
               raise SystemExit("release manifest top-level shape mismatch")
           if data["schema_version"] != 1 or data["channel"] != "main" or data["protocol_version"] != 1:
               raise SystemExit("release manifest channel/schema mismatch")
+          # One-release handoff: the deployed e758 Manager still requires the
+          # old key. It aliases the already-required PostgreSQL digest, so the
+          # bridge neither pulls nor runs a FoundationDB image. New Managers do
+          # not require the key; the next clean release removes it.
+          if data["images"].get("firecrawl-foundationdb") != data["images"].get("firecrawl-postgres"):
+              raise SystemExit("legacy Firecrawl image key must alias PostgreSQL during the bridge release")
+          image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
           digest = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
           for name, image in data["images"].items():
+              if not image_name.fullmatch(name):
+                  raise SystemExit(f"invalid image property name: {name!r}")
               if not digest.fullmatch(image):
                   raise SystemExit(f"invalid image digest for {name}: {image}")
           for artifact in [*data["manager"]["artifacts"].values(), data["compose"]]:

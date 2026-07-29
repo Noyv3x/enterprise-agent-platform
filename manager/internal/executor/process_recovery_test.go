@@ -49,7 +49,7 @@ func TestPreviewUsesScopeFamilyActiveOrderingAndOutputSensitiveCursor(t *testing
 	service, _ := newTestService(t)
 	processes := service.Processes
 	processes.completedRecordTTL = 24 * time.Hour
-	started := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	started := time.Now().UTC().Add(-10 * time.Minute)
 	add := func(id, scope, status string, offset time.Duration) *managedProcess {
 		stdout := &boundedBuffer{limit: 64 << 10}
 		_, _ = stdout.Write([]byte(id + "-first"))

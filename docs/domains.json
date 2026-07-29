@@ -103,6 +103,7 @@
       ],
       "code": [
         "enterprise-agent-platform/enterprise_agent_platform/db.py",
+        "containers/compose.yaml",
         "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
         "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",
         "enterprise-agent-platform/enterprise_agent_platform/memory_security.py",
@@ -169,7 +170,15 @@
         "enterprise-agent-platform/enterprise_agent_platform/schedules.py",
         "enterprise-agent-platform/enterprise_agent_platform/skills.py",
         "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
-        "enterprise-agent-platform/camofox-runtime/**"
+        "enterprise-agent-platform/camofox-runtime/**",
+        "containers/compose.yaml",
+        "containers/compose.dev.yaml",
+        "containers/dev.env.example",
+        "containers/platform.Dockerfile",
+        "containers/platform-entrypoint.sh",
+        "containers/camofox.Dockerfile",
+        "containers/camofox-entrypoint.sh",
+        "containers/release-manifest.schema.json"
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_schedules.py",
