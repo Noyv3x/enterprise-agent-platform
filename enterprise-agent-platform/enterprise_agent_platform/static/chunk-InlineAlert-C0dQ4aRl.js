@@ -1,0 +1,1 @@
+import{t as e}from"./chunk-vendor-react-SNKMMqOR.js";import{Lt as t}from"./app-JpFS3NyP.js";var n=e();function r({variant:e=`info`,title:r,children:i,action:a,className:o}){return(0,n.jsx)(t,{className:o,type:e,title:r??i,description:r?i:void 0,action:a,showIcon:!0})}export{r as t};

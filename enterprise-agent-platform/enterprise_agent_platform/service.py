@@ -4639,16 +4639,19 @@ class EnterpriseService:
         content: str,
         attachments: list[UploadedFile] | None = None,
     ) -> dict[str, Any]:
-        self._begin_agent_update_admission()
-        try:
-            return self._send_channel_message_admitted(
-                actor,
-                channel_id,
-                content,
-                attachments,
-            )
-        finally:
-            self._end_agent_update_admission()
+        with self._agent_ingress_lock(
+            self._conversation_key("channel", str(channel_id))
+        ):
+            self._begin_agent_update_admission()
+            try:
+                return self._send_channel_message_admitted(
+                    actor,
+                    channel_id,
+                    content,
+                    attachments,
+                )
+            finally:
+                self._end_agent_update_admission()
 
     def _send_channel_message_admitted(
         self,
@@ -4697,18 +4700,21 @@ class EnterpriseService:
                     "agent_status": self.agent_status(actor, "channel", scope_id),
                 }
             agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-            enqueue_result = self._enqueue_agent_reply(
-                {
-                    "scope_type": "channel",
-                    "scope_id": scope_id,
-                    "channel": channel,
-                    "actor": dict(actor),
-                    "content": agent_content,
-                    "attachments": agent_attachments,
-                    "generation": generation,
-                    "user_message": user_msg,
-                }
-            )
+            task = {
+                "scope_type": "channel",
+                "scope_id": scope_id,
+                "channel": channel,
+                "actor": dict(actor),
+                "content": agent_content,
+                "attachments": agent_attachments,
+                "generation": generation,
+                "user_message": user_msg,
+            }
+        enqueue_result = self._enqueue_after_browser_assistance_handoff(
+            task,
+            self.agent_scopes.channel_scope_key(scope_id),
+            int(actor["id"]),
+        )
         return {
             "user_message": user_msg,
             "agent_message": None,
@@ -4968,7 +4974,11 @@ class EnterpriseService:
                 "generation": generation,
                 "user_message": user_msg,
             }
-        enqueue_result = self._enqueue_agent_reply(task)
+        enqueue_result = self._enqueue_after_browser_assistance_handoff(
+            task,
+            agent_scope.scope_key,
+            int(actor["id"]),
+        )
         return {
             "user_message": user_msg,
             "agent_message": None,
@@ -9238,6 +9248,40 @@ class EnterpriseService:
         for key, lease in tuple(self._browser_control_leases.items()):
             if float(lease.get("expires_at") or 0.0) <= current:
                 self._browser_control_leases.pop(key, None)
+
+    def _release_owned_browser_assistance_serialized(
+        self,
+        root_scope_key: str,
+        owner_user_id: int,
+    ) -> int:
+        """Release matching leases while the root browser operation gate is held."""
+
+        released = 0
+        with self._agent_browser_tabs_lock:
+            self._expire_browser_control_leases_unlocked()
+            for lease_key, lease in tuple(self._browser_control_leases.items()):
+                if (
+                    lease_key[0] == root_scope_key
+                    and int(lease.get("owner_user_id") or 0) == int(owner_user_id)
+                ):
+                    self._browser_control_leases.pop(lease_key, None)
+                    released += 1
+        return released
+
+    def _enqueue_after_browser_assistance_handoff(
+        self,
+        task: dict[str, Any],
+        root_scope_key: str,
+        owner_user_id: int,
+    ) -> dict[str, Any]:
+        """Atomically hand browser control back before making Agent work runnable."""
+
+        with self._agent_browser_operation_lock(root_scope_key):
+            self._release_owned_browser_assistance_serialized(
+                root_scope_key,
+                owner_user_id,
+            )
+            return self._enqueue_agent_reply(task)
 
     def browser_preview(
         self,

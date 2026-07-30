@@ -67,7 +67,7 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 
 ### 交互回复
 
-1. Platform 先确认 Manager 持久更新预约已释放，再完成权限检查并持久化用户消息和 Agent job；候选容器启动期间所有后台 worker 同样保持冻结。
+1. Platform 先确认 Manager 持久更新预约已释放，再完成权限检查并持久化用户消息和 Agent job。若同一发送者正持有该 Agent root scope 的浏览器人工接管租约，Platform 必须在浏览器操作门内先撤销租约再把任务入队；其他用户租约保持不变。候选容器启动期间所有后台 worker 同样保持冻结。
 2. 每个会话 FIFO worker 领取任务，全局并发门控制同时进入 Runtime 的数量。
 3. Platform 创建 Runtime Run，随后消费事件；工具过程和最终内容分别写入状态和消息元数据。
 4. Runtime 将产品工具回调 Platform；terminal、process 与文件工具按主 Agent identity 调用管理器，默认进入对应 Sandbox。

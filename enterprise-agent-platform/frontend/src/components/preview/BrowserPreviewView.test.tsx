@@ -6,6 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { ApiError } from "../../lib/api";
+import { relinquishBrowserControlFor } from "../../lib/browserControl";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 
 const mocks = vi.hoisted(() => ({
@@ -213,6 +214,61 @@ describe("BrowserPreviewView", () => {
       "tab-1",
       "lease-2",
     ));
+  });
+
+  it("returns to read only when the user submits a message for this scope", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    const user = userEvent.setup();
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await screen.findByText("Human assistance");
+
+    await act(() => relinquishBrowserControlFor({ scope_type: "private", scope_id: "7" }));
+    await screen.findByText("Read only");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-1",
+    ));
+  });
+
+  it("releases an in-flight acquire before allowing message submission to continue", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    let finishAcquire!: (value: { lease_id: string; expires_in_ms: number }) => void;
+    mocks.acquire.mockImplementationOnce(() => new Promise((resolve) => {
+      finishAcquire = resolve;
+    }));
+    const user = userEvent.setup();
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await waitFor(() => expect(mocks.acquire).toHaveBeenCalledTimes(1));
+
+    let handoff!: Promise<void>;
+    act(() => {
+      handoff = relinquishBrowserControlFor({ scope_type: "private", scope_id: "7" });
+    });
+    let handoffFinished = false;
+    void handoff.then(() => { handoffFinished = true; });
+    await Promise.resolve();
+    expect(handoffFinished).toBe(false);
+
+    await act(async () => {
+      finishAcquire({ lease_id: "late-lease", expires_in_ms: 90_000 });
+      await handoff;
+    });
+    expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "late-lease",
+    );
+    expect(screen.getByText("Read only")).toBeVisible();
+    expect(screen.queryByText("Human assistance")).not.toBeInTheDocument();
   });
 
   it("expires the local lease and best-effort releases it", async () => {

@@ -35,6 +35,8 @@ Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API �
 
 Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、mail、schedule、session、session_search 和 delegate_task。
 
+模型可见的 assistant tool call 参数必须始终保持对应活动工具 schema 的规范形状；审计展示对象与模型历史使用不同的序列化边界，不能把 `tool` 名称或其它展示字段写回下一轮上下文。读取旧 session 时只允许在内存模型副本中收敛精确匹配的历史展示 envelope，未知字段、身份字段或不匹配工具名继续由严格 schema 拒绝，原 JSONL 不改写。敏感值替换仍须满足字段的枚举、正则和路径约束；允许任意 JSON 的浏览器提取 schema 必须同时限制深度、条目、节点和字符串大小。
+
 terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。
 
 用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件只使用 `/workspace/.ubitech/attachments/...` 逻辑路径，经 Manager 在当前 scope 的只读附件挂载中解析；Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。

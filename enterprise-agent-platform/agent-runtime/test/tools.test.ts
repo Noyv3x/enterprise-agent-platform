@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdir, open, rename, rm, symlink, writeFile } from "node:fs/promises";
 import test from "node:test";
+import { validateToolArguments } from "@earendil-works/pi-ai/compat";
+import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { assertReadableTargetAllowed, assertWritableTargetAllowed, browserGatewayResult, classifyToolCall, createTools, readRegularFileRange } from "../src/tools.js";
 import { resolveWorkspacePath } from "../src/utils.js";
 import { temporaryDirectory } from "./helpers.js";
@@ -238,6 +240,63 @@ test("browser schema omits unsupported interactions and download deletion", () =
     assert.doesNotMatch(schema, new RegExp(`\\b${unsupported}\\b`));
   }
   assert.match(browser.description, /downloads \(list metadata only/);
+  assert.match(browser.description, /exact root shape/);
+  assert.match(browser.description, /put url, tab_id, ref, selector, text.*inside arguments/);
+});
+
+test("browser prepares only its exact redundant tool discriminator before strict validation", () => {
+  const tools = createTools({
+    runId: "run",
+    request: {} as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const browser = tools.find((tool) => tool.name === "browser");
+  assert.ok(browser?.prepareArguments);
+
+  const redundant = {
+    tool: "browser",
+    action: "navigate",
+    arguments: { url: "https://example.com/" },
+  };
+  const prepared = browser.prepareArguments(redundant);
+  assert.deepEqual(prepared, {
+    action: "navigate",
+    arguments: { url: "https://example.com/" },
+  });
+  assert.doesNotThrow(() => validateToolArguments(
+    browser,
+    { ...fauxToolCall("browser", redundant), arguments: prepared },
+  ));
+
+  const mismatched = { ...redundant, tool: "web" };
+  assert.equal(browser.prepareArguments(mismatched), mismatched);
+  const preparedMismatch = browser.prepareArguments(mismatched);
+  assert.throws(
+    () => validateToolArguments(
+      browser,
+      { ...fauxToolCall("browser", mismatched), arguments: preparedMismatch as Record<string, unknown> },
+    ),
+    /root: must not have additional properties/,
+  );
+
+  const injectedIdentity = { ...redundant, user_id: "other-user" };
+  const preparedIdentity = browser.prepareArguments(injectedIdentity);
+  assert.deepEqual(preparedIdentity, {
+    action: "navigate",
+    arguments: { url: "https://example.com/" },
+    user_id: "other-user",
+  });
+  assert.throws(
+    () => validateToolArguments(
+      browser,
+      { ...fauxToolCall("browser", injectedIdentity), arguments: preparedIdentity },
+    ),
+    /root: must not have additional properties/,
+  );
 });
 
 test("schedule schema strictly describes every supported action", () => {

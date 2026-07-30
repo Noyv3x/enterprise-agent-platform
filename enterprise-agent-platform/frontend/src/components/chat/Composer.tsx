@@ -16,6 +16,7 @@
 import { useCallback, useRef, type ChangeEvent } from "react";
 import { useI18n } from "../../i18n";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES } from "../../lib/constants";
+import { relinquishBrowserControlFor } from "../../lib/browserControl";
 import { useAutoGrow } from "../../hooks/useAutoGrow";
 import { useMention } from "../../hooks/useMention";
 import { useToast } from "../../hooks/useToast";
@@ -147,6 +148,7 @@ export function Composer({
     const content = (store.getState().drafts[draftKey] || textareaRef.current?.value || "").trim();
     const files = store.getState().draftFiles[draftKey] || EMPTY_FILES;
     if ((!content && !files.length) || disabled) return;
+    const browserHandoff = relinquishBrowserControlFor({ scope_type: mode, scope_id: scopeId });
     // Clear, focus + snap to bottom, and tell the server we stopped typing. These
     // sync dispatches batch with the optimistic insert inside sendMessage.
     setDraft("");
@@ -158,6 +160,7 @@ export function Composer({
     onBumpFocus();
     onBumpForceBottom();
     notify(false);
+    await browserHandoff;
     const sent = await sendMessage(store, mode, scopeId, content, files);
     if (sent === false) {
       preserveFailedSend(store, draftKey, content, files);

@@ -46,6 +46,8 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 `target=host` 必须由模型在当前 terminal、文件或进程调用中显式选择，并逐次弹出用户审批；只允许 `once` 或 `deny`，不形成 session/always 授权。未批准、超时或通知失败时不得先调用 Manager。批准后管理器在执行前持久化并向聊天发送审计事件；terminal 展示完整实际命令参数、canonical cwd、前后台方式和有效超时，文件与进程工具展示 canonical 目标及完整操作参数。执行后记录结果与副作用。日志可脱敏 secret，但不能隐去影响语义的普通参数。浏览器、Skill、计划等独立业务审批不因命令策略变化而自动取消。邮件发送、回复、移动、标记和保存附件同样逐次审批，审批记录隐藏正文与凭据；邮件唤醒的 unattended Run 无条件拒绝这些动作。
 
+工具审计序列化不得复用于模型历史。模型可见的 tool call 必须保留活动 schema 的原始结构，脱敏占位符仍须符合字段约束；只有工具名精确匹配且仅含既知字段的历史展示 envelope 可以在内存中收敛。工具名不匹配、调用者身份字段或其它未知字段一律失败关闭，不能以兼容为由删除后继续执行。
+
 命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开执行器前脱敏。统一脱敏器覆盖常见客户端的紧凑、等号和分离参数形式；无法安全解析嵌套 shell 求值中的 secret 时直接拒绝。原始 secret 只留在当前执行闭包，不能进入事件 journal、session、预览或错误文本。
 
 终端预览和 `process.list/read/stop` 快照复用同一脱敏器后再裁剪。取消和 scope cleanup 尽力终止前台进程；Sandbox 后台进程可跨 Run 保留，但必须有登记、输出上限和管理员可见状态。Sandbox 停止会终止其容器进程，持久挂载数据保留。
@@ -104,7 +106,7 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 浏览器接管与局域网
 
-浏览器人工接管使用当前 scope/tab 的短期租约。服务端从登录身份重新派生 scope 与 Camoufox user identity，客户端不能提供 user id、selector、脚本或任意内部 URL；只接受限幅后的鼠标、滚动、文本和按键动作。同一 root scope 的租约取得/释放、人工输入与 Agent 变更型动作共享串行操作门，互斥范围覆盖真实 Camoufox 调用，不能留下“Agent 已检查无租约、人工随后取得租约、两者同时修改页面”的窗口。租约期间 Agent 的变更型浏览器工具返回可重试冲突；结束、失焦、页面隐藏、过期、tab 变化、409 冲突或 tab 关闭后客户端立即降为只读并尽力释放，服务端到期与 scope cleanup 负责最终回收。共享 X display 不能直接暴露为 noVNC/VNC，因为那会跨 scope 泄露页面。
+浏览器人工接管使用当前 scope/tab 的短期租约。服务端从登录身份重新派生 scope 与 Camoufox user identity，客户端不能提供 user id、selector、脚本或任意内部 URL；只接受限幅后的鼠标、滚动、文本和按键动作。同一 root scope 的租约取得/释放、人工输入与 Agent 变更型动作共享串行操作门，互斥范围覆盖真实 Camoufox 调用，不能留下“Agent 已检查无租约、人工随后取得租约、两者同时修改页面”的窗口。租约期间 Agent 的变更型浏览器工具返回可重试冲突。发送会触发 Agent 的新消息时，前端先等待本地接管队列收敛，Platform 再在同一操作门内、入队前只撤销发送者本人持有的对应 root scope 租约；不能撤销其他用户租约，也不能让不触发 Agent 的普通频道消息取得该能力。结束、失焦、页面隐藏、过期、tab 变化、409 冲突或 tab 关闭后客户端立即降为只读并尽力释放，服务端到期与 scope cleanup 负责最终回收。共享 X display 不能直接暴露为 noVNC/VNC，因为那会跨 scope 泄露页面。
 
 局域网入口默认关闭，只能绑定明确的私网或回环 IP，拒绝通配和公网 IP。启用时 Manager 以真实 `RemoteAddr` 和显式 CIDR 判断准入，丢弃非可信来源携带的 `Forwarded`/`X-Forwarded-*` 并自行重建；不能用客户端头判断来源。推荐局域网 DNS/TLS 反代到 Manager 回环入口，以维持 Secure Cookie、Web Notification 和统一 Origin/CSRF 语义。若管理员明确启用明文局域网入口，界面必须显示风险且浏览器不声称支持需要 secure context 的通知能力。
 

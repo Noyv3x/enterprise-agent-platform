@@ -8,6 +8,11 @@ import {
 } from "../../data/previewActions";
 import { intlLocale, useI18n } from "../../i18n";
 import { isApiError } from "../../lib/api";
+import {
+  BROWSER_CONTROL_RELINQUISH_EVENT,
+  browserControlRelinquishScope,
+  waitForBrowserControlRelinquish,
+} from "../../lib/browserControl";
 import type { AgentPreviewScope } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
@@ -69,6 +74,14 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
     const next = controlQueueRef.current.catch(() => undefined).then(operation);
     controlQueueRef.current = next.then(() => undefined, () => undefined);
     return next;
+  }, []);
+
+  const waitForControlIdle = useCallback(async () => {
+    for (;;) {
+      const pending = controlQueueRef.current;
+      await pending.catch(() => undefined);
+      if (pending === controlQueueRef.current) return;
+    }
   }, []);
 
   const queueBestEffortRelease = useCallback((active: ActiveBrowserLease) => {
@@ -216,6 +229,22 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [relinquishLease]);
+
+  useEffect(() => {
+    const onMessageSubmit = (event: Event) => {
+      const requestedScope = browserControlRelinquishScope(event);
+      if (
+        requestedScope
+        && `${requestedScope.scope_type}:${requestedScope.scope_id}` === scopeKey
+      ) {
+        controlLifecycleRef.current += 1;
+        relinquishLease();
+        waitForBrowserControlRelinquish(event, waitForControlIdle());
+      }
+    };
+    window.addEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, onMessageSubmit);
+    return () => window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, onMessageSubmit);
+  }, [relinquishLease, scopeKey, waitForControlIdle]);
 
   const beginControl = async () => {
     const requestedTab = state.tabId;

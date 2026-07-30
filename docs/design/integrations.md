@@ -42,7 +42,9 @@ Firecrawl API key 作为 Platform secret 注入调用方，不写入 Compose 文
 
 支持 tab、导航、snapshot、截图/vision、链接、图片、下载列表、结构化提取和常见交互；console 不执行任意 JavaScript。预览只读取已有 tab 的低频 viewport 帧，打开预览不能启动浏览器、创建 tab、导航或改变当前 tab。
 
-用户可以对当前已授权 tab 取得短期人工接管租约，用限幅坐标鼠标、滚动、文本与按键协助处理验证码或卡住的页面。Platform 每次操作都重新校验登录用户、scope family、tab 与租约，不接受客户端指定的 Camoufox user id、selector、脚本或任意导航 URL。同一 root scope 的人工取得/释放、人工输入与 Agent 变更型动作必须经过同一串行操作门，锁覆盖实际 Camoufox 调用及调用后的状态提交；因此 Agent 不能在“确认无租约”之后与正在取得租约或执行中的人工输入交叠。租约期间 Agent 的变更型浏览器动作返回可重试冲突；只读截图仍可继续。人工输入还按租约绑定的 tab 与单调序列串行，不能因并发 HTTP 请求乱序。结束、失焦、页面隐藏、到期、tab 变化、服务端租约冲突、tab 关闭或 scope cleanup 都立即把界面降为只读，并尽力释放原租约。共享 Xvfb 不直接暴露为远程桌面。
+用户可以对当前已授权 tab 取得短期人工接管租约，用限幅坐标鼠标、滚动、文本与按键协助处理验证码或卡住的页面。Platform 每次操作都重新校验登录用户、scope family、tab 与租约，不接受客户端指定的 Camoufox user id、selector、脚本或任意导航 URL。同一 root scope 的人工取得/释放、人工输入与 Agent 变更型动作必须经过同一串行操作门，锁覆盖实际 Camoufox 调用及调用后的状态提交；因此 Agent 不能在“确认无租约”之后与正在取得租约或执行中的人工输入交叠。租约期间 Agent 的变更型浏览器动作返回可重试冲突；只读截图仍可继续。人工输入还按租约绑定的 tab 与单调序列串行，不能因并发 HTTP 请求乱序。
+
+同一界面提交新消息时，前端立即把该 scope 的本地接管状态降为只读，并等待已经在途的 acquire/input 及其对应 release 收敛后再发送消息；凡该消息将触发 Agent，Platform 还必须在任务入队前、同一浏览器操作门内撤销发送者本人持有的该 root scope 租约。不同用户持有的租约不能被消息发送者夺取，未触发 Agent 的普通频道消息也不能由服务端隐式撤销他人的协助。这样“人工处理后让 Agent 再试”不依赖 90 秒自然过期，也不会让异步前端释放与 Agent 导航形成竞态。明确结束、失焦、页面隐藏、到期、tab 变化、服务端租约冲突、tab 关闭或 scope cleanup 同样立即把界面降为只读，并尽力释放原租约。共享 Xvfb 不直接暴露为远程桌面。
 
 ## Cognee
 

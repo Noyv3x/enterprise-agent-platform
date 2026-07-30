@@ -511,6 +511,9 @@ test("SessionStore redacts assistant tool-call payloads in journals and archives
     assert.doesNotMatch(journal, new RegExp(typedText));
     assert.match(journal, /\[redacted\]/);
     assert.match(journal, /input omitted/);
+    assert.doesNotMatch(journal, /"tool":"(?:process|browser)"/);
+    assert.match(journal, /"name":"process","arguments":\{"action":"write","process_id":"shell","input":/);
+    assert.match(journal, /"name":"browser","arguments":\{"action":"type","arguments":\{/);
     assert.match(
       JSON.stringify(terminalMessage),
       new RegExp(token),

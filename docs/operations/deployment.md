@@ -18,6 +18,8 @@
 - `searxng` 与 Firecrawl 受管服务；
 - `agent-sandbox`：按主 Agent 动态创建，不属于固定 Compose 数量。
 
+Platform、Agent Runtime 与 Camoufox 必须以同一发布 generation 实现浏览器接管交还协议：会触发 Agent 的消息在入队前由 Platform 撤销发送者本人持有的同 scope 租约，Runtime 随后才能执行浏览器变更动作。该交还是正常服务协议，不依赖旧 generation 兼容层，也不能靠租约自然过期完成。
+
 固定服务的持久路径必须由 Compose 显式绑定到 Manager 数据根，不能接受镜像 `VOLUME` 自动创建的匿名卷。SearXNG 必须把受管 `config/` 目录整体只读绑定到 `/etc/searxng`，而不是只覆盖其中的 `settings.yml`；候选 generation 的真实容器探针必须确认 `/etc/searxng` 是该宿主目录的只读 bind，且没有额外 volume mount。
 
 ## 宿主要求与安装位置

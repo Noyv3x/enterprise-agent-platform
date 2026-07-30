@@ -1,7 +1,8 @@
 import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { redactCommandForApproval, redactToolArgumentsForJournal } from "./approval-policy.js";
+import { redactCommandForApproval } from "./approval-policy.js";
+import { redactToolArgumentsForModelHistory } from "./model-history.js";
 import type { JsonValue, SessionEntry } from "./types.js";
 import { id, nowIso, scopeOwns, stableHash } from "./utils.js";
 
@@ -602,7 +603,7 @@ function durableSessionMessage(message: AgentMessage): AgentMessage {
       content: message.content.map((block) => block.type === "toolCall"
         ? {
             ...block,
-            arguments: redactToolArgumentsForJournal(
+            arguments: redactToolArgumentsForModelHistory(
               block.name,
               objectValue(block.arguments),
             ),

@@ -21,6 +21,7 @@ import { ApprovalBroker } from "./approval-broker.js";
 import { redactCommandForApproval, redactToolArgumentsForJournal } from "./approval-policy.js";
 import { CONTAINER_PATHS, EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import { EventJournal } from "./event-journal.js";
+import { redactToolArgumentsForModelHistory } from "./model-history.js";
 import {
   createExecutionManager,
   executionContext,
@@ -1905,7 +1906,7 @@ function sessionContentText(value: unknown, workspace?: string): string {
       const name = typeof item.name === "string" ? item.name : "unknown";
       const arguments_ = item.arguments === undefined
         ? ""
-        : JSON.stringify(redactToolArgumentsForJournal(
+        : JSON.stringify(redactToolArgumentsForModelHistory(
           name,
           recordValue(item.arguments),
           workspace,
@@ -2682,7 +2683,6 @@ export function prepareSessionHistoryForModel(
   workspace?: string,
 ): TrackedSessionMessage[] {
   return entries.map((entry) => {
-    if (entry.model_content_security_version === CURRENT_MODEL_CONTENT_SECURITY_VERSION) return entry;
     if (entry.message.role === "assistant") {
       return {
         ...entry,
@@ -2691,7 +2691,7 @@ export function prepareSessionHistoryForModel(
           content: entry.message.content.map((block) => block.type === "toolCall"
             ? {
                 ...block,
-                arguments: redactToolArgumentsForJournal(
+                arguments: redactToolArgumentsForModelHistory(
                   block.name,
                   recordValue(block.arguments),
                   workspace,
@@ -2702,6 +2702,7 @@ export function prepareSessionHistoryForModel(
         model_content_security_version: CURRENT_MODEL_CONTENT_SECURITY_VERSION,
       };
     }
+    if (entry.model_content_security_version === CURRENT_MODEL_CONTENT_SECURITY_VERSION) return entry;
     if (entry.message.role !== "toolResult") return entry;
     const source = UNMARKED_UNTRUSTED_TOOL_RESULT_SOURCES[entry.message.toolName];
     if (!source) return entry;
@@ -3024,7 +3025,7 @@ export function durableRunResultMessages(
         content: message.content.map((block) => block.type === "toolCall"
           ? {
               ...block,
-              arguments: redactToolArgumentsForJournal(
+              arguments: redactToolArgumentsForModelHistory(
                 block.name,
                 recordValue(block.arguments),
                 workspace,

@@ -15,7 +15,7 @@ import {
   RunValidationError,
   sanitizeToolResultForJournal,
 } from "../src/run-coordinator.js";
-import { CURRENT_MODEL_CONTENT_SECURITY_VERSION } from "../src/session-store.js";
+import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
@@ -182,6 +182,78 @@ test("unmarked imported assistant tool-call arguments are redacted in the model 
     prepared?.model_content_security_version,
     CURRENT_MODEL_CONTENT_SECURITY_VERSION,
   );
+});
+
+test("current model history canonicalizes legacy display envelopes without rewriting JSONL", async () => {
+  const home = await temporaryDirectory("agent-current-model-history-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "session" };
+    await store.initializeTracked(identity);
+    await store.appendMessage(
+      identity,
+      fauxAssistantMessage(fauxToolCall("browser", {
+        action: "type",
+        arguments: { tab_id: "tab", ref: "e1", text: "[input omitted: 17 UTF-8 bytes]" },
+      }), { stopReason: "toolUse" }),
+      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+    );
+    await store.appendMessage(
+      identity,
+      fauxAssistantMessage(fauxToolCall("process", {
+        action: "write",
+        process_id: "shell",
+        input: "printf [redacted]",
+      }), { stopReason: "toolUse" }),
+      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+    );
+
+    const path = store.path(identity);
+    const lines = (await readFile(path, "utf8")).trimEnd().split("\n");
+    for (let index = 1; index < lines.length; index += 1) {
+      const entry = JSON.parse(lines[index] ?? "{}") as Record<string, unknown>;
+      const payload = entry.payload as { role?: string; content?: Array<Record<string, unknown>> } | undefined;
+      const call = payload?.role === "assistant"
+        ? payload.content?.find((block) => block.type === "toolCall")
+        : undefined;
+      if (!call || typeof call.name !== "string") continue;
+      const args = call.arguments as Record<string, unknown>;
+      if (call.name === "process") {
+        const { action, ...arguments_ } = args;
+        call.arguments = { tool: "process", action, arguments: arguments_ };
+      } else if (call.name === "browser") {
+        call.arguments = { tool: "browser", ...args };
+      }
+      lines[index] = JSON.stringify(entry);
+    }
+    await writeFile(path, `${lines.join("\n")}\n`);
+    const before = await readFile(path, "utf8");
+
+    const prepared = prepareSessionHistoryForModel(await store.initializeTracked(identity));
+    const browser = prepared[0]?.message;
+    const process = prepared[1]?.message;
+    assert.equal(browser?.role, "assistant");
+    assert.equal(process?.role, "assistant");
+    if (browser?.role !== "assistant" || process?.role !== "assistant") assert.fail("expected assistant history");
+    const browserArguments = browser.content.find((block) => block.type === "toolCall")?.arguments;
+    const processArguments = process.content.find((block) => block.type === "toolCall")?.arguments;
+    assert.deepEqual(browserArguments, {
+      action: "type",
+      arguments: { tab_id: "tab", ref: "e1", text: "[input omitted: 17 UTF-8 bytes]" },
+    });
+    assert.deepEqual(processArguments, {
+      action: "write",
+      process_id: "shell",
+      input: "printf [redacted]",
+    });
+    assert.equal(
+      await readFile(path, "utf8"),
+      before,
+      "model-facing canonicalization must not rewrite durable JSONL",
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("available skill policy validates, escapes, and bounds metadata without injecting instructions", () => {
@@ -1981,7 +2053,7 @@ test("session read and search redact unmarked imported assistant credentials", a
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("session", { action: "search", arguments: { query: "tool call terminal" } }),
+      fauxToolCall("session", { action: "search", arguments: { query: "tool call" } }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage(
@@ -1996,10 +2068,20 @@ test("session read and search redact unmarked imported assistant credentials", a
     return faux.provider.streamSimple(model, context, options);
   };
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn });
-  coordinator.sessions.loadSearchable = async () => [fauxAssistantMessage(
-    fauxToolCall("terminal", { command: `API_TOKEN=${secret} printf ok` }),
-    { stopReason: "toolUse" },
-  )];
+  coordinator.sessions.loadSearchable = async () => [
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: `API_TOKEN=${secret} printf ok` }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("browser", {
+        tool: "browser",
+        action: "navigate",
+        arguments: { url: "https://example.com/" },
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ];
   try {
     const run = coordinator.createRun({
       scope_key: "private:1/delegate/child",
@@ -2015,6 +2097,15 @@ test("session read and search redact unmarked imported assistant credentials", a
     assert.doesNotMatch(returnedHistory, new RegExp(secret));
     assert.match(returnedHistory, /\[redacted\]/);
     assert.match(returnedHistory, /source=\\?"session/);
+    const sessionResultText = contexts.flatMap((messages) => messages)
+      .flatMap((message) => message.role === "toolResult" && message.toolName === "session"
+        ? message.content
+        : [])
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    assert.match(sessionResultText, /\[tool call browser\].*\\"action\\":\\"navigate\\"/);
+    assert.doesNotMatch(sessionResultText, /\\"tool\\":\\"browser\\"/);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -2115,6 +2206,16 @@ test("retained run messages redact tool calls and command details without mutati
   assert.doesNotMatch(serialized, /Bearer hidden/);
   assert.match(serialized, /\[redacted\]/);
   assert.match(serialized, /input omitted/);
+  const durableBrowser = durable[1];
+  assert.equal(durableBrowser?.role, "assistant");
+  if (durableBrowser?.role !== "assistant") assert.fail("expected browser assistant message");
+  assert.deepEqual(
+    durableBrowser.content.find((block) => block.type === "toolCall")?.arguments,
+    {
+      action: "type",
+      arguments: { tab_id: "tab", ref: "e1", text: "[input omitted: 18 UTF-8 bytes]" },
+    },
+  );
   assert.match(JSON.stringify([assistant, browser, result]), new RegExp(token));
   assert.match(JSON.stringify(browser), new RegExp(typed));
 });

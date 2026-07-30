@@ -126,6 +126,267 @@ class BrowserPreviewServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_private_agent_message_releases_senders_lease_before_enqueue(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                with mock.patch.object(
+                    service,
+                    "_resolve_browser_control_tab",
+                    return_value=resolved,
+                ):
+                    service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+
+                observed: dict[str, object] = {}
+
+                def enqueue(_task):
+                    observed["leases"] = dict(service._browser_control_leases)
+                    observed["agent_result"] = service._agent_browser_tool(
+                        scope.scope_key,
+                        "click",
+                        {"tab_id": "tab-1", "ref": "e1"},
+                    )
+                    return {
+                        "agent_status": {"state": "queued"},
+                        "processing_mode": "queued",
+                        "input_group_id": "group-1",
+                    }
+
+                with (
+                    mock.patch.object(service, "_enqueue_agent_reply", side_effect=enqueue),
+                    mock.patch.object(
+                        service,
+                        "_agent_browser_tool_call",
+                        return_value={"ok": True},
+                    ) as agent_call,
+                ):
+                    service.send_private_message(actor, "再试试")
+
+                self.assertEqual(observed["leases"], {})
+                self.assertEqual(observed["agent_result"], {"ok": True})
+                agent_call.assert_called_once()
+            finally:
+                service.close()
+
+    def test_message_handoff_keeps_the_browser_gate_through_enqueue(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            contender: threading.Thread | None = None
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                contender_started = threading.Event()
+                contender_finished = threading.Event()
+
+                def reacquire():
+                    contender_started.set()
+                    service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    contender_finished.set()
+
+                def enqueue(_task):
+                    nonlocal contender
+                    self.assertEqual(service._browser_control_leases, {})
+                    contender = threading.Thread(target=reacquire)
+                    contender.start()
+                    self.assertTrue(contender_started.wait(timeout=1))
+                    self.assertFalse(
+                        contender_finished.wait(timeout=0.05),
+                        "a competing acquire crossed the handoff before enqueue completed",
+                    )
+                    return {
+                        "agent_status": {"state": "queued"},
+                        "processing_mode": "queued",
+                        "input_group_id": "group-1",
+                    }
+
+                with (
+                    mock.patch.object(
+                        service,
+                        "_resolve_browser_control_tab",
+                        return_value=resolved,
+                    ),
+                    mock.patch.object(service, "_enqueue_agent_reply", side_effect=enqueue),
+                ):
+                    service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    service.send_private_message(actor, "再试试")
+                    self.assertTrue(contender_finished.wait(timeout=1))
+            finally:
+                if contender is not None:
+                    contender.join(timeout=1)
+                service.close()
+
+    def test_message_handoff_never_releases_another_users_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="browser-helper",
+                    password="member-pass",
+                    display_name="Browser Helper",
+                    role="member",
+                    actor=admin,
+                )
+                scope = service.agent_scopes.ensure_channel_scope(1)
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                with mock.patch.object(
+                    service,
+                    "_resolve_browser_control_tab",
+                    return_value=resolved,
+                ):
+                    service.browser_preview_control(
+                        admin,
+                        {
+                            "command": "acquire",
+                            "scope_type": "channel",
+                            "scope_id": "1",
+                            "tab_id": "tab-1",
+                        },
+                    )
+
+                with mock.patch.object(
+                    service,
+                    "_enqueue_agent_reply",
+                    return_value={"agent_status": {"state": "queued"}},
+                ):
+                    service._enqueue_after_browser_assistance_handoff(
+                        {},
+                        scope.scope_key,
+                        int(member["id"]),
+                    )
+
+                self.assertIn((scope.scope_key, "tab-1"), service._browser_control_leases)
+            finally:
+                service.close()
+
+    def test_channel_agent_message_releases_senders_lease_before_enqueue(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_channel_scope(1)
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                with mock.patch.object(
+                    service,
+                    "_resolve_browser_control_tab",
+                    return_value=resolved,
+                ):
+                    service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "channel",
+                            "scope_id": "1",
+                            "tab_id": "tab-1",
+                        },
+                    )
+
+                observed: dict[str, object] = {}
+
+                def enqueue(_task):
+                    observed["leases"] = dict(service._browser_control_leases)
+                    return {
+                        "agent_status": {"state": "queued"},
+                        "processing_mode": "queued",
+                        "input_group_id": "group-1",
+                    }
+
+                with mock.patch.object(
+                    service,
+                    "_enqueue_agent_reply",
+                    side_effect=enqueue,
+                ):
+                    service.send_channel_message(actor, 1, "@agent 再试试")
+
+                self.assertEqual(observed["leases"], {})
+            finally:
+                service.close()
+
+    def test_normal_channel_message_keeps_the_senders_assistance_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_channel_scope(1)
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                with mock.patch.object(
+                    service,
+                    "_resolve_browser_control_tab",
+                    return_value=resolved,
+                ):
+                    service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "channel",
+                            "scope_id": "1",
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    service.send_channel_message(actor, 1, "普通频道消息")
+
+                self.assertIn((scope.scope_key, "tab-1"), service._browser_control_leases)
+            finally:
+                service.close()
+
     def test_agent_mutation_and_human_acquire_share_the_real_operation_gate(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))

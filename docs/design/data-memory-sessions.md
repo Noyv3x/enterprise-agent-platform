@@ -32,6 +32,8 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 产品消息用于界面、审计、Telegram 投递、跨会话搜索和回复关联。Runtime 会话用于模型上下文、工具调用配对和压缩恢复。两者用 source message、Run、scope、lifecycle 和 session 元数据关联，但任何一方都不能通过模糊文本推断另一方身份。
 
+持久 Runtime 会话中的 assistant tool call 是下一轮模型会直接看到的协议样例，因此其参数必须始终保持当前工具 schema 的规范形状。敏感正文只可在 schema 允许的位置替换为有界且符合字段约束的占位符；受正则、枚举或路径规则约束的标识符不能使用破坏约束的通用展示占位符。允许任意 JSON 的字段还必须限制投影深度、条目数、节点数和单字符串字节数。审计专用的 `tool` 名称、展示 envelope、拒绝原因或其它 schema 外字段不得写回模型历史。工具活动 journal 可以使用独立的展示对象，不能与模型历史共用同一个序列化函数。读取既有会话时，Runtime 在不改写 JSONL 的前提下把历史展示 envelope 归一为规范参数后再交给模型；未知字段和身份字段仍失败关闭，不能借归一化扩大工具权限。
+
 管理审计中的单条删除、按时间删除和清空对话都是产品消息的逻辑隐藏：它们不轮换 lifecycle/session，不清理 Runtime 上下文、memory 或 workspace，也不取消已经运行的回复。用户后续继续对话时，Runtime 仍可使用原会话历史。真正重置 Agent 上下文必须走显式的 lifecycle/session rotation 与 scope cleanup，不能从消息行是否可见来推断。
 
 当前这些管理接口不执行物理消息清除。未来若增加不可恢复的 purge，必须把消息、附件、活动任务和 Agent scope 作为一个版本化操作共同设计，不能复用“隐藏”语义。
