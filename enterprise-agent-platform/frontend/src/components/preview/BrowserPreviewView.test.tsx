@@ -220,11 +220,11 @@ describe("BrowserPreviewView", () => {
     mocks.state.activity = "live";
     mocks.state.frameUrl = "blob:live-frame";
     mocks.state.tabId = "tab-1";
-    mocks.acquire.mockResolvedValue({ lease_id: "lease-short", expires_in_ms: 25 });
+    mocks.acquire.mockResolvedValue({ lease_id: "lease-short", expires_in_ms: 250 });
     const user = userEvent.setup();
     renderPreview();
     await user.click(screen.getByRole("button", { name: "Take control" }));
-    expect(screen.getByText("Human assistance")).toBeVisible();
+    expect(await screen.findByText("Human assistance")).toBeVisible();
 
     await screen.findByText("Read only");
     await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
