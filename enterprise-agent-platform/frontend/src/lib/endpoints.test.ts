@@ -69,16 +69,4 @@ describe("private Agent memory endpoints", () => {
     );
     expect(endpoints.exportPrivateAgentMemories.path()).toBe("/api/private-agent/memories/export");
   });
-
-  it("uses explicit approve and reject resources for pending candidates", () => {
-    expect(endpoints.privateAgentMemoryCandidates.path("pending", 100)).toBe(
-      "/api/private-agent/memory-candidates?status=pending&limit=100",
-    );
-    expect(endpoints.approvePrivateAgentMemoryCandidate.path(7)).toBe(
-      "/api/private-agent/memory-candidates/7/approve",
-    );
-    expect(endpoints.rejectPrivateAgentMemoryCandidate.path(7)).toBe(
-      "/api/private-agent/memory-candidates/7/reject",
-    );
-  });
 });

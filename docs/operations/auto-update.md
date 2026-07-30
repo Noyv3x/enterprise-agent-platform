@@ -19,11 +19,13 @@ Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Com
 镜像就绪后公开状态进入 `waiting_for_tasks`。Platform 继续服务，直到没有以下活动：
 
 - Agent Run 以及 queued/running durable job；
-- 消息、知识、计划任务、Telegram 或其它副作用 worker 的准入窗口；
+- 已完成网络接收、正在把消息/附件/邮件 checkpoint 等权威状态原子提交到本地的短准入窗口；
 - Manager 登记的 Sandbox 或 host 后台终端；
 - 其它不能安全跨 generation 切换的写操作。
 
 Manager 不为更新强行终止任务。任务自然结束后，排队更新自动继续。只有 Manager 本地进程登记为空闲后，它才请求 Platform 在对话锁内原子复核业务状态并建立 reservation。候选校验、下载和任务等待期间不持有固定容器切换锁；只要 `maintenance=false`，current generation 的能力后台仍可修复。Manager 取得 reservation 后才与能力收敛互斥并进入固定栈切换边界。
+
+网络接收或只读外部探测不能无限占有 Platform 写准入。持续前进的附件上传没有普通墙钟总时限，但 multipart 只写非权威 staging；完整请求读完后才竞争短提交准入。若更新先取得 reservation，上传连接可以随旧 Platform 停止，staging 在请求清理或下次启动时删除，客户端明确重试。后台 IMAP 轮询同样在准入外读取；每个 checkpoint、消息/任务事务和错误状态落库前重新竞争短准入，更新已经预约时放弃本轮并由新 generation 从旧 checkpoint 重试。交互式邮件调用属于正在运行的 Agent Run，仍由任务本身自然阻塞更新；不能再用一个额外、不可收敛的网络 admission 重复阻塞。任何可能产生本地写入的网络结果都不得在 reservation 后补写。
 
 ## 原子准入与维护
 
@@ -56,9 +58,25 @@ operation 为 `install`、`update`、`restart`、`rollback` 或 `repair`；phase
 8. 明确释放 reservation，恢复公网入口和后台 worker；
 9. 各 Sandbox 空闲时独立刷新其基础镜像。
 
+提交前必须在 reservation 仍生效时再次探测 Manager 控制面、Platform、Runtime 与公网入口，确认运行中的核心容器与目标 digest 完全一致；不能只复用较早的 readiness 结果。能力服务继续按独立 degraded 语义收敛。
+
 Platform 与 Agent Runtime 属于 generation 的核心 readiness；Manager 自身还必须持续持有公网入口和 owner-only 控制接口。Camoufox、SearXNG、Firecrawl 与 Cognee 是能力级服务：核心 generation 提交后由后台收敛器逐项拉取和启动，它们未收敛时只降级浏览器、搜索、网页提取或知识能力，不能回滚已经健康的核心 generation、阻止 finalize、让整个平台进入长期维护，或终止 Manager。Agent Sandbox 镜像在对应 Sandbox 首次创建时执行相同的本地 digest 检查和有界按需拉取。release 若因不可分割的数据迁移确实依赖某项能力服务，必须在发布契约中显式声明本次临时门禁，并提供不依赖该服务自身健康的恢复路径，部署机不能临时猜测。
 
 Firecrawl 显式使用 `NUQ_BACKEND=pg` 的 PostgreSQL 队列基线。后台收敛检查 Playwright、Redis、RabbitMQ、Postgres 与 API，并把结果投影为独立服务状态；FoundationDB 及其初始化任务不属于当前发布、运行或健康目录。收敛使用有界等待和指数退避，失败只把网页提取标记为 degraded。只要 Manager、Platform 与 Runtime 正常且未进入维护，Firecrawl 修复可与候选校验、核心镜像预拉取和任务等待并行，不能占用全局维护门。
+
+## 自维护与空间回收
+
+Manager 在启动、更新成功后和低频定时器中运行同一幂等维护循环。只有 `idle + maintenance=false`、没有 activation/active/finalize operation 且 Sandbox/host 执行登记稳定时才允许删除；仅由更新检查产生、尚未进入 operation 的候选可以存在，但必须进入保护集合。清理准入与 operation 创建、候选发布及按需 Sandbox 注册共用短临界区，不能在读取空闲状态后与新执行交错。每轮先计算保护集合：current、previous、候选、自更新 activation、未终结 operation、回滚快照、正在运行或已登记 Sandbox，以及全部现有容器引用的镜像和挂载。
+
+清理对象必须同时具备可验证的 Manager provenance 和零消费者。数据库 generation 快照使用 `migration_backup_retention_seconds` 的七天恢复窗口；不可达 release、对应受管 digest 镜像、旧 Manager binary 与可证明来源的 staging/download 临时工件使用独立的 `obsolete_artifact_retention_seconds` 一小时宽限，避免高频发布把镜像积累到磁盘耗尽。终态 recovery journal 与 activation plan 属于审计证据，不作为普通临时文件泛化删除。每个对象独立、非 force 删除并记录有界结果；未知文件、未知 label、符号链接、路径越界、仍被引用或状态读取失败都跳过。禁止 `docker system/image/volume prune`、按仓库名通配删除、递归清空 backups/data 或处理其它项目的 Docker 资源。
+
+更新 preflight 在下载前检查数据根与 Docker root 所在文件系统的普通进程可用字节和普通用户可用 inode。Manager 先按精确 digest 检查本机，仅为缺失的 Platform/Runtime 镜像累计 [`container-platform.json`](../contracts/container-platform.json) 中的压缩层上限与展开后上限，再加下载安全余量。切换前的字节门槛不是一个孤立常数：Manager 对每个当前受管快照源取逻辑文件大小和已分配块大小中的较大者并安全求和，再加契约中的 `update_pre_cutover_min_free_bytes` 固定安全余量；文件类型、大小计数或整数边界不可证明时失败关闭。发布 CI 必须对两个受支持架构逐项验证压缩层和展开后尺寸不超过这些上限，超限 release 不得发布。当前严格 manifest 协议保持原 JSON 形状，以免尚未接收本次 Manager 更新的实例因未知字段自阻断；容量估算与同一 source commit 的 canonical contract 和发布门绑定，而不是由部署机猜测。
+
+数据根与 Docker root 位于同一文件系统时只采用该文件系统所需门槛的最大值，位于不同文件系统时分别满足各自门槛；字节使用普通进程可用块，inode 使用普通用户可用 inode。第一次切换容量检查发生在建立 Platform reservation 前，容量不足时当前 generation 继续在线并先尝试一次受控维护。reservation 成功后、停止任何 writer 之前必须重新读取快照源和文件系统余量；此时不再删除工件，若余量因并发增长而不足，Manager 必须明确释放同一 reservation，再把 operation 作为可重试的切换前失败结束。无法确认 reservation 已释放时继续保持维护状态，不能冒充在线失败。
+
+首次容量检查不足时，Manager 先运行一次受控自维护：只清理超过宽限、可证明归属且没有消费者的旧工件，然后重新读取缺失 digest、快照源大小和文件系统余量；维护不能满足门槛时才把 operation 标为可重试失败。失败的镜像拉取只清理本次调用开始前不存在、能够由目标 immutable digest 证明归属且仍无容器消费者的候选镜像；Docker 全局缓存、未知 layer 和其它项目资源绝不泛化清理。成功提交后尽快再次运行维护循环，再按指数退避处理暂时仍被 Docker 引用的旧对象。两阶段均至少保留契约 inode 门槛；同一文件系统只计算一次。清理失败只报告独立 degraded 状态，不能回滚已经健康的 generation 或把业务长期锁在维护页。
+
+维护循环把准入快照与慢速检查分离：短临界区记录状态 epoch 和保护集合，目录校验、hash 与 Docker 枚举在锁外执行；每个删除边界都必须重新取得准入锁并确认 epoch、current/previous/candidate、未终结 operation、Sandbox 与容器消费者仍与计划一致。Manager binary 由更窄的 recovery lock 和其自身 state 二次校验串行化，不能与通用准入锁形成反向锁序。保护集发生变化时放弃本轮对象而不是沿用旧快照。
 
 ## 数据库迁移
 

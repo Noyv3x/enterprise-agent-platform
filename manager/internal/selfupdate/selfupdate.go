@@ -146,6 +146,10 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return err
 	}
+	candidate := Version{Version: manifest.Manager.Version, SourceCommit: manifest.SourceCommit, Path: path, SHA256: sha256Hex(data), VerifiedAt: m.now()}
+	if err := m.ensureVersionMetadata(candidate); err != nil {
+		return fmt.Errorf("record verified Manager candidate artifact: %w", err)
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(probeCtx, path, "version").CombinedOutput()
@@ -166,7 +170,7 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 		}
 		state.Current = current
 	}
-	state.Candidate = &Version{Version: manifest.Manager.Version, SourceCommit: manifest.SourceCommit, Path: path, SHA256: sha256Hex(data), VerifiedAt: m.now()}
+	state.Candidate = &candidate
 	state.Activation = nil
 	state.UpdatedAt = m.now()
 	return atomicfile.WriteJSON(m.StatePath, state, 0o600)
@@ -576,7 +580,11 @@ func (m *Manager) backupRunningVersion() (*Version, error) {
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return nil, err
 	}
-	return &Version{Version: m.RunningVersion, Path: path, SHA256: hash, VerifiedAt: m.now(), PlatformCommitted: true}, nil
+	version := &Version{Version: m.RunningVersion, Path: path, SHA256: hash, VerifiedAt: m.now(), PlatformCommitted: true}
+	if err := m.ensureVersionMetadata(*version); err != nil {
+		return nil, fmt.Errorf("record running Manager backup: %w", err)
+	}
+	return version, nil
 }
 
 func (m *Manager) installPath() (string, error) {
@@ -587,6 +595,207 @@ func (m *Manager) installPath() (string, error) {
 }
 
 func (m *Manager) State() (State, error) { return m.load() }
+
+// PruneVersions removes only expired version directories carrying metadata
+// whose path and binary hash have been revalidated. Referenced versions and
+// activation rollback binaries are always protected; unknown directories are
+// retained for diagnosis instead of being guessed to be temporary.
+func (m *Manager) PruneVersions(ctx context.Context, now time.Time, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		retention = 7 * 24 * time.Hour
+	}
+	releaseRecoveryLock, err := acquireRecoveryLock(m.Root)
+	if err != nil {
+		return 0, fmt.Errorf("coordinate Manager binary cleanup with recovery: %w", err)
+	}
+	defer releaseRecoveryLock()
+	state, err := m.load()
+	if err != nil {
+		return 0, err
+	}
+	protected := map[string]struct{}{}
+	for _, item := range []*Version{state.Current, state.Previous, state.Candidate} {
+		if item == nil || item.Path == "" {
+			continue
+		}
+		path, pathErr := filepath.Abs(filepath.Clean(item.Path))
+		if pathErr != nil {
+			return 0, pathErr
+		}
+		protected[path] = struct{}{}
+		if err := m.ensureVersionMetadata(*item); err != nil {
+			return 0, err
+		}
+	}
+	if state.Activation != nil {
+		candidatePath, pathErr := filepath.Abs(filepath.Clean(state.Activation.CandidatePath))
+		if pathErr != nil {
+			return 0, pathErr
+		}
+		protected[candidatePath] = struct{}{}
+		var plan Plan
+		if err := atomicfile.ReadJSON(state.Activation.PlanPath, &plan); err != nil {
+			return 0, fmt.Errorf("read active Manager activation during cleanup: %w", err)
+		}
+		if plan.PreviousPath != "" {
+			previousPath, previousErr := filepath.Abs(filepath.Clean(plan.PreviousPath))
+			if previousErr != nil {
+				return 0, previousErr
+			}
+			protected[previousPath] = struct{}{}
+		}
+	}
+	root, err := filepath.Abs(filepath.Join(m.Root, "versions"))
+	if err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return removed, ctx.Err()
+		default:
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || safeID(entry.Name()) != entry.Name() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		binary := filepath.Join(dir, "ubitech-manager")
+		if _, keep := protected[binary]; keep {
+			continue
+		}
+		var metadata Version
+		if err := atomicfile.ReadJSON(filepath.Join(dir, "metadata.json"), &metadata); err != nil {
+			continue
+		}
+		if !validVersionDirectoryIdentity(entry.Name(), metadata) || !filepath.IsAbs(metadata.Path) || filepath.Clean(metadata.Path) != binary || metadata.VerifiedAt.IsZero() || now.Sub(metadata.VerifiedAt) <= retention {
+			continue
+		}
+		if err := validateVersionDirectoryContents(dir); err != nil {
+			continue
+		}
+		digest, err := fileSHA256(binary)
+		if err != nil || digest != metadata.SHA256 || !validSHA256(metadata.SHA256) {
+			continue
+		}
+		// Repeat the exact-content and checksum checks immediately before the
+		// recursive removal. Unknown evidence appearing during maintenance is a
+		// reason to retain the directory, never a reason to delete it.
+		var latest Version
+		if err := atomicfile.ReadJSON(filepath.Join(dir, "metadata.json"), &latest); err != nil || latest != metadata {
+			continue
+		}
+		if err := validateVersionDirectoryContents(dir); err != nil {
+			continue
+		}
+		if latestDigest, err := fileSHA256(binary); err != nil || latestDigest != metadata.SHA256 {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	if removed > 0 {
+		directory, err := os.Open(root)
+		if err != nil {
+			return removed, err
+		}
+		err = directory.Sync()
+		_ = directory.Close()
+		if err != nil {
+			return removed, fmt.Errorf("sync Manager version root after cleanup: %w", err)
+		}
+	}
+	return removed, nil
+}
+
+func (m *Manager) ensureVersionMetadata(version Version) error {
+	root, err := filepath.Abs(filepath.Join(m.Root, "versions"))
+	if err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("Manager version root is not a regular directory")
+	}
+	path, err := filepath.Abs(filepath.Clean(version.Path))
+	if err != nil {
+		return err
+	}
+	if filepath.Dir(filepath.Dir(path)) != root || filepath.Base(path) != "ubitech-manager" {
+		return errors.New("referenced Manager version is outside the version root")
+	}
+	dir := filepath.Dir(path)
+	dirInfo, err := os.Lstat(dir)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("referenced Manager version directory is not a regular directory")
+	}
+	if !validVersionDirectoryIdentity(filepath.Base(dir), version) || !validSHA256(version.SHA256) {
+		return errors.New("referenced Manager version identity is invalid")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("referenced Manager version is not a regular file")
+	}
+	digest, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	if digest != version.SHA256 {
+		return errors.New("referenced Manager version checksum changed")
+	}
+	version.Path = path
+	if version.VerifiedAt.IsZero() {
+		version.VerifiedAt = m.now()
+	}
+	if err := atomicfile.WriteJSON(filepath.Join(dir, "metadata.json"), version, 0o600); err != nil {
+		return err
+	}
+	return validateVersionDirectoryContents(dir)
+}
+
+func validateVersionDirectoryContents(dir string) error {
+	contents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	allowed := map[string]struct{}{"ubitech-manager": {}, "metadata.json": {}}
+	if len(contents) != len(allowed) {
+		return errors.New("Manager version directory contains unknown files")
+	}
+	for _, content := range contents {
+		if _, ok := allowed[content.Name()]; !ok {
+			return fmt.Errorf("unknown file in Manager version directory: %s", content.Name())
+		}
+		info, err := os.Lstat(filepath.Join(dir, content.Name()))
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("Manager version content %s is not a regular file", content.Name())
+		}
+	}
+	return nil
+}
+
+func validVersionDirectoryIdentity(name string, version Version) bool {
+	if !validSHA256(version.SHA256) {
+		return false
+	}
+	if name == "running-"+version.SHA256[:12] || name == "recovery-"+version.SHA256[:12] {
+		return true
+	}
+	if !validSourceCommit(version.SourceCommit) {
+		return false
+	}
+	return name == safeID(version.Version+"-"+version.SourceCommit[:12])
+}
+
 func (m *Manager) PendingActivation() (bool, error) {
 	state, err := m.load()
 	return err == nil && state.Activation != nil, err

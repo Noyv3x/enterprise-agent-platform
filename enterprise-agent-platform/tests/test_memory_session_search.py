@@ -11,9 +11,6 @@ from enterprise_agent_platform.db import encode_json, now_ts
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.memory_security import memory_content_hash
 from enterprise_agent_platform.service import (
-    MEMORY_CANDIDATE_PENDING_TTL_SECONDS,
-    MEMORY_CANDIDATE_TERMINAL_LIMIT,
-    MEMORY_CANDIDATE_TERMINAL_TTL_SECONDS,
     SESSION_SEARCH_MESSAGE_MAX_CHARACTERS,
     SESSION_SEARCH_QUERY_MAX_CHARACTERS,
     SESSION_SEARCH_RESPONSE_MAX_CHARACTERS,
@@ -189,172 +186,33 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_memory_candidate_is_private_bounded_idempotent_and_approves_once(self):
-        with tempfile.TemporaryDirectory() as td:
-            service = self._service(Path(td))
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                private = service.agent_scopes.ensure_private_scope(int(admin["id"]))
-                channel = service.agent_scopes.ensure_channel_scope("1")
-                payload = {
-                    "scope_key": private.scope_key,
-                    "owner_user_id": admin["id"],
-                    "target": "user",
-                    "content": "Prefers weekly progress reports",
-                    "source_run_id": "run-1",
-                    "source_message_id": "42",
-                }
-                proposed = service.agent_memory_propose(payload)
-                retried = service.agent_memory_propose(
-                    {**payload, "candidate_hash": "untrusted-client-value"}
-                )
-                self.assertTrue(proposed["created"])
-                self.assertFalse(retried["created"])
-                self.assertEqual(
-                    proposed["candidate"]["id"], retried["candidate"]["id"]
-                )
-
-                with self.assertRaises(ServiceError) as raised:
-                    service.agent_memory_propose(
-                        {**payload, "scope_key": channel.scope_key}
-                    )
-                self.assertEqual(raised.exception.status, 400)
-
-                candidate_id = proposed["candidate"]["id"]
-                approved = service.user_approve_memory_candidate(
-                    admin, candidate_id
-                )
-                approved_retry = service.user_approve_memory_candidate(
-                    admin, candidate_id
-                )
-                self.assertTrue(approved["created"])
-                self.assertFalse(approved_retry["created"])
-                self.assertEqual(
-                    approved["memory"]["id"], approved_retry["memory"]["id"]
-                )
-                self.assertEqual(
-                    service.db.scalar(
-                        "SELECT count(*) FROM agent_memories WHERE source_type = 'candidate'"
-                    ),
-                    1,
-                )
-            finally:
-                service.close()
-
-    def test_memory_candidate_retention_is_pruned_before_new_proposal(self):
+    def test_concurrent_automatic_memory_add_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
             try:
                 _, admin = service.authenticate("admin", "admin")
                 scope = service.agent_scopes.ensure_private_scope(int(admin["id"]))
-                timestamp = now_ts()
-                rows = [
-                    (
-                        scope.scope_key,
-                        admin["id"],
-                        "stale pending",
-                        "stale-pending",
-                        "pending",
-                        timestamp - MEMORY_CANDIDATE_PENDING_TTL_SECONDS - 1,
-                        None,
-                    ),
-                    (
-                        scope.scope_key,
-                        admin["id"],
-                        "stale rejected",
-                        "stale-rejected",
-                        "rejected",
-                        timestamp - MEMORY_CANDIDATE_TERMINAL_TTL_SECONDS - 1,
-                        timestamp - MEMORY_CANDIDATE_TERMINAL_TTL_SECONDS - 1,
-                    ),
-                    *[
-                        (
-                            scope.scope_key,
-                            admin["id"],
-                            f"terminal {index}",
-                            f"terminal-{index}",
-                            "rejected",
-                            timestamp - index,
-                            timestamp - index,
-                        )
-                        for index in range(
-                            MEMORY_CANDIDATE_TERMINAL_LIMIT + 5
-                        )
-                    ],
-                ]
-                service.db.executemany(
-                    """
-                    INSERT INTO agent_memory_candidates(
-                        scope_key, target, owner_user_id, content, tags_json,
-                        dedupe_key, status, created_at, decided_at
-                    ) VALUES (?, 'memory', ?, ?, '[]', ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
-
-                proposed = service.agent_memory_propose(
-                    {
-                        "scope_key": scope.scope_key,
-                        "owner_user_id": admin["id"],
-                        "target": "memory",
-                        "content": "fresh pending proposal",
-                    }
-                )
-
-                self.assertTrue(proposed["created"])
-                self.assertIsNone(
-                    service.db.query_one(
-                        """
-                        SELECT id FROM agent_memory_candidates
-                        WHERE dedupe_key IN ('stale-pending', 'stale-rejected')
-                        """
-                    )
-                )
-                self.assertEqual(
-                    service.db.scalar(
-                        """
-                        SELECT count(*) FROM agent_memory_candidates
-                        WHERE scope_key = ? AND owner_user_id = ?
-                          AND status IN ('approved', 'rejected')
-                        """,
-                        (scope.scope_key, admin["id"]),
-                    ),
-                    MEMORY_CANDIDATE_TERMINAL_LIMIT,
-                )
-                self.assertEqual(
-                    service.db.scalar(
-                        """
-                        SELECT count(*) FROM agent_memory_candidates
-                        WHERE scope_key = ? AND owner_user_id = ?
-                          AND status = 'pending'
-                        """,
-                        (scope.scope_key, admin["id"]),
-                    ),
-                    1,
-                )
-            finally:
-                service.close()
-
-    def test_concurrent_memory_add_and_candidate_approval_are_idempotent(self):
-        with tempfile.TemporaryDirectory() as td:
-            service = self._service(Path(td))
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                scope = service.agent_scopes.ensure_private_scope(int(admin["id"]))
-                add_results: list[dict] = []
+                results: list[dict] = []
                 errors: list[BaseException] = []
                 barrier = threading.Barrier(2)
 
                 def add_memory() -> None:
                     try:
                         barrier.wait(timeout=5)
-                        add_results.append(
+                        results.append(
                             service.agent_memory_mutate(
                                 {
                                     "scope_key": scope.scope_key,
+                                    "lifecycle_id": scope.lifecycle_id,
                                     "owner_user_id": admin["id"],
                                     "target": "memory",
-                                    "content": "concurrent memory",
+                                    "content": "concurrent automatic memory",
+                                    "source_type": "automatic",
+                                    "source_run_id": "run-concurrent",
+                                    "run_id": "run-concurrent",
+                                    "source_message_id": "42",
+                                    "delegation_depth": 0,
+                                    "unattended": False,
                                 }
                             )
                         )
@@ -368,78 +226,24 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                     thread.join(timeout=10)
                 self.assertEqual(errors, [])
                 self.assertEqual(
-                    sorted(
-                        result["changed"][0]["created"]
-                        for result in add_results
-                    ),
+                    sorted(result["changed"][0]["created"] for result in results),
                     [False, True],
                 )
-                self.assertEqual(
-                    service.db.scalar(
-                        """
-                        SELECT count(*) FROM agent_memories
-                        WHERE scope_key = ? AND content_hash = ?
-                        """,
-                        (
-                            scope.scope_key,
-                            memory_content_hash("concurrent memory"),
-                        ),
+                stored = service.db.query_one(
+                    "SELECT source_type, source_run_id, source_message_id "
+                    "FROM agent_memories WHERE scope_key = ? AND content_hash = ?",
+                    (
+                        scope.scope_key,
+                        memory_content_hash("concurrent automatic memory"),
                     ),
-                    1,
                 )
-
-                candidate_id = service.agent_memory_propose(
-                    {
-                        "scope_key": scope.scope_key,
-                        "owner_user_id": admin["id"],
-                        "target": "memory",
-                        "content": "concurrently approved memory",
-                    }
-                )["candidate"]["id"]
-                approval_results: list[dict] = []
-                errors.clear()
-                barrier = threading.Barrier(2)
-
-                def approve() -> None:
-                    try:
-                        barrier.wait(timeout=5)
-                        approval_results.append(
-                            service.user_approve_memory_candidate(
-                                admin, candidate_id
-                            )
-                        )
-                    except BaseException as exc:
-                        errors.append(exc)
-
-                threads = [threading.Thread(target=approve) for _ in range(2)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=10)
-                self.assertEqual(errors, [])
-                self.assertEqual(
-                    sorted(result["created"] for result in approval_results),
-                    [False, True],
-                )
-                self.assertEqual(
-                    service.db.scalar(
-                        """
-                        SELECT count(*) FROM agent_memories
-                        WHERE scope_key = ? AND content_hash = ?
-                        """,
-                        (
-                            scope.scope_key,
-                            memory_content_hash(
-                                "concurrently approved memory"
-                            ),
-                        ),
-                    ),
-                    1,
-                )
+                self.assertEqual(stored["source_type"], "automatic")
+                self.assertEqual(stored["source_run_id"], "run-concurrent")
+                self.assertEqual(stored["source_message_id"], "42")
             finally:
                 service.close()
 
-    def test_user_profile_quota_and_candidate_size_are_bounded(self):
+    def test_user_profile_quota_is_bounded(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
             try:
@@ -481,16 +285,49 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                     ),
                     20,
                 )
-                with self.assertRaises(ServiceError) as candidate_size:
-                    service.agent_memory_propose(
-                        {
-                            "scope_key": scope.scope_key,
-                            "owner_user_id": admin["id"],
-                            "target": "memory",
-                            "content": "x" * 2001,
-                        }
-                    )
-                self.assertEqual(candidate_size.exception.status, 400)
+            finally:
+                service.close()
+
+    def test_automatic_memory_write_rejects_noninteractive_run_contexts(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                private = service.agent_scopes.ensure_private_scope(int(admin["id"]))
+                base = {
+                    "scope_key": private.scope_key,
+                    "lifecycle_id": private.lifecycle_id,
+                    "owner_user_id": admin["id"],
+                    "target": "memory",
+                    "content": "stable fact",
+                    "source_type": "automatic",
+                    "source_run_id": "run-1",
+                    "run_id": "run-1",
+                    "source_message_id": "42",
+                    "delegation_depth": 0,
+                    "unattended": False,
+                }
+                channel = service.agent_scopes.ensure_channel_scope("1")
+                blocked = [
+                    {**base, "trigger": "scheduled"},
+                    {**base, "unattended": True},
+                    {**base, "parent_run_id": "parent", "delegation_depth": 1},
+                    {**base, "scope_key": f"{private.scope_key}/delegate/child"},
+                    {
+                        **base,
+                        "scope_key": channel.scope_key,
+                        "lifecycle_id": channel.lifecycle_id,
+                    },
+                ]
+                for payload in blocked:
+                    with self.subTest(payload=payload):
+                        with self.assertRaises(ServiceError) as raised:
+                            service.agent_memory_mutate(payload)
+                        self.assertEqual(raised.exception.status, 403)
+                self.assertEqual(
+                    service.db.scalar("SELECT count(*) FROM agent_memories"),
+                    0,
+                )
             finally:
                 service.close()
 
@@ -1095,7 +932,7 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             self.assertEqual(detail, "search")
             self.assertNotIn(query, detail)
 
-    def test_private_memory_http_crud_export_and_candidate_review(self):
+    def test_private_memory_http_crud_and_export(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             service = EnterpriseService(config, agent_client=RecordingAgent())
@@ -1161,31 +998,6 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                     exported["memories"][0]["content"],
                     "Updated project convention",
                 )
-
-                scope = service.agent_scopes.ensure_private_scope(int(admin["id"]))
-                candidate = service.agent_memory_propose(
-                    {
-                        "scope_key": scope.scope_key,
-                        "owner_user_id": admin["id"],
-                        "target": "memory",
-                        "content": "Candidate convention",
-                    }
-                )["candidate"]
-                status, candidates = request(
-                    "GET", "/api/private-agent/memory-candidates"
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(candidates["candidates"][0]["id"], candidate["id"])
-                status, approved = request(
-                    "POST",
-                    (
-                        "/api/private-agent/memory-candidates/"
-                        f"{candidate['id']}/approve"
-                    ),
-                    {},
-                )
-                self.assertEqual(status, 200)
-                self.assertTrue(approved["created"])
 
                 status, _ = request(
                     "DELETE", f"/api/private-agent/memories/{memory_id}"

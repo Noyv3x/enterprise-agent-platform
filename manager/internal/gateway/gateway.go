@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/model"
@@ -19,11 +23,34 @@ import (
 type StateProvider interface{ State() model.ManagerState }
 
 type Handler struct {
-	State StateProvider
-	Proxy *httputil.ReverseProxy
+	State    StateProvider
+	Proxy    *httputil.ReverseProxy
+	accessMu sync.RWMutex
+	access   AccessPolicy
+}
+
+// AccessPolicy is evaluated against the TCP peer address, never client
+// forwarding metadata. A nil AllowedRemotePrefixes slice means this handler is
+// the primary listener and does not apply an additional source allowlist; an
+// empty non-nil slice denies every source.
+type AccessPolicy struct {
+	AllowedRemotePrefixes  []netip.Prefix
+	TrustedIngressPrefixes []netip.Prefix
+}
+
+type forwardingContextKey struct{}
+
+type forwardingMetadata struct {
+	clientIP string
+	proto    string
+	host     string
 }
 
 func NewHandler(state StateProvider, platformURL string) (*Handler, error) {
+	return NewHandlerWithAccess(state, platformURL, AccessPolicy{})
+}
+
+func NewHandlerWithAccess(state StateProvider, platformURL string, access AccessPolicy) (*Handler, error) {
 	target, err := url.Parse(platformURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse platform URL: %w", err)
@@ -31,16 +58,67 @@ func NewHandler(state StateProvider, platformURL string) (*Handler, error) {
 	if target.Scheme != "http" && target.Scheme != "https" {
 		return nil, errors.New("platform URL must use http or https")
 	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := &httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) {
+		request.SetURL(target)
+		request.Out.Host = request.In.Host
+		clearForwardingHeaders(request.Out.Header)
+		if metadata, ok := request.In.Context().Value(forwardingContextKey{}).(forwardingMetadata); ok {
+			request.Out.Header.Set("X-Forwarded-For", metadata.clientIP)
+			request.Out.Header.Set("X-Forwarded-Proto", metadata.proto)
+			if metadata.host != "" {
+				request.Out.Header.Set("X-Forwarded-Host", metadata.host)
+			}
+		}
+	}}
 	proxy.ErrorHandler = func(response http.ResponseWriter, request *http.Request, err error) {
 		safeHeaders(response.Header())
 		response.Header().Set("Content-Type", "text/html; charset=utf-8")
 		response.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = response.Write([]byte(fallbackPage))
 	}
-	return &Handler{State: state, Proxy: proxy}, nil
+	return &Handler{State: state, Proxy: proxy, access: cloneAccessPolicy(access)}, nil
 }
+
+func (h *Handler) SetAccessPolicy(access AccessPolicy) {
+	h.accessMu.Lock()
+	h.access = cloneAccessPolicy(access)
+	h.accessMu.Unlock()
+}
+
+func (h *Handler) accessPolicy() AccessPolicy {
+	h.accessMu.RLock()
+	defer h.accessMu.RUnlock()
+	return cloneAccessPolicy(h.access)
+}
+
+func cloneAccessPolicy(access AccessPolicy) AccessPolicy {
+	return AccessPolicy{
+		AllowedRemotePrefixes:  clonePrefixes(access.AllowedRemotePrefixes),
+		TrustedIngressPrefixes: clonePrefixes(access.TrustedIngressPrefixes),
+	}
+}
+
+func clonePrefixes(values []netip.Prefix) []netip.Prefix {
+	if values == nil {
+		return nil
+	}
+	result := make([]netip.Prefix, len(values))
+	copy(result, values)
+	return result
+}
+
 func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	peer, ok := remoteAddress(request.RemoteAddr)
+	access := h.accessPolicy()
+	if !ok || !remoteAllowed(access, peer) {
+		safeHeaders(response.Header())
+		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = response.Write([]byte("access denied\n"))
+		return
+	}
+	metadata := forwardingMetadataFor(access, request, peer)
+	request = request.WithContext(context.WithValue(request.Context(), forwardingContextKey{}, metadata))
 	state := h.State.State()
 	if request.URL.Path == "/__ubitech/status" {
 		safeHeaders(response.Header())
@@ -60,6 +138,133 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 		return
 	}
 	h.Proxy.ServeHTTP(response, request)
+}
+
+func remoteAllowed(access AccessPolicy, address netip.Addr) bool {
+	if access.AllowedRemotePrefixes == nil {
+		return true
+	}
+	return prefixContains(access.AllowedRemotePrefixes, address)
+}
+
+func forwardingMetadataFor(access AccessPolicy, request *http.Request, peer netip.Addr) forwardingMetadata {
+	metadata := forwardingMetadata{
+		clientIP: peer.String(),
+		proto:    requestProtocol(request),
+		host:     safeForwardedHost(request.Host),
+	}
+	if !prefixContains(access.TrustedIngressPrefixes, peer) {
+		return metadata
+	}
+	if client, ok := forwardedClient(request.Header.Values("X-Forwarded-For"), access.TrustedIngressPrefixes); ok {
+		metadata.clientIP = client.String()
+	}
+	if proto, ok := firstForwardedToken(request.Header.Values("X-Forwarded-Proto")); ok && (proto == "http" || proto == "https") {
+		metadata.proto = proto
+	}
+	if host, ok := firstForwardedToken(request.Header.Values("X-Forwarded-Host")); ok {
+		if safe := safeForwardedHost(host); safe != "" {
+			metadata.host = safe
+		}
+	}
+	return metadata
+}
+
+func requestProtocol(request *http.Request) string {
+	if request.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func remoteAddress(value string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(value), "[]")
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil || address.Zone() != "" {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
+}
+
+func prefixContains(prefixes []netip.Prefix, address netip.Addr) bool {
+	address = address.Unmap()
+	for _, prefix := range prefixes {
+		candidate := prefix
+		if prefix.Addr().Is4In6() {
+			candidate = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		if candidate.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func forwardedClient(values []string, trusted []netip.Prefix) (netip.Addr, bool) {
+	parts := splitForwardedValues(values)
+	if len(parts) == 0 || len(parts) > 16 {
+		return netip.Addr{}, false
+	}
+	addresses := make([]netip.Addr, 0, len(parts))
+	for _, part := range parts {
+		address, err := netip.ParseAddr(part)
+		if err != nil || address.Zone() != "" {
+			return netip.Addr{}, false
+		}
+		addresses = append(addresses, address.Unmap())
+	}
+	for index := len(addresses) - 1; index >= 0; index-- {
+		if !prefixContains(trusted, addresses[index]) {
+			return addresses[index], true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+func firstForwardedToken(values []string) (string, bool) {
+	parts := splitForwardedValues(values)
+	if len(parts) == 0 || len(parts) > 16 {
+		return "", false
+	}
+	return strings.ToLower(parts[0]), true
+}
+
+func splitForwardedValues(values []string) []string {
+	var result []string
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || len(part) > 512 || strings.ContainsAny(part, "\r\n\x00") {
+				return nil
+			}
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+func safeForwardedHost(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 255 || strings.ContainsAny(value, "\r\n\x00/@\\?#") {
+		return ""
+	}
+	parsed, err := url.Parse("http://" + value)
+	if err != nil || parsed.Host != value || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return value
+}
+
+func clearForwardingHeaders(header http.Header) {
+	header.Del("Forwarded")
+	header.Del("X-Forwarded-For")
+	header.Del("X-Forwarded-Host")
+	header.Del("X-Forwarded-Proto")
+	header.Del("X-Forwarded-Port")
+	header.Del("X-Real-Ip")
 }
 func (h *Handler) maintenance(response http.ResponseWriter, state model.ManagerState) {
 	safeHeaders(response.Header())
@@ -104,6 +309,11 @@ func Listener(address string) (net.Listener, error) {
 	}
 	return net.Listen("tcp", address)
 }
+
+// TCPListener deliberately bypasses systemd socket activation. Only the
+// primary listener may own LISTEN_FDS; the optional LAN listener is always a
+// separately configured socket.
+func TCPListener(address string) (net.Listener, error) { return net.Listen("tcp", address) }
 func Server(listener net.Listener, handler http.Handler) *http.Server {
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
 	go func() { _ = server.Serve(listener) }()

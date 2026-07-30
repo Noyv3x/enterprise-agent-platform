@@ -146,14 +146,8 @@ test("action approval keys bind action and resource", async () => {
   assert.equal(writeOne.allowPermanent, false);
 });
 
-test("mutation approval keys bind all arguments and redact body fields", async () => {
+test("approved mutation keys bind all arguments and redact body fields", async () => {
   const cases = [
-    {
-      tool: "memory",
-      first: { action: "store", arguments: { target: "memory", content: "first memory", tags: ["one"] } },
-      second: { action: "store", arguments: { target: "memory", content: "second memory", tags: ["one"] } },
-      omitted: "content omitted",
-    },
     {
       tool: "skill",
       first: { action: "update", arguments: { id: "review", instructions: "first instructions", version: "1" } },

@@ -19,6 +19,8 @@ import { initials } from "../../utils/format";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
 import { PageHeader } from "../common/PageHeader";
+import { BrowserNotificationSettings } from "./BrowserNotificationSettings";
+import { MailAccountSettings } from "./MailAccountSettings";
 import "./settings.css";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -140,6 +142,8 @@ export function SettingsView() {
             {user.position ? <Typography.Text type="secondary">{user.position}</Typography.Text> : null}
           </div>
         </Card>
+        <BrowserNotificationSettings userId={user.id} />
+        <MailAccountSettings />
         <Card
           className="settings-card"
           classNames={{ body: "settings-card__body" }}

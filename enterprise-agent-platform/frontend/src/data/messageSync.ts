@@ -8,8 +8,9 @@ import type {
 interface MessageSyncResponse {
   messages?: Message[];
   message_revision?: MessageRevision;
+  reset_revision?: MessageRevision;
   next_after_id?: Id;
-  mode?: "full" | "delta";
+  mode?: "full" | "delta" | "history";
 }
 
 function responseAfterId(
@@ -35,8 +36,10 @@ export function messageSyncCursor(
 ): MessageSyncCursor | undefined {
   const revision = result.message_revision ?? previous?.revision;
   if (revision === undefined) return undefined;
+  const resetRevision = result.reset_revision ?? previous?.resetRevision;
   return {
     afterId: responseAfterId(result, previous),
     revision,
+    ...(resetRevision === undefined ? {} : { resetRevision }),
   };
 }

@@ -106,13 +106,13 @@ takeover journal 落盘后，先禁用 Manager 主 unit 的自动启动并证明
 
 ## 公网入口与维护
 
-Manager 持有唯一产品端口。正常时代理 current Platform generation；维护或 Platform 不可用时直接返回临时页面和精简更新状态，所以应用容器未启动时入口仍然可用。
+Manager 持有所有产品监听。默认主入口只绑定回环；管理员可在管理面板显式开启受 CIDR 限制、使用独立端口的第二个局域网入口，且推荐局域网 TLS 反向代理继续连接回环主入口。LAN 配置热收敛不重启 Platform；绑定失败时必须保持主入口工作并向管理员报告。Manager 以真实远端地址判断直连准入并清洗 forwarded headers，不能把通配 bind 地址当成公共 URL。正常时代理 current Platform generation；维护或 Platform 不可用时直接返回临时页面和精简更新状态，所以应用容器未启动时入口仍然可用。
 
 维护页只展示公开 state、phase、重试时间和 support/operation id，并使用无脚本的短周期刷新。日志、宿主路径、镜像凭据、Docker 信息和恢复动作不能进入公共页面。正常管理面板通过 Platform 代理 Manager 状态；Platform 故障时使用宿主 CLI。
 
 ## 镜像与发布物
 
-main 质量门构建受支持架构的镜像与 Manager 二进制。release manifest 包含 source commit、协议版本、数据库版本、Manager 校验和、Compose 摘要及每个镜像的完整 registry digest。Manager 只按 digest 拉取，不使用 mutable tag 作为运行身份。
+main 质量门构建受支持架构的镜像与 Manager 二进制。release manifest 包含 source commit、协议版本、数据库版本、Manager 校验和、Compose 摘要及每个镜像的完整 registry digest。Manager 只按 digest 拉取，不使用 mutable tag 作为运行身份。Platform 与 Agent Runtime 的各架构压缩层总量和本地展开尺寸还必须不超过同一提交 [`container-platform.json`](../contracts/container-platform.json) 的容量上限；该上限供部署机按“本地缺失 digest”计算更新空间，不是可由部署端放宽的设置。
 
 官方清单引用的 Platform、Runtime、Camoufox 和 Sandbox package 必须能够在无 registry 登录状态下按 digest 拉取。CI 使用隔离的匿名 Docker 配置验证这一点，再执行 Compose smoke test；必需工件全部通过后才发布清单。
 

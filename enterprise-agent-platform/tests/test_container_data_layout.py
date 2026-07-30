@@ -9,6 +9,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainerDataLayoutTests(unittest.TestCase):
+    def test_platform_receives_the_trusted_host_data_root(self) -> None:
+        compose = (REPOSITORY_ROOT / "containers" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "UBITECH_HOST_DATA_ROOT: ${UBITECH_DATA_ROOT:?UBITECH_DATA_ROOT must be set}",
+            compose,
+        )
+
     def test_searxng_mounts_the_managed_config_root(self) -> None:
         compose = (REPOSITORY_ROOT / "containers" / "compose.yaml").read_text(
             encoding="utf-8"

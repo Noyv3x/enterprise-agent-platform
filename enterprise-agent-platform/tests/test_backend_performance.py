@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import enterprise_agent_platform.server as server_module
+import enterprise_agent_platform.service as service_module
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, UploadedFile
 
@@ -16,6 +17,83 @@ from test_platform import RecordingAgent, make_config
 
 
 class BackendPerformanceServiceTests(unittest.TestCase):
+    def test_upload_envelope_covers_the_product_attachment_total(self):
+        self.assertEqual(
+            server_module.MAX_UPLOAD_BODY_BYTES,
+            service_module.MAX_ATTACHMENTS_TOTAL_BYTES + 1024 * 1024,
+        )
+
+    def test_message_history_pages_backward_without_changing_forward_cursor(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)), agent_client=RecordingAgent()
+            )
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                sent = [
+                    service.send_channel_message(actor, 1, f"message {index}")[
+                        "user_message"
+                    ]
+                    for index in range(6)
+                ]
+
+                latest = service.message_sync(actor, "channel", "1", limit=2)
+                self.assertEqual(latest["mode"], "full")
+                self.assertEqual(
+                    [item["id"] for item in latest["messages"]],
+                    [sent[4]["id"], sent[5]["id"]],
+                )
+                self.assertTrue(latest["has_more_before"])
+                self.assertEqual(latest["next_before_id"], sent[4]["id"])
+                forward_cursor = latest["next_after_id"]
+
+                middle = service.message_sync(
+                    actor,
+                    "channel",
+                    "1",
+                    limit=2,
+                    before_id=int(latest["next_before_id"]),
+                )
+                self.assertEqual(middle["mode"], "history")
+                self.assertEqual(
+                    [item["id"] for item in middle["messages"]],
+                    [sent[2]["id"], sent[3]["id"]],
+                )
+                self.assertTrue(middle["has_more_before"])
+                self.assertEqual(middle["next_before_id"], sent[2]["id"])
+                # A backward page is deliberately not a forward synchronization point.
+                self.assertEqual(middle["next_after_id"], 0)
+                self.assertEqual(latest["next_after_id"], forward_cursor)
+
+                oldest = service.message_sync(
+                    actor,
+                    "channel",
+                    "1",
+                    limit=2,
+                    before_id=int(middle["next_before_id"]),
+                )
+                self.assertEqual(
+                    [item["id"] for item in oldest["messages"]],
+                    [sent[0]["id"], sent[1]["id"]],
+                )
+                self.assertFalse(oldest["has_more_before"])
+                self.assertIsNone(oldest["next_before_id"])
+
+                with self.assertRaisesRegex(
+                    service_module.ServiceError,
+                    "before_id cannot be combined",
+                ):
+                    service.message_sync(
+                        actor,
+                        "channel",
+                        "1",
+                        before_id=int(sent[4]["id"]),
+                        after_id=int(sent[5]["id"]),
+                        since_revision=int(latest["message_revision"]),
+                    )
+            finally:
+                service.close()
+
     def test_message_delta_batches_attachments_and_hide_forces_full_sync(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -143,7 +221,10 @@ class BackendPerformanceServiceTests(unittest.TestCase):
                         "agent_status",
                         "typing",
                         "message_revision",
+                        "reset_revision",
                         "next_after_id",
+                        "next_before_id",
+                        "has_more_before",
                     },
                     set(bootstrap),
                 )

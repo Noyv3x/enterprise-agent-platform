@@ -337,6 +337,36 @@ class ConfigFromEnvTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be absolute"):
                     PlatformConfig.from_env(root)
 
+    def test_container_mode_exposes_only_an_absolute_trusted_host_data_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            host_data_root = root / "managed-data"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_HOST_DATA_ROOT": str(host_data_root),
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    PlatformConfig.from_env(root).host_data_root,
+                    host_data_root,
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_HOST_DATA_ROOT": "relative-data",
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "UBITECH_HOST_DATA_ROOT must be absolute"
+                ):
+                    PlatformConfig.from_env(root)
+
     def test_missing_container_mode_is_rejected(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "must be 'container'"):

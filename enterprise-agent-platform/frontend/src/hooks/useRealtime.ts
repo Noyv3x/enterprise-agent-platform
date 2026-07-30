@@ -10,7 +10,8 @@
    - on a terminal close (readyState === 2) we probe GET /api/auth/me (NOT
      skipAuthHandling, so a 401 drops to login) and, if still authed + visible,
      schedule a single 3s reconnect;
-   - hidden tabs close the stream and reopen when visible;
+   - hidden tabs keep the lightweight active-scope stream open so reply-complete
+     browser notifications can be delivered while the page remains loaded;
    - pagehide closes the stream and pageshow restores it after BFCache resume;
    - logout/401 close it via the session teardown. */
 
@@ -85,7 +86,6 @@ export function useRealtime(): boolean {
     };
 
     const open = () => {
-      if (document.hidden) return;
       if (es && es.readyState !== 2) return; // already connected to this scope
       close();
       const current = new EventSource(url, { withCredentials: true });
@@ -137,7 +137,7 @@ export function useRealtime(): boolean {
               if (disposed || reconnect != null) return;
               reconnect = window.setTimeout(() => {
                 reconnect = null;
-                if (!disposed && store.getState().user && !document.hidden) open();
+                if (!disposed && store.getState().user) open();
               }, SSE_RECONNECT_MS);
             })
             .catch(() => {
@@ -148,8 +148,7 @@ export function useRealtime(): boolean {
     };
 
     const onVisibility = () => {
-      if (document.hidden) close();
-      else open();
+      if (!document.hidden) open();
     };
     const onPageHide = () => close();
     const onPageShow = () => open();

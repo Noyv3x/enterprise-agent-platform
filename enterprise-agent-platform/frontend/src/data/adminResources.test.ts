@@ -51,7 +51,7 @@ describe("administration page resources", () => {
       "agent-runtime": ["agentRuntime", "oauth"],
       telegram: ["telegram"],
       updates: ["updates"],
-      security: ["security"],
+      security: ["security", "updates"],
       runtime: ["runtime"],
       cognee: ["cognee"],
       secrets: ["secrets"],

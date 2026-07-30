@@ -5,6 +5,28 @@ import { initialAppState, rootReducer } from "../store/reducer";
 import type { Message, PostMessageResponse, User } from "../types";
 import { refreshActiveChat, sendMessage } from "./chatActions";
 
+class FakeUploadRequest {
+  static instances: FakeUploadRequest[] = [];
+  readonly upload: {
+    onprogress: ((event: ProgressEvent) => void) | null;
+    onload: (() => void) | null;
+  } = { onprogress: null, onload: null };
+  timeout = -1;
+  withCredentials = false;
+  status = 0;
+  responseText = "";
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+
+  constructor() { FakeUploadRequest.instances.push(this); }
+  open() {}
+  setRequestHeader() {}
+  send() {}
+  abort() { this.onabort?.(); }
+}
+
 function response(status: number, body: unknown) {
   return {
     ok: status >= 200 && status < 300,
@@ -62,9 +84,47 @@ function privateStore() {
 afterEach(() => {
   resetApiSession();
   vi.unstubAllGlobals();
+  FakeUploadRequest.instances = [];
 });
 
 describe("private rapid-message sends", () => {
+  it("shows queued, byte upload, and server processing states for an attachment", async () => {
+    vi.stubGlobal("XMLHttpRequest", FakeUploadRequest);
+    const store = privateStore();
+    const file = new File(["1234567890"], "note.txt", { type: "text/plain" });
+
+    const sending = sendMessage(store, "private", "7", "with file", [file]);
+    expect(store.getState().privateMessages[0]?.metadata?.upload?.state).toBe("queued");
+    await vi.waitFor(() => expect(FakeUploadRequest.instances).toHaveLength(1));
+    const xhr = FakeUploadRequest.instances[0];
+    expect(xhr.timeout).toBe(0);
+
+    xhr.upload.onprogress?.({
+      lengthComputable: true,
+      loaded: 50,
+      total: 100,
+    } as unknown as ProgressEvent);
+    expect(store.getState().privateMessages[0]?.metadata?.upload).toMatchObject({
+      state: "uploading",
+      loaded: 50,
+      total: 100,
+      percent: 50,
+    });
+
+    xhr.upload.onload?.();
+    expect(store.getState().privateMessages[0]?.metadata?.upload).toMatchObject({
+      state: "processing",
+      percent: 100,
+    });
+    xhr.status = 200;
+    xhr.responseText = JSON.stringify(result(91, "with file", 1));
+    xhr.onload?.();
+
+    await expect(sending).resolves.toBe(true);
+    expect(store.getState().pendingMessages).toEqual([]);
+    expect(store.getState().privateMessages[0]?.id).toBe(91);
+  });
+
   it("renders every optimistic bubble immediately but POSTs in strict FIFO order", async () => {
     const pending: Array<{
       content: string;

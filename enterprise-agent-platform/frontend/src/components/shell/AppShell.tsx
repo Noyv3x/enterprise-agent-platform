@@ -12,6 +12,7 @@ import { useEffect } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { usePolling } from "../../hooks/usePolling";
 import { useRealtime } from "../../hooks/useRealtime";
+import { useReplyNotifications } from "../../hooks/useReplyNotifications";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
 import { ContentRouter } from "./ContentRouter";
@@ -35,6 +36,7 @@ export function AppShell() {
   // emit that same event again.
   const realtimeConnected = useRealtime();
   usePolling(realtimeConnected ? 30_000 : 4_000);
+  useReplyNotifications();
 
   useEffect(() => {
     if (userId == null) return;

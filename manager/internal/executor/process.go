@@ -233,6 +233,12 @@ os.close(out_w); os.close(err_w)
 os.execv("/bin/sh", ["/bin/sh", "-lc", command])
 `
 
+const hostProcessWrapper = `
+cd /proc/self/fd/3 || exit 125
+exec 3<&-
+exec /bin/sh -lc "$1"
+`
+
 const sandboxStopScript = `
 file=$1
 if [ ! -r "$file" ]; then echo stopped; exit 0; fi
@@ -303,6 +309,12 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	var name string
 	var commandArgs []string
 	var pidFile, hostPIDFile, hostStdoutFile, hostStderrFile string
+	var hostWorkingDirectory *os.File
+	defer func() {
+		if hostWorkingDirectory != nil {
+			_ = hostWorkingDirectory.Close()
+		}
+	}()
 	if call.Target == "sandbox" {
 		if cwd == "" {
 			cwd = contract.ContainerWorkspace
@@ -326,14 +338,19 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 		name, commandArgs = m.Engine.ExecArgs(spec, cwd, "python3", []string{"-c", sandboxProcessWrapper, pidFile, stdoutFile, stderrFile, strconv.FormatInt(m.MaxOutput, 10), args.Command})
 	} else if call.Target == "host" {
 		if cwd == "" {
-			cwd = spec.Workspace
-		} else if resolved, resolveErr := m.Sandboxes.ResolvePath("host", call.ExecutionContext.SandboxID, cwd); resolveErr == nil {
-			cwd = resolved
-		} else {
+			cwd = contract.ContainerWorkspace
+		}
+		resolved, resolveErr := m.Sandboxes.ResolveHostPath(call.ExecutionContext.SandboxID, cwd, sandbox.HostPathWorkingDirectory)
+		if resolveErr != nil {
 			return ProcessSnapshot{}, resolveErr
 		}
+		hostWorkingDirectory, err = openHostWorkingDirectory(resolved)
+		if err != nil {
+			return ProcessSnapshot{}, err
+		}
+		cwd = resolved.Canonical
 		name = "/bin/sh"
-		commandArgs = []string{"-lc", args.Command}
+		commandArgs = []string{"-c", hostProcessWrapper, "ubitech-manager", args.Command}
 	} else {
 		return ProcessSnapshot{}, errors.New("invalid target")
 	}
@@ -347,7 +364,8 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	}
 	command := exec.CommandContext(executionContext, name, commandArgs...)
 	if call.Target == "host" {
-		command.Dir = cwd
+		command.Dir = string(filepath.Separator)
+		command.ExtraFiles = []*os.File{hostWorkingDirectory}
 		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	}
 	stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
@@ -366,6 +384,10 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	if err := command.Start(); err != nil {
 		cancel()
 		return ProcessSnapshot{}, err
+	}
+	if hostWorkingDirectory != nil {
+		_ = hostWorkingDirectory.Close()
+		hostWorkingDirectory = nil
 	}
 	process.snapshot.PID = command.Process.Pid
 	if call.Target == "sandbox" {

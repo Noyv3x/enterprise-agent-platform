@@ -345,6 +345,9 @@ func (m *Manager) stageRecoveryBinary(data []byte, digest string) (string, error
 		if sha256Hex(current) != digest {
 			return "", errors.New("immutable recovered Manager version has different contents")
 		}
+		if err := m.ensureRecoveryVersionMetadata(path, digest); err != nil {
+			return "", err
+		}
 		return path, nil
 	} else if !os.IsNotExist(err) {
 		return "", err
@@ -355,7 +358,28 @@ func (m *Manager) stageRecoveryBinary(data []byte, digest string) (string, error
 	if !binaryMatches(path, digest) {
 		return "", errors.New("staged recovered Manager checksum mismatch")
 	}
+	if err := m.ensureRecoveryVersionMetadata(path, digest); err != nil {
+		return "", err
+	}
 	return path, nil
+}
+
+func (m *Manager) ensureRecoveryVersionMetadata(path, digest string) error {
+	version := Version{
+		Version:           m.RunningVersion,
+		Path:              path,
+		SHA256:            digest,
+		VerifiedAt:        m.now(),
+		PlatformCommitted: true,
+	}
+	var existing Version
+	if err := atomicfile.ReadJSON(filepath.Join(filepath.Dir(path), "metadata.json"), &existing); err == nil && existing.Path == path && existing.SHA256 == digest {
+		version = existing
+	}
+	if err := m.ensureVersionMetadata(version); err != nil {
+		return fmt.Errorf("record recovered Manager artifact provenance: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) restoreRecoveryCurrent(oldBinary []byte, unit string) error {

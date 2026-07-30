@@ -96,7 +96,7 @@ test("Manager process snapshots preserve orphaned as an active, unconfirmed stat
   }
 });
 
-test("managed execution defaults to sandbox, audits before start, skips approval, and inherits identity", async () => {
+test("managed execution skips sandbox approval, requires one-shot host approval, and inherits identity", async () => {
   const home = await temporaryDirectory("managed-execution-");
   const socketPath = join(home, "manager.sock");
   const manager = new FakeManager(socketPath);
@@ -125,12 +125,25 @@ test("managed execution defaults to sandbox, audits before start, skips approval
   try {
     const execution_context = { sandbox_id: "agent_42", workspace_id: "workspace_42" };
     const run = coordinator.createRun(managedRequest({ execution_context }));
+    const approval = await waitUntil(() => coordinator.approvals.latestForRun(run.id));
+    assert.equal(approval.tool_name, "terminal");
+    assert.equal(approval.allow_session, false);
+    assert.equal(approval.allow_permanent, false);
+    assert.equal((approval.arguments as JsonObject).target, "host");
+    assert.equal(
+      manager.requests.some((request) =>
+        request.path === "/v1/executor/audit" && request.body.target === "host"
+      ),
+      false,
+      "host execution must not reach Manager before approval",
+    );
+    await coordinator.respondApproval(run.id, approval.id, "once");
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "parent complete");
 
     const events = coordinator.getJournal(run.id)?.list() ?? [];
-    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.equal(events.filter((event) => event.type === "approval.requested").length, 1);
     const auditIndexes = events.flatMap((event, index) => event.type === "execution.audit" ? [index] : []);
     const startedIndexes = events.flatMap((event, index) => event.type === "tool.started" ? [index] : []);
     assert.ok(auditIndexes.length >= 2);
@@ -439,4 +452,14 @@ async function readBody(request: IncomingMessage): Promise<JsonObject> {
 function send(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify(body));
+}
+
+async function waitUntil<T>(read: () => T | undefined, timeoutMs = 2_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for managed execution state");
 }

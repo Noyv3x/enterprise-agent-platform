@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { ApiError } from "../../lib/api";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 
 const mocks = vi.hoisted(() => ({
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     connection: "connecting" as "connecting" | "connected" | "disconnected",
     activity: "loading" as "loading" | "live" | "idle",
     frameUrl: "",
+    tabId: "",
     error: "",
     title: "",
     url: "",
@@ -19,10 +21,19 @@ const mocks = vi.hoisted(() => ({
     checkedAt: null as number | null,
   },
   refresh: vi.fn(),
+  acquire: vi.fn(),
+  release: vi.fn(),
+  send: vi.fn(),
 }));
 
 vi.mock("./useBrowserPreview", () => ({
   useBrowserPreview: () => ({ state: mocks.state, refresh: mocks.refresh }),
+}));
+
+vi.mock("../../data/previewActions", () => ({
+  acquireBrowserControl: mocks.acquire,
+  releaseBrowserControl: mocks.release,
+  sendBrowserControlInput: mocks.send,
 }));
 
 function renderPreview() {
@@ -40,16 +51,27 @@ describe("BrowserPreviewView", () => {
       connection: "connecting",
       activity: "loading",
       frameUrl: "",
+      tabId: "",
       error: "",
       title: "",
       url: "",
       capturedAt: "",
       checkedAt: null,
     });
+    mocks.acquire.mockResolvedValue({
+      active: true,
+      lease_id: "lease-1",
+      tab_id: "tab-1",
+      expires_in_ms: 90_000,
+    });
+    mocks.release.mockResolvedValue({ active: false, released: true });
+    mocks.send.mockResolvedValue({ ok: true, expires_in_ms: 90_000 });
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
   });
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     localStorage.clear();
     vi.clearAllMocks();
   });
@@ -108,5 +130,127 @@ describe("BrowserPreviewView", () => {
     expect(mocks.refresh).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("img", { name: "Latest Agent browser frame" })).toHaveAttribute("draggable", "false");
     expect(screen.getByText("Read only")).toBeVisible();
+  });
+
+  it("serializes human inputs and keeps their sequence bound to the leased tab", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    let resolveFirst: (value: { ok: boolean; expires_in_ms: number }) => void = () => undefined;
+    mocks.send
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValue({ ok: true, expires_in_ms: 90_000 });
+    const user = userEvent.setup();
+    renderPreview();
+
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await screen.findByText("Human assistance");
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await user.click(screen.getByRole("button", { name: "Forward" }));
+
+    expect(mocks.send).toHaveBeenCalledTimes(1);
+    expect(mocks.send.mock.calls[0][1]).toBe("tab-1");
+    expect(mocks.send.mock.calls[0][3]).toBe(1);
+    resolveFirst({ ok: true, expires_in_ms: 90_000 });
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1][1]).toBe("tab-1");
+    expect(mocks.send.mock.calls[1][3]).toBe(2);
+  });
+
+  it("drops to read only and releases the original tab when polling selects another tab", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    const user = userEvent.setup();
+    const view = renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await screen.findByText("Human assistance");
+
+    mocks.state.tabId = "tab-2";
+    view.rerender(
+      <I18nProvider>
+        <BrowserPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
+      </I18nProvider>,
+    );
+
+    await screen.findByText("Read only");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-1",
+    ));
+  });
+
+  it("releases control on window blur and page visibility loss", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    const user = userEvent.setup();
+    const first = renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await screen.findByText("Human assistance");
+
+    act(() => window.dispatchEvent(new Event("blur")));
+    await screen.findByText("Read only");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledTimes(1));
+
+    first.unmount();
+    vi.clearAllMocks();
+    mocks.acquire.mockResolvedValue({ lease_id: "lease-2", expires_in_ms: 90_000 });
+    mocks.release.mockResolvedValue({ released: true });
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await screen.findByText("Human assistance");
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+
+    await screen.findByText("Read only");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-2",
+    ));
+  });
+
+  it("expires the local lease and best-effort releases it", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    mocks.acquire.mockResolvedValue({ lease_id: "lease-short", expires_in_ms: 25 });
+    const user = userEvent.setup();
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    expect(screen.getByText("Human assistance")).toBeVisible();
+
+    await screen.findByText("Read only");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-short",
+    ));
+  });
+
+  it("treats a server lease conflict as read-only degradation", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    mocks.send.mockRejectedValueOnce(new ApiError("expired", 409));
+    const user = userEvent.setup();
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await user.click(screen.getByRole("button", { name: "Back" }));
+
+    await screen.findByText("Read only");
+    expect(screen.getByText("Browser control ended. Take control again to continue.")).toBeVisible();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-1",
+    ));
   });
 });

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ubitech/agent-platform/manager/internal/config"
 	"github.com/ubitech/agent-platform/manager/internal/control"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
@@ -50,6 +51,29 @@ type blockingFirecrawlRunner struct {
 	once    sync.Once
 	mu      sync.Mutex
 	calls   [][]string
+}
+
+func TestTriggeredReconciliationRunsBeforeThePeriodicDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	trigger := make(chan struct{}, 1)
+	called := make(chan struct{}, 1)
+	go runTriggeredReconciliationLoop(
+		ctx,
+		time.Hour,
+		func(int) time.Duration { return time.Hour },
+		trigger,
+		func(context.Context) error {
+			called <- struct{}{}
+			return nil
+		},
+	)
+	trigger <- struct{}{}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("finalized-generation trigger did not start maintenance")
+	}
 }
 
 func (r *blockingFirecrawlRunner) Run(ctx context.Context, _ string, args []string, _ []string) (driver.Result, error) {
@@ -571,4 +595,97 @@ func TestWaitForManagerRejectsDeterministicHTTPFailureImmediately(t *testing.T) 
 	if time.Since(started) >= time.Second {
 		t.Fatalf("deterministic authentication failure was retried: %s", time.Since(started))
 	}
+}
+
+func TestGatewayControllerHotReconcilesIndependentLANListener(t *testing.T) {
+	primary := reserveTCPAddress(t)
+	lanLoopback := reserveTCPAddress(t)
+	_, port, err := net.SplitHostPort(lanLoopback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.GatewayAddress = primary
+	cfg.ConfigPath = filepath.Join(t.TempDir(), "manager.toml")
+	cfg.LANEnabled = true
+	cfg.LANAddress = "127.0.0.1:" + port
+	cfg.DirectAccessCIDRs = []string{"127.0.0.0/8"}
+	cfg.TrustedIngressCIDRs = []string{"127.0.0.0/8"}
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs := config.NewManager(cfg)
+	controller := newGatewayController(&application{config: cfg, configs: configs, state: store})
+	t.Cleanup(controller.Stop)
+	if err := controller.Start(); err != nil {
+		t.Fatal(err)
+	}
+	configs.SetLANApply(controller.ApplyLANConfig)
+	if status := configs.Public(); !status.LANActive || status.LANError != "" {
+		t.Fatalf("LAN status after start = %#v", status)
+	}
+	assertHTTPStatus(t, "http://"+cfg.LANAddress+"/__ubitech/health", http.StatusOK)
+	enabled := false
+	if _, err := configs.Patch(config.Patch{LANEnabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	if status := configs.Public(); status.LANActive || status.LANError != "" {
+		t.Fatalf("LAN status after disable = %#v", status)
+	}
+	if connection, err := net.DialTimeout("tcp", cfg.LANAddress, 100*time.Millisecond); err == nil {
+		_ = connection.Close()
+		t.Fatal("disabled LAN listener still accepts connections")
+	}
+
+	enabled = true
+	if _, err := configs.Patch(config.Patch{LANEnabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	assertHTTPStatus(t, "http://"+cfg.LANAddress+"/__ubitech/health", http.StatusOK)
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+	occupiedAddress := occupied.Addr().String()
+	if _, err := configs.Patch(config.Patch{LANListen: &occupiedAddress}); err == nil {
+		t.Fatal("occupied LAN listener update unexpectedly succeeded")
+	}
+	status := configs.Public()
+	if status.LANListen != cfg.LANAddress || !status.LANActive || status.LANError == "" {
+		t.Fatalf("failed bind did not retain active LAN configuration: %#v", status)
+	}
+	assertHTTPStatus(t, "http://"+cfg.LANAddress+"/__ubitech/health", http.StatusOK)
+	assertHTTPStatus(t, "http://"+primary+"/__ubitech/health", http.StatusOK)
+}
+
+func assertHTTPStatus(t *testing.T, address string, want int) {
+	t.Helper()
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != want {
+		t.Fatalf("GET %s = %d, want %d", address, response.StatusCode, want)
+	}
+}
+
+func reserveTCPAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
 }

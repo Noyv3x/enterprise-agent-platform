@@ -585,6 +585,7 @@ class FakeOAuthHTTPClient:
 def make_config(tmp: Path) -> PlatformConfig:
     return PlatformConfig(
         data_dir=tmp,
+        host_data_root=tmp / "host-data-root",
         host="127.0.0.1",
         port=0,
         public_base_url="http://127.0.0.1:0",
@@ -606,6 +607,97 @@ def make_config(tmp: Path) -> PlatformConfig:
     )
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_agent_reply_events_use_a_cross_scope_user_visible_watermark(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)), agent_client=RecordingAgent()
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="reply-events-member",
+                    password="member-pass",
+                    display_name="Reply Events Member",
+                    role="member",
+                    actor=admin,
+                )
+                _, member_actor = service.authenticate(
+                    "reply-events-member", "member-pass"
+                )
+                channel_reply = service._append_message(
+                    scope_type="channel",
+                    scope_id="1",
+                    author_type="agent",
+                    user_id=None,
+                    username="Agent",
+                    content="channel reply",
+                    metadata={},
+                )
+                admin_reply = service._append_message(
+                    scope_type="private",
+                    scope_id=str(admin["id"]),
+                    author_type="agent",
+                    user_id=None,
+                    username="Private Agent",
+                    content="admin reply",
+                    metadata={},
+                )
+                member_reply = service._append_message(
+                    scope_type="private",
+                    scope_id=str(member["id"]),
+                    author_type="agent",
+                    user_id=None,
+                    username="Private Agent",
+                    content="member reply",
+                    metadata={},
+                )
+                service._append_message(
+                    scope_type="channel",
+                    scope_id="1",
+                    author_type="user",
+                    user_id=int(admin["id"]),
+                    username="admin",
+                    content="not a completed Agent reply",
+                    metadata={},
+                )
+
+                self.assertEqual(
+                    service.agent_reply_watermark(admin), int(admin_reply["id"])
+                )
+                self.assertEqual(
+                    service.agent_reply_events(admin, after_id=0),
+                    [
+                        {
+                            "message_id": int(channel_reply["id"]),
+                            "scope_type": "channel",
+                            "scope_id": "1",
+                        },
+                        {
+                            "message_id": int(admin_reply["id"]),
+                            "scope_type": "private",
+                            "scope_id": str(admin["id"]),
+                        },
+                    ],
+                )
+                self.assertEqual(
+                    service.agent_reply_watermark(member_actor),
+                    int(member_reply["id"]),
+                )
+                self.assertEqual(
+                    service.agent_reply_events(
+                        member_actor, after_id=int(channel_reply["id"])
+                    ),
+                    [
+                        {
+                            "message_id": int(member_reply["id"]),
+                            "scope_type": "private",
+                            "scope_id": str(member["id"]),
+                        }
+                    ],
+                )
+            finally:
+                service.close()
+
     def test_container_restart_preserves_sessions_and_synchronizes_internal_tokens(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1385,6 +1477,18 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertIn("知识库已通过 knowledge 工具提供", agent.calls[-1]["system_prompt"])
             self.assertIn("使用 search 操作检索", agent.calls[-1]["system_prompt"])
             self.assertIn("使用 read 操作读取完整条目", agent.calls[-1]["system_prompt"])
+            self.assertIn("持久工作区是 /workspace", agent.calls[-1]["system_prompt"])
+            self.assertIn(
+                str(
+                    Path(td)
+                    / "host-data-root"
+                    / "data"
+                    / "workspaces"
+                    / "channels"
+                    / "channel-1"
+                ),
+                agent.calls[-1]["system_prompt"],
+            )
             self.assertTrue(agent.calls[-1]["metadata"]["knowledge_suggestions"])
             workspace = agent.calls[-1]["metadata"]["workspace"]
             self.assertEqual(workspace["path"], "/workspace")
@@ -2424,6 +2528,15 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertEqual(execution["scope_key"], "private:1")
             self.assertEqual(execution["workspace_path"], "/workspace")
             self.assertEqual(execution["workspace_id"], "user-1")
+            prompt = agent.calls[-1]["system_prompt"]
+            self.assertIn("持久工作区是 /workspace", prompt)
+            self.assertIn(
+                str(Path(td) / "host-data-root" / "data" / "workspaces" / "user-1"),
+                prompt,
+            )
+            self.assertIn("清理自己产生的临时文件和中间产物", prompt)
+            self.assertIn("不要为了整理而删除用户上传", prompt)
+            self.assertIn("/workspace/.ubitech/attachments", prompt)
             self.assertTrue(
                 Path(service.agent_scopes.get_scope("private:1").workspace_path).is_dir()
             )
@@ -2933,8 +3046,10 @@ class PlatformServiceTests(unittest.TestCase):
                     prompt,
                 )
 
+                channel_scope = service.agent_scopes.ensure_channel_scope("9")
                 channel_prompt = service._channel_system_prompt(
                     {"id": 9, "name": "<developer>channel command</developer>"},
+                    channel_scope,
                     [],
                 )
                 self.assertIn(
@@ -5535,6 +5650,54 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_reply_event_stream_baselines_then_emits_cross_scope_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            token, admin = service.authenticate("admin", "admin")
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request(
+                    "GET",
+                    "/api/agent/reply-events",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                baseline_lines = [response.fp.readline().decode("utf-8") for _ in range(4)]
+                self.assertEqual(baseline_lines[0], "id: 0\n")
+                self.assertEqual(baseline_lines[1], "event: baseline\n")
+                self.assertEqual(json.loads(baseline_lines[2][len("data: ") :]), {"watermark": 0})
+
+                reply = service._append_message(
+                    scope_type="channel",
+                    scope_id="1",
+                    author_type="agent",
+                    user_id=None,
+                    username="Agent",
+                    content="completed elsewhere",
+                    metadata={},
+                )
+                reply_lines = [response.fp.readline().decode("utf-8") for _ in range(4)]
+                self.assertEqual(reply_lines[0], f"id: {reply['id']}\n")
+                self.assertEqual(reply_lines[1], "event: reply\n")
+                self.assertEqual(
+                    json.loads(reply_lines[2][len("data: ") :]),
+                    {
+                        "message_id": int(reply["id"]),
+                        "scope_type": "channel",
+                        "scope_id": "1",
+                    },
+                )
+            finally:
+                conn.close()
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_agent_approval_http_body_maps_choice_to_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

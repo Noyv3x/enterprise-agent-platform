@@ -8,6 +8,7 @@ import {
   refreshActiveChat,
   selectChannel,
 } from "./chatActions";
+import { loadOlderMessages } from "./loaders";
 
 function response(status: number, body: unknown) {
   return {
@@ -118,7 +119,7 @@ describe("chat transport performance", () => {
     });
   });
 
-  it("keeps the incremental chat window bounded to the latest 100 messages", async () => {
+  it("retains already loaded history when an incremental delta arrives", async () => {
     const delta = Array.from({ length: 10 }, (_, index) => ({
       ...message(101 + index, `new ${index}`),
       scope_type: "private" as const,
@@ -143,10 +144,226 @@ describe("chat transport performance", () => {
 
     await refreshActiveChat(store);
 
-    const bounded = store.getState().privateMessages;
-    expect(bounded).toHaveLength(100);
-    expect(bounded[0]?.id).toBe(11);
-    expect(bounded[bounded.length - 1]?.id).toBe(110);
+    const retained = store.getState().privateMessages;
+    expect(retained).toHaveLength(110);
+    expect(retained[0]?.id).toBe(1);
+    expect(retained[retained.length - 1]?.id).toBe(110);
+  });
+
+  it("prepends a before_id page without advancing the forward sync cursor", async () => {
+    const fetchMock = vi.fn(async () => response(200, {
+      mode: "history",
+      messages: [
+        { ...message(99, "older 99"), scope_type: "private", scope_id: "7" },
+        { ...message(100, "older 100"), scope_type: "private", scope_id: "7" },
+        { ...message(101, "duplicate"), scope_type: "private", scope_id: "7" },
+      ],
+      has_more_before: true,
+      next_before_id: 99,
+      message_revision: 202,
+      reset_revision: 0,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+      privateMessages: [
+        { ...message(101, "current 101"), scope_type: "private", scope_id: "7" },
+        { ...message(102, "current 102"), scope_type: "private", scope_id: "7" },
+      ],
+      messageSyncCursors: {
+        "private:7": { afterId: "102", revision: 202, resetRevision: 0 },
+      },
+      messageHistory: {
+        "private:7": {
+          nextBeforeId: "101",
+          hasMore: true,
+          loading: false,
+          error: "",
+          prependVersion: 0,
+        },
+      },
+    });
+
+    await loadOlderMessages(store, "private", "7");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/private-agent/messages?before_id=101&limit=100",
+      expect.anything(),
+    );
+    expect(store.getState().privateMessages.map((item) => item.id)).toEqual([
+      99,
+      100,
+      101,
+      102,
+    ]);
+    expect(store.getState().messageSyncCursors["private:7"]).toEqual({
+      afterId: "102",
+      revision: 202,
+      resetRevision: 0,
+    });
+    expect(store.getState().messageHistory["private:7"]).toMatchObject({
+      nextBeforeId: "99",
+      hasMore: true,
+      loading: false,
+      prependVersion: 1,
+    });
+  });
+
+  it("does not request history without a server reset boundary", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+      messageSyncCursors: { "private:7": { afterId: "101", revision: 4 } },
+      messageHistory: {
+        "private:7": {
+          nextBeforeId: "101",
+          hasMore: true,
+          loading: false,
+          error: "",
+          prependVersion: 0,
+        },
+      },
+    });
+
+    await loadOlderMessages(store, "private", "7");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.getState().messageHistory["private:7"]?.loading).toBe(false);
+  });
+
+  it("does not let a replaced history request clear or overwrite its successor", async () => {
+    const resolvers: Array<(value: ReturnType<typeof response>) => void> = [];
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<ReturnType<typeof response>>((resolve) => {
+      resolvers.push(resolve);
+    })));
+    const initialHistory = {
+      nextBeforeId: "101",
+      hasMore: true,
+      loading: false,
+      error: "",
+      prependVersion: 0,
+    };
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+      privateMessages: [
+        { ...message(101, "current"), scope_type: "private" as const, scope_id: "7" },
+      ],
+      messageSyncCursors: {
+        "private:7": { afterId: "101", revision: 4, resetRevision: 0 },
+      },
+      messageHistory: { "private:7": initialHistory },
+    });
+
+    const first = loadOlderMessages(store, "private", "7");
+    await Promise.resolve();
+    store.dispatch({
+      type: "SET_MESSAGE_HISTORY",
+      payload: { key: "private:7", history: initialHistory },
+    });
+    const second = loadOlderMessages(store, "private", "7");
+    await Promise.resolve();
+
+    resolvers[0]?.(response(200, {
+      mode: "history",
+      messages: [{ ...message(99, "superseded"), scope_type: "private", scope_id: "7" }],
+      message_revision: 4,
+      reset_revision: 0,
+      has_more_before: false,
+      next_before_id: null,
+    }));
+    await first;
+    expect(store.getState().messageHistory["private:7"]?.loading).toBe(true);
+    expect(store.getState().privateMessages.map((item) => item.id)).toEqual([101]);
+
+    resolvers[1]?.(response(200, {
+      mode: "history",
+      messages: [{ ...message(100, "successor"), scope_type: "private", scope_id: "7" }],
+      message_revision: 4,
+      reset_revision: 0,
+      has_more_before: false,
+      next_before_id: null,
+    }));
+    await second;
+    expect(store.getState().messageHistory["private:7"]?.loading).toBe(false);
+    expect(store.getState().privateMessages.map((item) => item.id)).toEqual([100, 101]);
+  });
+
+  it("discards an older history page after a destructive conversation reset", async () => {
+    let resolveHistory!: (value: ReturnType<typeof response>) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<ReturnType<typeof response>>((resolve) => {
+      resolveHistory = resolve;
+    })));
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+      privateMessages: [
+        { ...message(101, "current"), scope_type: "private" as const, scope_id: "7" },
+      ],
+      messageSyncCursors: {
+        "private:7": { afterId: "101", revision: 4, resetRevision: 0 },
+      },
+      messageHistory: {
+        "private:7": {
+          nextBeforeId: "101",
+          hasMore: true,
+          loading: false,
+          error: "",
+          prependVersion: 0,
+        },
+      },
+    });
+
+    const pending = loadOlderMessages(store, "private", "7");
+    await Promise.resolve();
+    store.dispatch({
+      type: "SET_PRIVATE_MESSAGES",
+      payload: [{ ...message(200, "after reset"), scope_type: "private", scope_id: "7" }],
+    });
+    store.dispatch({
+      type: "SET_MESSAGE_SYNC_CURSOR",
+      payload: {
+        key: "private:7",
+        cursor: { afterId: "200", revision: 5, resetRevision: 5 },
+      },
+    });
+    store.dispatch({
+      type: "SET_MESSAGE_HISTORY",
+      payload: {
+        key: "private:7",
+        history: {
+          nextBeforeId: null,
+          hasMore: false,
+          loading: false,
+          error: "",
+          prependVersion: 0,
+        },
+      },
+    });
+    resolveHistory(response(200, {
+      mode: "history",
+      messages: [{ ...message(99, "stale"), scope_type: "private", scope_id: "7" }],
+      message_revision: 4,
+      reset_revision: 0,
+      has_more_before: false,
+      next_before_id: null,
+    }));
+    await pending;
+
+    expect(store.getState().privateMessages.map((item) => item.id)).toEqual([200]);
+    expect(store.getState().messageSyncCursors["private:7"]?.resetRevision).toBe(5);
+    expect(store.getState().messageHistory["private:7"]).toMatchObject({
+      hasMore: false,
+      loading: false,
+      prependVersion: 0,
+    });
   });
 
   it("coalesces a revision event received while an older refresh is in flight", async () => {

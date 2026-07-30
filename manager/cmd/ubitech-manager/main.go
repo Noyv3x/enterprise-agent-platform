@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	"github.com/ubitech/agent-platform/manager/internal/gateway"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/logstore"
+	"github.com/ubitech/agent-platform/manager/internal/maintenance"
 	"github.com/ubitech/agent-platform/manager/internal/model"
 	"github.com/ubitech/agent-platform/manager/internal/operation"
 	"github.com/ubitech/agent-platform/manager/internal/release"
@@ -38,17 +40,20 @@ import (
 var version = "development"
 
 type application struct {
-	config       config.Config
-	configs      *config.Manager
-	state        *journal.Store
-	docker       *driver.DockerCLI
-	operations   *operation.Orchestrator
-	sandboxes    *sandbox.Manager
-	selfUpdate   *selfupdate.Manager
-	processes    *executor.ProcessManager
-	audit        *logstore.Store
-	api          *control.API
-	fixedStackMu sync.Locker
+	config          config.Config
+	configs         *config.Manager
+	state           *journal.Store
+	docker          *driver.DockerCLI
+	operations      *operation.Orchestrator
+	sandboxes       *sandbox.Manager
+	selfUpdate      *selfupdate.Manager
+	snapshots       snapshot.Store
+	processes       *executor.ProcessManager
+	audit           *logstore.Store
+	api             *control.API
+	fixedStackMu    sync.Locker
+	maintenanceMu   *maintenance.Admission
+	maintenanceWake chan struct{}
 }
 
 type currentRecoveryPolicy struct {
@@ -233,10 +238,11 @@ func build(path string) (*application, error) {
 	}
 	audit := logstore.New(filepath.Join(cfg.StateDir, "logs", "audit.jsonl"), cfg.LogMaxBytes, cfg.LogBackups)
 	dataDir := cfg.PlatformDataDir()
-	snapshots := snapshot.Store{DataDir: dataDir, BackupDir: filepath.Join(cfg.DataRoot, "backups"), Retention: time.Duration(contract.MigrationBackupRetentionSeconds) * time.Second}
+	snapshots := snapshot.Store{DataDir: dataDir, BackupDir: filepath.Join(cfg.DataRoot, "backups"), Retention: time.Duration(contract.MigrationBackupRetentionSeconds) * time.Second, StagingRetention: time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second}
 	selfUpdater := &selfupdate.Manager{Root: filepath.Join(cfg.StateDir, "manager-binaries"), StatePath: filepath.Join(cfg.StateDir, "manager-binaries.json"), InstallPath: managerInstallPath(), SocketPath: cfg.SocketPath, ControlTokenFile: controlTokenPath, UnitName: "ubitech-agent-manager.service", RunningVersion: version}
 	fixedStackMu := &sync.Mutex{}
-	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, SelfUpdate: selfUpdater, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval, FixedStackMu: fixedStackMu}
+	maintenanceMu := &maintenance.Admission{}
+	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, SelfUpdate: selfUpdater, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval, FixedStackMu: fixedStackMu, MaintenanceMu: maintenanceMu}
 	selfUpdater.Client = ops.ReleaseClient
 	image := cfg.SandboxImage
 	if current := state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
@@ -246,7 +252,15 @@ func build(path string) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandboxes.MaintenanceMu = maintenanceMu
+	maintenanceWake := make(chan struct{}, 1)
 	ops.OnCommit = func(manifest release.Manifest) { sandboxes.SetImage(manifest.Images["agent-sandbox"]) }
+	ops.OnFinalized = func(release.Manifest) {
+		select {
+		case maintenanceWake <- struct{}{}:
+		default:
+		}
+	}
 	processes := executor.NewProcessManager(docker, sandboxes, cfg.CommandMaxBytes)
 	ops.LocalActiveProcesses = processes.ActiveBackgroundCount
 	execution := &executor.Service{Audits: executor.AuditStore{Dir: filepath.Join(cfg.StateDir, "control"), Log: audit}, Processes: processes, Files: executor.FileService{Sandboxes: sandboxes, MaxBytes: 10 << 20}}
@@ -256,7 +270,11 @@ func build(path string) (*application, error) {
 		return nil, fmt.Errorf("identify running Manager executable: %w", err)
 	}
 	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken, ManagerVersion: version, ManagerSHA256: runningSHA}
-	return &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu}, nil
+	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake}
+	ops.ReclaimCapacity = func(ctx context.Context, operationID string, manifest release.Manifest) error {
+		return app.reconcileMaintenanceWithProtection(ctx, operationID, &manifest)
+	}
+	return app, nil
 }
 
 func preflightCommand(arguments []string) error {
@@ -301,6 +319,9 @@ func serveCommand(arguments []string) error {
 		return err
 	}
 	defer func() { _ = listener.Close(); _ = os.Remove(app.config.SocketPath) }()
+	gatewayControl := newGatewayController(app)
+	app.configs.SetLANApply(gatewayControl.ApplyLANConfig)
+	app.operations.PublicProbe = gatewayControl.Health
 	server := &http.Server{Handler: app.api, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
 	serveErrors := make(chan error, 1)
 	go func() {
@@ -308,8 +329,6 @@ func serveCommand(arguments []string) error {
 			serveErrors <- err
 		}
 	}()
-	gatewayControl := newGatewayController(app)
-	app.operations.PublicProbe = gatewayControl.Health
 	go gatewayControl.Run()
 	defer gatewayControl.Stop()
 	if pendingActivation {
@@ -519,14 +538,19 @@ func (a *application) background(ctx context.Context) {
 	defer updateTicker.Stop()
 	go runReconciliationLoop(ctx, 2*time.Second, capabilityRetryDelay, a.reconcileCapabilities)
 	go runReconciliationLoop(ctx, 5*time.Second, firecrawlRetryDelay, a.reconcileFirecrawl)
+	go runTriggeredReconciliationLoop(ctx, 3*time.Minute, maintenanceRetryDelay, a.maintenanceWake, a.reconcileMaintenance)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-sandboxTicker.C:
-			_, _ = a.sandboxes.Reap(ctx, now)
 			if current := a.state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
 				a.sandboxes.SetImage(current.Images["agent-sandbox"])
+			}
+			_, reapErr := a.sandboxes.Reap(ctx, now)
+			refreshed, refreshErr := a.sandboxes.ReconcileImages(ctx, now)
+			if err := errors.Join(reapErr, refreshErr); err != nil && a.audit != nil {
+				_ = a.audit.Append(logstore.Event{At: now.UTC(), Type: "sandbox.reconcile_failed", Details: map[string]any{"images_refreshed": len(refreshed)}, Error: journal.BoundDiagnostic(err.Error())})
 			}
 		case now := <-updateTicker.C:
 			if a.operations.RecoveryPending() {
@@ -562,6 +586,38 @@ func runReconciliationLoop(
 			}
 			timer.Reset(retryDelay(failures))
 		}
+	}
+}
+
+func runTriggeredReconciliationLoop(
+	ctx context.Context,
+	initialDelay time.Duration,
+	retryDelay func(int) time.Duration,
+	trigger <-chan struct{},
+	reconcile func(context.Context) error,
+) {
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		case <-trigger:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		if err := reconcile(ctx); err != nil {
+			failures++
+		} else {
+			failures = 0
+		}
+		timer.Reset(retryDelay(failures))
 	}
 }
 
@@ -688,6 +744,190 @@ func firecrawlRetryDelay(failures int) time.Duration {
 	return delay
 }
 
+func maintenanceRetryDelay(failures int) time.Duration {
+	if failures <= 0 {
+		return 30 * time.Minute
+	}
+	delay := 15 * time.Minute
+	for attempt := 1; attempt < failures && delay < 6*time.Hour; attempt++ {
+		delay *= 2
+	}
+	if delay > 6*time.Hour {
+		return 6 * time.Hour
+	}
+	return delay
+}
+
+// reconcileMaintenance runs only at an idle, fully-finalized generation
+// boundary. Every removable path is revalidated by its owning subsystem; an
+// unknown directory or image is retained rather than guessed to be obsolete.
+func (a *application) reconcileMaintenance(ctx context.Context) error {
+	return a.reconcileMaintenanceWithProtection(ctx, "", nil)
+}
+
+func (a *application) reconcileMaintenanceForOperation(ctx context.Context, allowedOperationID string) error {
+	return a.reconcileMaintenanceWithProtection(ctx, allowedOperationID, nil)
+}
+
+func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, allowedOperationID string, additional *release.Manifest) error {
+	if a.maintenanceMu == nil {
+		return errors.New("maintenance admission is unavailable")
+	}
+	a.maintenanceMu.Lock()
+	state := a.state.State()
+	if !maintenanceStateEligible(state, allowedOperationID) {
+		a.maintenanceMu.Unlock()
+		return nil
+	}
+	unfinished, err := a.state.UnfinishedOperations()
+	if err != nil {
+		a.maintenanceMu.Unlock()
+		return fmt.Errorf("inspect unfinished operations before maintenance: %w", err)
+	}
+	for _, operation := range unfinished {
+		if operation.ID != allowedOperationID {
+			a.maintenanceMu.Unlock()
+			return nil
+		}
+	}
+	if a.processes != nil && a.processes.ActiveBackgroundCount() > 0 {
+		a.maintenanceMu.Unlock()
+		return nil
+	}
+	selfState, err := a.selfUpdate.State()
+	if err != nil {
+		a.maintenanceMu.Unlock()
+		return fmt.Errorf("inspect Manager self-update state before maintenance: %w", err)
+	}
+	if selfState.Activation != nil {
+		a.maintenanceMu.Unlock()
+		return nil
+	}
+	protectedSnapshots := map[string]struct{}{}
+	protectedIDs := map[string]struct{}{}
+	protectedImages := map[string]struct{}{}
+	for _, generation := range []*model.Generation{state.Current, state.Previous, state.Candidate} {
+		if generation == nil {
+			continue
+		}
+		if generation.ID != "" {
+			protectedIDs[generation.ID] = struct{}{}
+		}
+		if generation.RollbackSnapshotPath != "" {
+			protectedSnapshots[generation.RollbackSnapshotPath] = struct{}{}
+		}
+		for name, image := range generation.Images {
+			if release.IsManagedImageName(name) && release.IsDigestReference(image) {
+				protectedImages[image] = struct{}{}
+			}
+		}
+	}
+	if additional != nil {
+		if additional.ID() != "" {
+			protectedIDs[additional.ID()] = struct{}{}
+		}
+		for name, image := range additional.Images {
+			if release.IsManagedImageName(name) && release.IsDigestReference(image) {
+				protectedImages[image] = struct{}{}
+			}
+		}
+	}
+	heldImages := map[string]struct{}{}
+	for _, record := range a.sandboxes.Records() {
+		if record.ActiveCalls > 0 || record.BackgroundProcesses > 0 {
+			a.maintenanceMu.Unlock()
+			return nil
+		}
+		if release.IsDigestReference(record.Image) {
+			heldImages[record.Image] = struct{}{}
+		}
+	}
+	for _, version := range []*selfupdate.Version{selfState.Current, selfState.Previous, selfState.Candidate} {
+		if version != nil && len(version.SourceCommit) == 40 {
+			protectedIDs[version.SourceCommit] = struct{}{}
+		}
+	}
+	planGeneration := state.Generation
+	expectedEpoch := a.maintenanceMu.Epoch() + 1
+	a.maintenanceMu.Unlock()
+	aborted := false
+	removalGuard := release.RemovalGuard(func() (func(), bool) {
+		if aborted {
+			return func() {}, false
+		}
+		a.maintenanceMu.Lock()
+		current := a.state.State()
+		if a.maintenanceMu.Epoch() != expectedEpoch || current.Generation != planGeneration || !maintenanceStateEligible(current, allowedOperationID) || a.processes != nil && a.processes.ActiveBackgroundCount() > 0 {
+			aborted = true
+			nextEpoch := a.maintenanceMu.Epoch() + 1
+			a.maintenanceMu.Unlock()
+			expectedEpoch = nextEpoch
+			return func() {}, false
+		}
+		for _, record := range a.sandboxes.Records() {
+			if record.ActiveCalls > 0 || record.BackgroundProcesses > 0 {
+				aborted = true
+				nextEpoch := a.maintenanceMu.Epoch() + 1
+				a.maintenanceMu.Unlock()
+				expectedEpoch = nextEpoch
+				return func() {}, false
+			}
+		}
+		return func() {
+			nextEpoch := a.maintenanceMu.Epoch() + 1
+			a.maintenanceMu.Unlock()
+			expectedEpoch = nextEpoch
+		}, true
+	})
+	now := time.Now().UTC()
+	snapshots := a.snapshots
+	snapshots.RemovalGuard = removalGuard
+	snapshotCount, snapshotErr := snapshots.Prune(ctx, now, protectedSnapshots)
+	releaseCount, releaseErr := maintenance.PruneReleases(ctx, now, maintenance.ReleasePolicy{
+		Root:            filepath.Join(a.config.StateDir, "releases"),
+		Channel:         a.config.ReleaseChannel,
+		Retention:       time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second,
+		ProtectedIDs:    protectedIDs,
+		ProtectedImages: protectedImages,
+		HeldImages:      heldImages,
+		Images:          a.docker,
+		RemovalGuard:    removalGuard,
+	})
+	// Manager binaries are serialized by their dedicated recovery lock inside
+	// PruneVersions. Do not invert that lock with admission by adding the generic
+	// removal guard here.
+	managerVersionCount, managerVersionErr := a.selfUpdate.PruneVersions(ctx, now, time.Duration(contract.ObsoleteArtifactRetentionSeconds)*time.Second)
+	err = errors.Join(snapshotErr, releaseErr, managerVersionErr)
+	if a.audit != nil && (snapshotCount > 0 || releaseCount > 0 || managerVersionCount > 0 || err != nil) {
+		event := logstore.Event{
+			At:      now,
+			Type:    "manager.maintenance",
+			Details: map[string]any{"snapshots_removed": snapshotCount, "releases_removed": releaseCount, "manager_versions_removed": managerVersionCount},
+		}
+		if err != nil {
+			event.Error = journal.BoundDiagnostic(err.Error())
+		}
+		_ = a.audit.Append(event)
+	}
+	return err
+}
+
+func maintenanceStateEligible(state model.ManagerState, allowedOperationID string) bool {
+	if state.FinalizePendingOperationID != "" || state.Maintenance {
+		return false
+	}
+	if state.ActiveOperationID != "" && state.ActiveOperationID != allowedOperationID {
+		return false
+	}
+	if allowedOperationID == "" {
+		return state.ActiveOperationID == "" && state.PublicState == model.StateIdle && state.Current != nil
+	}
+	if state.ActiveOperationID != allowedOperationID {
+		return false
+	}
+	return state.PublicState == model.StateIdle || state.PublicState == model.StateWaitingForTasks
+}
+
 func autoUpdateDue(last, now time.Time, interval time.Duration) bool {
 	if interval <= 0 {
 		interval = 5 * time.Minute
@@ -714,10 +954,17 @@ func (a *application) autoUpdate(ctx context.Context) {
 }
 
 type gatewayController struct {
-	app      *application
-	mu       sync.Mutex
-	server   *http.Server
-	listener net.Listener
+	app            *application
+	mu             sync.Mutex
+	server         *http.Server
+	listener       net.Listener
+	handler        *gateway.Handler
+	lanServer      *http.Server
+	lanListener    net.Listener
+	lanHandler     *gateway.Handler
+	lanAddress     string
+	lanInitialized bool
+	lanLastError   error
 }
 
 func newGatewayController(app *application) *gatewayController { return &gatewayController{app: app} }
@@ -735,23 +982,106 @@ func (g *gatewayController) Run() {
 	}
 }
 func (g *gatewayController) Start() error {
+	cfg := g.app.configs.Config()
+	g.mu.Lock()
+	active, lanErr, err := g.startLocked(cfg)
+	g.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	g.app.configs.SetLANStatus(active, lanErr)
+	return nil
+}
+
+func (g *gatewayController) startLocked(cfg config.Config) (bool, error, error) {
+	trusted, err := config.TrustedIngressPrefixes(cfg.TrustedIngressCIDRs)
+	if err != nil {
+		return false, nil, err
+	}
+	if g.listener == nil {
+		listener, listenErr := gateway.Listener(g.app.config.GatewayAddress)
+		if listenErr != nil {
+			return false, nil, listenErr
+		}
+		handler, handlerErr := gateway.NewHandlerWithAccess(g.app.state, g.app.config.PlatformURL, gateway.AccessPolicy{TrustedIngressPrefixes: trusted})
+		if handlerErr != nil {
+			_ = listener.Close()
+			return false, nil, handlerErr
+		}
+		g.listener = listener
+		g.handler = handler
+		g.server = gateway.Server(listener, handler)
+	} else {
+		g.handler.SetAccessPolicy(gateway.AccessPolicy{TrustedIngressPrefixes: trusted})
+	}
+	if g.lanInitialized {
+		return g.lanListener != nil, g.lanLastError, nil
+	}
+	active, lanErr := g.applyLANConfigLocked(cfg, trusted)
+	if lanErr == nil {
+		g.lanInitialized = true
+	}
+	g.lanLastError = lanErr
+	return active, lanErr, nil
+}
+
+// ApplyLANConfig is the synchronous configuration commit hook. It binds a new
+// listener before replacing the old one and does not call back into the config
+// manager, which holds its transaction lock while invoking this method.
+func (g *gatewayController) ApplyLANConfig(cfg config.Config) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.listener != nil {
-		return nil
-	}
-	listener, err := gateway.Listener(g.app.config.GatewayAddress)
+	trusted, err := config.TrustedIngressPrefixes(cfg.TrustedIngressCIDRs)
 	if err != nil {
-		return err
+		return g.lanListener != nil, err
 	}
-	handler, err := gateway.NewHandler(g.app.state, g.app.config.PlatformURL)
+	active, err := g.applyLANConfigLocked(cfg, trusted)
+	if err == nil {
+		g.lanInitialized = true
+	}
+	g.lanLastError = err
+	return active, err
+}
+
+func (g *gatewayController) applyLANConfigLocked(cfg config.Config, trusted []netip.Prefix) (bool, error) {
+	if !cfg.LANEnabled {
+		g.stopLANLocked()
+		if g.handler != nil {
+			g.handler.SetAccessPolicy(gateway.AccessPolicy{TrustedIngressPrefixes: trusted})
+		}
+		return false, nil
+	}
+	direct, err := config.DirectAccessPrefixes(cfg.DirectAccessCIDRs)
+	if err != nil {
+		return g.lanListener != nil, err
+	}
+	access := gateway.AccessPolicy{AllowedRemotePrefixes: direct, TrustedIngressPrefixes: trusted}
+	if g.lanListener != nil && g.lanAddress == cfg.LANAddress {
+		g.lanHandler.SetAccessPolicy(access)
+		if g.handler != nil {
+			g.handler.SetAccessPolicy(gateway.AccessPolicy{TrustedIngressPrefixes: trusted})
+		}
+		return true, nil
+	}
+	listener, err := gateway.TCPListener(cfg.LANAddress)
+	if err != nil {
+		return g.lanListener != nil, err
+	}
+	handler, err := gateway.NewHandlerWithAccess(g.app.state, g.app.config.PlatformURL, access)
 	if err != nil {
 		_ = listener.Close()
-		return err
+		return g.lanListener != nil, err
 	}
-	g.listener = listener
-	g.server = gateway.Server(listener, handler)
-	return nil
+	oldServer, oldListener := g.lanServer, g.lanListener
+	g.lanAddress = cfg.LANAddress
+	g.lanListener = listener
+	g.lanHandler = handler
+	g.lanServer = gateway.Server(listener, handler)
+	if g.handler != nil {
+		g.handler.SetAccessPolicy(gateway.AccessPolicy{TrustedIngressPrefixes: trusted})
+	}
+	shutdownListener(oldServer, oldListener)
+	return true, nil
 }
 func (g *gatewayController) Health(ctx context.Context) error {
 	if err := g.Start(); err != nil {
@@ -772,7 +1102,7 @@ func (g *gatewayController) Health(ctx context.Context) error {
 }
 func (g *gatewayController) Stop() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.stopLANLocked()
 	if g.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_ = g.server.Shutdown(ctx)
@@ -783,6 +1113,29 @@ func (g *gatewayController) Stop() {
 	}
 	g.server = nil
 	g.listener = nil
+	g.handler = nil
+	g.mu.Unlock()
+}
+
+func (g *gatewayController) stopLANLocked() {
+	shutdownListener(g.lanServer, g.lanListener)
+	g.lanServer = nil
+	g.lanListener = nil
+	g.lanHandler = nil
+	g.lanAddress = ""
+	g.lanInitialized = false
+	g.lanLastError = nil
+}
+
+func shutdownListener(server *http.Server, listener net.Listener) {
+	if server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = server.Shutdown(ctx)
+		cancel()
+	}
+	if listener != nil {
+		_ = listener.Close()
+	}
 }
 
 func managerClient(configPath string) (control.Client, config.Config, error) {

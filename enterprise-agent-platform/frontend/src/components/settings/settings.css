@@ -2,6 +2,17 @@
   width: min(920px, 100%);
 }
 
+.notification-setting {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.notification-setting .ant-typography {
+  margin-bottom: 0;
+}
+
 .account-identity {
   padding: 0;
 }
@@ -85,6 +96,68 @@
   margin-top: 16px;
 }
 
+.mail-settings__description {
+  margin-block-end: 16px;
+}
+
+.mail-settings__empty {
+  display: grid;
+  gap: 4px;
+  padding: 20px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+
+.mail-account-list {
+  display: grid;
+  gap: 10px;
+}
+
+.mail-account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.mail-account__identity {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.mail-account__identity > .eap-typography {
+  overflow-wrap: anywhere;
+}
+
+.mail-account__error {
+  max-width: 720px;
+}
+
+.mail-account__actions {
+  flex: none;
+}
+
+.mail-server-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 112px minmax(150px, 0.6fr);
+  gap: 12px;
+}
+
+.mail-server-grid .eap-input-number {
+  width: 100%;
+}
+
+.mail-settings__security {
+  margin-block-start: 18px;
+}
+
 @media (max-width: 800px) {
   .account-identity__body {
     grid-template-columns: auto minmax(0, 1fr);
@@ -98,6 +171,15 @@
   .settings-card .form-actions {
     justify-content: flex-start;
   }
+
+  .mail-account {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .mail-account__actions {
+    width: 100%;
+  }
 }
 
 @media (max-width: 560px) {
@@ -107,5 +189,10 @@
 
   .settings-card .form-actions > .eap-btn {
     width: 100%;
+  }
+
+  .mail-server-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
   }
 }

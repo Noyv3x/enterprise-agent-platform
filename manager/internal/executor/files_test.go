@@ -3,10 +3,13 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ubitech/agent-platform/manager/internal/sandbox"
 )
 
 func executeSandboxFile(t *testing.T, service *Service, action string, arguments any) (string, map[string]any, error) {
@@ -18,6 +21,20 @@ func executeSandboxFile(t *testing.T, service *Service, action string, arguments
 	return service.Files.Execute(context.Background(), Call{
 		Identity:  identity(),
 		Target:    "sandbox",
+		Action:    action,
+		Arguments: raw,
+	})
+}
+
+func executeHostFile(t *testing.T, service *Service, action string, arguments any) (string, map[string]any, error) {
+	t.Helper()
+	raw, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service.Files.Execute(context.Background(), Call{
+		Identity:  identity(),
+		Target:    "host",
 		Action:    action,
 		Arguments: raw,
 	})
@@ -112,6 +129,117 @@ func TestSandboxFileActionsRejectSymlinkEscape(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "new.txt")); !os.IsNotExist(err) {
 		t.Fatalf("write created an outside file: %v", err)
+	}
+}
+
+func TestHostFileActionsRejectParentSymlinksAndManagerPaths(t *testing.T) {
+	service, root := newTestService(t)
+	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := filepath.Join(root, "data", "workspaces", "user-1")
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secretPath := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("outside-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(workspace, "escape")); err != nil {
+		t.Fatal(err)
+	}
+
+	for action, arguments := range map[string]any{
+		"read":   fileReadArguments{Path: "/workspace/escape/secret.txt"},
+		"write":  fileWriteArguments{Path: "/workspace/escape/new.txt", Content: "created outside"},
+		"patch":  filePatchArguments{Path: "/workspace/escape/secret.txt", OldText: "outside", NewText: "changed"},
+		"search": fileSearchArguments{Path: "/workspace/escape", Query: "outside-secret"},
+	} {
+		t.Run(action+"_parent_symlink", func(t *testing.T) {
+			if _, _, err := executeHostFile(t, service, action, arguments); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+				t.Fatalf("host %s followed a parent symlink: %v", action, err)
+			}
+		})
+	}
+	if content, err := os.ReadFile(secretPath); err != nil || string(content) != "outside-secret" {
+		t.Fatalf("outside file changed: %q %v", content, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("host write escaped through symlink: %v", err)
+	}
+
+	managerSecret := filepath.Join(root, "manager", "secrets", "manager-token")
+	if err := os.MkdirAll(filepath.Dir(managerSecret), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managerSecret, []byte("manager-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for action, arguments := range map[string]any{
+		"read":   fileReadArguments{Path: managerSecret},
+		"write":  fileWriteArguments{Path: managerSecret, Content: "changed"},
+		"patch":  filePatchArguments{Path: managerSecret, OldText: "manager", NewText: "changed"},
+		"search": fileSearchArguments{Path: filepath.Dir(managerSecret), Query: "manager-secret"},
+	} {
+		t.Run(action+"_manager_path", func(t *testing.T) {
+			if _, _, err := executeHostFile(t, service, action, arguments); err == nil || !strings.Contains(err.Error(), "protected") {
+				t.Fatalf("host %s accessed Manager state: %v", action, err)
+			}
+		})
+	}
+
+	result, _, err := executeHostFile(t, service, "search", fileSearchArguments{Path: root, Query: "manager-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "No matches" {
+		t.Fatalf("broad host search entered protected Manager state: %q", result)
+	}
+}
+
+func TestManagedPatchKeepsTheVerifiedParentDirectoryPinned(t *testing.T) {
+	service, root := newTestService(t)
+	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/target/file.txt", Content: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	call := Call{Identity: identity(), Target: "host"}
+	path, err := service.Files.hostPath(call, "/workspace/target/file.txt", sandbox.HostPathWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, parent, leaf, err := openManagedRegularForUpdate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	data, err := io.ReadAll(file)
+	_ = file.Close()
+	if err != nil || string(data) != "original" {
+		t.Fatalf("read pinned file: %q %v", data, err)
+	}
+
+	workspace := filepath.Join(root, "data", "workspaces", "user-1")
+	target := filepath.Join(workspace, "target")
+	pinned := filepath.Join(workspace, "target-pinned")
+	if err := os.Rename(target, pinned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "file.txt"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManagedFileAt(parent, leaf, []byte("patched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(filepath.Join(pinned, "file.txt")); err != nil || string(content) != "patched" {
+		t.Fatalf("pinned file was not patched: %q %v", content, err)
+	}
+	if content, err := os.ReadFile(filepath.Join(target, "file.txt")); err != nil || string(content) != "replacement" {
+		t.Fatalf("replacement pathname was modified: %q %v", content, err)
 	}
 }
 

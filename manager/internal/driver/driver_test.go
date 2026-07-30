@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ubitech/agent-platform/manager/internal/contract"
 	"github.com/ubitech/agent-platform/manager/internal/release"
 )
 
@@ -234,6 +235,52 @@ func TestPullFailureRedactsCredentialsAndBoundsPersistedDiagnostic(t *testing.T)
 	}
 	if len(message) > pullDiagnosticMaxBytes+512 {
 		t.Fatalf("pull failure exceeded its bounded diagnostic budget: %d bytes", len(message))
+	}
+}
+
+func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T) {
+	manifest := pullTestManifest()
+	platform := manifest.Images["platform"]
+	runtimeImage := manifest.Images["agent-runtime"]
+	platformPulled := false
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .RepoDigests}}":
+			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
+		case reflect.DeepEqual(args, []string{"pull", platform}):
+			platformPulled = true
+			return Result{}, nil
+		case reflect.DeepEqual(args, []string{"pull", runtimeImage}):
+			return Result{ExitCode: 1, Stderr: "registry unavailable"}, errors.New("docker exited with 1")
+		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
+			return Result{}, nil
+		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{.Id}}":
+			if args[4] == platform && platformPulled {
+				return Result{Stdout: "sha256:" + strings.Repeat("c", 64)}, nil
+			}
+			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
+		case reflect.DeepEqual(args, []string{"image", "rm", platform}):
+			return Result{}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected command: %v", args)
+		}
+	}}
+	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second}
+	err := docker.Pull(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "managed image agent-runtime") {
+		t.Fatalf("pull failure = %v", err)
+	}
+	foundRemoval := false
+	for _, call := range runner.calls {
+		if reflect.DeepEqual(call.args, []string{"image", "rm", platform}) {
+			foundRemoval = true
+		}
+		if strings.Contains(strings.Join(call.args, " "), "--force") {
+			t.Fatalf("candidate cleanup forced a removal: %v", call.args)
+		}
+	}
+	if !foundRemoval {
+		t.Fatalf("new candidate image was not cleaned after the later pull failed: %#v", runner.calls)
 	}
 }
 
@@ -627,11 +674,13 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 	services := []string{"platform", "agent-runtime"}
 	ids := map[string]string{}
 	states := map[string]string{}
+	images := map[string]string{}
 	hexDigits := "abcdef0123456789"
 	for index, service := range services {
 		id := strings.Repeat(string(hexDigits[index]), 64)
 		ids[service] = id
 		states[id] = "running healthy\n"
+		images[service] = "registry.example/" + service + "@sha256:" + strings.Repeat(string(hexDigits[index+2]), 64)
 	}
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		if len(args) > 0 && args[0] == "compose" && slicesContain(args, "ps") {
@@ -643,6 +692,14 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 			return Result{Stdout: id + "\n"}, nil
 		}
 		if len(args) > 0 && args[0] == "inspect" {
+			if slicesContain(args, "{{.Config.Image}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}") {
+				id := args[len(args)-1]
+				for service, serviceID := range ids {
+					if id == serviceID {
+						return Result{Stdout: images[service] + "\tubitech-agent\t" + service + "\n"}, nil
+					}
+				}
+			}
 			return Result{Stdout: states[args[len(args)-1]]}, nil
 		}
 		return Result{}, nil
@@ -651,21 +708,25 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
 		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
 	}
-	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+	manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: images}
 	if err := docker.Probe(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != len(services)*2 {
-		t.Fatalf("probe made %d calls, want %d: %#v", len(runner.calls), len(services)*2, runner.calls)
+	if len(runner.calls) != len(services)*3 {
+		t.Fatalf("probe made %d calls, want %d: %#v", len(runner.calls), len(services)*3, runner.calls)
 	}
 	for index, service := range services {
-		list := strings.Join(runner.calls[index*2].args, " ")
+		list := strings.Join(runner.calls[index*3].args, " ")
 		if !strings.Contains(list, " ps --all --quiet "+service) {
 			t.Fatalf("service %s was not listed including stopped and duplicate containers: %s", service, list)
 		}
-		inspect := runner.calls[index*2+1].args
+		inspect := runner.calls[index*3+1].args
 		if inspect[0] != "inspect" || inspect[len(inspect)-1] != ids[service] {
 			t.Fatalf("service %s container was not inspected directly: %v", service, inspect)
+		}
+		identity := runner.calls[index*3+2].args
+		if identity[0] != "inspect" || identity[len(identity)-1] != ids[service] || !strings.Contains(strings.Join(identity, " "), "com.docker.compose.project") {
+			t.Fatalf("service %s immutable identity was not inspected: %v", service, identity)
 		}
 	}
 }
@@ -752,7 +813,10 @@ func TestProbeRejectsMissingDuplicateStoppedOrUnhealthyCoreContainer(t *testing.
 				Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
 				ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
 			}
-			manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{}}
+			manifest := release.Manifest{SourceCommit: strings.Repeat("f", 40), Images: map[string]string{
+				"platform":      "registry.example/platform@sha256:" + strings.Repeat("c", 64),
+				"agent-runtime": "registry.example/runtime@sha256:" + strings.Repeat("d", 64),
+			}}
 			err := docker.Probe(context.Background(), manifest)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Probe() error = %v, want containing %q", err, test.want)
@@ -1002,5 +1066,208 @@ func TestEnsureCoreNetworkCreatesMissingManagedBridge(t *testing.T) {
 	}
 	if got := strings.Join(runner.calls[1].args, " "); got != "network create --driver bridge --label org.ubitech.agent.network=core ubitech-agent-core" {
 		t.Fatalf("unexpected network creation: %s", got)
+	}
+}
+
+func TestCheckCapacityRejectsLowDiskBeforePull(t *testing.T) {
+	root := t.TempDir()
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+			return Result{Stdout: root + "\n"}, nil
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{
+		Runner:   runner,
+		DataRoot: root,
+		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 4096, AvailableBlock: 1024, Favail: 10000, FilesystemID: "same"}, nil
+		},
+	}
+	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err == nil || !strings.Contains(err.Error(), "insufficient free space") {
+		t.Fatalf("low disk capacity was accepted: %v", err)
+	}
+}
+
+func TestCheckCapacityRejectsLowAvailableInodes(t *testing.T) {
+	root := t.TempDir()
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+			return Result{Stdout: root + "\n"}, nil
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{
+		Runner: runner, DataRoot: root,
+		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 4096, AvailableBlock: 10 << 20, Favail: 100, FilesystemID: "same"}, nil
+		},
+	}
+	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err == nil || !strings.Contains(err.Error(), "insufficient free inodes") {
+		t.Fatalf("low available inode capacity was accepted: %v", err)
+	}
+}
+
+func TestCheckCapacityBudgetsOnlyMissingCoreDigests(t *testing.T) {
+	root := t.TempDir()
+	platform := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
+	runtimeImage := "registry.example/runtime@sha256:" + strings.Repeat("b", 64)
+	runtimePresent := false
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
+			return Result{Stdout: root + "\n"}, nil
+		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect":
+			image := args[len(args)-1]
+			if image == platform || runtimePresent {
+				return Result{Stdout: "[\"" + image + "\"]\n"}, nil
+			}
+			return Result{ExitCode: 1, Stderr: "Error: No such image"}, errors.New("docker exited with 1")
+		default:
+			return Result{}, fmt.Errorf("unexpected command: %v", args)
+		}
+	}}
+	available := uint64(19 << 30)
+	docker := DockerCLI{
+		Runner: runner, DataRoot: root,
+		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: available, Favail: 10000, FilesystemID: "same"}, nil
+		},
+	}
+	manifest := release.Manifest{Images: map[string]string{"platform": platform, "agent-runtime": runtimeImage}}
+	err := docker.CheckCapacity(context.Background(), CapacityPreDownload, manifest)
+	var capacityErr *CapacityError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("missing runtime image did not produce a capacity error: %v", err)
+	}
+	want := uint64(20 << 30)
+	if capacityErr.Require != want {
+		t.Fatalf("required capacity = %d, want %d", capacityErr.Require, want)
+	}
+	runtimePresent = true
+	if err := docker.CheckCapacity(context.Background(), CapacityPreDownload, manifest); err != nil {
+		t.Fatalf("locally present digests still consumed pull budget: %v", err)
+	}
+}
+
+func TestCheckCapacityAddsConservativeSnapshotBytesOnlyToDataFilesystem(t *testing.T) {
+	root := t.TempDir()
+	dockerRoot := filepath.Join(root, "docker")
+	if err := os.MkdirAll(dockerRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+			return Result{Stdout: dockerRoot + "\n"}, nil
+		}
+		return Result{}, fmt.Errorf("unexpected command: %v", args)
+	}}
+	snapshotBytes := uint64(5 << 30)
+	dataAvailable := uint64(contract.UpdatePreCutoverMinFreeBytes) + snapshotBytes - 1
+	dockerAvailable := uint64(contract.UpdatePreCutoverMinFreeBytes)
+	docker := DockerCLI{
+		Runner: runner, DataRoot: root,
+		SnapshotRequired: func(_ context.Context, path string) (uint64, error) {
+			if path != filepath.Join(root, "data") {
+				t.Fatalf("snapshot data path = %q", path)
+			}
+			return snapshotBytes, nil
+		},
+		FilesystemStat: func(_ context.Context, path string) (CapacityFilesystemStat, error) {
+			if filepath.Clean(path) == filepath.Clean(root) {
+				return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: dataAvailable, Favail: 10000, FilesystemID: "data"}, nil
+			}
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: dockerAvailable, Favail: 10000, FilesystemID: "docker"}, nil
+		},
+	}
+	err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{})
+	var capacityErr *CapacityError
+	if !errors.As(err, &capacityErr) || capacityErr.Path != root || capacityErr.Require != uint64(contract.UpdatePreCutoverMinFreeBytes)+snapshotBytes {
+		t.Fatalf("snapshot capacity failure = %#v / %v", capacityErr, err)
+	}
+	dataAvailable++
+	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err != nil {
+		t.Fatalf("sufficient per-filesystem snapshot capacity was rejected: %v", err)
+	}
+}
+
+func TestCheckCapacityDeduplicatesSnapshotAndDockerOnSameFilesystem(t *testing.T) {
+	root := t.TempDir()
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+			return Result{Stdout: root + "\n"}, nil
+		}
+		return Result{}, fmt.Errorf("unexpected command: %v", args)
+	}}
+	snapshotBytes := uint64(3 << 30)
+	want := uint64(contract.UpdatePreCutoverMinFreeBytes) + snapshotBytes
+	docker := DockerCLI{
+		Runner: runner, DataRoot: root,
+		SnapshotRequired: func(context.Context, string) (uint64, error) { return snapshotBytes, nil },
+		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: want, Favail: 10000, FilesystemID: "same"}, nil
+		},
+	}
+	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err != nil {
+		t.Fatalf("same-filesystem requirements were summed twice: %v", err)
+	}
+}
+
+func TestPruneManagedImagesKeepsContainerReferencesAndNeverForces(t *testing.T) {
+	inUse := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
+	obsolete := "registry.example/runtime@sha256:" + strings.Repeat("b", 64)
+	containerID := strings.Repeat("c", 64)
+	inUseImageID := "sha256:" + strings.Repeat("d", 64)
+	obsoleteImageID := "sha256:" + strings.Repeat("e", 64)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
+			return Result{Stdout: containerID + "\n"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: inUse + "\t" + inUseImageID + "\n"}, nil
+		case len(args) > 1 && args[0] == "image" && args[1] == "inspect":
+			return Result{Stdout: obsoleteImageID + "\n"}, nil
+		}
+		return Result{}, nil
+	}}
+	disposition, err := (DockerCLI{Runner: runner}).PruneManagedImages(context.Background(), []string{inUse, obsolete}, map[string]struct{}{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition[inUse] || !disposition[obsolete] {
+		t.Fatalf("unexpected image dispositions: %#v", disposition)
+	}
+	if len(runner.calls) != 4 || !reflect.DeepEqual(runner.calls[3].args, []string{"image", "rm", obsolete}) {
+		t.Fatalf("cleanup used an unsafe command sequence: %#v", runner.calls)
+	}
+}
+
+func TestPruneManagedImagesProtectsContainerByResolvedImageID(t *testing.T) {
+	candidate := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
+	containerID := strings.Repeat("b", 64)
+	imageID := "sha256:" + strings.Repeat("c", 64)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
+			return Result{Stdout: containerID + "\n"}, nil
+		case len(args) > 0 && args[0] == "inspect":
+			return Result{Stdout: "registry.example/platform:local\t" + imageID + "\n"}, nil
+		case len(args) > 1 && args[0] == "image" && args[1] == "inspect":
+			return Result{Stdout: imageID + "\n"}, nil
+		default:
+			return Result{}, errors.New("unexpected mutation")
+		}
+	}}
+	disposition, err := (DockerCLI{Runner: runner}).PruneManagedImages(context.Background(), []string{candidate}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition[candidate] {
+		t.Fatalf("container image ID consumer was ignored: %#v", disposition)
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 1 && call.args[0] == "image" && call.args[1] == "rm" {
+			t.Fatalf("in-use image was removed: %#v", runner.calls)
+		}
 	}
 }

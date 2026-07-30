@@ -209,6 +209,33 @@ const screenshotEncodingAfter = `    const { tabState } = found;
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
     res.send(buffer);`;
+const coordinateClickRequestBefore = `    const { userId, ref, selector } = req.body;`;
+const coordinateClickRequestAfter = `    const { userId, ref, selector, x, y, doubleClick = false } = req.body;
+    const coordinateX = Number(x);
+    const coordinateY = Number(y);
+    const hasCoordinate = Number.isFinite(coordinateX) && Number.isFinite(coordinateY);`;
+const coordinateClickValidationBefore = `    if (!ref && !selector) {
+      return res.status(400).json({ error: 'ref or selector required' });
+    }`;
+const coordinateClickValidationAfter = `    if (!ref && !selector && !hasCoordinate) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates required' });
+    }
+    if (hasCoordinate && (coordinateX < 0 || coordinateY < 0 || coordinateX > 16384 || coordinateY > 16384)) {
+      return res.status(400).json({ error: 'coordinates out of range' });
+    }`;
+const coordinateClickBranchBefore = `      if (ref) {
+        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        if (!locator) {
+          // Use tight timeout (4s max) to leave budget for click + post-click buildRefs`;
+const coordinateClickBranchAfter = `      if (hasCoordinate) {
+        await tabState.page.mouse.click(coordinateX, coordinateY, {
+          clickCount: doubleClick === true ? 2 : 1,
+          delay: 50,
+        });
+      } else if (ref) {
+        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        if (!locator) {
+          // Use tight timeout (4s max) to leave budget for click + post-click buildRefs`;
 const displayAfter = `    let displayStartupError = null;
     try {
       if (os.platform() === 'linux') {
@@ -314,6 +341,9 @@ applyExactPatch("browser-close-timeout-display-cleanup", closeTimeoutCleanupBefo
 applyExactPatch("scoped-browser-survivor-scan", survivorScanBefore, survivorScanAfter);
 applyExactPatch("platform-managed-display", displayBefore, displayAfter);
 applyExactPatch("low-bandwidth-screenshot-encoding", screenshotEncodingBefore, screenshotEncodingAfter);
+applyExactPatch("coordinate-click-request", coordinateClickRequestBefore, coordinateClickRequestAfter);
+applyExactPatch("coordinate-click-validation", coordinateClickValidationBefore, coordinateClickValidationAfter);
+applyExactPatch("coordinate-click-branch", coordinateClickBranchBefore, coordinateClickBranchAfter);
 
 const source = fs.readFileSync(target, "utf8");
 if (patched === source) process.exit(0);

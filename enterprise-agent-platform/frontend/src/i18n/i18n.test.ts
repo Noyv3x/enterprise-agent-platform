@@ -8,6 +8,7 @@ import { previewMessages } from "./messages/preview";
 import { scheduledTaskMessages } from "./messages/scheduledTasks";
 import { memoryMessages } from "./messages/memory";
 import { skillMessages } from "./messages/skills";
+import { mailMessages } from "./messages/mail";
 import {
   LOCALE_STORAGE_KEY,
   applyDocumentLocale,
@@ -121,6 +122,7 @@ describe("translation catalogs", () => {
       scheduledTaskMessages,
       memoryMessages,
       skillMessages,
+      mailMessages,
     ]) {
       for (const key of Object.keys(domain)) {
         if (seen.has(key)) duplicates.push(key);

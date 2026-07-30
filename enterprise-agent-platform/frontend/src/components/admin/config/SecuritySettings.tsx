@@ -17,6 +17,7 @@ import { Field } from "../../common/Field";
 import { StatusBadge } from "../../common/StatusBadge";
 import { AdminCard } from "../AdminCard";
 import { useI18n } from "../../../i18n";
+import { LANAccessSettings } from "./LANAccessSettings";
 
 interface SecurityFormState {
   publicBaseUrl: string;
@@ -87,6 +88,7 @@ export function SecuritySettings() {
   };
 
   return (
+    <div className="eap-security-settings-stack">
     <AdminCard className="config-form security-config">
       <CardHead
         title={t("admin.security.title")}
@@ -236,5 +238,7 @@ export function SecuritySettings() {
         />
       </div>
     </AdminCard>
+    <LANAccessSettings />
+    </div>
   );
 }

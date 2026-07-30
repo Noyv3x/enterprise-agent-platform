@@ -18,8 +18,6 @@ import type {
   AgentApprovalSubmitResponse,
   AgentMemoriesExportResponse,
   AgentMemoriesResponse,
-  AgentMemoryCandidateDecisionResponse,
-  AgentMemoryCandidatesResponse,
   AgentMemoryMutationRequest,
   AgentMemoryMutationResponse,
   AgentSkillCreateRequest,
@@ -52,6 +50,12 @@ import type {
   KnowledgeSearchResponse,
   LoginRequest,
   LoginResponse,
+  MailAccountCheckResponse,
+  MailAccountMutationRequest,
+  MailAccountPatchRequest,
+  MailAccountResponse,
+  MailAccountsResponse,
+  MailAccountTestResponse,
   SessionBootstrapResponse,
   MentionTargetsResponse,
   OAuthCompleteRequest,
@@ -152,6 +156,9 @@ export const endpoints = {
   ),
   channelEvents: ep<void, never, [Id]>("GET", (id) => `/api/channels/${id}/events`),
 
+  /* authenticated cross-scope Agent reply notifications */
+  agentReplyEvents: ep<void, never>("GET", () => "/api/agent/reply-events"),
+
   /* private agent */
   privateMessages: ep<void, PrivateMessagesResponse>(
     "GET",
@@ -175,6 +182,36 @@ export const endpoints = {
     () => "/api/private-agent/telegram",
   ),
   deletePrivateTelegram: ep<string, unknown>("DELETE", () => "/api/private-agent/telegram"),
+
+  /* private Agent mail */
+  privateMailAccounts: ep<void, MailAccountsResponse>(
+    "GET",
+    () => "/api/private-agent/mail/accounts",
+  ),
+  createPrivateMailAccount: ep<MailAccountMutationRequest, MailAccountResponse>(
+    "POST",
+    () => "/api/private-agent/mail/accounts",
+  ),
+  privateMailAccount: ep<void, MailAccountResponse, [Id]>(
+    "GET",
+    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}`,
+  ),
+  updatePrivateMailAccount: ep<MailAccountPatchRequest, MailAccountResponse, [Id]>(
+    "PATCH",
+    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}`,
+  ),
+  deletePrivateMailAccount: ep<void, { ok: true }, [Id]>(
+    "DELETE",
+    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}`,
+  ),
+  testPrivateMailAccount: ep<void, MailAccountTestResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}/test`,
+  ),
+  checkPrivateMailAccount: ep<void, MailAccountCheckResponse, [Id]>(
+    "POST",
+    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}/check`,
+  ),
 
   /* private Agent schedules */
   privateSchedules: ep<void, AgentSchedulesResponse>(
@@ -242,22 +279,6 @@ export const endpoints = {
     "GET",
     () => "/api/private-agent/memories/export",
   ),
-  privateAgentMemoryCandidates: ep<void, AgentMemoryCandidatesResponse, [string, number]>(
-    "GET",
-    (status, limit) => {
-      const params = new URLSearchParams({ status, limit: String(limit) });
-      return `/api/private-agent/memory-candidates?${params.toString()}`;
-    },
-  ),
-  approvePrivateAgentMemoryCandidate: ep<void, AgentMemoryCandidateDecisionResponse, [Id]>(
-    "POST",
-    (id) => `/api/private-agent/memory-candidates/${encodeURIComponent(String(id))}/approve`,
-  ),
-  rejectPrivateAgentMemoryCandidate: ep<void, AgentMemoryCandidateDecisionResponse, [Id]>(
-    "POST",
-    (id) => `/api/private-agent/memory-candidates/${encodeURIComponent(String(id))}/reject`,
-  ),
-
   /* Agent-scoped procedural skills */
   agentSkills: ep<void, AgentSkillsResponse, [ScopeType, Id, string, number]>(
     "GET",

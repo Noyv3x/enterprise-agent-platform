@@ -3,16 +3,19 @@ package snapshot
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
+	"github.com/ubitech/agent-platform/manager/internal/release"
 )
 
 type Entry struct {
@@ -31,8 +34,11 @@ type Manifest struct {
 type Store struct {
 	DataDir, BackupDir string
 	Retention          time.Duration
+	StagingRetention   time.Duration
+	RemovalGuard       release.RemovalGuard
 	renamePath         func(string, string) error
 	syncDir            func(string) error
+	copyPath           func(string, string, os.FileMode) (string, error)
 }
 
 // Verify validates a rollback snapshot without changing the live database.
@@ -43,19 +49,91 @@ func (s Store) Verify(ctx context.Context, path string) error {
 
 var managedFiles = []string{"platform.db", "platform.db-wal", "platform.db-shm", "bootstrap-admin-password.txt"}
 
+// RequiredBytes returns a conservative upper bound for one snapshot of the
+// current managed files. Sparse files are charged at their logical size, while
+// filesystems which allocate more blocks than the logical length are charged at
+// the allocated size. Callers must still recheck after quiescing admissions.
+func RequiredBytes(ctx context.Context, dataDir string) (uint64, error) {
+	var required uint64
+	for _, name := range managedFiles {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+		path := filepath.Join(dataDir, name)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("inspect snapshot source %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 {
+			return 0, fmt.Errorf("snapshot source %s is not a regular file", name)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Blocks < 0 {
+			return 0, fmt.Errorf("snapshot source %s has unavailable allocation metadata", name)
+		}
+		logical := uint64(info.Size())
+		blocks := uint64(stat.Blocks)
+		if blocks > ^uint64(0)/512 {
+			return 0, fmt.Errorf("snapshot source %s allocated size overflows", name)
+		}
+		allocated := blocks * 512
+		if allocated > logical {
+			logical = allocated
+		}
+		if required > ^uint64(0)-logical {
+			return 0, errors.New("snapshot source size total overflows")
+		}
+		required += logical
+	}
+	return required, nil
+}
+
 type validatedEntry struct {
 	entry  Entry
 	source string
 }
 
-func (s Store) Create(ctx context.Context, operationID string) (string, error) {
+func (s Store) Create(ctx context.Context, operationID string) (path string, resultErr error) {
 	if !safeID(operationID) {
 		return "", fmt.Errorf("invalid operation id")
 	}
-	dir := filepath.Join(s.BackupDir, operationID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(s.BackupDir, 0o700); err != nil {
 		return "", err
 	}
+	encodedID := base64.RawURLEncoding.EncodeToString([]byte(operationID))
+	staging, err := os.MkdirTemp(s.BackupDir, ".snapshot-"+encodedID+".*")
+	if err != nil {
+		return "", fmt.Errorf("create snapshot staging directory: %w", err)
+	}
+	if err := os.Chmod(staging, 0o700); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("restrict snapshot staging directory: %w", err)
+	}
+	published := false
+	renamed := false
+	finalPath := filepath.Join(s.BackupDir, operationID)
+	defer func() {
+		if published {
+			return
+		}
+		cleanupErr := error(nil)
+		if renamed {
+			cleanupErr = s.removeUncommittedSnapshot(finalPath, operationID)
+		} else {
+			cleanupErr = removeSnapshotStaging(staging)
+		}
+		if cleanupErr == nil {
+			cleanupErr = s.syncDirectory(s.BackupDir)
+		}
+		if cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("clean failed snapshot staging: %w", cleanupErr))
+		}
+	}()
 	manifest := Manifest{SchemaVersion: 1, OperationID: operationID, CreatedAt: time.Now().UTC()}
 	for _, name := range managedFiles {
 		select {
@@ -74,26 +152,122 @@ func (s Store) Create(ctx context.Context, operationID string) (string, error) {
 		if !info.Mode().IsRegular() {
 			return "", fmt.Errorf("snapshot source %s is not a regular file", name)
 		}
-		dest := filepath.Join(dir, name)
-		digest, err := copyFile(source, dest, info.Mode().Perm())
+		dest := filepath.Join(staging, name)
+		digest, err := s.copyFile(source, dest, info.Mode().Perm())
 		if err != nil {
 			return "", err
 		}
 		manifest.Entries = append(manifest.Entries, Entry{Path: name, Size: info.Size(), SHA256: digest, Mode: uint32(info.Mode().Perm())})
 	}
-	if err := atomicfile.WriteJSON(filepath.Join(dir, "manifest.json"), manifest, 0o600); err != nil {
+	if err := atomicfile.WriteJSON(filepath.Join(staging, "manifest.json"), manifest, 0o600); err != nil {
 		return "", err
 	}
 	// The copied files and manifest are not a durable snapshot until both the
 	// snapshot directory entries and the operation directory's entry in the
 	// backup root have reached stable storage.
-	if err := s.syncDirectory(dir); err != nil {
+	if err := s.syncDirectory(staging); err != nil {
 		return "", fmt.Errorf("sync snapshot directory: %w", err)
 	}
+	if _, err := os.Lstat(finalPath); err == nil {
+		return "", errors.New("snapshot destination already exists")
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("inspect snapshot destination: %w", err)
+	}
+	if err := os.Rename(staging, finalPath); err != nil {
+		return "", fmt.Errorf("publish snapshot directory: %w", err)
+	}
+	renamed = true
 	if err := s.syncDirectory(s.BackupDir); err != nil {
 		return "", fmt.Errorf("sync snapshot backup directory: %w", err)
 	}
-	return dir, nil
+	published = true
+	return finalPath, nil
+}
+
+func (s Store) copyFile(source, destination string, mode os.FileMode) (string, error) {
+	if s.copyPath != nil {
+		return s.copyPath(source, destination, mode)
+	}
+	return copyFile(source, destination, mode)
+}
+
+func (s Store) removeUncommittedSnapshot(path, operationID string) error {
+	manifest, _, err := s.validateSnapshot(context.Background(), path)
+	if err != nil {
+		return fmt.Errorf("validate uncommitted snapshot: %w", err)
+	}
+	var identity Manifest
+	if err := atomicfile.ReadJSON(filepath.Join(manifest, "manifest.json"), &identity); err != nil {
+		return err
+	}
+	if identity.OperationID != operationID || filepath.Base(manifest) != operationID {
+		return errors.New("uncommitted snapshot identity changed")
+	}
+	return os.RemoveAll(manifest)
+}
+
+func removeSnapshotStaging(path string) error {
+	if err := validateSnapshotStaging(path); err != nil {
+		return err
+	}
+	return os.RemoveAll(path)
+}
+
+func snapshotStagingOperationID(name string) (string, bool) {
+	const prefix = ".snapshot-"
+	if !strings.HasPrefix(name, prefix) {
+		return "", false
+	}
+	encoded, suffix, ok := strings.Cut(strings.TrimPrefix(name, prefix), ".")
+	if !ok || encoded == "" || suffix == "" {
+		return "", false
+	}
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			return "", false
+		}
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || !safeID(string(decoded)) {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func validateSnapshotStaging(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("snapshot staging path is not a private regular directory")
+	}
+	if _, ok := snapshotStagingOperationID(filepath.Base(path)); !ok {
+		return errors.New("snapshot staging path has an invalid operation identity")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() {
+		return errors.New("snapshot staging path is not owned by the Manager user")
+	}
+	allowed := map[string]struct{}{"manifest.json": {}}
+	for _, name := range managedFiles {
+		allowed[name] = struct{}{}
+	}
+	contents, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, content := range contents {
+		if _, known := allowed[content.Name()]; !known && !strings.HasPrefix(content.Name(), ".tmp-") {
+			return fmt.Errorf("unknown file in snapshot staging directory: %s", content.Name())
+		}
+		entryInfo, err := os.Lstat(filepath.Join(path, content.Name()))
+		if err != nil || !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("snapshot staging content %s is not a regular file", content.Name())
+		}
+		entryStat, ok := entryInfo.Sys().(*syscall.Stat_t)
+		if !ok || int(entryStat.Uid) != os.Getuid() {
+			return fmt.Errorf("snapshot staging content %s has invalid ownership", content.Name())
+		}
+	}
+	return nil
 }
 
 func (s Store) Restore(ctx context.Context, path string) error {
@@ -265,6 +439,25 @@ func (s Store) validateSnapshot(ctx context.Context, path string) (string, map[s
 			return "", nil, fmt.Errorf("snapshot checksum mismatch for %s", entry.Path)
 		}
 		validated[entry.Path] = validatedEntry{entry: entry, source: source}
+	}
+	contents, err := os.ReadDir(clean)
+	if err != nil {
+		return "", nil, fmt.Errorf("list snapshot contents: %w", err)
+	}
+	allowedContents := map[string]struct{}{"manifest.json": {}}
+	for name := range validated {
+		allowedContents[name] = struct{}{}
+	}
+	for _, content := range contents {
+		if _, ok := allowedContents[content.Name()]; !ok {
+			return "", nil, fmt.Errorf("unknown file in snapshot: %s", content.Name())
+		}
+		if content.Type()&os.ModeSymlink != 0 || !content.Type().IsRegular() {
+			info, infoErr := content.Info()
+			if infoErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return "", nil, fmt.Errorf("snapshot content %s is not a regular file", content.Name())
+			}
+		}
 	}
 	return clean, validated, nil
 }
@@ -449,33 +642,116 @@ func (s Store) syncDirectory(path string) error {
 	return dir.Sync()
 }
 
-func (s Store) Prune(now time.Time) error {
+// Prune removes only expired, fully validated snapshots that are not referenced
+// by a current generation or unfinished operation. Unknown or damaged entries
+// are retained so maintenance can never turn a diagnostic anomaly into data
+// loss.
+func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]struct{}) (int, error) {
 	retention := s.Retention
 	if retention <= 0 {
 		retention = 7 * 24 * time.Hour
 	}
+	stagingRetention := s.StagingRetention
+	if stagingRetention <= 0 {
+		stagingRetention = time.Hour
+	}
 	entries, err := os.ReadDir(s.BackupDir)
 	if os.IsNotExist(err) {
-		return nil
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	canonicalProtected := make(map[string]struct{}, len(protected))
+	for path := range protected {
+		if path == "" {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
+		absolute, absoluteErr := filepath.Abs(path)
+		if absoluteErr != nil {
+			return 0, absoluteErr
 		}
-		if now.Sub(info.ModTime()) > retention {
-			if err := os.RemoveAll(filepath.Join(s.BackupDir, entry.Name())); err != nil {
-				return err
+		canonicalProtected[filepath.Clean(absolute)] = struct{}{}
+	}
+	removed := 0
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return removed, ctx.Err()
+		default:
+		}
+		if _, staging := snapshotStagingOperationID(entry.Name()); staging {
+			path := filepath.Join(s.BackupDir, entry.Name())
+			info, infoErr := entry.Info()
+			if infoErr != nil || now.Sub(info.ModTime()) <= stagingRetention || validateSnapshotStaging(path) != nil {
+				continue
+			}
+			releaseGuard := func() {}
+			if s.RemovalGuard != nil {
+				var ok bool
+				releaseGuard, ok = s.RemovalGuard()
+				if !ok {
+					continue
+				}
+			}
+			err := removeSnapshotStaging(path)
+			releaseGuard()
+			if err != nil {
+				return removed, err
+			}
+			removed++
+			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || !safeID(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(s.BackupDir, entry.Name())
+		absolute, absoluteErr := filepath.Abs(path)
+		if absoluteErr != nil {
+			return removed, absoluteErr
+		}
+		if _, keep := canonicalProtected[filepath.Clean(absolute)]; keep {
+			continue
+		}
+		clean, _, validateErr := s.validateSnapshot(ctx, path)
+		if validateErr != nil {
+			continue
+		}
+		var manifest Manifest
+		if readErr := atomicfile.ReadJSON(filepath.Join(clean, "manifest.json"), &manifest); readErr != nil {
+			continue
+		}
+		if manifest.CreatedAt.IsZero() || now.Sub(manifest.CreatedAt) <= retention {
+			continue
+		}
+		// Revalidate at the deletion boundary. A failed or interrupted snapshot
+		// writer may have left new evidence after the first verification; such a
+		// directory must be retained rather than recursively removed.
+		rechecked, _, recheckErr := s.validateSnapshot(ctx, clean)
+		if recheckErr != nil || rechecked != clean {
+			continue
+		}
+		releaseGuard := func() {}
+		if s.RemovalGuard != nil {
+			var ok bool
+			releaseGuard, ok = s.RemovalGuard()
+			if !ok {
+				continue
 			}
 		}
+		err := os.RemoveAll(rechecked)
+		releaseGuard()
+		if err != nil {
+			return removed, err
+		}
+		removed++
 	}
-	return nil
+	if removed > 0 {
+		if err := s.syncDirectory(s.BackupDir); err != nil {
+			return removed, fmt.Errorf("sync snapshot backup directory after prune: %w", err)
+		}
+	}
+	return removed, nil
 }
 
 func copyFile(source, destination string, mode os.FileMode) (string, error) {

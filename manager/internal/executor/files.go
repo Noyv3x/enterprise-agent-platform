@@ -1,19 +1,16 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
 	"github.com/ubitech/agent-platform/manager/internal/sandbox"
 )
 
@@ -50,17 +47,17 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 			err  error
 		)
 		if call.Target == "sandbox" {
-			sandboxPath, pathErr := s.sandboxPath(call, args.Path)
+			path, pathErr := s.sandboxPath(call, args.Path)
 			if pathErr != nil {
 				return "", nil, pathErr
 			}
-			file, err = openSandboxRegular(sandboxPath)
+			file, err = openManagedRegular(path)
 		} else {
-			path, pathErr := s.path(call, args.Path)
+			path, pathErr := s.hostPath(call, args.Path, sandbox.HostPathRead)
 			if pathErr != nil {
 				return "", nil, pathErr
 			}
-			file, err = openRegular(path)
+			file, err = openManagedRegular(path)
 		}
 		if err != nil {
 			return "", nil, err
@@ -94,18 +91,15 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 			if err != nil {
 				return "", nil, err
 			}
-			if err := writeSandboxFile(path, []byte(args.Content), 0o600); err != nil {
+			if err := writeManagedFile(path, []byte(args.Content), 0o600); err != nil {
 				return "", nil, err
 			}
 		} else {
-			path, err := s.path(call, args.Path)
+			path, err := s.hostPath(call, args.Path, sandbox.HostPathWrite)
 			if err != nil {
 				return "", nil, err
 			}
-			if err := rejectSymlinkTarget(path); err != nil {
-				return "", nil, err
-			}
-			if err := atomicfile.WriteFile(path, []byte(args.Content), 0o600); err != nil {
+			if err := writeManagedFile(path, []byte(args.Content), 0o600); err != nil {
 				return "", nil, err
 			}
 		}
@@ -122,29 +116,24 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 		if expected == 0 {
 			expected = 1
 		}
-		var (
-			sandboxPath sandboxFilePath
-			path        string
-			file        *os.File
-			err         error
-		)
+		var path managedFilePath
+		var err error
 		if call.Target == "sandbox" {
-			sandboxPath, err = s.sandboxPath(call, args.Path)
-			if err == nil {
-				err = sandboxPath.rejectMutation()
-			}
-			if err == nil {
-				file, err = openSandboxRegular(sandboxPath)
-			}
+			path, err = s.sandboxPath(call, args.Path)
 		} else {
-			path, err = s.path(call, args.Path)
-			if err == nil {
-				file, err = openRegular(path)
-			}
+			path, err = s.hostPath(call, args.Path, sandbox.HostPathWrite)
+		}
+		if err == nil {
+			err = path.rejectMutation()
 		}
 		if err != nil {
 			return "", nil, err
 		}
+		file, parent, leaf, err := openManagedRegularForUpdate(path)
+		if err != nil {
+			return "", nil, err
+		}
+		defer parent.Close()
 		data, err := io.ReadAll(io.LimitReader(file, s.MaxBytes+1))
 		_ = file.Close()
 		if err != nil {
@@ -161,14 +150,8 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 		if int64(len(updated)) > s.MaxBytes {
 			return "", nil, errors.New("patched file exceeds manager limit")
 		}
-		if call.Target == "sandbox" {
-			if err := writeSandboxFile(sandboxPath, updated, 0o600); err != nil {
-				return "", nil, err
-			}
-		} else {
-			if err := atomicfile.WriteFile(path, updated, 0o600); err != nil {
-				return "", nil, err
-			}
+		if err := writeManagedFileAt(parent, leaf, updated, 0o600); err != nil {
+			return "", nil, err
 		}
 		return fmt.Sprintf("Patched %s (%d replacement%s)", args.Path, count, plural(count)), map[string]any{"path": args.Path, "replacements": count}, nil
 	case "search":
@@ -206,67 +189,16 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 			if pathErr != nil {
 				return "", nil, pathErr
 			}
-			results, err = searchSandbox(ctx, path, matcher, max)
+			results, err = searchManaged(ctx, path, matcher, max)
 			if err != nil {
 				return "", nil, err
 			}
 		} else {
-			root, pathErr := s.path(call, args.Path)
+			path, pathErr := s.hostPath(call, args.Path, sandbox.HostPathRead)
 			if pathErr != nil {
 				return "", nil, pathErr
 			}
-			err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-				}
-				if len(results) >= max {
-					return filepath.SkipAll
-				}
-				rel, _ := filepath.Rel(root, path)
-				if matcher.MatchString(rel) {
-					results = append(results, rel+": filename match")
-				}
-				if entry.Type()&os.ModeSymlink != 0 {
-					return nil
-				}
-				if !entry.Type().IsRegular() {
-					return nil
-				}
-				info, err := entry.Info()
-				if err != nil {
-					return err
-				}
-				if info.Size() > 2<<20 {
-					return nil
-				}
-				file, err := openRegular(path)
-				if err != nil {
-					return err
-				}
-				scanner := bufio.NewScanner(file)
-				scanner.Buffer(make([]byte, 64*1024), 2<<20)
-				line := 0
-				for scanner.Scan() && len(results) < max {
-					line++
-					text := scanner.Text()
-					if matcher.MatchString(text) {
-						if len(text) > 500 {
-							text = text[:500]
-						}
-						results = append(results, fmt.Sprintf("%s:%d:%s", rel, line, text))
-					}
-				}
-				closeErr := file.Close()
-				if err := scanner.Err(); err != nil {
-					return err
-				}
-				return closeErr
-			})
+			results, err = searchManaged(ctx, path, matcher, max)
 			if err != nil {
 				return "", nil, err
 			}
@@ -279,39 +211,6 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 	default:
 		return "", nil, errors.New("unsupported file action")
 	}
-}
-
-func (s FileService) path(call Call, value string) (string, error) {
-	if value == "" {
-		return "", errors.New("path is required")
-	}
-	return s.Sandboxes.ResolvePath(call.Target, call.ExecutionContext.SandboxID, value)
-}
-func openRegular(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("path is not a regular file")
-	}
-	return os.Open(path)
-}
-func rejectSymlinkTarget(path string) error {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("refusing to replace a symbolic link")
-	}
-	if info.IsDir() {
-		return errors.New("path is a directory")
-	}
-	return nil
 }
 func plural(count int) string {
 	if count == 1 {

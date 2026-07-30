@@ -203,6 +203,17 @@ grep -Fq 'env -u GH_TOKEN -u GITHUB_TOKEN curl -q' .github/workflows/container-r
   || fail "public package metadata verification can inherit GitHub credentials"
 grep -Fq 'https://ghcr.io/v2/${owner}/${package}/manifests/${digest}' .github/workflows/container-release.yml \
   || fail "release does not verify final digest metadata through the anonymous GHCR registry contract"
+grep -Fq '.update_core_image_capacity_estimates[$component].compressed_bytes' .github/workflows/container-release.yml \
+  || fail "release does not enforce the canonical compressed core-image capacity limit"
+grep -Fq '.update_core_image_capacity_estimates[$component].unpacked_bytes' .github/workflows/container-release.yml \
+  || fail "release does not enforce the canonical unpacked core-image capacity limit"
+grep -Fq 'docker pull --platform "linux/${architecture}" "$image"' .github/workflows/container-release.yml \
+  || fail "release does not verify every supported core-image architecture"
+grep -Fq 'image_repository="${image%@*}"' .github/workflows/container-release.yml \
+  || fail "release core-image verification does not isolate its repository variable"
+if rg -q '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
+  fail "release core-image verification overwrites the package repository variable"
+fi
 grep -Fq 'docker pull "$image"' .github/workflows/container-release.yml \
   || fail "release does not anonymously pull each final image digest"
 if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then

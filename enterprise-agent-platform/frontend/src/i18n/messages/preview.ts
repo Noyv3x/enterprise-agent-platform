@@ -30,10 +30,25 @@ export const previewMessages = defineMessages({
 
   "browserPreview.title": { "zh-CN": "浏览器实时预览", en: "Live browser preview", "zh-TW": "瀏覽器即時預覽" },
   "browserPreview.description": {
-    "zh-CN": "以低帧率查看 Agent 当前浏览器画面；预览无法点击或输入。",
-    en: "Watch the Agent's current browser at a low frame rate. The preview cannot be clicked or typed into.",
-    "zh-TW": "以低幀率檢視 Agent 目前的瀏覽器畫面；預覽無法點擊或輸入。",
+    "zh-CN": "以低帧率查看 Agent 当前浏览器；需要时可接管并协助操作。",
+    en: "Watch the Agent's browser at a low frame rate and take control when assistance is needed.",
+    "zh-TW": "以低幀率檢視 Agent 目前的瀏覽器；需要時可接管並協助操作。",
   },
+  "browserPreview.takeControl": { "zh-CN": "接管浏览器", en: "Take control", "zh-TW": "接管瀏覽器" },
+  "browserPreview.endControl": { "zh-CN": "结束协助", en: "End assistance", "zh-TW": "結束協助" },
+  "browserPreview.assisting": { "zh-CN": "人工协助中", en: "Human assistance", "zh-TW": "人工協助中" },
+  "browserPreview.controlFailed": { "zh-CN": "无法取得浏览器控制权。", en: "Could not acquire browser control.", "zh-TW": "無法取得瀏覽器控制權。" },
+  "browserPreview.controlExpired": {
+    "zh-CN": "浏览器接管已结束，请重新接管后继续。",
+    en: "Browser control ended. Take control again to continue.",
+    "zh-TW": "瀏覽器接管已結束，請重新接管後繼續。",
+  },
+  "browserPreview.back": { "zh-CN": "后退", en: "Back", "zh-TW": "上一頁" },
+  "browserPreview.forward": { "zh-CN": "前进", en: "Forward", "zh-TW": "下一頁" },
+  "browserPreview.reload": { "zh-CN": "重载", en: "Reload", "zh-TW": "重新載入" },
+  "browserPreview.typePlaceholder": { "zh-CN": "向当前焦点输入文字", en: "Type into the focused field", "zh-TW": "向目前焦點輸入文字" },
+  "browserPreview.typeSend": { "zh-CN": "输入", en: "Type", "zh-TW": "輸入" },
+  "browserPreview.controlSurface": { "zh-CN": "可操作的 Agent 浏览器画面", en: "Interactive Agent browser view", "zh-TW": "可操作的 Agent 瀏覽器畫面" },
   "browserPreview.frameAlt": { "zh-CN": "Agent 浏览器的最新画面", en: "Latest Agent browser frame", "zh-TW": "Agent 瀏覽器的最新畫面" },
   "browserPreview.loadingFrame": {
     "zh-CN": "正在加载浏览器画面",

@@ -95,8 +95,108 @@ func (e *sandboxEngine) SandboxRunning(_ context.Context, name string) (bool, er
 	}
 	return e.running[name], nil
 }
+func (e *sandboxEngine) InspectManagedSandbox(_ context.Context, name, _ string) (driver.ManagedSandboxState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, exists := e.containers[name]
+	return driver.ManagedSandboxState{Exists: exists, Running: e.running[name], Owned: exists}, nil
+}
+func (e *sandboxEngine) RemoveStoppedManagedSandbox(_ context.Context, name, _ string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running[name] {
+		return errors.New("sandbox is running")
+	}
+	e.removed = append(e.removed, name)
+	delete(e.containers, name)
+	delete(e.running, name)
+	return nil
+}
 func (e *sandboxEngine) ExecArgs(driver.SandboxSpec, string, string, []string) (string, []string) {
 	return "true", nil
+}
+
+func TestEnsureWaitsForMaintenanceAdmission(t *testing.T) {
+	engine := &sandboxEngine{entered: make(chan struct{}), release: make(chan struct{})}
+	root := t.TempDir()
+	maintenance := &sync.Mutex{}
+	maintenance.Lock()
+	manager, err := Open(engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.MaintenanceMu = maintenance
+	done := make(chan error, 1)
+	go func() {
+		_, ensureErr := manager.Ensure(context.Background(), "private-1", "user-1", time.Now())
+		done <- ensureErr
+	}()
+	select {
+	case <-engine.entered:
+		t.Fatal("on-demand sandbox crossed maintenance admission")
+	case <-time.After(30 * time.Millisecond):
+	}
+	maintenance.Unlock()
+	select {
+	case <-engine.entered:
+		close(engine.release)
+	case <-time.After(time.Second):
+		t.Fatal("sandbox did not resume after maintenance admission")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileImagesRetiresStoppedObsoleteSandboxWithoutTouchingWorkspace(t *testing.T) {
+	engine := &sandboxEngine{}
+	root := t.TempDir()
+	oldImage := "sandbox@sha256:" + strings.Repeat("a", 64)
+	newImage := "sandbox@sha256:" + strings.Repeat("b", 64)
+	manager, err := Open(engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), oldImage, "network", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Unix(1, 0)
+	spec, err := manager.Ensure(context.Background(), "private-1", "user-1", started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(spec.Workspace, "kept.txt")
+	if err := os.WriteFile(marker, []byte("persistent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stopped, err := manager.Reap(context.Background(), started.Add(2*time.Minute)); err != nil || len(stopped) != 1 {
+		t.Fatalf("stop old sandbox: stopped=%v err=%v", stopped, err)
+	}
+	manager.SetImage(newImage)
+	updated, err := manager.ReconcileImages(context.Background(), started.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 1 || updated[0] != "private-1" {
+		t.Fatalf("obsolete sandbox was not refreshed: %#v", updated)
+	}
+	records := manager.Records()
+	if len(records) != 1 || records[0].Image != newImage || records[0].StoppedAt == nil {
+		t.Fatalf("refreshed sandbox registry is invalid: %#v", records)
+	}
+	if content, err := os.ReadFile(marker); err != nil || string(content) != "persistent" {
+		t.Fatalf("persistent workspace changed: %q %v", content, err)
+	}
+	engine.mu.Lock()
+	_, containerExists := engine.containers[spec.ContainerName]
+	engine.mu.Unlock()
+	if containerExists {
+		t.Fatal("stopped obsolete sandbox container still pins its image")
+	}
+	recreated, err := manager.Ensure(context.Background(), "private-1", "user-1", started.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recreated.Image != newImage {
+		t.Fatalf("sandbox was not recreated from current digest: %#v", recreated)
+	}
 }
 
 func TestReapSerializesContainerStopWithANewCall(t *testing.T) {

@@ -231,6 +231,7 @@ export interface ContextUsage {
 
 export interface MessageMetadata {
   local_pending?: boolean;
+  upload?: MessageUploadProgress;
   streaming?: boolean;
   stream_segment?: boolean;
   input_group_id?: string;
@@ -242,6 +243,13 @@ export interface MessageMetadata {
   agent_work?: AgentWork;
   /** Marks the compact source message emitted by a scheduled task run. */
   scheduled_task?: ScheduledTaskMessageMarker;
+}
+
+export interface MessageUploadProgress {
+  state: "queued" | "uploading" | "processing";
+  loaded: number;
+  total: number;
+  percent: number;
 }
 
 export interface ScheduledTaskMessageMarker {
@@ -306,6 +314,32 @@ export interface PrivateTelegram {
   pending?: PrivateTelegramPending | null;
 }
 
+/* ----------------------------------------------------------- private mail */
+
+export type MailSecurityMode = "tls" | "starttls";
+
+export interface MailAccount {
+  id: number;
+  label: string;
+  email_address: string;
+  username: string;
+  imap_host: string;
+  imap_port: number;
+  imap_security: MailSecurityMode;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: MailSecurityMode;
+  enabled: boolean;
+  wake_enabled: boolean;
+  wake_folder: string;
+  poll_interval_seconds: number;
+  credential_configured: boolean;
+  last_checked_at: number | null;
+  last_error: string;
+  created_at: number;
+  updated_at: number;
+}
+
 /* ---------------------------------------------------- scheduled Agent work */
 
 export type AgentScheduleRule =
@@ -364,21 +398,9 @@ export interface AgentMemory {
   tags: string[];
   created_at: number | string;
   updated_at: number | string;
-  source_type: "manual" | "tool" | "candidate" | "imported";
+  source_type: "manual" | "automatic";
   blocked: boolean;
   blocked_reasons: string[];
-}
-
-export interface AgentMemoryCandidate {
-  id: number;
-  target: AgentMemoryTarget;
-  content: string;
-  tags: string[];
-  status: "pending" | "approved" | "rejected";
-  source_message_id: string;
-  created_at: number | string;
-  decided_at: number | string | null;
-  memory_id: number | null;
 }
 
 /* ------------------------------------------------------- procedural Agent skills */
@@ -728,6 +750,12 @@ export interface AutoUpdateConfigValues {
   interval_seconds?: number | string;
   release_manifest_url?: string;
   release_channel?: string;
+  lan_enabled?: boolean;
+  lan_listen?: string;
+  direct_access_cidrs?: string[];
+  trusted_ingress_cidrs?: string[];
+  lan_active?: boolean;
+  lan_error?: string;
 }
 
 /** Public, deliberately redacted update state used before authentication. */

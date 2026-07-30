@@ -60,6 +60,11 @@ class _ManagerStub:
             "update_enabled": True,
             "update_interval": 300,
             "release_manifest_url": "https://releases.example/main.json",
+            "lan_enabled": False,
+            "lan_listen": "127.0.0.1:8081",
+            "direct_access_cidrs": ["192.168.0.0/16"],
+            "trusted_ingress_cidrs": ["127.0.0.0/8"],
+            "lan_active": False,
         }
 
     def config(self):
@@ -194,6 +199,49 @@ class ManagerUpdateControlTests(unittest.TestCase):
                 manager_client=_ManagerStub(),
             )
             corrected.close()
+
+    def test_lan_config_is_manager_owned_and_strictly_forwarded(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager = _ManagerStub()
+            service = EnterpriseService(
+                _config(Path(td)),
+                agent_client=_BlockingAgent(),
+                manager_client=manager,
+            )
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                current = service.auto_update_config(actor)["config"]
+                self.assertFalse(current["lan_enabled"])
+                self.assertEqual(current["lan_listen"], "127.0.0.1:8081")
+                self.assertEqual(current["direct_access_cidrs"], ["192.168.0.0/16"])
+
+                updated = service.update_auto_update_config(
+                    actor,
+                    {
+                        "lan_enabled": True,
+                        "lan_listen": "192.168.10.5:8091",
+                        "direct_access_cidrs": ["10.20.0.0/16"],
+                        "trusted_ingress_cidrs": ["127.0.0.0/8", "10.20.0.2/32"],
+                    },
+                )
+                self.assertEqual(
+                    manager.config_updates,
+                    [{
+                        "lan_enabled": True,
+                        "lan_listen": "192.168.10.5:8091",
+                        "direct_access_cidrs": ["10.20.0.0/16"],
+                        "trusted_ingress_cidrs": ["127.0.0.0/8", "10.20.0.2/32"],
+                    }],
+                )
+                self.assertTrue(updated["config"]["lan_enabled"])
+
+                with self.assertRaisesRegex(ServiceError, "entries must be strings"):
+                    service.update_auto_update_config(
+                        actor,
+                        {"direct_access_cidrs": ["10.0.0.0/8", 7]},
+                    )
+            finally:
+                service.close()
 
     def test_manager_maintenance_identity_is_strictly_validated(self):
         operation_id = "operation-active-1"

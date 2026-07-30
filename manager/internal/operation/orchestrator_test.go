@@ -113,6 +113,164 @@ type fakeSnapshot struct{}
 func (fakeSnapshot) Create(context.Context, string) (string, error) { return "/snapshot", nil }
 func (fakeSnapshot) Restore(context.Context, string) error          { return nil }
 
+type scriptedCapacityChecker struct {
+	errors []error
+	calls  int
+}
+
+func (c *scriptedCapacityChecker) CheckCapacity(context.Context, string, release.Manifest) error {
+	index := c.calls
+	c.calls++
+	if index < len(c.errors) {
+		return c.errors[index]
+	}
+	return nil
+}
+
+type capacityEngine struct {
+	*fakeEngine
+	capacity *scriptedCapacityChecker
+}
+
+func (e *capacityEngine) CheckCapacity(ctx context.Context, stage string, manifest release.Manifest) error {
+	return e.capacity.CheckCapacity(ctx, stage, manifest)
+}
+
+func TestCapacityShortfallRunsOneControlledMaintenanceThenRechecks(t *testing.T) {
+	checker := &scriptedCapacityChecker{errors: []error{
+		&driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/var/lib/docker", Resource: "space", Have: 1, Require: 2},
+		nil,
+	}}
+	reclaims := 0
+	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40)}
+	orchestrator := &Orchestrator{ReclaimCapacity: func(_ context.Context, operationID string, protected release.Manifest) error {
+		reclaims++
+		if operationID != "op_capacity" || protected.ID() != manifest.ID() {
+			t.Fatalf("capacity reclaim identity = %q/%q", operationID, protected.ID())
+		}
+		return nil
+	}}
+	if err := orchestrator.checkCapacity(context.Background(), checker, "op_capacity", driver.CapacityPreDownload, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if checker.calls != 2 || reclaims != 1 {
+		t.Fatalf("capacity checks/reclaims = %d/%d, want 2/1", checker.calls, reclaims)
+	}
+}
+
+func TestNonCapacityFailureDoesNotRunMaintenance(t *testing.T) {
+	checker := &scriptedCapacityChecker{errors: []error{errors.New("Docker unavailable")}}
+	reclaims := 0
+	orchestrator := &Orchestrator{ReclaimCapacity: func(context.Context, string, release.Manifest) error {
+		reclaims++
+		return nil
+	}}
+	err := orchestrator.checkCapacity(context.Background(), checker, "op_error", driver.CapacityPreDownload, release.Manifest{})
+	if err == nil || err.Error() != "Docker unavailable" || checker.calls != 1 || reclaims != 0 {
+		t.Fatalf("non-capacity failure = %v, checks=%d reclaims=%d", err, checker.calls, reclaims)
+	}
+}
+
+func TestCapacityGrowthAfterInitialCheckReleasesReservationBeforeRetryableFailure(t *testing.T) {
+	server, manifestURL := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Unix(11, 0), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "capacity-growth", ExpectedGeneration: store.State().Generation,
+	}, time.Unix(12, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker := &scriptedCapacityChecker{errors: []error{
+		nil,
+		nil,
+		&driver.CapacityError{Stage: driver.CapacityPreCutover, Path: "/data", Resource: "space", Have: 4, Require: 8},
+	}}
+	engine := &capacityEngine{fakeEngine: &fakeEngine{}, capacity: checker}
+	gate := &scriptedGate{
+		onReserve: func(int) {
+			if checker.calls != 2 {
+				t.Fatalf("reservation began after %d capacity checks, want initial pre-download and pre-cutover", checker.calls)
+			}
+		},
+		onRelease: func(int) {
+			if checker.calls != 3 {
+				t.Fatalf("reservation release began before the post-reservation capacity recheck: %d checks", checker.calls)
+			}
+		},
+	}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{},
+		ReleasesDir: t.TempDir(), ManifestURL: manifestURL, Channel: "main",
+		ReleaseClient: release.Client{HTTP: server.Client()}, Now: func() time.Time { return time.Unix(13, 0) },
+	}
+	orchestrator.runUpdate(context.Background(), op)
+	if checker.calls != 3 {
+		t.Fatalf("capacity checks = %d, want pre-download plus two pre-cutover checks", checker.calls)
+	}
+	if len(gate.releaseIDs) != 1 || gate.releaseIDs[0] != op.ID {
+		t.Fatalf("reservation releases = %#v, want the active operation once", gate.releaseIDs)
+	}
+	finished, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != model.OperationFailed || !finished.Finalized || !finished.Retryable {
+		t.Fatalf("capacity operation did not finish retryably: %#v", finished)
+	}
+	finalState := store.State()
+	if finalState.Maintenance || finalState.PublicState != model.StateIdle || finalState.ActiveOperationID != "" {
+		t.Fatalf("capacity failure left current generation unavailable: %#v", finalState)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(calls, "stop") || strings.Contains(calls, "migrate") {
+		t.Fatalf("post-reservation capacity shortfall crossed destructive boundary: %s", calls)
+	}
+}
+
+func TestCapacityRecheckKeepsMaintenanceWhenReservationReleaseIsUncertain(t *testing.T) {
+	store, err := journal.Open(t.TempDir(), time.Unix(20, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "capacity-release-uncertain", ExpectedGeneration: store.State().Generation,
+	}, time.Unix(21, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "reserved", time.Unix(22, 0)); err != nil {
+		t.Fatal(err)
+	}
+	gate := &retryGate{failOnce: true}
+	orchestrator := &Orchestrator{Store: store, Gate: gate, Now: func() time.Time { return time.Unix(23, 0) }}
+	orchestrator.failReservedCapacityRecheck(op, &driver.CapacityError{
+		Stage: driver.CapacityPreCutover, Path: "/data", Resource: "space", Have: 4, Require: 8,
+	})
+	state := store.State()
+	if !state.Maintenance || state.PublicState != model.StateFailed || state.ActiveOperationID != op.ID {
+		t.Fatalf("uncertain reservation release reopened the platform: %#v", state)
+	}
+	current, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != model.OperationRunning || current.Finalized || current.ReservationStatus != model.ReservationReleaseUncertain {
+		t.Fatalf("uncertain capacity release lost recovery intent: %#v", current)
+	}
+}
+
 type scriptedSnapshot struct {
 	creates      []string
 	restores     []string
@@ -616,7 +774,7 @@ func TestFreshInstallCommitsOnlyAfterProbe(t *testing.T) {
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
 	engine.mu.Unlock()
-	if calls != "pull,prepare,stop,migrate,start,probe" {
+	if calls != "pull,prepare,stop,migrate,start,probe,probe" {
 		t.Fatalf("unexpected engine sequence: %s", calls)
 	}
 }
@@ -1617,7 +1775,8 @@ func TestRecoverFinalizesCrashBetweenOperationAndStateCommit(t *testing.T) {
 	gate := &recordingGate{}
 	selfUpdate := &recordingSelfUpdate{}
 	commits := 0
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}, OnCommit: func(release.Manifest) { commits++ }}
+	finalized := 0
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}, OnCommit: func(release.Manifest) { commits++ }, OnFinalized: func(release.Manifest) { finalized++ }}
 	manifest, err := orchestrator.Check(context.Background(), url)
 	if err != nil {
 		t.Fatal(err)
@@ -1643,8 +1802,8 @@ func TestRecoverFinalizesCrashBetweenOperationAndStateCommit(t *testing.T) {
 	if state.Current == nil || state.Current.ID != manifest.ID() || state.Current.RollbackSnapshotPath != "/backup/before-update" || state.Candidate != nil || state.ActiveOperationID != "" {
 		t.Fatalf("recovery did not finish durable state commit: %#v", state)
 	}
-	if gate.releases != 1 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 {
-		t.Fatalf("recovery skipped finalize hooks: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
+	if gate.releases != 1 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 || finalized != 1 {
+		t.Fatalf("recovery skipped finalize hooks: gate=%d self=%#v commits=%d finalized=%d", gate.releases, selfUpdate, commits, finalized)
 	}
 }
 

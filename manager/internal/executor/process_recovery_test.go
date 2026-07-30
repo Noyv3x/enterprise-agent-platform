@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -184,6 +185,76 @@ func TestRunPreStartFailureReleasesSandboxCallAndProcessReservation(t *testing.T
 	processes.mu.Unlock()
 	if pendingGlobal != 0 || pendingFamily != 0 {
 		t.Fatalf("pre-start failure leaked process reservation: global=%d families=%d", pendingGlobal, pendingFamily)
+	}
+}
+
+func TestHostRunRejectsSymlinkedWorkingDirectory(t *testing.T) {
+	service, root := newTestService(t)
+	if _, err := service.Processes.Sandboxes.Ensure(context.Background(), identity().ExecutionContext.SandboxID, identity().ExecutionContext.WorkspaceID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside-cwd")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(root, "data", "workspaces", "user-1")
+	if err := os.Symlink(outside, filepath.Join(workspace, "escape-cwd")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := service.Processes.Run(context.Background(), Call{Identity: identity(), Target: "host"}, terminalArguments{
+		Command: "true", CWD: "/workspace/escape-cwd",
+	})
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("host terminal followed a symlinked cwd: %v", err)
+	}
+	records := service.Processes.Sandboxes.Records()
+	if len(records) != 1 || records[0].ActiveCalls != 0 {
+		t.Fatalf("rejected host cwd leaked an active call: %#v", records)
+	}
+}
+
+func TestHostWorkingDirectoryFDStaysPinnedAfterPathReplacement(t *testing.T) {
+	service, _ := newTestService(t)
+	spec, err := service.Processes.Sandboxes.Ensure(context.Background(), identity().ExecutionContext.SandboxID, identity().ExecutionContext.WorkspaceID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(spec.Workspace, "cwd")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "marker.txt"), []byte("pinned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := service.Processes.Sandboxes.ResolveHostPath(identity().ExecutionContext.SandboxID, "/workspace/cwd", sandbox.HostPathWorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := openHostWorkingDirectory(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+
+	pinned := filepath.Join(spec.Workspace, "cwd-pinned")
+	if err := os.Rename(target, pinned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "marker.txt"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", "-c", hostProcessWrapper, "ubitech-manager", "cat marker.txt")
+	command.Dir = string(filepath.Separator)
+	command.ExtraFiles = []*os.File{directory}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run from pinned cwd: %v: %s", err, output)
+	}
+	if string(output) != "pinned" {
+		t.Fatalf("command used replacement cwd: %q", output)
 	}
 }
 

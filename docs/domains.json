@@ -1,7 +1,6 @@
 {
-  "version": 2,
+  "version": 3,
   "forbidden_top_level_files": [
-    "AGENTS.md",
     "CLAUDE.md"
   ],
   "coverage": {
@@ -42,6 +41,7 @@
       "enterprise-agent-platform/frontend/src/**/*.test.tsx"
     ],
     "document_include": [
+      "AGENTS.md",
       "docs/design/*.md",
       "docs/reference/*.md",
       "docs/operations/*.md",
@@ -55,6 +55,7 @@
     {
       "id": "documentation-governance",
       "documents": [
+        "AGENTS.md",
         "docs/development/documentation-workflow.md",
         "docs/domains.json"
       ],

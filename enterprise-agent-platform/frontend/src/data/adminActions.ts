@@ -350,6 +350,30 @@ export async function saveAutoUpdateConfig(
   });
 }
 
+/** Save the Manager-owned, hot-reloaded LAN listener configuration. */
+export async function saveLANAccessConfig(
+  store: AppStore,
+  body: Pick<
+    AutoUpdateConfigUpdateRequest,
+    "lan_enabled" | "lan_listen" | "direct_access_cidrs" | "trusted_ingress_cidrs"
+  >,
+): Promise<void> {
+  await runBusy(store, "admin:security:lan:save", async () => {
+    try {
+      await api(endpoints.updateAutoUpdateConfig.path(), {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+    } finally {
+      // A rejected bind leaves the previous listener active and records a
+      // bounded Manager error; refresh even on failure so the UI shows that
+      // real applied state instead of the optimistic form values.
+      await loadAutoUpdateConfig(store);
+    }
+    toast(t("admin.toast.lanSaved"), { type: "ok", title: t("admin.toast.complete") });
+  });
+}
+
 /** Request an immediate update check with a literal empty JSON body. */
 export async function checkAutoUpdateNow(store: AppStore): Promise<void> {
   await runBusy(store, "admin:updates:check", async () => {

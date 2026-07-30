@@ -504,6 +504,15 @@ case " $* " in
     ;;
 esac
 if [ "${1:-}" = inspect ]; then
+  case "$*" in
+    *com.docker.compose.project*)
+      case "$last" in
+        a*) printf 'registry.example/platform@sha256:%064d\tubitech-recovery-test\tplatform\n' 0 | tr 0 1 ;;
+        b*) printf 'registry.example/agent-runtime@sha256:%064d\tubitech-recovery-test\tagent-runtime\n' 0 | tr 0 2 ;;
+      esac
+      exit 0
+      ;;
+  esac
   case "$last" in
     a*|b*) printf 'running healthy\n' ;;
     *) printf 'running unhealthy\n' ;;

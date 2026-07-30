@@ -333,6 +333,27 @@
   max-width: none;
 }
 
+.eap-security-settings-stack {
+  display: grid;
+  gap: 16px;
+  width: min(840px, 100%);
+}
+
+.eap-security-settings-stack .config-form {
+  width: 100%;
+}
+
+.eap-lan-access-config__status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.eap-lan-access-config > .eap-alert {
+  margin-bottom: 12px;
+}
+
 .eap-admin-page .config-grid,
 .eap-admin-page .config-group__body,
 .eap-admin-page .oauth-grid {

@@ -37,7 +37,7 @@ func newTestService(t *testing.T) (*Service, string) {
 	t.Helper()
 	root := t.TempDir()
 	engine := engineStub{}
-	sandboxes, err := sandbox.Open(engine, filepath.Join(root, "data"), filepath.Join(root, "sandboxes.json"), "registry/sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	sandboxes, err := sandbox.Open(engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "registry/sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +87,40 @@ func TestReceiptCannotBeReusedForDifferentTarget(t *testing.T) {
 	call := Call{Identity: request.Identity, AuditID: receipt.AuditID, ExecutorID: receipt.ExecutorID, Target: "host", Action: "run", Arguments: arguments}
 	if _, err := service.Terminal(context.Background(), call); err == nil {
 		t.Fatal("expected receipt target mismatch")
+	}
+}
+
+func TestApprovedHostFilePathCannotBeRedirectedBeforeExecution(t *testing.T) {
+	service, root := newTestService(t)
+	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/approved/secret.txt", Content: "approved"}); err != nil {
+		t.Fatal(err)
+	}
+	managerSecrets := filepath.Join(root, "manager", "secrets")
+	if err := os.MkdirAll(managerSecrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managerSecrets, "secret.txt"), []byte("manager-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arguments, _ := json.Marshal(fileReadArguments{Path: "/workspace/approved/secret.txt"})
+	request := AuditRequest{Identity: identity(), AuditID: "audit-host-file", Target: "host", Operation: "read_file", Action: "read", Arguments: arguments, Details: map[string]any{"path": "/workspace/approved/secret.txt"}}
+	receipt, err := service.Audit(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(root, "data", "workspaces", "user-1")
+	if err := os.Rename(filepath.Join(workspace, "approved"), filepath.Join(workspace, "approved-original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(managerSecrets, filepath.Join(workspace, "approved")); err != nil {
+		t.Fatal(err)
+	}
+	call := Call{Identity: request.Identity, AuditID: receipt.AuditID, ExecutorID: receipt.ExecutorID, Target: "host", Action: "read", Arguments: arguments}
+	if _, err := service.File(context.Background(), call); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("approved host path followed a replacement symlink: %v", err)
+	}
+	if _, err := service.File(context.Background(), call); err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("rejected host approval receipt was reusable: %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -65,6 +66,318 @@ class BrowserPreviewServiceTests(unittest.TestCase):
                 self.assertTrue(preview["etag"].startswith('"idle-'))
                 ensure.assert_not_called()
                 runtime_request.assert_not_called()
+            finally:
+                service.close()
+
+    def test_human_control_is_leased_scoped_and_sequence_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                calls: list[tuple[str, dict[str, object]]] = []
+
+                def request(url, body, **_kwargs):
+                    calls.append((url, dict(body or {})))
+                    return {"ok": True}
+
+                with (
+                    mock.patch.object(service, "_resolve_browser_control_tab", return_value=resolved),
+                    mock.patch.object(service, "_runtime_json_request", side_effect=request),
+                    mock.patch.object(service, "_agent_browser_validate_tab_url", return_value="https://example.test/"),
+                ):
+                    acquired = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    with self.assertRaisesRegex(ServiceError, "human browser assistance"):
+                        service._agent_browser_tool(scope.scope_key, "click", {"ref": "e1"})
+                    body = {
+                        "command": "input",
+                        "scope_type": "private",
+                        "scope_id": str(actor["id"]),
+                        "tab_id": "tab-1",
+                        "lease_id": acquired["lease_id"],
+                        "sequence": 1,
+                        "action": "click",
+                        "x": 120,
+                        "y": 80,
+                    }
+                    first = service.browser_preview_control(actor, body)
+                    duplicate = service.browser_preview_control(actor, body)
+
+                self.assertTrue(first["ok"])
+                self.assertTrue(duplicate["duplicate"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][1]["userId"], "agent-browser-user")
+                self.assertNotIn("selector", calls[0][1])
+            finally:
+                service.close()
+
+    def test_agent_mutation_and_human_acquire_share_the_real_operation_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                entered = threading.Event()
+                release_agent = threading.Event()
+                acquire_done = threading.Event()
+                thread_errors: list[BaseException] = []
+
+                def blocked_agent_call(_scope_key, _action, _arguments):
+                    entered.set()
+                    self.assertTrue(release_agent.wait(timeout=3))
+                    return {"ok": True}
+
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+
+                def run_agent():
+                    try:
+                        service._agent_browser_tool(
+                            scope.scope_key,
+                            "click",
+                            {"tab_id": "tab-1", "ref": "e1"},
+                        )
+                    except BaseException as exc:  # pragma: no cover - asserted below
+                        thread_errors.append(exc)
+
+                def acquire():
+                    try:
+                        service.browser_preview_control(
+                            actor,
+                            {
+                                "command": "acquire",
+                                "scope_type": "private",
+                                "scope_id": str(actor["id"]),
+                                "tab_id": "tab-1",
+                            },
+                        )
+                    except BaseException as exc:  # pragma: no cover - asserted below
+                        thread_errors.append(exc)
+                    finally:
+                        acquire_done.set()
+
+                with (
+                    mock.patch.object(
+                        service,
+                        "_agent_browser_tool_call",
+                        side_effect=blocked_agent_call,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_resolve_browser_control_tab",
+                        return_value=resolved,
+                    ),
+                ):
+                    agent_thread = threading.Thread(target=run_agent)
+                    acquire_thread = threading.Thread(target=acquire)
+                    agent_thread.start()
+                    self.assertTrue(entered.wait(timeout=3))
+                    acquire_thread.start()
+                    self.assertFalse(acquire_done.wait(timeout=0.1))
+                    release_agent.set()
+                    agent_thread.join(timeout=3)
+                    acquire_thread.join(timeout=3)
+
+                self.assertFalse(agent_thread.is_alive())
+                self.assertFalse(acquire_thread.is_alive())
+                self.assertEqual(thread_errors, [])
+                self.assertTrue(acquire_done.is_set())
+            finally:
+                service.close()
+
+    def test_human_input_holds_gate_until_camofox_returns_then_blocks_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                entered = threading.Event()
+                release_input = threading.Event()
+                agent_done = threading.Event()
+                input_errors: list[BaseException] = []
+                agent_errors: list[BaseException] = []
+
+                def request(_url, _body, **_kwargs):
+                    entered.set()
+                    self.assertTrue(release_input.wait(timeout=3))
+                    return {"ok": True}
+
+                with (
+                    mock.patch.object(
+                        service,
+                        "_resolve_browser_control_tab",
+                        return_value=resolved,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_runtime_json_request",
+                        side_effect=request,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_agent_browser_validate_tab_url",
+                        return_value="https://example.test/",
+                    ),
+                    mock.patch.object(service, "_agent_browser_tool_call") as agent_call,
+                ):
+                    acquired = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+
+                    def send_input():
+                        try:
+                            service.browser_preview_control(
+                                actor,
+                                {
+                                    "command": "input",
+                                    "scope_type": "private",
+                                    "scope_id": str(actor["id"]),
+                                    "tab_id": "tab-1",
+                                    "lease_id": acquired["lease_id"],
+                                    "sequence": 1,
+                                    "action": "click",
+                                    "x": 12,
+                                    "y": 24,
+                                },
+                            )
+                        except BaseException as exc:  # pragma: no cover - asserted below
+                            input_errors.append(exc)
+
+                    def run_agent():
+                        try:
+                            service._agent_browser_tool(
+                                scope.scope_key,
+                                "click",
+                                {"tab_id": "tab-1", "ref": "e1"},
+                            )
+                        except BaseException as exc:
+                            agent_errors.append(exc)
+                        finally:
+                            agent_done.set()
+
+                    input_thread = threading.Thread(target=send_input)
+                    agent_thread = threading.Thread(target=run_agent)
+                    input_thread.start()
+                    self.assertTrue(entered.wait(timeout=3))
+                    agent_thread.start()
+                    self.assertFalse(agent_done.wait(timeout=0.1))
+                    release_input.set()
+                    input_thread.join(timeout=3)
+                    agent_thread.join(timeout=3)
+
+                self.assertEqual(input_errors, [])
+                self.assertEqual(len(agent_errors), 1)
+                self.assertIsInstance(agent_errors[0], ServiceError)
+                self.assertEqual(agent_errors[0].status, 409)
+                agent_call.assert_not_called()
+            finally:
+                service.close()
+
+    def test_release_succeeds_after_the_leased_tab_disappears(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                with mock.patch.object(
+                    service,
+                    "_resolve_browser_control_tab",
+                    return_value=resolved,
+                ) as resolver:
+                    acquired = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    resolver.side_effect = ServiceError(404, "tab disappeared")
+                    released = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "release",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                            "lease_id": acquired["lease_id"],
+                        },
+                    )
+
+                self.assertTrue(released["released"])
+                self.assertEqual(resolver.call_count, 1)
+            finally:
+                service.close()
+
+    def test_human_control_resolver_does_not_accept_unowned_tab(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                requested_users: list[str] = []
+
+                def request(url, _body, **_kwargs):
+                    requested_users.extend(urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("userId", []))
+                    return {"tabs": [{"tabId": "owned-tab"}]}
+
+                with (
+                    mock.patch.object(service.runtimes, "_effective_camofox_url", return_value="http://127.0.0.1:9090"),
+                    mock.patch.object(service, "_browser_preview_existing_access_key", return_value="x" * 32),
+                    mock.patch.object(service, "_runtime_json_request", side_effect=request),
+                ):
+                    with self.assertRaisesRegex(ServiceError, "no longer available"):
+                        service.browser_preview_control(
+                            actor,
+                            {
+                                "command": "acquire",
+                                "scope_type": "private",
+                                "scope_id": str(actor["id"]),
+                                "tab_id": "foreign-tab",
+                            },
+                        )
+                self.assertEqual(requested_users, [service._agent_browser_user_id(scope.scope_key)])
             finally:
                 service.close()
 

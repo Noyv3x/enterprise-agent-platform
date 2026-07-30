@@ -39,7 +39,7 @@ export function loadAdminPage(store: AppStore, pageId: AdminPageId): Promise<voi
     case "updates":
       return loadAutoUpdateConfig(store);
     case "security":
-      return loadSecurityConfig(store);
+      return Promise.all([loadSecurityConfig(store), loadAutoUpdateConfig(store)]).then(() => undefined);
     case "runtime":
       return loadRuntime(store);
     case "cognee":

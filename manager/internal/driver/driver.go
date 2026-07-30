@@ -24,6 +24,7 @@ import (
 	"github.com/ubitech/agent-platform/manager/internal/contract"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
 	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/ubitech/agent-platform/manager/internal/snapshot"
 )
 
 type Result struct {
@@ -176,6 +177,43 @@ type FixedServiceReporter interface {
 	FixedServiceStatus(context.Context) map[string]FixedServiceState
 }
 
+type ManagedSandboxState struct {
+	Exists  bool
+	Running bool
+	Owned   bool
+}
+
+// ManagedSandboxRetirer is the narrow lifecycle capability used to replace an
+// idle Sandbox image. Implementations must prove the ownership labels and
+// stopped state again before performing a non-force removal.
+type ManagedSandboxRetirer interface {
+	InspectManagedSandbox(context.Context, string, string) (ManagedSandboxState, error)
+	RemoveStoppedManagedSandbox(context.Context, string, string) error
+}
+
+// CapacityChecker is an optional Engine capability used before downloading a
+// candidate and immediately before cutover.
+type CapacityChecker interface {
+	CheckCapacity(context.Context, string, release.Manifest) error
+}
+
+type CapacityError struct {
+	Stage    string
+	Path     string
+	Resource string
+	Have     uint64
+	Require  uint64
+}
+
+func (e *CapacityError) Error() string {
+	return fmt.Sprintf("insufficient free %s at %s before %s: have %d, require %d", e.Resource, e.Path, e.Stage, e.Have, e.Require)
+}
+
+func IsInsufficientCapacity(err error) bool {
+	var capacity *CapacityError
+	return errors.As(err, &capacity)
+}
+
 // CandidateFailureDiagnoser is an optional Engine capability. Keeping it
 // separate from Engine lets non-Docker test engines and alternate backends omit
 // host-specific diagnostics while callers can still collect them when present.
@@ -236,6 +274,290 @@ type DockerCLI struct {
 	GID                 int
 	PullIdleTimeout     time.Duration
 	PullAbsoluteTimeout time.Duration
+	FilesystemStat      func(context.Context, string) (CapacityFilesystemStat, error)
+	SnapshotRequired    func(context.Context, string) (uint64, error)
+}
+
+type CapacityFilesystemStat struct {
+	BlockSize      uint64
+	AvailableBlock uint64
+	Favail         uint64
+	FilesystemID   string
+}
+
+const (
+	CapacityPreDownload = "pre-download"
+	CapacityPreCutover  = "pre-cutover"
+)
+
+// CheckCapacity refuses an update before it can fill either the Manager data
+// filesystem or Docker's storage filesystem. It measures actual free space and
+// never assumes a global Docker prune is safe.
+func (d DockerCLI) CheckCapacity(ctx context.Context, stage string, manifest release.Manifest) error {
+	minimumBytes := uint64(contract.UpdatePreDownloadMinFreeBytes)
+	if stage == CapacityPreCutover {
+		minimumBytes = uint64(contract.UpdatePreCutoverMinFreeBytes)
+	} else if stage != CapacityPreDownload {
+		return fmt.Errorf("unknown capacity check stage %q", stage)
+	}
+	dockerMinimumBytes := minimumBytes
+	dataMinimumBytes := minimumBytes
+	if stage == CapacityPreDownload {
+		for _, name := range coreUpdateImageNames {
+			image := manifest.Images[name]
+			if !release.IsDigestReference(image) {
+				return fmt.Errorf("core image %s is missing an immutable digest for capacity estimation", name)
+			}
+			present, inspectErr := d.imagePresent(ctx, name, image)
+			if inspectErr != nil {
+				return fmt.Errorf("inspect core image before capacity estimation: %w", inspectErr)
+			}
+			if present {
+				continue
+			}
+			estimate, ok := contract.UpdateCoreImageCapacityEstimates[name]
+			if !ok || estimate.CompressedBytes == 0 || estimate.UnpackedBytes == 0 {
+				return fmt.Errorf("core image %s has no valid capacity estimate", name)
+			}
+			for _, addition := range []uint64{estimate.CompressedBytes, estimate.UnpackedBytes} {
+				if dockerMinimumBytes > ^uint64(0)-addition {
+					return errors.New("core image capacity estimate overflow")
+				}
+				dockerMinimumBytes += addition
+			}
+		}
+	} else {
+		requiredSnapshot := d.SnapshotRequired
+		if requiredSnapshot == nil {
+			requiredSnapshot = snapshot.RequiredBytes
+		}
+		snapshotBytes, snapshotErr := requiredSnapshot(ctx, filepath.Join(d.DataRoot, "data"))
+		if snapshotErr != nil {
+			return fmt.Errorf("measure rollback snapshot capacity: %w", snapshotErr)
+		}
+		if dataMinimumBytes > ^uint64(0)-snapshotBytes {
+			return errors.New("rollback snapshot capacity requirement overflows")
+		}
+		dataMinimumBytes += snapshotBytes
+	}
+	dockerInfo, err := d.runner().Run(ctx, d.binary(), []string{"info", "--format", "{{.DockerRootDir}}"}, nil)
+	if err != nil {
+		return fmt.Errorf("locate Docker storage for capacity check: %w", err)
+	}
+	dockerRoot := strings.TrimSpace(dockerInfo.Stdout)
+	if !filepath.IsAbs(dockerRoot) || strings.ContainsAny(dockerRoot, "\r\n") {
+		return errors.New("Docker returned an invalid storage root")
+	}
+	type capacityRoot struct {
+		path         string
+		minimumBytes uint64
+	}
+	roots := []capacityRoot{
+		{path: filepath.Clean(d.DataRoot), minimumBytes: dataMinimumBytes},
+		{path: filepath.Clean(dockerRoot), minimumBytes: dockerMinimumBytes},
+	}
+	type filesystemCapacity struct {
+		path         string
+		minimumBytes uint64
+		stat         CapacityFilesystemStat
+	}
+	filesystems := map[string]filesystemCapacity{}
+	for _, root := range roots {
+		if !filepath.IsAbs(root.path) {
+			return fmt.Errorf("capacity root %q is not absolute", root.path)
+		}
+		resolved, resolveErr := filepath.EvalSymlinks(root.path)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve capacity root %s: %w", root.path, resolveErr)
+		}
+		statFilesystem := d.FilesystemStat
+		if statFilesystem == nil {
+			statFilesystem = defaultCapacityFilesystemStat
+		}
+		stat, err := statFilesystem(ctx, resolved)
+		if err != nil {
+			return fmt.Errorf("inspect free capacity at %s: %w", resolved, err)
+		}
+		if stat.BlockSize == 0 || stat.AvailableBlock > ^uint64(0)/stat.BlockSize || stat.FilesystemID == "" {
+			return fmt.Errorf("inspect free capacity at %s: invalid filesystem counters", resolved)
+		}
+		filesystemKey := stat.FilesystemID
+		if existing, duplicate := filesystems[filesystemKey]; duplicate {
+			if root.minimumBytes > existing.minimumBytes {
+				existing.minimumBytes = root.minimumBytes
+			}
+			filesystems[filesystemKey] = existing
+			continue
+		}
+		filesystems[filesystemKey] = filesystemCapacity{path: resolved, minimumBytes: root.minimumBytes, stat: stat}
+	}
+	for _, filesystem := range filesystems {
+		stat := filesystem.stat
+		availableBytes := stat.AvailableBlock * stat.BlockSize
+		if availableBytes < filesystem.minimumBytes {
+			return &CapacityError{Stage: stage, Path: filesystem.path, Resource: "space", Have: availableBytes, Require: filesystem.minimumBytes}
+		}
+		if stat.Favail < uint64(contract.UpdateMinFreeInodes) {
+			return &CapacityError{Stage: stage, Path: filesystem.path, Resource: "inodes", Have: stat.Favail, Require: uint64(contract.UpdateMinFreeInodes)}
+		}
+	}
+	return nil
+}
+
+func defaultCapacityFilesystemStat(ctx context.Context, path string) (CapacityFilesystemStat, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return CapacityFilesystemStat{}, err
+	}
+	if stat.Bsize <= 0 {
+		return CapacityFilesystemStat{}, errors.New("filesystem block size is invalid")
+	}
+	// Linux statfs exposes f_ffree but not statvfs.f_favail. GNU df uses
+	// statvfs and therefore reports the ordinary process's actually available
+	// inode count; use that value instead of silently treating reserved inodes as
+	// writable capacity.
+	command := exec.CommandContext(ctx, "df", "--output=iavail", "--", path)
+	command.Env = append(os.Environ(), "LC_ALL=C")
+	output, err := command.Output()
+	if err != nil {
+		return CapacityFilesystemStat{}, fmt.Errorf("read available inodes with df: %w", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 {
+		return CapacityFilesystemStat{}, errors.New("df returned invalid available inode output")
+	}
+	availableInodes, err := strconv.ParseUint(fields[len(fields)-1], 10, 64)
+	if err != nil {
+		return CapacityFilesystemStat{}, errors.New("df returned a non-numeric available inode count")
+	}
+	return CapacityFilesystemStat{
+		BlockSize:      uint64(stat.Bsize),
+		AvailableBlock: stat.Bavail,
+		Favail:         availableInodes,
+		FilesystemID:   fmt.Sprintf("%v", stat.Fsid),
+	}, nil
+}
+
+// PruneManagedImages removes only immutable digest references supplied by
+// verified historical release manifests. The method rechecks every Docker
+// container and never uses --force. A true result means that the caller may
+// discard the manifest which supplied that image reference; false means the
+// manifest must be retained for a later retry.
+func (d DockerCLI) PruneManagedImages(ctx context.Context, candidates []string, protected map[string]struct{}, guard release.RemovalGuard) (map[string]bool, error) {
+	result := make(map[string]bool, len(candidates))
+	containers, err := d.runner().Run(ctx, d.binary(), []string{"ps", "--all", "--quiet", "--no-trunc"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list containers before image cleanup: %w", err)
+	}
+	inUseReferences := map[string]struct{}{}
+	inUseImageIDs := map[string]struct{}{}
+	for _, id := range strings.Fields(containers.Stdout) {
+		if !validContainerID(id) {
+			return nil, errors.New("Docker returned an invalid container ID during image cleanup")
+		}
+		inspection, inspectErr := d.runner().Run(ctx, d.binary(), []string{"inspect", "--format", "{{.Config.Image}}\t{{.Image}}", id}, nil)
+		if inspectErr != nil {
+			return nil, fmt.Errorf("inspect container image reference %s before cleanup: %w", id, inspectErr)
+		}
+		fields := strings.Split(strings.TrimSpace(inspection.Stdout), "\t")
+		if len(fields) != 2 || !validDockerImageID(fields[1]) {
+			return nil, errors.New("Docker returned invalid container image metadata during cleanup")
+		}
+		if release.IsDigestReference(fields[0]) {
+			inUseReferences[fields[0]] = struct{}{}
+		}
+		inUseImageIDs[fields[1]] = struct{}{}
+	}
+	unique := map[string]struct{}{}
+	for _, image := range candidates {
+		if !release.IsDigestReference(image) {
+			return nil, fmt.Errorf("refusing non-immutable image cleanup candidate %q", image)
+		}
+		unique[image] = struct{}{}
+	}
+	images := make([]string, 0, len(unique))
+	for image := range unique {
+		images = append(images, image)
+	}
+	sort.Strings(images)
+	var cleanupErr error
+	for _, image := range images {
+		select {
+		case <-ctx.Done():
+			return result, errors.Join(ctx.Err(), cleanupErr)
+		default:
+		}
+		if _, keep := protected[image]; keep {
+			result[image] = true
+			continue
+		}
+		if _, used := inUseReferences[image]; used {
+			result[image] = false
+			continue
+		}
+		identity, inspectErr := d.runner().Run(ctx, d.binary(), []string{"image", "inspect", "--format", "{{.Id}}", image}, nil)
+		if inspectErr != nil {
+			if dockerObjectMissing(identity, inspectErr) {
+				result[image] = true
+				continue
+			}
+			result[image] = false
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect obsolete managed image %s: %w", image, inspectErr))
+			continue
+		}
+		imageID := strings.TrimSpace(identity.Stdout)
+		if !validDockerImageID(imageID) {
+			result[image] = false
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect obsolete managed image %s: Docker returned an invalid image ID", image))
+			continue
+		}
+		if _, used := inUseImageIDs[imageID]; used {
+			result[image] = false
+			continue
+		}
+		releaseGuard := func() {}
+		if guard != nil {
+			var ok bool
+			releaseGuard, ok = guard()
+			if !ok {
+				result[image] = false
+				continue
+			}
+		}
+		_, removeErr := d.runner().Run(ctx, d.binary(), []string{"image", "rm", image}, nil)
+		releaseGuard()
+		if removeErr == nil || dockerObjectMissing(Result{}, removeErr) {
+			result[image] = true
+			continue
+		}
+		result[image] = false
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove obsolete managed image %s: %w", image, removeErr))
+	}
+	return result, cleanupErr
+}
+
+func dockerObjectMissing(result Result, err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error() + "\n" + result.Stderr)
+	return strings.Contains(message, "no such image") || strings.Contains(message, "no such object")
+}
+
+func validDockerImageID(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	digest := strings.TrimPrefix(value, "sha256:")
+	if len(digest) != 64 {
+		return false
+	}
+	for _, character := range digest {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (d DockerCLI) runner() Runner {
@@ -273,12 +595,27 @@ func (d DockerCLI) Preflight(ctx context.Context) error {
 }
 
 func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
+	pulledByAttempt := make([]string, 0, len(coreUpdateImageNames))
 	for _, name := range coreUpdateImageNames {
 		image := manifest.Images[name]
 		if image == "" {
 			return fmt.Errorf("core image %s is missing from the release manifest", name)
 		}
-		if err := d.ensureImage(ctx, name, image); err != nil {
+		present, err := d.imagePresent(ctx, name, image)
+		if err != nil {
+			return err
+		}
+		if present {
+			continue
+		}
+		pulledByAttempt = append(pulledByAttempt, image)
+		if err := d.pullImage(ctx, name, image); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			_, cleanupErr := d.PruneManagedImages(cleanupCtx, pulledByAttempt, nil, nil)
+			cancel()
+			if cleanupErr != nil {
+				return errors.Join(err, fmt.Errorf("clean failed candidate pull artifacts: %w", cleanupErr))
+			}
 			return err
 		}
 	}
@@ -648,7 +985,11 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 	}
 	required := []string{"platform", "agent-runtime"}
 	for _, service := range required {
-		if err := d.probeHealthyComposeService(ctx, env, service); err != nil {
+		id, err := d.probeHealthyComposeService(ctx, env, service)
+		if err != nil {
+			return err
+		}
+		if err := d.probeComposeServiceIdentity(ctx, id, service, manifest.Images[service]); err != nil {
 			return err
 		}
 	}
@@ -720,10 +1061,10 @@ func (d DockerCLI) composeServiceContainerID(ctx context.Context, env, service s
 	return ids[0], nil
 }
 
-func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service string) error {
+func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service string) (string, error) {
 	id, err := d.composeServiceContainerID(ctx, env, service)
 	if err != nil {
-		return err
+		return "", err
 	}
 	state, err := d.runner().Run(ctx, d.binary(), []string{
 		"inspect", "--format",
@@ -731,17 +1072,42 @@ func (d DockerCLI) probeHealthyComposeService(ctx context.Context, env, service 
 		id,
 	}, nil)
 	if err != nil {
-		return fmt.Errorf("inspect required service %s container: %w", service, err)
+		return "", fmt.Errorf("inspect required service %s container: %w", service, err)
 	}
 	fields := strings.Fields(state.Stdout)
 	if len(fields) != 2 {
-		return fmt.Errorf("required service %s returned an invalid container state", service)
+		return "", fmt.Errorf("required service %s returned an invalid container state", service)
 	}
 	if fields[0] != "running" {
-		return fmt.Errorf("required service %s container status is %s, want running", service, fields[0])
+		return "", fmt.Errorf("required service %s container status is %s, want running", service, fields[0])
 	}
 	if fields[1] != "healthy" {
-		return fmt.Errorf("required service %s container health is %s, want healthy", service, fields[1])
+		return "", fmt.Errorf("required service %s container health is %s, want healthy", service, fields[1])
+	}
+	return id, nil
+}
+
+func (d DockerCLI) probeComposeServiceIdentity(ctx context.Context, id, service, expectedImage string) error {
+	if !release.IsDigestReference(expectedImage) {
+		return fmt.Errorf("required service %s expected image is not an immutable digest", service)
+	}
+	identity, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		"{{.Config.Image}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}",
+		id,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("inspect required service %s identity: %w", service, err)
+	}
+	fields := strings.Split(strings.TrimSpace(identity.Stdout), "\t")
+	if len(fields) != 3 {
+		return fmt.Errorf("required service %s returned invalid Compose identity", service)
+	}
+	if fields[0] != expectedImage {
+		return fmt.Errorf("required service %s image is %s, want %s", service, fields[0], expectedImage)
+	}
+	if fields[1] != d.ComposeProject || fields[2] != service {
+		return fmt.Errorf("required service %s does not belong to Compose project %s", service, d.ComposeProject)
 	}
 	return nil
 }
@@ -923,6 +1289,52 @@ func (d DockerCLI) RemoveSandbox(ctx context.Context, name string) error {
 	_, err := d.runner().Run(ctx, d.binary(), []string{"rm", "--force", name}, nil)
 	return err
 }
+
+func (d DockerCLI) InspectManagedSandbox(ctx context.Context, name, agentHash string) (ManagedSandboxState, error) {
+	if !safeName(name) || !validAgentHash(agentHash) {
+		return ManagedSandboxState{}, errors.New("invalid managed sandbox identity")
+	}
+	result, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		"{{.State.Running}}\t{{index .Config.Labels \"org.ubitech.agent.sandbox\"}}\t{{index .Config.Labels \"org.ubitech.agent.id\"}}",
+		name,
+	}, nil)
+	if err != nil {
+		if dockerObjectMissing(result, err) || strings.Contains(strings.ToLower(err.Error()), "no such container") {
+			return ManagedSandboxState{}, nil
+		}
+		return ManagedSandboxState{}, fmt.Errorf("inspect managed sandbox %s: %w", name, err)
+	}
+	fields := strings.Split(strings.TrimSpace(result.Stdout), "\t")
+	if len(fields) != 3 || fields[0] != "true" && fields[0] != "false" {
+		return ManagedSandboxState{}, errors.New("Docker returned invalid managed sandbox metadata")
+	}
+	return ManagedSandboxState{
+		Exists: true, Running: fields[0] == "true",
+		Owned: fields[1] == "true" && fields[2] == agentHash,
+	}, nil
+}
+
+func (d DockerCLI) RemoveStoppedManagedSandbox(ctx context.Context, name, agentHash string) error {
+	state, err := d.InspectManagedSandbox(ctx, name, agentHash)
+	if err != nil {
+		return err
+	}
+	if !state.Exists {
+		return nil
+	}
+	if !state.Owned {
+		return errors.New("refusing to remove a sandbox without Manager ownership labels")
+	}
+	if state.Running {
+		return errors.New("refusing to remove a running managed sandbox")
+	}
+	if _, err := d.runner().Run(ctx, d.binary(), []string{"rm", name}, nil); err != nil {
+		return fmt.Errorf("remove stopped managed sandbox %s: %w", name, err)
+	}
+	return nil
+}
+
 func (d DockerCLI) SandboxRunning(ctx context.Context, name string) (bool, error) {
 	if !safeName(name) {
 		return false, errors.New("invalid sandbox name")
@@ -932,6 +1344,18 @@ func (d DockerCLI) SandboxRunning(ctx context.Context, name string) (bool, error
 		return false, err
 	}
 	return strings.TrimSpace(result.Stdout) == "true", nil
+}
+
+func validAgentHash(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 func (d DockerCLI) ExecArgs(spec SandboxSpec, cwd, command string, args []string) (string, []string) {
 	if cwd == "" {

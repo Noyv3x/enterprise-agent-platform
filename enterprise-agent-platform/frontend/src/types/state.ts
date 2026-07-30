@@ -51,6 +51,7 @@ export interface AppState {
   draftFiles: Record<string, File[]>;
   failedSends: Record<string, FailedSend[]>;
   messageSyncCursors: Record<string, MessageSyncCursor>;
+  messageHistory: Record<string, MessageHistoryState>;
   agentStatuses: AgentStatuses;
   expandedAgentRuns: Record<string, boolean>;
   mentionTargets: MentionTarget[];
@@ -111,6 +112,17 @@ export interface FailedSend {
 export interface MessageSyncCursor {
   afterId: string;
   revision: string | number;
+  /** Last destructive hide/delete boundary observed from the server. */
+  resetRevision?: string | number;
+}
+
+export interface MessageHistoryState {
+  nextBeforeId: string | null;
+  hasMore: boolean;
+  loading: boolean;
+  error: string;
+  /** Changes atomically with a successful prepend so scroll anchoring can distinguish it from new messages. */
+  prependVersion: number;
 }
 
 /* ----------------------------- per-slice state sub-types (for slice files) */
@@ -129,6 +141,7 @@ export type ChatSliceState = Pick<
   | "draftFiles"
   | "failedSends"
   | "messageSyncCursors"
+  | "messageHistory"
   | "agentStatuses"
   | "expandedAgentRuns"
   | "mentionTargets"
@@ -216,6 +229,20 @@ interface SetMessageSyncCursorAction {
   type: "SET_MESSAGE_SYNC_CURSOR";
   payload: { key: string; cursor: MessageSyncCursor };
 }
+interface SetMessageHistoryAction {
+  type: "SET_MESSAGE_HISTORY";
+  payload: { key: string; history: MessageHistoryState };
+}
+interface PrependMessagesAction {
+  type: "PREPEND_MESSAGES";
+  payload: {
+    mode: ChatMode;
+    scopeId: string;
+    messages: Message[];
+    nextBeforeId: string | null;
+    hasMore: boolean;
+  };
+}
 interface SetPendingMessagesAction {
   type: "SET_PENDING_MESSAGES";
   payload: Message[];
@@ -231,6 +258,10 @@ interface ReplaceOptimisticMessageAction {
 interface RemoveOptimisticMessageAction {
   type: "REMOVE_OPTIMISTIC_MESSAGE";
   payload: { mode: ChatMode; scopeId: string; tempId: Id };
+}
+interface UpdateOptimisticUploadAction {
+  type: "UPDATE_OPTIMISTIC_UPLOAD";
+  payload: { tempId: Id; upload: NonNullable<Message["metadata"]>["upload"] };
 }
 interface SetAgentStatusAction {
   type: "SET_AGENT_STATUS";
@@ -425,10 +456,13 @@ export type Action =
   | SetMessagesAction
   | SetPrivateMessagesAction
   | SetMessageSyncCursorAction
+  | SetMessageHistoryAction
+  | PrependMessagesAction
   | SetPendingMessagesAction
   | AddPendingMessageAction
   | ReplaceOptimisticMessageAction
   | RemoveOptimisticMessageAction
+  | UpdateOptimisticUploadAction
   | SetAgentStatusAction
   | SetAgentStatusesAction
   | ToggleAgentRunAction

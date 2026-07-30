@@ -8,7 +8,6 @@ from .prompt_security import prompt_threat_reasons
 
 
 MAX_MEMORY_CONTENT_LENGTH = 4_000
-MAX_MEMORY_CANDIDATE_LENGTH = 2_000
 MEMORY_QUOTAS: dict[str, tuple[int, int]] = {
     # (maximum rows, maximum characters) per exact scope/target/owner.
     "memory": (200, 100_000),
@@ -24,23 +23,6 @@ def normalize_memory_content(content: str) -> str:
 
 def memory_content_hash(content: str) -> str:
     return hashlib.sha256(normalize_memory_content(content).encode("utf-8")).hexdigest()
-
-
-def memory_dedupe_key(
-    scope_key: str,
-    target: str,
-    owner_user_id: int | None,
-    content: str,
-) -> str:
-    material = "\x1f".join(
-        (
-            str(scope_key),
-            str(target),
-            str(owner_user_id or 0),
-            memory_content_hash(content),
-        )
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def memory_injection_reasons(content: str) -> list[str]:

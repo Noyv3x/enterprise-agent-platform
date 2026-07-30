@@ -139,6 +139,26 @@ export const chatMessages = defineMessages({
     en: { one: "Up to {count} attachment per message", other: "Up to {count} attachments per message" },
     "zh-TW": { other: "每則訊息最多 {count} 個附件" },
   },
+  "chat.upload.queued": {
+    "zh-CN": "等待上传",
+    en: "Waiting to upload",
+    "zh-TW": "等待上傳",
+  },
+  "chat.upload.uploading": {
+    "zh-CN": "正在上传",
+    en: "Uploading",
+    "zh-TW": "正在上傳",
+  },
+  "chat.upload.processing": {
+    "zh-CN": "上传完成，正在处理",
+    en: "Upload complete, processing",
+    "zh-TW": "上傳完成，正在處理",
+  },
+  "chat.upload.progress": {
+    "zh-CN": "上传进度 {count}%",
+    en: "Upload progress {count}%",
+    "zh-TW": "上傳進度 {count}%",
+  },
   "chat.composer.noChannel": {
     "zh-CN": "选择频道后发送消息",
     en: "Select a channel to send a message",
@@ -244,6 +264,21 @@ export const chatMessages = defineMessages({
     "zh-CN": { other: "{count} 条新消息" },
     en: { one: "{count} new message", other: "{count} new messages" },
     "zh-TW": { other: "{count} 則新訊息" },
+  },
+  "chat.history.loadOlder": {
+    "zh-CN": "加载更早消息",
+    en: "Load earlier messages",
+    "zh-TW": "載入更早訊息",
+  },
+  "chat.history.loading": {
+    "zh-CN": "正在加载更早消息",
+    en: "Loading earlier messages",
+    "zh-TW": "正在載入更早訊息",
+  },
+  "chat.history.retry": {
+    "zh-CN": "加载失败，重试",
+    en: "Could not load; retry",
+    "zh-TW": "載入失敗，重試",
   },
   "chat.typing.someone": { "zh-CN": "有人正在输入", en: "Someone is typing", "zh-TW": "有人正在輸入" },
   "chat.typing.users": {

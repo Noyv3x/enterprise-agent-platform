@@ -114,9 +114,9 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 
 审批 body 只接受 `approval_id` 和 `decision`。decision 是 `once`、`session`、`always` 或 `deny`。省略 `approval_id` 时处理该 Run 最新待决审批；未知字段或无效 decision 返回 400。
 
-审批用于已提交记忆、Skill、计划修改和其它明确需要用户决定的业务动作。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
+审批用于 host terminal、Skill、计划修改和其它明确需要用户决定的业务动作。自动记忆不使用审批。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
 
-terminal、process 和文件工具不使用审批。它们必须带 `target=sandbox|host`，省略时为 sandbox；Runtime 在调用 Manager 前写入 `execution.audit`，数据包含 target、完整安全展示参数、canonical cwd/路径、前后台方式和有效 timeout。host 不支持 session/always 复用，也不能成为 Run 默认。Manager 响应回显不可伪造的 executor id、实际 target 和审计 id，Runtime 才能发出 `tool.started`。
+terminal、process 和文件工具必须带 `target=sandbox|host`，省略时为 sandbox。Sandbox 不使用人工审批；host terminal 在调用 Manager 之前逐次请求审批，choices 固定为 `once|deny`，不支持 session/always 复用，也不能成为 Run 默认。批准后 Runtime 写入 `execution.audit`，数据包含 target、完整安全展示参数、canonical cwd/路径、前后台方式和有效 timeout。Manager 响应回显不可伪造的 executor id、实际 target 和审计 id，Runtime 才能发出 `tool.started`。
 
 子 Run 可以把审批所有权委托给顶层 Run，但 scope 和 session 必须来自可信 metadata。审批决定不能通过工具参数指定。
 
@@ -134,9 +134,13 @@ Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`f
 
 Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
-Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule 和 skill；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill 和 mail；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
 
-Gateway 中网页、浏览器、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
+Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
+
+`mail` Gateway 只接受由 Run context 派生的私人账户所有权。读取动作为 `accounts/folders/search/read`，副作用动作为 `send/reply/move/mark/save_attachment`；unattended trigger 只能使用读取动作。SMTP mutation 携带 `run_id + tool_call_id` 幂等身份，结果不确定时返回 `needs_review` 语义而不是自动重发。
+
+浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API申请当前 scope/tab 的短期租约并发送限幅输入；Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
 
 ## 协议演进
 

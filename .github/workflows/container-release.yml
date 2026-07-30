@@ -247,11 +247,17 @@ jobs:
       - prepare
       - images
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: read
     steps:
+      - name: Check out release capacity contract
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
       - name: Download immutable image identities
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -353,10 +359,39 @@ jobs:
               echo "Anonymous registry metadata returned ${registry_digest:-no digest} for ${image}" >&2
               exit 1
             }
-            docker image rm --force "$image" >/dev/null 2>&1 || true
-            docker pull "$image"
-            docker image inspect "$image" --format '{{json .RepoDigests}}' |
-              jq -e --arg image "$image" 'index($image) != null' >/dev/null
+            if [[ "$component" == platform || "$component" == agent-runtime ]]; then
+              compressed_limit="$(jq -er --arg component "$component" '.update_core_image_capacity_estimates[$component].compressed_bytes' docs/contracts/container-platform.json)"
+              unpacked_limit="$(jq -er --arg component "$component" '.update_core_image_capacity_estimates[$component].unpacked_bytes' docs/contracts/container-platform.json)"
+              index_raw="$(docker buildx imagetools inspect "$image" --raw)"
+              image_repository="${image%@*}"
+              for architecture in amd64 arm64; do
+                platform_digest="$(jq -er --arg architecture "$architecture" '
+                  [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest]
+                  | if length == 1 then .[0] else error("release index has an ambiguous platform manifest") end
+                ' <<<"$index_raw")"
+                platform_raw="$(docker buildx imagetools inspect "${image_repository}@${platform_digest}" --raw)"
+                compressed_bytes="$(jq -er '[.config.size, (.layers[]?.size)] | add | select(type == "number" and . > 0)' <<<"$platform_raw")"
+                if (( compressed_bytes > compressed_limit )); then
+                  echo "${component} linux/${architecture} compressed size ${compressed_bytes} exceeds contract limit ${compressed_limit}" >&2
+                  exit 1
+                fi
+                docker image rm --force "$image" >/dev/null 2>&1 || true
+                docker pull --platform "linux/${architecture}" "$image"
+                unpacked_bytes="$(docker image inspect "$image" --format '{{.Size}}')"
+                [[ "$unpacked_bytes" =~ ^[0-9]+$ ]]
+                if (( unpacked_bytes > unpacked_limit )); then
+                  echo "${component} linux/${architecture} unpacked size ${unpacked_bytes} exceeds contract limit ${unpacked_limit}" >&2
+                  exit 1
+                fi
+                docker image inspect "$image" --format '{{json .RepoDigests}}' |
+                  jq -e --arg image "$image" 'index($image) != null' >/dev/null
+              done
+            else
+              docker image rm --force "$image" >/dev/null 2>&1 || true
+              docker pull "$image"
+              docker image inspect "$image" --format '{{json .RepoDigests}}' |
+                jq -e --arg image "$image" 'index($image) != null' >/dev/null
+            fi
           done
 
           jq -e '

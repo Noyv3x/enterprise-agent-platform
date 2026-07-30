@@ -31,7 +31,7 @@ REQUIRED_RUNTIME_POLICIES = {
     "max_turns_per_run",
     "terminal_timeout",
 }
-REQUIRED_FORBIDDEN_TOP_LEVEL_FILES = {"agents.md", "claude.md"}
+REQUIRED_FORBIDDEN_TOP_LEVEL_FILES = {"claude.md"}
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 DOMAIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 ZERO_SHA_RE = re.compile(r"^0+$")
@@ -257,8 +257,8 @@ def load_manifest(root: Path) -> Manifest:
         {"version", "forbidden_top_level_files", "coverage", "domains", "contracts"},
         "documentation manifest",
     )
-    if raw.get("version") != 2:
-        raise DocsSyncError("documentation manifest version must be 2")
+    if raw.get("version") != 3:
+        raise DocsSyncError("documentation manifest version must be 3")
 
     forbidden = _expect_string_list(
         raw.get("forbidden_top_level_files"),
@@ -346,8 +346,10 @@ def load_manifest(root: Path) -> Manifest:
         )
         for document in documents:
             _reject_symlink_chain(root, document, f"{label}.document")
-            if not _is_beneath(document, "docs"):
-                raise DocsSyncError(f"{label}.documents must stay under docs/: {document}")
+            if document != "AGENTS.md" and not _is_beneath(document, "docs"):
+                raise DocsSyncError(
+                    f"{label}.documents must stay under docs/ (except behavior-only AGENTS.md): {document}"
+                )
         for pattern in (*code, *tests):
             _glob_regex(pattern)
         domains.append(
@@ -425,7 +427,7 @@ def load_manifest(root: Path) -> Manifest:
             )
 
     manifest = Manifest(
-        version=2,
+        version=3,
         forbidden_top_level_files=forbidden,
         coverage=coverage,
         domains=tuple(domains),
@@ -1084,6 +1086,11 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
             "execution_targets",
             "sandbox_idle_seconds",
             "migration_backup_retention_seconds",
+            "obsolete_artifact_retention_seconds",
+            "update_pre_download_min_free_bytes",
+            "update_pre_cutover_min_free_bytes",
+            "update_min_free_inodes",
+            "update_core_image_capacity_estimates",
             "public_update_states",
             "operations",
             "operation_phases",
@@ -1142,17 +1149,53 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         "database_schema_version",
         "sandbox_idle_seconds",
         "migration_backup_retention_seconds",
+        "obsolete_artifact_retention_seconds",
+        "update_pre_download_min_free_bytes",
+        "update_pre_cutover_min_free_bytes",
+        "update_min_free_inodes",
     ):
         value = contract.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise DocsSyncError(f"{label}.{field} must be a positive integer")
         if value > JAVASCRIPT_MAX_SAFE_INTEGER:
             raise DocsSyncError(f"{label}.{field} must be a JavaScript safe integer")
+
+    estimates = _expect_object(
+        contract.get("update_core_image_capacity_estimates"),
+        f"{label}.update_core_image_capacity_estimates",
+    )
+    if set(estimates) != {"platform", "agent-runtime"}:
+        raise DocsSyncError(
+            f"{label}.update_core_image_capacity_estimates must contain exactly "
+            "platform and agent-runtime"
+        )
+    for image_name, estimate_value in estimates.items():
+        estimate = _expect_object(
+            estimate_value,
+            f"{label}.update_core_image_capacity_estimates.{image_name}",
+        )
+        if set(estimate) != {"compressed_bytes", "unpacked_bytes"}:
+            raise DocsSyncError(
+                f"{label}.update_core_image_capacity_estimates.{image_name} must "
+                "contain exactly compressed_bytes and unpacked_bytes"
+            )
+        for size_name, value in estimate.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value > JAVASCRIPT_MAX_SAFE_INTEGER
+            ):
+                raise DocsSyncError(
+                    f"{label}.update_core_image_capacity_estimates.{image_name}."
+                    f"{size_name} must be a positive JavaScript-safe integer"
+                )
     return contract
 
 
 def _render_python_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
+    estimates = contract["update_core_image_capacity_estimates"]
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -1163,6 +1206,11 @@ CONTAINER_PATHS = {paths!r}
 EXECUTION_TARGETS = {tuple(contract["execution_targets"])!r}
 SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]}
 MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]}
+OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]}
+UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES = {contract["update_pre_download_min_free_bytes"]}
+UPDATE_PRE_CUTOVER_MIN_FREE_BYTES = {contract["update_pre_cutover_min_free_bytes"]}
+UPDATE_MIN_FREE_INODES = {contract["update_min_free_inodes"]}
+UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {estimates!r}
 PUBLIC_UPDATE_STATES = {tuple(contract["public_update_states"])!r}
 MANAGER_OPERATIONS = {tuple(contract["operations"])!r}
 MANAGER_OPERATION_PHASES = {tuple(contract["operation_phases"])!r}
@@ -1175,6 +1223,7 @@ def _render_typescript_container_platform(contract: dict[str, Any], source: str)
     states = json.dumps(contract["public_update_states"], ensure_ascii=False)
     operations = json.dumps(contract["operations"], ensure_ascii=False)
     phases = json.dumps(contract["operation_phases"], ensure_ascii=False)
+    estimates = json.dumps(contract["update_core_image_capacity_estimates"], ensure_ascii=False, indent=2)
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]} as const;
 export const RELEASE_CHANNEL = {_typescript_string(contract["release_channel"])} as const;
@@ -1184,6 +1233,11 @@ export const EXECUTION_TARGETS = {targets} as const;
 export type ExecutionTarget = (typeof EXECUTION_TARGETS)[number];
 export const SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]} as const;
 export const MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]} as const;
+export const OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]} as const;
+export const UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES = {contract["update_pre_download_min_free_bytes"]} as const;
+export const UPDATE_PRE_CUTOVER_MIN_FREE_BYTES = {contract["update_pre_cutover_min_free_bytes"]} as const;
+export const UPDATE_MIN_FREE_INODES = {contract["update_min_free_inodes"]} as const;
+export const UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {estimates} as const;
 export const PUBLIC_UPDATE_STATES = {states} as const;
 export type PublicUpdateState = (typeof PUBLIC_UPDATE_STATES)[number];
 export const MANAGER_OPERATIONS = {operations} as const;
@@ -1216,10 +1270,33 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
             "MigrationBackupRetentionSeconds",
             str(contract["migration_backup_retention_seconds"]),
         ),
+        (
+            "ObsoleteArtifactRetentionSeconds",
+            str(contract["obsolete_artifact_retention_seconds"]),
+        ),
+        (
+            "UpdatePreDownloadMinFreeBytes",
+            str(contract["update_pre_download_min_free_bytes"]),
+        ),
+        (
+            "UpdatePreCutoverMinFreeBytes",
+            str(contract["update_pre_cutover_min_free_bytes"]),
+        ),
+        ("UpdateMinFreeInodes", str(contract["update_min_free_inodes"])),
     )
     name_width = max(len(name) for name, _ in constants)
     constant_lines = "\n".join(
         f"\t{name:<{name_width}} = {value}" for name, value in constants
+    )
+    estimate_lines = "\n".join(
+        "\t"
+        + _go_string(name)
+        + ": {\n\t\tCompressedBytes: "
+        + str(value["compressed_bytes"])
+        + ",\n\t\tUnpackedBytes:   "
+        + str(value["unpacked_bytes"])
+        + ",\n\t},"
+        for name, value in sorted(contract["update_core_image_capacity_estimates"].items())
     )
 
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
@@ -1228,6 +1305,15 @@ package contract
 const (
 {constant_lines}
 )
+
+type ImageCapacityEstimate struct {{
+\tCompressedBytes uint64
+\tUnpackedBytes   uint64
+}}
+
+var UpdateCoreImageCapacityEstimates = map[string]ImageCapacityEstimate{{
+{estimate_lines}
+}}
 
 var ExecutionTargets = []string{{{strings(contract["execution_targets"])}}}
 var PublicUpdateStates = []string{{{strings(contract["public_update_states"])}}}

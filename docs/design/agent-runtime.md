@@ -13,7 +13,7 @@ Runtime 直接依赖 lockfile 中精确版本的 Pi Core 与 Pi AI，不经由�
 - 幂等 Run 结果与可恢复事件 journal；
 - Runtime 可执行模型目录。
 
-Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、知识、技能、计划和浏览器业务接口。宿主管理器拥有 Sandbox/host 进程、文件执行和容器生命周期。Runtime 不复制这些状态，也不访问 Docker socket。
+Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、知识、技能、计划、邮箱和浏览器业务接口。宿主管理器拥有 Sandbox/host 进程、文件执行和容器生命周期。Runtime 不复制这些状态，也不访问 Docker socket。
 
 ## Run 状态机
 
@@ -31,15 +31,17 @@ Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API �
 
 ## 工具与执行目标
 
-Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、schedule、session、session_search 和 delegate_task。
+Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、mail、schedule、session、session_search 和 delegate_task。
 
 terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。
 
 用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件只使用 `/workspace/.ubitech/attachments/...` 逻辑路径，经 Manager 在当前 scope 的只读附件挂载中解析；Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
 
-模型可为单次 terminal、process 或文件调用显式选择 `target=host`。该目标不等待用户审批：平台采用可信成员模型，管理器以部署用户在宿主机执行，并允许该用户已有的免密 `sudo`。每次调用仍必须在执行前发出可见审计事件，包含未经隐藏的实际命令参数或 canonical 文件路径、目标、cwd 和超时；凭据只做安全脱敏。宿主执行不能复用为后续调用的隐式授权，也不能把 host 变为 Run 默认值。
+模型可为单次 terminal、process 或文件调用显式选择 `target=host`。Sandbox 命令不等待人工审批；terminal、process 与文件工具的宿主目标都必须逐次取得用户批准，并且只提供本次批准或拒绝，不能创建 session/permanent 规则。批准后管理器以部署用户在宿主机执行，并允许该用户已有的免密 `sudo`。每次调用仍必须在执行前发出可见审计事件，包含未经隐藏的实际命令参数或 canonical 文件路径、目标、cwd 和超时；凭据只做安全脱敏。宿主执行不能复用为后续调用的隐式授权，也不能把 host 变为 Run 默认值。
 
 Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化、参数上限、凭据脱敏和输出上限。Sandbox 是工作环境隔离，不是恶意租户安全边界；host target 等同授予本次调用部署用户权限。Docker socket、管理器状态根和宿主凭据目录始终由管理器拒绝，即使请求 `target=host`。
+
+Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和规范化逻辑路径；Manager 是宿主映射的最终可信边界。Manager 必须把 `/workspace`、`/home/agent`、`/opt/agent-env` 或绝对宿主路径解析为不可变的根与相对路径，从根目录 fd 逐段以不跟随符号链接的方式打开。文件 read/write/patch/search 与 terminal cwd 都不能在检查后重新按字符串解析；patch 在同一个已固定父目录中完成读取与原子替换，terminal 子进程从已固定目录 fd 切换 cwd。审批后路径被替换为符号链接、非目录或受保护路径时，本次调用失败且批准不可复用。
 
 来自网页、浏览器、知识、记忆、session 和技能附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
 
@@ -55,7 +57,9 @@ terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进
 
 顶层 Run 启动前，Runtime 尝试召回当前 Agent 记忆和用户资料记忆；失败不阻止 Run。注入采用独立字符预算、完整记录边界和明确的不可信数据标签。
 
-只有规范私人、顶层、交互式 Run 可以免写审批提交候选记忆。候选不是已提交记忆，在用户批准前不得被召回。可用技能只在系统提示中注入精简索引；完整 `SKILL.md` 及支持文件必须由 Agent 按需加载。
+只有规范私人、顶层、交互式 Run 可以自动写入或整理正式记忆，不再经过候选审批。记忆只保存稳定身份、长期偏好、持续约束和跨会话有价值的事实；任务进度、临时 TODO、一次性路径或当前回复内容不得写入长期记忆，重复或过时事实应合并或替换。计划任务、邮件唤醒、频道和委派 Run 默认只读记忆，不能被外部内容诱导修改。可用技能只在系统提示中注入精简索引；完整 `SKILL.md` 及支持文件必须由 Agent 按需加载。
+
+每个主 Agent 的系统提示同时说明 Sandbox 逻辑工作区 `/workspace` 和由可信部署配置派生的当前宿主映射。Agent 默认在工作区创建并保存交付物，保持目录有序，并在确认无用后清理自己产生的临时中间文件；不得以“整理”为由删除上传附件、用户文件或含义不明的内容。宿主映射只用于帮助理解路径关系，不改变 Sandbox 默认执行目标，也不进入公共状态、数据库或普通工具 metadata。
 
 ## 委派
 

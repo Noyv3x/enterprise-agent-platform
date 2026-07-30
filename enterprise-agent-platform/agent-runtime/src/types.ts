@@ -185,7 +185,7 @@ export interface ResolvedModel {
 }
 
 export interface GatewayToolRequest {
-  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule" | "skill";
+  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule" | "skill" | "mail";
   action: string;
   arguments: JsonObject;
   context: {
@@ -196,6 +196,11 @@ export interface GatewayToolRequest {
     workspace: string;
     owner_user_id?: number;
     source_message_id?: number;
+    tool_call_id?: string;
+    parent_run_id?: string;
+    delegation_depth?: number;
+    trigger?: string;
+    unattended?: boolean;
   };
 }
 

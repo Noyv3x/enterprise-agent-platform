@@ -43,6 +43,7 @@ services:
     stop_grace_period: 45s
     environment:
       ENTERPRISE_PLATFORM_DATA: /var/lib/ubitech-agent
+      UBITECH_HOST_DATA_ROOT: ${UBITECH_DATA_ROOT:?UBITECH_DATA_ROOT must be set}
       ENTERPRISE_PLATFORM_HOST: 0.0.0.0
       ENTERPRISE_PLATFORM_PORT: "8765"
       UBITECH_DEPLOYMENT_MODE: container

@@ -4,21 +4,21 @@
 
 ## 数据所有者
 
-Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元数据、token 用量、Agent scope、记忆、知识、设置、Telegram、持久任务和计划任务的权威存储。Runtime 的 JSONL 文件只保存模型会话和工具历史，不替代产品消息库。
+Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元数据、token 用量、Agent scope、记忆、知识、设置、Telegram、邮箱、持久任务和计划任务的权威存储。Runtime 的 JSONL 文件只保存模型会话和工具历史，不替代产品消息库。
 
 主要数据组如下：
 
 - `users`、`channels`、`messages`、`attachments`、`conversation_revisions`；
 - `agent_scopes`、`agent_runtime_scopes`、`agent_runtime_scope_sessions`；
 - `durable_jobs`、`agent_run_inputs`；
-- `agent_memories`、`agent_memory_candidates` 及其 FTS；
+- `agent_memories` 及其 FTS；
 - `knowledge_documents` 及其 FTS；
 - `agent_schedules`、`agent_schedule_runs`；
-- `settings`、`token_usage_events`、Telegram 与外部身份表。
+- `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
 数据库启用 WAL、外键和按线程连接。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
-Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前发布把容器平台 schema marker 与最终表结构作为唯一 baseline：空数据库直接创建该结构；`durable_jobs`、`agent_run_inputs`、`agent_schedules`、`agent_schedule_runs` 也属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表；仅允许从上一个已部署的容器基线执行一次原子升级，把没有当前来源语义的记忆标记为 `imported`，并在确认每个私人 Agent 已由规范 scope 和 Runtime 状态接管后删除该源基线可选携带的退役 `private_agents` 登记表。该表的 session、容器和绝对 workspace 字段不是当前权威数据，不导入或覆盖新基线。其它非空数据库缺少受支持 marker、包含未声明表或不满足声明结构时明确拒绝启动，不在 Platform 内猜测来源或修补任意旧结构。
+Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。目标基线把当前容器 schema marker 与最终表结构作为唯一 baseline：空数据库直接创建该结构；全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。本次过渡发布只额外接受唯一部署机已经在用、结构精确匹配的直接上一容器 marker，并以单事务升级正式记忆来源、把尚未决定且未与正式记忆重复的候选转为 `automatic` 记忆、删除候选表、创建邮箱表后切换到当前 marker；已批准候选已有正式记忆，已拒绝候选不恢复。任何其它 marker、未知业务表或退役表仍明确拒绝。部署机确认当前 marker 后，紧接着的基线发布必须删除该一次性分支，使非空数据库只接受当前 marker 和声明结构。
 
 ## Agent scope
 
@@ -55,9 +55,9 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 - `memory`：属于一个 Agent scope 的事实、规则与工作偏好；
 - `user`：属于用户的资料，可被该用户的相关 Agent 使用。
 
-每条已提交记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual`、`tool` 或 `candidate`；`imported` 只表示从上一个容器基线保留下来的无精确来源记录，不能由普通写入接口伪造。所有权从可信 Run context 派生；模型参数不能覆盖 owner。写入有配额、长度和去重约束，精确限制由代码契约和测试维护。
+每条记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual` 或 `automatic`。所有权和是否允许自动写入从可信 Run context 派生；模型参数不能覆盖 owner 或把 unattended/channel/delegated Run 提升为可写。写入有配额、长度、注入扫描和去重约束，精确限制由代码契约和测试维护。
 
-交互式私人顶层 Run 可以提出 `pending` 候选。候选经过用户批准后才生成正式记忆，也可以被拒绝；已决定或过期候选按有界策略清理。计划任务、频道 Agent 和委派 Agent不能走免审批候选通道。
+交互式私人顶层 Run 在对话中发现稳定且跨会话有价值的信息时直接写入、替换或忘记正式记忆，不弹出审批。Agent 应优先更新同一事实而不是追加冲突副本；临时任务状态和过程信息留在 session 或工作区。计划任务、邮件唤醒、频道 Agent 和委派 Agent 只能召回，不得自动修改记忆。
 
 ## 召回与搜索
 
@@ -79,6 +79,6 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。当前代码不包含容器 baseline 之前的迁移；启动只接受当前 marker，或精确匹配上一个已部署容器 marker 后执行受限的一次性升级。源基线中的 `private_agents` 只能作为结构精确匹配的可选退役表；迁移必须先证明其每行已有对应的 `users`、`private:<user-id>` scope、相对 workspace、sandbox identity 和 Runtime session/lifecycle，再与记忆格式升级及 marker 切换在同一事务中删除。任何证明失败或后续步骤异常都必须保留原表、原数据和原 marker；当前 marker 下不允许该表存在。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或禁止表都拒绝启动。未来新增迁移必须拥有不可变的独立版本、唯一名称和明确 source version，并在 Manager 快照边界内原子执行；不得把旧产品布局扫描重新放回常规启动路径。
+数据库 schema version 单调递增。本次发布暂时携带且只携带上段定义的直接上一容器 baseline 升级；它不扫描旧源码布局、不猜测结构，也不接受更早 marker。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或退役表都拒绝启动。部署机升级成功并确认无回滚消费者后，下一基线删除该临时升级实现，不能让迁移代码永久堆积。
 
-未来数据格式变更必须先更新文档、schema version 和迁移测试；仅支持从届时文档明确声明的上一基线升级，不扫描其它产品目录或猜测未声明布局。
+未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

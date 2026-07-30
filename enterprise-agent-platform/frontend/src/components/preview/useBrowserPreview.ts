@@ -11,6 +11,7 @@ export interface BrowserPreviewState {
   connection: PreviewConnection;
   activity: BrowserPreviewActivity;
   frameUrl: string;
+  tabId: string;
   error: string;
   title: string;
   url: string;
@@ -22,6 +23,7 @@ const initialState: BrowserPreviewState = {
   connection: "connecting",
   activity: "loading",
   frameUrl: "",
+  tabId: "",
   error: "",
   title: "",
   url: "",
@@ -86,6 +88,7 @@ export function useBrowserPreview(scope: AgentPreviewScope | null) {
             connection: "connected",
             activity: "idle",
             frameUrl: "",
+            tabId: "",
             error: "",
             title: "",
             url: "",
@@ -101,6 +104,7 @@ export function useBrowserPreview(scope: AgentPreviewScope | null) {
             connection: "connected",
             activity: "live",
             frameUrl: nextFrameUrl,
+            tabId: result.tabId,
             error: "",
             title: result.title,
             url: result.url,
@@ -139,6 +143,7 @@ export function useBrowserPreview(scope: AgentPreviewScope | null) {
           ...current,
           activity: "loading",
           frameUrl: "",
+          tabId: "",
           title: "",
           url: "",
           capturedAt: "",

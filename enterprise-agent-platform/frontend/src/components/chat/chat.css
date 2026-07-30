@@ -23,6 +23,12 @@
   height: 100%;
 }
 
+.chat-history-loader {
+  display: flex;
+  justify-content: center;
+  min-height: 32px;
+}
+
 .scroll-latest {
   position: absolute;
   z-index: 4;
@@ -152,6 +158,22 @@
   border-color: var(--line);
   line-height: 19px;
   font-size: 10.5px;
+}
+
+.msg-upload {
+  min-width: min(280px, 100%);
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.msg-upload__label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.msg-upload .ant-progress {
+  margin: 0;
 }
 
 .msg__suggest .chip.chip {

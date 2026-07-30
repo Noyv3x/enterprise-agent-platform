@@ -105,6 +105,88 @@ func TestPrepareVerifiesButDoesNotActivateCandidate(t *testing.T) {
 	if string(installed) != string(oldBinary) {
 		t.Fatal("Prepare changed the stable executable")
 	}
+	for _, version := range []*Version{state.Current, state.Candidate} {
+		var metadata Version
+		if err := atomicfile.ReadJSON(filepath.Join(filepath.Dir(version.Path), "metadata.json"), &metadata); err != nil {
+			t.Fatalf("verified Manager version lacks cleanup provenance: %v", err)
+		}
+		if metadata != *version {
+			t.Fatalf("Manager version metadata = %#v, want %#v", metadata, *version)
+		}
+	}
+}
+
+func TestPruneVersionsRemovesOnlyExpiredVerifiedUnreferencedDirectories(t *testing.T) {
+	manager, _, _, _ := newPreparedManager(t)
+	state, err := manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBinary := []byte("obsolete manager binary")
+	oldDigest := sha256Hex(oldBinary)
+	oldCommit := strings.Repeat("b", 40)
+	oldVersion := Version{
+		Version: "obsolete", SourceCommit: oldCommit,
+		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+oldCommit[:12]), "ubitech-manager"),
+		SHA256:     oldDigest,
+		VerifiedAt: time.Unix(10, 0).UTC(),
+	}
+	if err := atomicfile.WriteFile(oldVersion.Path, oldBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ensureVersionMetadata(oldVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := manager.PruneVersions(context.Background(), time.Unix(10_000, 0).UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed Manager versions = %d, want 1", removed)
+	}
+	if _, err := os.Lstat(filepath.Dir(oldVersion.Path)); !os.IsNotExist(err) {
+		t.Fatalf("expired Manager version remains: %v", err)
+	}
+	for _, version := range []*Version{state.Current, state.Candidate} {
+		if _, err := os.Lstat(version.Path); err != nil {
+			t.Fatalf("referenced Manager version was removed: %v", err)
+		}
+	}
+}
+
+func TestPruneVersionsRetainsDirectoryContainingUnknownEvidence(t *testing.T) {
+	manager, _, _, _ := newPreparedManager(t)
+	binary := []byte("obsolete manager binary")
+	digest := sha256Hex(binary)
+	commit := strings.Repeat("c", 40)
+	version := Version{
+		Version: "obsolete", SourceCommit: commit,
+		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+commit[:12]), "ubitech-manager"),
+		SHA256:     digest,
+		VerifiedAt: time.Unix(10, 0).UTC(),
+	}
+	if err := atomicfile.WriteFile(version.Path, binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ensureVersionMetadata(version); err != nil {
+		t.Fatal(err)
+	}
+	note := filepath.Join(filepath.Dir(version.Path), "operator-note.txt")
+	if err := os.WriteFile(note, []byte("retain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := manager.PruneVersions(context.Background(), time.Unix(10_000, 0).UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Fatalf("Manager version with unknown evidence was removed: %d", removed)
+	}
+	if content, err := os.ReadFile(note); err != nil || string(content) != "retain" {
+		t.Fatalf("unknown Manager version evidence changed: %q %v", content, err)
+	}
 }
 
 func TestPrepareCannotRaceExternalCurrentRecovery(t *testing.T) {

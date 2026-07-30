@@ -14,9 +14,11 @@
 
 import {
   api,
+  apiUpload,
   ApiRequestCancelledError,
   isApiRequestCancelled,
   type ApiOptions,
+  type ApiUploadProgress,
 } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
@@ -44,6 +46,7 @@ import {
   issueStatusRead,
 } from "./statusFence";
 import { messageSyncCursor } from "./messageSync";
+import { messageHistoryState } from "./messageHistory";
 import {
   loadChannelMessages,
   loadDocuments,
@@ -73,7 +76,6 @@ let pendingRefresh: {
   store: AppStore;
   authoritativeStatus: boolean;
 } | null = null;
-const CHAT_WINDOW_LIMIT = 100;
 
 /* --------- local mirrors of the loaders' private merge/status helpers ---------
    refreshActiveChat fetches directly (instead of via the dispatching loaders) so
@@ -195,7 +197,7 @@ function mergeDelta(
     state,
     mode,
     scopeId,
-    merged.slice(-CHAT_WINDOW_LIMIT),
+    merged,
   );
 }
 
@@ -320,12 +322,23 @@ export async function refreshActiveChat(
           },
         });
       }
+      const channelKey = chatScopeKey("channel", channelId);
+      if (result.mode !== "delta") {
+        store.dispatch({
+          type: "SET_MESSAGE_HISTORY",
+          payload: {
+            key: channelKey,
+            history: messageHistoryState(result, state.messageHistory[channelKey]),
+          },
+        });
+      }
       cacheChat(
         store,
         "channel",
         channelId,
         store.getState().messages,
         cursor,
+        store.getState().messageHistory[channelKey],
       );
     } else {
       const scopeId = scopeIdFor(initial, "private");
@@ -372,12 +385,26 @@ export async function refreshActiveChat(
           },
         });
       }
+      const privateKey = chatScopeKey("private", scopeId);
+      if (messagesResult.mode !== "delta") {
+        store.dispatch({
+          type: "SET_MESSAGE_HISTORY",
+          payload: {
+            key: privateKey,
+            history: messageHistoryState(
+              messagesResult,
+              state.messageHistory[privateKey],
+            ),
+          },
+        });
+      }
       cacheChat(
         store,
         "private",
         scopeId,
         store.getState().privateMessages,
         cursor,
+        store.getState().messageHistory[privateKey],
       );
     }
   } catch {
@@ -487,7 +514,19 @@ function buildOptimisticMessage(
     username: state.user?.display_name || state.user?.username || t("chat.you"),
     content,
     attachments: optimisticAttachments(files, seq),
-    metadata: { local_pending: true },
+    metadata: {
+      local_pending: true,
+      ...(files.length
+        ? {
+            upload: {
+              state: "queued" as const,
+              loaded: 0,
+              total: files.reduce((sum, file) => sum + file.size, 0),
+              percent: 0,
+            },
+          }
+        : {}),
+    },
     created_at: Math.floor(Date.now() / 1000),
   };
 }
@@ -512,6 +551,30 @@ export async function sendMessage(
   const message = buildOptimisticMessage(store.getState(), mode, scopeId, content, files, seq);
   store.dispatch({ type: "ADD_PENDING_MESSAGE", payload: { mode, scopeId, message } });
 
+  const updateUpload = (
+    state: "queued" | "uploading" | "processing",
+    progress?: ApiUploadProgress,
+  ) => {
+    if (!files.length) return;
+    const fallbackTotal = files.reduce((sum, file) => sum + file.size, 0);
+    const total = Math.max(0, progress?.total || fallbackTotal);
+    const loaded = state === "processing"
+      ? total
+      : Math.max(0, Math.min(progress?.loaded || 0, total));
+    const percent = state === "processing"
+      ? 100
+      : total > 0
+        ? Math.max(0, Math.min(100, Math.round((loaded / total) * 100)))
+        : 0;
+    store.dispatch({
+      type: "UPDATE_OPTIMISTIC_UPLOAD",
+      payload: {
+        tempId: message.id,
+        upload: { state, loaded, total, percent },
+      },
+    });
+  };
+
   try {
     const post = async (): Promise<PostMessageResponse> => {
       // RESET_SESSION removes all pending messages. Do not let an old queued
@@ -519,17 +582,24 @@ export async function sendMessage(
       if (!store.getState().pendingMessages.some((pending) => pending.id === message.id)) {
         throw new ApiRequestCancelledError();
       }
-      let request: ApiOptions;
       if (files.length) {
         const form = new FormData();
         form.append("content", content);
         // Field name "files" (repeated, with filename); no Content-Type — the
         // browser sets the multipart boundary and api() leaves FormData headers alone.
         for (const file of files) form.append("files", file, file.name);
-        request = { method: "POST", body: form };
-      } else {
-        request = { method: "POST", body: JSON.stringify({ content }) };
+        updateUpload("uploading");
+        const path = mode === "private"
+          ? endpoints.postPrivateMessage.path()
+          : endpoints.postChannelMessage.path(scopeId);
+        return runStatusMutation(store, mode, scopeId, () =>
+          apiUpload<PostMessageResponse>(path, form, {
+            onProgress: (progress) => updateUpload("uploading", progress),
+            onUploadComplete: () => updateUpload("processing"),
+          }),
+        );
       }
+      const request: ApiOptions = { method: "POST", body: JSON.stringify({ content }) };
       return runStatusMutation(store, mode, scopeId, () =>
         mode === "private"
           ? api<PostMessageResponse>(endpoints.postPrivateMessage.path(), request)

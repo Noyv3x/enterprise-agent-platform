@@ -25,6 +25,10 @@ Platform 只接受容器基线：`UBITECH_DEPLOYMENT_MODE` 必须显式为 `cont
 ```toml
 data_root = "~/.local/share/ubitech-agent"
 listen = "127.0.0.1:8080"
+lan_enabled = false
+lan_listen = "127.0.0.1:8081"
+direct_access_cidrs = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"]
+trusted_ingress_cidrs = ["127.0.0.0/8", "::1/128"]
 release_manifest_url = "https://example.invalid/ubitech-agent/main.json"
 release_channel = "main"
 update_enabled = true
@@ -35,13 +39,13 @@ log_max_files = 5
 ```
 
 - `data_root` 是 Manager、Platform 数据和快照的唯一宿主根；展开后必须为绝对、非符号链接、部署用户可写路径。Platform 数据目录固定为规范化后的 `$data_root/data`，Manager 的 schema migration、快照、Sandbox registry、容器环境和 Compose bind mount 全部使用该路径。不存在独立 `data_dir` 配置。
-- `listen` 是唯一产品入口；生产反向代理连接此地址。Platform 容器端口由 Manager 动态选择，不单独配置公网监听。
+- `listen` 是主产品入口；生产反向代理连接此地址。Platform 容器端口由 Manager 动态选择，不单独配置公网监听。可选 LAN listener 默认关闭；`lan_listen` 必须使用与主入口不冲突的独立端口，并只能绑定明确的私网或回环 IP，拒绝通配和公网 IP。启用时只接受 `direct_access_cidrs` 的真实远端地址，并推荐由局域网 TLS 反向代理访问。只有 `trusted_ingress_cidrs` 可以提供 forwarded headers，其它请求头会被 Manager 丢弃并重建。bind 地址不是 canonical public URL。
 - `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。运行身份永远使用 digest，不使用 tag。
 - `update_enabled` 与 `update_interval` 控制检测；手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
 - `sandbox_idle` 默认值由机器契约生成；配置覆盖必须在受支持范围内，并同时作用于任务与后台进程判断。
 - 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。Manager 状态、operation 和 API 投影都必须使用明确的小型读取预算；提高客户端上限不能代替服务端限制诊断大小。
 
-Manager 配置修改通过临时文件、fsync 和原子替换保存。常驻进程只热加载明确声明可热更新的字段；listen、data root 和 control socket 变化需要 restart operation。
+Manager 配置修改通过临时文件、fsync 和原子替换保存。`lan_enabled`、`lan_listen`、`direct_access_cidrs` 与 `trusted_ingress_cidrs` 由 Gateway 热收敛；Manager 先验证并绑定新监听，成功后才原子提交配置和替换旧监听。新监听无法绑定时保留原配置与原监听，主入口不受影响，并向管理员报告错误。其它常驻进程配置只热加载明确声明可热更新的字段；主 `listen`、data root 和 control socket 变化需要 restart operation。
 
 ## 容器生成配置
 
@@ -51,6 +55,8 @@ Manager 为固定服务生成私有网络和下列路径：
 - Runtime 状态：容器 `/var/lib/ubitech-agent/runtime`；
 - Camoufox/SearXNG/Firecrawl：各自明确的 `$DATA_ROOT/data/runtimes/*` 子目录；
 - Sandbox：`/workspace`、`/home/agent`、`/opt/agent-env`，分别映射主 Agent 的 workspace、home 和 env。
+
+Platform 额外接收只读的宿主数据根字符串，用于在当前 scope 的可信系统提示中计算工作区映射；它不能用该值访问宿主文件，不能写入数据库或公共状态，也不能接受模型覆盖。
 
 Platform 的集成服务 URL 与 Runtime 的 Platform URL 使用 Compose service name，不接受部署用户提供的公网 base URL。Runtime 不直接接收 Camoufox、SearXNG、Firecrawl URL 或这些服务的 secret，相关工具统一回调 Platform。Platform 在容器模式下不暴露固定服务的 install/restart API；这些容器只由 Manager operation 管理。内部 bearer 通过 owner-only token file 或 Docker secret 风格只读挂载传入，不能出现在 Compose 命令行、环境 dump 或 Manager 公共状态。Manager control 使用 `manager-token`，仅挂载给 Platform；Manager executor 使用独立的 `manager-executor-token`，仅挂载给 Runtime。宿主 CLI 从 Manager owner-only secret 读取 control token。两枚 token 即使共享同一个 owner-only Unix socket，也不能访问对方的路由集合。
 
@@ -66,7 +72,8 @@ Platform 容器接受 Manager 生成的最小环境：
 - 内部监听 host/port、public base URL 和 trusted proxy；
 - Agent Runtime、Camoufox、SearXNG 与 Firecrawl 的私有 service URL；
 - 对应内部 token file；
-- 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制。
+- 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制；
+- `ENTERPRISE_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
 `ENTERPRISE_` 是现存内部环境前缀，不代表产品名称。它们是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
 
@@ -97,6 +104,8 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 ### 知识与集成
 
 Cognee backend、dataset 与内部设置由管理入口持久化。托管 Cognee/Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、Cognee provider secret 和 Telegram secret仍由 Platform secret store 管理。
+
+私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。
 
 ### Telegram 与自动更新
 

@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .container_contract_generated import DATABASE_SCHEMA_VERSION
+from .memory_security import MEMORY_QUOTAS, memory_content_hash
 from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
 
 
-_PREVIOUS_DATABASE_BASELINE_VERSION = 2026072402
-_PREVIOUS_DATABASE_BASELINE_NAME = "agent-scopes-container-sandbox-v2"
-_DATABASE_BASELINE_VERSION = 2026072801
-_DATABASE_BASELINE_NAME = "ubitech-agent-container-baseline-v1"
+_PREVIOUS_DATABASE_BASELINE_VERSION = 2026072801
+_PREVIOUS_DATABASE_BASELINE_NAME = "ubitech-agent-container-baseline-v1"
+_DATABASE_BASELINE_VERSION = 2026072901
+_DATABASE_BASELINE_NAME = "ubitech-agent-container-baseline-v2"
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
 
@@ -290,7 +291,7 @@ class Database:
                     content TEXT NOT NULL,
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     source_type TEXT NOT NULL DEFAULT 'manual'
-                        CHECK(source_type IN ('manual', 'tool', 'candidate', 'imported')),
+                        CHECK(source_type IN ('manual', 'automatic')),
                     source_run_id TEXT NOT NULL DEFAULT '',
                     source_message_id TEXT NOT NULL DEFAULT '',
                     content_hash TEXT NOT NULL DEFAULT '',
@@ -306,28 +307,6 @@ class Database:
                         scope_key, target, COALESCE(owner_user_id, 0), content_hash
                     )
                     WHERE content_hash != '';
-
-                CREATE TABLE IF NOT EXISTS agent_memory_candidates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope_key TEXT NOT NULL,
-                    target TEXT NOT NULL DEFAULT 'memory' CHECK(target IN ('memory', 'user')),
-                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    content TEXT NOT NULL,
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    dedupe_key TEXT NOT NULL UNIQUE,
-                    source_run_id TEXT NOT NULL DEFAULT '',
-                    source_message_id TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK(status IN ('pending', 'approved', 'rejected')),
-                    memory_id INTEGER REFERENCES agent_memories(id) ON DELETE SET NULL,
-                    created_at INTEGER NOT NULL,
-                    decided_at INTEGER,
-                    decided_by_user_id INTEGER REFERENCES users(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_agent_memory_candidates_scope
-                    ON agent_memory_candidates(
-                        scope_key, owner_user_id, status, created_at DESC
-                    );
 
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -384,6 +363,46 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_updates_status
                     ON telegram_updates(status, update_id);
+
+                CREATE TABLE IF NOT EXISTS mail_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    email_address TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    imap_host TEXT NOT NULL,
+                    imap_port INTEGER NOT NULL CHECK(imap_port BETWEEN 1 AND 65535),
+                    imap_security TEXT NOT NULL CHECK(imap_security IN ('tls', 'starttls')),
+                    smtp_host TEXT NOT NULL,
+                    smtp_port INTEGER NOT NULL CHECK(smtp_port BETWEEN 1 AND 65535),
+                    smtp_security TEXT NOT NULL CHECK(smtp_security IN ('tls', 'starttls')),
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                    wake_enabled INTEGER NOT NULL DEFAULT 0 CHECK(wake_enabled IN (0, 1)),
+                    wake_folder TEXT NOT NULL DEFAULT 'INBOX',
+                    poll_interval_seconds INTEGER NOT NULL DEFAULT 300
+                        CHECK(poll_interval_seconds BETWEEN 60 AND 3600),
+                    checkpoint_initialized INTEGER NOT NULL DEFAULT 0
+                        CHECK(checkpoint_initialized IN (0, 1)),
+                    uid_validity INTEGER,
+                    last_uid INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    last_checked_at INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(owner_user_id, email_address)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mail_accounts_poll
+                    ON mail_accounts(enabled, wake_enabled, last_checked_at, id);
+                CREATE INDEX IF NOT EXISTS idx_mail_accounts_owner
+                    ON mail_accounts(owner_user_id, id);
+
+                CREATE TABLE IF NOT EXISTS mail_account_credentials (
+                    account_id INTEGER PRIMARY KEY
+                        REFERENCES mail_accounts(id) ON DELETE CASCADE,
+                    password TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS durable_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -487,8 +506,8 @@ class Database:
 
                 INSERT INTO schema_migrations(version, name, applied_at)
                     VALUES (
-                        2026072801,
-                        'ubitech-agent-container-baseline-v1',
+                        2026072901,
+                        'ubitech-agent-container-baseline-v2',
                         CAST(strftime('%s', 'now') AS INTEGER)
                     );
                 INSERT INTO settings(key, value, secret, updated_at)
@@ -567,7 +586,12 @@ class Database:
             self._conn.commit()
 
     def _upgrade_previous_container_baseline(self, tables: set[str]) -> None:
-        """Upgrade exactly one declared container baseline, or reject the DB."""
+        """Upgrade exactly the deployed v1 baseline, or reject the DB.
+
+        This is a one-release bridge for the only deployed installation.  Once
+        that installation reports the v2 marker, the bridge is removed so v2
+        becomes the sole accepted baseline.
+        """
 
         markers = [
             (int(row["version"]), str(row["name"]))
@@ -593,12 +617,7 @@ class Database:
                 "database does not match a supported baseline marker"
             )
 
-        self._assert_database_structure(
-            tables,
-            current_memory_sources=False,
-            previous_scope_backend=True,
-            allow_retired_private_agents=True,
-        )
+        self._assert_database_structure(tables, previous_product_baseline=True)
         unexpected_dependents = sorted(
             self._foreign_key_dependents("agent_memories")
             - {"agent_memory_candidates"}
@@ -612,32 +631,113 @@ class Database:
         memory_count = int(
             self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
         )
-        scope_count = int(
-            self._conn.execute("SELECT count(*) FROM agent_scopes").fetchone()[0]
-        )
-        candidate_count = int(
-            self._conn.execute(
-                "SELECT count(*) FROM agent_memory_candidates"
-            ).fetchone()[0]
-        )
+        existing_memory_keys = {
+            (
+                str(row["scope_key"]),
+                str(row["target"]),
+                int(row["owner_user_id"]) if row["owner_user_id"] is not None else None,
+                str(row["content_hash"]),
+            )
+            for row in self._conn.execute(
+                "SELECT scope_key, target, owner_user_id, content_hash "
+                "FROM agent_memories WHERE content_hash != ''"
+            ).fetchall()
+        }
+        pending_candidates: list[dict[str, Any]] = []
+        promoted_keys = set(existing_memory_keys)
+        for raw in self._conn.execute(
+            "SELECT * FROM agent_memory_candidates "
+            "WHERE status = 'pending' ORDER BY id"
+        ).fetchall():
+            candidate = dict(raw)
+            content = str(candidate.get("content") or "").strip()
+            if not content or len(content) > 2_000:
+                raise sqlite3.DatabaseError(
+                    "previous baseline contains an invalid pending memory candidate"
+                )
+            try:
+                tags = json.loads(str(candidate.get("tags_json") or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise sqlite3.DatabaseError(
+                    "previous baseline contains invalid pending memory tags"
+                ) from exc
+            if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+                raise sqlite3.DatabaseError(
+                    "previous baseline contains invalid pending memory tags"
+                )
+            target = str(candidate["target"])
+            owner_user_id = (
+                int(candidate["owner_user_id"])
+                if target == "user"
+                else None
+            )
+            content_hash = memory_content_hash(content)
+            key = (
+                str(candidate["scope_key"]),
+                target,
+                owner_user_id,
+                content_hash,
+            )
+            if key in promoted_keys:
+                continue
+            promoted_keys.add(key)
+            pending_candidates.append(
+                {
+                    **candidate,
+                    "content": content,
+                    "owner_user_id": owner_user_id,
+                    "content_hash": content_hash,
+                }
+            )
+        promoted_budgets: dict[tuple[str, str, int | None], tuple[int, int]] = {}
+        for candidate in pending_candidates:
+            budget_key = (
+                str(candidate["scope_key"]),
+                str(candidate["target"]),
+                candidate["owner_user_id"],
+            )
+            added_count, added_characters = promoted_budgets.get(budget_key, (0, 0))
+            promoted_budgets[budget_key] = (
+                added_count + 1,
+                added_characters + len(str(candidate["content"])),
+            )
+        for (scope_key, target, owner_user_id), additions in promoted_budgets.items():
+            if target == "user":
+                owner_clause = "owner_user_id = ?"
+                parameters: tuple[Any, ...] = (scope_key, target, owner_user_id)
+            else:
+                owner_clause = "owner_user_id IS NULL"
+                parameters = (scope_key, target)
+            current_count, current_characters = self._conn.execute(
+                "SELECT count(*), COALESCE(sum(length(content)), 0) "
+                "FROM agent_memories WHERE scope_key = ? AND target = ? "
+                f"AND {owner_clause}",
+                parameters,
+            ).fetchone()
+            maximum_count, maximum_characters = MEMORY_QUOTAS[target]
+            if (
+                int(current_count) + additions[0] > maximum_count
+                or int(current_characters) + additions[1] > maximum_characters
+            ):
+                raise sqlite3.DatabaseError(
+                    "pending memory candidates exceed the current automatic memory quota"
+                )
+        scope_count = int(self._conn.execute(
+            "SELECT count(*) FROM agent_scopes"
+        ).fetchone()[0])
         self._conn.commit()
         self._conn.execute("PRAGMA foreign_keys=OFF")
         try:
             self._conn.executescript(
                 """
                 BEGIN IMMEDIATE;
-                DROP TABLE IF EXISTS private_agents;
-                ALTER TABLE agent_scopes DROP COLUMN execution_backend;
                 DROP TRIGGER IF EXISTS agent_memory_ai;
                 DROP TRIGGER IF EXISTS agent_memory_ad;
                 DROP TRIGGER IF EXISTS agent_memory_au;
                 DROP TABLE IF EXISTS agent_memory_fts;
-                DROP INDEX IF EXISTS idx_agent_memory_candidates_scope;
                 DROP INDEX IF EXISTS idx_agent_memories_scope;
                 DROP INDEX IF EXISTS idx_agent_memories_content_hash;
                 DROP INDEX IF EXISTS uq_agent_memories_dedupe;
-                ALTER TABLE agent_memory_candidates
-                    RENAME TO agent_memory_candidates_baseline_source;
                 ALTER TABLE agent_memories
                     RENAME TO agent_memories_baseline_source;
 
@@ -650,7 +750,7 @@ class Database:
                     content TEXT NOT NULL,
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     source_type TEXT NOT NULL DEFAULT 'manual'
-                        CHECK(source_type IN ('manual', 'tool', 'candidate', 'imported')),
+                        CHECK(source_type IN ('manual', 'automatic')),
                     source_run_id TEXT NOT NULL DEFAULT '',
                     source_message_id TEXT NOT NULL DEFAULT '',
                     content_hash TEXT NOT NULL DEFAULT '',
@@ -671,29 +771,6 @@ class Database:
                     )
                     WHERE content_hash != '';
 
-                CREATE TABLE agent_memory_candidates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope_key TEXT NOT NULL,
-                    target TEXT NOT NULL DEFAULT 'memory'
-                        CHECK(target IN ('memory', 'user')),
-                    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    content TEXT NOT NULL,
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    dedupe_key TEXT NOT NULL UNIQUE,
-                    source_run_id TEXT NOT NULL DEFAULT '',
-                    source_message_id TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK(status IN ('pending', 'approved', 'rejected')),
-                    memory_id INTEGER REFERENCES agent_memories(id) ON DELETE SET NULL,
-                    created_at INTEGER NOT NULL,
-                    decided_at INTEGER,
-                    decided_by_user_id INTEGER REFERENCES users(id)
-                );
-                CREATE INDEX idx_agent_memory_candidates_scope
-                    ON agent_memory_candidates(
-                        scope_key, owner_user_id, status, created_at DESC
-                    );
-
                 INSERT INTO agent_memories(
                     id, scope_key, target, owner_user_id, content, tags_json,
                     source_type, source_run_id, source_message_id, content_hash,
@@ -701,30 +778,81 @@ class Database:
                 )
                 SELECT id, scope_key, target, owner_user_id, content, tags_json,
                        CASE
-                           WHEN source_type IN ('manual', 'tool', 'candidate')
-                               THEN source_type
-                           ELSE 'imported'
+                           WHEN source_type = 'manual' THEN 'manual'
+                           ELSE 'automatic'
                        END,
                        source_run_id, source_message_id, content_hash,
                        created_at, updated_at
                 FROM agent_memories_baseline_source;
-                INSERT INTO agent_memory_candidates(
-                    id, scope_key, target, owner_user_id, content, tags_json,
-                    dedupe_key, source_run_id, source_message_id, status,
-                    memory_id, created_at, decided_at, decided_by_user_id
-                )
-                SELECT id, scope_key, target, owner_user_id, content, tags_json,
-                       dedupe_key, source_run_id, source_message_id, status,
-                       memory_id, created_at, decided_at, decided_by_user_id
-                FROM agent_memory_candidates_baseline_source;
-                DROP TABLE agent_memory_candidates_baseline_source;
                 DROP TABLE agent_memories_baseline_source;
+
+                CREATE TABLE mail_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    email_address TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    imap_host TEXT NOT NULL,
+                    imap_port INTEGER NOT NULL CHECK(imap_port BETWEEN 1 AND 65535),
+                    imap_security TEXT NOT NULL CHECK(imap_security IN ('tls', 'starttls')),
+                    smtp_host TEXT NOT NULL,
+                    smtp_port INTEGER NOT NULL CHECK(smtp_port BETWEEN 1 AND 65535),
+                    smtp_security TEXT NOT NULL CHECK(smtp_security IN ('tls', 'starttls')),
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                    wake_enabled INTEGER NOT NULL DEFAULT 0 CHECK(wake_enabled IN (0, 1)),
+                    wake_folder TEXT NOT NULL DEFAULT 'INBOX',
+                    poll_interval_seconds INTEGER NOT NULL DEFAULT 300
+                        CHECK(poll_interval_seconds BETWEEN 60 AND 3600),
+                    checkpoint_initialized INTEGER NOT NULL DEFAULT 0
+                        CHECK(checkpoint_initialized IN (0, 1)),
+                    uid_validity INTEGER,
+                    last_uid INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    last_checked_at INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(owner_user_id, email_address)
+                );
+                CREATE INDEX idx_mail_accounts_poll
+                    ON mail_accounts(enabled, wake_enabled, last_checked_at, id);
+                CREATE INDEX idx_mail_accounts_owner
+                    ON mail_accounts(owner_user_id, id);
+                CREATE TABLE mail_account_credentials (
+                    account_id INTEGER PRIMARY KEY
+                        REFERENCES mail_accounts(id) ON DELETE CASCADE,
+                    password TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 DELETE FROM schema_migrations;
                 """
             )
+            for candidate in pending_candidates:
+                self._conn.execute(
+                    """
+                    INSERT INTO agent_memories(
+                        scope_key, target, owner_user_id, content, tags_json,
+                        source_type, source_run_id, source_message_id,
+                        content_hash, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'automatic', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(candidate["scope_key"]),
+                        str(candidate["target"]),
+                        candidate["owner_user_id"],
+                        str(candidate["content"]),
+                        str(candidate["tags_json"]),
+                        str(candidate.get("source_run_id") or ""),
+                        str(candidate.get("source_message_id") or ""),
+                        str(candidate["content_hash"]),
+                        int(candidate["created_at"]),
+                        int(candidate["created_at"]),
+                    ),
+                )
+            self._conn.execute("DROP TABLE agent_memory_candidates")
             if int(
                 self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
-            ) != memory_count:
+            ) != memory_count + len(pending_candidates):
                 raise sqlite3.IntegrityError(
                     "container baseline upgrade changed the memory row count"
                 )
@@ -734,13 +862,12 @@ class Database:
                 raise sqlite3.IntegrityError(
                     "container baseline upgrade changed the Agent scope row count"
                 )
-            if int(
-                self._conn.execute(
-                    "SELECT count(*) FROM agent_memory_candidates"
-                ).fetchone()[0]
-            ) != candidate_count:
+            if self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='agent_memory_candidates'"
+            ).fetchone() is not None:
                 raise sqlite3.IntegrityError(
-                    "container baseline upgrade changed the candidate row count"
+                    "container baseline upgrade retained memory candidates"
                 )
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
@@ -778,9 +905,7 @@ class Database:
             )
         self._assert_database_structure(
             tables,
-            current_memory_sources=True,
-            previous_scope_backend=False,
-            allow_retired_private_agents=False,
+            previous_product_baseline=False,
         )
 
     def _database_tables(self) -> set[str]:
@@ -796,13 +921,16 @@ class Database:
         self,
         tables: set[str],
         *,
-        current_memory_sources: bool,
-        previous_scope_backend: bool,
-        allow_retired_private_agents: bool,
+        previous_product_baseline: bool,
     ) -> None:
         forbidden = sorted(
-            {"agent_scope_sessions", "agent_memories_baseline_source",
-             "agent_memory_candidates_baseline_source"} & tables
+            {
+                "agent_scope_sessions",
+                "agent_memories_baseline_source",
+                "agent_memory_candidates_baseline_source",
+                "private_agents",
+            }
+            & tables
         )
         if forbidden:
             raise sqlite3.DatabaseError(
@@ -815,9 +943,6 @@ class Database:
             "lifecycle_id", "workspace_path", "sandbox_id", "created_at",
             "updated_at",
         }
-        if previous_scope_backend:
-            agent_scope_columns.add("execution_backend")
-
         required_columns = {
             "schema_migrations": {"version", "name", "applied_at"},
             "users": {
@@ -860,12 +985,6 @@ class Database:
                 "tags_json", "source_type", "source_run_id", "source_message_id",
                 "content_hash", "created_at", "updated_at",
             },
-            "agent_memory_candidates": {
-                "id", "scope_key", "target", "owner_user_id", "content",
-                "tags_json", "dedupe_key", "source_run_id", "source_message_id",
-                "status", "memory_id", "created_at", "decided_at",
-                "decided_by_user_id",
-            },
             "knowledge_documents": {
                 "id", "title", "summary", "content", "source", "created_by",
                 "created_at", "updated_at", "content_hash",
@@ -906,6 +1025,25 @@ class Database:
                 "updated_at",
             },
         }
+        if previous_product_baseline:
+            required_columns["agent_memory_candidates"] = {
+                "id", "scope_key", "target", "owner_user_id", "content",
+                "tags_json", "dedupe_key", "source_run_id", "source_message_id",
+                "status", "memory_id", "created_at", "decided_at",
+                "decided_by_user_id",
+            }
+        else:
+            required_columns["mail_accounts"] = {
+                "id", "owner_user_id", "label", "email_address", "username",
+                "imap_host", "imap_port", "imap_security", "smtp_host",
+                "smtp_port", "smtp_security", "enabled", "wake_enabled",
+                "wake_folder", "poll_interval_seconds", "checkpoint_initialized",
+                "uid_validity", "last_uid", "revision", "last_checked_at",
+                "last_error", "created_at", "updated_at",
+            }
+            required_columns["mail_account_credentials"] = {
+                "account_id", "password", "updated_at",
+            }
         fts_tables = {
             f"{prefix}{suffix}"
             for prefix in (
@@ -916,13 +1054,8 @@ class Database:
             )
             for suffix in ("", "_data", "_idx", "_docsize", "_config")
         }
-        retired_tables = (
-            {"private_agents"}
-            if allow_retired_private_agents and "private_agents" in tables
-            else set()
-        )
         unexpected_tables = sorted(
-            tables - set(required_columns) - fts_tables - retired_tables
+            tables - set(required_columns) - fts_tables
         )
         if unexpected_tables:
             raise sqlite3.DatabaseError(
@@ -953,13 +1086,6 @@ class Database:
                     + "; ".join(differences)
                 )
 
-        if retired_tables:
-            self._assert_retired_private_agents_redundant()
-
-        if previous_scope_backend:
-            self._assert_table_sql(
-                "agent_scopes", "check(execution_backend='sandbox')"
-            )
         self._assert_table_sql(
             "attachments", "check(sourcein('upload','agent_generated'))"
         )
@@ -967,6 +1093,16 @@ class Database:
             "durable_jobs",
             "check(statusin('queued','running','succeeded','failed','needs_review'))",
         )
+        if not previous_product_baseline:
+            self._assert_table_sql(
+                "mail_accounts", "check(imap_securityin('tls','starttls'))"
+            )
+            self._assert_table_sql(
+                "mail_accounts", "check(smtp_securityin('tls','starttls'))"
+            )
+            self._assert_table_sql(
+                "mail_accounts", "check(poll_interval_secondsbetween60and3600)"
+            )
         self._assert_table_sql(
             "agent_run_inputs",
             "check(statein('running','reserved','submitting','accepted','injected','unconsumed','succeeded','failed','needs_review'))",
@@ -987,21 +1123,28 @@ class Database:
             "agent_schedule_runs",
             "check(statusin('queued','running','succeeded','failed','needs_review','blocked','skipped','cancelled'))",
         )
-        if current_memory_sources:
+        if previous_product_baseline:
             self._assert_table_sql(
                 "agent_memories",
                 "check(source_typein('manual','tool','candidate','imported'))",
             )
-            invalid_sources = int(
-                self._conn.execute(
-                    "SELECT count(*) FROM agent_memories "
-                    "WHERE source_type NOT IN ('manual', 'tool', 'candidate', 'imported')"
-                ).fetchone()[0]
+            memory_sources = ("manual", "tool", "candidate", "imported")
+        else:
+            self._assert_table_sql(
+                "agent_memories",
+                "check(source_typein('manual','automatic'))",
             )
-            if invalid_sources:
-                raise sqlite3.DatabaseError(
-                    "database contains invalid current memory sources"
-                )
+            memory_sources = ("manual", "automatic")
+        placeholders = ", ".join("?" for _ in memory_sources)
+        invalid_sources = int(self._conn.execute(
+            "SELECT count(*) FROM agent_memories "
+            f"WHERE source_type NOT IN ({placeholders})",
+            memory_sources,
+        ).fetchone()[0])
+        if invalid_sources:
+            raise sqlite3.DatabaseError(
+                "database contains invalid current memory sources"
+            )
 
         required_indexes = {
             "idx_messages_visible_scope",
@@ -1017,6 +1160,13 @@ class Database:
             "idx_agent_schedule_runs_schedule",
             "idx_agent_schedule_runs_job",
         }
+        if previous_product_baseline:
+            required_indexes.add("idx_agent_memory_candidates_scope")
+        else:
+            required_indexes.update({
+                "idx_mail_accounts_poll",
+                "idx_mail_accounts_owner",
+            })
         indexes = {
             str(row["name"])
             for row in self._conn.execute(
@@ -1029,7 +1179,7 @@ class Database:
                 "database is missing current baseline indexes: "
                 + ", ".join(missing_indexes)
             )
-        for index_name, table_name, columns in (
+        named_indexes = [
             ("idx_durable_jobs_ready", "durable_jobs", ("kind", "status", "available_at", "id")),
             ("idx_durable_jobs_scope", "durable_jobs", ("scope_type", "scope_id", "id")),
             ("idx_agent_run_inputs_group", "agent_run_inputs", ("input_group_id", "message_id")),
@@ -1039,9 +1189,23 @@ class Database:
             ("idx_agent_schedules_owner", "agent_schedules", ("owner_user_id", "deleted_at", "id")),
             ("idx_agent_schedule_runs_schedule", "agent_schedule_runs", ("schedule_id", "id")),
             ("idx_agent_schedule_runs_job", "agent_schedule_runs", ("durable_job_id",)),
-        ):
+        ]
+        if previous_product_baseline:
+            named_indexes.append((
+                "idx_agent_memory_candidates_scope",
+                "agent_memory_candidates",
+                ("scope_key", "owner_user_id", "status", "created_at"),
+            ))
+        else:
+            named_indexes.extend([
+                ("idx_mail_accounts_poll", "mail_accounts", ("enabled", "wake_enabled", "last_checked_at", "id")),
+                ("idx_mail_accounts_owner", "mail_accounts", ("owner_user_id", "id")),
+            ])
+        for index_name, table_name, columns in named_indexes:
             self._assert_named_index(index_name, table_name, columns)
         self._assert_unique_columns("durable_jobs", ("kind", "dedupe_key"))
+        if not previous_product_baseline:
+            self._assert_unique_columns("mail_accounts", ("owner_user_id", "email_address"))
         self._assert_unique_columns("agent_run_inputs", ("job_id",))
         self._assert_unique_columns(
             "agent_schedule_runs",
@@ -1049,6 +1213,24 @@ class Database:
         )
 
         self._assert_foreign_keys("durable_jobs", set())
+        if previous_product_baseline:
+            self._assert_foreign_keys(
+                "agent_memory_candidates",
+                {
+                    ("owner_user_id", "users", "id", "CASCADE"),
+                    ("memory_id", "agent_memories", "id", "SET NULL"),
+                    ("decided_by_user_id", "users", "id", "NO ACTION"),
+                },
+            )
+        else:
+            self._assert_foreign_keys(
+                "mail_accounts",
+                {("owner_user_id", "users", "id", "CASCADE")},
+            )
+            self._assert_foreign_keys(
+                "mail_account_credentials",
+                {("account_id", "mail_accounts", "id", "CASCADE")},
+            )
         self._assert_foreign_keys("agent_run_inputs", set())
         self._assert_foreign_keys(
             "agent_schedules",
@@ -1106,98 +1288,6 @@ class Database:
         if violations:
             raise sqlite3.IntegrityError(
                 f"database has {len(violations)} foreign-key violations"
-            )
-
-    def _assert_retired_private_agents_redundant(self) -> None:
-        """Prove the previous baseline's retired Agent registry is redundant."""
-
-        expected_columns = (
-            ("user_id", "INTEGER", 0, None, 1),
-            ("session_id", "TEXT", 1, None, 0),
-            ("container_name", "TEXT", 1, "''", 0),
-            ("container_id", "TEXT", 1, "''", 0),
-            ("container_status", "TEXT", 1, "'unknown'", 0),
-            ("workspace_path", "TEXT", 1, None, 0),
-            ("created_at", "INTEGER", 1, None, 0),
-            ("updated_at", "INTEGER", 1, None, 0),
-        )
-        actual_columns = tuple(
-            (
-                str(row["name"]),
-                str(row["type"]).upper(),
-                int(row["notnull"]),
-                row["dflt_value"],
-                int(row["pk"]),
-            )
-            for row in self._conn.execute(
-                'PRAGMA table_info("private_agents")'
-            ).fetchall()
-        )
-        if actual_columns != expected_columns:
-            raise sqlite3.DatabaseError(
-                "retired private_agents table is outside the declared source baseline"
-            )
-        self._assert_foreign_keys(
-            "private_agents",
-            {("user_id", "users", "id", "CASCADE")},
-        )
-
-        foreign_key_dependents = sorted(
-            self._foreign_key_dependents("private_agents")
-        )
-        schema_references = [
-            f'{row["type"]}:{row["name"]}'
-            for row in self._conn.execute(
-                "SELECT type, name FROM sqlite_master "
-                "WHERE name != 'private_agents' AND sql IS NOT NULL "
-                "AND instr(lower(sql), 'private_agents') > 0 "
-                "ORDER BY type, name"
-            ).fetchall()
-        ]
-        if foreign_key_dependents or schema_references:
-            details = sorted(
-                {f"table:{name}" for name in foreign_key_dependents}
-                | set(schema_references)
-            )
-            raise sqlite3.DatabaseError(
-                "retired private_agents table has unsupported dependents: "
-                + ", ".join(details)
-            )
-
-        unsafe_user_ids = [
-            int(row["user_id"])
-            for row in self._conn.execute(
-                """
-                SELECT retired.user_id
-                FROM private_agents AS retired
-                LEFT JOIN users AS account
-                    ON account.id = retired.user_id
-                LEFT JOIN agent_scopes AS scope
-                    ON scope.scope_key = 'private:' || CAST(retired.user_id AS TEXT)
-                LEFT JOIN agent_runtime_scopes AS runtime
-                    ON runtime.scope_key = scope.scope_key
-                WHERE retired.user_id <= 0
-                   OR account.id IS NULL
-                   OR scope.scope_key IS NULL
-                   OR scope.scope_type != 'private'
-                   OR scope.scope_id != CAST(retired.user_id AS TEXT)
-                   OR scope.workspace_path
-                        != 'user-' || CAST(retired.user_id AS TEXT)
-                   OR length(trim(scope.sandbox_id)) = 0
-                   OR runtime.scope_key IS NULL
-                   OR length(trim(runtime.session_id)) = 0
-                   OR length(trim(runtime.lifecycle_id)) = 0
-                ORDER BY retired.user_id
-                LIMIT 6
-                """
-            ).fetchall()
-        ]
-        if unsafe_user_ids:
-            listed = ", ".join(str(user_id) for user_id in unsafe_user_ids[:5])
-            suffix = ", ..." if len(unsafe_user_ids) > 5 else ""
-            raise sqlite3.DatabaseError(
-                "cannot retire private_agents safely; canonical scope/runtime "
-                f"state is missing for user ids: {listed}{suffix}"
             )
 
     def _assert_table_sql(self, table_name: str, required_fragment: str) -> None:

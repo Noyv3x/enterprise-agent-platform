@@ -57,6 +57,7 @@ class PlatformConfig:
     platform_internal_url: str = "http://platform:8765"
     manager_socket: Path | None = None
     manager_token_file: Path | None = None
+    host_data_root: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -92,6 +93,14 @@ class PlatformConfig:
         if not manager_socket.is_absolute() or not manager_token_file.is_absolute():
             raise ValueError("Manager socket and token file paths must be absolute")
         data_dir = Path(os.getenv("ENTERPRISE_PLATFORM_DATA", base / "data")).expanduser()
+        host_data_root_value = os.getenv("UBITECH_HOST_DATA_ROOT", "").strip()
+        host_data_root = (
+            Path(os.path.normpath(host_data_root_value)).expanduser()
+            if host_data_root_value
+            else None
+        )
+        if host_data_root is not None and not host_data_root.is_absolute():
+            raise ValueError("UBITECH_HOST_DATA_ROOT must be absolute")
         host = os.getenv("ENTERPRISE_PLATFORM_HOST", "127.0.0.1")
         port = _env_int("ENTERPRISE_PLATFORM_PORT", 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
@@ -155,6 +164,7 @@ class PlatformConfig:
             ).strip().rstrip("/"),
             manager_socket=manager_socket,
             manager_token_file=manager_token_file,
+            host_data_root=host_data_root,
         )
 
 

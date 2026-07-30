@@ -14,6 +14,7 @@ let sessionExpiredHandler: SessionExpiredHandler | null = null;
 let platformUpdatingHandler: PlatformUpdatingHandler | null = null;
 let sessionGeneration = 0;
 const activeRequests = new Set<AbortController>();
+const activeUploads = new Set<XMLHttpRequest>();
 
 export const DEFAULT_API_TIMEOUT_MS = 60_000;
 
@@ -85,6 +86,8 @@ export function resetApiSession(): void {
   sessionGeneration += 1;
   for (const controller of [...activeRequests]) controller.abort();
   activeRequests.clear();
+  for (const upload of [...activeUploads]) upload.abort();
+  activeUploads.clear();
 }
 
 export interface ApiOptions extends RequestInit {
@@ -92,6 +95,45 @@ export interface ApiOptions extends RequestInit {
   skipAuthHandling?: boolean;
   /** Per-request timeout. Set to 0 only for an intentionally unbounded request. */
   timeoutMs?: number;
+}
+
+export interface ApiUploadProgress {
+  loaded: number;
+  total: number;
+}
+
+export interface ApiUploadOptions {
+  /** Opt out of the automatic 401 → handleSessionExpired drop-to-login. */
+  skipAuthHandling?: boolean;
+  /** Upload cancellation remains supported even though wall-clock timeout is disabled. */
+  signal?: AbortSignal;
+  method?: "POST" | "PUT" | "PATCH";
+  headers?: Record<string, string>;
+  onProgress?: (progress: ApiUploadProgress) => void;
+  /** Browser bytes are fully sent; the server may still be persisting the message. */
+  onUploadComplete?: () => void;
+}
+
+function parsedJson(text: string): unknown {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function responseError(status: number, data: unknown): ApiError {
+  const err = data as { code?: string; error?: string; detail?: string };
+  const code = err.code || (err.error === "platform_updating" ? err.error : undefined);
+  if (status === 503 && code === "platform_updating") {
+    _invokePlatformUpdating();
+  }
+  return new ApiError(
+    err.error || err.detail || t("api.failed", { status }),
+    status,
+    code,
+  );
 }
 
 export async function api<T = unknown>(path: string, options: ApiOptions = {}): Promise<T> {
@@ -133,31 +175,15 @@ export async function api<T = unknown>(path: string, options: ApiOptions = {}): 
       signal: controller.signal,
     });
     const text = await res.text();
-    let data: unknown = {};
-    if (text) {
-      // A proxy can emit an HTML 502/504 page; preserve a useful status error.
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = {};
-      }
-    }
+    // A proxy can emit an HTML 502/504 page; preserve a useful status error.
+    const data = parsedJson(text);
     if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
     if (res.status === 401 && !skipAuthHandling) {
       _invokeSessionExpired();
       if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
     }
     if (!res.ok) {
-      const err = data as { code?: string; error?: string; detail?: string };
-      const code = err.code || (err.error === "platform_updating" ? err.error : undefined);
-      if (res.status === 503 && code === "platform_updating") {
-        _invokePlatformUpdating();
-      }
-      throw new ApiError(
-        err.error || err.detail || t("api.failed", { status: res.status }),
-        res.status,
-        code,
-      );
+      throw responseError(res.status, data);
     }
     return data as T;
   } catch (error) {
@@ -171,6 +197,96 @@ export async function api<T = unknown>(path: string, options: ApiOptions = {}): 
     callerSignal?.removeEventListener("abort", abortFromCaller);
     activeRequests.delete(controller);
   }
+}
+
+/** Multipart transport with browser upload progress and no fixed wall-clock timeout.
+ * Session generation, explicit cancellation, 401, and maintenance handling match
+ * api(). XMLHttpRequest is intentionally isolated to this boundary because Fetch
+ * does not expose reliable upload progress. */
+export function apiUpload<T = unknown>(
+  path: string,
+  body: FormData,
+  options: ApiUploadOptions = {},
+): Promise<T> {
+  const generation = sessionGeneration;
+  const {
+    skipAuthHandling = false,
+    signal: callerSignal,
+    method = "POST",
+    headers = {},
+    onProgress,
+    onUploadComplete,
+  } = options;
+
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+
+    const cleanup = () => {
+      callerSignal?.removeEventListener("abort", abortFromCaller);
+      activeUploads.delete(xhr);
+    };
+    const finish = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      operation();
+    };
+    const cancel = () => finish(() => reject(new ApiRequestCancelledError()));
+    const abortFromCaller = () => xhr.abort();
+
+    xhr.open(method, path, true);
+    xhr.withCredentials = true;
+    // 0 is the XMLHttpRequest contract for no fixed timeout.
+    xhr.timeout = 0;
+    for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+
+    xhr.upload.onprogress = (event) => {
+      if (settled || generation !== sessionGeneration || !event.lengthComputable) return;
+      onProgress?.({
+        loaded: Math.max(0, event.loaded),
+        total: Math.max(0, event.total),
+      });
+    };
+    xhr.upload.onload = () => {
+      if (!settled && generation === sessionGeneration) onUploadComplete?.();
+    };
+    xhr.onload = () => {
+      if (generation !== sessionGeneration) {
+        cancel();
+        return;
+      }
+      const data = parsedJson(xhr.responseText || "");
+      if (xhr.status === 401 && !skipAuthHandling) {
+        _invokeSessionExpired();
+        if (generation !== sessionGeneration) {
+          cancel();
+          return;
+        }
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        finish(() => reject(responseError(xhr.status, data)));
+        return;
+      }
+      finish(() => resolve(data as T));
+    };
+    xhr.onerror = () => finish(() => reject(responseError(xhr.status || 0, {})));
+    xhr.ontimeout = () => finish(() => reject(new ApiTimeoutError(xhr.timeout)));
+    xhr.onabort = cancel;
+
+    callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    activeUploads.add(xhr);
+    try {
+      if (callerSignal?.aborted) xhr.abort();
+      else xhr.send(body);
+    } catch (error) {
+      // XMLHttpRequest.send() may throw synchronously (for example when the
+      // browser rejects the body or request state). Route that exit through the
+      // same owner as async completion so the session registry and caller's
+      // AbortSignal listener cannot leak.
+      finish(() => reject(error));
+    }
+  });
 }
 
 /* ---------------------------------------------------------------- safeUrl */

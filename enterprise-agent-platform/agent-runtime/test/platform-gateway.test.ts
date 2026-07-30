@@ -73,6 +73,69 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
   }
 });
 
+test("PlatformGateway forwards mail through the internal boundary with trusted tool-call identity", async () => {
+  let body: Record<string, unknown> = {};
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data: { status: "succeeded" } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const gateway = new PlatformGateway(`http://127.0.0.1:${address.port}`, "token");
+    const request: RunRequest = {
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace: "/workspace",
+      system_prompt: "system",
+      input: "input",
+      model: { provider: "openai-codex", id: "gpt-5" },
+      metadata: { actor: { id: 42 }, trigger: "email", unattended: false },
+    };
+    await gateway.invoke(
+      request,
+      "run-mail",
+      "mail",
+      "send",
+      { account_id: 3, to: ["user@example.com"], subject: "Hello", text_body: "private" },
+      undefined,
+      "call-mail",
+    );
+    assert.equal(body.tool, "mail");
+    assert.equal(body.action, "send");
+    assert.deepEqual(body.arguments, {
+      account_id: 3,
+      to: ["user@example.com"],
+      subject: "Hello",
+      text_body: "private",
+    });
+    assert.deepEqual(body.context, {
+      run_id: "run-mail",
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace: "/workspace",
+      owner_user_id: 42,
+      tool_call_id: "call-mail",
+      trigger: "email",
+      unattended: false,
+    });
+    await assert.rejects(
+      gateway.invoke(request, "run", "mail", "delete", {}, undefined, "call"),
+      /mail action is not supported/,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("PlatformGateway preserves memory actions and recursively enforces trusted ownership", async () => {
   const bodies: Array<{ path: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (request, response) => {
@@ -117,8 +180,8 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
         { action: "clear", target: "user", owner_user_id: 8 },
       ],
     });
-    await gateway.invoke(request, "run-propose", "memory", "propose", {
-      category: "preference",
+    await gateway.invoke(request, "run-replace", "memory", "replace", {
+      id: 12,
       target: "user",
       content: "  Prefers   concise replies  ",
       source_run_id: "forged",
@@ -151,7 +214,7 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
     assert.equal(bodies[1]?.body.owner_user_id, 42);
     assert.equal(bodies[1]?.body.source_run_id, "run-batch");
     assert.equal(bodies[1]?.body.source_message_id, 88);
-    assert.equal(bodies[1]?.body.source_type, "tool");
+    assert.equal(bodies[1]?.body.source_type, "automatic");
     assert.deepEqual(bodies[1]?.body.operations, [
       {
         action: "add",
@@ -160,7 +223,7 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
         content: "one",
         source_run_id: "run-batch",
         source_message_id: 88,
-        source_type: "tool",
+        source_type: "automatic",
       },
       {
         action: "clear",
@@ -168,16 +231,17 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
         owner_user_id: 42,
         source_run_id: "run-batch",
         source_message_id: 88,
-        source_type: "tool",
+        source_type: "automatic",
       },
     ]);
-    assert.equal(bodies[2]?.body.source_run_id, "run-propose");
+    assert.equal(bodies[2]?.body.action, "replace");
+    assert.equal(bodies[2]?.body.source_run_id, "run-replace");
     assert.equal(bodies[2]?.body.source_message_id, 88);
-    assert.equal(bodies[2]?.body.source_type, "tool");
+    assert.equal(bodies[2]?.body.source_type, "automatic");
     assert.equal(Object.hasOwn(bodies[2]?.body || {}, "candidate_hash"), false);
     assert.equal(Object.hasOwn(bodies[3]?.body || {}, "owner_user_id"), false);
     assert.deepEqual(bodies[3]?.body.operations, [
-      { action: "clear", target: "user", source_run_id: "run-no-owner", source_type: "tool" },
+      { action: "clear", target: "user", source_run_id: "run-no-owner", source_type: "automatic" },
     ]);
     assert.equal(Object.hasOwn(bodies[3]?.body || {}, "source_message_id"), false);
   } finally {

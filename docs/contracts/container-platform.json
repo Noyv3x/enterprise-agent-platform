@@ -2,7 +2,7 @@
   "schema_version": 1,
   "policy": "container-platform",
   "release_channel": "main",
-  "database_schema_version": 2026072801,
+  "database_schema_version": 2026072901,
   "container_paths": {
     "data_root": "/var/lib/ubitech-agent",
     "workspace": "/workspace",
@@ -15,6 +15,20 @@
   ],
   "sandbox_idle_seconds": 1800,
   "migration_backup_retention_seconds": 604800,
+  "obsolete_artifact_retention_seconds": 3600,
+  "update_pre_download_min_free_bytes": 8589934592,
+  "update_pre_cutover_min_free_bytes": 2147483648,
+  "update_min_free_inodes": 4096,
+  "update_core_image_capacity_estimates": {
+    "platform": {
+      "compressed_bytes": 8589934592,
+      "unpacked_bytes": 17179869184
+    },
+    "agent-runtime": {
+      "compressed_bytes": 4294967296,
+      "unpacked_bytes": 8589934592
+    }
+  },
   "public_update_states": [
     "idle",
     "waiting_for_tasks",

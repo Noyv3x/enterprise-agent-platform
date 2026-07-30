@@ -6,6 +6,7 @@ import { previewMessages } from "./messages/preview";
 import { scheduledTaskMessages } from "./messages/scheduledTasks";
 import { memoryMessages } from "./messages/memory";
 import { skillMessages } from "./messages/skills";
+import { mailMessages } from "./messages/mail";
 
 export const messages = {
   ...coreMessages,
@@ -16,6 +17,7 @@ export const messages = {
   ...scheduledTaskMessages,
   ...memoryMessages,
   ...skillMessages,
+  ...mailMessages,
 } as const;
 
 export type MessageKey = keyof typeof messages;

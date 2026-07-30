@@ -308,3 +308,34 @@ func TestCompletePersistsTerminalOperationBeforeStateAndLeavesRecoverableWindow(
 		t.Fatalf("terminal operation was not persisted first: %#v", active)
 	}
 }
+
+func TestUnfinishedOperationsFailsClosedAndExcludesFinalizedHistory(t *testing.T) {
+	store, err := Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "maintenance-protection",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unfinished, err := store.UnfinishedOperations()
+	if err != nil || len(unfinished) != 1 || unfinished[0].ID != op.ID {
+		t.Fatalf("pending operation was not protected: %#v %v", unfinished, err)
+	}
+	if _, err := store.Complete(op.ID, false, nil, "failed before maintenance", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	unfinished, err = store.UnfinishedOperations()
+	if err != nil || len(unfinished) != 0 {
+		t.Fatalf("finalized operation remained protected: %#v %v", unfinished, err)
+	}
+	if err := os.WriteFile(filepath.Join(store.operations, "unknown.tmp"), []byte("evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UnfinishedOperations(); err == nil || !strings.Contains(err.Error(), "unknown operation journal entry") {
+		t.Fatalf("unknown operation evidence was ignored: %v", err)
+	}
+}

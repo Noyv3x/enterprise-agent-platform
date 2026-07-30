@@ -21,6 +21,7 @@ from test_platform import RecordingAgent as RuntimeAgentStub
 def make_config(tmp: Path) -> PlatformConfig:
     return PlatformConfig(
         data_dir=tmp,
+        host_data_root=tmp / "host-data-root",
         host="127.0.0.1",
         port=0,
         public_base_url="http://127.0.0.1:0",

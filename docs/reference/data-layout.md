@@ -24,6 +24,7 @@
 │   ├── platform.db-shm
 │   ├── bootstrap-admin-password.txt
 │   ├── attachments/
+│   ├── upload-staging/             # 仅在上传请求存活期间存在的 owner-only 暂存文件
 │   ├── workspaces/
 │   │   ├── user-<id>/
 │   │   └── channels/channel-<id>/
@@ -53,7 +54,7 @@
 
 `platform.db` 是账号、凭据、消息、记忆、知识、任务和设置的权威存储。SQLite 使用 WAL；迁移和备份必须在线 backup 或在停止 writer 后 checkpoint，不能单独复制主文件。
 
-附件、工作区和 Skill 的逻辑关系保持原设计。附件数据库路径为相对路径。工作区在数据库中保存相对标识，不保存宿主绝对路径；Platform 将其解析为宿主数据目录，Sandbox 内统一映射为 `/workspace`。管理器只把与当前私人或频道 scope 对应的附件子目录只读挂载到 `/workspace/.ubitech/attachments`；模型和 Runtime 只接收这个容器逻辑路径，不接收 Platform 或宿主绝对路径。
+附件、工作区和 Skill 的逻辑关系保持原设计。附件数据库路径为相对路径。Multipart 上传先增量写入 `upload-staging/` 下按请求隔离的 `0700` 目录和 `0600` 普通文件，提交后流式复制到 `attachments/`；staging 不是权威数据，不进入备份，并在请求成功、失败、取消或超时后删除。Platform 启动可以清理不属于活跃请求的遗留 staging 目录。工作区在数据库中保存相对标识，不保存宿主绝对路径；Platform 将其解析为宿主数据目录，Sandbox 内统一映射为 `/workspace`。管理器只把与当前私人或频道 scope 对应的附件子目录只读挂载到 `/workspace/.ubitech/attachments`。当前 scope 的可信系统提示可以同时说明 `/workspace` 和由 Manager 数据根派生的精确宿主映射，帮助 Agent 在获批宿主命令中理解同一文件；该绝对路径不得写入数据库、公共 API、普通 Runtime metadata 或日志。
 
 恢复或复制必须保留可执行位并按各子树修复所有权，不能对整个数据根递归使用同一种 chmod/chown。根目录和 secret 为 owner-only；Manager 每次启动都验证并收紧 `manager/control`、`manager/secrets` 与 capability token 的 owner、类型和权限，拒绝符号链接。对外部服务专用 UID 的授权只应用到明确子目录。
 
@@ -83,9 +84,11 @@ Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs �
 
 管理器状态根保存 current/previous/target release、generation、operation journal、心跳和 owner-only control socket。每个本地 `releases/<commit>/` 的 manifest 与 Compose 是不可变发布物；可变的 `compose.env` 只包含该宿主生成的路径与镜像 digest。`active-generation` 由 Manager 原子写入，明确指出停止、日志和恢复命令应使用的 Compose generation，不能按目录修改时间猜测。Platform 的业务数据库不得成为容器编排状态的唯一存储，否则 Platform 失败时无法恢复。
 
-每次可能改变数据库或 sidecar 格式的 operation 都建立与目标 generation 绑定的一致快照，至少保留 previous generation 所需的回滚点。快照 manifest 记录受管文件的类型、mode、大小与内容 hash；只有文件和 manifest 全部同步、父目录也完成同步后，快照才能写入 operation journal。
+每次可能改变数据库或 sidecar 格式的 operation 都建立与目标 generation 绑定的一致快照，至少保留 previous generation 所需的回滚点。容量门禁对每个受管快照源采用 `max(逻辑大小, 已分配块大小)`，并在 reservation 前以及 reservation 后、停止 writer 前各检查一次，避免稀疏文件、WAL 增长或并发文件变化把实际回滚成本低估。快照 manifest 记录受管文件的类型、mode、大小与内容 hash；只有文件和 manifest 全部同步、父目录也完成同步后，快照才能写入 operation journal。
 
-快照清理由 generation 引用和明确保留策略驱动。current、previous、活动或 finalize-pending operation 引用的快照绝不能删除；不得按目录名称或修改时间猜测归属，也不得对 `backups/` 使用全局递归清理。
+快照不得直接向最终 `backups/<operation-id>/` 写入半成品。Manager 先在 `backups/` 下创建名称绑定 operation id 的 owner-only staging，增量复制受管文件、写 manifest 并同步 staging；全部成功后才原子 rename 为最终目录并同步 `backups/`。复制、manifest、校验、同步或 ENOSPC 在发布边界前失败时，只精确清理本次 staging 并保持最终路径不存在。进程在清理前崩溃时，维护循环只识别符合受管命名、类型、所有权和内容白名单的 staging，并在 `obsolete_artifact_retention_seconds` 宽限后删除；未知目录或附加证据继续保留。
+
+快照清理由 generation 引用和明确保留策略驱动。current、previous、活动或 finalize-pending operation 引用的快照绝不能删除；不得按普通最终目录名称或修改时间猜测归属，也不得对 `backups/` 使用全局递归清理。唯一按较短工件宽限处理的是上述带 operation 身份且通过严格白名单复核的崩溃 staging。Manager 只在稳定空闲状态执行维护：从状态、operation journal、Sandbox registry 和 release manifest 计算带 epoch 的保护集合，再裁剪已过保留期且具备完整归属的快照、旧 release、旧 Manager binary、staging/recovery 临时工件和不再被任何容器使用的受管镜像。慢速目录/hash/Docker 检查在准入锁外执行，每个删除边界重新核对 epoch 和保护集；变化即保留。清理只允许精确对象删除且失败可重试，禁止全局 Docker prune、通配路径删除或触碰未证明归属的数据、镜像和 volume。
 
 应用与容器日志必须轮转。默认限制和保留数量由管理器实现与测试约束；日志不得无限增长，也不得包含 secret、原始宿主执行凭据或 Docker registry 凭据。
 

@@ -100,4 +100,25 @@ describe("useRealtime compact updates", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(store.getState().privateMessages).toHaveLength(2));
   });
+
+  it("keeps the active scope stream open while the loaded page is hidden", () => {
+    const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
+    );
+    renderHook(() => useRealtime(), { wrapper });
+    const stream = FakeEventSource.instances[0];
+    act(() => stream.open());
+
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+
+    expect(stream.readyState).toBe(1);
+    expect(FakeEventSource.instances).toHaveLength(1);
+  });
 });

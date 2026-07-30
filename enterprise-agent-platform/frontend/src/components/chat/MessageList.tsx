@@ -9,9 +9,10 @@
 import { useRef, type ReactNode } from "react";
 import { Button } from "antd";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
+import { loadOlderMessages } from "../../data/loaders";
 import { useI18n, type Translator } from "../../i18n";
 import { agentStatusFor, hasPermission, isAgentActive, scopeTypeFor } from "../../store/selectors";
-import { useStore } from "../../store/useStore";
+import { useStore, useStoreHandle } from "../../store/useStore";
 import type { AgentStatus, ChatMode, Message, ScopeType, StreamMsg, TypingUser } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
@@ -109,11 +110,13 @@ export function MessageList({
   forceBottomToken: number;
 }) {
   const { t } = useI18n();
+  const store = useStoreHandle();
   const ref = useRef<HTMLDivElement>(null);
   const scopeType = scopeTypeFor(mode);
   const scopeKey = `${scopeType}:${scopeId}`;
 
   const messages = useStore((state) => (mode === "private" ? state.privateMessages : state.messages));
+  const history = useStore((state) => state.messageHistory[scopeKey]);
   const status = useStore((state) => agentStatusFor(state, mode));
   const typingUsers = useStore((state) => (mode === "channel" ? state.typingUsers : EMPTY_TYPING));
   const canApprove = useStore((state) =>
@@ -134,6 +137,7 @@ export function MessageList({
     forceBottomToken,
     messages.length + streamCount,
     contentRevision,
+    history?.prependVersion || 0,
   );
 
   let body: ReactNode;
@@ -157,9 +161,27 @@ export function MessageList({
         />
       );
   } else {
-    const items: ReactNode[] = messages.map((message) => (
+    const items: ReactNode[] = [];
+    if (history?.hasMore) {
+      items.push(
+        <div className="chat-history-loader" key="chat-history-loader">
+          <Button
+            size="small"
+            loading={history.loading}
+            onClick={() => void loadOlderMessages(store, mode, scopeId).catch(() => undefined)}
+          >
+            {history.loading
+              ? t("chat.history.loading")
+              : history.error
+                ? t("chat.history.retry")
+                : t("chat.history.loadOlder")}
+          </Button>
+        </div>,
+      );
+    }
+    items.push(...messages.map((message) => (
       <MessageBubble key={String(message.id)} message={message} />
-    ));
+    )));
     if (isAgentActive(status) && status) {
       items.push(
         hasAgentProcessSteps(status) ? (

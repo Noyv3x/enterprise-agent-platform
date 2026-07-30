@@ -3,7 +3,6 @@
 import type {
   AgentApprovalChoice,
   AgentMemory,
-  AgentMemoryCandidate,
   AgentMemoryTarget,
   AgentSkill,
   AgentStatus,
@@ -18,6 +17,8 @@ import type {
   KnowledgeDocument,
   KnowledgeHit,
   MentionTarget,
+  MailAccount,
+  MailSecurityMode,
   Message,
   OAuthFlow,
   OAuthProvider,
@@ -58,7 +59,10 @@ export interface SessionBootstrapResponse {
   agent_status?: AgentStatus | null;
   typing?: TypingUser[];
   message_revision?: MessageRevision;
+  reset_revision?: MessageRevision;
   next_after_id?: Id;
+  next_before_id?: Id | null;
+  has_more_before?: boolean;
 }
 
 export interface LoginRequest {
@@ -106,16 +110,22 @@ export interface ChannelMessagesResponse {
   agent_status?: AgentStatus | null;
   typing?: TypingUser[];
   message_revision?: MessageRevision;
+  reset_revision?: MessageRevision;
   next_after_id?: Id;
-  mode?: "full" | "delta";
+  next_before_id?: Id | null;
+  has_more_before?: boolean;
+  mode?: "full" | "delta" | "history";
 }
 
 export interface PrivateMessagesResponse {
   messages: Message[];
   agent_status?: AgentStatus | null;
   message_revision?: MessageRevision;
+  reset_revision?: MessageRevision;
   next_after_id?: Id;
-  mode?: "full" | "delta";
+  next_before_id?: Id | null;
+  has_more_before?: boolean;
+  mode?: "full" | "delta" | "history";
 }
 
 /** JSON send body (the FormData variant carries `content` + repeated `files`). */
@@ -150,6 +160,46 @@ export type PrivateTelegramResponse = PrivateTelegram;
 
 /** Creating a Telegram link challenge accepts an intentionally empty object. */
 export type PrivateTelegramUpdateRequest = Record<string, never>;
+
+export interface MailAccountsResponse {
+  accounts: MailAccount[];
+  count: number;
+}
+
+export interface MailAccountResponse {
+  account: MailAccount;
+}
+
+export interface MailAccountMutationRequest {
+  label: string;
+  email_address: string;
+  username: string;
+  imap_host: string;
+  imap_port: number;
+  imap_security: MailSecurityMode;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: MailSecurityMode;
+  enabled: boolean;
+  wake_enabled: boolean;
+  wake_folder: string;
+  poll_interval_seconds: number;
+  password?: string;
+}
+
+export type MailAccountPatchRequest = Partial<MailAccountMutationRequest>;
+
+export interface MailAccountTestResponse extends MailAccountResponse {
+  ok: boolean;
+  connections: { imap: boolean; smtp: boolean };
+}
+
+export interface MailAccountCheckResponse extends MailAccountResponse {
+  ok: boolean;
+  baseline: boolean;
+  new_messages: number;
+  stale: boolean;
+}
 
 export interface AgentSchedulesResponse {
   schedules: AgentSchedule[];
@@ -203,18 +253,6 @@ export interface AgentMemoriesExportResponse {
   version: number;
   exported_at: number | string;
   memories: AgentMemory[];
-}
-
-export interface AgentMemoryCandidatesResponse {
-  candidates: AgentMemoryCandidate[];
-  count: number;
-  found: boolean;
-}
-
-export interface AgentMemoryCandidateDecisionResponse {
-  candidate: AgentMemoryCandidate;
-  memory?: AgentMemory | null;
-  created?: boolean;
 }
 
 /* --------------------------------------------------------- Agent skills */
@@ -392,9 +430,13 @@ export type AutoUpdateConfigResponse = AutoUpdateConfigState;
 export type PlatformUpdateStatusResponse = PlatformUpdateStatus;
 
 export interface AutoUpdateConfigUpdateRequest {
-  enabled: boolean;
-  interval_seconds: string;
-  release_manifest_url: string;
+  enabled?: boolean;
+  interval_seconds?: string;
+  release_manifest_url?: string;
+  lan_enabled?: boolean;
+  lan_listen?: string;
+  direct_access_cidrs?: string[];
+  trusted_ingress_cidrs?: string[];
 }
 
 export interface ManagerOperationRequest {

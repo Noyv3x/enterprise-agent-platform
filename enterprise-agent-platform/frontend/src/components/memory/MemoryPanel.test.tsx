@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
 import { TestUiProviders } from "../../test/TestUiProviders";
-import type { AgentMemory, AgentMemoryCandidate, AgentMemoryTarget } from "../../types";
+import type { AgentMemory, AgentMemoryTarget } from "../../types";
 import { MemoryPanel } from "./MemoryPanel";
 
 const mocks = vi.hoisted(() => ({
@@ -16,9 +16,6 @@ const mocks = vi.hoisted(() => ({
   deleteAgentMemory: vi.fn(),
   clearAgentMemories: vi.fn(),
   exportAgentMemories: vi.fn(),
-  loadAgentMemoryCandidates: vi.fn(),
-  approveAgentMemoryCandidate: vi.fn(),
-  rejectAgentMemoryCandidate: vi.fn(),
   downloadJson: vi.fn(),
   toast: vi.fn(),
 }));
@@ -30,9 +27,6 @@ vi.mock("../../data/memoryActions", () => ({
   deleteAgentMemory: mocks.deleteAgentMemory,
   clearAgentMemories: mocks.clearAgentMemories,
   exportAgentMemories: mocks.exportAgentMemories,
-  loadAgentMemoryCandidates: mocks.loadAgentMemoryCandidates,
-  approveAgentMemoryCandidate: mocks.approveAgentMemoryCandidate,
-  rejectAgentMemoryCandidate: mocks.rejectAgentMemoryCandidate,
 }));
 
 vi.mock("../../lib/api", () => ({ downloadJson: mocks.downloadJson }));
@@ -62,18 +56,6 @@ const userMemory: AgentMemory = {
   blocked_reasons: [],
 };
 
-const candidate = (id: number, content: string, target: AgentMemoryTarget = "memory"): AgentMemoryCandidate => ({
-  id,
-  target,
-  content,
-  tags: [],
-  status: "pending",
-  source_message_id: String(id + 100),
-  created_at: "2026-07-18T08:00:00Z",
-  decided_at: null,
-  memory_id: null,
-});
-
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -95,7 +77,6 @@ describe("MemoryPanel", () => {
     mocks.loadAgentMemories.mockImplementation((target: AgentMemoryTarget) => Promise.resolve({
       memories: target === "user" ? [userMemory] : [agentMemory],
     }));
-    mocks.loadAgentMemoryCandidates.mockResolvedValue({ candidates: [] });
     mocks.createAgentMemory.mockResolvedValue({
       changed: [{ action: "add", id: agentMemory.id, created: true, duplicate: false }],
     });
@@ -112,14 +93,6 @@ describe("MemoryPanel", () => {
       version: 1,
       exported_at: "2026-07-18T08:00:00Z",
       memories: [agentMemory, userMemory],
-    });
-    mocks.approveAgentMemoryCandidate.mockResolvedValue({
-      candidate: { ...candidate(1, "Approved"), status: "approved" },
-      memory: agentMemory,
-      created: true,
-    });
-    mocks.rejectAgentMemoryCandidate.mockResolvedValue({
-      candidate: { ...candidate(2, "Ignored"), status: "rejected" },
     });
   });
 
@@ -278,29 +251,6 @@ describe("MemoryPanel", () => {
       expect.objectContaining({ memories: [agentMemory, userMemory] }),
       expect.stringMatching(/^ubitech-agent-memories-\d{4}-\d{2}-\d{2}\.json$/),
     );
-  });
-
-  it("approves or ignores pending memory suggestions before they become durable", async () => {
-    const user = userEvent.setup();
-    const first = candidate(1, "Remember the project test command.");
-    const second = candidate(2, "Remember my response preference.", "user");
-    mocks.loadAgentMemoryCandidates
-      .mockResolvedValueOnce({ candidates: [first, second] })
-      .mockResolvedValueOnce({ candidates: [second] })
-      .mockResolvedValueOnce({ candidates: [] });
-    renderPanel();
-
-    const firstCard = (await screen.findByText(first.content)).closest("article");
-    expect(firstCard).not.toBeNull();
-    await user.click(within(firstCard!).getByRole("button", { name: "Approve" }));
-    expect(mocks.approveAgentMemoryCandidate).toHaveBeenCalledWith(1);
-    await waitFor(() => expect(screen.queryByText(first.content)).not.toBeInTheDocument());
-
-    const secondCard = screen.getByText(second.content).closest("article");
-    expect(secondCard).not.toBeNull();
-    await user.click(within(secondCard!).getByRole("button", { name: "Ignore" }));
-    expect(mocks.rejectAgentMemoryCandidate).toHaveBeenCalledWith(2);
-    await waitFor(() => expect(screen.queryByText(second.content)).not.toBeInTheDocument());
   });
 
   it(

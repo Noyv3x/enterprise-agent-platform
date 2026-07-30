@@ -1,6 +1,6 @@
 # 外部集成
 
-本文定义平台与模型 OAuth、SearXNG、Firecrawl、Camoufox、Cognee 和 Telegram 的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
+本文定义平台与模型 OAuth、SearXNG、Firecrawl、Camoufox、Cognee、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
 
 ## 发布与通用原则
 
@@ -41,6 +41,8 @@ Firecrawl API key 作为 Platform secret 注入调用方，不写入 Compose 文
 
 支持 tab、导航、snapshot、截图/vision、链接、图片、下载列表、结构化提取和常见交互；console 不执行任意 JavaScript。预览只读取已有 tab 的低频 viewport 帧，打开预览不能启动浏览器、创建 tab、导航或改变当前 tab。
 
+用户可以对当前已授权 tab 取得短期人工接管租约，用限幅坐标鼠标、滚动、文本与按键协助处理验证码或卡住的页面。Platform 每次操作都重新校验登录用户、scope family、tab 与租约，不接受客户端指定的 Camoufox user id、selector、脚本或任意导航 URL。同一 root scope 的人工取得/释放、人工输入与 Agent 变更型动作必须经过同一串行操作门，锁覆盖实际 Camoufox 调用及调用后的状态提交；因此 Agent 不能在“确认无租约”之后与正在取得租约或执行中的人工输入交叠。租约期间 Agent 的变更型浏览器动作返回可重试冲突；只读截图仍可继续。人工输入还按租约绑定的 tab 与单调序列串行，不能因并发 HTTP 请求乱序。结束、失焦、页面隐藏、到期、tab 变化、服务端租约冲突、tab 关闭或 scope cleanup 都立即把界面降为只读，并尽力释放原租约。共享 Xvfb 不直接暴露为远程桌面。
+
 ## Cognee
 
 本地 SQLite/FTS 知识库始终可用。`local` 模式不调用 Cognee；`hybrid` 和 `cognee` 模式尝试摄取到指定 dataset，并合并 Cognee 与本地结果。
@@ -49,7 +51,7 @@ Cognee 精确 revision 在 Platform 镜像构建时安装为分发版，运行�
 
 ## 不可信内容
 
-搜索、提取、浏览器文本、知识结果、记忆、历史会话、计划定义/历史和 Skill 附件都可能包含间接提示词注入。返回模型前必须进入防伪闭合的 `untrusted_tool_result` 数据边界，并先中和载荷伪造的同名标签；图片保持图片块，伴随文本仍使用相同边界。
+搜索、提取、浏览器文本、邮件、知识结果、记忆、历史会话、计划定义/历史和 Skill 附件都可能包含间接提示词注入。返回模型前必须进入防伪闭合的 `untrusted_tool_result` 数据边界，并先中和载荷伪造的同名标签；图片保持图片块，伴随文本仍使用相同边界。
 
 结构化边界是主要语义防线。共享威胁扫描器只作纵深防护：输入先 NFKC 归一化，检测不可见/双向 Unicode，并使用有界规则。长期记忆、Skill 主指令和计划 prompt 在写入及加载/执行时复查；普通网页内容不因关键词被删除，而是保持可见并始终作为不可信数据。
 
@@ -58,6 +60,18 @@ Cognee 精确 revision 在 Platform 镜像构建时安装为分发版，运行�
 Telegram Gateway 只处理私聊，忽略群组、超级群组和频道。用户在私人 Agent 界面生成短时绑定码，通过 `/link CODE` 或 `/start CODE` 绑定身份。
 
 update id 是入站去重边界；未确认 update 可在重启后重新领取。出站回复使用持久 delivery job；已开始发送但结果未知的任务进入 `needs_review`，不能盲目重复。停用或轮换 bot 时先吊销旧 sender generation，再停止 transport。
+
+## 邮箱
+
+私人 Agent 可以配置标准 IMAP/SMTP 邮箱账户与应用专用密码。Platform 使用系统 CA 验证 IMAPS、SMTPS 或 STARTTLS，不增加邮件容器，也不把密码交给 Runtime、Sandbox、日志或工具结果。界面只管理账户、测试连接、立即检查和收信唤醒开关，不实现第二个完整邮件客户端。
+
+`mail` 工具支持列账户、文件夹、搜索、读取、发送、回复、移动、标记与把附件安全保存到当前工作区。所有权由可信私人 scope 派生；频道、委派或其他用户不能访问账户。交互式搜索也必须先用 `UIDNEXT` 限定最近的有界 UID 窗口，不能让 `SEARCH ALL` 为大邮箱生成无界响应；读取完整正文前先读取 `RFC822.SIZE` 并拒绝超限或缺失大小的响应。邮件正文、头部和附件名始终作为不可信工具结果。发送使用持久幂等投递记录：明确成功才完成，明确失败可由新请求重试，结果未知进入 `needs_review`，不得盲目重发；“删除”只移动到 Trash，不执行不可恢复 expunge。
+
+保存邮件附件时，Platform 必须从可信 scope 的工作区根目录 fd 开始，逐段以 `O_DIRECTORY | O_NOFOLLOW` 打开或以 `mkdirat` 创建目标父目录，并验证每一段都是部署用户拥有的真实目录。最终文件只能相对已固定的父目录 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，再验证其类型与 owner；不得先按路径检查、随后重新按字符串路径打开。父目录在保存过程中被替换、重命名或改成符号链接时，写入也不能越过当前 scope 的工作区边界。
+
+启用收信唤醒后，一个有界轮询器按 `UIDVALIDITY + UID` 做 checkpoint 和去重。首次启用或 `UIDVALIDITY` 变化时必须用服务器 `UIDNEXT` 建立当前高水位，不能执行 `SEARCH ALL`、把整个邮箱 UID 列表载入内存或把历史邮箱当成新邮件；服务器未返回有效 `UIDVALIDITY/UIDNEXT` 时 fail closed。增量检查只搜索从 checkpoint 开始的有界 UID 数值窗口，每批新邮件数量另有更小上限；有剩余窗口时把账户标记为立即到期，由公平的后台轮询循环继续追赶，而不是等待用户配置的常规周期。公平顺序按持久化的下次到期时间排列；追赶一个窗口后，该账户仍立即到期，但必须移到其他已到期账户之后。这个顺序必须跨轮询循环和进程重启保留，不能让前一批持续积压的账户固定占满批次。只有成功处理完整窗口才持久化已扫描边界；批内超过上限时只能推进到最后一个已选择 UID，读取或落库失败不得越过失败 UID。这样既不让大邮箱一次占满 worker，也不会让稀疏 UID 或持续流量积压数小时。后台 IMAP 网络读取不持有更新写准入；每个 checkpoint、触发消息/durable job 事务和检查状态落库前重新取得短准入，更新已经预约时放弃未提交结果并在新 generation 从原 checkpoint 重试。新邮件以 system trigger 写入私人对话，并和 Agent durable job、checkpoint 在同一事务提交。唤醒 Run 标记为 unattended，只能读取和汇报，不能因邮件正文自行发送、移动、删除、修改记忆或执行宿主命令。维护期间不开始轮询、投递或唤醒，解除后从 checkpoint 继续。
+
+公平轮转中的“立即到期”指下一调度秒即可再次被领取，不等待账户的常规周期。每次追赶后持久化的到期边界必须严格前进，不能因秒级时钟相同而再次与未处理账户并列。
 
 ## 上游边界
 

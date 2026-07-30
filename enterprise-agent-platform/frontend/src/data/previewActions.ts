@@ -1,4 +1,4 @@
-import { _invokePlatformUpdating, _invokeSessionExpired, ApiError } from "../lib/api";
+import { _invokePlatformUpdating, _invokeSessionExpired, api, ApiError } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { t } from "../i18n";
 import type {
@@ -47,6 +47,77 @@ export interface PreviewUnchanged {
 }
 
 export type BrowserPreviewResult = BrowserPreviewFrame | BrowserPreviewIdle | PreviewUnchanged;
+
+export interface BrowserControlResponse {
+  active?: boolean;
+  released?: boolean;
+  lease_id?: string;
+  tab_id?: string;
+  expires_in_ms?: number;
+  ok?: boolean;
+  duplicate?: boolean;
+  sequence?: number;
+}
+
+export type BrowserControlInput =
+  | { action: "click" | "double_click"; x: number; y: number }
+  | { action: "text"; text: string }
+  | { action: "key"; key: string }
+  | { action: "wheel"; delta_x: number; delta_y: number }
+  | { action: "back" | "forward" | "refresh" };
+
+export function acquireBrowserControl(
+  scope: AgentPreviewScope,
+  tabId: string,
+): Promise<BrowserControlResponse> {
+  return api("/api/agent-previews/browser/control", {
+    method: "POST",
+    body: JSON.stringify({
+      command: "acquire",
+      scope_type: scope.scope_type,
+      scope_id: String(scope.scope_id),
+      tab_id: tabId,
+    }),
+  });
+}
+
+export function releaseBrowserControl(
+  scope: AgentPreviewScope,
+  tabId: string,
+  leaseId: string,
+): Promise<BrowserControlResponse> {
+  return api("/api/agent-previews/browser/control", {
+    method: "POST",
+    body: JSON.stringify({
+      command: "release",
+      scope_type: scope.scope_type,
+      scope_id: String(scope.scope_id),
+      tab_id: tabId,
+      lease_id: leaseId,
+    }),
+  });
+}
+
+export function sendBrowserControlInput(
+  scope: AgentPreviewScope,
+  tabId: string,
+  leaseId: string,
+  sequence: number,
+  input: BrowserControlInput,
+): Promise<BrowserControlResponse> {
+  return api("/api/agent-previews/browser/control", {
+    method: "POST",
+    body: JSON.stringify({
+      command: "input",
+      scope_type: scope.scope_type,
+      scope_id: String(scope.scope_id),
+      tab_id: tabId,
+      lease_id: leaseId,
+      sequence,
+      ...input,
+    }),
+  });
+}
 
 export interface TerminalPreviewResult {
   kind: "snapshot" | "unchanged";

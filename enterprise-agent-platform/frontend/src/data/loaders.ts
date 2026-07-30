@@ -14,6 +14,7 @@ import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { cacheChat, chatScopeKey } from "./chatCache";
 import { messageSyncCursor } from "./messageSync";
+import { messageHistoryState } from "./messageHistory";
 import {
   isScopeReadCurrent,
   isStatusReadCurrent,
@@ -92,6 +93,18 @@ function applyAgentStatus(
   });
 }
 
+function applyMessageHistory(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+  result: ChannelMessagesResponse | PrivateMessagesResponse | SessionBootstrapResponse,
+) {
+  const key = chatScopeKey(mode, scopeId);
+  const history = messageHistoryState(result, store.getState().messageHistory[key]);
+  store.dispatch({ type: "SET_MESSAGE_HISTORY", payload: { key, history } });
+  return history;
+}
+
 /* --------------------------------------------------------------- loaders */
 
 export async function loadInitial(store: AppStore): Promise<void> {
@@ -143,7 +156,8 @@ export function hydrateSessionBootstrap(
       },
     });
   }
-  cacheChat(store, mode, scopeId, messages, cursor);
+  const history = applyMessageHistory(store, mode, scopeId, result);
+  cacheChat(store, mode, scopeId, messages, cursor, history);
 }
 
 export async function loadSessionBootstrap(store: AppStore): Promise<void> {
@@ -209,12 +223,14 @@ export async function loadChannelMessages(store: AppStore): Promise<void> {
       },
     });
   }
+  const history = applyMessageHistory(store, "channel", channelId, result);
   cacheChat(
     store,
     "channel",
     channelId,
     store.getState().messages,
     cursor,
+    history,
   );
 }
 
@@ -246,13 +262,148 @@ export async function loadPrivateMessages(store: AppStore): Promise<void> {
       },
     });
   }
+  const history = applyMessageHistory(store, "private", scopeId, result);
   cacheChat(
     store,
     "private",
     scopeId,
     store.getState().privateMessages,
     cursor,
+    history,
   );
+}
+
+function scopeStillVisible(store: AppStore, mode: ChatMode, scopeId: string): boolean {
+  const state = store.getState();
+  if (mode === "private") {
+    return state.activeView === "private" && String(state.user?.id || "") === scopeId;
+  }
+  return state.activeView === "channel" && String(state.activeChannelId || "") === scopeId;
+}
+
+let historyRequestSequence = 0;
+const historyRequestOwners = new WeakMap<AppStore, Map<string, number>>();
+
+function claimHistoryRequest(store: AppStore, key: string): number {
+  let owners = historyRequestOwners.get(store);
+  if (!owners) {
+    owners = new Map<string, number>();
+    historyRequestOwners.set(store, owners);
+  }
+  historyRequestSequence += 1;
+  owners.set(key, historyRequestSequence);
+  return historyRequestSequence;
+}
+
+function ownsHistoryRequest(store: AppStore, key: string, requestId: number): boolean {
+  return historyRequestOwners.get(store)?.get(key) === requestId;
+}
+
+function releaseHistoryRequest(store: AppStore, key: string, requestId: number): void {
+  const owners = historyRequestOwners.get(store);
+  if (owners?.get(key) !== requestId) return;
+  owners.delete(key);
+  if (owners.size === 0) historyRequestOwners.delete(store);
+}
+
+/** Load one backward page without advancing the independent SSE/after_id cursor. */
+export async function loadOlderMessages(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+): Promise<void> {
+  const key = chatScopeKey(mode, scopeId);
+  const startedState = store.getState();
+  const current = startedState.messageHistory[key];
+  if (!current?.hasMore || !current.nextBeforeId || current.loading) return;
+  const requestedBeforeId = current.nextBeforeId;
+  const requestedPrependVersion = current.prependVersion;
+  const requestedResetRevision = startedState.messageSyncCursors[key]?.resetRevision;
+  if (requestedResetRevision === undefined) return;
+  const requestId = claimHistoryRequest(store, key);
+  store.dispatch({
+    type: "SET_MESSAGE_HISTORY",
+    payload: { key, history: { ...current, loading: true, error: "" } },
+  });
+  const path = mode === "private"
+    ? endpoints.privateMessages.path()
+    : endpoints.channelMessages.path(scopeId);
+  const query = new URLSearchParams({ before_id: requestedBeforeId, limit: "100" });
+  const stillOwnsRequest = (): boolean => {
+    const state = store.getState();
+    const history = state.messageHistory[key];
+    const currentResetRevision = state.messageSyncCursors[key]?.resetRevision;
+    return ownsHistoryRequest(store, key, requestId)
+      && scopeStillVisible(store, mode, scopeId)
+      && Boolean(history?.loading)
+      && history?.nextBeforeId === requestedBeforeId
+      && history?.prependVersion === requestedPrependVersion
+      && String(currentResetRevision) === String(requestedResetRevision);
+  };
+  const releaseOwnedRequest = (error = ""): void => {
+    if (!ownsHistoryRequest(store, key, requestId)) return;
+    const history = store.getState().messageHistory[key];
+    if (
+      history?.loading
+      && history.nextBeforeId === requestedBeforeId
+      && history.prependVersion === requestedPrependVersion
+      && String(store.getState().messageSyncCursors[key]?.resetRevision)
+        === String(requestedResetRevision)
+    ) {
+      store.dispatch({
+        type: "SET_MESSAGE_HISTORY",
+        payload: { key, history: { ...history, loading: false, error } },
+      });
+    }
+    releaseHistoryRequest(store, key, requestId);
+  };
+  try {
+    const result = await api<ChannelMessagesResponse | PrivateMessagesResponse>(
+      `${path}?${query.toString()}`,
+    );
+    const responseResetRevision = result.reset_revision;
+    if (
+      !stillOwnsRequest()
+      || responseResetRevision === undefined
+      || String(responseResetRevision) !== String(requestedResetRevision)
+    ) {
+      releaseOwnedRequest();
+      return;
+    }
+    if (result.mode && result.mode !== "history") {
+      throw new Error("message history endpoint returned an invalid mode");
+    }
+    store.dispatch({
+      type: "PREPEND_MESSAGES",
+      payload: {
+        mode,
+        scopeId,
+        messages: result.messages || [],
+        nextBeforeId:
+          result.has_more_before && result.next_before_id != null
+            ? String(result.next_before_id)
+            : null,
+        hasMore: Boolean(result.has_more_before),
+      },
+    });
+    const state = store.getState();
+    cacheChat(
+      store,
+      mode,
+      scopeId,
+      mode === "private" ? state.privateMessages : state.messages,
+      state.messageSyncCursors[key],
+      state.messageHistory[key],
+    );
+    releaseHistoryRequest(store, key, requestId);
+  } catch (error) {
+    releaseOwnedRequest(
+      scopeStillVisible(store, mode, scopeId)
+        ? error instanceof Error ? error.message : String(error)
+        : "",
+    );
+    throw error;
+  }
 }
 
 export async function loadPrivateTelegram(store: AppStore): Promise<void> {

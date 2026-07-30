@@ -1,21 +1,18 @@
 import { Alert, Button, Card, Form, Input, Space, Tabs, Tag, Typography } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  approveAgentMemoryCandidate,
   clearAgentMemories,
   createAgentMemory,
   deleteAgentMemory,
   exportAgentMemories,
   loadAgentMemories,
-  loadAgentMemoryCandidates,
-  rejectAgentMemoryCandidate,
   updateAgentMemory,
 } from "../../data/memoryActions";
 import { toast } from "../../context/ToastContext";
 import { intlLocale, useI18n } from "../../i18n";
 import { downloadJson } from "../../lib/api";
 import { cx } from "../../lib/cx";
-import type { AgentMemory, AgentMemoryCandidate, AgentMemoryTarget } from "../../types";
+import type { AgentMemory, AgentMemoryTarget } from "../../types";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { EmptyState } from "../common/EmptyState";
 import { Icon } from "../common/Icon";
@@ -153,69 +150,22 @@ function MemoryCard({
   );
 }
 
-function PendingCandidateCard({
-  candidate,
-  busy,
-  locale,
-  onApprove,
-  onIgnore,
-}: {
-  candidate: AgentMemoryCandidate;
-  busy: boolean;
-  locale: string;
-  onApprove: () => void;
-  onIgnore: () => void;
-}) {
-  const { t } = useI18n();
-  const created = memoryTime(candidate.created_at, locale);
-  return (
-    <article className="memory-candidate">
-      <Card className="memory-candidate__surface" classNames={{ body: "memory-candidate__body" }} size="small">
-        <header>
-          <Tag
-            className="memory-candidate__target"
-            icon={<Icon name={candidate.target === "user" ? "users" : "bot"} size={13} />}
-            color="blue"
-          >
-            {targetLabel(candidate.target, t)}
-          </Tag>
-          {created ? <Typography.Text type="secondary"><time>{created}</time></Typography.Text> : null}
-        </header>
-        <Typography.Paragraph>{candidate.content}</Typography.Paragraph>
-        <footer>
-          <Button size="small" disabled={busy} onClick={onIgnore}>
-            {t("memory.ignore")}
-          </Button>
-          <Button size="small" type="primary" loading={busy} onClick={onApprove}>
-            {t("memory.approve")}
-          </Button>
-        </footer>
-      </Card>
-    </article>
-  );
-}
-
 export function MemoryPanel() {
   const { t, locale } = useI18n();
   const [target, setTarget] = useState<AgentMemoryTarget>("memory");
   const [memories, setMemories] = useState<AgentMemory[]>([]);
-  const [candidates, setCandidates] = useState<AgentMemoryCandidate[]>([]);
   const [queryDraft, setQueryDraft] = useState("");
   const [query, setQuery] = useState("");
   const [newContent, setNewContent] = useState("");
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editContent, setEditContent] = useState("");
   const [loading, setLoading] = useState(true);
-  const [candidatesLoading, setCandidatesLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [candidatesError, setCandidatesError] = useState("");
   const [mutationError, setMutationError] = useState("");
   const [busyKey, setBusyKey] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
   const memoryController = useRef<AbortController | null>(null);
-  const candidateController = useRef<AbortController | null>(null);
   const memoryRequestVersion = useRef(0);
-  const candidateRequestVersion = useRef(0);
   const busyRef = useRef(false);
   const targetRef = useRef<AgentMemoryTarget>(target);
   const queryRef = useRef(query);
@@ -259,30 +209,6 @@ export function MemoryPanel() {
     }
   }, []);
 
-  const refreshCandidates = useCallback(async () => {
-    candidateController.current?.abort();
-    const controller = new AbortController();
-    const requestVersion = ++candidateRequestVersion.current;
-    candidateController.current = controller;
-    setCandidatesLoading(true);
-    setCandidatesError("");
-    try {
-      const result = await loadAgentMemoryCandidates(controller.signal);
-      if (!controller.signal.aborted && candidateRequestVersion.current === requestVersion) {
-        setCandidates(result.candidates || []);
-      }
-    } catch (error) {
-      if (!controller.signal.aborted && candidateRequestVersion.current === requestVersion) {
-        setCandidatesError(errorText(error));
-      }
-    } finally {
-      if (candidateController.current === controller) {
-        candidateController.current = null;
-        setCandidatesLoading(false);
-      }
-    }
-  }, []);
-
   useEffect(() => {
     void refreshMemories();
     return () => {
@@ -292,16 +218,6 @@ export function MemoryPanel() {
       controller?.abort();
     };
   }, [query, refreshMemories, target]);
-
-  useEffect(() => {
-    void refreshCandidates();
-    return () => {
-      const controller = candidateController.current;
-      candidateController.current = null;
-      candidateRequestVersion.current += 1;
-      controller?.abort();
-    };
-  }, [refreshCandidates]);
 
   const stopStaleMemoryLoad = useCallback(() => {
     memoryController.current?.abort();
@@ -314,7 +230,7 @@ export function MemoryPanel() {
     key: string,
     action: () => Promise<unknown>,
     successMessage: string,
-    options: { refreshMemories?: boolean; refreshCandidates?: boolean } = {},
+    options: { refreshMemories?: boolean } = {},
   ) => {
     if (busyRef.current) return false;
     busyRef.current = true;
@@ -324,7 +240,6 @@ export function MemoryPanel() {
     try {
       await action();
       toast(successMessage, { type: "ok" });
-      if (options.refreshCandidates) await refreshCandidates();
       if (options.refreshMemories !== false) await refreshMemories();
       return true;
     } catch (error) {
@@ -334,7 +249,7 @@ export function MemoryPanel() {
       busyRef.current = false;
       setBusyKey("");
     }
-  }, [refreshCandidates, refreshMemories, stopStaleMemoryLoad, t]);
+  }, [refreshMemories, stopStaleMemoryLoad, t]);
 
   const switchTarget = (next: AgentMemoryTarget) => {
     if (next === target) return;
@@ -403,21 +318,6 @@ export function MemoryPanel() {
       () => clearAgentMemories(clearTarget),
       t("memory.clearSuccess"),
     );
-  };
-
-  const decideCandidate = async (candidate: AgentMemoryCandidate, decision: "approve" | "reject") => {
-    const approved = decision === "approve";
-    const changed = await runMutation(
-      `candidate:${decision}:${candidate.id}`,
-      () => approved
-        ? approveAgentMemoryCandidate(candidate.id)
-        : rejectAgentMemoryCandidate(candidate.id),
-      t(approved ? "memory.approveSuccess" : "memory.ignoreSuccess"),
-      { refreshMemories: approved, refreshCandidates: true },
-    );
-    if (changed && !approved) {
-      setCandidates((current) => current.filter((item) => item.id !== candidate.id));
-    }
   };
 
   const exportMemories = async () => {
@@ -528,7 +428,6 @@ export function MemoryPanel() {
             icon={<Icon name="refresh" size={14} />}
             onClick={() => {
               void refreshMemories();
-              void refreshCandidates();
             }}
           >
             {t("memory.refresh")}
@@ -605,44 +504,6 @@ export function MemoryPanel() {
       <InlineAlert variant="warning" title={t("memory.chatNoticeTitle")}>
         {t("memory.chatNotice")}
       </InlineAlert>
-
-      {(candidatesLoading || candidatesError || candidates.length > 0) ? (
-        <section className="memory-pending" aria-labelledby="memory-pending-title">
-          <header className="memory-section__head">
-            <div>
-              <h3 id="memory-pending-title">{t("memory.pendingTitle")}</h3>
-              <p>{t("memory.pendingDescription")}</p>
-            </div>
-            {!candidatesLoading ? <Tag>{t("memory.pendingCount", { count: candidates.length })}</Tag> : null}
-          </header>
-          {candidatesError ? (
-            <InlineAlert
-              variant="error"
-              action={<Button size="small" onClick={() => void refreshCandidates()}>{t("common.retry")}</Button>}
-            >
-              {candidatesError || t("memory.pendingLoadFailed")}
-            </InlineAlert>
-          ) : candidatesLoading ? (
-            <div className="memory-loading" role="status">
-              <Spinner size={18} />
-              <span>{t("memory.loading")}</span>
-            </div>
-          ) : (
-            <div className="memory-candidate-list">
-              {candidates.map((candidate) => (
-                <PendingCandidateCard
-                  key={candidate.id}
-                  candidate={candidate}
-                  busy={!!busyKey}
-                  locale={intl}
-                  onApprove={() => void decideCandidate(candidate, "approve")}
-                  onIgnore={() => void decideCandidate(candidate, "reject")}
-                />
-              ))}
-            </div>
-          )}
-        </section>
-      ) : null}
 
       <Tabs
         className="memory-tabs"

@@ -43,7 +43,7 @@ Python Platform 容器拥有产品业务状态：
 - 登录、会话签名、账号和服务端权限；
 - 频道、私人消息、附件、审计和 token 用量；
 - Agent scope、消息准入、持久任务、短消息合并和计划任务；
-- 记忆、候选记忆、知识库、技能和跨会话搜索；
+- 自动记忆、知识库、技能、跨会话搜索和邮箱账户；
 - OAuth 流程、凭据刷新和可见模型目录；
 - Telegram 与面向 Runtime 的内部业务工具 Gateway。
 
@@ -71,7 +71,7 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 2. 每个会话 FIFO worker 领取任务，全局并发门控制同时进入 Runtime 的数量。
 3. Platform 创建 Runtime Run，随后消费事件；工具过程和最终内容分别写入状态和消息元数据。
 4. Runtime 将产品工具回调 Platform；terminal、process 与文件工具按主 Agent identity 调用管理器，默认进入对应 Sandbox。
-5. 管理器在执行前产生带完整安全展示参数的审计事件，再将输出流回 Runtime；宿主目标还记录 target、部署用户和 sudo 使用情况。
+5. Sandbox 执行在硬阻断和审计后直接运行；宿主命令必须先获得本次用户审批，管理器再产生带完整安全展示参数的审计事件，并记录 target、部署用户和 sudo 使用情况。
 6. 最终回复和用量先持久化，再将任务账本转为成功。
 
 ### 运行中追加输入
@@ -94,4 +94,5 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 - Runtime 重启通过幂等记录和会话日志区分可重放结果与 `needs_review`。
 - 管理器重启从 operation journal 和容器 label 对账，不从容器名称猜测状态。
 - 搜索、抓取、浏览器和 Cognee 失败只影响对应工具，不能破坏本地消息和知识数据。
+- 邮件轮询和回复通知失败只降级对应集成，不阻断对话；更新维护期间不启动新的邮件副作用或唤醒。
 - Run 空闲、模型轮次和 terminal 默认超时只在 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义；容器与更新状态只在 [`container-platform.json`](../contracts/container-platform.json) 定义。

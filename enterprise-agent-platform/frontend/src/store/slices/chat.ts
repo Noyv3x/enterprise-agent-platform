@@ -19,6 +19,7 @@ export const chatInitial: ChatSliceState = {
   draftFiles: {},
   failedSends: {},
   messageSyncCursors: {},
+  messageHistory: {},
   agentStatuses: { channels: {}, private: null },
   expandedAgentRuns: {},
   mentionTargets: [],
@@ -51,6 +52,47 @@ export function chatReducer(state: AppState, action: Action): AppState {
           [action.payload.key]: action.payload.cursor,
         },
       };
+    case "SET_MESSAGE_HISTORY":
+      return {
+        ...state,
+        messageHistory: {
+          ...state.messageHistory,
+          [action.payload.key]: action.payload.history,
+        },
+      };
+    case "PREPEND_MESSAGES": {
+      const { mode, scopeId, messages, nextBeforeId, hasMore } = action.payload;
+      const key = `${mode}:${String(scopeId)}`;
+      const previousHistory = state.messageHistory[key];
+      const prepend = (current: Message[]): Message[] => {
+        const existing = new Set(current.map((message) => String(message.id)));
+        return [
+          ...messages.filter((message) => !existing.has(String(message.id))),
+          ...current,
+        ];
+      };
+      const messageHistory = {
+        ...state.messageHistory,
+        [key]: {
+          nextBeforeId,
+          hasMore,
+          loading: false,
+          error: "",
+          prependVersion: (previousHistory?.prependVersion || 0) + 1,
+        },
+      };
+      if (mode === "private") {
+        return {
+          ...state,
+          privateMessages: prepend(state.privateMessages),
+          messageHistory,
+        };
+      }
+      if (String(state.activeChannelId) === String(scopeId)) {
+        return { ...state, messages: prepend(state.messages), messageHistory };
+      }
+      return { ...state, messageHistory };
+    }
     case "SET_PENDING_MESSAGES":
       return { ...state, pendingMessages: action.payload };
     case "SET_AGENT_STATUSES":
@@ -192,6 +234,22 @@ export function chatReducer(state: AppState, action: Action): AppState {
       }
       return { ...state, pendingMessages };
     }
+    case "UPDATE_OPTIMISTIC_UPLOAD": {
+      const { tempId, upload } = action.payload;
+      const update = (message: Message): Message =>
+        message.id === tempId
+          ? {
+              ...message,
+              metadata: { ...message.metadata, upload },
+            }
+          : message;
+      return {
+        ...state,
+        pendingMessages: state.pendingMessages.map(update),
+        messages: state.messages.map(update),
+        privateMessages: state.privateMessages.map(update),
+      };
+    }
 
     /* Per-scope Agent status write: no-op on a falsy status; otherwise replace
        just that scope's entry. */
@@ -240,6 +298,7 @@ export function chatReducer(state: AppState, action: Action): AppState {
         draftFiles: {},
         failedSends: {},
         messageSyncCursors: {},
+        messageHistory: {},
         mentionTargets: [],
         typingUsers: [],
       };

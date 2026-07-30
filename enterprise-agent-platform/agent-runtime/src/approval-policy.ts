@@ -654,7 +654,7 @@ export function redactToolArgumentsForJournal(
     }
     return result;
   }
-  if (["process", "memory", "skill", "browser", "schedule"].includes(toolName)) {
+  if (["process", "memory", "skill", "browser", "schedule", "mail"].includes(toolName)) {
     try {
       return actionApprovalObject(toolName, args).displayArguments;
     } catch (error) {
@@ -847,7 +847,9 @@ function redactActionArguments(toolName: string, action: string, args: JsonObjec
         ? ["instructions", "content"]
         : toolName === "schedule"
           ? ["prompt"]
-          : [];
+          : toolName === "mail"
+            ? ["text_body", "html_body"]
+            : [];
   const display: JsonObject = {};
   for (const [key, value] of Object.entries(args)) {
     if (omittedBodyKeys.includes(key)) {

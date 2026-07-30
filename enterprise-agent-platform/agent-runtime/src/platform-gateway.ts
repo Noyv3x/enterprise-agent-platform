@@ -21,6 +21,7 @@ export class PlatformGateway {
     action: string,
     arguments_: JsonObject,
     signal?: AbortSignal,
+    toolCallId?: string,
   ): Promise<GatewayToolResponse> {
     throwIfAborted(signal);
     const { baseUrl, token } = this.connection(request);
@@ -39,6 +40,15 @@ export class PlatformGateway {
         workspace: request.workspace,
         ...(owner === undefined ? {} : { owner_user_id: owner }),
         ...(sourceMessageId === undefined ? {} : { source_message_id: sourceMessageId }),
+        ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+        ...(request.metadata?.parent_run_id ? { parent_run_id: request.metadata.parent_run_id } : {}),
+        ...(request.metadata?.delegation_depth === undefined
+          ? {}
+          : { delegation_depth: Number(request.metadata.delegation_depth) }),
+        ...(typeof request.metadata?.trigger === "string" ? { trigger: request.metadata.trigger } : {}),
+        ...(request.metadata?.unattended === undefined
+          ? {}
+          : { unattended: request.metadata.unattended === true }),
       },
     };
     const target = gatewayTarget(baseUrl, body);
@@ -117,7 +127,7 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     run_id: request.context.run_id,
   };
   if (request.tool === "memory") {
-    if (!["search", "read", "list", "store", "replace", "forget", "clear", "propose"].includes(request.action)) {
+    if (!["search", "read", "list", "store", "replace", "forget", "clear"].includes(request.action)) {
       throw new Error("memory action is not supported");
     }
     if (["search", "read", "list"].includes(request.action)) {
@@ -131,7 +141,14 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     return {
       method: "POST",
       url: `${baseUrl}/api/agent/tools/memory`,
-      body: { ...flattened, action: actions[request.action] ?? request.action },
+      body: {
+        ...flattened,
+        action: actions[request.action] ?? request.action,
+        parent_run_id: request.context.parent_run_id,
+        delegation_depth: request.context.delegation_depth,
+        trigger: request.context.trigger,
+        unattended: request.context.unattended,
+      },
     };
   }
   if (request.tool === "session") {
@@ -168,6 +185,12 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
   if (request.tool === "web" && !["search", "extract"].includes(request.action)) {
     throw new Error("web action must be search or extract");
   }
+  if (
+    request.tool === "mail"
+    && !["accounts", "folders", "search", "read", "send", "reply", "move", "mark", "save_attachment"].includes(request.action)
+  ) {
+    throw new Error("mail action is not supported");
+  }
   return { method: "POST", url: `${baseUrl}/internal/agent/tools/${request.tool}`, body: request as unknown as JsonObject };
 }
 
@@ -190,7 +213,7 @@ function authoritativeMemoryArguments(request: GatewayToolRequest): JsonObject {
       const operationAction = typeof normalized.action === "string" ? normalized.action : request.action;
       if (!["search", "read", "list"].includes(operationAction)) {
         normalized.source_run_id = request.context.run_id;
-        normalized.source_type = "tool";
+        normalized.source_type = "automatic";
         if (request.context.source_message_id !== undefined) {
           normalized.source_message_id = request.context.source_message_id;
         }
@@ -200,7 +223,7 @@ function authoritativeMemoryArguments(request: GatewayToolRequest): JsonObject {
   }
   if (!["search", "read", "list"].includes(request.action)) {
     result.source_run_id = request.context.run_id;
-    result.source_type = "tool";
+    result.source_type = "automatic";
     if (request.context.source_message_id !== undefined) {
       result.source_message_id = request.context.source_message_id;
     } else {

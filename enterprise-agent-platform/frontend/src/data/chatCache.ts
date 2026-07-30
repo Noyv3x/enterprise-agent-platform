@@ -4,6 +4,7 @@ import type {
   AppState,
   ChatMode,
   Message,
+  MessageHistoryState,
   MessageSyncCursor,
 } from "../types";
 
@@ -14,6 +15,7 @@ const MAX_SCOPES = 8;
 interface ChatCacheEntry {
   messages: Message[];
   cursor?: MessageSyncCursor;
+  history?: MessageHistoryState;
 }
 
 const caches = new WeakMap<AppStore, Map<string, ChatCacheEntry>>();
@@ -37,6 +39,7 @@ export function cacheChat(
   scopeId: string,
   messages: Message[],
   cursor?: MessageSyncCursor,
+  history?: MessageHistoryState,
 ): void {
   const cache = cacheFor(store);
   const key = chatScopeKey(mode, scopeId);
@@ -44,6 +47,7 @@ export function cacheChat(
   cache.set(key, {
     messages: messages.filter((message) => !message.metadata?.local_pending),
     cursor,
+    history: history ? { ...history, loading: false } : undefined,
   });
   while (cache.size > MAX_SCOPES) {
     const oldest = cache.keys().next().value as string | undefined;
@@ -62,6 +66,7 @@ export function cacheVisibleChat(store: AppStore): void {
       scopeId,
       state.messages,
       state.messageSyncCursors[chatScopeKey("channel", scopeId)],
+      state.messageHistory[chatScopeKey("channel", scopeId)],
     );
   } else if (state.activeView === "private" && state.user) {
     const scopeId = String(state.user.id);
@@ -71,6 +76,7 @@ export function cacheVisibleChat(store: AppStore): void {
       scopeId,
       state.privateMessages,
       state.messageSyncCursors[chatScopeKey("private", scopeId)],
+      state.messageHistory[chatScopeKey("private", scopeId)],
     );
   }
 }
@@ -100,6 +106,12 @@ export function restoreCachedChat(
     store.dispatch({
       type: "SET_MESSAGE_SYNC_CURSOR",
       payload: { key, cursor: entry.cursor },
+    });
+  }
+  if (entry.history !== undefined) {
+    store.dispatch({
+      type: "SET_MESSAGE_HISTORY",
+      payload: { key, history: entry.history },
     });
   }
   return true;

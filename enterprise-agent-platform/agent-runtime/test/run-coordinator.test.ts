@@ -2119,6 +2119,34 @@ test("retained run messages redact tool calls and command details without mutati
   assert.match(JSON.stringify(browser), new RegExp(typed));
 });
 
+test("retained mail records omit message bodies while live Agent context remains intact", () => {
+  const body = "confidential mail body that must not enter journals";
+  const assistant = fauxAssistantMessage(fauxToolCall("mail", {
+    action: "send",
+    arguments: {
+      account_id: 1,
+      to: ["recipient@example.com"],
+      subject: "Report",
+      text_body: body,
+    },
+  }), { stopReason: "toolUse" });
+  const result: AgentMessage = {
+    role: "toolResult",
+    toolCallId: "mail-call",
+    toolName: "mail",
+    content: [{ type: "text", text: body }],
+    details: { message: { uid: 7, body } },
+    isError: false,
+    timestamp: Date.now(),
+  };
+
+  const durable = durableRunResultMessages([assistant, result], "/workspace");
+  assert.doesNotMatch(JSON.stringify(durable), new RegExp(body));
+  assert.match(JSON.stringify(durable), /text_body omitted/);
+  assert.match(JSON.stringify(durable), /Mail tool result content omitted/);
+  assert.match(JSON.stringify([assistant, result]), new RegExp(body));
+});
+
 test("Spark receives browser vision text fallback while work records omit the live screenshot", async () => {
   const home = await temporaryDirectory("agent-spark-browser-vision-");
   const workspace = await temporaryDirectory("agent-spark-browser-workspace-");

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
-	"github.com/ubitech/agent-platform/manager/internal/contract"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
 )
 
@@ -35,17 +34,21 @@ type registry struct {
 }
 
 type Manager struct {
-	Engine     driver.Engine
-	DataDir    string
-	StatePath  string
-	Image      string
-	Network    string
-	Idle       time.Duration
-	UID, GID   int
-	mu         sync.Mutex
-	registry   registry
-	ensureMu   sync.Mutex
-	ensureByID map[string]*sync.Mutex
+	Engine    driver.Engine
+	DataDir   string
+	StatePath string
+	Image     string
+	Network   string
+	Idle      time.Duration
+	UID, GID  int
+	// MaintenanceMu serializes lifecycle registration with Manager artifact
+	// cleanup. It is intentionally held only for short Sandbox registry and
+	// container transitions, never for an Agent command's execution lifetime.
+	MaintenanceMu sync.Locker
+	mu            sync.Mutex
+	registry      registry
+	ensureMu      sync.Mutex
+	ensureByID    map[string]*sync.Mutex
 }
 
 func Open(engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
@@ -69,6 +72,8 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	if sandboxID == "" {
 		return driver.SandboxSpec{}, errors.New("sandbox_id is required")
 	}
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 
@@ -159,6 +164,8 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 }
 
 func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -223,6 +230,8 @@ func (m *Manager) Touch(sandboxID string, now time.Time) error {
 }
 
 func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	m.mu.Lock()
 	candidates := make([]Record, 0)
 	for _, record := range m.registry.Records {
@@ -265,6 +274,97 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 	return stopped, nil
 }
 
+// ReconcileImages retires stopped, idle Sandbox containers that still pin an
+// obsolete digest. Persistent workspaces and Agent homes are bind mounts and
+// remain untouched; the next Ensure recreates the ephemeral container from the
+// current digest. Unknown or running containers are retained.
+func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string, error) {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
+	m.mu.Lock()
+	desired := m.Image
+	candidates := make([]Record, 0)
+	for _, record := range m.registry.Records {
+		if desired != "" && record.Image != desired && record.ActiveCalls == 0 && record.BackgroundProcesses == 0 {
+			candidates = append(candidates, record)
+		}
+	}
+	m.mu.Unlock()
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	retirer, ok := m.Engine.(driver.ManagedSandboxRetirer)
+	if !ok {
+		return nil, errors.New("sandbox engine cannot prove stopped-container ownership")
+	}
+	updated := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		select {
+		case <-ctx.Done():
+			return updated, ctx.Err()
+		default:
+		}
+		unlock := m.lockEnsure(candidate.SandboxID)
+		m.mu.Lock()
+		current, exists := m.registry.Records[candidate.SandboxID]
+		desired = m.Image
+		eligible := exists && desired != "" && current.Image != desired && current.ActiveCalls == 0 && current.BackgroundProcesses == 0
+		m.mu.Unlock()
+		if !eligible {
+			unlock()
+			continue
+		}
+		state, err := retirer.InspectManagedSandbox(ctx, current.ContainerName, current.SandboxHash)
+		if err != nil {
+			unlock()
+			return updated, err
+		}
+		if state.Exists && (!state.Owned || state.Running) {
+			unlock()
+			continue
+		}
+		if state.Exists {
+			if err := retirer.RemoveStoppedManagedSandbox(ctx, current.ContainerName, current.SandboxHash); err != nil {
+				unlock()
+				return updated, err
+			}
+		}
+		m.mu.Lock()
+		latest, stillExists := m.registry.Records[candidate.SandboxID]
+		if !stillExists || latest.ActiveCalls != 0 || latest.BackgroundProcesses != 0 || latest.Image == desired {
+			m.mu.Unlock()
+			unlock()
+			continue
+		}
+		original := latest
+		latest.Image = desired
+		if latest.StoppedAt == nil {
+			stoppedAt := now.UTC()
+			latest.StoppedAt = &stoppedAt
+		}
+		m.registry.Records[candidate.SandboxID] = latest
+		persistErr := m.persistLocked()
+		if persistErr != nil {
+			m.registry.Records[candidate.SandboxID] = original
+		}
+		m.mu.Unlock()
+		unlock()
+		if persistErr != nil {
+			return updated, fmt.Errorf("persist refreshed sandbox image: %w", persistErr)
+		}
+		updated = append(updated, candidate.SandboxID)
+	}
+	return updated, nil
+}
+
+func (m *Manager) lockMaintenance() func() {
+	if m.MaintenanceMu == nil {
+		return func() {}
+	}
+	m.MaintenanceMu.Lock()
+	return m.MaintenanceMu.Unlock
+}
+
 func (m *Manager) Spec(sandboxID string) (driver.SandboxSpec, error) {
 	m.mu.Lock()
 	record, ok := m.registry.Records[sandboxID]
@@ -273,44 +373,6 @@ func (m *Manager) Spec(sandboxID string) (driver.SandboxSpec, error) {
 		return driver.SandboxSpec{}, errors.New("sandbox is not registered")
 	}
 	return m.specForRecord(record)
-}
-
-func (m *Manager) ResolvePath(target, sandboxID, value string) (string, error) {
-	spec, err := m.Spec(sandboxID)
-	if err != nil {
-		return "", err
-	}
-	if target == "host" {
-		clean := filepath.Clean(value)
-		for containerPath, hostPath := range map[string]string{contract.ContainerWorkspace: spec.Workspace, contract.ContainerAgentHome: spec.Home, contract.ContainerAgentEnv: spec.Environment} {
-			if clean == containerPath {
-				return hostPath, nil
-			}
-			if strings.HasPrefix(clean, containerPath+"/") {
-				return containedJoin(hostPath, strings.TrimPrefix(clean, containerPath+"/"))
-			}
-		}
-		if filepath.IsAbs(value) {
-			return clean, nil
-		}
-		return containedJoin(spec.Workspace, value)
-	}
-	if target != "sandbox" {
-		return "", errors.New("invalid execution target")
-	}
-	clean := filepath.Clean(value)
-	if !filepath.IsAbs(clean) {
-		return containedJoin(spec.Workspace, clean)
-	}
-	for containerPath, hostPath := range map[string]string{contract.ContainerWorkspace: spec.Workspace, contract.ContainerAgentHome: spec.Home, contract.ContainerAgentEnv: spec.Environment} {
-		if clean == containerPath {
-			return hostPath, nil
-		}
-		if strings.HasPrefix(clean, containerPath+"/") {
-			return containedJoin(hostPath, strings.TrimPrefix(clean, containerPath+"/"))
-		}
-	}
-	return "", errors.New("sandbox file tools can access only persistent mounted paths")
 }
 
 func (m *Manager) Records() []Record {
@@ -510,16 +572,4 @@ func (m *Manager) persistLocked() error { return atomicfile.WriteJSON(m.StatePat
 func stableHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-func containedJoin(root, relative string) (string, error) {
-	clean := filepath.Clean(relative)
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes workspace")
-	}
-	joined := filepath.Join(root, clean)
-	rel, err := filepath.Rel(root, joined)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes workspace")
-	}
-	return joined, nil
 }

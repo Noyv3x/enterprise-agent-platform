@@ -48,9 +48,12 @@ type Orchestrator struct {
 	Sleep                func(context.Context, time.Duration) error
 	PollInterval         time.Duration
 	OnCommit             func(release.Manifest)
+	OnFinalized          func(release.Manifest)
 	PublicProbe          func(context.Context) error
 	LocalActiveProcesses func() int
 	FixedStackMu         sync.Locker
+	MaintenanceMu        sync.Locker
+	ReclaimCapacity      func(context.Context, string, release.Manifest) error
 	mu                   sync.Mutex
 	finalizeMu           sync.Mutex
 	rollbackMu           sync.Mutex
@@ -84,6 +87,8 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	if err != nil {
 		return release.Manifest{}, err
 	}
+	unlockMaintenance := o.lockMaintenanceAdmission()
+	defer unlockMaintenance()
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
 		return release.Manifest{}, err
@@ -100,6 +105,8 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	return manifest, err
 }
 func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, bool, error) {
+	unlockMaintenance := o.lockMaintenanceAdmission()
+	defer unlockMaintenance()
 	o.mu.Lock()
 	op, reused, err := o.Store.Begin(request, o.now())
 	if err != nil || reused {
@@ -145,11 +152,23 @@ func (o *Orchestrator) Await(ctx context.Context, id string) (model.Operation, e
 // are deliberately withheld until the watchdog has committed the candidate
 // binary.
 func (o *Orchestrator) RecoverBeforeActivation(ctx context.Context) error {
+	unlockMaintenance := o.lockMaintenanceAdmission()
+	defer unlockMaintenance()
 	return o.recover(ctx, false, true)
 }
 
 func (o *Orchestrator) Recover(ctx context.Context) error {
+	unlockMaintenance := o.lockMaintenanceAdmission()
+	defer unlockMaintenance()
 	return o.recover(ctx, true, false)
+}
+
+func (o *Orchestrator) lockMaintenanceAdmission() func() {
+	if o.MaintenanceMu == nil {
+		return func() {}
+	}
+	o.MaintenanceMu.Lock()
+	return o.MaintenanceMu.Unlock
 }
 
 func (o *Orchestrator) RecoveryPending() bool {
@@ -266,10 +285,10 @@ func (o *Orchestrator) recoverFinalize(ctx context.Context, state model.ManagerS
 	if err != nil {
 		return err
 	}
-	if err = o.probeCommittedGeneration(ctx, manifest); err != nil {
-		return o.finalizeFailure("committed generation readiness is pending", err)
-	}
 	if !runHooks {
+		if err = o.probeCommittedGeneration(ctx, manifest); err != nil {
+			return o.finalizeFailure("committed generation readiness is pending", err)
+		}
 		return nil
 	}
 	return o.finalizeCommitted(ctx, op, manifest)
@@ -351,6 +370,12 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			return
 		}
 	}
+	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
+		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreDownload, manifest); err != nil {
+			o.failBeforeMaintenanceRetryable(op, err)
+			return
+		}
+	}
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
 		if release.IsTemporarilyUnavailable(err) {
@@ -398,6 +423,12 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, err)
 		return
 	}
+	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
+		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreCutover, manifest); err != nil {
+			o.failBeforeMaintenanceRetryable(op, err)
+			return
+		}
+	}
 	stateBeforeCutover := o.Store.State()
 	freshInstall := op.Kind == model.OperationInstall && stateBeforeCutover.Current == nil
 	if !freshInstall {
@@ -409,6 +440,20 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	if o.FixedStackMu != nil {
 		o.FixedStackMu.Lock()
 		defer o.FixedStackMu.Unlock()
+	}
+	// Platform admission is now quiesced and capability reconciliation is excluded
+	// by FixedStackMu. Re-read both the snapshot sources and ordinary-user
+	// filesystem capacity at this final non-destructive boundary. A shortfall must
+	// release the reservation before the current writer is stopped.
+	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
+		if err = checker.CheckCapacity(ctx, driver.CapacityPreCutover, manifest); err != nil {
+			if freshInstall {
+				o.failBeforeMaintenanceRetryable(op, fmt.Errorf("recheck capacity before fresh-install writer start: %w", err))
+				return
+			}
+			o.failReservedCapacityRecheck(op, err)
+			return
+		}
 	}
 	if freshInstall {
 		if _, err = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "fresh install entering maintenance", o.now()); err != nil {
@@ -491,6 +536,32 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	}
 }
 
+func (o *Orchestrator) checkCapacity(ctx context.Context, checker driver.CapacityChecker, operationID, stage string, manifest release.Manifest) error {
+	err := checker.CheckCapacity(ctx, stage, manifest)
+	if err == nil || !driver.IsInsufficientCapacity(err) || o.ReclaimCapacity == nil {
+		return err
+	}
+	reclaimErr := o.ReclaimCapacity(ctx, operationID, manifest)
+	retryErr := checker.CheckCapacity(ctx, stage, manifest)
+	if retryErr == nil {
+		return nil
+	}
+	if reclaimErr != nil {
+		return errors.Join(retryErr, fmt.Errorf("controlled maintenance before capacity retry: %w", reclaimErr))
+	}
+	return retryErr
+}
+
+func (o *Orchestrator) failReservedCapacityRecheck(op model.Operation, cause error) {
+	released := o.resolveReservationUncertainty(o.Gate, op.ID, fmt.Errorf("recheck capacity after admission reservation: %w", cause))
+	var uncertain *reservationReleaseUncertainError
+	if errors.As(released, &uncertain) {
+		o.failReservation(op, released)
+		return
+	}
+	o.failBeforeMaintenanceRetryable(op, released)
+}
+
 func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation, manifest release.Manifest) error {
 	o.finalizeMu.Lock()
 	defer o.finalizeMu.Unlock()
@@ -524,6 +595,15 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 		if (isGenerationChange || op.Kind == model.OperationRollback) && o.OnCommit != nil {
 			o.OnCommit(manifest)
 		}
+	}
+	// Activation and commit hooks can take long enough for a previously healthy
+	// core container or the public listener to change underneath us. Re-probe at
+	// the final reservation boundary, including crash recovery after the
+	// operation journal was finalized but Manager state was not yet cleared.
+	if err := o.probeCommittedGeneration(ctx, manifest); err != nil {
+		return o.finalizeFailure("final committed generation readiness is pending", err)
+	}
+	if !op.Finalized {
 		// Admission release is the final externally visible hook.
 		if err := o.Gate.Release(ctx, op.ID); err != nil {
 			return o.finalizeFailure("update reservation release is pending", err)
@@ -553,6 +633,9 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	})
 	if err != nil {
 		return err
+	}
+	if o.OnFinalized != nil {
+		o.OnFinalized(manifest)
 	}
 	return nil
 }

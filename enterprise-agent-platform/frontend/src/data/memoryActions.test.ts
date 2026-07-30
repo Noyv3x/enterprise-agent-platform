@@ -1,14 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import {
-  approveAgentMemoryCandidate,
   clearAgentMemories,
   createAgentMemory,
   deleteAgentMemory,
   exportAgentMemories,
   loadAgentMemories,
-  loadAgentMemoryCandidates,
-  rejectAgentMemoryCandidate,
   updateAgentMemory,
 } from "./memoryActions";
 
@@ -58,26 +55,4 @@ describe("memory actions", () => {
     expect(apiMock).toHaveBeenNthCalledWith(5, "/api/private-agent/memories/export");
   });
 
-  it("loads and decides pending memory candidates", async () => {
-    const controller = new AbortController();
-    await loadAgentMemoryCandidates(controller.signal);
-    await approveAgentMemoryCandidate(7);
-    await rejectAgentMemoryCandidate(8);
-
-    expect(apiMock).toHaveBeenNthCalledWith(
-      1,
-      "/api/private-agent/memory-candidates?status=pending&limit=200",
-      { signal: controller.signal },
-    );
-    expect(apiMock).toHaveBeenNthCalledWith(
-      2,
-      "/api/private-agent/memory-candidates/7/approve",
-      { method: "POST" },
-    );
-    expect(apiMock).toHaveBeenNthCalledWith(
-      3,
-      "/api/private-agent/memory-candidates/8/reject",
-      { method: "POST" },
-    );
-  });
 });

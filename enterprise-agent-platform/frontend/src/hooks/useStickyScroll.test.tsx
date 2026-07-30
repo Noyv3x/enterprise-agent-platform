@@ -14,14 +14,16 @@ function StickyHarness({
   count = 1,
   force = 0,
   revision,
+  prepend = 0,
 }: {
   scope?: string;
   count?: number;
   force?: number;
   revision?: number;
+  prepend?: number;
 }) {
   const ref = createRef<HTMLDivElement>();
-  const state = useStickyScroll(ref, scope, force, count, revision ?? count);
+  const state = useStickyScroll(ref, scope, force, count, revision ?? count, prepend);
   return (
     <div>
       <div ref={ref} data-testid="scroller" />
@@ -92,6 +94,21 @@ describe("useStickyScroll", () => {
 
     view.rerender(<StickyHarness revision={20} />);
     expect(scroller.scrollTop).toBe(1_100);
+  });
+
+  it("preserves the viewport anchor and unread count when older rows are prepended", () => {
+    const view = render(<StickyHarness count={2} />);
+    const scroller = screen.getByTestId("scroller");
+    setScrollGeometry(scroller);
+    fireEvent.scroll(scroller);
+    expect(screen.getByTestId("unread")).toHaveTextContent("0");
+
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_200 });
+    view.rerender(<StickyHarness count={4} prepend={1} />);
+
+    expect(scroller.scrollTop).toBe(500);
+    expect(screen.getByTestId("position")).toHaveTextContent("away");
+    expect(screen.getByTestId("unread")).toHaveTextContent("0");
   });
 });
 

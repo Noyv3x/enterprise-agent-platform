@@ -3,8 +3,6 @@ import { endpoints } from "../lib/endpoints";
 import type {
   AgentMemoriesExportResponse,
   AgentMemoriesResponse,
-  AgentMemoryCandidateDecisionResponse,
-  AgentMemoryCandidatesResponse,
   AgentMemoryMutationRequest,
   AgentMemoryMutationResponse,
   AgentMemoryTarget,
@@ -13,7 +11,6 @@ import type {
 } from "../types";
 
 const DEFAULT_MEMORY_LIMIT = 500;
-const DEFAULT_CANDIDATE_LIMIT = 200;
 
 export function loadAgentMemories(
   target: AgentMemoryTarget,
@@ -56,22 +53,4 @@ export function clearAgentMemories(
 
 export function exportAgentMemories(): Promise<AgentMemoriesExportResponse> {
   return api(endpoints.exportPrivateAgentMemories.path());
-}
-
-export function loadAgentMemoryCandidates(
-  signal?: AbortSignal,
-): Promise<AgentMemoryCandidatesResponse> {
-  return api(endpoints.privateAgentMemoryCandidates.path("pending", DEFAULT_CANDIDATE_LIMIT), { signal });
-}
-
-export function approveAgentMemoryCandidate(
-  id: Id,
-): Promise<AgentMemoryCandidateDecisionResponse> {
-  return api(endpoints.approvePrivateAgentMemoryCandidate.path(id), { method: "POST" });
-}
-
-export function rejectAgentMemoryCandidate(
-  id: Id,
-): Promise<AgentMemoryCandidateDecisionResponse> {
-  return api(endpoints.rejectPrivateAgentMemoryCandidate.path(id), { method: "POST" });
 }

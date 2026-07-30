@@ -91,6 +91,41 @@ export const workspaceMessages = defineMessages({
     en: "Password updated",
     "zh-TW": "密碼已更新",
   },
+  "notifications.settings.title": {
+    "zh-CN": "浏览器通知",
+    en: "Browser notifications",
+    "zh-TW": "瀏覽器通知",
+  },
+  "notifications.settings.replyComplete": {
+    "zh-CN": "Agent 回复完成",
+    en: "Agent reply completed",
+    "zh-TW": "Agent 回覆完成",
+  },
+  "notifications.settings.description": {
+    "zh-CN": "页面保持打开时，如果你切到其它页面，Agent 回复完成后会弹出系统通知。",
+    en: "While this page remains open, show a system notification when an Agent finishes replying in the background.",
+    "zh-TW": "頁面保持開啟時，若你切換到其他頁面，Agent 回覆完成後會顯示系統通知。",
+  },
+  "notifications.settings.unsupported": {
+    "zh-CN": "当前浏览器或连接不支持系统通知；请使用 HTTPS 访问。",
+    en: "System notifications are unavailable in this browser or connection. Use HTTPS.",
+    "zh-TW": "目前瀏覽器或連線不支援系統通知；請使用 HTTPS 存取。",
+  },
+  "notifications.settings.denied": {
+    "zh-CN": "浏览器已阻止通知，请在浏览器站点设置中重新允许。",
+    en: "Notifications are blocked. Allow them again in your browser's site settings.",
+    "zh-TW": "瀏覽器已封鎖通知，請在瀏覽器網站設定中重新允許。",
+  },
+  "notifications.reply.title": {
+    "zh-CN": "ubitech agent 已回复",
+    en: "ubitech agent replied",
+    "zh-TW": "ubitech agent 已回覆",
+  },
+  "notifications.reply.body": {
+    "zh-CN": "点击返回对话查看回复。",
+    en: "Open the conversation to view the reply.",
+    "zh-TW": "點擊返回對話查看回覆。",
+  },
 
   "knowledge.viewDocument": { "zh-CN": "查看正文", en: "View document", "zh-TW": "檢視正文" },
   "knowledge.documentRegion": { "zh-CN": "文档正文", en: "Document content", "zh-TW": "文件正文" },

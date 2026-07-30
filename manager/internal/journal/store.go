@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -216,6 +217,50 @@ func (s *Store) Operation(id string) (model.Operation, error) {
 		return model.Operation{}, err
 	}
 	return BoundOperation(op), nil
+}
+
+// UnfinishedOperations returns every durable operation that could still own a
+// candidate, snapshot, reservation, or recovery action. Maintenance treats an
+// unreadable or unknown journal entry as a hard stop rather than guessing that
+// its resources are unreachable.
+func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.operations)
+	if err != nil {
+		return nil, err
+	}
+	unfinished := make([]model.Operation, 0)
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil, fmt.Errorf("unknown operation journal entry %s", entry.Name())
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if !validID(id) {
+			return nil, fmt.Errorf("invalid operation journal entry %s", entry.Name())
+		}
+		op, err := s.readOperationLocked(id)
+		if err != nil {
+			return nil, err
+		}
+		if op.ID != id || op.SchemaVersion != 1 {
+			return nil, fmt.Errorf("operation journal identity mismatch for %s", entry.Name())
+		}
+		switch op.Status {
+		case model.OperationPending, model.OperationRunning:
+			unfinished = append(unfinished, BoundOperation(op))
+		case model.OperationSucceeded, model.OperationFailed:
+			if !op.Finalized {
+				unfinished = append(unfinished, BoundOperation(op))
+			}
+		default:
+			return nil, fmt.Errorf("operation journal %s has unknown status %q", entry.Name(), op.Status)
+		}
+	}
+	sort.Slice(unfinished, func(left, right int) bool {
+		return unfinished[left].CreatedAt.Before(unfinished[right].CreatedAt)
+	})
+	return unfinished, nil
 }
 
 func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.PublicState, maintenance bool, note string, now time.Time) (model.Operation, error) {

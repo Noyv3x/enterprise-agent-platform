@@ -322,6 +322,29 @@
   -webkit-user-drag: none;
 }
 
+.browser-preview__screen.is-controlling {
+  cursor: crosshair;
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -2px;
+}
+
+.browser-preview__screen.is-controlling:focus-visible {
+  box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.browser-preview__controls {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.browser-preview__text-control {
+  min-width: min(100%, 280px);
+  flex: 1 1 280px;
+}
+
 .browser-preview__screen .eap-empty-state__copy > * {
   color: hsl(220 8% 66%);
 }

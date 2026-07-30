@@ -54,8 +54,8 @@ class DocsSyncTests(unittest.TestCase):
     @staticmethod
     def manifest() -> dict[str, object]:
         return {
-            "version": 2,
-            "forbidden_top_level_files": ["AGENTS.md", "CLAUDE.md"],
+            "version": 3,
+            "forbidden_top_level_files": ["CLAUDE.md"],
             "coverage": {
                 "code_include": [
                     ".gitignore",
@@ -254,6 +254,20 @@ class DocsSyncTests(unittest.TestCase):
                     "execution_targets": ["sandbox", "host"],
                     "sandbox_idle_seconds": 1800,
                     "migration_backup_retention_seconds": 604800,
+                    "obsolete_artifact_retention_seconds": 3600,
+                    "update_pre_download_min_free_bytes": 8589934592,
+                    "update_pre_cutover_min_free_bytes": 2147483648,
+                    "update_min_free_inodes": 4096,
+                    "update_core_image_capacity_estimates": {
+                        "platform": {
+                            "compressed_bytes": 8589934592,
+                            "unpacked_bytes": 17179869184,
+                        },
+                        "agent-runtime": {
+                            "compressed_bytes": 4294967296,
+                            "unpacked_bytes": 8589934592,
+                        },
+                    },
                     "public_update_states": [
                         "idle",
                         "waiting_for_tasks",
@@ -373,10 +387,10 @@ class DocsSyncTests(unittest.TestCase):
         self.write_fixture()
         self.run_command("sync", expect=0)
 
-        (self.root / "AGENTS.md").write_text("forbidden\n", encoding="utf-8")
+        (self.root / "CLAUDE.md").write_text("forbidden\n", encoding="utf-8")
         forbidden = self.run_command("check", expect=1)
         self.assertIn("top-level instruction file is forbidden", forbidden.stderr)
-        (self.root / "AGENTS.md").unlink()
+        (self.root / "CLAUDE.md").unlink()
 
         feature = self.root / "docs/design/feature.md"
         feature.write_text("# Feature\n\n[Missing](missing.md)\n", encoding="utf-8")
@@ -396,13 +410,13 @@ class DocsSyncTests(unittest.TestCase):
         self.initialize_git()
         self.write_fixture()
         manifest = self.manifest()
-        manifest["forbidden_top_level_files"] = ["CLAUDE.md"]
+        manifest["forbidden_top_level_files"] = ["OTHER.md"]
         (self.root / "docs/domains.json").write_text(
             json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
         )
         result = self.run_command("sync", expect=1)
-        self.assertIn("must permanently forbid: agents.md", result.stderr)
+        self.assertIn("must permanently forbid: claude.md", result.stderr)
 
     def test_check_rejects_invalid_contract_bounds(self) -> None:
         self.initialize_git()
@@ -415,6 +429,21 @@ class DocsSyncTests(unittest.TestCase):
         )
         result = self.run_command("sync", expect=1)
         self.assertIn("0 <= minimum <= default <= maximum", result.stderr)
+
+    def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/container-platform.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        del contract["update_core_image_capacity_estimates"]["agent-runtime"][
+            "unpacked_bytes"
+        ]
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        result = self.run_command("sync", expect=1)
+        self.assertIn(
+            "must contain exactly compressed_bytes and unpacked_bytes",
+            result.stderr,
+        )
 
     def test_check_change_requires_documentation_for_code(self) -> None:
         base = self.ready_repository()
@@ -521,9 +550,9 @@ class DocsSyncTests(unittest.TestCase):
 
     def test_index_check_reads_staged_forbidden_file_after_worktree_deletion(self) -> None:
         base = self.ready_repository()
-        forbidden = self.root / "AGENTS.md"
+        forbidden = self.root / "CLAUDE.md"
         forbidden.write_text("staged forbidden instructions\n", encoding="utf-8")
-        self.git("add", "AGENTS.md")
+        self.git("add", "CLAUDE.md")
         forbidden.unlink()
 
         result = self.run_command(

@@ -38,11 +38,14 @@ export function useStickyScroll(
   forceBottomToken: number,
   itemCount: number,
   contentRevision: number = itemCount,
+  prependVersion: number = 0,
 ): StickyScrollState {
   const nearBottom = useRef(true);
   const prevScope = useRef(scopeKey);
   const prevForce = useRef(forceBottomToken);
   const prevItemCount = useRef(itemCount);
+  const prevPrependVersion = useRef(prependVersion);
+  const previousGeometry = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
 
@@ -73,6 +76,10 @@ export function useStickyScroll(
     const onScroll = () => {
       const nextAtBottom = isNearBottom(element);
       nearBottom.current = nextAtBottom;
+      previousGeometry.current = {
+        scrollHeight: element.scrollHeight,
+        scrollTop: element.scrollTop,
+      };
       setAtBottom((current) => (current === nextAtBottom ? current : nextAtBottom));
       if (nextAtBottom) setUnreadCount((current) => (current ? 0 : current));
     };
@@ -86,18 +93,32 @@ export function useStickyScroll(
     if (!element) return;
     const scopeChanged = prevScope.current !== scopeKey;
     const forced = prevForce.current !== forceBottomToken;
+    const prepended = prevPrependVersion.current !== prependVersion;
     const addedItems = Math.max(0, itemCount - prevItemCount.current);
+    const geometry = previousGeometry.current;
     prevScope.current = scopeKey;
     prevForce.current = forceBottomToken;
     prevItemCount.current = itemCount;
+    prevPrependVersion.current = prependVersion;
 
-    if (forced || scopeChanged || nearBottom.current) {
+    if (prepended && geometry && !scopeChanged && !forced) {
+      const addedHeight = Math.max(0, element.scrollHeight - geometry.scrollHeight);
+      element.scrollTop = geometry.scrollTop + addedHeight;
+      const nextAtBottom = isNearBottom(element);
+      nearBottom.current = nextAtBottom;
+      setAtBottom(nextAtBottom);
+      // Loading earlier rows is not a new-message event; preserve unreadCount.
+    } else if (forced || scopeChanged || nearBottom.current) {
       element.scrollTop = element.scrollHeight;
       settleAtBottom();
     } else if (addedItems > 0) {
       setUnreadCount((current) => current + addedItems);
     }
-  }, [contentRevision, forceBottomToken, itemCount, ref, scopeKey, settleAtBottom]);
+    previousGeometry.current = {
+      scrollHeight: element.scrollHeight,
+      scrollTop: element.scrollTop,
+    };
+  }, [contentRevision, forceBottomToken, itemCount, prependVersion, ref, scopeKey, settleAtBottom]);
 
   return { atBottom, unreadCount, scrollToBottom };
 }

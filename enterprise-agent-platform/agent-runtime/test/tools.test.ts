@@ -11,7 +11,7 @@ test("tool policy blocks obvious catastrophic host commands", async () => {
   assert.match((await classifyToolCall("terminal", { command: "curl http://169.254.169.254/latest/meta-data" })).hardBlock || "", /metadata/);
 });
 
-test("tool policy requires approval for host commands and mutations", async () => {
+test("tool policy requires approval for local execution and explicit business mutations", async () => {
   const workspace = await temporaryDirectory("agent-tool-policy-");
   try {
     assert.ok((await classifyToolCall("write_file", { path: "a" }, workspace)).approvalReason);
@@ -19,7 +19,7 @@ test("tool policy requires approval for host commands and mutations", async () =
     assert.ok((await classifyToolCall("terminal", { command: "python3 -c 'import shutil; shutil.rmtree(chr(47))'" }, workspace)).approvalReason);
     assert.ok((await classifyToolCall("read_file", { path: "/tmp/a" }, workspace)).approvalReason);
     assert.ok((await classifyToolCall("write_file", { path: "/tmp/a" }, workspace)).approvalReason);
-    assert.ok((await classifyToolCall("memory", { action: "store" }, workspace)).approvalReason);
+    assert.deepEqual(await classifyToolCall("memory", { action: "store" }, workspace), {});
     assert.ok((await classifyToolCall("browser", { action: "click", tab_id: "tab" }, workspace)).approvalReason);
     assert.ok((await classifyToolCall("browser", { action: "cleanup" }, workspace)).approvalReason);
     assert.deepEqual(await classifyToolCall("browser", { action: "snapshot", tab_id: "tab" }, workspace), {});
@@ -29,6 +29,54 @@ test("tool policy requires approval for host commands and mutations", async () =
     );
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("managed terminal policy auto-allows sandbox and requires one-shot host approval", async () => {
+  const sandbox = await classifyToolCall(
+    "terminal",
+    { command: "printf sandbox" },
+    "/workspace",
+    12_345,
+    true,
+  );
+  assert.equal(sandbox.approvalReason, undefined);
+  assert.equal(sandbox.executionTarget, "sandbox");
+  assert.equal(sandbox.displayArguments?.target, "sandbox");
+
+  const host = await classifyToolCall(
+    "terminal",
+    { target: "host", command: "printf host" },
+    "/workspace",
+    12_345,
+    true,
+  );
+  assert.equal(host.approvalReason, "Run this command on the host");
+  assert.equal(host.allowSession, false);
+  assert.equal(host.allowPermanent, false);
+  assert.equal(host.executionTarget, "host");
+  assert.equal(host.displayArguments?.target, "host");
+});
+
+test("managed file and process policy auto-allows sandbox and requires one-shot host approval", async () => {
+  for (const [tool, sandboxArgs, hostArgs] of [
+    ["read_file", { path: "note.txt" }, { target: "host", path: "/tmp/note.txt" }],
+    ["write_file", { path: "note.txt", content: "ok" }, { target: "host", path: "/tmp/note.txt", content: "ok" }],
+    ["search_files", { path: ".", query: "ok" }, { target: "host", path: "/tmp", query: "ok" }],
+    ["process", { action: "list" }, { target: "host", action: "list" }],
+    ["process", { action: "kill", process_id: "process-1" }, { target: "host", action: "kill", process_id: "process-1" }],
+  ] as const) {
+    const sandbox = await classifyToolCall(tool, sandboxArgs, "/workspace", 12_345, true);
+    assert.equal(sandbox.approvalReason, undefined, `${tool} sandbox call must not request approval`);
+    assert.equal(sandbox.executionTarget, "sandbox");
+
+    const host = await classifyToolCall(tool, hostArgs, "/workspace", 12_345, true);
+    assert.ok(host.approvalReason, `${tool} host call must request approval`);
+    assert.ok(host.approvalKey, `${tool} host call must bind an approval key`);
+    assert.equal(host.allowSession, false);
+    assert.equal(host.allowPermanent, false);
+    assert.equal(host.executionTarget, "host");
+    assert.equal(host.displayArguments?.target, "host");
   }
 });
 
@@ -263,6 +311,116 @@ test("schedule tool forwards strict arguments and marks only mutations as side e
   ]);
 });
 
+test("mail schema is private-only, strict, and requires one-shot approval for mutations", async () => {
+  const makeTools = (scope_key: string, metadata: Record<string, unknown> = {}) => createTools({
+    runId: "run-mail",
+    request: { scope_key, metadata } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const mail = makeTools("private:1").find((tool) => tool.name === "mail");
+  assert.ok(mail);
+  assert.equal(makeTools("channel:1:main-agent").some((tool) => tool.name === "mail"), false);
+  const schema = JSON.stringify(mail.parameters);
+  for (const action of ["accounts", "folders", "search", "read", "send", "reply", "move", "mark", "save_attachment"]) {
+    assert.match(schema, new RegExp(`"const":"${action}"`));
+  }
+  for (const forbidden of ["password", "credential", "owner_user_id", "scope_key"]) {
+    assert.doesNotMatch(schema, new RegExp(`"${forbidden}"`));
+  }
+  assert.equal(collectObjectSchemas(mail.parameters).every((entry) => entry.additionalProperties === false), true);
+
+  for (const action of ["accounts", "folders", "search", "read"]) {
+    assert.deepEqual(await classifyToolCall("mail", { action, arguments: {} }), {});
+  }
+  for (const action of ["send", "reply", "move", "mark", "save_attachment"]) {
+    const policy = await classifyToolCall("mail", {
+      action,
+      arguments: { account_id: 1, text_body: "safe body" },
+    });
+    assert.equal(policy.approvalReason, "Perform this external mail operation");
+    assert.equal(policy.allowSession, false);
+    assert.equal(policy.allowPermanent, false);
+    assert.match(policy.approvalKey || "", /^v2:mail:/);
+    assert.doesNotMatch(JSON.stringify(policy.displayArguments), /safe body/);
+    if (action === "send" || action === "reply") {
+      assert.match(JSON.stringify(policy.displayArguments), /text_body omitted/);
+    }
+  }
+  const firstBody = await classifyToolCall("mail", {
+    action: "send",
+    arguments: { account_id: 1, text_body: "first private body" },
+  });
+  const secondBody = await classifyToolCall("mail", {
+    action: "send",
+    arguments: { account_id: 1, text_body: "second private body" },
+  });
+  assert.notEqual(firstBody.approvalKey, secondBody.approvalKey);
+  assert.doesNotMatch(JSON.stringify(firstBody.displayArguments), /first private body/);
+  const blocked = await classifyToolCall("mail", {
+    action: "send",
+    arguments: { account_id: 1, password: "must-not-pass" },
+  });
+  assert.match(blocked.hardBlock || "", /trusted run context/);
+});
+
+test("mail forwards tool-call id, frames untrusted results, and blocks unattended mutations", async () => {
+  const invocations: Array<Record<string, unknown>> = [];
+  let sideEffects = 0;
+  const mailFor = (metadata: Record<string, unknown> = {}) => createTools({
+    runId: "run-mail",
+    request: { scope_key: "private:1", metadata } as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async (...args: unknown[]) => {
+        invocations.push({
+          tool: args[2], action: args[3], arguments: args[4], toolCallId: args[6],
+        });
+        return { content: "Subject: untrusted", data: { ok: true } };
+      },
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => { sideEffects += 1; },
+  }).find((tool) => tool.name === "mail")!;
+
+  const read = await mailFor().execute("call-read", {
+    action: "read",
+    arguments: { account_id: 1, folder: "INBOX", uid: 9 },
+  }, undefined);
+  await mailFor().execute("call-send", {
+    action: "send",
+    arguments: {
+      account_id: 1,
+      to: ["recipient@example.com"],
+      subject: "Hello",
+      text_body: "Body",
+    },
+  }, undefined);
+  assert.equal(sideEffects, 1);
+  assert.deepEqual(invocations.map((item) => item.toolCallId), ["call-read", "call-send"]);
+  assert.match(
+    read.content.map((block) => block.type === "text" ? block.text : "").join("\n"),
+    /untrusted_tool_result/,
+  );
+
+  await assert.rejects(
+    mailFor({ trigger: "email", unattended: true }).execute("blocked-send", {
+      action: "send",
+      arguments: {
+        account_id: 1,
+        to: ["recipient@example.com"],
+        subject: "Blocked",
+        text_body: "Body",
+      },
+    }, undefined),
+    /can only read mail/,
+  );
+});
+
 test("skill schema strictly describes progressively loaded skill actions and bounds", () => {
   const skill = createTools({
     runId: "run",
@@ -488,7 +646,7 @@ test("skill serializes mutations while permitting read requests to overlap", asy
   assert.equal(maximumMutations, 1);
 });
 
-test("memory schema strictly describes committed-memory and candidate actions", () => {
+test("memory schema strictly describes automatic durable-memory actions", () => {
   const memory = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
@@ -500,13 +658,14 @@ test("memory schema strictly describes committed-memory and candidate actions", 
   }).find((tool) => tool.name === "memory");
   assert.ok(memory);
   const schema = JSON.stringify(memory.parameters);
-  for (const action of ["search", "read", "list", "store", "replace", "forget", "clear", "propose"]) {
+  for (const action of ["search", "read", "list", "store", "replace", "forget", "clear"]) {
     assert.match(schema, new RegExp(`"const":"${action}"`));
   }
-  for (const field of ["query", "id", "content", "target", "tags", "category"]) {
+  for (const field of ["query", "id", "content", "target", "tags"]) {
     assert.match(schema, new RegExp(`"${field}"`));
   }
-  assert.match(schema, /"const":"stable_fact"/);
+  assert.doesNotMatch(schema, /"const":"propose"/);
+  assert.doesNotMatch(schema, /"category"/);
   for (const forbidden of ["owner_user_id", "source_run_id", "source_message_id", "operations"]) {
     assert.doesNotMatch(schema, new RegExp(`"${forbidden}"`));
   }
@@ -563,7 +722,7 @@ test("session, knowledge, and web schemas expose only current actions and argume
   }
 });
 
-test("memory propose is approval-free but hard-limited to top-level interactive private runs", async () => {
+test("memory mutations are approval-free but hard-limited to top-level interactive private runs", async () => {
   const invocations: Array<{ action: string; arguments_: Record<string, unknown> }> = [];
   let sideEffects = 0;
   const memoryFor = (scope_key: string, metadata: Record<string, unknown> = {}) => createTools({
@@ -586,21 +745,20 @@ test("memory propose is approval-free but hard-limited to top-level interactive 
     delegate: async () => "",
     markSideEffect: () => { sideEffects += 1; },
   }).find((tool) => tool.name === "memory")!;
-  const proposal = {
-    action: "propose" as const,
+  const mutation = {
+    action: "store" as const,
     arguments: {
-      category: "preference" as const,
       target: "user" as const,
       content: "Prefer concise replies",
       tags: ["format"],
     },
   };
 
-  assert.deepEqual(await classifyToolCall("memory", proposal), {});
-  await memoryFor("private:1").execute("call", proposal, undefined);
+  assert.deepEqual(await classifyToolCall("memory", mutation), {});
+  await memoryFor("private:1").execute("call", mutation, undefined);
   assert.deepEqual(invocations, [{
-    action: "propose",
-    arguments_: proposal.arguments,
+    action: "store",
+    arguments_: mutation.arguments,
   }]);
   assert.equal(sideEffects, 1);
   for (const memory of [
@@ -609,7 +767,7 @@ test("memory propose is approval-free but hard-limited to top-level interactive 
     memoryFor("private:1", { trigger: "scheduled" }),
     memoryFor("private:1", { unattended: true }),
   ]) {
-    await assert.rejects(memory.execute("call", proposal, undefined), /top-level interactive private/);
+    await assert.rejects(memory.execute("call", mutation, undefined), /top-level interactive private/);
   }
   assert.equal(sideEffects, 1);
 });

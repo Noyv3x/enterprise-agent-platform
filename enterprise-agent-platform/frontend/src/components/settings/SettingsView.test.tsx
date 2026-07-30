@@ -85,7 +85,7 @@ describe("SettingsView dirty forms", () => {
     expect(update).toBeEnabled();
     await userEventApi.click(update);
 
-    expect(screen.getByRole("alert")).toHaveTextContent("The new passwords do not match");
+    expect(screen.getByText("The new passwords do not match")).toBeVisible();
     expect(accountActions.changePassword).not.toHaveBeenCalled();
   });
 

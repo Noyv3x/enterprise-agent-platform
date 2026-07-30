@@ -9,7 +9,10 @@ import os
 import re
 import shutil
 import signal
+import socket
+import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -20,15 +23,28 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Callable
 
 from .config import PlatformConfig
-from .service import BOOTSTRAP_ADMIN_PASSWORD_FILE, EnterpriseService, ServiceError, UploadedFile, is_safe_inline_attachment_mime
+from .service import (
+    BOOTSTRAP_ADMIN_PASSWORD_FILE,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_PER_MESSAGE,
+    MAX_ATTACHMENTS_TOTAL_BYTES,
+    EnterpriseService,
+    ServiceError,
+    UploadedFile,
+    is_safe_inline_attachment_mime,
+)
+from .secure_fs import ensure_private_directory
 
 
 COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
-MAX_UPLOAD_BODY_BYTES = 55 * 1024 * 1024
+# Attachment bytes are bounded independently by the service. Keep a small,
+# bounded allowance for multipart headers, boundaries, and the message text so
+# the HTTP envelope does not reject a valid multi-file payload first.
+MAX_UPLOAD_BODY_BYTES = MAX_ATTACHMENTS_TOTAL_BYTES + 1024 * 1024
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Server-sent events: how often the stream checks for scope changes, and the
 # max lifetime of one connection before the browser's EventSource reconnects.
@@ -70,6 +86,244 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 MAX_CONCURRENT_REQUESTS = _env_int("ENTERPRISE_MAX_CONCURRENT_REQUESTS", 64)
 MAX_CONCURRENT_SSE_STREAMS = _env_int("ENTERPRISE_MAX_SSE_STREAMS", 256)
 MAX_SSE_STREAMS_PER_USER = _env_int("ENTERPRISE_MAX_SSE_STREAMS_PER_USER", 4)
+MAX_CONCURRENT_UPLOADS = _env_int("ENTERPRISE_MAX_CONCURRENT_UPLOADS", 4)
+UPLOAD_IDLE_TIMEOUT_SECONDS = _env_int("ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS", 120)
+UPLOAD_STREAM_CHUNK_BYTES = 64 * 1024
+MAX_MULTIPART_HEADER_BYTES = 64 * 1024
+MAX_MULTIPART_BOUNDARY_BYTES = 200
+MAX_MULTIPART_EPILOGUE_BYTES = 1024
+
+
+class _BoundedMultipartInput:
+    """Incrementally consume one Content-Length-bounded multipart body."""
+
+    def __init__(self, source: BinaryIO, length: int, boundary: bytes):
+        self._source = source
+        self._remaining = int(length)
+        self._buffer = bytearray()
+        self._part_marker = b"\r\n--" + boundary
+
+    def _fill(self) -> None:
+        if self._remaining <= 0:
+            raise ServiceError(400, "incomplete multipart body")
+        chunk = self._source.read(min(UPLOAD_STREAM_CHUNK_BYTES, self._remaining))
+        if not chunk:
+            raise ServiceError(400, "incomplete multipart body")
+        if len(chunk) > self._remaining:
+            raise ServiceError(400, "invalid multipart body length")
+        self._remaining -= len(chunk)
+        self._buffer.extend(chunk)
+
+    def take_exact(self, size: int) -> bytes:
+        while len(self._buffer) < size:
+            self._fill()
+        value = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return value
+
+    def take_until(self, marker: bytes, *, limit: int) -> bytes:
+        while True:
+            index = self._buffer.find(marker)
+            if index >= 0:
+                if index > limit:
+                    raise ServiceError(400, "multipart part headers are too large")
+                value = bytes(self._buffer[:index])
+                del self._buffer[: index + len(marker)]
+                return value
+            if len(self._buffer) > limit + len(marker):
+                raise ServiceError(400, "multipart part headers are too large")
+            self._fill()
+
+    def stream_part(self, writer: Callable[[bytes], None]) -> bool:
+        """Write one part body and return True for the final boundary."""
+
+        while True:
+            search_from = 0
+            while True:
+                index = self._buffer.find(self._part_marker, search_from)
+                if index < 0:
+                    break
+                suffix_offset = index + len(self._part_marker)
+                while len(self._buffer) < suffix_offset + 2 and self._remaining > 0:
+                    self._fill()
+                if len(self._buffer) < suffix_offset + 2:
+                    raise ServiceError(400, "incomplete multipart boundary")
+                suffix = bytes(self._buffer[suffix_offset : suffix_offset + 2])
+                suffix_is_valid = suffix == b"\r\n"
+                if suffix == b"--":
+                    while len(self._buffer) < suffix_offset + 4 and self._remaining > 0:
+                        self._fill()
+                    after_close = bytes(self._buffer[suffix_offset + 2 : suffix_offset + 4])
+                    suffix_is_valid = after_close in {b"", b"\r\n"}
+                if suffix_is_valid:
+                    if index:
+                        writer(bytes(self._buffer[:index]))
+                    del self._buffer[: suffix_offset + 2]
+                    return suffix == b"--"
+                search_from = index + 1
+
+            # Retain only enough bytes to recognize a marker split across two
+            # socket reads. Everything before that tail is definitively payload.
+            retain = len(self._part_marker) + 2
+            flush_bytes = len(self._buffer) - retain
+            if flush_bytes > 0:
+                writer(bytes(self._buffer[:flush_bytes]))
+                del self._buffer[:flush_bytes]
+            if self._remaining <= 0:
+                raise ServiceError(400, "multipart closing boundary is missing")
+            self._fill()
+
+    def finish(self) -> None:
+        epilogue_bytes = 0
+        whitespace = frozenset(b" \t\r\n")
+        while self._buffer or self._remaining:
+            if not self._buffer:
+                self._fill()
+            chunk = bytes(self._buffer)
+            self._buffer.clear()
+            epilogue_bytes += len(chunk)
+            if epilogue_bytes > MAX_MULTIPART_EPILOGUE_BYTES or any(
+                byte not in whitespace for byte in chunk
+            ):
+                raise ServiceError(400, "invalid multipart epilogue")
+
+
+def _multipart_boundary(content_type: str) -> bytes:
+    if "\r" in content_type or "\n" in content_type:
+        raise ServiceError(400, "invalid multipart Content-Type")
+    try:
+        header = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode("latin-1")
+        )
+        boundary_text = header.get_boundary() or ""
+        boundary = boundary_text.encode("ascii")
+    except (UnicodeEncodeError, UnicodeDecodeError, ValueError) as exc:
+        raise ServiceError(400, "invalid multipart boundary") from exc
+    if not boundary or len(boundary) > MAX_MULTIPART_BOUNDARY_BYTES:
+        raise ServiceError(400, "invalid multipart boundary")
+    if any(byte < 0x20 or byte >= 0x7F for byte in boundary):
+        raise ServiceError(400, "invalid multipart boundary")
+    return boundary
+
+
+def _remove_upload_staging_path(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _parse_multipart_upload(
+    source: BinaryIO,
+    *,
+    length: int,
+    content_type: str,
+    staging_root: Path,
+) -> tuple[str, list[UploadedFile], Path]:
+    """Parse multipart form data with bounded memory and disk-backed files."""
+
+    if length <= 0:
+        raise ServiceError(400, "multipart body is empty")
+    boundary = _multipart_boundary(content_type)
+    root = ensure_private_directory(staging_root)
+    request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=root))
+    request_dir.chmod(0o700)
+    reader = _BoundedMultipartInput(source, length, boundary)
+    attachments: list[UploadedFile] = []
+    content = ""
+    declared_files = 0
+    try:
+        opening = b"--" + boundary + b"\r\n"
+        if reader.take_exact(len(opening)) != opening:
+            raise ServiceError(400, "invalid multipart opening boundary")
+
+        final_boundary = False
+        while not final_boundary:
+            header_bytes = reader.take_until(b"\r\n\r\n", limit=MAX_MULTIPART_HEADER_BYTES)
+            try:
+                part = BytesParser(policy=policy.default).parsebytes(
+                    header_bytes + b"\r\n\r\n"
+                )
+            except Exception as exc:
+                raise ServiceError(400, "invalid multipart part headers") from exc
+            if part.defects:
+                raise ServiceError(400, "invalid multipart part headers")
+            transfer_encoding = str(part.get("Content-Transfer-Encoding") or "").strip().lower()
+            if transfer_encoding not in {"", "7bit", "8bit", "binary"}:
+                raise ServiceError(400, "encoded multipart file parts are not supported")
+
+            disposition = part.get_content_disposition()
+            name = part.get_param("name", header="content-disposition")
+            filename = part.get_filename()
+            if disposition in {"form-data", "attachment", "inline"} and filename is not None:
+                declared_files += 1
+                if declared_files > MAX_ATTACHMENTS_PER_MESSAGE:
+                    raise ServiceError(400, f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed")
+                staged_path = request_dir / f"part-{declared_files:04d}"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(str(staged_path), flags, 0o600)
+                size_bytes = 0
+                digest = hashlib.sha256()
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        def write_file(chunk: bytes) -> None:
+                            nonlocal size_bytes
+                            if size_bytes + len(chunk) > MAX_ATTACHMENT_BYTES:
+                                raise ServiceError(
+                                    413,
+                                    f"attachment exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB",
+                                )
+                            handle.write(chunk)
+                            digest.update(chunk)
+                            size_bytes += len(chunk)
+
+                        final_boundary = reader.stream_part(write_file)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except BaseException:
+                    staged_path.unlink(missing_ok=True)
+                    raise
+                if filename == "" and size_bytes == 0:
+                    staged_path.unlink(missing_ok=True)
+                    continue
+                attachments.append(
+                    UploadedFile(
+                        filename=filename or "attachment",
+                        content_type=part.get_content_type(),
+                        data=None,
+                        staged_path=staged_path,
+                        size_bytes=size_bytes,
+                        sha256=digest.hexdigest(),
+                    )
+                )
+            elif disposition in {"form-data", "attachment", "inline"} and name == "content":
+                content_bytes = bytearray()
+
+                def write_content(chunk: bytes) -> None:
+                    if len(content_bytes) + len(chunk) > MAX_BODY_BYTES:
+                        raise ServiceError(413, "message content is too large")
+                    content_bytes.extend(chunk)
+
+                final_boundary = reader.stream_part(write_content)
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    content = bytes(content_bytes).decode(charset, errors="replace")
+                except LookupError as exc:
+                    raise ServiceError(400, "invalid multipart content charset") from exc
+            else:
+                final_boundary = reader.stream_part(lambda _chunk: None)
+
+        reader.finish()
+        return content, attachments, request_dir
+    except BaseException:
+        _remove_upload_staging_path(request_dir)
+        raise
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
@@ -85,6 +339,16 @@ class EnterpriseHTTPServer(ThreadingHTTPServer):
         self.service = service
         # Bounded admission control across all worker threads.
         self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        # Uploads additionally consume a small, independent budget so slow
+        # clients cannot occupy every general HTTP worker.
+        self._upload_slots = threading.BoundedSemaphore(MAX_CONCURRENT_UPLOADS)
+        self.upload_staging_root = ensure_private_directory(
+            self.service.config.data_dir / "upload-staging"
+        )
+        # Staging is request-scoped and never authoritative. Server startup is
+        # therefore the safe crash-recovery boundary for abandoned directories.
+        for candidate in self.upload_staging_root.iterdir():
+            _remove_upload_staging_path(candidate)
         # Per-worker-thread guard so a long-lived SSE stream can hand its general
         # request slot back early (and finish_request won't double-release it).
         self._local = threading.local()
@@ -160,6 +424,12 @@ class EnterpriseHTTPServer(ThreadingHTTPServer):
             else:
                 self._sse_per_user.pop(user_key, None)
 
+    def acquire_upload_slot(self) -> bool:
+        return self._upload_slots.acquire(blocking=False)
+
+    def release_upload_slot(self) -> None:
+        self._upload_slots.release()
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     server: EnterpriseHTTPServer
@@ -213,6 +483,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         self._request_started_monotonic = time.monotonic()
+        self._upload_slot_held = False
+        self._upload_staging_dirs: list[Path] = []
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -291,6 +563,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             self._json({"error": "internal server error"}, status=500)
+        finally:
+            self._cleanup_upload_request()
 
     def _handle_telegram_webhook(self, method: str, path: str) -> None:
         if method != "POST":
@@ -396,6 +670,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             self._serve_browser_preview(preview)
             return
+        if path == "/api/agent-previews/browser/control":
+            if method != "POST":
+                raise ServiceError(405, "method not allowed")
+            self._json(service.browser_preview_control(actor, self._body_json()))
+            return
         if path == "/api/auth/me" and method == "GET":
             self._json({"user": actor})
             return
@@ -485,6 +764,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 m.group(1),
                 limit=limit,
                 after_id=optional_int_arg(query, "after_id", minimum=0),
+                before_id=optional_int_arg(query, "before_id", minimum=0),
                 since_revision=optional_int_arg(
                     query, "since_revision", minimum=0
                 ),
@@ -531,6 +811,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._stream_scope_events(actor, "channel", m.group(1))
             return
 
+        if path == "/api/agent/reply-events" and method == "GET":
+            self._stream_agent_reply_events(actor)
+            return
+
         if path == "/api/private-agent/messages" and method == "GET":
             limit = int_arg(query, "limit", 100)
             sync = service.message_sync(
@@ -539,6 +823,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 str(actor["id"]),
                 limit=limit,
                 after_id=optional_int_arg(query, "after_id", minimum=0),
+                before_id=optional_int_arg(query, "before_id", minimum=0),
                 since_revision=optional_int_arg(
                     query, "since_revision", minimum=0
                 ),
@@ -594,28 +879,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if m and method == "DELETE":
             self._json(service.user_delete_memory(actor, int(m.group(1))))
-            return
-        if path == "/api/private-agent/memory-candidates" and method == "GET":
-            self._json(
-                service.user_list_memory_candidates(
-                    actor,
-                    status=first(query, "status", "pending"),
-                    limit=int_arg(query, "limit", 100),
-                )
-            )
-            return
-        m = re.fullmatch(
-            r"/api/private-agent/memory-candidates/(\d+)/(approve|reject)",
-            path,
-        )
-        if m and method == "POST":
-            candidate_id = int(m.group(1))
-            payload = (
-                service.user_approve_memory_candidate(actor, candidate_id)
-                if m.group(2) == "approve"
-                else service.user_reject_memory_candidate(actor, candidate_id)
-            )
-            self._json(payload)
             return
         if path == "/api/agent-skills" and method == "GET":
             self._json(
@@ -702,6 +965,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/private-agent/telegram" and method == "DELETE":
             self._json(service.unlink_telegram_private_config(actor))
+            return
+        if path == "/api/private-agent/mail/accounts" and method == "GET":
+            self._json(service.list_private_mail_accounts(actor))
+            return
+        if path == "/api/private-agent/mail/accounts" and method == "POST":
+            self._json(
+                service.create_private_mail_account(actor, self._body_json()),
+                status=201,
+            )
+            return
+        m = re.fullmatch(r"/api/private-agent/mail/accounts/(\d+)/(test|check)", path)
+        if m and method == "POST":
+            account_id = int(m.group(1))
+            if m.group(2) == "test":
+                payload = service.test_private_mail_account(actor, account_id)
+            else:
+                payload = service.check_private_mail_account(actor, account_id)
+            self._json(payload)
+            return
+        m = re.fullmatch(r"/api/private-agent/mail/accounts/(\d+)", path)
+        if m and method == "GET":
+            self._json(service.get_private_mail_account(actor, int(m.group(1))))
+            return
+        if m and method == "PATCH":
+            self._json(
+                service.update_private_mail_account(
+                    actor, int(m.group(1)), self._body_json()
+                )
+            )
+            return
+        if m and method == "DELETE":
+            self._json(service.delete_private_mail_account(actor, int(m.group(1))))
             return
         if path == "/api/private-agent/schedules" and method == "GET":
             self._json(service.list_private_schedules(actor))
@@ -898,10 +1193,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/agent/tools/memory" and method == "POST":
             body = self._body_json()
-            if str(body.get("action") or "").strip().lower() == "propose":
-                self._json(service.agent_memory_propose(body))
-            else:
-                self._json(service.agent_memory_mutate(body))
+            if str(body.get("source_type") or "").strip().lower() != "automatic":
+                raise ServiceError(403, "Agent memory mutations require automatic run provenance")
+            self._json(service.agent_memory_mutate(body))
             return
         if path == "/api/agent/tools/session/search" and method == "POST":
             self._json(service.agent_session_search(self._body_json()))
@@ -918,7 +1212,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid Agent runtime token")
         if method != "POST":
             raise ServiceError(405, "method not allowed")
-        if re.fullmatch(r"/internal/agent/tools/(?:web|browser|schedule|skill)", path):
+        if re.fullmatch(r"/internal/agent/tools/(?:web|browser|schedule|skill|mail)", path):
             body = self._body_json()
             body["tool"] = path.rsplit("/", 1)[-1]
             self._json(service.invoke_agent_runtime_tool(body))
@@ -974,32 +1268,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         length = self._content_length()
         if length > MAX_UPLOAD_BODY_BYTES:
             raise ServiceError(413, "upload body too large")
-        raw = self.rfile.read(length) if length else b""
-        parser_body = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw
+        if not self.server.acquire_upload_slot():
+            raise ServiceError(429, "too many concurrent uploads; try again later")
+        self._upload_slot_held = True
+        previous_timeout = self.connection.gettimeout()
         try:
-            message = BytesParser(policy=policy.default).parsebytes(parser_body)
-        except Exception as exc:
-            raise ServiceError(400, "invalid multipart body") from exc
-        if not message.is_multipart():
-            raise ServiceError(400, "invalid multipart body")
+            self.connection.settimeout(UPLOAD_IDLE_TIMEOUT_SECONDS)
+            content, attachments, request_dir = _parse_multipart_upload(
+                self.rfile,
+                length=length,
+                content_type=content_type,
+                staging_root=self.server.upload_staging_root,
+            )
+            self._upload_staging_dirs.append(request_dir)
+            return content, attachments
+        except TimeoutError as exc:
+            raise ServiceError(408, "upload stalled while waiting for data") from exc
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
 
-        content = ""
-        attachments: list[UploadedFile] = []
-        for part in message.iter_parts():
-            disposition = part.get_content_disposition()
-            if disposition not in {"form-data", "attachment", "inline"}:
-                continue
-            name = part.get_param("name", header="content-disposition")
-            filename = part.get_filename()
-            data = part.get_payload(decode=True) or b""
-            if filename is not None:
-                if filename == "" and not data:
-                    continue
-                attachments.append(UploadedFile(filename=filename or "attachment", content_type=part.get_content_type(), data=data))
-            elif name == "content":
-                charset = part.get_content_charset() or "utf-8"
-                content = data.decode(charset, errors="replace")
-        return content, attachments
+    def _cleanup_upload_request(self) -> None:
+        staging_root = getattr(self.server, "upload_staging_root", None)
+        for path in getattr(self, "_upload_staging_dirs", []):
+            try:
+                if staging_root is not None and path.parent == staging_root:
+                    _remove_upload_staging_path(path)
+            except OSError:
+                pass
+        self._upload_staging_dirs = []
+        if getattr(self, "_upload_slot_held", False):
+            self._upload_slot_held = False
+            self.server.release_upload_slot()
 
     def _json(self, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1354,6 +1656,68 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             # Client disconnected or the scope became unavailable; just end the
             # stream (the browser's EventSource will reconnect if appropriate).
+            return
+        finally:
+            self.server.release_sse_slot(user_key)
+
+    def _stream_agent_reply_events(self, actor: dict[str, Any]) -> None:
+        """Stream completed Agent replies across every scope visible to a user."""
+
+        service = self.server.service
+        token = self._read_token()
+        last_event_id = self.headers.get("Last-Event-ID", "").strip()
+        if last_event_id and not re.fullmatch(r"[0-9]{1,20}", last_event_id):
+            raise ServiceError(400, "invalid reply event watermark")
+        baseline = service.agent_reply_watermark(actor)
+        cursor = min(int(last_event_id), baseline) if last_event_id else baseline
+        user_key = actor.get("id")
+        if not self.server.acquire_sse_slot(user_key):
+            raise ServiceError(503, "too many concurrent event streams; retry shortly")
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self._send_security_headers()
+            self.end_headers()
+            self.server.release_request_slot_once()
+            initial = json.dumps({"watermark": cursor}, ensure_ascii=False)
+            self.wfile.write(
+                f"id: {cursor}\nevent: baseline\ndata: {initial}\n\n".encode("utf-8")
+            )
+            self.wfile.flush()
+            last_write = time.monotonic()
+            deadline = time.time() + SSE_MAX_SECONDS
+            next_auth_check = time.time() + SSE_AUTH_RECHECK_SECONDS
+            current_actor = actor
+            while time.time() < deadline and not self.server.shutdown_event.is_set():
+                now = time.time()
+                if now >= next_auth_check:
+                    fresh_actor = service.user_from_token(token)
+                    if not fresh_actor:
+                        return
+                    current_actor = fresh_actor
+                    next_auth_check = now + SSE_AUTH_RECHECK_SECONDS
+                events = service.agent_reply_events(current_actor, after_id=cursor)
+                if events:
+                    for item in events:
+                        message_id = int(item["message_id"])
+                        payload = json.dumps(item, ensure_ascii=False)
+                        self.wfile.write(
+                            f"id: {message_id}\nevent: reply\ndata: {payload}\n\n".encode(
+                                "utf-8"
+                            )
+                        )
+                        cursor = message_id
+                    self.wfile.flush()
+                    last_write = time.monotonic()
+                elif time.monotonic() - last_write >= SSE_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_write = time.monotonic()
+                time.sleep(SSE_POLL_INTERVAL)
+        except Exception:
             return
         finally:
             self.server.release_sse_slot(user_key)

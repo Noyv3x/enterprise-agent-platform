@@ -1,6 +1,6 @@
 # 文档与代码同步流程
 
-`docs/` 是 ubitech agent 当前设计的唯一真相源。设计约束、运行边界、公开契约和运维行为应先在这里修改，再落实到代码与测试。根目录的 `AGENTS.md`、`CLAUDE.md` 已弃用，不得重新建立。
+`docs/` 是 ubitech agent 当前设计的唯一真相源。设计约束、运行边界、公开契约和运维行为应先在这里修改，再落实到代码与测试。根目录 `AGENTS.md` 只提供与工具无关的工作行为和“先读、先改文档”的入口，不得复制代码库结构、配置值或产品设计；`CLAUDE.md` 继续弃用。
 
 完整文档入口见 [文档索引](../README.md)，代码域映射见 [`domains.json`](../domains.json)。
 
@@ -34,7 +34,7 @@ Manifest、canonical 文档、机器契约及生成目标都必须位于仓库�
 - 应纳入同步的设计文档均登记在域清单中；
 - 生成模块与机器可读契约逐字节一致；
 - `docs/` 中的本地相对链接没有失效；
-- 顶层遗留指令文件没有重新出现。
+- 顶层 `CLAUDE.md` 没有重新出现，`AGENTS.md` 只包含行为准则且纳入文档治理域。
 
 `check-change` 先运行全部当前树检查。比较两个提交时，以它们的 Git merge-base 到 head 作为变更集，避免落后主线的分支把主线变化误算成自己的修改；是否属于首次 bootstrap 仍以 policy base 上是否已有 manifest 判断。校验同时读取 merge-base 与目标版本的 domain manifest，并按前后 coverage 与 owner 的并集归类路径，因此删除 owner、缩窄 coverage、删除文件或把文件 rename 出受管路径都不能绕过原设计域。将 `--head` 设为 `INDEX` 时只检查基准提交、已有提交和暂存快照，防止“已暂存代码、文档仍未暂存”的下一次提交逃逸；设为 `WORKTREE` 时会进一步合并未暂存修改和未跟踪文件。两种本地模式都把 rename 当成删除加新增，并由 `./scripts/test.sh` 与 CI 共同执行。
 

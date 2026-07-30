@@ -4,6 +4,7 @@
    suggestions / agent_work) changes. Optimistic and synthetic streaming messages flow through
    here too (msg--pending / msg--streaming toggle the CSS badges + caret). */
 
+import { Progress } from "antd";
 import { memo } from "react";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
@@ -29,6 +30,7 @@ function MessageBubbleImpl({ message }: { message: Message }) {
   const attachments = message.attachments || [];
   const showWorkCard = !!agentWork && hasAgentProcessSteps(agentWork);
   const scheduledTask = message.metadata?.scheduled_task;
+  const upload = message.metadata?.upload;
 
   if (scheduledTask && message.author_type === "system") {
     return <ScheduledTaskMarker marker={scheduledTask} message={message} />;
@@ -56,6 +58,19 @@ function MessageBubbleImpl({ message }: { message: Message }) {
         {showWorkCard && agentWork ? <AgentWorkCard work={agentWork} active={false} /> : null}
         {message.content ? <MessageBody content={message.content} /> : null}
         {attachments.length ? <MessageAttachments attachments={attachments} /> : null}
+        {pending && upload ? (
+          <div className="msg-upload" aria-live="polite">
+            <span className="msg-upload__label">
+              {t(`chat.upload.${upload.state}`)}
+            </span>
+            <Progress
+              percent={upload.percent}
+              size="small"
+              status="active"
+              aria-label={t("chat.upload.progress", { count: upload.percent })}
+            />
+          </div>
+        ) : null}
         {suggestions.length ? <KnowledgeSuggestions suggestions={suggestions} /> : null}
       </div>
     </article>

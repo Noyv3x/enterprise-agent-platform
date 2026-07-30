@@ -35,6 +35,7 @@ export function messageFingerprint(message: Message): unknown {
     })),
     created_at: message.created_at,
     pending: !!message.metadata?.local_pending,
+    upload: message.metadata?.upload || null,
     streaming: !!message.metadata?.streaming,
     stream_segment: !!message.metadata?.stream_segment,
     input_group_id: message.metadata?.input_group_id || "",
