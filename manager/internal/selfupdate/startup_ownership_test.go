@@ -723,6 +723,48 @@ func TestStartupOwnershipTerminalJournalSurvivesLaterArtifactPruning(t *testing.
 	}
 }
 
+func TestStartupOwnershipRejectsTerminalSupersededPlanMissingIdentityWithoutMutation(t *testing.T) {
+	fixture, journal := startupActiveRecoveryFixture(t)
+	if err := fixture.manager.AcknowledgeStartup(); err != nil {
+		t.Fatal(err)
+	}
+	_, recoveryPlan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commitActivation(recoveryPlan.PlanPath, recoveryPlan); err != nil {
+		t.Fatalf("commit recovery activation fixture: %v", err)
+	}
+	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if err != nil || !exists || journal.Phase != recoveryTakeoverCommitted {
+		t.Fatalf("committed recovery journal = %#v, exists=%v err=%v", journal, exists, err)
+	}
+	_, superseded, err := readRecoveryActivationPlan(journal.OriginalPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	superseded.CandidatePath = ""
+	superseded.PlatformCommit = ""
+	activationTakeoverWriteJSON(t, journal.OriginalPlanPath, superseded)
+
+	before := fixture.keyFiles()
+	for _, path := range []string{journal.Path, journal.RecoveryPlanPath} {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		before[path] = data
+	}
+	calls := fixture.runner.snapshot()
+	if err := fixture.manager.ValidateStartupOwnership(); err == nil || !strings.Contains(err.Error(), "not bound") {
+		t.Fatalf("terminal superseded plan with missing identity was admitted: %v", err)
+	}
+	activationTakeoverAssertFiles(t, before)
+	if !reflect.DeepEqual(fixture.runner.snapshot(), calls) {
+		t.Fatal("startup ownership refusal invoked the recovery runner")
+	}
+}
+
 func TestStartupOwnershipRejectsMalformedAndUnknownRecoveryArtifacts(t *testing.T) {
 	for _, test := range []struct {
 		name string
