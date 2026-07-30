@@ -206,6 +206,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		CandidateVersion: fixture.candidateCommit,
 		CandidateSHA:     fixture.candidateSHA,
 		CandidatePath:    candidatePath,
+		PlatformCommit:   fixture.candidateCommit,
 		PreviousPath:     currentPath,
 		Activated:        true,
 		Acknowledged:     false,
@@ -401,6 +402,40 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 	return fixture
 }
 
+func configureB121ActivationPlanProducer(t *testing.T, fixture *activationTakeoverFixture) string {
+	t.Helper()
+	currentDir := filepath.Join(
+		fixture.manager.Root,
+		"versions",
+		b121ActivationPlanProducer+"-"+b121ActivationPlanProducer[:12],
+	)
+	if err := os.MkdirAll(currentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	currentPath := filepath.Join(currentDir, "ubitech-manager")
+	if err := atomicfile.WriteFile(currentPath, fixture.currentBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	state := fixture.originalState
+	current := *state.Current
+	current.Version = b121ActivationPlanProducer
+	current.SourceCommit = b121ActivationPlanProducer
+	current.Path = currentPath
+	state.Current = &current
+	plan := fixture.originalPlan
+	plan.PreviousPath = currentPath
+	plan.CandidatePath = ""
+	plan.PlatformCommit = ""
+
+	fixture.currentCommit = b121ActivationPlanProducer
+	fixture.originalState = state
+	fixture.originalPlan = plan
+	activationTakeoverWriteJSON(t, fixture.statePath, state)
+	activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+	return activationTakeoverFileSHA(t, fixture.oldPlanPath)
+}
+
 func (f *activationTakeoverFixture) runHook(name string, arguments []string) error {
 	if name == "systemd-run" {
 		for index, argument := range arguments {
@@ -566,6 +601,121 @@ func TestRecoverCurrentTakesOverExactStuckActivationThroughWatchdogCommit(t *tes
 	fixture.mu.Unlock()
 	if processChecks < 2 || watchdogChecks < 2 || fixture.runner.countCommand("systemd-run") != 1 {
 		t.Fatalf("recovery did not prove process/watchdog ownership: processChecks=%d watchdogChecks=%d calls=%#v", processChecks, watchdogChecks, fixture.runner.snapshot())
+	}
+}
+
+func TestB121ActivationPlanIsBoundAtCandidateAcknowledgement(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	configureB121ActivationPlanProducer(t, fixture)
+
+	if err := fixture.manager.acknowledgeExecutable(fixture.originalState.Candidate.Path); err != nil {
+		t.Fatal(err)
+	}
+	_, plan, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Status != "acknowledged" || !plan.Activated || !plan.Acknowledged ||
+		plan.CandidatePath != fixture.originalState.Candidate.Path ||
+		plan.PlatformCommit != fixture.candidateCommit {
+		t.Fatalf("b121 activation plan was not strictly rebound before acknowledgement: %#v", plan)
+	}
+}
+
+func TestRecoverCurrentAcceptsOnlyExactB121ActivationPlanProducer(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	originalPlanSHA := configureB121ActivationPlanProducer(t, fixture)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+		t.Fatal(err)
+	}
+	_, superseded, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded.Status != recoverySupersededStatus ||
+		superseded.CandidatePath != fixture.originalState.Candidate.Path ||
+		superseded.PlatformCommit != fixture.candidateCommit {
+		t.Fatalf("b121 activation plan was not rebound at the owned takeover boundary: %#v", superseded)
+	}
+	journalPath := fixture.manager.recoveryTakeoverJournalPath(fixture.candidateCommit, fixture.recoverySHA)
+	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journalPath)
+	if err != nil || !exists {
+		t.Fatalf("read b121 takeover journal: exists=%v err=%v", exists, err)
+	}
+	if journal.OriginalPlanSHA256 != originalPlanSHA || journal.OriginalCurrent.SourceCommit != b121ActivationPlanProducer {
+		t.Fatalf("b121 takeover did not preserve the original producer evidence: %#v", journal)
+	}
+}
+
+func TestIncompleteActivationPlanBindingFailsClosedOutsideExactB121Producer(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *activationTakeoverFixture)
+	}{
+		{
+			name: "different producer",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				plan := fixture.originalPlan
+				plan.CandidatePath = ""
+				plan.PlatformCommit = ""
+				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+			},
+		},
+		{
+			name: "only candidate path missing",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				configureB121ActivationPlanProducer(t, fixture)
+				plan := fixture.originalPlan
+				plan.PlatformCommit = fixture.candidateCommit
+				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+			},
+		},
+		{
+			name: "only Platform commit missing",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				configureB121ActivationPlanProducer(t, fixture)
+				plan := fixture.originalPlan
+				plan.CandidatePath = fixture.originalState.Candidate.Path
+				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+			},
+		},
+		{
+			name: "other plan identity changed",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				configureB121ActivationPlanProducer(t, fixture)
+				plan := fixture.originalPlan
+				plan.PreviousPath = fixture.originalState.Candidate.Path
+				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+			},
+		},
+		{
+			name: "producer source commit changed",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				configureB121ActivationPlanProducer(t, fixture)
+				state := fixture.originalState
+				current := *state.Current
+				current.SourceCommit = strings.Repeat("3", 40)
+				state.Current = &current
+				activationTakeoverWriteJSON(t, fixture.statePath, state)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			test.mutate(t, fixture)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err == nil {
+				t.Fatal("incomplete activation binding unexpectedly entered controlled takeover")
+			}
+			if calls := fixture.runner.snapshot(); len(calls) != 0 {
+				t.Fatalf("rejected activation binding reached systemd: %#v", calls)
+			}
+		})
 	}
 }
 

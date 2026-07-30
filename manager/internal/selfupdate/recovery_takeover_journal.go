@@ -459,7 +459,7 @@ func validateSupersededRecoveryPlanConfiguration(recoveryPlan Plan, journal reco
 		superseded.InstallPath != journal.InstallPath || superseded.SocketPath != journal.SocketPath ||
 		superseded.ControlTokenFile != journal.ControlTokenFile || superseded.UnitName != journal.UnitName ||
 		superseded.CandidateVersion != journal.OriginalCandidate.Version || superseded.CandidateSHA != journal.OriginalCandidate.SHA256 ||
-		superseded.CandidatePath != "" && superseded.CandidatePath != journal.OriginalCandidate.Path ||
+		superseded.CandidatePath != journal.OriginalCandidate.Path || superseded.PlatformCommit != journal.PlatformCommit ||
 		superseded.PreviousPath != journal.OriginalCurrent.Path ||
 		recoveryPlan.StatePath != superseded.StatePath || recoveryPlan.InstallPath != superseded.InstallPath ||
 		recoveryPlan.SocketPath != superseded.SocketPath || recoveryPlan.ControlTokenFile != superseded.ControlTokenFile ||

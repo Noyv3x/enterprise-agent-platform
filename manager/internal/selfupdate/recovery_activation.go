@@ -25,6 +25,7 @@ const (
 	recoveryActivationObservationPoll = 100 * time.Millisecond
 	recoveryWatchdogUnitPrefix        = "ubitech-agent-manager-watchdog-"
 	recoveryCurrentWatchdogUnitPrefix = "ubitech-agent-manager-watchdog-current-recovery-"
+	b121ActivationPlanProducer        = "b121de2892497ff1cc3a786a4e42c3119dcb22a9"
 )
 
 type recoveryActivationRequest struct {
@@ -315,6 +316,10 @@ func (m *Manager) readRecoveryTakeover(stateData []byte, state State, evidence r
 	if plan.Mode != "" {
 		return nil, errors.New("ordinary activation takeover cannot claim a specialized activation plan")
 	}
+	plan, err = m.bindB121ActivationPlan(plan, state, candidate, evidence.manifest.SourceCommit)
+	if err != nil {
+		return nil, err
+	}
 	if err := m.validateRecoveryPlanBinding(plan, state, candidate, evidence.manifest.SourceCommit, false); err != nil {
 		return nil, err
 	}
@@ -352,6 +357,30 @@ func readRecoveryActivationPlan(path string) ([]byte, Plan, error) {
 	return data, plan, nil
 }
 
+// bindB121ActivationPlan is a one-release bootstrap bridge for the exact
+// Manager that produced an otherwise complete ordinary plan without the two
+// bindings added by the current protocol. Callers must still run the normal
+// strict plan validator after this in-memory completion. The original bytes are
+// intentionally left untouched until the caller owns the mutation boundary.
+func (m *Manager) bindB121ActivationPlan(plan Plan, state State, candidate Version, platformCommit string) (Plan, error) {
+	missingCandidatePath := plan.CandidatePath == ""
+	missingPlatformCommit := plan.PlatformCommit == ""
+	if !missingCandidatePath && !missingPlatformCommit {
+		return plan, nil
+	}
+	if missingCandidatePath != missingPlatformCommit {
+		return Plan{}, errors.New("ordinary Manager activation plan has a partial Platform binding")
+	}
+	if plan.Mode != "" || state.Current == nil ||
+		state.Current.Version != b121ActivationPlanProducer ||
+		state.Current.SourceCommit != b121ActivationPlanProducer {
+		return Plan{}, errors.New("ordinary Manager activation plan is missing its Platform binding")
+	}
+	plan.CandidatePath = candidate.Path
+	plan.PlatformCommit = platformCommit
+	return plan, nil
+}
+
 func (m *Manager) validateRecoveryPlanBinding(plan Plan, state State, candidate Version, platformCommit string, owned bool) error {
 	unit := m.recoveryUnitName()
 	if plan.PlanPath == "" || plan.StatePath != m.StatePath || plan.InstallPath != m.InstallPath ||
@@ -370,10 +399,11 @@ func (m *Manager) validateRecoveryPlanBinding(plan Plan, state State, candidate 
 			!validSHA256(plan.SupersededPlanSHA) {
 			return errors.New("current recovery activation plan has an invalid recovery binding")
 		}
-	} else if plan.Mode != "" || plan.PlatformCommit != "" ||
+	} else if plan.Mode != "" || !validSourceCommit(platformCommit) || plan.PlatformCommit != platformCommit ||
+		plan.CandidatePath != candidate.Path ||
 		plan.RecoveryTransactionID != "" || plan.RecoveryJournalPath != "" ||
 		plan.SupersededPlanPath != "" || plan.SupersededPlanSHA != "" {
-		return errors.New("ordinary Manager activation unexpectedly contains a recovery Platform binding")
+		return errors.New("ordinary Manager activation has an invalid Platform binding")
 	}
 	if plan.HealthTimeoutMS < 1_000 || plan.HealthTimeoutMS > 10*60*1_000 || plan.CreatedAt.IsZero() || plan.UpdatedAt.IsZero() || plan.UpdatedAt.Before(plan.CreatedAt) {
 		return errors.New("Manager activation plan has invalid timing fields")

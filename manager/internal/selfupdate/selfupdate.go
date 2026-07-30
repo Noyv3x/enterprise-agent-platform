@@ -223,7 +223,7 @@ func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error
 	if m.ControlTokenFile == "" {
 		return errors.New("manager control token file is required for safe activation")
 	}
-	plan := Plan{SchemaVersion: 1, PlanPath: planPath, Status: "prepared", StatePath: m.StatePath, InstallPath: installPath, SocketPath: m.SocketPath, ControlTokenFile: m.ControlTokenFile, UnitName: unit, CandidateVersion: state.Candidate.Version, CandidateSHA: state.Candidate.SHA256, PreviousPath: state.Current.Path, CreatedAt: m.now(), UpdatedAt: m.now(), HealthTimeoutMS: 45_000, BootID: m.bootID()}
+	plan := Plan{SchemaVersion: 1, PlanPath: planPath, Status: "prepared", StatePath: m.StatePath, InstallPath: installPath, SocketPath: m.SocketPath, ControlTokenFile: m.ControlTokenFile, UnitName: unit, CandidateVersion: state.Candidate.Version, CandidateSHA: state.Candidate.SHA256, CandidatePath: state.Candidate.Path, PlatformCommit: manifest.SourceCommit, PreviousPath: state.Current.Path, CreatedAt: m.now(), UpdatedAt: m.now(), HealthTimeoutMS: 45_000, BootID: m.bootID()}
 	if err := persistActivationPlan(planPath, plan); err != nil {
 		return err
 	}
@@ -313,6 +313,19 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 			return errors.New("current recovery activation does not match Manager service configuration")
 		}
 		return m.acknowledgeRecoveryExecutable(plan)
+	}
+	if state.Candidate == nil || !state.Candidate.PlatformCommitted ||
+		state.Candidate.SHA256 != state.Activation.CandidateSHA ||
+		state.Candidate.Path != state.Activation.CandidatePath ||
+		!validSourceCommit(state.Candidate.SourceCommit) {
+		return errors.New("ordinary Manager activation has no committed Candidate binding")
+	}
+	plan, err = m.bindB121ActivationPlan(plan, state, *state.Candidate, state.Candidate.SourceCommit)
+	if err != nil {
+		return err
+	}
+	if err := m.validateRecoveryPlanBinding(plan, state, *state.Candidate, state.Candidate.SourceCommit, false); err != nil {
+		return err
 	}
 	// Crash after atomic replacement but before plan.Activated was durable is a
 	// safe roll-forward: the candidate itself proves the persisted intent by its
