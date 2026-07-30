@@ -12,13 +12,14 @@ import (
 )
 
 func TestIsManagedTempNameIsExact(t *testing.T) {
-	for _, name := range []string{".tmp-0", ".tmp-1234567890"} {
+	for _, name := range []string{".tmp-0", ".tmp-1234567890", ".tmp-4294967295"} {
 		if !IsManagedTempName(name) {
 			t.Fatalf("IsManagedTempName(%q) = false, want true", name)
 		}
 	}
 	for _, name := range []string{
-		".tmp-", ".tmp-12345678901", ".tmp-123.json", ".tmp-a123", "x.tmp-123", ".tmp-12/3",
+		".tmp-", ".tmp-00", ".tmp-01", ".tmp-0000000000", ".tmp-4294967296", ".tmp-9999999999",
+		".tmp-12345678901", ".tmp-123.json", ".tmp-a123", "x.tmp-123", ".tmp-12/3",
 	} {
 		if IsManagedTempName(name) {
 			t.Fatalf("IsManagedTempName(%q) = true, want false", name)

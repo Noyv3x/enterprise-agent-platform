@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,7 +49,8 @@ func IsManagedTempName(name string) bool {
 			return false
 		}
 	}
-	return true
+	value, err := strconv.ParseUint(suffix, 10, 32)
+	return err == nil && strconv.FormatUint(value, 10) == suffix
 }
 
 // ValidateDurableReference rejects a durable path whose leaf could be removed
