@@ -1090,7 +1090,7 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
             "update_pre_download_min_free_bytes",
             "update_pre_cutover_min_free_bytes",
             "update_min_free_inodes",
-            "update_core_image_capacity_estimates",
+            "managed_image_capacity_estimates",
             "public_update_states",
             "operations",
             "operation_phases",
@@ -1161,22 +1161,33 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
             raise DocsSyncError(f"{label}.{field} must be a JavaScript safe integer")
 
     estimates = _expect_object(
-        contract.get("update_core_image_capacity_estimates"),
-        f"{label}.update_core_image_capacity_estimates",
+        contract.get("managed_image_capacity_estimates"),
+        f"{label}.managed_image_capacity_estimates",
     )
-    if set(estimates) != {"platform", "agent-runtime"}:
+    managed_images = {
+        "platform",
+        "agent-runtime",
+        "camofox",
+        "agent-sandbox",
+        "searxng",
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-postgres",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+    }
+    if set(estimates) != managed_images:
         raise DocsSyncError(
-            f"{label}.update_core_image_capacity_estimates must contain exactly "
-            "platform and agent-runtime"
+            f"{label}.managed_image_capacity_estimates must contain exactly the current managed image set"
         )
     for image_name, estimate_value in estimates.items():
         estimate = _expect_object(
             estimate_value,
-            f"{label}.update_core_image_capacity_estimates.{image_name}",
+            f"{label}.managed_image_capacity_estimates.{image_name}",
         )
         if set(estimate) != {"compressed_bytes", "unpacked_bytes"}:
             raise DocsSyncError(
-                f"{label}.update_core_image_capacity_estimates.{image_name} must "
+                f"{label}.managed_image_capacity_estimates.{image_name} must "
                 "contain exactly compressed_bytes and unpacked_bytes"
             )
         for size_name, value in estimate.items():
@@ -1187,7 +1198,7 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
                 or value > JAVASCRIPT_MAX_SAFE_INTEGER
             ):
                 raise DocsSyncError(
-                    f"{label}.update_core_image_capacity_estimates.{image_name}."
+                    f"{label}.managed_image_capacity_estimates.{image_name}."
                     f"{size_name} must be a positive JavaScript-safe integer"
                 )
     return contract
@@ -1195,7 +1206,7 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
 
 def _render_python_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
-    estimates = contract["update_core_image_capacity_estimates"]
+    estimates = contract["managed_image_capacity_estimates"]
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -1210,7 +1221,7 @@ OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_sec
 UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES = {contract["update_pre_download_min_free_bytes"]}
 UPDATE_PRE_CUTOVER_MIN_FREE_BYTES = {contract["update_pre_cutover_min_free_bytes"]}
 UPDATE_MIN_FREE_INODES = {contract["update_min_free_inodes"]}
-UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {estimates!r}
+MANAGED_IMAGE_CAPACITY_ESTIMATES = {estimates!r}
 PUBLIC_UPDATE_STATES = {tuple(contract["public_update_states"])!r}
 MANAGER_OPERATIONS = {tuple(contract["operations"])!r}
 MANAGER_OPERATION_PHASES = {tuple(contract["operation_phases"])!r}
@@ -1223,7 +1234,7 @@ def _render_typescript_container_platform(contract: dict[str, Any], source: str)
     states = json.dumps(contract["public_update_states"], ensure_ascii=False)
     operations = json.dumps(contract["operations"], ensure_ascii=False)
     phases = json.dumps(contract["operation_phases"], ensure_ascii=False)
-    estimates = json.dumps(contract["update_core_image_capacity_estimates"], ensure_ascii=False, indent=2)
+    estimates = json.dumps(contract["managed_image_capacity_estimates"], ensure_ascii=False, indent=2)
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]} as const;
 export const RELEASE_CHANNEL = {_typescript_string(contract["release_channel"])} as const;
@@ -1237,7 +1248,7 @@ export const OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_
 export const UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES = {contract["update_pre_download_min_free_bytes"]} as const;
 export const UPDATE_PRE_CUTOVER_MIN_FREE_BYTES = {contract["update_pre_cutover_min_free_bytes"]} as const;
 export const UPDATE_MIN_FREE_INODES = {contract["update_min_free_inodes"]} as const;
-export const UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {estimates} as const;
+export const MANAGED_IMAGE_CAPACITY_ESTIMATES = {estimates} as const;
 export const PUBLIC_UPDATE_STATES = {states} as const;
 export type PublicUpdateState = (typeof PUBLIC_UPDATE_STATES)[number];
 export const MANAGER_OPERATIONS = {operations} as const;
@@ -1296,7 +1307,7 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
         + ",\n\t\tUnpackedBytes:   "
         + str(value["unpacked_bytes"])
         + ",\n\t},"
-        for name, value in sorted(contract["update_core_image_capacity_estimates"].items())
+        for name, value in sorted(contract["managed_image_capacity_estimates"].items())
     )
 
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
@@ -1311,7 +1322,7 @@ type ImageCapacityEstimate struct {{
 \tUnpackedBytes   uint64
 }}
 
-var UpdateCoreImageCapacityEstimates = map[string]ImageCapacityEstimate{{
+var ManagedImageCapacityEstimates = map[string]ImageCapacityEstimate{{
 {estimate_lines}
 }}
 

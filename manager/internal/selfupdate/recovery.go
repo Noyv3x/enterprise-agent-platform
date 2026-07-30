@@ -394,7 +394,7 @@ func (m *Manager) restoreRecoveryCurrent(oldBinary []byte, unit string) error {
 	if writeErr == nil {
 		startErr = m.runner().Run(ctx, "systemctl", "--user", "start", unit)
 		if startErr == nil {
-			healthErr = waitLegacyRecoveryManagerHealthy(ctx, m.SocketPath, m.ControlTokenFile)
+			healthErr = waitRestoredManagerHealthy(ctx, m.SocketPath, m.ControlTokenFile)
 		}
 	}
 	return errors.Join(
@@ -630,11 +630,11 @@ func recoveryManagerIdentityMatches(ctx context.Context, socketPath, tokenPath, 
 	return identity.Status == "healthy" && identity.Version == expectedVersion && identity.SHA256 == expectedSHA
 }
 
-func waitLegacyRecoveryManagerHealthy(ctx context.Context, socketPath, tokenPath string) error {
+func waitRestoredManagerHealthy(ctx context.Context, socketPath, tokenPath string) error {
 	ticker := time.NewTicker(recoveryHealthPoll)
 	defer ticker.Stop()
 	for {
-		if legacyRecoveryManagerHealthy(ctx, socketPath, tokenPath) {
+		if restoredManagerHealthy(ctx, socketPath, tokenPath) {
 			return nil
 		}
 		select {
@@ -645,7 +645,7 @@ func waitLegacyRecoveryManagerHealthy(ctx context.Context, socketPath, tokenPath
 	}
 }
 
-func legacyRecoveryManagerHealthy(ctx context.Context, socketPath, tokenPath string) bool {
+func restoredManagerHealthy(ctx context.Context, socketPath, tokenPath string) bool {
 	token, err := readRecoveryControlToken(tokenPath)
 	if err != nil || validateRecoverySocket(socketPath) != nil {
 		return false

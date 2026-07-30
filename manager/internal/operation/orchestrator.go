@@ -31,6 +31,7 @@ type SelfUpdater interface {
 	MarkPlatformCommitted(release.Manifest) error
 	Activate(context.Context, release.Manifest) error
 	ActivationCommitted(release.Manifest) (bool, error)
+	ActivationRolledBack(release.Manifest) (bool, error)
 }
 
 type Orchestrator struct {
@@ -197,6 +198,9 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 	if op == nil {
 		return nil
 	}
+	if op.ManagerActivationRollback {
+		return o.recoverManagerActivationRollback(ctx, *op)
+	}
 	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
 		return o.recoverUnconfirmedReservation(ctx, *op)
 	}
@@ -274,6 +278,9 @@ func (o *Orchestrator) recoverFinalize(ctx context.Context, state model.ManagerS
 	op, err := o.Store.Operation(state.FinalizePendingOperationID)
 	if err != nil {
 		return fmt.Errorf("load pending finalize operation: %w", err)
+	}
+	if op.ManagerActivationRollback {
+		return o.recoverManagerActivationRollback(ctx, op)
 	}
 	if op.Status != model.OperationSucceeded {
 		return fmt.Errorf("pending finalize operation %s is not succeeded", op.ID)
@@ -411,7 +418,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist pulling phase: %w", err))
 		return
 	}
-	if err = o.Engine.Pull(ctx, manifest); err != nil {
+	if err = o.pullWithCapacityRetry(ctx, op.ID, manifest); err != nil {
 		o.failBeforeMaintenanceRetryable(op, err)
 		return
 	}
@@ -552,6 +559,22 @@ func (o *Orchestrator) checkCapacity(ctx context.Context, checker driver.Capacit
 	return retryErr
 }
 
+func (o *Orchestrator) pullWithCapacityRetry(ctx context.Context, operationID string, manifest release.Manifest) error {
+	err := o.Engine.Pull(ctx, manifest)
+	if err == nil || !driver.IsInsufficientCapacity(err) || o.ReclaimCapacity == nil {
+		return err
+	}
+	reclaimErr := o.ReclaimCapacity(ctx, operationID, manifest)
+	retryErr := o.Engine.Pull(ctx, manifest)
+	if retryErr == nil {
+		return nil
+	}
+	if reclaimErr != nil {
+		return errors.Join(retryErr, fmt.Errorf("controlled maintenance before image pull retry: %w", reclaimErr))
+	}
+	return retryErr
+}
+
 func (o *Orchestrator) failReservedCapacityRecheck(op model.Operation, cause error) {
 	released := o.resolveReservationUncertainty(o.Gate, op.ID, fmt.Errorf("recheck capacity after admission reservation: %w", cause))
 	var uncertain *reservationReleaseUncertainError
@@ -575,6 +598,13 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	if !op.Finalized {
 		isGenerationChange := op.Kind == model.OperationInstall || op.Kind == model.OperationUpdate
 		if isGenerationChange && o.SelfUpdate != nil {
+			rolledBack, selfErr := o.SelfUpdate.ActivationRolledBack(manifest)
+			if selfErr != nil {
+				return o.finalizeFailure("manager activation rollback evidence is invalid", selfErr)
+			}
+			if rolledBack {
+				return o.beginManagerActivationRollback(ctx, op, manifest)
+			}
 			if selfErr := o.SelfUpdate.MarkPlatformCommitted(manifest); selfErr != nil {
 				return o.finalizeFailure("manager binary could not be committed", selfErr)
 			}
@@ -637,6 +667,109 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	if o.OnFinalized != nil {
 		o.OnFinalized(manifest)
 	}
+	return nil
+}
+
+func (o *Orchestrator) beginManagerActivationRollback(ctx context.Context, op model.Operation, manifest release.Manifest) error {
+	durable, err := o.Store.Operation(op.ID)
+	if err != nil {
+		return o.finalizeFailure("load Manager activation rollback operation", err)
+	}
+	op = durable
+	state := o.Store.State()
+	if op.Kind != model.OperationUpdate || state.FinalizePendingOperationID != op.ID ||
+		state.Current == nil || state.Current.ID != manifest.ID() || state.Previous == nil ||
+		state.Previous.ID == "" || state.Previous.ManifestPath == "" || op.SnapshotPath == "" ||
+		op.ReservationStatus != model.ReservationMutationStarted {
+		return o.finalizeFailure("manager activation rollback cannot restore the previous generation", errors.New("committed update rollback evidence is incomplete"))
+	}
+	message := journal.BoundDiagnostic("Manager candidate was rejected by its activation watchdog; restoring the previous Platform generation")
+	updated, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		if value.Status != model.OperationSucceeded || value.TargetGeneration != manifest.ID() {
+			return errors.New("committed update operation changed before Manager rollback")
+		}
+		value.ManagerActivationRollback = true
+		value.ManagerRollbackGeneration = state.Previous.ID
+		value.Status = model.OperationRunning
+		value.Finalized = false
+		value.Retryable = true
+		value.Phase = model.PhaseRollingBack
+		value.CompletedAt = nil
+		value.Error = message
+		value.History = append(value.History, model.PhaseEvent{Phase: model.PhaseRollingBack, At: o.now(), Note: "Manager watchdog rejected candidate; restoring previous generation"})
+		value.UpdatedAt = o.now()
+		return nil
+	})
+	if err != nil {
+		return o.finalizeFailure("persist Manager activation rollback intent", err)
+	}
+	return o.recoverManagerActivationRollback(ctx, updated)
+}
+
+func (o *Orchestrator) recoverManagerActivationRollback(ctx context.Context, op model.Operation) error {
+	if !op.ManagerActivationRollback || op.ManagerRollbackGeneration == "" || op.SnapshotPath == "" || op.Error == "" ||
+		(op.Status != model.OperationRunning && op.Status != model.OperationFailed) {
+		return errors.New("Manager activation rollback journal is incomplete")
+	}
+	state := o.Store.State()
+	if state.FinalizePendingOperationID == op.ID {
+		if state.ActiveOperationID != "" || state.Current == nil || state.Current.ID != op.TargetGeneration ||
+			state.Previous == nil || state.Previous.ID != op.ManagerRollbackGeneration || state.Previous.ManifestPath == "" {
+			return errors.New("pending Manager activation rollback does not match Platform generations")
+		}
+		if _, err := o.Store.MutateState(o.now(), func(value *model.ManagerState) error {
+			if value.FinalizePendingOperationID != op.ID || value.ActiveOperationID != "" ||
+				value.Current == nil || value.Current.ID != op.TargetGeneration || value.Previous == nil ||
+				value.Previous.ID != op.ManagerRollbackGeneration {
+				return errors.New("Manager activation rollback ownership changed")
+			}
+			previous := *value.Previous
+			value.Current = &previous
+			value.Previous = nil
+			value.Candidate = nil
+			value.ActiveOperationID = op.ID
+			value.FinalizePendingOperationID = ""
+			value.Phase = model.PhaseRollingBack
+			value.PublicState = model.StateUpdating
+			value.Maintenance = true
+			value.LastError = op.Error
+			value.RetryAfterSeconds = 0
+			return nil
+		}); err != nil {
+			return fmt.Errorf("enter Manager activation Platform rollback: %w", err)
+		}
+		state = o.Store.State()
+	}
+	if state.ActiveOperationID == "" {
+		current, err := o.Store.Operation(op.ID)
+		if err == nil && current.Status == model.OperationFailed && current.Finalized {
+			return nil
+		}
+		return errors.New("Manager activation rollback lost its active operation")
+	}
+	if state.ActiveOperationID != op.ID || state.FinalizePendingOperationID != "" || state.Current == nil ||
+		state.Current.ID != op.ManagerRollbackGeneration || state.Previous != nil {
+		return errors.New("active Manager activation rollback does not match the previous Platform generation")
+	}
+	current, err := o.Store.Operation(op.ID)
+	if err != nil {
+		return err
+	}
+	o.failAfterMaintenance(ctx, current, nil, errors.New(current.Error))
+	completed, err := o.Store.Operation(op.ID)
+	if err != nil {
+		return err
+	}
+	finalState := o.Store.State()
+	if completed.Status != model.OperationFailed || !completed.Finalized || !completed.Retryable ||
+		finalState.ActiveOperationID != "" || finalState.FinalizePendingOperationID != "" ||
+		finalState.Current == nil || finalState.Current.ID != op.ManagerRollbackGeneration || finalState.Maintenance {
+		if finalState.LastError != "" {
+			return errors.New(finalState.LastError)
+		}
+		return errors.New("Manager activation Platform rollback remains pending")
+	}
+	o.event(op.ID, "operation.failed", op.TargetGeneration, errors.New(completed.Error))
 	return nil
 }
 
@@ -744,7 +877,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist rollback image phase: %w", err))
 		return
 	}
-	if err = o.Engine.Pull(ctx, manifest); err != nil {
+	if err = o.pullWithCapacityRetry(ctx, op.ID, manifest); err != nil {
 		o.failBeforeMaintenanceRetryable(op, fmt.Errorf("prepare previous generation images: %w", err))
 		return
 	}

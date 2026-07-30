@@ -402,40 +402,6 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 	return fixture
 }
 
-func configureB121ActivationPlanProducer(t *testing.T, fixture *activationTakeoverFixture) string {
-	t.Helper()
-	currentDir := filepath.Join(
-		fixture.manager.Root,
-		"versions",
-		b121ActivationPlanProducer+"-"+b121ActivationPlanProducer[:12],
-	)
-	if err := os.MkdirAll(currentDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	currentPath := filepath.Join(currentDir, "ubitech-manager")
-	if err := atomicfile.WriteFile(currentPath, fixture.currentBinary, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	state := fixture.originalState
-	current := *state.Current
-	current.Version = b121ActivationPlanProducer
-	current.SourceCommit = b121ActivationPlanProducer
-	current.Path = currentPath
-	state.Current = &current
-	plan := fixture.originalPlan
-	plan.PreviousPath = currentPath
-	plan.CandidatePath = ""
-	plan.PlatformCommit = ""
-
-	fixture.currentCommit = b121ActivationPlanProducer
-	fixture.originalState = state
-	fixture.originalPlan = plan
-	activationTakeoverWriteJSON(t, fixture.statePath, state)
-	activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
-	return activationTakeoverFileSHA(t, fixture.oldPlanPath)
-}
-
 func (f *activationTakeoverFixture) runHook(name string, arguments []string) error {
 	if name == "systemd-run" {
 		for index, argument := range arguments {
@@ -604,59 +570,46 @@ func TestRecoverCurrentTakesOverExactStuckActivationThroughWatchdogCommit(t *tes
 	}
 }
 
-func TestB121ActivationPlanIsBoundAtCandidateAcknowledgement(t *testing.T) {
-	fixture := newActivationTakeoverFixture(t)
-	configureB121ActivationPlanProducer(t, fixture)
+func TestAcknowledgementRejectsIncompleteActivationPlanBinding(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Plan)
+	}{
+		{"candidate path missing", func(plan *Plan) { plan.CandidatePath = "" }},
+		{"Platform commit missing", func(plan *Plan) { plan.PlatformCommit = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			plan := fixture.originalPlan
+			test.mutate(&plan)
+			activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
 
-	if err := fixture.manager.acknowledgeExecutable(fixture.originalState.Candidate.Path); err != nil {
-		t.Fatal(err)
-	}
-	_, plan, err := readRecoveryActivationPlan(fixture.oldPlanPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Status != "acknowledged" || !plan.Activated || !plan.Acknowledged ||
-		plan.CandidatePath != fixture.originalState.Candidate.Path ||
-		plan.PlatformCommit != fixture.candidateCommit {
-		t.Fatalf("b121 activation plan was not strictly rebound before acknowledgement: %#v", plan)
+			if err := fixture.manager.acknowledgeExecutable(fixture.originalState.Candidate.Path); err == nil {
+				t.Fatal("incomplete activation binding was acknowledged")
+			}
+			state := activationTakeoverReadState(fixture.statePath)
+			if state.Activation == nil || state.Candidate == nil {
+				t.Fatalf("failed acknowledgement mutated activation ownership: %#v", state)
+			}
+			_, persisted, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(persisted, plan) {
+				t.Fatalf("failed acknowledgement rewrote incomplete activation plan: got=%#v want=%#v", persisted, plan)
+			}
+		})
 	}
 }
 
-func TestRecoverCurrentAcceptsOnlyExactB121ActivationPlanProducer(t *testing.T) {
-	fixture := newActivationTakeoverFixture(t)
-	originalPlanSHA := configureB121ActivationPlanProducer(t, fixture)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
-		t.Fatal(err)
-	}
-	_, superseded, err := readRecoveryActivationPlan(fixture.oldPlanPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if superseded.Status != recoverySupersededStatus ||
-		superseded.CandidatePath != fixture.originalState.Candidate.Path ||
-		superseded.PlatformCommit != fixture.candidateCommit {
-		t.Fatalf("b121 activation plan was not rebound at the owned takeover boundary: %#v", superseded)
-	}
-	journalPath := fixture.manager.recoveryTakeoverJournalPath(fixture.candidateCommit, fixture.recoverySHA)
-	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journalPath)
-	if err != nil || !exists {
-		t.Fatalf("read b121 takeover journal: exists=%v err=%v", exists, err)
-	}
-	if journal.OriginalPlanSHA256 != originalPlanSHA || journal.OriginalCurrent.SourceCommit != b121ActivationPlanProducer {
-		t.Fatalf("b121 takeover did not preserve the original producer evidence: %#v", journal)
-	}
-}
-
-func TestIncompleteActivationPlanBindingFailsClosedOutsideExactB121Producer(t *testing.T) {
+func TestIncompleteActivationPlanBindingFailsClosed(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, *activationTakeoverFixture)
 	}{
 		{
-			name: "different producer",
+			name: "both fields missing",
 			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
 				plan := fixture.originalPlan
 				plan.CandidatePath = ""
@@ -667,50 +620,33 @@ func TestIncompleteActivationPlanBindingFailsClosedOutsideExactB121Producer(t *t
 		{
 			name: "only candidate path missing",
 			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
-				configureB121ActivationPlanProducer(t, fixture)
 				plan := fixture.originalPlan
-				plan.PlatformCommit = fixture.candidateCommit
+				plan.CandidatePath = ""
 				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
 			},
 		},
 		{
 			name: "only Platform commit missing",
 			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
-				configureB121ActivationPlanProducer(t, fixture)
 				plan := fixture.originalPlan
-				plan.CandidatePath = fixture.originalState.Candidate.Path
+				plan.PlatformCommit = ""
 				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
 			},
 		},
 		{
-			name: "other plan identity changed",
+			name: "candidate path changed",
 			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
-				configureB121ActivationPlanProducer(t, fixture)
 				plan := fixture.originalPlan
-				plan.PreviousPath = fixture.originalState.Candidate.Path
+				plan.CandidatePath = fixture.originalState.Current.Path
 				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
 			},
 		},
 		{
-			name: "producer source commit changed",
+			name: "Platform commit changed",
 			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
-				configureB121ActivationPlanProducer(t, fixture)
-				state := fixture.originalState
-				current := *state.Current
-				current.SourceCommit = strings.Repeat("3", 40)
-				state.Current = &current
-				activationTakeoverWriteJSON(t, fixture.statePath, state)
-			},
-		},
-		{
-			name: "producer version changed",
-			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
-				configureB121ActivationPlanProducer(t, fixture)
-				state := fixture.originalState
-				current := *state.Current
-				current.Version = strings.Repeat("4", 40)
-				state.Current = &current
-				activationTakeoverWriteJSON(t, fixture.statePath, state)
+				plan := fixture.originalPlan
+				plan.PlatformCommit = strings.Repeat("3", 40)
+				activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
 			},
 		},
 	}

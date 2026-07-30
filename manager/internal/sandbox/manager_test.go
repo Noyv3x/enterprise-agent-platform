@@ -31,6 +31,19 @@ type sandboxEngine struct {
 	stopOnce    sync.Once
 }
 
+type capacityPreparingEngine struct {
+	*sandboxEngine
+	prepareCalls int
+}
+
+func (e *capacityPreparingEngine) PrepareManagedImage(context.Context, string, string) error {
+	e.prepareCalls++
+	if e.prepareCalls == 1 {
+		return &driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/docker", Resource: "space", Have: 1, Require: 2}
+	}
+	return nil
+}
+
 func (e *sandboxEngine) Preflight(context.Context) error                    { return nil }
 func (e *sandboxEngine) Pull(context.Context, release.Manifest) error       { return nil }
 func (e *sandboxEngine) Prepare(context.Context, release.Manifest) error    { return nil }
@@ -145,6 +158,26 @@ func TestEnsureWaitsForMaintenanceAdmission(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnsureRunsOneMaintenancePassBeforeRetryingSandboxCapacity(t *testing.T) {
+	engine := &capacityPreparingEngine{sandboxEngine: &sandboxEngine{}}
+	root := t.TempDir()
+	manager, err := Open(engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaims := 0
+	manager.ReclaimCapacity = func(context.Context) error {
+		reclaims++
+		return nil
+	}
+	if _, err := manager.Ensure(context.Background(), "private-1", "user-1", time.Now()); err != nil {
+		t.Fatalf("Sandbox did not converge after one controlled maintenance retry: %v", err)
+	}
+	if engine.prepareCalls != 2 || reclaims != 1 {
+		t.Fatalf("prepare calls=%d reclaims=%d, want 2/1", engine.prepareCalls, reclaims)
 	}
 }
 

@@ -18,7 +18,7 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 
 数据库启用 WAL、外键和按线程连接。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
-Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。目标基线把当前容器 schema marker 与最终表结构作为唯一 baseline：空数据库直接创建该结构；全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。本次过渡发布只额外接受唯一部署机已经在用、结构精确匹配的直接上一容器 marker，并以单事务升级正式记忆来源、把尚未决定且未与正式记忆重复的候选转为 `automatic` 记忆、删除候选表、创建邮箱表后切换到当前 marker；已批准候选已有正式记忆，已拒绝候选不恢复。任何其它 marker、未知业务表或退役表仍明确拒绝。部署机确认当前 marker 后，紧接着的基线发布必须删除该一次性分支，使非空数据库只接受当前 marker 和声明结构。
+Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；非空数据库必须同时精确匹配当前 marker 和声明结构；全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。任何其它 marker、未知业务表、额外列、缺失结构或退役表都必须在修改数据库前明确拒绝，当前版本不携带历史 baseline 升级入口。
 
 ## Agent scope
 
@@ -40,7 +40,7 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO worker 消费，全局并发门只限制实际进入 Runtime 的任务。
 
-当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，上一个容器基线升级时验证并原样保留既有值。正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
+当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
 
 私人 Agent 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。服务重启时：
 
@@ -79,6 +79,6 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。本次发布暂时携带且只携带上段定义的直接上一容器 baseline 升级；它不扫描旧源码布局、不猜测结构，也不接受更早 marker。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或退役表都拒绝启动。部署机升级成功并确认无回滚消费者后，下一基线删除该临时升级实现，不能让迁移代码永久堆积。
+数据库 schema version 单调递增。当前版本只接受当前 baseline，不扫描旧源码布局、不猜测结构，也不携带历史升级入口。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或退役表都拒绝启动。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

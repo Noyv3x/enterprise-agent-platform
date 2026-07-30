@@ -247,7 +247,7 @@ jobs:
       - prepare
       - images
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
@@ -336,69 +336,164 @@ jobs:
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           repository="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
 
-          for component in platform agent-runtime camofox agent-sandbox; do
-            package="${repository}/${component}"
-            image="$(jq -er '
+          remove_exact_local_image() {
+            local reference="$1"
+            local expected_id="${2:-}"
+            local local_id=""
+            if local_id="$(docker image inspect "$reference" --format '{{.Id}}' 2>/dev/null)"; then
+              [[ "$local_id" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                echo "Docker returned an invalid image ID for ${reference}: ${local_id}" >&2
+                exit 1
+              }
+              if [[ -n "$expected_id" && "$local_id" != "$expected_id" ]]; then
+                echo "Refusing to remove ${reference}: expected ${expected_id}, found ${local_id}" >&2
+                exit 1
+              fi
+              docker image rm --force "$local_id"
+            elif [[ -n "$expected_id" ]]; then
+              echo "Expected pulled image ${reference} (${expected_id}) is already missing" >&2
+              exit 1
+            fi
+            docker info --format '{{.ServerVersion}}' >/dev/null
+            if docker image inspect "$reference" >/dev/null 2>&1; then
+              echo "Exact image reference remains after cleanup: ${reference}" >&2
+              exit 1
+            fi
+            if [[ -n "$local_id" ]] && docker image inspect "$local_id" >/dev/null 2>&1; then
+              echo "Exact image ID remains after cleanup: ${local_id}" >&2
+              exit 1
+            fi
+          }
+
+          declare -A images=(
+            [platform]="$(jq -er '
               select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
               select(.digest | test("^sha256:[0-9a-f]{64}$")) |
               .reference + "@" + .digest
-            ' "image-metadata/${component}.json")"
-            digest="${image##*@}"
-            anonymous_token="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
-              --fail --silent --show-error --get \
-              --data-urlencode 'service=ghcr.io' \
-              --data-urlencode "scope=repository:${owner}/${package}:pull" \
-              'https://ghcr.io/token' | jq -er '.token | select(type == "string" and length > 0)')"
-            manifest_headers="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
-              --fail --silent --show-error --head \
-              --header "Authorization: Bearer ${anonymous_token}" \
-              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-              "https://ghcr.io/v2/${owner}/${package}/manifests/${digest}")"
-            registry_digest="$(awk 'BEGIN {IGNORECASE=1} $1 == "docker-content-digest:" {gsub("\r", "", $2); print tolower($2)}' <<<"$manifest_headers" | tail -n 1)"
-            [[ "$registry_digest" == "$digest" ]] || {
-              echo "Anonymous registry metadata returned ${registry_digest:-no digest} for ${image}" >&2
+            ' image-metadata/platform.json)"
+            [agent-runtime]="$(jq -er '
+              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
+              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+              .reference + "@" + .digest
+            ' image-metadata/agent-runtime.json)"
+            [camofox]="$(jq -er '
+              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
+              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+              .reference + "@" + .digest
+            ' image-metadata/camofox.json)"
+            [agent-sandbox]="$(jq -er '
+              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
+              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+              .reference + "@" + .digest
+            ' image-metadata/agent-sandbox.json)"
+            [searxng]='ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812'
+            [firecrawl-api]='ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c'
+            [firecrawl-playwright]='ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2'
+            [firecrawl-postgres]='ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6'
+            [firecrawl-redis]='redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
+            [firecrawl-rabbitmq]='rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
+          )
+          mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)
+          [[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]
+
+          for component in "${components[@]}"; do
+            image="${images[$component]-}"
+            [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || {
+              echo "Canonical managed image ${component} is missing an immutable release reference" >&2
               exit 1
             }
-            if [[ "$component" == platform || "$component" == agent-runtime ]]; then
-              compressed_limit="$(jq -er --arg component "$component" '.update_core_image_capacity_estimates[$component].compressed_bytes' docs/contracts/container-platform.json)"
-              unpacked_limit="$(jq -er --arg component "$component" '.update_core_image_capacity_estimates[$component].unpacked_bytes' docs/contracts/container-platform.json)"
-              index_raw="$(docker buildx imagetools inspect "$image" --raw)"
-              image_repository="${image%@*}"
-              for architecture in amd64 arm64; do
-                platform_digest="$(jq -er --arg architecture "$architecture" '
-                  [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest]
-                  | if length == 1 then .[0] else error("release index has an ambiguous platform manifest") end
-                ' <<<"$index_raw")"
-                platform_raw="$(docker buildx imagetools inspect "${image_repository}@${platform_digest}" --raw)"
-                compressed_bytes="$(jq -er '[.config.size, (.layers[]?.size)] | add | select(type == "number" and . > 0)' <<<"$platform_raw")"
-                if (( compressed_bytes > compressed_limit )); then
-                  echo "${component} linux/${architecture} compressed size ${compressed_bytes} exceeds contract limit ${compressed_limit}" >&2
+            case "$component" in
+              platform|agent-runtime|camofox|agent-sandbox)
+                package="${repository}/${component}"
+                digest="${image##*@}"
+                anonymous_token="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
+                  --fail --silent --show-error --get \
+                  --data-urlencode 'service=ghcr.io' \
+                  --data-urlencode "scope=repository:${owner}/${package}:pull" \
+                  'https://ghcr.io/token' | jq -er '.token | select(type == "string" and length > 0)')"
+                manifest_headers="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
+                  --fail --silent --show-error --head \
+                  --header "Authorization: Bearer ${anonymous_token}" \
+                  --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                  "https://ghcr.io/v2/${owner}/${package}/manifests/${digest}")"
+                registry_digest="$(awk 'BEGIN {IGNORECASE=1} $1 == "docker-content-digest:" {gsub("\r", "", $2); print tolower($2)}' <<<"$manifest_headers" | tail -n 1)"
+                [[ "$registry_digest" == "$digest" ]] || {
+                  echo "Anonymous registry metadata returned ${registry_digest:-no digest} for ${image}" >&2
                   exit 1
-                fi
-                docker image rm --force "$image" >/dev/null 2>&1 || true
-                docker pull --platform "linux/${architecture}" "$image"
-                unpacked_bytes="$(docker image inspect "$image" --format '{{.Size}}')"
-                [[ "$unpacked_bytes" =~ ^[0-9]+$ ]]
-                if (( unpacked_bytes > unpacked_limit )); then
-                  echo "${component} linux/${architecture} unpacked size ${unpacked_bytes} exceeds contract limit ${unpacked_limit}" >&2
-                  exit 1
-                fi
-                docker image inspect "$image" --format '{{json .RepoDigests}}' |
-                  jq -e --arg image "$image" 'index($image) != null' >/dev/null
-              done
-            else
-              docker image rm --force "$image" >/dev/null 2>&1 || true
-              docker pull "$image"
-              docker image inspect "$image" --format '{{json .RepoDigests}}' |
-                jq -e --arg image "$image" 'index($image) != null' >/dev/null
-            fi
+                }
+                ;;
+            esac
+
+            compressed_limit="$(jq -er --arg component "$component" '.managed_image_capacity_estimates[$component].compressed_bytes' docs/contracts/container-platform.json)"
+            unpacked_limit="$(jq -er --arg component "$component" '.managed_image_capacity_estimates[$component].unpacked_bytes' docs/contracts/container-platform.json)"
+            index_raw="$(docker buildx imagetools inspect "$image" --raw)"
+            image_repository="${image%@*}"
+            for architecture in amd64 arm64; do
+              platform_digest="$(jq -er --arg architecture "$architecture" '
+                [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest]
+                | if length == 1 then .[0] else error("release index has an ambiguous platform manifest") end
+              ' <<<"$index_raw")"
+              platform_raw="$(docker buildx imagetools inspect "${image_repository}@${platform_digest}" --raw)"
+              compressed_bytes="$(jq -er '[.config.size, (.layers[]?.size)] | add | select(type == "number" and . > 0)' <<<"$platform_raw")"
+              if (( compressed_bytes > compressed_limit )); then
+                echo "${component} linux/${architecture} compressed size ${compressed_bytes} exceeds contract limit ${compressed_limit}" >&2
+                exit 1
+              fi
+              remove_exact_local_image "$image"
+              docker pull --platform "linux/${architecture}" "$image"
+              pulled_metadata="$(docker image inspect "$image")"
+              jq -e --arg image "$image" --arg architecture "$architecture" '
+                length == 1 and
+                .[0].Os == "linux" and
+                .[0].Architecture == $architecture and
+                (.[0].RepoDigests | index($image) != null)
+              ' <<<"$pulled_metadata" >/dev/null
+              pulled_id="$(jq -er '
+                if length == 1
+                then .[0].Id | select(test("^sha256:[0-9a-f]{64}$"))
+                else error("Docker returned an ambiguous pulled image")
+                end
+              ' <<<"$pulled_metadata")"
+              unpacked_bytes="$(jq -er '
+                if length == 1
+                then .[0].Size | select(type == "number" and . > 0)
+                else error("Docker returned an ambiguous pulled image")
+                end
+              ' <<<"$pulled_metadata")"
+              [[ "$unpacked_bytes" =~ ^[0-9]+$ ]]
+              if (( unpacked_bytes > unpacked_limit )); then
+                echo "${component} linux/${architecture} unpacked size ${unpacked_bytes} exceeds contract limit ${unpacked_limit}" >&2
+                exit 1
+              fi
+              remove_exact_local_image "$image" "$pulled_id"
+            done
           done
+
+          verified_images="$GITHUB_WORKSPACE/verified-managed-images.json"
+          for component in "${components[@]}"; do
+            jq -n --arg key "$component" --arg value "${images[$component]}" '{key:$key,value:$value}'
+          done | jq -se '
+            map({(.key): .value}) | add |
+            select(length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
+          ' > "$verified_images"
+          jq -e --slurpfile verified "$verified_images" '
+            (.managed_image_capacity_estimates | keys) == ($verified[0] | keys)
+          ' docs/contracts/container-platform.json >/dev/null
 
           jq -e '
             ((.auths // {}) | length) == 0 and
             (has("credsStore") | not) and
             (has("credHelpers") | not)
           ' "$DOCKER_CONFIG/config.json" >/dev/null
+
+      - name: Upload verified managed-image directory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-managed-images
+          path: verified-managed-images.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
 
   manager-binaries:
     name: Manager linux/${{ matrix.arch }}
@@ -474,12 +569,11 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download image identities
+      - name: Download verified managed-image directory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: image-*
-          path: image-metadata
-          merge-multiple: true
+          name: verified-managed-images
+          path: artifacts
 
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
@@ -498,18 +592,36 @@ jobs:
           export UBITECH_DATA_ROOT="$root/state"
           export UBITECH_SECRETS_DIR="$UBITECH_DATA_ROOT/manager/secrets"
           export UBITECH_MANAGER_CONTROL_DIR="$UBITECH_DATA_ROOT/manager/control"
-          export UBITECH_UID="$(id -u)"
-          export UBITECH_GID="$(id -g)"
+          UBITECH_UID="$(id -u)"
+          UBITECH_GID="$(id -g)"
+          export UBITECH_UID UBITECH_GID
           export UBITECH_PLATFORM_BIND=127.0.0.1:18080
           export UBITECH_PUBLIC_BASE_URL=http://127.0.0.1:18080
-          export UBITECH_PLATFORM_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/platform.json)"
-          export UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/agent-runtime.json)"
-          export UBITECH_CAMOFOX_IMAGE="$(jq -er '.reference + "@" + .digest' image-metadata/camofox.json)"
-          sandbox_image="$(jq -er '.reference + "@" + .digest' image-metadata/agent-sandbox.json)"
+          verified_images=artifacts/verified-managed-images.json
+          jq -e 'length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$"))' "$verified_images" >/dev/null
+          UBITECH_PLATFORM_IMAGE="$(jq -er '.platform' "$verified_images")"
+          UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er '."agent-runtime"' "$verified_images")"
+          UBITECH_CAMOFOX_IMAGE="$(jq -er '.camofox' "$verified_images")"
+          UBITECH_AGENT_SANDBOX_IMAGE="$(jq -er '."agent-sandbox"' "$verified_images")"
+          UBITECH_SEARXNG_IMAGE="$(jq -er '.searxng' "$verified_images")"
+          UBITECH_FIRECRAWL_API_IMAGE="$(jq -er '."firecrawl-api"' "$verified_images")"
+          UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE="$(jq -er '."firecrawl-playwright"' "$verified_images")"
+          UBITECH_FIRECRAWL_POSTGRES_IMAGE="$(jq -er '."firecrawl-postgres"' "$verified_images")"
+          UBITECH_FIRECRAWL_REDIS_IMAGE="$(jq -er '."firecrawl-redis"' "$verified_images")"
+          UBITECH_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er '."firecrawl-rabbitmq"' "$verified_images")"
+          export \
+            UBITECH_PLATFORM_IMAGE UBITECH_AGENT_RUNTIME_IMAGE UBITECH_CAMOFOX_IMAGE \
+            UBITECH_AGENT_SANDBOX_IMAGE UBITECH_SEARXNG_IMAGE \
+            UBITECH_FIRECRAWL_API_IMAGE UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE \
+            UBITECH_FIRECRAWL_POSTGRES_IMAGE UBITECH_FIRECRAWL_REDIS_IMAGE \
+            UBITECH_FIRECRAWL_RABBITMQ_IMAGE
+          sandbox_image="$UBITECH_AGENT_SANDBOX_IMAGE"
           sandbox_container="${UBITECH_COMPOSE_PROJECT}-sandbox"
+          browser_fixture_container="${UBITECH_COMPOSE_PROJECT}-browser-fixture"
           manager_stub_pid=""
           cleanup() {
             docker rm --force "$sandbox_container" >/dev/null 2>&1 || true
+            docker rm --force "$browser_fixture_container" >/dev/null 2>&1 || true
             docker compose -f containers/compose.yaml down --volumes --remove-orphans >/dev/null 2>&1 || true
             docker network rm "$UBITECH_CORE_NETWORK" >/dev/null 2>&1 || true
             if [[ -n "$manager_stub_pid" ]]; then
@@ -631,6 +743,20 @@ jobs:
             --label org.ubitech.agent.network=core \
             "$UBITECH_CORE_NETWORK"
           docker compose -f containers/compose.yaml config --quiet
+          resolved_compose="$(docker compose -f containers/compose.yaml config --format json)"
+          jq -e --slurpfile expected "$verified_images" '
+            {
+              platform: .services.platform.image,
+              "agent-runtime": .services["agent-runtime"].image,
+              camofox: .services.camofox.image,
+              searxng: .services.searxng.image,
+              "firecrawl-api": .services["firecrawl-api"].image,
+              "firecrawl-playwright": .services["firecrawl-playwright"].image,
+              "firecrawl-postgres": .services["firecrawl-postgres"].image,
+              "firecrawl-redis": .services["firecrawl-redis"].image,
+              "firecrawl-rabbitmq": .services["firecrawl-rabbitmq"].image
+            } == ($expected[0] | del(."agent-sandbox"))
+          ' <<<"$resolved_compose" >/dev/null
           docker compose -f containers/compose.yaml up --detach agent-runtime camofox searxng platform
           for service in agent-runtime camofox searxng platform; do
             container="$(docker compose -f containers/compose.yaml ps -q "$service")"
@@ -660,27 +786,36 @@ jobs:
             test "$(stat -c %u /etc/searxng/settings.yml)" = "$(id -u)"
           '
           curl --fail --silent --show-error http://127.0.0.1:18080/healthz | jq -e '.service == "ubitech-agent-platform"'
-          docker compose -f containers/compose.yaml exec -T camofox node --input-type=module - <<'NODE'
-          import { readFileSync } from 'node:fs';
-          const key = readFileSync('/run/secrets/ubitech/camofox-access-key', 'utf8').trim();
-          const response = await fetch('http://127.0.0.1:9377/tabs', {
-            method: 'POST',
-            headers: {
-              authorization: `Bearer ${key}`,
-              'content-type': 'application/json',
-            },
-            body: JSON.stringify({
-              userId: 'release-smoke',
-              sessionKey: 'browser',
-              url: 'https://example.com/',
-            }),
-          });
-          if (!response.ok) throw new Error(`Camoufox tab creation failed: ${response.status} ${await response.text()}`);
-          const tab = await response.json();
-          if (tab.url !== 'https://example.com/') throw new Error(`unexpected Camoufox URL: ${tab.url}`);
-          const health = await (await fetch('http://127.0.0.1:9377/health')).json();
-          if (!health.browserConnected || !health.browserRunning) throw new Error('Camoufox browser did not start');
-          NODE
+          browser_fixture_path="$GITHUB_WORKSPACE/scripts/fixtures/browser-control.html"
+          test -f "$browser_fixture_path"
+          docker run --detach \
+            --name "$browser_fixture_container" \
+            --network "$UBITECH_CORE_NETWORK" \
+            --user "$UBITECH_UID:$UBITECH_GID" \
+            --read-only \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m \
+            --mount "type=bind,src=$browser_fixture_path,dst=/fixture/index.html,readonly" \
+            --entrypoint python \
+            "$UBITECH_PLATFORM_IMAGE" \
+            -m http.server 18081 --bind 0.0.0.0 --directory /fixture
+          for attempt in $(seq 1 50); do
+            if docker exec "$browser_fixture_container" python -c \
+              'import urllib.request; urllib.request.urlopen("http://127.0.0.1:18081/", timeout=1).read(1)'; then
+              break
+            fi
+            [[ "$attempt" -lt 50 ]] || {
+              docker logs "$browser_fixture_container"
+              exit 1
+            }
+            sleep 0.2
+          done
+          python3 scripts/browser-control-compose-smoke.py \
+            --platform-url http://127.0.0.1:18080 \
+            --bootstrap-password-file "$UBITECH_DATA_ROOT/data/bootstrap-admin-password.txt" \
+            --agent-tool-token-file "$UBITECH_SECRETS_DIR/agent-tool-token" \
+            --fixture-url "http://${browser_fixture_container}:18081/"
+          docker rm --force "$browser_fixture_container"
           sandbox_mount_root="$root/sandbox-uid-mapping"
           mkdir -p "$sandbox_mount_root/workspace" "$sandbox_mount_root/home" "$sandbox_mount_root/env"
           touch "$sandbox_mount_root/workspace/ownership-sentinel"
@@ -866,12 +1001,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download immutable image identities
+      - name: Download verified managed-image directory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: image-*
+          name: verified-managed-images
           path: artifacts
-          merge-multiple: true
 
       - name: Download Manager binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -904,7 +1038,11 @@ jobs:
           arm64_sha="$(awk 'NR==1 {print $1}' "$stage/ubitech-manager-linux-arm64.sha256")"
           generated_at="$(git show -s --format=%cI "$SOURCE_COMMIT")"
           database_schema_version="$(jq -er '.database_schema_version' docs/contracts/container-platform.json)"
-          image() { jq -er '.reference + "@" + .digest' "artifacts/$1.json"; }
+          verified_images="$(jq -ec '
+            select(length == 10) |
+            with_entries(select(.key | test("^[a-z0-9]+(-[a-z0-9]+)*$"))) |
+            select(length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
+          ' artifacts/verified-managed-images.json)"
           jq -n \
             --arg source_commit "$SOURCE_COMMIT" \
             --arg generated_at "$generated_at" \
@@ -916,10 +1054,7 @@ jobs:
             --arg manager_arm64_sha "$arm64_sha" \
             --arg compose_url "$release_base/ubitech-compose.yaml" \
             --arg compose_sha "$compose_sha" \
-            --arg platform "$(image platform)" \
-            --arg runtime "$(image agent-runtime)" \
-            --arg camofox "$(image camofox)" \
-            --arg sandbox "$(image agent-sandbox)" \
+            --argjson images "$verified_images" \
             '{
               schema_version: 1,
               channel: "main",
@@ -935,18 +1070,7 @@ jobs:
                 }
               },
               compose: {url: $compose_url, sha256: $compose_sha},
-              images: {
-                platform: $platform,
-                "agent-runtime": $runtime,
-                camofox: $camofox,
-                "agent-sandbox": $sandbox,
-                searxng: "ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812",
-                "firecrawl-api": "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c",
-                "firecrawl-playwright": "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2",
-                "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
-                "firecrawl-redis": "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
-                "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
-              }
+              images: $images
             }' > "$stage/release.json"
           python3 - "$stage/release.json" <<'PY'
           import json

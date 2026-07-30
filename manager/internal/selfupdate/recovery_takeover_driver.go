@@ -268,9 +268,8 @@ func (m *Manager) ensureOriginalPlanSuperseded(journal recoveryTakeoverJournal) 
 		return err
 	}
 	if sha256Hex(data) == journal.OriginalPlanSHA256 {
-		plan, err = m.bindB121ActivationPlan(plan, journal.OriginalState, journal.OriginalCandidate, journal.PlatformCommit)
-		if err != nil {
-			return fmt.Errorf("bind original Manager activation plan: %w", err)
+		if err := m.validateRecoveryPlanBinding(plan, journal.OriginalState, journal.OriginalCandidate, journal.PlatformCommit, false); err != nil {
+			return fmt.Errorf("validate original Manager activation plan: %w", err)
 		}
 		plan.Status = recoverySupersededStatus
 		plan.Error = "ordinary Manager activation was superseded by controlled Current recovery transaction " + journal.TransactionID
@@ -282,10 +281,6 @@ func (m *Manager) ensureOriginalPlanSuperseded(journal recoveryTakeoverJournal) 
 	}
 	settledState := journal.OriginalState
 	settledState.Activation = nil
-	plan, err = m.bindB121ActivationPlan(plan, settledState, journal.OriginalCandidate, journal.PlatformCommit)
-	if err != nil {
-		return fmt.Errorf("bind terminal original Manager activation plan: %w", err)
-	}
 	if err := m.validateRecoveryPlanBinding(plan, settledState, journal.OriginalCandidate, journal.PlatformCommit, false); err != nil {
 		return fmt.Errorf("validate terminal original Manager activation plan: %w", err)
 	}

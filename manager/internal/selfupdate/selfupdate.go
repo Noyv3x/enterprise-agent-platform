@@ -72,6 +72,8 @@ type Plan struct {
 	Error                 string    `json:"error,omitempty"`
 }
 
+const ordinaryRolledBackStatus = "rolled_back"
+
 type Runner interface {
 	Run(context.Context, string, ...string) error
 }
@@ -118,6 +120,16 @@ func (m *Manager) ProbeTransientUnit(ctx context.Context) error {
 }
 
 func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error {
+	if len(manifest.SourceCommit) < 12 {
+		return errors.New("release source commit is invalid")
+	}
+	rejected, err := m.activationRejected(manifest)
+	if err != nil {
+		return fmt.Errorf("check rejected Manager activation: %w", err)
+	}
+	if rejected {
+		return errors.New("Manager candidate was rejected by its activation watchdog and cannot be retried")
+	}
 	if err := ensureRecoveryDirectory(m.Root); err != nil {
 		return fmt.Errorf("prepare Manager binary root: %w", err)
 	}
@@ -133,9 +145,6 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	data, err := m.Client.FetchArtifact(ctx, artifact, 128<<20)
 	if err != nil {
 		return err
-	}
-	if len(manifest.SourceCommit) < 12 {
-		return errors.New("release source commit is invalid")
 	}
 	id := safeID(manifest.Manager.Version + "-" + manifest.SourceCommit[:12])
 	dir := filepath.Join(m.Root, "versions", id)
@@ -287,6 +296,12 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 	if plan.CandidateSHA != state.Activation.CandidateSHA {
 		return errors.New("manager activation plan does not match running binary")
 	}
+	if plan.Mode == "" && plan.Status == ordinaryRolledBackStatus {
+		if state.Current == nil || hash != state.Current.SHA256 || !binaryMatches(plan.InstallPath, hash) {
+			return errors.New("rolled-back Manager activation does not match the registered Current binary")
+		}
+		return settleOrdinaryRollbackState(plan)
+	}
 	if hash != state.Activation.CandidateSHA {
 		if plan.Mode == recoveryActivationMode {
 			return errors.New("current recovery activation can only be settled by its recovery watchdog")
@@ -295,6 +310,17 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 		// authoritative, so abort the durable intent and leave the verified
 		// candidate available for a later retry.
 		if state.Current != nil && hash == state.Current.SHA256 && binaryMatches(plan.InstallPath, hash) {
+			if plan.Activated {
+				if plan.Error == "" {
+					plan.Error = "candidate Manager was restored before startup acknowledgement"
+				}
+				plan.Status = ordinaryRolledBackStatus
+				plan.UpdatedAt = m.now()
+				if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+					return err
+				}
+				return settleOrdinaryRollbackState(plan)
+			}
 			state.Activation = nil
 			state.UpdatedAt = m.now()
 			plan.Status = "aborted_before_replace"
@@ -319,10 +345,6 @@ func (m *Manager) acknowledgeExecutable(executable string) error {
 		state.Candidate.Path != state.Activation.CandidatePath ||
 		!validSourceCommit(state.Candidate.SourceCommit) {
 		return errors.New("ordinary Manager activation has no committed Candidate binding")
-	}
-	plan, err = m.bindB121ActivationPlan(plan, state, *state.Candidate, state.Candidate.SourceCommit)
-	if err != nil {
-		return err
 	}
 	if err := m.validateRecoveryPlanBinding(plan, state, *state.Candidate, state.Candidate.SourceCommit, false); err != nil {
 		return err
@@ -524,6 +546,7 @@ func commitActivationWithOwnership(planPath string, plan Plan, ownership *recove
 
 func restorePrevious(plan Plan, runner Runner) error {
 	plan.Error = journal.BoundDiagnostic(plan.Error)
+	rollbackError := plan.Error
 	if plan.Mode == recoveryActivationMode {
 		ownership, err := readRecoveryTakeoverOwnership(plan)
 		if err != nil {
@@ -548,6 +571,11 @@ func restorePrevious(plan Plan, runner Runner) error {
 		if durablePlan.Status == recoverySupersededStatus {
 			return errors.New("activation rollback was superseded by controlled Current recovery")
 		}
+		if err := validateOrdinaryActivationIdentity(plan, durablePlan); err != nil {
+			return fmt.Errorf("revalidate activation identity before rollback: %w", err)
+		}
+		plan = durablePlan
+		plan.Error = rollbackError
 	}
 	previous, readErr := os.ReadFile(plan.PreviousPath)
 	if readErr != nil {
@@ -556,21 +584,63 @@ func restorePrevious(plan Plan, runner Runner) error {
 	if err := atomicfile.WriteFile(plan.InstallPath, previous, 0o755); err != nil {
 		return fmt.Errorf("restore previous Manager: %w", err)
 	}
-	var state State
-	if err := atomicfile.ReadJSON(plan.StatePath, &state); err == nil {
-		state.Activation = nil
-		state.UpdatedAt = time.Now().UTC()
-		_ = atomicfile.WriteJSON(plan.StatePath, state, 0o600)
+	if plan.Error == "" {
+		plan.Error = "candidate Manager activation was rejected by its watchdog"
 	}
-	plan.Status = "rolled_back"
+	plan.Status = ordinaryRolledBackStatus
 	plan.UpdatedAt = time.Now().UTC()
 	if plan.PlanPath != "" {
-		_ = persistActivationPlan(plan.PlanPath, plan)
+		if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+			restartErr := runner.Run(context.Background(), "systemctl", "--user", "restart", "--no-block", plan.UnitName)
+			return errors.Join(fmt.Errorf("persist terminal Manager rollback plan: %w", err), restartErr)
+		}
+	}
+	if err := settleOrdinaryRollbackState(plan); err != nil {
+		restartErr := runner.Run(context.Background(), "systemctl", "--user", "restart", "--no-block", plan.UnitName)
+		return errors.Join(fmt.Errorf("clear rejected Manager candidate: %w", err), restartErr)
 	}
 	if err := runner.Run(context.Background(), "systemctl", "--user", "restart", "--no-block", plan.UnitName); err != nil {
 		return fmt.Errorf("previous Manager restored but restart failed: %w", err)
 	}
 	return errors.New(plan.Error)
+}
+
+func validateOrdinaryActivationIdentity(expected, actual Plan) error {
+	if actual.Mode != "" || expected.PlanPath == "" || actual.PlanPath != expected.PlanPath ||
+		actual.StatePath != expected.StatePath || actual.InstallPath != expected.InstallPath ||
+		actual.UnitName != expected.UnitName || actual.CandidateVersion != expected.CandidateVersion ||
+		actual.CandidateSHA != expected.CandidateSHA || actual.CandidatePath != expected.CandidatePath ||
+		actual.PlatformCommit != expected.PlatformCommit || actual.PreviousPath != expected.PreviousPath {
+		return errors.New("ordinary activation plan identity changed")
+	}
+	return nil
+}
+
+func settleOrdinaryRollbackState(plan Plan) error {
+	if plan.Mode != "" || plan.Status != ordinaryRolledBackStatus || plan.PlanPath == "" ||
+		plan.CandidateSHA == "" || plan.CandidatePath == "" || plan.PlatformCommit == "" {
+		return errors.New("ordinary activation rollback evidence is incomplete")
+	}
+	var state State
+	if err := atomicfile.ReadJSON(plan.StatePath, &state); err != nil {
+		return err
+	}
+	if state.Activation != nil && (state.Activation.PlanPath != plan.PlanPath ||
+		state.Activation.CandidateSHA != plan.CandidateSHA || state.Activation.CandidatePath != plan.CandidatePath) {
+		return errors.New("ordinary activation ownership changed before rollback state commit")
+	}
+	if state.Candidate != nil && (state.Candidate.SourceCommit != plan.PlatformCommit ||
+		state.Candidate.Version != plan.CandidateVersion || state.Candidate.SHA256 != plan.CandidateSHA ||
+		state.Candidate.Path != plan.CandidatePath) {
+		return errors.New("Manager candidate changed before rollback state commit")
+	}
+	if state.Activation == nil && state.Candidate == nil {
+		return nil
+	}
+	state.Activation = nil
+	state.Candidate = nil
+	state.UpdatedAt = time.Now().UTC()
+	return atomicfile.WriteJSON(plan.StatePath, state, 0o600)
 }
 
 func persistActivationPlan(path string, plan Plan) error {
@@ -824,6 +894,58 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 		return false, err
 	}
 	return state.Activation == nil && state.Current != nil && state.Current.SourceCommit == manifest.SourceCommit, nil
+}
+
+// ActivationRolledBack is the durable negative activation barrier consumed by
+// operation recovery. It reports true only when the exact release candidate was
+// rejected, both candidate references were cleared atomically, and the stable
+// executable is the still-registered previous Manager.
+func (m *Manager) ActivationRolledBack(manifest release.Manifest) (bool, error) {
+	rejected, err := m.activationRejected(manifest)
+	if err != nil || !rejected {
+		return false, err
+	}
+	state, err := m.load()
+	if err != nil {
+		return false, err
+	}
+	if state.Activation != nil || state.Candidate != nil {
+		return false, nil
+	}
+	if state.Current == nil || state.Current.SourceCommit == manifest.SourceCommit ||
+		!binaryMatches(state.Current.Path, state.Current.SHA256) || !binaryMatches(m.InstallPath, state.Current.SHA256) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (m *Manager) activationRejected(manifest release.Manifest) (bool, error) {
+	if len(manifest.SourceCommit) < 12 {
+		return false, errors.New("release source commit is invalid")
+	}
+	artifact, ok := manifest.Manager.Artifacts[runtime.GOARCH]
+	if !ok {
+		return false, errors.New("manager artifact is missing")
+	}
+	planPath := filepath.Join(m.Root, "activations", safeID(manifest.SourceCommit)+".json")
+	var plan Plan
+	if err := atomicfile.ReadJSON(planPath, &plan); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if plan.Status != ordinaryRolledBackStatus {
+		return false, nil
+	}
+	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), "ubitech-manager")
+	if plan.Mode != "" || plan.PlanPath != planPath || plan.StatePath != m.StatePath ||
+		plan.InstallPath != m.InstallPath || plan.CandidateVersion != manifest.Manager.Version ||
+		!strings.EqualFold(plan.CandidateSHA, artifact.SHA256) || plan.CandidatePath != expectedCandidatePath ||
+		plan.PlatformCommit != manifest.SourceCommit {
+		return false, errors.New("terminal Manager activation plan does not match the release candidate")
+	}
+	return true, nil
 }
 
 // AwaitStartupCommit keeps the candidate control socket alive while the

@@ -6,7 +6,7 @@
 
 `ubitech-manager` 是部署机唯一更新控制器。部署机不读取 Git remote、branch 或 working tree，也不从仓库脚本启动产品。main 通道的 release manifest 是唯一版本目录；实际运行身份由清单中的完整 Manager 校验和、Compose 内容和镜像 digest 共同确定。
 
-CI 只有在文档门禁、Python、Runtime、前端、Manager、容器构建、上游契约与真实 Compose smoke test 全部成功后才发布清单。每个 main commit 先产生不可变 `container-<commit>` release，main 通道再在全局 promotion 锁内只向已通过质量门的后代 commit 单调推进。较早 workflow 即使后完成，也不能改写 latest 或触发降级。发布清单必须最后出现，实例不能看到半套发布物。
+CI 只有在文档门禁、Python、Runtime、前端、Manager、容器构建、上游契约与真实 Compose smoke test 全部成功后才发布清单。全部受管镜像先生成唯一的已验证 digest 目录：双架构容量门、真实 Compose 验收与最终 release manifest 必须消费这一份目录。Compose 验收在启动前逐项确认解析后的服务镜像就是将发布的 digest，不得使用另一套默认值通过验收。每个 main commit 先产生不可变 `container-<commit>` release，main 通道再在全局 promotion 锁内只向已通过质量门的后代 commit 单调推进。较早 workflow 即使后完成，也不能改写 latest 或触发降级。发布清单必须最后出现，实例不能看到半套发布物。
 
 Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Compose 先下载到同目录 staging，完整验证并同步后原子发布。相同 commit 的工件必须逐字节一致；缺件或内容漂移视为 immutable-ID collision，必须在拉取镜像和进入维护前失败。
 
@@ -15,6 +15,8 @@ Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Com
 ## 检测与预拉取
 
 管理员可以启用 Manager 轮询、从管理界面提交检查，或使用宿主 CLI。其它进程不得实现第二套更新器。发现更新时，Manager 先校验 HTTPS、协议版本、宿主架构、数据库版本、磁盘空间、Manager 工件和全部镜像 digest，再在平台仍可使用时准备候选工件。切换前只强制预拉取 Platform 与 Agent Runtime 的精确 digest；本地已经存在的 digest 不访问 registry。每个缺失核心镜像的拉取同时受无输出空闲时限和较大的绝对上限约束，超时在进入维护前记录为可重试失败，继续保留 current generation。Camoufox、SearXNG、Firecrawl 与 Agent Sandbox 镜像由各自的后台收敛或首次使用独立拉取，不能因第三方 registry 缓慢阻塞核心更新。
+
+所有受管镜像都使用同一份按镜像上限目录。能力服务或 Sandbox 在按需拉取前先精确检查本地 digest，只为缺失项累计压缩层与展开后上限，并对 Docker 文件系统执行普通进程可用字节和 inode 门禁。容量不足时只运行一次受控维护并重新计算；仍不足就保持现有服务、把能力标记为 degraded 或让本次 Sandbox 创建明确重试，不能继续拉取到磁盘耗尽。能力栈先逐 digest 完成有界拉取，再执行 Compose 收敛，不能让 Compose 隐式拉取绕过容量门。失败时只删除本次调用开始前不存在、仍无容器消费者的精确 digest；不得清理未知 layer 或其它项目资源。
 
 镜像就绪后公开状态进入 `waiting_for_tasks`。Platform 继续服务，直到没有以下活动：
 
@@ -66,9 +68,9 @@ Firecrawl 显式使用 `NUQ_BACKEND=pg` 的 PostgreSQL 队列基线。后台收�
 
 ## 自维护与空间回收
 
-Manager 在启动、更新成功后和低频定时器中运行同一幂等维护循环。只有 `idle + maintenance=false`、没有 activation/active/finalize operation 且 Sandbox/host 执行登记稳定时才允许删除；仅由更新检查产生、尚未进入 operation 的候选可以存在，但必须进入保护集合。清理准入与 operation 创建、候选发布及按需 Sandbox 注册共用短临界区，不能在读取空闲状态后与新执行交错。每轮先计算保护集合：current、previous、候选、自更新 activation、未终结 operation、回滚快照、正在运行或已登记 Sandbox，以及全部现有容器引用的镜像和挂载。
+Manager 在启动、更新成功后和低频定时器中运行同一幂等维护循环。只有 `idle + maintenance=false`、没有 activation/active/finalize operation 且 Sandbox/host 执行登记稳定时才允许删除；仅由更新检查产生、尚未进入 operation 的候选可以存在，但必须进入保护集合。更新 preflight 为释放容量而显式允许当前 operation 进入维护循环时，该 operation 必须是唯一未终结 operation，其 `target_generation` 与 `snapshot_path` 也必须分别作为 release 与快照保护项；任一 operation journal 不可读、身份不一致或出现第二个未终结 operation 都失败关闭。清理准入与 operation 创建、候选发布及按需 Sandbox 注册共用短临界区，不能在读取空闲状态后与新执行交错。每轮先计算保护集合：current、previous、候选、自更新 activation、未终结 operation、回滚快照、正在运行或已登记 Sandbox，以及全部现有容器引用的镜像和挂载。
 
-清理对象必须同时具备可验证的 Manager provenance 和零消费者。数据库 generation 快照使用 `migration_backup_retention_seconds` 的七天恢复窗口；不可达 release、对应受管 digest 镜像、旧 Manager binary 与可证明来源的 staging/download 临时工件使用独立的 `obsolete_artifact_retention_seconds` 一小时宽限，避免高频发布把镜像积累到磁盘耗尽。终态 recovery journal 与 activation plan 属于审计证据，不作为普通临时文件泛化删除。每个对象独立、非 force 删除并记录有界结果；未知文件、未知 label、符号链接、路径越界、仍被引用或状态读取失败都跳过。禁止 `docker system/image/volume prune`、按仓库名通配删除、递归清空 backups/data 或处理其它项目的 Docker 资源。
+清理对象必须同时具备可验证的 Manager provenance 和零消费者。数据库 generation 快照使用 `migration_backup_retention_seconds` 的七天恢复窗口；不可达 release、对应受管 digest 镜像、旧 Manager binary 与可证明来源的 staging/download 临时工件使用独立的 `obsolete_artifact_retention_seconds` 一小时宽限，避免高频发布把镜像积累到磁盘耗尽。终态 recovery journal 与 activation plan 属于审计证据，不作为普通临时文件泛化删除。每轮依次尝试快照、release（连同其不可达镜像）和旧 Manager binary 三个独立清理域；一个域失败不得跳过其余安全域，最终聚合有界错误与各域删除计数。每个对象独立、非 force 删除并记录有界结果；未知文件、未知 label、符号链接、路径越界、仍被引用或状态读取失败都跳过。禁止 `docker system/image/volume prune`、按仓库名通配删除、递归清空 backups/data 或处理其它项目的 Docker 资源。
 
 更新 preflight 在下载前检查数据根与 Docker root 所在文件系统的普通进程可用字节和普通用户可用 inode。Manager 先按精确 digest 检查本机，仅为缺失的 Platform/Runtime 镜像累计 [`container-platform.json`](../contracts/container-platform.json) 中的压缩层上限与展开后上限，再加下载安全余量。切换前的字节门槛不是一个孤立常数：Manager 对每个当前受管快照源取逻辑文件大小和已分配块大小中的较大者并安全求和，再加契约中的 `update_pre_cutover_min_free_bytes` 固定安全余量；文件类型、大小计数或整数边界不可证明时失败关闭。发布 CI 必须对两个受支持架构逐项验证压缩层和展开后尺寸不超过这些上限，超限 release 不得发布。当前严格 manifest 协议保持原 JSON 形状，以免尚未接收本次 Manager 更新的实例因未知字段自阻断；容量估算与同一 source commit 的 canonical contract 和发布门绑定，而不是由部署机猜测。
 
@@ -94,9 +96,11 @@ Manager 在任一 phase 被终止、宿主重启或 Docker 重启后，从 opera
 
 operation 终态与 Manager state 的半提交窗口必须显式收敛：失败 operation 已落盘但 active id 未清除时只能完成失败收尾；current 已提交但 finalize 尚未完成时保持 `finalize_pending` 和维护，重新执行核心探针及幂等 finalize hook，最后才释放 reservation。能力级服务的健康状态不参与该探针。任何 checkpoint 写入错误都必须可观察，不能伪造完成。
 
-候选 Manager 尚未被 watchdog 接纳时，journal 损坏、核心 readiness 失败或控制入口不可用必须使候选进程退出，由 watchdog 恢复 previous Manager。候选已经成为 current 后，恢复或 finalize 的暂时错误不再是 Manager 进程级致命错误：Manager 必须保持公网维护页和控制接口在线，持久保留原 operation，并由后台循环带退避重试。不可恢复错误同样不得形成 systemd 崩溃循环；它保持安全维护状态并向宿主 CLI 提供有界诊断和受控恢复入口。
+候选 Manager 尚未被 watchdog 接纳时，journal 损坏、核心 readiness 失败或控制入口不可用必须使候选进程退出，由 watchdog 恢复 previous Manager。普通 activation 一旦由 watchdog 判定失败，必须把失败 Candidate 从可自动激活状态原子移除并在终态 plan 中保留身份；previous Manager 重启后不得再次激活同一二进制。若 Platform generation 已经提交但仍在等待这次 Manager activation，恢复循环使用原 operation、原 reservation 和原更新前快照自动停止失败 generation、恢复 previous generation 与数据、释放 reservation，并把本次更新终结为可重试失败。该回退在每个 journal 半提交窗口都必须幂等；不能留下永久 `finalize_pending`，也不能要求人工清除 Candidate。
 
-唯一部署点从 `b121de2892497ff1cc3a786a4e42c3119dcb22a9` 跨越到下一代 Manager 时允许一次严格限定的 activation-plan 补全：只有 Current 的 version 与 source commit 都精确等于该提交、普通 plan 的原始 JSON 同时没有 `candidate_path` 与 `platform_commit`、其余 Manager state、Candidate、activation、Platform manifest 和 operation 证据全部一致时，才可从已经校验的 Candidate 与 Platform generation 补回这两个字段。单字段缺失、其它生产者、身份漂移或文件篡改必须失败关闭；原始 plan 字节哈希仍作为接管 journal 的证据。部署点持久提交下一代 Current 且 operation 完成 finalize 后必须删除这条临时桥接。
+当前基线不接受未完整绑定身份的 activation plan。普通 plan 必须在首次持久化时同时写入 `candidate_path` 与 `platform_commit`，并在启动确认、watchdog 回滚、外部恢复接管和终态收敛的每个边界与已验证且已提交的 Candidate、Activation 和 Platform generation 精确匹配。任一字段缺失、部分绑定、身份漂移或文件篡改都必须失败关闭；恢复路径不得从 Current、Candidate、manifest 或路径规则推断、补写这两个字段。接管 journal、watchdog、回滚和 recovery activation 仍保留原始 plan 字节哈希与完整身份链作为持久证据。
+
+候选已经成为 current 后，恢复或 finalize 的暂时错误不再是 Manager 进程级致命错误：Manager 必须保持公网维护页和控制接口在线，持久保留原 operation，并由后台循环带退避重试。不可恢复错误同样不得形成 systemd 崩溃循环；它保持安全维护状态并向宿主 CLI 提供有界诊断和受控恢复入口。
 
 候选固定服务启动或探针失败时，Manager 在删除容器前采集有界的 healthcheck 和日志诊断。所有诊断先脱敏再截断；采集失败可以附加错误，但不能阻止安全回滚。
 

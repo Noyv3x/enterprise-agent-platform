@@ -29,6 +29,8 @@ Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 diges
 
 真实启动 SearXNG 后还必须检查容器 Mounts，证明 `/etc/searxng` 来自受管 config 根的只读 bind，且镜像声明没有额外生成匿名 volume；只检查 Compose 文本不足以覆盖镜像自身的 `VOLUME` 行为。
 
+Camoufox 发布验收使用同一 Compose 中的真实 Platform/Camoufox 镜像与一个只接入临时 core network 的静态页面，不访问公网。测试必须经 Platform 登录和内部 browser Gateway 建立私人 scope/tab，再经浏览器同源控制 API 完成 `acquire → 坐标 click → text → key → wheel → frame/snapshot → release`；租约期间 Agent 变更型动作必须返回冲突，释放后必须重新可用。测试不得把管理员密码、session 或内部 bearer 放进命令参数和输出。
+
 ## Python 平台
 
 ```bash
@@ -109,7 +111,7 @@ npm run build
 
 发布冒烟会故意把 Agent Sandbox 挂载根映射为与 CI runner 不同的 UID/GID。测试退出路径必须先尝试停止并移除相关容器，再以 runner 的受控提权只清理 `RUNNER_TEMP` 下由 `mktemp` 创建且带固定产品前缀的单一临时树；不能用普通 runner 身份递归删除已重映射的目录，也不能对未经前缀约束的路径执行提权删除。受控临时树清理失败仍应让发布失败，避免把残留数据掩盖为成功。
 
-原子 release 组装只能按独立 artifact family 下载 `image-*` 镜像身份与 `manager-*` 二进制，不得使用 `*` 下载当前 run 的全部 artifact。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
+原子 release 组装只能下载经过匿名拉取、双架构容量和本地镜像身份验证后生成的单一 `verified-managed-images` 目录，以及独立的 `manager-*` 二进制 family；不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Compose 冒烟和最终 manifest 必须消费同一份已验证目录，不能各自维护镜像默认值。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
 
 镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖其同名中间 artifact。真正修改 GitHub Release 的 `publish` job 必须按 `prepare` 已解析的完整 source commit 跨 run 串行，不能使用可能指向同一提交的原始分支/ref 文本作为锁键；已公开 release 仍逐文件比较并拒绝漂移，main channel promotion 使用独立的全局单调锁。
 

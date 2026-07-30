@@ -47,7 +47,7 @@ Python Platform 容器拥有产品业务状态：
 - OAuth 流程、凭据刷新和可见模型目录；
 - Telegram 与面向 Runtime 的内部业务工具 Gateway。
 
-SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务及 Telegram 投递通过持久任务账本记录；进程重启后，安全可重试的任务可重新排队，已开始副作用的任务进入人工复核。Platform 只接受当前数据库基线或精确的直接源基线；后者的受限迁移会在证明新 scope/runtime 状态完整后原子删除退役 `private_agents` 登记表，不恢复其任何运行逻辑。Platform 不再安装依赖、拉取上游源码、调用 Compose 或拥有服务生命周期。
+SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务及 Telegram 投递通过持久任务账本记录；进程重启后，安全可重试的任务可重新排队，已开始副作用的任务进入人工复核。Platform 只接受当前数据库 marker 与精确结构，任何其它非空数据库都在修改前拒绝。Platform 不安装依赖、拉取上游源码、调用 Compose 或拥有服务生命周期。
 
 ## Agent Runtime
 

@@ -2,22 +2,32 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ubitech/agent-platform/manager/internal/config"
+	"github.com/ubitech/agent-platform/manager/internal/contract"
 	"github.com/ubitech/agent-platform/manager/internal/control"
 	"github.com/ubitech/agent-platform/manager/internal/driver"
 	"github.com/ubitech/agent-platform/manager/internal/journal"
+	"github.com/ubitech/agent-platform/manager/internal/maintenance"
 	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/ubitech/agent-platform/manager/internal/sandbox"
+	"github.com/ubitech/agent-platform/manager/internal/selfupdate"
+	"github.com/ubitech/agent-platform/manager/internal/snapshot"
 )
 
 type observedFixedStackLocker struct {
@@ -41,7 +51,76 @@ func (l *observedFixedStackLocker) Unlock() { l.mu.Unlock() }
 
 type firecrawlRunner struct{ calls chan []string }
 
+type recordingMaintenanceCleanup struct {
+	calls              []string
+	protectedSnapshots map[string]struct{}
+	protectedIDs       map[string]struct{}
+	protectedImages    map[string]struct{}
+	heldImages         map[string]struct{}
+	snapshotErr        error
+	releaseErr         error
+	managerErr         error
+	snapshotAction     func(release.RemovalGuard)
+	releaseAction      func(release.RemovalGuard)
+}
+
+type maintenanceDockerRunner struct {
+	removed []string
+}
+
+func (r *maintenanceDockerRunner) Run(_ context.Context, _ string, args []string, _ []string) (driver.Result, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case joined == "ps --all --quiet --no-trunc":
+		return driver.Result{}, nil
+	case len(args) == 5 && args[0] == "image" && args[1] == "inspect":
+		digest := sha256.Sum256([]byte(args[4]))
+		return driver.Result{Stdout: "sha256:" + hex.EncodeToString(digest[:]) + "\n"}, nil
+	case len(args) == 3 && args[0] == "image" && args[1] == "rm":
+		r.removed = append(r.removed, args[2])
+		return driver.Result{}, nil
+	default:
+		return driver.Result{}, fmt.Errorf("unexpected Docker maintenance command: %s", joined)
+	}
+}
+
+func (c *recordingMaintenanceCleanup) PruneSnapshots(_ context.Context, _ time.Time, protected map[string]struct{}, guard release.RemovalGuard) (int, error) {
+	c.calls = append(c.calls, "snapshots")
+	c.protectedSnapshots = cloneStringSet(protected)
+	if c.snapshotAction != nil {
+		c.snapshotAction(guard)
+	}
+	return 1, c.snapshotErr
+}
+
+func (c *recordingMaintenanceCleanup) PruneReleases(_ context.Context, _ time.Time, protectedIDs, protectedImages, heldImages map[string]struct{}, guard release.RemovalGuard) (int, error) {
+	c.calls = append(c.calls, "releases-and-images")
+	c.protectedIDs = cloneStringSet(protectedIDs)
+	c.protectedImages = cloneStringSet(protectedImages)
+	c.heldImages = cloneStringSet(heldImages)
+	if c.releaseAction != nil {
+		c.releaseAction(guard)
+	}
+	return 2, c.releaseErr
+}
+
+func (c *recordingMaintenanceCleanup) PruneManagerVersions(_ context.Context, _ time.Time, _ time.Duration) (int, error) {
+	c.calls = append(c.calls, "manager-versions")
+	return 3, c.managerErr
+}
+
+func cloneStringSet(source map[string]struct{}) map[string]struct{} {
+	result := make(map[string]struct{}, len(source))
+	for value := range source {
+		result[value] = struct{}{}
+	}
+	return result
+}
+
 func (r firecrawlRunner) Run(_ context.Context, _ string, args []string, _ []string) (driver.Result, error) {
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+		return driver.Result{Stdout: "[\"" + args[len(args)-1] + "\"]\n"}, nil
+	}
 	r.calls <- append([]string(nil), args...)
 	return driver.Result{}, nil
 }
@@ -77,6 +156,9 @@ func TestTriggeredReconciliationRunsBeforeThePeriodicDelay(t *testing.T) {
 }
 
 func (r *blockingFirecrawlRunner) Run(ctx context.Context, _ string, args []string, _ []string) (driver.Result, error) {
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+		return driver.Result{Stdout: "[\"" + args[len(args)-1] + "\"]\n"}, nil
+	}
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string(nil), args...))
 	r.mu.Unlock()
@@ -86,6 +168,15 @@ func (r *blockingFirecrawlRunner) Run(ctx context.Context, _ string, args []stri
 		return driver.Result{}, ctx.Err()
 	}
 	return driver.Result{}, errors.New("unexpected diagnostic command after reconciliation cancellation")
+}
+
+func testFirecrawlImages(digestCharacter string) map[string]string {
+	image := "registry/firecrawl@sha256:" + strings.Repeat(digestCharacter, 64)
+	return map[string]string{
+		"firecrawl-api": image, "firecrawl-playwright": image,
+		"firecrawl-postgres": image, "firecrawl-redis": image,
+		"firecrawl-rabbitmq": image,
+	}
 }
 
 func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
@@ -98,6 +189,245 @@ func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
 	}
 	if !autoUpdateDue(last, last.Add(31*time.Second), 30*time.Second) {
 		t.Fatal("a shorter patched interval was not effective")
+	}
+}
+
+func TestReconcileMaintenanceProtectsEveryReachableResource(t *testing.T) {
+	heldImage := maintenanceImage("held-sandbox")
+	cleanup := &recordingMaintenanceCleanup{}
+	app, store := newMaintenanceTestApplication(t, cleanup, []sandbox.Record{{
+		SandboxID: "sandbox-1", WorkspaceID: "user-1", Image: heldImage,
+	}})
+	currentID, previousID, candidateID := strings.Repeat("1", 40), strings.Repeat("2", 40), strings.Repeat("3", 40)
+	currentImage, previousImage, candidateImage := maintenanceImage("current"), maintenanceImage("previous"), maintenanceImage("candidate")
+	currentSnapshot, previousSnapshot, candidateSnapshot := "/backups/current", "/backups/previous", "/backups/candidate"
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID, RollbackSnapshotPath: currentSnapshot, Images: map[string]string{"platform": currentImage, "opaque-extension": maintenanceImage("opaque")}}
+		state.Previous = &model.Generation{ID: previousID, RollbackSnapshotPath: previousSnapshot, Images: map[string]string{"agent-runtime": previousImage}}
+		state.Candidate = &model.Generation{ID: candidateID, RollbackSnapshotPath: candidateSnapshot, Images: map[string]string{"camofox": candidateImage, "platform": "registry.invalid/platform:latest"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	operation, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "maintenance-protection", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, targetSnapshot := strings.Repeat("4", 40), "/backups/active-operation"
+	if _, err := store.UpdateOperation(operation.ID, func(value *model.Operation) error {
+		value.TargetGeneration = targetID
+		value.SnapshotPath = targetSnapshot
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selfCurrentID, selfPreviousID, selfCandidateID := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
+	writeTestJSON(t, app.selfUpdate.StatePath, selfupdate.State{
+		SchemaVersion: 1,
+		Current:       &selfupdate.Version{SourceCommit: selfCurrentID},
+		Previous:      &selfupdate.Version{SourceCommit: selfPreviousID},
+		Candidate:     &selfupdate.Version{SourceCommit: selfCandidateID},
+	})
+	additionalID, additionalImage := strings.Repeat("5", 40), maintenanceImage("additional")
+	additional := release.Manifest{SourceCommit: additionalID, Images: map[string]string{"firecrawl-api": additionalImage, "future-service": maintenanceImage("future")}}
+
+	if err := app.reconcileMaintenanceWithProtection(context.Background(), operation.ID, &additional); err != nil {
+		t.Fatal(err)
+	}
+	assertStringSetContains(t, cleanup.protectedSnapshots, currentSnapshot, previousSnapshot, candidateSnapshot, targetSnapshot)
+	assertStringSetContains(t, cleanup.protectedIDs, currentID, previousID, candidateID, targetID, additionalID, selfCurrentID, selfPreviousID, selfCandidateID)
+	assertStringSetContains(t, cleanup.protectedImages, currentImage, previousImage, candidateImage, additionalImage)
+	assertStringSetContains(t, cleanup.heldImages, heldImage)
+	if _, included := cleanup.protectedImages[maintenanceImage("opaque")]; included {
+		t.Fatal("opaque manifest image crossed the managed-image protection boundary")
+	}
+	if _, included := cleanup.protectedImages[maintenanceImage("future")]; included {
+		t.Fatal("unknown additional image crossed the managed-image protection boundary")
+	}
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,manager-versions" {
+		t.Fatalf("maintenance calls = %s", got)
+	}
+}
+
+func TestReconcileMaintenanceFailsClosedOutsideStableIdleBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		records    []sandbox.Record
+		mutate     func(*model.ManagerState)
+		selfState  *selfupdate.State
+		activeHost bool
+	}{
+		{name: "no current generation", mutate: func(state *model.ManagerState) { state.Current = nil }},
+		{name: "maintenance active", mutate: func(state *model.ManagerState) { state.Maintenance = true }},
+		{name: "finalize pending", mutate: func(state *model.ManagerState) { state.FinalizePendingOperationID = "op_finalize" }},
+		{name: "active operation", mutate: func(state *model.ManagerState) { state.ActiveOperationID = "op_active" }},
+		{name: "non-idle public state", mutate: func(state *model.ManagerState) { state.PublicState = model.StateWaitingForTasks }},
+		{name: "active sandbox call", records: []sandbox.Record{{SandboxID: "sandbox-active", WorkspaceID: "user-1", Image: maintenanceImage("sandbox"), ActiveCalls: 1}}},
+		{name: "active sandbox process", records: []sandbox.Record{{SandboxID: "sandbox-process", WorkspaceID: "user-1", Image: maintenanceImage("sandbox"), BackgroundProcesses: 1}}},
+		{name: "active host process", activeHost: true},
+		{name: "manager activation", selfState: &selfupdate.State{SchemaVersion: 1, Activation: &selfupdate.Activation{PlanPath: "/activation"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := &recordingMaintenanceCleanup{}
+			app, store := newMaintenanceTestApplication(t, cleanup, test.records)
+			if test.mutate != nil {
+				if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error { test.mutate(state); return nil }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.selfState != nil {
+				writeTestJSON(t, app.selfUpdate.StatePath, *test.selfState)
+			}
+			if test.activeHost {
+				app.maintenanceActiveProcesses = func() int { return 1 }
+			}
+			if err := app.reconcileMaintenance(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(cleanup.calls) != 0 {
+				t.Fatalf("cleanup crossed an unsafe boundary: %#v", cleanup.calls)
+			}
+		})
+	}
+}
+
+func TestReconcileMaintenanceAbortsDeletionWhenOperationChangesAfterPlanning(t *testing.T) {
+	cleanup := &recordingMaintenanceCleanup{}
+	app, store := newMaintenanceTestApplication(t, cleanup, nil)
+	operation, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "maintenance-race", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOperation(operation.ID, func(value *model.Operation) error {
+		value.TargetGeneration = strings.Repeat("d", 40)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guardAccepted := true
+	cleanup.snapshotAction = func(guard release.RemovalGuard) {
+		if _, err := store.UpdateOperation(operation.ID, func(value *model.Operation) error {
+			value.SnapshotPath = "/backups/published-after-plan"
+			value.UpdatedAt = value.UpdatedAt.Add(time.Second)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, guardAccepted = guard()
+	}
+	cleanup.releaseAction = func(guard release.RemovalGuard) {
+		if _, ok := guard(); ok {
+			t.Error("release deletion guard reopened after the maintenance plan was invalidated")
+		}
+	}
+	if err := app.reconcileMaintenanceForOperation(context.Background(), operation.ID); err != nil {
+		t.Fatal(err)
+	}
+	if guardAccepted {
+		t.Fatal("operation journal changed after planning but the deletion guard remained open")
+	}
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images" {
+		t.Fatalf("cleanup after concurrent mutation = %s; Manager binary cleanup must not start", got)
+	}
+}
+
+func TestReconcileMaintenanceIsolatesCleanupDomainFailures(t *testing.T) {
+	cleanup := &recordingMaintenanceCleanup{
+		snapshotErr: errors.New("snapshot cleanup failed"),
+		releaseErr:  errors.New("release cleanup failed"),
+		managerErr:  errors.New("manager cleanup failed"),
+	}
+	app, _ := newMaintenanceTestApplication(t, cleanup, nil)
+	err := app.reconcileMaintenance(context.Background())
+	if err == nil {
+		t.Fatal("independent cleanup failures were discarded")
+	}
+	for _, message := range []string{"snapshot cleanup failed", "release cleanup failed", "manager cleanup failed"} {
+		if !strings.Contains(err.Error(), message) {
+			t.Fatalf("combined maintenance error %q omitted %q", err, message)
+		}
+	}
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,manager-versions" {
+		t.Fatalf("one cleanup failure suppressed another domain: %s", got)
+	}
+}
+
+func TestReconcileMaintenanceJointlyReclaimsSnapshotsReleasesImagesAndManagerVersions(t *testing.T) {
+	root := t.TempDir()
+	stateRoot := filepath.Join(root, "manager")
+	dataRoot := filepath.Join(root, "data")
+	dataDir := filepath.Join(dataRoot, "platform")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "platform.db"), []byte("database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	snapshots := snapshot.Store{DataDir: dataDir, BackupDir: filepath.Join(dataRoot, "backups"), Retention: time.Hour, StagingRetention: time.Hour}
+	protectedSnapshot, err := snapshots.Create(context.Background(), "op_protected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	obsoleteSnapshot, err := snapshots.Create(context.Background(), "op_obsolete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSnapshotCreatedAt(t, protectedSnapshot, now.Add(-2*time.Hour))
+	setSnapshotCreatedAt(t, obsoleteSnapshot, now.Add(-2*time.Hour))
+
+	releasesRoot := filepath.Join(stateRoot, "releases")
+	currentID, obsoleteID := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	currentManifest, currentRelease := writeMaintenanceRelease(t, releasesRoot, currentID, now.Add(-2*time.Hour), "current")
+	obsoleteManifest, obsoleteRelease := writeMaintenanceRelease(t, releasesRoot, obsoleteID, now.Add(-2*time.Hour), "obsolete")
+
+	selfUpdater := &selfupdate.Manager{Root: filepath.Join(stateRoot, "manager-binaries"), StatePath: filepath.Join(stateRoot, "manager-binaries.json")}
+	currentVersion := writeMaintenanceManagerVersion(t, selfUpdater.Root, "current", currentID, now.Add(-2*time.Hour))
+	obsoleteVersion := writeMaintenanceManagerVersion(t, selfUpdater.Root, "obsolete", obsoleteID, now.Add(-2*time.Hour))
+	writeTestJSON(t, selfUpdater.StatePath, selfupdate.State{SchemaVersion: 1, Current: &currentVersion, UpdatedAt: now})
+
+	store, err := journal.Open(stateRoot, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(now, func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID, Images: currentManifest.Images, RollbackSnapshotPath: protectedSnapshot}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sandboxes, err := sandbox.Open(nil, dataDir, filepath.Join(stateRoot, "sandboxes.json"), currentManifest.Images["agent-sandbox"], "test", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &maintenanceDockerRunner{}
+	docker := &driver.DockerCLI{Binary: "docker", Runner: runner}
+	cfg := config.Config{StateDir: stateRoot, ReleaseChannel: contract.ReleaseChannel}
+	app := &application{
+		config: cfg, state: store, docker: docker, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots,
+		maintenanceMu: &maintenance.Admission{},
+	}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+
+	if err := app.reconcileMaintenance(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertPathExists(t, protectedSnapshot)
+	assertPathExists(t, currentRelease)
+	assertPathExists(t, filepath.Dir(currentVersion.Path))
+	assertPathMissing(t, obsoleteSnapshot)
+	assertPathMissing(t, obsoleteRelease)
+	assertPathMissing(t, filepath.Dir(obsoleteVersion.Path))
+	if len(runner.removed) != len(obsoleteManifest.Images) {
+		t.Fatalf("removed images = %d, want %d: %#v", len(runner.removed), len(obsoleteManifest.Images), runner.removed)
+	}
+	for _, image := range currentManifest.Images {
+		for _, removed := range runner.removed {
+			if removed == image {
+				t.Fatalf("current image was removed: %s", image)
+			}
+		}
 	}
 }
 
@@ -298,9 +628,7 @@ func TestFirecrawlReconciliationCancellationYieldsToMaintenanceWithoutDiagnostic
 	}
 	generation := strings.Repeat("a", 40)
 	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: generation, Images: map[string]string{
-			"firecrawl-api": "registry/firecrawl@sha256:" + strings.Repeat("b", 64),
-		}}
+		state.Current = &model.Generation{ID: generation, Images: testFirecrawlImages("b")}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -354,7 +682,7 @@ func TestFirecrawlReconciliationLocksBeforeReadingCurrentGeneration(t *testing.T
 	firstID := strings.Repeat("a", 40)
 	secondID := strings.Repeat("b", 40)
 	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: firstID, Images: map[string]string{"firecrawl-api": "registry/firecrawl@sha256:" + strings.Repeat("c", 64)}}
+		state.Current = &model.Generation{ID: firstID, Images: testFirecrawlImages("c")}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -393,7 +721,7 @@ func TestFirecrawlReconciliationLocksBeforeReadingCurrentGeneration(t *testing.T
 	default:
 	}
 	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: secondID, Images: map[string]string{"firecrawl-api": "registry/firecrawl@sha256:" + strings.Repeat("d", 64)}}
+		state.Current = &model.Generation{ID: secondID, Images: testFirecrawlImages("d")}
 		state.ActiveOperationID = "op_pulling"
 		state.Phase = model.PhasePulling
 		return nil
@@ -662,6 +990,154 @@ func TestGatewayControllerHotReconcilesIndependentLANListener(t *testing.T) {
 	}
 	assertHTTPStatus(t, "http://"+cfg.LANAddress+"/__ubitech/health", http.StatusOK)
 	assertHTTPStatus(t, "http://"+primary+"/__ubitech/health", http.StatusOK)
+}
+
+func newMaintenanceTestApplication(t *testing.T, cleanup maintenanceCleanup, records []sandbox.Record) (*application, *journal.Store) {
+	t.Helper()
+	root := t.TempDir()
+	store, err := journal.Open(filepath.Join(root, "manager"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("f", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sandboxPath := filepath.Join(root, "manager", "sandboxes.json")
+	if len(records) > 0 {
+		registry := struct {
+			SchemaVersion int                       `json:"schema_version"`
+			Records       map[string]sandbox.Record `json:"records"`
+		}{SchemaVersion: 1, Records: map[string]sandbox.Record{}}
+		for _, record := range records {
+			hash := sha256.Sum256([]byte(record.SandboxID))
+			record.SandboxHash = hex.EncodeToString(hash[:])
+			record.ContainerName = "ubitech-sandbox-" + record.SandboxHash[:16]
+			registry.Records[record.SandboxID] = record
+		}
+		writeTestJSON(t, sandboxPath, registry)
+	}
+	sandboxes, err := sandbox.Open(nil, filepath.Join(root, "data"), sandboxPath, maintenanceImage("default-sandbox"), "test", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfUpdater := &selfupdate.Manager{Root: filepath.Join(root, "manager", "manager-binaries"), StatePath: filepath.Join(root, "manager", "manager-binaries.json")}
+	return &application{
+		config: config.Config{StateDir: filepath.Join(root, "manager"), ReleaseChannel: contract.ReleaseChannel},
+		state:  store, sandboxes: sandboxes, selfUpdate: selfUpdater,
+		maintenanceMu: &maintenance.Admission{}, maintenanceJobs: cleanup,
+	}, store
+}
+
+func writeMaintenanceRelease(t *testing.T, root, id string, generatedAt time.Time, seed string) (release.Manifest, string) {
+	t.Helper()
+	compose := []byte("services: {}\n")
+	composeDigest := sha256.Sum256(compose)
+	images := map[string]string{}
+	for _, name := range []string{
+		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq",
+	} {
+		images[name] = maintenanceImage(seed + "-" + name)
+	}
+	manifest := release.Manifest{
+		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: id, GeneratedAt: generatedAt,
+		ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 1,
+		Manager: release.ManagerRelease{Version: id, Artifacts: map[string]release.Artifact{
+			runtime.GOARCH: {URL: "https://example.invalid/manager", SHA256: strings.Repeat("f", 64)},
+		}},
+		Compose: release.Artifact{URL: "https://example.invalid/compose", SHA256: hex.EncodeToString(composeDigest[:])},
+		Images:  images,
+	}
+	path := filepath.Join(root, id)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestJSON(t, filepath.Join(path, "manifest.json"), manifest)
+	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), compose, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifest, path
+}
+
+func writeMaintenanceManagerVersion(t *testing.T, root, name, commit string, verifiedAt time.Time) selfupdate.Version {
+	t.Helper()
+	binary := []byte("manager-" + name)
+	digest := sha256.Sum256(binary)
+	sha := hex.EncodeToString(digest[:])
+	dir := filepath.Join(root, "versions", name+"-"+commit[:12])
+	path := filepath.Join(dir, "ubitech-manager")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	version := selfupdate.Version{Version: name, SourceCommit: commit, Path: path, SHA256: sha, VerifiedAt: verifiedAt, PlatformCommitted: true}
+	writeTestJSON(t, filepath.Join(dir, "metadata.json"), version)
+	return version
+}
+
+func setSnapshotCreatedAt(t *testing.T, path string, createdAt time.Time) {
+	t.Helper()
+	manifestPath := filepath.Join(path, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest snapshot.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.CreatedAt = createdAt
+	writeTestJSON(t, manifestPath, manifest)
+}
+
+func assertPathExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("expected %s to remain: %v", path, err)
+	}
+}
+
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed: %v", path, err)
+	}
+}
+
+func maintenanceImage(seed string) string {
+	digest := sha256.Sum256([]byte(seed))
+	return "registry.example/managed@sha256:" + hex.EncodeToString(digest[:])
+}
+
+func writeTestJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertStringSetContains(t *testing.T, values map[string]struct{}, expected ...string) {
+	t.Helper()
+	for _, value := range expected {
+		if _, ok := values[value]; !ok {
+			t.Errorf("protected set %#v omitted %q", values, value)
+		}
+	}
 }
 
 func assertHTTPStatus(t *testing.T, address string, want int) {

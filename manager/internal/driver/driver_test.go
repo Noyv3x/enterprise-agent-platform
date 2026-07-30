@@ -40,6 +40,9 @@ type pullTestRunner struct {
 }
 
 func (r *pullTestRunner) Run(_ context.Context, _ string, args []string, _ []string) (Result, error) {
+	if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+		return Result{Stdout: os.TempDir() + "\n"}, nil
+	}
 	r.calls = append(r.calls, append([]string(nil), args...))
 	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
 		image := args[len(args)-1]
@@ -49,6 +52,15 @@ func (r *pullTestRunner) Run(_ context.Context, _ string, args []string, _ []str
 		return Result{Stderr: "Error response from daemon: No such image: " + image, ExitCode: 1}, errors.New("docker exited with 1")
 	}
 	return Result{}, nil
+}
+
+func pullTestDocker(runner Runner, idle, absolute time.Duration) DockerCLI {
+	return DockerCLI{
+		Runner: runner, Binary: "docker", PullIdleTimeout: idle, PullAbsoluteTimeout: absolute,
+		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: 1 << 40, Favail: 1 << 20, FilesystemID: "pull-test"}, nil
+		},
+	}
 }
 
 func (r *pullTestRunner) RunWithActivity(ctx context.Context, _ string, args []string, _ []string, activity func()) (Result, error) {
@@ -106,12 +118,12 @@ func TestGenerationEnvironmentExcludesOpaqueExtraImages(t *testing.T) {
 func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	manifest := pullTestManifest()
 	runner := &pullTestRunner{present: map[string]bool{manifest.Images["platform"]: true}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second}
+	docker := pullTestDocker(runner, time.Second, 2*time.Second)
 	if err := docker.Pull(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 3 {
-		t.Fatalf("pull commands = %#v, want two inspections and one pull", runner.calls)
+	if len(runner.calls) != 4 {
+		t.Fatalf("pull commands = %#v, want initial inspections, one ownership recheck, and one pull", runner.calls)
 	}
 	if got := runner.calls[0]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["platform"]}) {
 		t.Fatalf("platform inspection = %v", got)
@@ -119,7 +131,10 @@ func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	if got := runner.calls[1]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
 		t.Fatalf("runtime inspection = %v", got)
 	}
-	if got := runner.calls[2]; !reflect.DeepEqual(got, []string{"pull", manifest.Images["agent-runtime"]}) {
+	if got := runner.calls[2]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
+		t.Fatalf("runtime ownership recheck = %v", got)
+	}
+	if got := runner.calls[3]; !reflect.DeepEqual(got, []string{"pull", manifest.Images["agent-runtime"]}) {
 		t.Fatalf("runtime pull = %v", got)
 	}
 	joined := fmt.Sprint(runner.calls)
@@ -141,7 +156,7 @@ func TestPullFailsAfterOutputIdleTimeoutWithLogicalImageName(t *testing.T) {
 			return Result{}, ctx.Err()
 		},
 	}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: 250 * time.Millisecond, PullAbsoluteTimeout: 2 * time.Second}
+	docker := pullTestDocker(runner, 250*time.Millisecond, 2*time.Second)
 	started := time.Now()
 	err := docker.Pull(context.Background(), manifest)
 	if err == nil || !strings.Contains(err.Error(), "managed image platform") || !strings.Contains(err.Error(), "no output for 250ms") {
@@ -173,7 +188,7 @@ func TestPullProgressRefreshesIdleDeadline(t *testing.T) {
 			return Result{}, nil
 		},
 	}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: 250 * time.Millisecond, PullAbsoluteTimeout: 2 * time.Second}
+	docker := pullTestDocker(runner, 250*time.Millisecond, 2*time.Second)
 	if err := docker.Pull(context.Background(), manifest); err != nil {
 		t.Fatalf("progressing pull was treated as idle: %v", err)
 	}
@@ -196,7 +211,7 @@ func TestPullAbsoluteLimitWinsDespiteContinuousProgress(t *testing.T) {
 			}
 		},
 	}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: 250 * time.Millisecond, PullAbsoluteTimeout: 400 * time.Millisecond}
+	docker := pullTestDocker(runner, 250*time.Millisecond, 400*time.Millisecond)
 	err := docker.Pull(context.Background(), manifest)
 	if err == nil || !strings.Contains(err.Error(), "managed image platform") || !strings.Contains(err.Error(), "exceeded absolute limit 400ms") {
 		t.Fatalf("absolute pull error = %v", err)
@@ -216,7 +231,7 @@ func TestPullFailureRedactsCredentialsAndBoundsPersistedDiagnostic(t *testing.T)
 			return Result{}, errors.New(diagnostic)
 		},
 	}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second}
+	docker := pullTestDocker(runner, time.Second, 2*time.Second)
 	err := docker.Pull(context.Background(), manifest)
 	if err == nil {
 		t.Fatal("credential-bearing pull failure unexpectedly succeeded")
@@ -245,6 +260,8 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 	platformPulled := false
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		switch {
+		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
+			return Result{Stdout: os.TempDir() + "\n"}, nil
 		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .RepoDigests}}":
 			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
 		case reflect.DeepEqual(args, []string{"pull", platform}):
@@ -265,7 +282,7 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 			return Result{}, fmt.Errorf("unexpected command: %v", args)
 		}
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second}
+	docker := pullTestDocker(runner, time.Second, 2*time.Second)
 	err := docker.Pull(context.Background(), manifest)
 	if err == nil || !strings.Contains(err.Error(), "managed image agent-runtime") {
 		t.Fatalf("pull failure = %v", err)
@@ -285,9 +302,10 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 }
 
 func TestEnsureSandboxUsesRootEntrypointAndExecUsesMappedUser(t *testing.T) {
+	image := "sandbox@sha256:" + strings.Repeat("a", 64)
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
-			return Result{Stdout: fmt.Sprintf("[%q]", "sandbox@sha256:abc")}, nil
+			return Result{Stdout: fmt.Sprintf("[%q]", image)}, nil
 		}
 		if len(args) > 0 && args[0] == "inspect" {
 			return Result{}, errors.New("not found")
@@ -298,7 +316,7 @@ func TestEnsureSandboxUsesRootEntrypointAndExecUsesMappedUser(t *testing.T) {
 	spec := SandboxSpec{
 		ContainerName: "ubitech-sandbox-test",
 		AgentHash:     "abc",
-		Image:         "sandbox@sha256:abc",
+		Image:         image,
 		Network:       "ubitech-agent-core",
 		Workspace:     "/data/workspace",
 		Home:          "/data/home",
@@ -332,10 +350,11 @@ func TestEnsureSandboxUsesRootEntrypointAndExecUsesMappedUser(t *testing.T) {
 }
 
 func TestEnsureSandboxRemovesCreatedContainerWhenStartFails(t *testing.T) {
+	image := "sandbox@sha256:" + strings.Repeat("a", 64)
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		switch args[0] {
 		case "image":
-			return Result{Stdout: fmt.Sprintf("[%q]", "sandbox@sha256:abc")}, nil
+			return Result{Stdout: fmt.Sprintf("[%q]", image)}, nil
 		case "inspect":
 			return Result{}, errors.New("not found")
 		case "start":
@@ -345,7 +364,7 @@ func TestEnsureSandboxRemovesCreatedContainerWhenStartFails(t *testing.T) {
 		}
 	}}
 	docker := DockerCLI{Runner: runner, Binary: "docker"}
-	spec := SandboxSpec{ContainerName: "ubitech-sandbox-test", AgentHash: "abc", Image: "sandbox@sha256:abc", Network: "core", Workspace: "/data/workspace", Home: "/data/home", Environment: "/data/env", UID: 12345, GID: 23456}
+	spec := SandboxSpec{ContainerName: "ubitech-sandbox-test", AgentHash: "abc", Image: image, Network: "core", Workspace: "/data/workspace", Home: "/data/home", Environment: "/data/env", UID: 12345, GID: 23456}
 	outcome, err := docker.EnsureSandboxWithResult(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "entrypoint failed") {
 		t.Fatalf("sandbox start failure was not returned: %v", err)
@@ -361,7 +380,11 @@ func TestEnsureSandboxRemovesCreatedContainerWhenStartFails(t *testing.T) {
 
 func TestEnsureSandboxPullsMissingExactImageBeforeCreate(t *testing.T) {
 	const image = "registry.example/sandbox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	root := t.TempDir()
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
+			return Result{Stdout: root + "\n"}, nil
+		}
 		switch args[0] {
 		case "inspect":
 			return Result{}, errors.New("container not found")
@@ -372,8 +395,11 @@ func TestEnsureSandboxPullsMissingExactImageBeforeCreate(t *testing.T) {
 		}
 	}}
 	docker := DockerCLI{
-		Runner: runner, Binary: "docker",
+		Runner: runner, Binary: "docker", DataRoot: root,
 		PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second,
+		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: 32 << 30, Favail: 10000, FilesystemID: "test"}, nil
+		},
 	}
 	spec := SandboxSpec{
 		ContainerName: "ubitech-sandbox-test", AgentHash: "abc", Image: image,
@@ -575,6 +601,9 @@ func TestReconcileCapabilitiesRetriesEveryServiceAndJoinsFailures(t *testing.T) 
 	attempts := map[string]int{}
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		joined := strings.Join(args, " ")
+		if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+			return Result{Stdout: "[\"" + args[len(args)-1] + "\"]\n"}, nil
+		}
 		for _, service := range capabilityServices {
 			if strings.Contains(joined, " up --detach "+service) {
 				attempts[service]++
@@ -591,7 +620,10 @@ func TestReconcileCapabilitiesRetriesEveryServiceAndJoinsFailures(t *testing.T) 
 		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
 		StateDir: filepath.Join(root, "manager"), CoreNetwork: "ubitech-agent-core",
 	}
-	manifest := release.Manifest{SourceCommit: generation, Images: map[string]string{}}
+	manifest := release.Manifest{SourceCommit: generation, Images: map[string]string{
+		"camofox": "registry/camofox@sha256:" + strings.Repeat("c", 64),
+		"searxng": "registry/searxng@sha256:" + strings.Repeat("d", 64),
+	}}
 	firstErr := docker.ReconcileCapabilities(context.Background(), manifest)
 	if firstErr == nil || !strings.Contains(firstErr.Error(), "start capability service camofox: camofox transient failure") ||
 		!strings.Contains(firstErr.Error(), "start capability service searxng: searxng transient failure") {
@@ -1086,6 +1118,52 @@ func TestCheckCapacityRejectsLowDiskBeforePull(t *testing.T) {
 	}
 	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err == nil || !strings.Contains(err.Error(), "insufficient free space") {
 		t.Fatalf("low disk capacity was accepted: %v", err)
+	}
+}
+
+func TestPrepareManagedImageAppliesCapacityGateBeforeSandboxPull(t *testing.T) {
+	root := t.TempDir()
+	image := "registry.example/sandbox@sha256:" + strings.Repeat("a", 64)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
+			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("not found")
+		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
+			return Result{Stdout: root + "\n"}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected command: %v", args)
+		}
+	}}
+	docker := DockerCLI{
+		Runner: runner, DataRoot: root,
+		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
+			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: 19 << 30, Favail: 10000, FilesystemID: "same"}, nil
+		},
+	}
+	err := docker.PrepareManagedImage(context.Background(), "agent-sandbox", image)
+	if !IsInsufficientCapacity(err) {
+		t.Fatalf("low-capacity Sandbox image preparation error = %v", err)
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && call.args[0] == "pull" {
+			t.Fatalf("Sandbox image was pulled before the capacity gate: %#v", runner.calls)
+		}
+	}
+}
+
+func TestPrepareManagedImageSkipsCapacityProbeForExactLocalDigest(t *testing.T) {
+	image := "registry.example/sandbox@sha256:" + strings.Repeat("b", 64)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+			return Result{Stdout: "[\"" + image + "\"]\n"}, nil
+		}
+		return Result{}, fmt.Errorf("unexpected command: %v", args)
+	}}
+	if err := (DockerCLI{Runner: runner}).PrepareManagedImage(context.Background(), "agent-sandbox", image); err != nil {
+		t.Fatalf("exact local digest required unrelated free capacity: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("exact local digest caused extra Docker calls: %#v", runner.calls)
 	}
 }
 

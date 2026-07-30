@@ -30,6 +30,7 @@ import (
 type fakeEngine struct {
 	mu              sync.Mutex
 	calls           []string
+	started         []string
 	failAt          string
 	diagnostic      string
 	diagnosticCalls int
@@ -83,14 +84,19 @@ func (e *fakeEngine) add(value string) error {
 	}
 	return nil
 }
-func (e *fakeEngine) Preflight(context.Context) error                    { return e.add("preflight") }
-func (e *fakeEngine) Pull(context.Context, release.Manifest) error       { return e.add("pull") }
-func (e *fakeEngine) Prepare(context.Context, release.Manifest) error    { return e.add("prepare") }
-func (e *fakeEngine) StopFixed(context.Context) error                    { return e.add("stop") }
-func (e *fakeEngine) StartFixed(context.Context, release.Manifest) error { return e.add("start") }
-func (e *fakeEngine) Migrate(context.Context, release.Manifest) error    { return e.add("migrate") }
-func (e *fakeEngine) Probe(context.Context, release.Manifest) error      { return e.add("probe") }
-func (e *fakeEngine) Logs(context.Context, string, int) (string, error)  { return "", nil }
+func (e *fakeEngine) Preflight(context.Context) error                 { return e.add("preflight") }
+func (e *fakeEngine) Pull(context.Context, release.Manifest) error    { return e.add("pull") }
+func (e *fakeEngine) Prepare(context.Context, release.Manifest) error { return e.add("prepare") }
+func (e *fakeEngine) StopFixed(context.Context) error                 { return e.add("stop") }
+func (e *fakeEngine) StartFixed(_ context.Context, manifest release.Manifest) error {
+	e.mu.Lock()
+	e.started = append(e.started, manifest.ID())
+	e.mu.Unlock()
+	return e.add("start")
+}
+func (e *fakeEngine) Migrate(context.Context, release.Manifest) error   { return e.add("migrate") }
+func (e *fakeEngine) Probe(context.Context, release.Manifest) error     { return e.add("probe") }
+func (e *fakeEngine) Logs(context.Context, string, int) (string, error) { return "", nil }
 func (e *fakeEngine) CandidateFailureDiagnostics(context.Context, release.Manifest) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -136,6 +142,21 @@ func (e *capacityEngine) CheckCapacity(ctx context.Context, stage string, manife
 	return e.capacity.CheckCapacity(ctx, stage, manifest)
 }
 
+type capacityPullEngine struct {
+	*fakeEngine
+	errors []error
+	calls  int
+}
+
+func (e *capacityPullEngine) Pull(context.Context, release.Manifest) error {
+	index := e.calls
+	e.calls++
+	if index < len(e.errors) {
+		return e.errors[index]
+	}
+	return nil
+}
+
 func TestCapacityShortfallRunsOneControlledMaintenanceThenRechecks(t *testing.T) {
 	checker := &scriptedCapacityChecker{errors: []error{
 		&driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/var/lib/docker", Resource: "space", Have: 1, Require: 2},
@@ -168,6 +189,26 @@ func TestNonCapacityFailureDoesNotRunMaintenance(t *testing.T) {
 	err := orchestrator.checkCapacity(context.Background(), checker, "op_error", driver.CapacityPreDownload, release.Manifest{})
 	if err == nil || err.Error() != "Docker unavailable" || checker.calls != 1 || reclaims != 0 {
 		t.Fatalf("non-capacity failure = %v, checks=%d reclaims=%d", err, checker.calls, reclaims)
+	}
+}
+
+func TestAtomicImagePullCapacityShortfallRunsOneControlledMaintenanceRetry(t *testing.T) {
+	capacityErr := &driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/var/lib/docker", Resource: "space", Have: 1, Require: 2}
+	engine := &capacityPullEngine{fakeEngine: &fakeEngine{}, errors: []error{capacityErr, nil}}
+	reclaims := 0
+	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40)}
+	orchestrator := &Orchestrator{Engine: engine, ReclaimCapacity: func(_ context.Context, operationID string, protected release.Manifest) error {
+		reclaims++
+		if operationID != "op_pull" || protected.ID() != manifest.ID() {
+			t.Fatalf("pull reclaim identity = %q/%q", operationID, protected.ID())
+		}
+		return nil
+	}}
+	if err := orchestrator.pullWithCapacityRetry(context.Background(), "op_pull", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if engine.calls != 2 || reclaims != 1 {
+		t.Fatalf("pull calls/reclaims = %d/%d, want 2/1", engine.calls, reclaims)
 	}
 }
 
@@ -403,6 +444,8 @@ type recordingSelfUpdate struct {
 	pendingCommitChecks int
 	activationErr       error
 	commitChecks        int
+	rolledBack          bool
+	rollbackChecks      int
 }
 
 func (s *recordingSelfUpdate) Prepare(context.Context, release.Manifest) error { return nil }
@@ -428,6 +471,10 @@ func (s *recordingSelfUpdate) ActivationCommitted(release.Manifest) (bool, error
 		return false, nil
 	}
 	return true, nil
+}
+func (s *recordingSelfUpdate) ActivationRolledBack(release.Manifest) (bool, error) {
+	s.rollbackChecks++
+	return s.rolledBack, nil
 }
 
 func testReleaseServer(t *testing.T) (*httptest.Server, string) {
@@ -1894,6 +1941,154 @@ func TestRecoverRetriesDurableFinalizePendingAfterStateCommit(t *testing.T) {
 	}
 	if gate.releases != 2 || selfUpdate.activated != 2 || commits != 2 {
 		t.Fatalf("unexpected idempotent finalize calls: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
+	}
+}
+
+func TestRejectedManagerCandidateRestoresPreviousCommittedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousID, rejectedID := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	previousPath := writeRollbackManifest(t, dir, previousID)
+	rejectedPath := writeRollbackManifest(t, dir, rejectedID)
+	_, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: previousID, ManifestPath: previousPath}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "manager-watchdog-rollback", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationSucceeded
+		value.TargetGeneration = rejectedID
+		value.SnapshotPath = "/snapshots/before-rejected-manager"
+		value.ReservationStatus = model.ReservationMutationStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.ActiveOperationID = ""
+		state.Previous = state.Current
+		state.Current = &model.Generation{ID: rejectedID, ManifestPath: rejectedPath, RollbackSnapshotPath: "/snapshots/before-rejected-manager"}
+		state.FinalizePendingOperationID = op.ID
+		state.PublicState = model.StateUpdating
+		state.Maintenance = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	snapshots := &scriptedSnapshot{}
+	gate := &recordingGate{}
+	selfUpdate := &recordingSelfUpdate{rolledBack: true}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: snapshots, SelfUpdate: selfUpdate, Channel: contract.ReleaseChannel}
+
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	completed, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Current == nil || state.Current.ID != previousID || state.Previous != nil || state.ActiveOperationID != "" ||
+		state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
+		t.Fatalf("Manager watchdog rollback did not restore the previous Platform generation: %#v", state)
+	}
+	if completed.Status != model.OperationFailed || !completed.Finalized || !completed.Retryable ||
+		!completed.ManagerActivationRollback || completed.ManagerRollbackGeneration != previousID ||
+		!completed.SnapshotRestored || !completed.ReservationReleased {
+		t.Fatalf("original update did not become a terminal retryable failure: %#v", completed)
+	}
+	if strings.Join(snapshots.restores, ",") != "/snapshots/before-rejected-manager" || gate.releases != 1 ||
+		selfUpdate.marked != 0 || selfUpdate.activated != 0 || selfUpdate.rollbackChecks != 1 {
+		t.Fatalf("rollback side effects are incomplete: restores=%v gate=%d self=%#v", snapshots.restores, gate.releases, selfUpdate)
+	}
+	engine.mu.Lock()
+	started := append([]string(nil), engine.started...)
+	engine.mu.Unlock()
+	if !reflect.DeepEqual(started, []string{previousID}) {
+		t.Fatalf("rollback started generations %v, want only %s", started, previousID)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots.restores) != 1 || gate.releases != 1 {
+		t.Fatalf("terminal rollback replay repeated external effects: restores=%v releases=%d", snapshots.restores, gate.releases)
+	}
+}
+
+func TestRecoverManagerRollbackIntentPersistedBeforeStateTransition(t *testing.T) {
+	dir := t.TempDir()
+	store, err := journal.Open(filepath.Join(dir, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousID, rejectedID := strings.Repeat("c", 40), strings.Repeat("d", 40)
+	previousPath := writeRollbackManifest(t, dir, previousID)
+	rejectedPath := writeRollbackManifest(t, dir, rejectedID)
+	_, _ = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: previousID, ManifestPath: previousPath}
+		return nil
+	})
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "manager-watchdog-crash", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationRunning
+		value.Finalized = false
+		value.Retryable = true
+		value.TargetGeneration = rejectedID
+		value.SnapshotPath = "/snapshots/crash-before-state"
+		value.ReservationStatus = model.ReservationMutationStarted
+		value.ManagerActivationRollback = true
+		value.ManagerRollbackGeneration = previousID
+		value.Phase = model.PhaseRollingBack
+		value.Error = "Manager candidate was rejected"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.ActiveOperationID = ""
+		state.Previous = state.Current
+		state.Current = &model.Generation{ID: rejectedID, ManifestPath: rejectedPath}
+		state.FinalizePendingOperationID = op.ID
+		state.PublicState = model.StateUpdating
+		state.Maintenance = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := &scriptedSnapshot{}
+	gate := &recordingGate{}
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: snapshots, Channel: contract.ReleaseChannel}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	completed, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Current == nil || state.Current.ID != previousID || state.FinalizePendingOperationID != "" || state.ActiveOperationID != "" || state.Maintenance ||
+		completed.Status != model.OperationFailed || !completed.Finalized || !completed.Retryable || !completed.SnapshotRestored || !completed.ReservationReleased {
+		t.Fatalf("crash-replayed Manager rollback did not converge: state=%#v operation=%#v", state, completed)
+	}
+	if !reflect.DeepEqual(snapshots.restores, []string{"/snapshots/crash-before-state"}) || gate.releases != 1 {
+		t.Fatalf("crash replay effects = restores %v, releases %d", snapshots.restores, gate.releases)
 	}
 }
 

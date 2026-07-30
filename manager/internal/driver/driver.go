@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -197,6 +198,14 @@ type CapacityChecker interface {
 	CheckCapacity(context.Context, string, release.Manifest) error
 }
 
+// ManagedImagePreparer is the narrow capability used by asynchronous
+// capability and Sandbox reconcilers. Implementations must apply the same
+// immutable-reference, capacity, pull, and failed-attempt cleanup policy as the
+// fixed update path.
+type ManagedImagePreparer interface {
+	PrepareManagedImage(context.Context, string, string) error
+}
+
 type CapacityError struct {
 	Stage    string
 	Path     string
@@ -276,6 +285,7 @@ type DockerCLI struct {
 	PullAbsoluteTimeout time.Duration
 	FilesystemStat      func(context.Context, string) (CapacityFilesystemStat, error)
 	SnapshotRequired    func(context.Context, string) (uint64, error)
+	ManagedImageMu      *sync.Mutex
 }
 
 type CapacityFilesystemStat struct {
@@ -294,6 +304,10 @@ const (
 // filesystem or Docker's storage filesystem. It measures actual free space and
 // never assumes a global Docker prune is safe.
 func (d DockerCLI) CheckCapacity(ctx context.Context, stage string, manifest release.Manifest) error {
+	return d.checkCapacity(ctx, stage, manifest, coreUpdateImageNames, true, false)
+}
+
+func (d DockerCLI) checkCapacity(ctx context.Context, stage string, manifest release.Manifest, imageNames []string, includeDataFilesystem, knownMissing bool) error {
 	minimumBytes := uint64(contract.UpdatePreDownloadMinFreeBytes)
 	if stage == CapacityPreCutover {
 		minimumBytes = uint64(contract.UpdatePreCutoverMinFreeBytes)
@@ -303,25 +317,27 @@ func (d DockerCLI) CheckCapacity(ctx context.Context, stage string, manifest rel
 	dockerMinimumBytes := minimumBytes
 	dataMinimumBytes := minimumBytes
 	if stage == CapacityPreDownload {
-		for _, name := range coreUpdateImageNames {
+		for _, name := range imageNames {
 			image := manifest.Images[name]
 			if !release.IsDigestReference(image) {
-				return fmt.Errorf("core image %s is missing an immutable digest for capacity estimation", name)
+				return fmt.Errorf("managed image %s is missing an immutable digest for capacity estimation", name)
 			}
-			present, inspectErr := d.imagePresent(ctx, name, image)
-			if inspectErr != nil {
-				return fmt.Errorf("inspect core image before capacity estimation: %w", inspectErr)
+			if !knownMissing {
+				present, inspectErr := d.imagePresent(ctx, name, image)
+				if inspectErr != nil {
+					return fmt.Errorf("inspect managed image before capacity estimation: %w", inspectErr)
+				}
+				if present {
+					continue
+				}
 			}
-			if present {
-				continue
-			}
-			estimate, ok := contract.UpdateCoreImageCapacityEstimates[name]
+			estimate, ok := contract.ManagedImageCapacityEstimates[name]
 			if !ok || estimate.CompressedBytes == 0 || estimate.UnpackedBytes == 0 {
-				return fmt.Errorf("core image %s has no valid capacity estimate", name)
+				return fmt.Errorf("managed image %s has no valid capacity estimate", name)
 			}
 			for _, addition := range []uint64{estimate.CompressedBytes, estimate.UnpackedBytes} {
 				if dockerMinimumBytes > ^uint64(0)-addition {
-					return errors.New("core image capacity estimate overflow")
+					return errors.New("managed image capacity estimate overflow")
 				}
 				dockerMinimumBytes += addition
 			}
@@ -352,9 +368,9 @@ func (d DockerCLI) CheckCapacity(ctx context.Context, stage string, manifest rel
 		path         string
 		minimumBytes uint64
 	}
-	roots := []capacityRoot{
-		{path: filepath.Clean(d.DataRoot), minimumBytes: dataMinimumBytes},
-		{path: filepath.Clean(dockerRoot), minimumBytes: dockerMinimumBytes},
+	roots := []capacityRoot{{path: filepath.Clean(dockerRoot), minimumBytes: dockerMinimumBytes}}
+	if includeDataFilesystem {
+		roots = append(roots, capacityRoot{path: filepath.Clean(d.DataRoot), minimumBytes: dataMinimumBytes})
 	}
 	type filesystemCapacity struct {
 		path         string
@@ -595,18 +611,53 @@ func (d DockerCLI) Preflight(ctx context.Context) error {
 }
 
 func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
-	pulledByAttempt := make([]string, 0, len(coreUpdateImageNames))
-	for _, name := range coreUpdateImageNames {
+	return d.prepareManagedImages(ctx, manifest, coreUpdateImageNames, true)
+}
+
+// PrepareManagedImage applies the canonical capacity and exact-cleanup policy
+// to one immutable image outside the fixed update path.
+func (d DockerCLI) PrepareManagedImage(ctx context.Context, name, image string) error {
+	return d.prepareManagedImages(ctx, release.Manifest{Images: map[string]string{name: image}}, []string{name}, true)
+}
+
+func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Manifest, names []string, enforceCapacity bool) error {
+	if d.ManagedImageMu != nil {
+		d.ManagedImageMu.Lock()
+		defer d.ManagedImageMu.Unlock()
+	}
+	missing := make([]string, 0, len(names))
+	for _, name := range names {
 		image := manifest.Images[name]
-		if image == "" {
-			return fmt.Errorf("core image %s is missing from the release manifest", name)
+		if !release.IsManagedImageName(name) || !release.IsDigestReference(image) {
+			return fmt.Errorf("managed image %s is missing an immutable digest", name)
 		}
 		present, err := d.imagePresent(ctx, name, image)
 		if err != nil {
 			return err
 		}
-		if present {
-			continue
+		if !present {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if enforceCapacity {
+		if err := d.checkCapacity(ctx, CapacityPreDownload, manifest, missing, false, true); err != nil {
+			return err
+		}
+	}
+	pulledByAttempt := make([]string, 0, len(missing))
+	for _, name := range missing {
+		image := manifest.Images[name]
+		if enforceCapacity {
+			present, err := d.imagePresent(ctx, name, image)
+			if err != nil {
+				return err
+			}
+			if present {
+				continue
+			}
 		}
 		pulledByAttempt = append(pulledByAttempt, image)
 		if err := d.pullImage(ctx, name, image); err != nil {
@@ -614,23 +665,12 @@ func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
 			_, cleanupErr := d.PruneManagedImages(cleanupCtx, pulledByAttempt, nil, nil)
 			cancel()
 			if cleanupErr != nil {
-				return errors.Join(err, fmt.Errorf("clean failed candidate pull artifacts: %w", cleanupErr))
+				return errors.Join(err, fmt.Errorf("clean failed managed image pull artifacts: %w", cleanupErr))
 			}
 			return err
 		}
 	}
 	return nil
-}
-
-func (d DockerCLI) ensureImage(ctx context.Context, name, image string) error {
-	present, err := d.imagePresent(ctx, name, image)
-	if err != nil {
-		return err
-	}
-	if present {
-		return nil
-	}
-	return d.pullImage(ctx, name, image)
 }
 
 func (d DockerCLI) imagePresent(ctx context.Context, name, image string) (bool, error) {
@@ -845,6 +885,9 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 // caller decides how to report and retry the joined error; generation readiness
 // never depends on this method. Firecrawl uses its own bounded reconciler.
 func (d DockerCLI) ReconcileCapabilities(ctx context.Context, manifest release.Manifest) error {
+	if err := d.prepareManagedImages(ctx, manifest, capabilityServices, true); err != nil {
+		return fmt.Errorf("prepare capability images: %w", err)
+	}
 	env, err := d.writeGenerationEnvironment(manifest)
 	if err != nil {
 		return err
@@ -866,6 +909,9 @@ func (d DockerCLI) reconcileCapabilities(ctx context.Context, env string) error 
 // active generation. It is safe to call again after Manager activation because
 // Compose is idempotent and the Manager never removes or rewrites service data.
 func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Manifest) error {
+	if err := d.prepareManagedImages(ctx, manifest, firecrawlHealthyServices, true); err != nil {
+		return fmt.Errorf("prepare Firecrawl images: %w", err)
+	}
 	env, err := d.writeGenerationEnvironment(manifest)
 	if err != nil {
 		return err
@@ -1248,7 +1294,7 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 		}
 		return SandboxEnsureResult{Started: true}, nil
 	}
-	if err := d.ensureImage(ctx, "agent-sandbox", spec.Image); err != nil {
+	if err := d.PrepareManagedImage(ctx, "agent-sandbox", spec.Image); err != nil {
 		return SandboxEnsureResult{}, fmt.Errorf("prepare sandbox image: %w", err)
 	}
 	args := []string{"create", "--name", spec.ContainerName, "--label", "org.ubitech.agent.sandbox=true", "--label", "org.ubitech.agent.id=" + spec.AgentHash,

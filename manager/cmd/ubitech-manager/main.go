@@ -40,20 +40,58 @@ import (
 var version = "development"
 
 type application struct {
-	config          config.Config
-	configs         *config.Manager
-	state           *journal.Store
-	docker          *driver.DockerCLI
-	operations      *operation.Orchestrator
-	sandboxes       *sandbox.Manager
-	selfUpdate      *selfupdate.Manager
-	snapshots       snapshot.Store
-	processes       *executor.ProcessManager
-	audit           *logstore.Store
-	api             *control.API
-	fixedStackMu    sync.Locker
-	maintenanceMu   *maintenance.Admission
-	maintenanceWake chan struct{}
+	config                     config.Config
+	configs                    *config.Manager
+	state                      *journal.Store
+	docker                     *driver.DockerCLI
+	operations                 *operation.Orchestrator
+	sandboxes                  *sandbox.Manager
+	selfUpdate                 *selfupdate.Manager
+	snapshots                  snapshot.Store
+	processes                  *executor.ProcessManager
+	audit                      *logstore.Store
+	api                        *control.API
+	fixedStackMu               sync.Locker
+	maintenanceMu              *maintenance.Admission
+	maintenanceWake            chan struct{}
+	maintenanceJobs            maintenanceCleanup
+	maintenanceActiveProcesses func() int
+}
+
+type maintenanceCleanup interface {
+	PruneSnapshots(context.Context, time.Time, map[string]struct{}, release.RemovalGuard) (int, error)
+	PruneReleases(context.Context, time.Time, map[string]struct{}, map[string]struct{}, map[string]struct{}, release.RemovalGuard) (int, error)
+	PruneManagerVersions(context.Context, time.Time, time.Duration) (int, error)
+}
+
+type liveMaintenanceCleanup struct {
+	config     config.Config
+	snapshots  snapshot.Store
+	selfUpdate *selfupdate.Manager
+	images     maintenance.ImagePruner
+}
+
+func (c liveMaintenanceCleanup) PruneSnapshots(ctx context.Context, now time.Time, protected map[string]struct{}, guard release.RemovalGuard) (int, error) {
+	snapshots := c.snapshots
+	snapshots.RemovalGuard = guard
+	return snapshots.Prune(ctx, now, protected)
+}
+
+func (c liveMaintenanceCleanup) PruneReleases(ctx context.Context, now time.Time, protectedIDs, protectedImages, heldImages map[string]struct{}, guard release.RemovalGuard) (int, error) {
+	return maintenance.PruneReleases(ctx, now, maintenance.ReleasePolicy{
+		Root:            filepath.Join(c.config.StateDir, "releases"),
+		Channel:         c.config.ReleaseChannel,
+		Retention:       time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second,
+		ProtectedIDs:    protectedIDs,
+		ProtectedImages: protectedImages,
+		HeldImages:      heldImages,
+		Images:          c.images,
+		RemovalGuard:    guard,
+	})
+}
+
+func (c liveMaintenanceCleanup) PruneManagerVersions(ctx context.Context, now time.Time, retention time.Duration) (int, error) {
+	return c.selfUpdate.PruneVersions(ctx, now, retention)
 }
 
 type currentRecoveryPolicy struct {
@@ -213,7 +251,7 @@ func build(path string) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
-	docker := &driver.DockerCLI{Binary: cfg.DockerBinary, ComposeFile: cfg.ComposeFile, ComposeProject: cfg.ComposeProject, GenerationDir: filepath.Join(cfg.StateDir, "releases"), DataRoot: cfg.DataRoot, StateDir: cfg.StateDir, GatewayAddress: cfg.GatewayAddress, PlatformBind: "127.0.0.1:18080", CoreNetwork: cfg.SandboxNetwork, LogMaxSize: dockerLogSize(cfg.LogMaxBytes), LogMaxFiles: cfg.LogBackups, UID: os.Getuid(), GID: os.Getgid(), Runner: driver.CommandRunner{MaxOutputBytes: cfg.CommandMaxBytes}}
+	docker := &driver.DockerCLI{Binary: cfg.DockerBinary, ComposeFile: cfg.ComposeFile, ComposeProject: cfg.ComposeProject, GenerationDir: filepath.Join(cfg.StateDir, "releases"), DataRoot: cfg.DataRoot, StateDir: cfg.StateDir, GatewayAddress: cfg.GatewayAddress, PlatformBind: "127.0.0.1:18080", CoreNetwork: cfg.SandboxNetwork, LogMaxSize: dockerLogSize(cfg.LogMaxBytes), LogMaxFiles: cfg.LogBackups, UID: os.Getuid(), GID: os.Getgid(), Runner: driver.CommandRunner{MaxOutputBytes: cfg.CommandMaxBytes}, ManagedImageMu: &sync.Mutex{}}
 	if err := docker.EnsureHostLayout(); err != nil {
 		return nil, err
 	}
@@ -270,7 +308,9 @@ func build(path string) (*application, error) {
 		return nil, fmt.Errorf("identify running Manager executable: %w", err)
 	}
 	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken, ManagerVersion: version, ManagerSHA256: runningSHA}
-	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake}
+	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake, maintenanceActiveProcesses: processes.ActiveBackgroundCount}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+	sandboxes.ReclaimCapacity = app.reconcileMaintenance
 	ops.ReclaimCapacity = func(ctx context.Context, operationID string, manifest release.Manifest) error {
 		return app.reconcileMaintenanceWithProtection(ctx, operationID, &manifest)
 	}
@@ -665,6 +705,31 @@ func (a *application) reconciliationContext(parent context.Context, generation s
 }
 
 func (a *application) reconcileFirecrawl(ctx context.Context) error {
+	err := a.reconcileFirecrawlAttempt(ctx)
+	if driver.IsInsufficientCapacity(err) {
+		if reclaimErr := a.reconcileMaintenance(ctx); reclaimErr != nil {
+			err = errors.Join(err, fmt.Errorf("reclaim capacity before Firecrawl retry: %w", reclaimErr))
+		} else {
+			err = a.reconcileFirecrawlAttempt(ctx)
+		}
+	}
+	if err != nil && a.audit != nil {
+		state := a.state.State()
+		generation := ""
+		if state.Current != nil {
+			generation = state.Current.ID
+		}
+		_ = a.audit.Append(logstore.Event{
+			At:      time.Now().UTC(),
+			Type:    "firecrawl.reconcile_failed",
+			Details: map[string]any{"generation": generation},
+			Error:   journal.BoundDiagnostic(err.Error()),
+		})
+	}
+	return err
+}
+
+func (a *application) reconcileFirecrawlAttempt(ctx context.Context) error {
 	if a.fixedStackMu != nil {
 		a.fixedStackMu.Lock()
 		defer a.fixedStackMu.Unlock()
@@ -679,18 +744,35 @@ func (a *application) reconcileFirecrawl(ctx context.Context) error {
 	if errors.Is(reconcileCtx.Err(), context.Canceled) {
 		return nil
 	}
+	return err
+}
+
+func (a *application) reconcileCapabilities(ctx context.Context) error {
+	err := a.reconcileCapabilitiesAttempt(ctx)
+	if driver.IsInsufficientCapacity(err) {
+		if reclaimErr := a.reconcileMaintenance(ctx); reclaimErr != nil {
+			err = errors.Join(err, fmt.Errorf("reclaim capacity before capability retry: %w", reclaimErr))
+		} else {
+			err = a.reconcileCapabilitiesAttempt(ctx)
+		}
+	}
 	if err != nil && a.audit != nil {
+		state := a.state.State()
+		generation := ""
+		if state.Current != nil {
+			generation = state.Current.ID
+		}
 		_ = a.audit.Append(logstore.Event{
 			At:      time.Now().UTC(),
-			Type:    "firecrawl.reconcile_failed",
-			Details: map[string]any{"generation": manifest.ID()},
+			Type:    "capability.reconcile_failed",
+			Details: map[string]any{"generation": generation},
 			Error:   journal.BoundDiagnostic(err.Error()),
 		})
 	}
 	return err
 }
 
-func (a *application) reconcileCapabilities(ctx context.Context) error {
+func (a *application) reconcileCapabilitiesAttempt(ctx context.Context) error {
 	if a.fixedStackMu != nil {
 		a.fixedStackMu.Lock()
 		defer a.fixedStackMu.Unlock()
@@ -704,14 +786,6 @@ func (a *application) reconcileCapabilities(ctx context.Context) error {
 	err := a.docker.ReconcileCapabilities(reconcileCtx, manifest)
 	if errors.Is(reconcileCtx.Err(), context.Canceled) {
 		return nil
-	}
-	if err != nil && a.audit != nil {
-		_ = a.audit.Append(logstore.Event{
-			At:      time.Now().UTC(),
-			Type:    "capability.reconcile_failed",
-			Details: map[string]any{"generation": manifest.ID()},
-			Error:   journal.BoundDiagnostic(err.Error()),
-		})
 	}
 	return err
 }
@@ -773,6 +847,13 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 	if a.maintenanceMu == nil {
 		return errors.New("maintenance admission is unavailable")
 	}
+	if a.state == nil || a.sandboxes == nil || a.selfUpdate == nil {
+		return errors.New("maintenance state dependencies are unavailable")
+	}
+	jobs := a.maintenanceJobs
+	if jobs == nil {
+		jobs = liveMaintenanceCleanup{config: a.config, snapshots: a.snapshots, selfUpdate: a.selfUpdate, images: a.docker}
+	}
 	a.maintenanceMu.Lock()
 	state := a.state.State()
 	if !maintenanceStateEligible(state, allowedOperationID) {
@@ -784,13 +865,12 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 		a.maintenanceMu.Unlock()
 		return fmt.Errorf("inspect unfinished operations before maintenance: %w", err)
 	}
-	for _, operation := range unfinished {
-		if operation.ID != allowedOperationID {
-			a.maintenanceMu.Unlock()
-			return nil
-		}
+	operationReferences, operationsEligible := maintenanceOperationReferences(unfinished, allowedOperationID)
+	if !operationsEligible {
+		a.maintenanceMu.Unlock()
+		return nil
 	}
-	if a.processes != nil && a.processes.ActiveBackgroundCount() > 0 {
+	if a.activeMaintenanceProcesses() > 0 {
 		a.maintenanceMu.Unlock()
 		return nil
 	}
@@ -806,6 +886,14 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 	protectedSnapshots := map[string]struct{}{}
 	protectedIDs := map[string]struct{}{}
 	protectedImages := map[string]struct{}{}
+	for _, operation := range operationReferences {
+		if operation.TargetGeneration != "" {
+			protectedIDs[operation.TargetGeneration] = struct{}{}
+		}
+		if operation.SnapshotPath != "" {
+			protectedSnapshots[operation.SnapshotPath] = struct{}{}
+		}
+	}
 	for _, generation := range []*model.Generation{state.Current, state.Previous, state.Candidate} {
 		if generation == nil {
 			continue
@@ -857,7 +945,17 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 		}
 		a.maintenanceMu.Lock()
 		current := a.state.State()
-		if a.maintenanceMu.Epoch() != expectedEpoch || current.Generation != planGeneration || !maintenanceStateEligible(current, allowedOperationID) || a.processes != nil && a.processes.ActiveBackgroundCount() > 0 {
+		valid := a.maintenanceMu.Epoch() == expectedEpoch && current.Generation == planGeneration && maintenanceStateEligible(current, allowedOperationID) && a.activeMaintenanceProcesses() == 0
+		if valid {
+			currentOperations, operationErr := a.state.UnfinishedOperations()
+			currentReferences, currentEligible := maintenanceOperationReferences(currentOperations, allowedOperationID)
+			valid = operationErr == nil && currentEligible && sameMaintenanceOperationReferences(operationReferences, currentReferences)
+		}
+		if valid {
+			currentSelfState, selfStateErr := a.selfUpdate.State()
+			valid = selfStateErr == nil && currentSelfState.Activation == nil && sameMaintenanceSelfUpdateState(selfState, currentSelfState)
+		}
+		if !valid {
 			aborted = true
 			nextEpoch := a.maintenanceMu.Epoch() + 1
 			a.maintenanceMu.Unlock()
@@ -880,23 +978,18 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 		}, true
 	})
 	now := time.Now().UTC()
-	snapshots := a.snapshots
-	snapshots.RemovalGuard = removalGuard
-	snapshotCount, snapshotErr := snapshots.Prune(ctx, now, protectedSnapshots)
-	releaseCount, releaseErr := maintenance.PruneReleases(ctx, now, maintenance.ReleasePolicy{
-		Root:            filepath.Join(a.config.StateDir, "releases"),
-		Channel:         a.config.ReleaseChannel,
-		Retention:       time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second,
-		ProtectedIDs:    protectedIDs,
-		ProtectedImages: protectedImages,
-		HeldImages:      heldImages,
-		Images:          a.docker,
-		RemovalGuard:    removalGuard,
-	})
+	snapshotCount, snapshotErr := jobs.PruneSnapshots(ctx, now, protectedSnapshots, removalGuard)
+	releaseCount, releaseErr := jobs.PruneReleases(ctx, now, protectedIDs, protectedImages, heldImages, removalGuard)
 	// Manager binaries are serialized by their dedicated recovery lock inside
-	// PruneVersions. Do not invert that lock with admission by adding the generic
-	// removal guard here.
-	managerVersionCount, managerVersionErr := a.selfUpdate.PruneVersions(ctx, now, time.Duration(contract.ObsoleteArtifactRetentionSeconds)*time.Second)
+	// PruneManagerVersions. The admission guard is released before taking that
+	// lock, while the cleanup itself re-reads Manager state under the recovery
+	// lock before deleting any version.
+	managerVersionCount := 0
+	var managerVersionErr error
+	if releaseAdmission, ok := removalGuard(); ok {
+		releaseAdmission()
+		managerVersionCount, managerVersionErr = jobs.PruneManagerVersions(ctx, now, time.Duration(contract.ObsoleteArtifactRetentionSeconds)*time.Second)
+	}
 	err = errors.Join(snapshotErr, releaseErr, managerVersionErr)
 	if a.audit != nil && (snapshotCount > 0 || releaseCount > 0 || managerVersionCount > 0 || err != nil) {
 		event := logstore.Event{
@@ -910,6 +1003,72 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 		_ = a.audit.Append(event)
 	}
 	return err
+}
+
+type maintenanceOperationReference struct {
+	ID               string
+	TargetGeneration string
+	SnapshotPath     string
+	Status           model.OperationStatus
+	Phase            model.OperationPhase
+	Finalized        bool
+	UpdatedAt        time.Time
+}
+
+func maintenanceOperationReferences(operations []model.Operation, allowedOperationID string) ([]maintenanceOperationReference, bool) {
+	if len(operations) == 0 {
+		return nil, allowedOperationID == ""
+	}
+	if allowedOperationID == "" || len(operations) != 1 || operations[0].ID != allowedOperationID {
+		return nil, false
+	}
+	operation := operations[0]
+	return []maintenanceOperationReference{{
+		ID: operation.ID, TargetGeneration: operation.TargetGeneration, SnapshotPath: operation.SnapshotPath,
+		Status: operation.Status, Phase: operation.Phase, Finalized: operation.Finalized, UpdatedAt: operation.UpdatedAt,
+	}}, true
+}
+
+func sameMaintenanceOperationReferences(left, right []maintenanceOperationReference) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameMaintenanceSelfUpdateState(left, right selfupdate.State) bool {
+	return left.SchemaVersion == right.SchemaVersion && left.UpdatedAt.Equal(right.UpdatedAt) &&
+		sameMaintenanceVersion(left.Current, right.Current) && sameMaintenanceVersion(left.Previous, right.Previous) &&
+		sameMaintenanceVersion(left.Candidate, right.Candidate) && sameMaintenanceActivation(left.Activation, right.Activation)
+}
+
+func sameMaintenanceVersion(left, right *selfupdate.Version) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameMaintenanceActivation(left, right *selfupdate.Activation) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func (a *application) activeMaintenanceProcesses() int {
+	if a.maintenanceActiveProcesses != nil {
+		return a.maintenanceActiveProcesses()
+	}
+	if a.processes != nil {
+		return a.processes.ActiveBackgroundCount()
+	}
+	return 0
 }
 
 func maintenanceStateEligible(state model.ManagerState, allowedOperationID string) bool {

@@ -45,10 +45,14 @@ type Manager struct {
 	// cleanup. It is intentionally held only for short Sandbox registry and
 	// container transitions, never for an Agent command's execution lifetime.
 	MaintenanceMu sync.Locker
-	mu            sync.Mutex
-	registry      registry
-	ensureMu      sync.Mutex
-	ensureByID    map[string]*sync.Mutex
+	// ReclaimCapacity performs one controlled maintenance pass before a missing
+	// Sandbox image is retried. It is invoked before MaintenanceMu is acquired so
+	// cleanup cannot invert admission locks.
+	ReclaimCapacity func(context.Context) error
+	mu              sync.Mutex
+	registry        registry
+	ensureMu        sync.Mutex
+	ensureByID      map[string]*sync.Mutex
 }
 
 func Open(engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
@@ -72,7 +76,32 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	if sandboxID == "" {
 		return driver.SandboxSpec{}, errors.New("sandbox_id is required")
 	}
+	m.mu.Lock()
+	desiredImage := m.Image
+	m.mu.Unlock()
+	if desiredImage == "" {
+		return driver.SandboxSpec{}, errors.New("sandbox image is not configured")
+	}
+	if preparer, ok := m.Engine.(driver.ManagedImagePreparer); ok {
+		prepareErr := preparer.PrepareManagedImage(ctx, "agent-sandbox", desiredImage)
+		if driver.IsInsufficientCapacity(prepareErr) && m.ReclaimCapacity != nil {
+			if reclaimErr := m.ReclaimCapacity(ctx); reclaimErr != nil {
+				return driver.SandboxSpec{}, errors.Join(prepareErr, fmt.Errorf("reclaim capacity before sandbox image retry: %w", reclaimErr))
+			}
+			prepareErr = preparer.PrepareManagedImage(ctx, "agent-sandbox", desiredImage)
+		}
+		if prepareErr != nil {
+			return driver.SandboxSpec{}, fmt.Errorf("prepare sandbox image: %w", prepareErr)
+		}
+	}
 	unlockMaintenance := m.lockMaintenance()
+	m.mu.Lock()
+	imageStillCurrent := m.Image == desiredImage
+	m.mu.Unlock()
+	if !imageStillCurrent {
+		unlockMaintenance()
+		return m.Ensure(ctx, sandboxID, workspaceID, now)
+	}
 	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()

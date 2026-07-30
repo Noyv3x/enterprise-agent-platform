@@ -297,11 +297,63 @@ func TestWatchdogRestoresPreviousBinaryWhenCandidateDoesNotStart(t *testing.T) {
 		t.Fatal("watchdog did not atomically restore the previous executable")
 	}
 	state, _ = manager.State()
-	if state.Current == nil || state.Current.Version != "current" || state.Activation != nil {
+	if state.Current == nil || state.Current.Version != "current" || state.Activation != nil || state.Candidate != nil {
 		t.Fatalf("rollback corrupted self-update state: %#v", state)
+	}
+	var terminal Plan
+	if err := atomicfile.ReadJSON(plan.PlanPath, &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Status != ordinaryRolledBackStatus || terminal.PlatformCommit != manifest.SourceCommit || terminal.CandidatePath == "" {
+		t.Fatalf("watchdog rollback evidence is incomplete: %#v", terminal)
+	}
+	if rolledBack, err := manager.ActivationRolledBack(manifest); err != nil || !rolledBack {
+		t.Fatalf("watchdog rollback was not visible to Platform recovery: rolledBack=%v err=%v", rolledBack, err)
+	}
+	if err := manager.Prepare(context.Background(), manifest); err == nil || !strings.Contains(err.Error(), "cannot be retried") {
+		t.Fatalf("rejected Manager candidate was prepared again: %v", err)
 	}
 	if len(runner.calls) < 3 || runner.calls[len(runner.calls)-1][0] != "systemctl" {
 		t.Fatalf("rollback did not restart the restored service: %#v", runner.calls)
+	}
+}
+
+func TestPreviousManagerSettlesCrashAfterTerminalRollbackPlanBeforeStateClear(t *testing.T) {
+	manager, manifest, oldBinary, _ := newPreparedManager(t)
+	if err := manager.MarkPlatformCommitted(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Activate(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan Plan
+	if err := atomicfile.ReadJSON(state.Activation.PlanPath, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfile.WriteFile(manager.InstallPath, oldBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan.Status = ordinaryRolledBackStatus
+	plan.Error = "injected watchdog rejection"
+	if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.acknowledgeExecutable(state.Current.Path); err != nil {
+		t.Fatal(err)
+	}
+	state, err = manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Candidate != nil || state.Activation != nil || state.Current == nil || state.Current.Version != "current" {
+		t.Fatalf("old Manager did not settle terminal watchdog state: %#v", state)
+	}
+	if rolledBack, err := manager.ActivationRolledBack(manifest); err != nil || !rolledBack {
+		t.Fatalf("settled rollback was not reported: rolledBack=%v err=%v", rolledBack, err)
 	}
 }
 

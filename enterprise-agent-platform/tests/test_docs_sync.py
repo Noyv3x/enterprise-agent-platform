@@ -258,7 +258,11 @@ class DocsSyncTests(unittest.TestCase):
                     "update_pre_download_min_free_bytes": 8589934592,
                     "update_pre_cutover_min_free_bytes": 2147483648,
                     "update_min_free_inodes": 4096,
-                    "update_core_image_capacity_estimates": {
+                    "managed_image_capacity_estimates": {
+                        "agent-sandbox": {
+                            "compressed_bytes": 4294967296,
+                            "unpacked_bytes": 8589934592,
+                        },
                         "platform": {
                             "compressed_bytes": 8589934592,
                             "unpacked_bytes": 17179869184,
@@ -266,6 +270,34 @@ class DocsSyncTests(unittest.TestCase):
                         "agent-runtime": {
                             "compressed_bytes": 4294967296,
                             "unpacked_bytes": 8589934592,
+                        },
+                        "camofox": {
+                            "compressed_bytes": 4294967296,
+                            "unpacked_bytes": 8589934592,
+                        },
+                        "searxng": {
+                            "compressed_bytes": 2147483648,
+                            "unpacked_bytes": 4294967296,
+                        },
+                        "firecrawl-api": {
+                            "compressed_bytes": 8589934592,
+                            "unpacked_bytes": 17179869184,
+                        },
+                        "firecrawl-playwright": {
+                            "compressed_bytes": 8589934592,
+                            "unpacked_bytes": 17179869184,
+                        },
+                        "firecrawl-postgres": {
+                            "compressed_bytes": 2147483648,
+                            "unpacked_bytes": 4294967296,
+                        },
+                        "firecrawl-redis": {
+                            "compressed_bytes": 1073741824,
+                            "unpacked_bytes": 2147483648,
+                        },
+                        "firecrawl-rabbitmq": {
+                            "compressed_bytes": 1073741824,
+                            "unpacked_bytes": 2147483648,
                         },
                     },
                     "public_update_states": [
@@ -435,7 +467,7 @@ class DocsSyncTests(unittest.TestCase):
         self.write_fixture()
         path = self.root / "docs/contracts/container-platform.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        del contract["update_core_image_capacity_estimates"]["agent-runtime"][
+        del contract["managed_image_capacity_estimates"]["agent-runtime"][
             "unpacked_bytes"
         ]
         path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")

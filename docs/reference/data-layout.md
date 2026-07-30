@@ -84,7 +84,7 @@ Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs �
 
 管理器状态根保存 current/previous/target release、generation、operation journal、心跳和 owner-only control socket。每个本地 `releases/<commit>/` 的 manifest 与 Compose 是不可变发布物；可变的 `compose.env` 只包含该宿主生成的路径与镜像 digest。`active-generation` 由 Manager 原子写入，明确指出停止、日志和恢复命令应使用的 Compose generation，不能按目录修改时间猜测。Platform 的业务数据库不得成为容器编排状态的唯一存储，否则 Platform 失败时无法恢复。
 
-每次可能改变数据库或 sidecar 格式的 operation 都建立与目标 generation 绑定的一致快照，至少保留 previous generation 所需的回滚点。容量门禁对每个受管快照源采用 `max(逻辑大小, 已分配块大小)`，并在 reservation 前以及 reservation 后、停止 writer 前各检查一次，避免稀疏文件、WAL 增长或并发文件变化把实际回滚成本低估。快照 manifest 记录受管文件的类型、mode、大小与内容 hash；只有文件和 manifest 全部同步、父目录也完成同步后，快照才能写入 operation journal。
+每次可能改变数据库或 sidecar 格式的 operation 都建立与目标 generation 绑定的一致快照，至少保留 previous generation 所需的回滚点。容量门禁对每个受管快照源采用 `max(逻辑大小, 已分配块大小)`，并在 reservation 前以及 reservation 后、停止 writer 前各检查一次，避免稀疏文件、WAL 增长或并发文件变化把实际回滚成本低估。快照 manifest 记录受管文件的类型、mode、大小与内容 hash；只有文件和 manifest 全部同步、父目录也完成同步后，快照才能写入 operation journal。所有受管镜像还共享 canonical 的压缩层与展开后容量上限；核心预拉取、能力后台收敛和 Sandbox 按需拉取都必须按本地缺失 digest 使用该目录，不能只有更新主链路执行容量门禁。
 
 快照不得直接向最终 `backups/<operation-id>/` 写入半成品。Manager 先在 `backups/` 下创建名称绑定 operation id 的 owner-only staging，增量复制受管文件、写 manifest 并同步 staging；全部成功后才原子 rename 为最终目录并同步 `backups/`。复制、manifest、校验、同步或 ENOSPC 在发布边界前失败时，只精确清理本次 staging 并保持最终路径不存在。进程在清理前崩溃时，维护循环只识别符合受管命名、类型、所有权和内容白名单的 staging，并在 `obsolete_artifact_retention_seconds` 宽限后删除；未知目录或附加证据继续保留。
 

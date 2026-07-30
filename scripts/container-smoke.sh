@@ -171,8 +171,8 @@ for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do
   grep -Fq "$secret" containers/compose.yaml \
     || fail "Compose is missing Firecrawl secret $secret"
 done
-grep -Fq "url: 'https://example.com/'" .github/workflows/container-release.yml \
-  || fail "release smoke test does not launch a real Camoufox page"
+grep -Fq 'python3 scripts/browser-control-compose-smoke.py' .github/workflows/container-release.yml \
+  || fail "release smoke test does not exercise browser control through Platform"
 grep -Fq 'docker network inspect "$UBITECH_CORE_NETWORK"' .github/workflows/container-release.yml \
   || fail "release smoke test does not verify the durable core network"
 grep -Fq 'cp install.sh "$stage/install.sh"' .github/workflows/container-release.yml \
@@ -203,19 +203,21 @@ grep -Fq 'env -u GH_TOKEN -u GITHUB_TOKEN curl -q' .github/workflows/container-r
   || fail "public package metadata verification can inherit GitHub credentials"
 grep -Fq 'https://ghcr.io/v2/${owner}/${package}/manifests/${digest}' .github/workflows/container-release.yml \
   || fail "release does not verify final digest metadata through the anonymous GHCR registry contract"
-grep -Fq '.update_core_image_capacity_estimates[$component].compressed_bytes' .github/workflows/container-release.yml \
-  || fail "release does not enforce the canonical compressed core-image capacity limit"
-grep -Fq '.update_core_image_capacity_estimates[$component].unpacked_bytes' .github/workflows/container-release.yml \
-  || fail "release does not enforce the canonical unpacked core-image capacity limit"
+grep -Fq '.managed_image_capacity_estimates[$component].compressed_bytes' .github/workflows/container-release.yml \
+  || fail "release does not enforce the canonical compressed managed-image capacity limit"
+grep -Fq '.managed_image_capacity_estimates[$component].unpacked_bytes' .github/workflows/container-release.yml \
+  || fail "release does not enforce the canonical unpacked managed-image capacity limit"
 grep -Fq 'docker pull --platform "linux/${architecture}" "$image"' .github/workflows/container-release.yml \
-  || fail "release does not verify every supported core-image architecture"
+  || fail "release does not verify every supported managed-image architecture"
 grep -Fq 'image_repository="${image%@*}"' .github/workflows/container-release.yml \
-  || fail "release core-image verification does not isolate its repository variable"
+  || fail "release managed-image verification does not isolate its repository variable"
 if rg -q '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
-  fail "release core-image verification overwrites the package repository variable"
+  fail "release managed-image verification overwrites the package repository variable"
 fi
-grep -Fq 'docker pull "$image"' .github/workflows/container-release.yml \
-  || fail "release does not anonymously pull each final image digest"
+grep -Fq "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)" .github/workflows/container-release.yml \
+  || fail "release image verification is not driven by the canonical managed-image directory"
+grep -Fq '[[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]' .github/workflows/container-release.yml \
+  || fail "release does not fail closed when the managed-image catalog is incomplete"
 if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then
   fail "container release still publishes a retired FoundationDB image key"
 fi
@@ -243,14 +245,56 @@ def job(name: str) -> str:
 public_images = job("public-images")
 if "packages: read" not in public_images:
     raise SystemExit("public-image gate lacks package metadata read permission")
+if "    timeout-minutes: 120\n" not in public_images:
+    raise SystemExit("public-image gate lacks the all-image multi-architecture validation budget")
 if "docker/login-action" in public_images:
     raise SystemExit("public-image gate must never establish a registry login")
 for dependent in ("compose-smoke", "publish"):
     if "      - public-images\n" not in job(dependent):
         raise SystemExit(f"{dependent} can run before the public-image gate")
-for component in ("platform", "agent-runtime", "camofox", "agent-sandbox"):
+managed_components = (
+    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+    "firecrawl-redis", "firecrawl-rabbitmq",
+)
+for component in managed_components:
     if component not in public_images:
         raise SystemExit(f"public-image gate omits {component}")
+    if f"[{component}]=" not in public_images:
+        raise SystemExit(f"public-image capacity catalog omits {component}")
+for fragment in (
+    "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)",
+    '[[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]',
+    'for component in "${components[@]}"; do',
+    'for architecture in amd64 arm64; do',
+    'docker buildx imagetools inspect "$image" --raw',
+    'docker buildx imagetools inspect "${image_repository}@${platform_digest}" --raw',
+    'docker pull --platform "linux/${architecture}" "$image"',
+    "[.config.size, (.layers[]?.size)] | add",
+    'remove_exact_local_image() {',
+    'docker image rm --force "$local_id"',
+    "docker info --format '{{.ServerVersion}}'",
+    '.[0].Os == "linux"',
+    '.[0].Architecture == $architecture',
+    'remove_exact_local_image "$image" "$pulled_id"',
+    'verified_images="$GITHUB_WORKSPACE/verified-managed-images.json"',
+    "(.managed_image_capacity_estimates | keys) == ($verified[0] | keys)",
+    "name: verified-managed-images",
+):
+    if fragment not in public_images:
+        raise SystemExit(f"public-image capacity gate lacks required coverage: {fragment}")
+if 'if [[ "$component" == platform || "$component" == agent-runtime ]]' in public_images:
+    raise SystemExit("managed-image capacity verification is still limited to core images")
+if public_images.count('for architecture in amd64 arm64; do') != 1:
+    raise SystemExit("managed-image capacity gate must have one shared architecture loop")
+if public_images.count(".managed_image_capacity_estimates[$component].compressed_bytes") != 1 or public_images.count(
+    ".managed_image_capacity_estimates[$component].unpacked_bytes"
+) != 1:
+    raise SystemExit("managed-image capacity limits must be read once in the shared all-image loop")
+if 'docker image rm --force "$image" >/dev/null 2>&1 || true' in public_images:
+    raise SystemExit("managed-image cleanup still masks exact-reference removal failures")
+if "set -x" in public_images or 'echo "$anonymous_token"' in public_images:
+    raise SystemExit("public-image gate can expose anonymous registry credentials")
 
 upstream_contracts = job("upstream-contracts")
 if 'grep -Fxq "$service" "$root/actual-services"' not in upstream_contracts:
@@ -284,9 +328,39 @@ for fragment in (
     'test "$read_output" = "$sentinel_value"',
     'rm --stop --force',
     '--wait --wait-timeout 600 firecrawl-api',
+    'name: verified-managed-images',
+    'verified_images=artifacts/verified-managed-images.json',
+    'UBITECH_PLATFORM_IMAGE="$(jq -er',
+    'UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er',
+    'UBITECH_CAMOFOX_IMAGE="$(jq -er',
+    'UBITECH_AGENT_SANDBOX_IMAGE="$(jq -er',
+    'UBITECH_SEARXNG_IMAGE="$(jq -er',
+    'UBITECH_FIRECRAWL_API_IMAGE="$(jq -er',
+    'UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE="$(jq -er',
+    'UBITECH_FIRECRAWL_POSTGRES_IMAGE="$(jq -er',
+    'UBITECH_FIRECRAWL_REDIS_IMAGE="$(jq -er',
+    'UBITECH_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er',
+    'sandbox_image="$UBITECH_AGENT_SANDBOX_IMAGE"',
+    'docker compose -f containers/compose.yaml config --format json',
+    '} == ($expected[0] | del(."agent-sandbox"))',
+    'browser_fixture_container="${UBITECH_COMPOSE_PROJECT}-browser-fixture"',
+    'scripts/fixtures/browser-control.html',
+    '--entrypoint python',
+    'python3 scripts/browser-control-compose-smoke.py',
+    '--bootstrap-password-file "$UBITECH_DATA_ROOT/data/bootstrap-admin-password.txt"',
+    '--agent-tool-token-file "$UBITECH_SECRETS_DIR/agent-tool-token"',
+    '--fixture-url "http://${browser_fixture_container}:18081/"',
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks PostgreSQL Firecrawl acceptance coverage: {fragment}")
+for variable in (
+    "UBITECH_PLATFORM_IMAGE", "UBITECH_AGENT_RUNTIME_IMAGE", "UBITECH_CAMOFOX_IMAGE",
+    "UBITECH_AGENT_SANDBOX_IMAGE", "UBITECH_SEARXNG_IMAGE", "UBITECH_FIRECRAWL_API_IMAGE",
+    "UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE", "UBITECH_FIRECRAWL_POSTGRES_IMAGE",
+    "UBITECH_FIRECRAWL_REDIS_IMAGE", "UBITECH_FIRECRAWL_RABBITMQ_IMAGE",
+):
+    if compose_smoke.count(variable) < 2:
+        raise SystemExit(f"compose-smoke does not export verified image identity: {variable}")
 if compose_smoke.count('--wait --wait-timeout 600 firecrawl-api') < 2:
     raise SystemExit("compose-smoke must use the production Firecrawl wait budget for cold and warm starts")
 if compose_smoke.count("fetch('http://127.0.0.1:3002/v1/scrape'") != 1 or compose_smoke.count(
@@ -296,10 +370,28 @@ if compose_smoke.count("fetch('http://127.0.0.1:3002/v1/scrape'") != 1 or compos
 if "foundationdb/foundationdb@sha256:" in compose_smoke:
     raise SystemExit("compose-smoke still pulls or runs the retired FoundationDB image")
 
+browser_smoke = Path("scripts/browser-control-compose-smoke.py").read_text(encoding="utf-8")
+for fragment in (
+    '"/api/auth/login"',
+    '"/api/private-agent/status"',
+    '"/internal/agent/tools/browser"',
+    '"/api/agent-previews/browser/control"',
+    'send(1, "click", x=96, y=64)',
+    'send(2, "text", text=CONTROL_TEXT)',
+    'send(3, "key", key="Enter")',
+    'send(4, "wheel", delta_x=0, delta_y=900)',
+    'client.frame(actor_id, tab_id)',
+    'exc.status == 409',
+    '"command": "release"',
+    'client.gateway("refresh", {"tab_id": tab_id})',
+):
+    if fragment not in browser_smoke:
+        raise SystemExit(f"browser control compose smoke lacks required coverage: {fragment}")
+
 publish = job("publish")
 if "pattern: '*'" in publish or 'pattern: "*"' in publish:
     raise SystemExit("publish must not download every workflow artifact")
-for fragment in ("pattern: image-*", "pattern: manager-*"):
+for fragment in ("name: verified-managed-images", "pattern: manager-*"):
     if fragment not in publish:
         raise SystemExit(f"publish omits scoped release artifact family: {fragment}")
 for fragment in (
@@ -308,6 +400,8 @@ for fragment in (
     'image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")',
     "if not image_name.fullmatch(name):",
     'if set(data["images"]) != expected_images:',
+    '--argjson images "$verified_images"',
+    "images: $images",
 ):
     if fragment not in publish:
         raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")

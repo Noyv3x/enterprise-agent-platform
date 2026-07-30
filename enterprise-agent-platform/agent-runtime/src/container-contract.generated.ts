@@ -16,7 +16,11 @@ export const OBSOLETE_ARTIFACT_RETENTION_SECONDS = 3600 as const;
 export const UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES = 8589934592 as const;
 export const UPDATE_PRE_CUTOVER_MIN_FREE_BYTES = 2147483648 as const;
 export const UPDATE_MIN_FREE_INODES = 4096 as const;
-export const UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {
+export const MANAGED_IMAGE_CAPACITY_ESTIMATES = {
+  "agent-sandbox": {
+    "compressed_bytes": 4294967296,
+    "unpacked_bytes": 8589934592
+  },
   "platform": {
     "compressed_bytes": 8589934592,
     "unpacked_bytes": 17179869184
@@ -24,6 +28,34 @@ export const UPDATE_CORE_IMAGE_CAPACITY_ESTIMATES = {
   "agent-runtime": {
     "compressed_bytes": 4294967296,
     "unpacked_bytes": 8589934592
+  },
+  "camofox": {
+    "compressed_bytes": 4294967296,
+    "unpacked_bytes": 8589934592
+  },
+  "searxng": {
+    "compressed_bytes": 2147483648,
+    "unpacked_bytes": 4294967296
+  },
+  "firecrawl-api": {
+    "compressed_bytes": 8589934592,
+    "unpacked_bytes": 17179869184
+  },
+  "firecrawl-playwright": {
+    "compressed_bytes": 8589934592,
+    "unpacked_bytes": 17179869184
+  },
+  "firecrawl-postgres": {
+    "compressed_bytes": 2147483648,
+    "unpacked_bytes": 4294967296
+  },
+  "firecrawl-redis": {
+    "compressed_bytes": 1073741824,
+    "unpacked_bytes": 2147483648
+  },
+  "firecrawl-rabbitmq": {
+    "compressed_bytes": 1073741824,
+    "unpacked_bytes": 2147483648
   }
 } as const;
 export const PUBLIC_UPDATE_STATES = ["idle", "waiting_for_tasks", "updating", "failed"] as const;

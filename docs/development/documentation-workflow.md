@@ -7,7 +7,7 @@
 ## 修改顺序
 
 1. 在对应设计或参考文档中描述期望的最终行为。
-2. 如果精确默认值、边界或枚举跨语言/进程共享，或被声明为稳定设计契约，先修改相应的机器可读契约；当前跨层 Runtime 策略契约为 [`runtime-policy.json`](../contracts/runtime-policy.json)。
+2. 如果精确默认值、边界或枚举跨语言/进程共享，或被声明为稳定设计契约，先修改相应的机器可读契约；当前跨层 Runtime 策略契约为 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器服务集合、容量预算与更新边界由 [`container-platform.json`](../contracts/container-platform.json) 统一定义。
 3. 运行 `python3 scripts/docs_sync.py sync`，生成各语言消费的契约模块。
 4. 修改生产代码，并补充或更新映射域中的验收测试。
 5. 运行 `python3 scripts/docs_sync.py check` 和该代码域的完整测试。
@@ -46,9 +46,13 @@ Manifest、canonical 文档、机器契约及生成目标都必须位于仓库�
 
 CI 在生成 release 前验证当前文档树与代码共改关系。部署机只消费已经通过门禁的不可变发布物；CI、发布门和本地测试使用同一脚本，不能各自维护一套规则。
 
+容器发布的静态门禁还要锁定真实浏览器人工接管验收入口及动作集合，避免后续把跨层验收退化为直连 sidecar 的 health/tab 测试；静态门只确认验收脚本仍被调用，能力是否工作由同一次 Compose job 中的真实服务链路判定。
+
 顶层 `scripts/test.sh` 必须可以在没有生产部署变量的开发机或 CI 工作区中直接运行。它对 Compose 做静态解析时使用隔离环境、不可变占位镜像引用和无副作用的占位挂载路径，不读取项目 `.env`，也不连接或修改正在运行的产品容器。
 
 部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。发布器生成的镜像键必须与当前 JSON Schema 的必需集合精确相等；上游 Firecrawl Compose 验证只要求源码契约列出的现役受管服务存在，不能把未采用的上游实验服务重新带入产品契约。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须确认 PostgreSQL 是唯一队列基线、Compose 不含 FoundationDB 服务或注入，并真实启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API。随后在保留同一 PostgreSQL bind 数据的前提下重建服务，以容器 id 变化、精确读回首轮数据哨兵和真实提取请求共同证明持久与运行契约；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。
+
+受管镜像容量目录同样属于机器契约：文档同步器必须要求它与当前受管镜像集合精确相等，并为 Python、TypeScript 与 Go 生成同一份只读目录。发布静态验收必须证明匿名拉取、双架构压缩/展开尺寸门、真实 Compose 和最终 release manifest 全部消费同一份已经验证的镜像工件；每次临时拉取后只能按刚刚观察到的精确 image ID 清理，身份漂移、缺失或 Docker 状态不可读时失败关闭，不能用宽泛 prune 或忽略删除错误掩盖 CI 磁盘增长。
 
 镜像声明为 volume 的配置根必须由完整受管目录 bind 覆盖，并在发布工作流启动真实容器后检查 Mounts，确认没有匿名卷；SearXNG 的 `/etc/searxng` 是该规则的固定回归边界。
 
