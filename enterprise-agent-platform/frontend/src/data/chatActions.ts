@@ -51,6 +51,7 @@ import {
   loadChannelMessages,
   loadDocuments,
   loadPrivateMessages,
+  loadPrivateTelegram,
   type AppStore,
 } from "./loaders";
 import type {
@@ -158,6 +159,36 @@ function messageSyncPath(
   }
   const query = params.toString();
   return query ? `${path}?${query}` : path;
+}
+
+function canRefreshCachedScope(
+  state: AppState,
+  mode: ChatMode,
+  scopeId: string,
+): boolean {
+  const cursor = state.messageSyncCursors[chatScopeKey(mode, scopeId)];
+  return cursor?.afterId !== undefined && cursor.revision !== undefined;
+}
+
+async function loadNavigatedChat(
+  store: AppStore,
+  mode: ChatMode,
+  scopeId: string,
+  restored: boolean,
+  loadFullPage: () => Promise<void>,
+  refreshRelated?: () => Promise<void>,
+): Promise<void> {
+  // A restored cache can contain several history pages. Refresh it from its
+  // forward cursor so returning to the scope cannot replace that history with
+  // the server's unparameterized latest page.
+  if (restored && canRefreshCachedScope(store.getState(), mode, scopeId)) {
+    await Promise.all([
+      refreshActiveChat(store),
+      refreshRelated?.() ?? Promise.resolve(),
+    ]);
+    return;
+  }
+  await loadFullPage();
 }
 
 function mergeDelta(
@@ -435,8 +466,15 @@ export async function navigateToView(store: AppStore, view: ActiveView): Promise
   }
   if (view === "private") {
     const scopeId = scopeIdFor(store.getState(), "private");
-    restoreCachedChat(store, "private", scopeId);
-    await runResourceLoad(store, resourceKeys.privateChat, () => loadPrivateMessages(store));
+    const restored = restoreCachedChat(store, "private", scopeId);
+    await runResourceLoad(store, resourceKeys.privateChat, () => loadNavigatedChat(
+      store,
+      "private",
+      scopeId,
+      restored,
+      () => loadPrivateMessages(store),
+      () => loadPrivateTelegram(store),
+    ));
   } else if (view === "knowledge") {
     await ensureResource(store, resourceKeys.knowledgeList, () => loadDocuments(store));
   }
@@ -450,13 +488,21 @@ export async function selectChannel(store: AppStore, channelId: Id): Promise<voi
   cacheVisibleChat(store);
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
   store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: channelId });
-  if (!restoreCachedChat(store, "channel", String(channelId))) {
+  const scopeId = String(channelId);
+  const restored = restoreCachedChat(store, "channel", scopeId);
+  if (!restored) {
     store.dispatch({ type: "SET_MESSAGES", payload: [] });
   }
   store.dispatch({ type: "SET_TYPING_USERS", payload: [] });
   store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
   store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false });
-  await runResourceLoad(store, resourceKeys.channelChat(channelId), () => loadChannelMessages(store));
+  await runResourceLoad(store, resourceKeys.channelChat(channelId), () => loadNavigatedChat(
+    store,
+    "channel",
+    scopeId,
+    restored,
+    () => loadChannelMessages(store),
+  ));
 }
 
 /* ----------------------------------------------------- optimistic send */

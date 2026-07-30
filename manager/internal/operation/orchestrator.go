@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type Snapshotter interface {
 
 type SelfUpdater interface {
 	Prepare(context.Context, release.Manifest) error
+	DiscardPrepared(release.Manifest) error
 	MarkPlatformCommitted(release.Manifest) error
 	Activate(context.Context, release.Manifest) error
 	ActivationCommitted(release.Manifest) (bool, error)
@@ -198,8 +200,30 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 	if op == nil {
 		return nil
 	}
+	if op.PreparedCleanupPending {
+		return o.recoverPreparedCleanup(*op)
+	}
 	if op.ManagerActivationRollback {
 		return o.recoverManagerActivationRollback(ctx, *op)
+	}
+	// A terminal operation can be durable while Manager state still names it as
+	// active. Resolve that half-commit before inspecting reservation checkpoints:
+	// inverse cleanup deliberately retains the old reservation fields, and must
+	// never be routed back through reservation or update recovery after its
+	// terminal write has cleared PreparedCleanupPending.
+	if op.Status == model.OperationFailed {
+		state = o.Store.State()
+		if state.Maintenance {
+			return o.recoverRollback(ctx, *op)
+		}
+		_, err = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
+			value.Candidate = nil
+			value.PublicState = model.StateIdle
+			value.Maintenance = false
+			value.LastError = op.Error
+			value.RetryAfterSeconds = 0
+		}, op.Error, o.now())
+		return err
 	}
 	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
 		return o.recoverUnconfirmedReservation(ctx, *op)
@@ -229,19 +253,6 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 		if err == nil && runFinalizeHooks {
 			err = o.finalizeCommitted(ctx, *op, manifest)
 		}
-		return err
-	}
-	if op.Status == model.OperationFailed {
-		if state.Maintenance {
-			return o.recoverRollback(ctx, *op)
-		}
-		_, err = o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
-			value.Candidate = nil
-			value.PublicState = model.StateIdle
-			value.Maintenance = false
-			value.LastError = op.Error
-			value.RetryAfterSeconds = 0
-		}, op.Error, o.now())
 		return err
 	}
 	if !state.Maintenance && (op.Phase == model.PhaseValidating || op.Phase == model.PhasePulling || op.Phase == model.PhasePreparing || op.Phase == model.PhaseDraining) {
@@ -392,16 +403,6 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		}
 		return
 	}
-	if o.SelfUpdate != nil {
-		if err = o.SelfUpdate.Prepare(ctx, manifest); err != nil {
-			if release.IsTemporarilyUnavailable(err) {
-				o.failBeforeMaintenanceRetryable(op, err)
-			} else {
-				o.failBeforeMaintenance(op, err)
-			}
-			return
-		}
-	}
 	if _, err = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.TargetGeneration = manifest.ID()
 		value.UpdatedAt = o.now()
@@ -410,29 +411,36 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist target generation: %w", err))
 		return
 	}
+	op.TargetGeneration = manifest.ID()
 	if _, err = o.Store.MutateState(o.now(), func(state *model.ManagerState) error { state.Candidate = generation(manifest, path); return nil }); err != nil {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist candidate generation: %w", err))
 		return
 	}
+	if o.SelfUpdate != nil {
+		if err = o.SelfUpdate.Prepare(ctx, manifest); err != nil {
+			o.failPreparedBeforeMaintenance(op, manifest, path, err, release.IsTemporarilyUnavailable(err))
+			return
+		}
+	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhasePulling, model.StateIdle, false, "pulling immutable image digests", o.now()); err != nil {
-		o.failBeforeMaintenance(op, fmt.Errorf("persist pulling phase: %w", err))
+		o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("persist pulling phase: %w", err), false)
 		return
 	}
 	if err = o.pullWithCapacityRetry(ctx, op.ID, manifest); err != nil {
-		o.failBeforeMaintenanceRetryable(op, err)
+		o.failPreparedBeforeMaintenance(op, manifest, path, err, true)
 		return
 	}
 	if _, err = o.Store.SetPhase(op.ID, model.PhasePreparing, model.StateWaitingForTasks, false, "candidate is prepared", o.now()); err != nil {
-		o.failBeforeMaintenance(op, fmt.Errorf("persist preparing phase: %w", err))
+		o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("persist preparing phase: %w", err), false)
 		return
 	}
 	if err = o.Engine.Prepare(ctx, manifest); err != nil {
-		o.failBeforeMaintenance(op, err)
+		o.failPreparedBeforeMaintenance(op, manifest, path, err, false)
 		return
 	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
 		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreCutover, manifest); err != nil {
-			o.failBeforeMaintenanceRetryable(op, err)
+			o.failPreparedBeforeMaintenance(op, manifest, path, err, true)
 			return
 		}
 	}
@@ -440,7 +448,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	freshInstall := op.Kind == model.OperationInstall && stateBeforeCutover.Current == nil
 	if !freshInstall {
 		if err = o.reserve(ctx, op.ID); err != nil {
-			o.failReservation(op, err)
+			o.failPreparedReservation(op, manifest, path, err)
 			return
 		}
 	}
@@ -455,22 +463,22 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
 		if err = checker.CheckCapacity(ctx, driver.CapacityPreCutover, manifest); err != nil {
 			if freshInstall {
-				o.failBeforeMaintenanceRetryable(op, fmt.Errorf("recheck capacity before fresh-install writer start: %w", err))
+				o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("recheck capacity before fresh-install writer start: %w", err), true)
 				return
 			}
-			o.failReservedCapacityRecheck(op, err)
+			o.failReservedCapacityRecheck(op, manifest, path, err)
 			return
 		}
 	}
 	if freshInstall {
 		if _, err = o.Store.SetPhase(op.ID, model.PhaseDraining, model.StateUpdating, true, "fresh install entering maintenance", o.now()); err != nil {
-			o.failBeforeMaintenance(op, fmt.Errorf("persist fresh-install maintenance phase: %w", err))
+			o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("persist fresh-install maintenance phase: %w", err), false)
 			return
 		}
 	}
 	if !freshInstall {
 		if err = o.beginReservedMutation(op.ID); err != nil {
-			o.failReservation(op, err)
+			o.failPreparedReservation(op, manifest, path, err)
 			return
 		}
 	}
@@ -575,14 +583,14 @@ func (o *Orchestrator) pullWithCapacityRetry(ctx context.Context, operationID st
 	return retryErr
 }
 
-func (o *Orchestrator) failReservedCapacityRecheck(op model.Operation, cause error) {
+func (o *Orchestrator) failReservedCapacityRecheck(op model.Operation, manifest release.Manifest, path string, cause error) {
 	released := o.resolveReservationUncertainty(o.Gate, op.ID, fmt.Errorf("recheck capacity after admission reservation: %w", cause))
 	var uncertain *reservationReleaseUncertainError
 	if errors.As(released, &uncertain) {
 		o.failReservation(op, released)
 		return
 	}
-	o.failBeforeMaintenanceRetryable(op, released)
+	o.failPreparedBeforeMaintenance(op, manifest, path, released, true)
 }
 
 func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation, manifest release.Manifest) error {
@@ -1186,6 +1194,15 @@ func (o *Orchestrator) failReservation(op model.Operation, cause error) {
 	_ = o.holdUnconfirmedReservation(op, cause)
 }
 
+func (o *Orchestrator) failPreparedReservation(op model.Operation, manifest release.Manifest, path string, cause error) {
+	var uncertain *reservationReleaseUncertainError
+	if errors.As(cause, &uncertain) {
+		_ = o.holdUnconfirmedReservation(op, cause)
+		return
+	}
+	o.failPreparedBeforeMaintenance(op, manifest, path, cause, false)
+}
+
 func (o *Orchestrator) holdUnconfirmedReservation(op model.Operation, cause error) error {
 	message := journal.BoundDiagnostic(cause.Error())
 	if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
@@ -1233,13 +1250,29 @@ func (o *Orchestrator) recoverUnconfirmedReservation(_ context.Context, op model
 	if message == "" {
 		message = "operation interrupted before the admission reservation was confirmed"
 	}
-	_, err := o.Store.Complete(op.ID, false, func(state *model.ManagerState) {
-		state.PublicState = model.StateIdle
-		state.Maintenance = false
-		state.LastError = message
-		state.RetryAfterSeconds = 0
-	}, message, o.now())
-	return err
+	state := o.Store.State()
+	// Restart/rollback reservations, and validation failures which never staged
+	// a release target, have no Manager Candidate dependency to unwind.
+	if (op.Kind != model.OperationInstall && op.Kind != model.OperationUpdate) || op.TargetGeneration == "" {
+		if state.Candidate != nil {
+			return errors.New("reservation without a release target unexpectedly owns a Platform Candidate")
+		}
+		_, err := o.Store.Complete(op.ID, false, func(value *model.ManagerState) {
+			value.PublicState = model.StateIdle
+			value.Maintenance = false
+			value.LastError = message
+			value.RetryAfterSeconds = 0
+		}, message, o.now())
+		return err
+	}
+	durable, err := o.beginPreparedCleanup(op, op.TargetGeneration, errors.New(message), op.Retryable)
+	if err != nil {
+		return fmt.Errorf("persist prepared cleanup after reservation recovery: %w", err)
+	}
+	if err := o.reconcilePreparedCleanup(durable); err != nil {
+		return o.holdPreparedCleanup(durable, err)
+	}
+	return nil
 }
 
 func reservationRetryDiagnostic(existing, latest string) string {
@@ -1267,6 +1300,212 @@ func (o *Orchestrator) failBeforeMaintenance(op model.Operation, err error) {
 		state.LastError = err.Error()
 	}, err.Error(), o.now())
 	o.event(op.ID, "operation.failed", op.TargetGeneration, err)
+}
+
+func (o *Orchestrator) failPreparedBeforeMaintenance(op model.Operation, manifest release.Manifest, path string, cause error, retryable bool) {
+	durable, err := o.beginPreparedCleanup(op, manifest.ID(), cause, retryable)
+	if err != nil {
+		// An atomic write can report a directory-sync error after rename. Re-read
+		// before deciding that the marker is absent; if it is durable, recovery
+		// ownership has already transferred to the cleanup-only protocol.
+		if observed, readErr := o.Store.Operation(op.ID); readErr == nil && observed.PreparedCleanupPending {
+			durable = observed
+		} else {
+			o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cause, fmt.Errorf("persist prepared cleanup intent: %w", err)))
+			return
+		}
+	}
+	if path != filepath.Join(o.ReleasesDir, manifest.ID(), "manifest.json") {
+		_ = o.holdPreparedCleanup(durable, errors.New("prepared cleanup manifest is outside the managed release path"))
+		return
+	}
+	if err := o.reconcilePreparedCleanup(durable); err != nil {
+		_ = o.holdPreparedCleanup(durable, err)
+	}
+}
+
+func (o *Orchestrator) beginPreparedCleanup(op model.Operation, target string, cause error, retryable bool) (model.Operation, error) {
+	message := journal.BoundDiagnostic(cause.Error())
+	return o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		if value.ID != op.ID || (value.Kind != model.OperationInstall && value.Kind != model.OperationUpdate) ||
+			value.TargetGeneration != target || value.Finalized || value.CompletedAt != nil ||
+			(value.Status != model.OperationPending && value.Status != model.OperationRunning) {
+			return errors.New("prepared cleanup cannot claim the active operation")
+		}
+		if value.PreparedCleanupPending {
+			if value.Error == "" {
+				return errors.New("prepared cleanup marker has no original failure")
+			}
+			return nil
+		}
+		value.PreparedCleanupPending = true
+		value.Status = model.OperationRunning
+		value.Finalized = false
+		value.CompletedAt = nil
+		value.Retryable = retryable
+		value.Error = message
+		value.UpdatedAt = o.now()
+		return nil
+	})
+}
+
+func (o *Orchestrator) recoverPreparedCleanup(op model.Operation) error {
+	if err := o.reconcilePreparedCleanup(op); err != nil {
+		return o.holdPreparedCleanup(op, err)
+	}
+	return nil
+}
+
+// reconcilePreparedCleanup is the only recovery path after the durable marker.
+// It never fetches, prepares, reserves, starts, or migrates a generation.
+func (o *Orchestrator) reconcilePreparedCleanup(op model.Operation) error {
+	manifest, path, err := o.loadPreparedCleanupManifest(op)
+	if err != nil {
+		return err
+	}
+	expected := generation(manifest, path)
+	state := o.Store.State()
+	if state.ActiveOperationID != op.ID || state.FinalizePendingOperationID != "" {
+		return errors.New("prepared cleanup lost its active Platform owner")
+	}
+	if state.Candidate != nil && !reflect.DeepEqual(state.Candidate, expected) {
+		return errors.New("prepared cleanup Platform Candidate does not match its immutable manifest")
+	}
+	if o.SelfUpdate != nil {
+		if err := o.SelfUpdate.DiscardPrepared(manifest); err != nil {
+			return fmt.Errorf("discard prepared Manager Candidate: %w", err)
+		}
+	}
+	durable, err := o.Store.Operation(op.ID)
+	if err != nil {
+		return fmt.Errorf("re-read prepared cleanup operation: %w", err)
+	}
+	if !samePreparedCleanupOwner(op, durable) {
+		return errors.New("prepared cleanup operation identity changed after Manager cleanup")
+	}
+	if state = o.Store.State(); state.ActiveOperationID != op.ID || state.FinalizePendingOperationID != "" {
+		return errors.New("prepared cleanup Platform owner changed after Manager cleanup")
+	}
+	if state.Candidate != nil {
+		if !reflect.DeepEqual(state.Candidate, expected) {
+			return errors.New("prepared cleanup Platform Candidate changed before clearing")
+		}
+		if _, err := o.Store.MutateState(o.now(), func(value *model.ManagerState) error {
+			if value.ActiveOperationID != op.ID || value.FinalizePendingOperationID != "" ||
+				!reflect.DeepEqual(value.Candidate, expected) {
+				return errors.New("prepared cleanup Platform Candidate ownership changed during clearing")
+			}
+			value.Candidate = nil
+			return nil
+		}); err != nil {
+			return fmt.Errorf("clear prepared Platform Candidate: %w", err)
+		}
+	}
+	durable, err = o.Store.Operation(op.ID)
+	if err != nil || !samePreparedCleanupOwner(op, durable) {
+		if err == nil {
+			err = errors.New("prepared cleanup operation changed before terminal commit")
+		}
+		return err
+	}
+	state = o.Store.State()
+	if state.ActiveOperationID != op.ID || state.FinalizePendingOperationID != "" || state.Candidate != nil {
+		return errors.New("prepared cleanup Platform state is not terminal-ready")
+	}
+	completed, err := o.Store.CompletePreparedCleanup(op.ID, o.now())
+	if err != nil {
+		return fmt.Errorf("commit prepared cleanup terminal state: %w", err)
+	}
+	o.event(op.ID, "operation.failed", op.TargetGeneration, errors.New(completed.Error))
+	return nil
+}
+
+func (o *Orchestrator) loadPreparedCleanupManifest(op model.Operation) (release.Manifest, string, error) {
+	if !op.PreparedCleanupPending || (op.Kind != model.OperationInstall && op.Kind != model.OperationUpdate) ||
+		op.TargetGeneration == "" || op.Error == "" {
+		return release.Manifest{}, "", errors.New("prepared cleanup operation intent is incomplete")
+	}
+	if filepath.Base(op.TargetGeneration) != op.TargetGeneration || len(op.TargetGeneration) != 40 {
+		return release.Manifest{}, "", errors.New("prepared cleanup target generation is not a managed release identity")
+	}
+	for _, character := range op.TargetGeneration {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return release.Manifest{}, "", errors.New("prepared cleanup target generation is not a lowercase commit")
+		}
+	}
+	if o.ReleasesDir == "" || !filepath.IsAbs(o.ReleasesDir) || filepath.Clean(o.ReleasesDir) != o.ReleasesDir {
+		return release.Manifest{}, "", errors.New("prepared cleanup release root is not absolute and canonical")
+	}
+	generationDir := filepath.Join(o.ReleasesDir, op.TargetGeneration)
+	for _, entry := range []struct {
+		label string
+		path  string
+	}{{"release root", o.ReleasesDir}, {"generation directory", generationDir}} {
+		info, err := os.Lstat(entry.path)
+		if err != nil {
+			return release.Manifest{}, "", fmt.Errorf("inspect managed prepared cleanup %s: %w", entry.label, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return release.Manifest{}, "", fmt.Errorf("managed prepared cleanup %s is not a real directory", entry.label)
+		}
+	}
+	path := filepath.Join(generationDir, "manifest.json")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return release.Manifest{}, "", fmt.Errorf("inspect managed prepared cleanup manifest: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 1<<20 {
+		return release.Manifest{}, "", errors.New("managed prepared cleanup manifest has an invalid type or size")
+	}
+	manifest, err := o.loadManifest(path)
+	if err != nil {
+		return release.Manifest{}, "", fmt.Errorf("load managed prepared cleanup manifest: %w", err)
+	}
+	if manifest.ID() != op.TargetGeneration || manifest.SourceCommit != op.TargetGeneration {
+		return release.Manifest{}, "", errors.New("prepared cleanup manifest does not match operation target")
+	}
+	return manifest, path, nil
+}
+
+func samePreparedCleanupOwner(expected, actual model.Operation) bool {
+	return actual.ID == expected.ID && actual.Kind == expected.Kind &&
+		actual.TargetGeneration == expected.TargetGeneration && actual.PreparedCleanupPending &&
+		actual.Error == expected.Error && actual.Retryable == expected.Retryable &&
+		!actual.Finalized && actual.CompletedAt == nil &&
+		(actual.Status == model.OperationPending || actual.Status == model.OperationRunning)
+}
+
+func (o *Orchestrator) holdPreparedCleanup(op model.Operation, cleanupErr error) error {
+	message := journal.BoundDiagnostic(errors.Join(errors.New(op.Error), fmt.Errorf("prepared candidate cleanup remains pending: %w", cleanupErr)).Error())
+	_, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		if !samePreparedCleanupOwner(op, *value) {
+			return errors.New("prepared candidate cleanup lost its operation owner")
+		}
+		value.Status = model.OperationRunning
+		value.Finalized = false
+		value.CompletedAt = nil
+		// Preserve Error as the immutable original cause. The latest cleanup
+		// diagnostic is projected through Manager state without recursive growth.
+		value.UpdatedAt = o.now()
+		return nil
+	})
+	if err != nil {
+		o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cleanupErr, err))
+		return err
+	}
+	if _, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+		if state.ActiveOperationID != op.ID || state.FinalizePendingOperationID != "" {
+			return errors.New("prepared candidate cleanup lost its Platform owner")
+		}
+		state.LastError = message
+		state.RetryAfterSeconds = 5
+		return nil
+	}); err != nil {
+		o.event(op.ID, "operation.failed", op.TargetGeneration, errors.Join(cleanupErr, err))
+		return err
+	}
+	o.event(op.ID, "operation.failed", op.TargetGeneration, cleanupErr)
+	return nil
 }
 
 func (o *Orchestrator) failBeforeMaintenanceRetryable(op model.Operation, err error) {
@@ -1407,6 +1646,29 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			if operationErr != nil {
 				readErr = fmt.Errorf("persist reservation-released checkpoint: %w", operationErr)
 			}
+		}
+	}
+	// Platform has not committed this install/update candidate. Before the first
+	// destructive Candidate write, transfer ownership to the durable inverse
+	// protocol. Once that marker exists this function must return: recovery may
+	// only replay exact Candidate reconciliation and can never resume runUpdate.
+	if readErr == nil && !current.ManagerActivationRollback &&
+		(current.Kind == model.OperationInstall || current.Kind == model.OperationUpdate) {
+		durable, markerErr := o.beginPreparedCleanup(current, current.TargetGeneration, errors.New(originalError), current.Retryable)
+		if markerErr != nil {
+			// Rename can have succeeded even when the parent-directory sync reports
+			// an error. Re-read before deciding whether inverse ownership moved.
+			if observed, observedErr := o.Store.Operation(current.ID); observedErr == nil && observed.PreparedCleanupPending {
+				durable = observed
+			} else {
+				readErr = fmt.Errorf("persist rollback prepared cleanup intent: %w", markerErr)
+			}
+		}
+		if durable.PreparedCleanupPending {
+			if cleanupErr := o.reconcilePreparedCleanup(durable); cleanupErr != nil {
+				_ = o.holdPreparedCleanup(durable, cleanupErr)
+			}
+			return
 		}
 	}
 	if readErr == nil && state.Current == nil {

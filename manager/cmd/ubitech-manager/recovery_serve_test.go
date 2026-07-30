@@ -148,7 +148,7 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	generationID := strings.Repeat("c", 40)
 	manifestPath, images := writeRecoveryManifest(t, stateDir, generationID)
 	operationID := seedFinalizePendingUpdate(t, stateDir, generationID, manifestPath, images)
-	seedCommittedManagerBinary(t, stateDir, generationID)
+	seedCommittedManagerBinary(t, stateDir, filepath.Join(root, "bin", "ubitech-manager"), generationID)
 
 	logPath := filepath.Join(root, "manager-helper.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -456,7 +456,7 @@ func seedFinalizePendingUpdate(t *testing.T, stateDir, generationID, manifestPat
 	return operationValue.ID
 }
 
-func seedCommittedManagerBinary(t *testing.T, stateDir, generationID string) {
+func seedCommittedManagerBinary(t *testing.T, stateDir, stablePath, generationID string) {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
@@ -467,17 +467,34 @@ func seedCommittedManagerBinary(t *testing.T, stateDir, generationID string) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(data)
+	versionDirectory := filepath.Join(stateDir, "manager-binaries", "versions", "running-"+hex.EncodeToString(digest[:])[:12])
+	if err := os.MkdirAll(filepath.Join(stateDir, "manager-binaries", "activations"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(versionDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managedPath := filepath.Join(versionDirectory, "ubitech-manager")
+	if err := atomicfile.WriteFile(managedPath, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfile.WriteFile(stablePath, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	state := selfupdate.State{
 		SchemaVersion: 1,
 		Current: &selfupdate.Version{
-			Version:           generationID,
+			Version:           version,
 			SourceCommit:      generationID,
-			Path:              executable,
+			Path:              managedPath,
 			SHA256:            hex.EncodeToString(digest[:]),
 			VerifiedAt:        time.Now().UTC(),
 			PlatformCommitted: true,
 		},
 		UpdatedAt: time.Now().UTC(),
+	}
+	if err := atomicfile.WriteJSON(filepath.Join(versionDirectory, "metadata.json"), *state.Current, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := atomicfile.WriteJSON(filepath.Join(stateDir, "manager-binaries.json"), state, 0o600); err != nil {
 		t.Fatal(err)

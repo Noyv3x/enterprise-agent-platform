@@ -249,8 +249,9 @@ func TestCapacityGrowthAfterInitialCheckReleasesReservationBeforeRetryableFailur
 			}
 		},
 	}
+	selfUpdate := &recordingSelfUpdate{}
 	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{},
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
 		ReleasesDir: t.TempDir(), ManifestURL: manifestURL, Channel: "main",
 		ReleaseClient: release.Client{HTTP: server.Client()}, Now: func() time.Time { return time.Unix(13, 0) },
 	}
@@ -271,6 +272,9 @@ func TestCapacityGrowthAfterInitialCheckReleasesReservationBeforeRetryableFailur
 	finalState := store.State()
 	if finalState.Maintenance || finalState.PublicState != model.StateIdle || finalState.ActiveOperationID != "" {
 		t.Fatalf("capacity failure left current generation unavailable: %#v", finalState)
+	}
+	if selfUpdate.prepared != 1 || selfUpdate.discarded != 1 || finalState.Candidate != nil {
+		t.Fatalf("capacity failure left prepared Manager ownership: self=%#v state=%#v", selfUpdate, finalState)
 	}
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
@@ -296,7 +300,7 @@ func TestCapacityRecheckKeepsMaintenanceWhenReservationReleaseIsUncertain(t *tes
 	}
 	gate := &retryGate{failOnce: true}
 	orchestrator := &Orchestrator{Store: store, Gate: gate, Now: func() time.Time { return time.Unix(23, 0) }}
-	orchestrator.failReservedCapacityRecheck(op, &driver.CapacityError{
+	orchestrator.failReservedCapacityRecheck(op, release.Manifest{SourceCommit: strings.Repeat("b", 40)}, "/unused/manifest.json", &driver.CapacityError{
 		Stage: driver.CapacityPreCutover, Path: "/data", Resource: "space", Have: 4, Require: 8,
 	})
 	state := store.State()
@@ -439,8 +443,13 @@ func (g *scriptedGate) Release(ctx context.Context, id string) error {
 func (*scriptedGate) Health(context.Context) error { return nil }
 
 type recordingSelfUpdate struct {
+	prepared, discarded int
 	marked, activated   int
 	failActivateOnce    bool
+	prepareErr          error
+	discardErr          error
+	onPrepare           func(release.Manifest)
+	onDiscard           func(release.Manifest)
 	pendingCommitChecks int
 	activationErr       error
 	commitChecks        int
@@ -448,7 +457,20 @@ type recordingSelfUpdate struct {
 	rollbackChecks      int
 }
 
-func (s *recordingSelfUpdate) Prepare(context.Context, release.Manifest) error { return nil }
+func (s *recordingSelfUpdate) Prepare(_ context.Context, manifest release.Manifest) error {
+	s.prepared++
+	if s.onPrepare != nil {
+		s.onPrepare(manifest)
+	}
+	return s.prepareErr
+}
+func (s *recordingSelfUpdate) DiscardPrepared(manifest release.Manifest) error {
+	s.discarded++
+	if s.onDiscard != nil {
+		s.onDiscard(manifest)
+	}
+	return s.discardErr
+}
 func (s *recordingSelfUpdate) MarkPlatformCommitted(release.Manifest) error {
 	s.marked++
 	return nil
@@ -826,6 +848,344 @@ func TestFreshInstallCommitsOnlyAfterProbe(t *testing.T) {
 	}
 }
 
+func TestUpdatePersistsPlatformOwnershipBeforePreparingManagerCandidate(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observed error
+	selfUpdate := &recordingSelfUpdate{}
+	selfUpdate.onPrepare = func(manifest release.Manifest) {
+		state := store.State()
+		op, err := store.Operation(state.ActiveOperationID)
+		if err != nil {
+			observed = err
+			return
+		}
+		if op.TargetGeneration != manifest.ID() || state.Candidate == nil ||
+			state.Candidate.ID != manifest.ID() || state.Candidate.SourceCommit != manifest.SourceCommit ||
+			state.Candidate.ManifestPath == "" {
+			observed = fmt.Errorf("Prepare observed incomplete durable ownership: operation=%#v state=%#v", op, state)
+		}
+	}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "owner-before-manager", ExpectedGeneration: store.State().Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil || completed.Status != model.OperationSucceeded {
+		t.Fatalf("update failed: %#v %v", completed, err)
+	}
+	if observed != nil || selfUpdate.prepared != 1 {
+		t.Fatalf("Manager Prepare ownership ordering failed: prepares=%d err=%v", selfUpdate.prepared, observed)
+	}
+}
+
+func TestPreparedManagerCandidateIsDiscardedOnEveryPreCutoverFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		engineFail string
+		prepareErr error
+	}{
+		{name: "manager-prepare", prepareErr: errors.New("injected Manager prepare failure")},
+		{name: "image-pull", engineFail: "pull"},
+		{name: "candidate-prepare", engineFail: "prepare"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, url := testReleaseServer(t)
+			defer server.Close()
+			store, err := journal.Open(t.TempDir(), time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var markerErr error
+			selfUpdate := &recordingSelfUpdate{prepareErr: test.prepareErr}
+			selfUpdate.onDiscard = func(_ release.Manifest) {
+				state := store.State()
+				durable, err := store.Operation(state.ActiveOperationID)
+				if err != nil {
+					markerErr = err
+					return
+				}
+				if !durable.PreparedCleanupPending || durable.Error == "" ||
+					(test.engineFail == "pull" && (!durable.Retryable || durable.Error != "injected pull failure")) {
+					markerErr = fmt.Errorf("Discard observed incomplete cleanup intent: %#v", durable)
+				}
+			}
+			orchestrator := &Orchestrator{
+				Store: store, Engine: &fakeEngine{failAt: test.engineFail}, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
+				ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+			}
+			op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "discard-" + test.name, ExpectedGeneration: store.State().Generation})
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed, err := orchestrator.Await(context.Background(), op.ID)
+			if err != nil || completed.Status != model.OperationFailed || !completed.Finalized {
+				t.Fatalf("failure did not terminate cleanly: %#v %v", completed, err)
+			}
+			state := store.State()
+			if markerErr != nil || selfUpdate.discarded != 1 || state.Candidate != nil || state.ActiveOperationID != "" {
+				t.Fatalf("prepared ownership remained after failure: self=%#v state=%#v marker=%v", selfUpdate, state, markerErr)
+			}
+		})
+	}
+}
+
+func TestPreparedManagerDiscardFailureRetainsExactActiveOwner(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfUpdate := &recordingSelfUpdate{discardErr: errors.New("injected discard failure")}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{failAt: "pull"}, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "discard-fail-closed", ExpectedGeneration: store.State().Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var durable model.Operation
+	for time.Now().Before(deadline) {
+		durable, err = store.Operation(op.ID)
+		if err == nil && durable.PreparedCleanupPending && strings.Contains(store.State().LastError, "cleanup remains pending") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	state := store.State()
+	if durable.Status != model.OperationRunning || durable.Finalized || durable.CompletedAt != nil ||
+		state.ActiveOperationID != op.ID || state.Candidate == nil || state.Candidate.ID != durable.TargetGeneration ||
+		!durable.PreparedCleanupPending || durable.Error != "injected pull failure" || state.PublicState != model.StateIdle ||
+		state.Phase != model.PhasePulling || !strings.Contains(state.LastError, "injected discard failure") {
+		t.Fatalf("discard uncertainty lost its durable owner: operation=%#v state=%#v", durable, state)
+	}
+	if _, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "must-not-pass-owner", ExpectedGeneration: state.Generation}, time.Now()); !errors.Is(err, journal.ErrOperationInProgress) {
+		t.Fatalf("another operation crossed unresolved Manager cleanup: %v", err)
+	}
+}
+
+func preparedCleanupRecoveryFixture(t *testing.T) (*Orchestrator, *journal.Store, model.Operation, release.Manifest, *recordingSelfUpdate, *fakeEngine, *scriptedGate) {
+	t.Helper()
+	server, url := testReleaseServer(t)
+	t.Cleanup(server.Close)
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasesDir := t.TempDir()
+	client := release.Client{HTTP: server.Client()}
+	manifest, data, err := client.Fetch(context.Background(), url, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfUpdate := &recordingSelfUpdate{}
+	engine := &fakeEngine{}
+	gate := &scriptedGate{}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
+		ReleasesDir: releasesDir, ManifestURL: url, Channel: "main", ReleaseClient: client,
+	}
+	path, err := orchestrator.saveManifest(context.Background(), manifest, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationInstall, IdempotencyKey: "prepared-cleanup-recovery", ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.TargetGeneration = manifest.ID()
+		value.Status = model.OperationRunning
+		value.Phase = model.PhasePulling
+		value.PreparedCleanupPending = true
+		value.Retryable = true
+		value.Error = "original image pull failure"
+		value.UpdatedAt = time.Now().UTC()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Candidate = generation(manifest, path)
+		state.Phase = model.PhasePulling
+		state.PublicState = model.StateIdle
+		state.Maintenance = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return orchestrator, store, op, manifest, selfUpdate, engine, gate
+}
+
+func TestRecoverPreparedCleanupReplaysOnlyTheInverseProtocol(t *testing.T) {
+	tests := []struct {
+		name             string
+		selfAlreadyClear bool
+		platformClear    bool
+		terminalHalf     bool
+	}{
+		{name: "marker-before-self-discard"},
+		{name: "self-discarded-platform-present", selfAlreadyClear: true},
+		{name: "both-candidates-cleared", selfAlreadyClear: true, platformClear: true},
+		{name: "terminal-operation-state-active", selfAlreadyClear: true, platformClear: true, terminalHalf: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			orchestrator, store, op, _, selfUpdate, engine, gate := preparedCleanupRecoveryFixture(t)
+			if test.selfAlreadyClear {
+				selfUpdate.discarded = 1
+			}
+			if test.platformClear {
+				if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+					state.Candidate = nil
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.terminalHalf {
+				if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
+					now := time.Now().UTC()
+					value.Status = model.OperationFailed
+					value.Finalized = true
+					value.PreparedCleanupPending = false
+					value.ReservationStatus = model.ReservationConfirmed
+					value.CompletedAt = &now
+					value.UpdatedAt = now
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := orchestrator.Recover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			completed, err := store.Operation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := store.State()
+			if completed.Status != model.OperationFailed || !completed.Finalized || completed.PreparedCleanupPending ||
+				completed.Error != "original image pull failure" || state.ActiveOperationID != "" ||
+				state.Candidate != nil || state.PublicState != model.StateIdle || state.Maintenance {
+				t.Fatalf("cleanup checkpoint did not converge: operation=%#v state=%#v", completed, state)
+			}
+			engine.mu.Lock()
+			calls := append([]string(nil), engine.calls...)
+			engine.mu.Unlock()
+			if len(calls) != 0 || len(gate.reserveIDs) != 0 || len(gate.releaseIDs) != 0 {
+				t.Fatalf("cleanup recovery re-entered update work: engine=%v gate=%#v", calls, gate)
+			}
+			wantDiscards := 1
+			if test.selfAlreadyClear {
+				wantDiscards = 2
+			}
+			if test.terminalHalf {
+				wantDiscards = 1
+			}
+			if selfUpdate.discarded != wantDiscards {
+				t.Fatalf("cleanup did not idempotently prove self state: discards=%d want=%d", selfUpdate.discarded, wantDiscards)
+			}
+		})
+	}
+}
+
+func TestRecoverPreparedCleanupIdentityMismatchRemainsFailClosed(t *testing.T) {
+	orchestrator, store, op, _, selfUpdate, engine, gate := preparedCleanupRecoveryFixture(t)
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Candidate.DatabaseVersion++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	durable, err := store.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.State()
+	if !durable.PreparedCleanupPending || durable.Status != model.OperationRunning || durable.Finalized ||
+		durable.Error != "original image pull failure" || state.ActiveOperationID != op.ID || state.Candidate == nil ||
+		!strings.Contains(state.LastError, "does not match its immutable manifest") {
+		t.Fatalf("identity mismatch did not retain exact cleanup owner: operation=%#v state=%#v", durable, state)
+	}
+	engine.mu.Lock()
+	calls := append([]string(nil), engine.calls...)
+	engine.mu.Unlock()
+	if selfUpdate.discarded != 0 || len(calls) != 0 || len(gate.reserveIDs) != 0 || len(gate.releaseIDs) != 0 {
+		t.Fatalf("identity mismatch executed cleanup/update side effects: self=%#v engine=%v gate=%#v", selfUpdate, calls, gate)
+	}
+}
+
+func TestRecoverBeforePreparedCleanupMarkerMayResumeNormalUpdate(t *testing.T) {
+	orchestrator, store, op, _, _, engine, _ := preparedCleanupRecoveryFixture(t)
+	if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.PreparedCleanupPending = false
+		value.Error = ""
+		value.Retryable = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	completed, err := orchestrator.Await(ctx, op.ID)
+	if err != nil || completed.Status != model.OperationSucceeded {
+		t.Fatalf("pre-marker operation did not resume normally: operation=%#v err=%v", completed, err)
+	}
+	engine.mu.Lock()
+	calls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if !strings.Contains(calls, "pull") || !strings.Contains(calls, "prepare") {
+		t.Fatalf("pre-marker recovery did not resume update work: %s", calls)
+	}
+}
+
+func TestPreparedManagerCandidateIsDiscardedAfterPlatformRollback(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfUpdate := &recordingSelfUpdate{}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{failAt: "migrate"}, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationInstall, IdempotencyKey: "discard-after-rollback", ExpectedGeneration: store.State().Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil || completed.Status != model.OperationFailed || !completed.Finalized {
+		t.Fatalf("rollback did not terminate: %#v %v", completed, err)
+	}
+	if state := store.State(); selfUpdate.discarded != 1 || state.Candidate != nil || state.ActiveOperationID != "" {
+		t.Fatalf("rollback left prepared Manager ownership: self=%#v state=%#v", selfUpdate, state)
+	}
+}
+
 func TestReserveWaitsForLocalHostAndSandboxTerminalsBeforePlatformGate(t *testing.T) {
 	store, err := journal.Open(t.TempDir(), time.Now())
 	if err != nil {
@@ -1154,8 +1514,9 @@ func TestUpdateReservationAuthenticationRejectionIsPermanent(t *testing.T) {
 	}
 	engine := &fakeEngine{}
 	gate := HTTPGate{BaseURL: gateServer.URL, Token: "wrong-manager-token", Client: gateServer.Client()}
+	selfUpdate := &recordingSelfUpdate{}
 	orchestrator := &Orchestrator{
-		Store: store, Engine: engine, Gate: gate,
+		Store: store, Engine: engine, Gate: gate, SelfUpdate: selfUpdate,
 		Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: manifestURL,
 		Channel: "main", ReleaseClient: release.Client{HTTP: releaseServer.Client()},
 	}
@@ -1181,6 +1542,9 @@ func TestUpdateReservationAuthenticationRejectionIsPermanent(t *testing.T) {
 	}
 	if reserveCalls != 1 || releaseCalls != 0 {
 		t.Fatalf("definitive first-reserve rejection used the uncertainty release path: reserve=%d release=%d", reserveCalls, releaseCalls)
+	}
+	if selfUpdate.prepared != 1 || selfUpdate.discarded != 1 || state.Candidate != nil {
+		t.Fatalf("authentication rejection left prepared Manager ownership: self=%#v state=%#v", selfUpdate, state)
 	}
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
@@ -1401,7 +1765,8 @@ func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
 		steps:      []gateStep{{reservation: Reservation{Reserved: true}}, {err: errors.New("confirmation response lost")}},
 		releaseErr: errors.New("release response lost"),
 	}
-	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	selfUpdate := &recordingSelfUpdate{}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
 	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "uncertain-release", ExpectedGeneration: store.State().Generation}, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -1414,6 +1779,9 @@ func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
 	}
 	if !orchestrator.RecoveryPending() {
 		t.Fatal("in-process recovery loop did not observe the uncertain reservation")
+	}
+	if selfUpdate.discarded != 0 || state.Candidate == nil {
+		t.Fatalf("uncertain reservation release discarded its fail-closed owner: self=%#v state=%#v", selfUpdate, state)
 	}
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
@@ -1430,6 +1798,9 @@ func TestUnconfirmedReservationReleaseStaysClosedUntilRecovery(t *testing.T) {
 	state = store.State()
 	if completed.Status != model.OperationFailed || state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || len(gate.releaseIDs) != 2 {
 		t.Fatalf("confirmed recovery release did not reopen safely: state=%#v operation=%#v releases=%v", state, completed, gate.releaseIDs)
+	}
+	if selfUpdate.discarded != 1 || state.Candidate != nil {
+		t.Fatalf("confirmed reservation recovery left prepared Manager ownership: self=%#v state=%#v", selfUpdate, state)
 	}
 }
 

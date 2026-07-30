@@ -86,11 +86,10 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 	stateDir := filepath.Join(root, "state")
 	managerRoot := filepath.Join(stateDir, "manager-binaries")
 	versions := filepath.Join(managerRoot, "versions")
-	currentDir := filepath.Join(versions, "current")
 	binDir := filepath.Join(root, "bin")
 	recoveryDir := filepath.Join(root, "recovery")
 	secretsDir := filepath.Join(stateDir, "secrets")
-	for _, directory := range []string{stateDir, managerRoot, versions, currentDir, binDir, recoveryDir, secretsDir} {
+	for _, directory := range []string{stateDir, managerRoot, versions, binDir, recoveryDir, secretsDir} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -104,6 +103,13 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 	newDigest := sha256.Sum256(newBinary)
 	oldSHA := hex.EncodeToString(oldDigest[:])
 	newSHA := hex.EncodeToString(newDigest[:])
+	currentDir := filepath.Join(versions, "running-"+oldSHA[:12])
+	if err := os.MkdirAll(currentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(currentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	oldPath := filepath.Join(currentDir, "ubitech-manager")
 	stablePath := filepath.Join(binDir, "ubitech-manager")
 	executablePath := filepath.Join(recoveryDir, "ubitech-manager")

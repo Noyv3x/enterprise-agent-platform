@@ -307,15 +307,14 @@ func validateRecoveryTakeoverJournal(journal recoveryTakeoverJournal, manager *M
 		journal.OriginalActivation.StartedAt.IsZero() {
 		return errors.New("current recovery takeover journal version snapshot is invalid")
 	}
-	if journal.OriginalActivation.PlanPath != journal.OriginalPlanPath ||
+	if journal.OriginalCurrent.Path == "" || journal.OriginalCandidate.Path == "" ||
+		journal.OriginalActivation.PlanPath != journal.OriginalPlanPath ||
 		journal.OriginalActivation.CandidateSHA != journal.OriginalCandidate.SHA256 ||
-		journal.OriginalActivation.CandidatePath != journal.OriginalCandidate.Path ||
-		journal.OriginalCurrent.Path == "" || journal.OriginalCandidate.Path == "" {
+		journal.OriginalActivation.CandidatePath != journal.OriginalCandidate.Path {
 		return errors.New("current recovery takeover journal snapshot is inconsistent")
 	}
 	if journal.OriginalState.SchemaVersion != 1 || journal.OriginalState.Current == nil ||
-		journal.OriginalState.Candidate == nil || journal.OriginalState.Activation == nil ||
-		journal.OriginalState.UpdatedAt.IsZero() ||
+		journal.OriginalState.Candidate == nil || journal.OriginalState.Activation == nil || journal.OriginalState.UpdatedAt.IsZero() ||
 		!reflect.DeepEqual(*journal.OriginalState.Current, journal.OriginalCurrent) ||
 		!reflect.DeepEqual(*journal.OriginalState.Candidate, journal.OriginalCandidate) ||
 		!reflect.DeepEqual(*journal.OriginalState.Activation, journal.OriginalActivation) {

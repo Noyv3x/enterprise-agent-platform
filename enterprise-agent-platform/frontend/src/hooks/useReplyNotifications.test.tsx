@@ -11,6 +11,14 @@ import { StoreContext } from "../store/StoreProvider";
 import type { Action, AppState, User } from "../types";
 import { useReplyNotifications } from "./useReplyNotifications";
 
+function response(status: number, body: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(body),
+  };
+}
+
 class FakeNotification {
   static permission: NotificationPermission = "granted";
   static instances: FakeNotification[] = [];
@@ -88,11 +96,30 @@ describe("useReplyNotifications", () => {
 
   it("notifies for an inactive channel and navigates there when clicked", async () => {
     const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
+    const previousMessage = {
+      id: 1,
+      author_type: "user" as const,
+      content: "channel one",
+      scope_type: "channel" as const,
+      scope_id: "1",
+    };
+    const targetMessage = { ...previousMessage, id: 2, content: "channel two", scope_id: "2" };
+    const fetchMock = vi.fn(async (path: string) => {
+      expect(path).toBe("/api/channels/2/messages");
+      return response(200, {
+        mode: "full",
+        messages: [targetMessage],
+        message_revision: 2,
+        reset_revision: 0,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const store = createStore(rootReducer, {
       ...initialAppState,
       user,
       activeView: "channel",
       activeChannelId: 1,
+      messages: [previousMessage],
     });
     enableFor(user);
     renderHook(() => useReplyNotifications(), { wrapper: wrapperFor(store) });
@@ -111,11 +138,36 @@ describe("useReplyNotifications", () => {
     act(() => FakeNotification.instances[0].onclick?.());
     expect(store.getState().activeView).toBe("channel");
     expect(String(store.getState().activeChannelId)).toBe("2");
+    expect(store.getState().messages).toEqual([]);
+    await waitFor(() => expect(store.getState().messages).toEqual([targetMessage]));
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(FakeNotification.instances[0].close).toHaveBeenCalledOnce();
   });
 
   it("notifies for a private reply while a channel is visible", async () => {
     const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
+    const privateMessage = {
+      id: 21,
+      author_type: "agent" as const,
+      content: "private reply",
+      scope_type: "private" as const,
+      scope_id: "7",
+    };
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/private-agent/messages") {
+        return response(200, {
+          mode: "full",
+          messages: [privateMessage],
+          message_revision: 21,
+          reset_revision: 0,
+        });
+      }
+      if (path === "/api/private-agent/telegram") {
+        return response(200, { telegram: null });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const store = createStore(rootReducer, {
       ...initialAppState,
       user,
@@ -137,6 +189,8 @@ describe("useReplyNotifications", () => {
     expect(FakeNotification.instances).toHaveLength(1);
     act(() => FakeNotification.instances[0].onclick?.());
     expect(store.getState().activeView).toBe("private");
+    await waitFor(() => expect(store.getState().privateMessages).toEqual([privateMessage]));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("suppresses baseline, replayed events, and replies while the page is visible", async () => {

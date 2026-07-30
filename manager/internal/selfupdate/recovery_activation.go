@@ -135,35 +135,18 @@ func (m *Manager) recoverCurrentActivation(ctx context.Context, request recovery
 		}
 		return err
 	}
-
 	switch {
 	case bytes.Equal(latestStateData, takeover.stateData):
 		latestTakeover, validateErr := m.readRecoveryTakeover(latestStateData, latestState, latestEvidence)
 		if validateErr != nil {
 			return fmt.Errorf("revalidate activation after quiescing watchdog: %w", validateErr)
 		}
-		if latestTakeover.plan.PlanPath != takeover.plan.PlanPath || sha256Hex(latestTakeover.planData) != sha256Hex(takeover.planData) {
-			return errors.New("Manager activation plan changed while its watchdog was quiesced")
+		if latestTakeover.candidate != takeover.candidate || latestTakeover.plan.PlanPath != takeover.plan.PlanPath ||
+			!bytes.Equal(latestTakeover.planData, takeover.planData) || latestTakeover.stableSHA != takeover.stableSHA {
+			return errors.New("Manager activation identity changed while its watchdog was quiesced")
 		}
 		latestTakeover.unitWasEnabled = takeover.unitWasEnabled
 		journal, journalErr := m.newRecoveryTakeoverJournal(request, latestEvidence, *latestTakeover, stagedPath)
-		if journalErr != nil {
-			return journalErr
-		}
-		if journalErr = m.persistRecoveryTakeoverJournal(journal); journalErr != nil {
-			return fmt.Errorf("persist current recovery takeover journal: %w", journalErr)
-		}
-		restartOnError = false
-		return m.driveRecoveryTakeoverJournal(ctx, request, latestEvidence, journal)
-	case latestState.Activation == nil && latestState.Candidate != nil &&
-		latestState.Current != nil && latestState.Current.SHA256 == request.oldCurrent.SHA256:
-		// The old watchdog won the stop race and completed its normal rollback.
-		// Its terminal plan is still required as the audit binding.
-		_, _, _, checkpointErr := m.validateRecoveryCheckpoint(latestState, request.platformCommit)
-		if checkpointErr != nil {
-			return fmt.Errorf("reclassify watchdog rollback checkpoint: %w", checkpointErr)
-		}
-		journal, journalErr := m.newRecoveryTakeoverJournal(request, latestEvidence, *takeover, stagedPath)
 		if journalErr != nil {
 			return journalErr
 		}
@@ -305,12 +288,16 @@ func (m *Manager) readRecoveryTakeover(stateData []byte, state State, evidence r
 	if activation.CandidateSHA != candidate.SHA256 || activation.CandidatePath != candidate.Path || activation.PlanPath == "" {
 		return nil, errors.New("Manager Activation does not match Candidate")
 	}
-	if !pathWithin(filepath.Join(m.Root, "activations"), activation.PlanPath) {
+	planPath := activation.PlanPath
+	if !pathWithin(filepath.Join(m.Root, "activations"), planPath) {
 		return nil, errors.New("Manager activation plan is outside the activations directory")
 	}
-	planData, plan, err := readRecoveryActivationPlan(activation.PlanPath)
+	planData, plan, err := readRecoveryActivationPlan(planPath)
 	if err != nil {
 		return nil, err
+	}
+	if plan.PlanPath != planPath {
+		return nil, errors.New("Manager activation plan does not identify its managed path")
 	}
 	if plan.Mode != "" {
 		return nil, errors.New("ordinary activation takeover cannot claim a specialized activation plan")
@@ -392,7 +379,7 @@ func (m *Manager) validateRecoveryPlanBinding(plan Plan, state State, candidate 
 		if !plan.Activated || !plan.Acknowledged {
 			return errors.New("acknowledged Manager activation has invalid flags")
 		}
-	case "rolled_back", "aborted_before_replace", recoverySupersededStatus:
+	case "rolled_back", recoverySupersededStatus:
 		if state.Activation != nil && plan.Status != recoverySupersededStatus {
 			return errors.New("terminal Manager activation is still active")
 		}
@@ -649,28 +636,6 @@ func recoveryProcessInExactControlGroup(data []byte, controlGroup string) bool {
 		}
 	}
 	return false
-}
-
-func (m *Manager) validateRecoveryCheckpoint(state State, platformCommit string) (State, string, string, error) {
-	if state.Current == nil || state.Candidate == nil || state.Activation != nil || state.Candidate.SourceCommit != platformCommit {
-		return State{}, "", "", errors.New("Manager state is not a candidate-only rollback checkpoint")
-	}
-	planPath := filepath.Join(m.Root, "activations", safeID(platformCommit)+".json")
-	data, plan, err := readRecoveryActivationPlan(planPath)
-	if err != nil {
-		return State{}, "", "", err
-	}
-	if plan.Status != "rolled_back" && plan.Status != "aborted_before_replace" && plan.Status != recoverySupersededStatus {
-		return State{}, "", "", errors.New("candidate-only rollback checkpoint has no terminal activation plan")
-	}
-	if plan.CandidateSHA != state.Candidate.SHA256 || plan.PreviousPath != state.Current.Path {
-		return State{}, "", "", errors.New("candidate-only rollback checkpoint does not match its activation plan")
-	}
-	stable, _, err := readRecoveryRegularFile(m.InstallPath, recoveryMaxBinaryBytes, false)
-	if err != nil || sha256Hex(stable) != state.Current.SHA256 {
-		return State{}, "", "", errors.New("candidate-only rollback checkpoint stable does not match Current")
-	}
-	return state, planPath, sha256Hex(data), nil
 }
 
 func (m *Manager) currentRecoveryPlanPath(platformCommit, recoverySHA string) string {

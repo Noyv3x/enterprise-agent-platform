@@ -12,7 +12,7 @@ ubitech agent 面向彼此可信的内部成员，不试图在同一部署中抵
 
 密码使用 PBKDF2-SHA256 和随机盐。登录失败按客户端与账号限流，并使用固定 dummy hash 降低用户名时序泄漏。用户停用、改密、权限变化或显式吊销会推进 token version，使旧会话失效。
 
-浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly` 和 `SameSite=Lax`；公共 URL 为 HTTPS 时增加 `Secure`。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer；只有运维明确启用可信代理后才使用转发头。
+浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly` 和 `SameSite=Lax`。开启 Manager 可信代理边界时，`Secure` 必须以 Manager 清洗并重建的当前请求 scheme 为准：HTTPS 请求增加 `Secure`，明文 LAN HTTP 请求不增加，不能因全局公网 URL 为 HTTPS 而使 LAN 会话无法登录。未开启可信代理时必须忽略客户端伪造的 `Forwarded`/`X-Forwarded-*`，并以公共 URL scheme 作为本地直连的安全回退。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer。
 
 权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。Platform、Runtime 与 Manager 的内部接口分别使用独立 bearer 或 owner-only Unix socket；浏览器 session 不能替代内部身份。
 
@@ -65,6 +65,18 @@ Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再�
 快照完整验证、候选 generation 核心 readiness、Manager watchdog 提交和 reservation release 完成前不能开放业务。核心 readiness 只包含 Manager 控制面、Platform 与 Agent Runtime；Camoufox、SearXNG、Firecrawl 和 Cognee 失败时保持能力级 degraded，不能终止 Manager、关闭控制接口或阻止健康核心 generation 完成 finalize。Manager 自更新的 activation plan 与独立 watchdog 是持久安全所有者；外部恢复不能仅凭主 unit 停止或 recovery lock 抢占它，必须验证完整提交链、停止并证明相关 watchdog 退出，再通过新的持久 recovery activation 转移所有权。Docker 资源清理只能处理同时匹配 Manager ownership label、Compose project/resource label 且无 attachment 的对象，禁止全局 prune。Manager `/v1/status` 的 generation 只返回 id、source commit、数据库版本、镜像与激活时间，不投影 manifest、快照或其它宿主绝对路径。
 
 当前基线的普通 activation plan 必须原生包含 `candidate_path` 与 `platform_commit`，并在启动确认、watchdog 回滚、外部恢复接管和终态收敛边界与已验证且已提交的 Candidate、Activation 和 Platform generation 精确匹配。任一字段缺失、部分绑定、身份漂移或文件篡改都必须失败关闭；不得根据 Current、Candidate、manifest 或路径规则推断或补写身份字段。接管 journal、watchdog、回滚和 recovery activation 必须持续保留原始 plan 字节哈希和完整身份链作为证据。
+
+recovery takeover journal 一旦持久化就是启动安全边界，即使主 unit 尚未被禁用也不得绕过。Manager serve 在任何会写宿主状态的 application 构造、activation acknowledgement、recovery loop 或 listener 创建前，必须以非阻塞方式协调全局 recovery flock 并安全枚举 owner-only、非符号链接的 `recoveries/`。未知或不安全工件、损坏 journal、多个非终态事务或任何配置/身份绑定漂移都必须在零副作用下拒绝启动。空闲全局锁必须作为 lease 保留到 listener 已建立且 pending activation 已结算，不能在检查后释放再执行副作用。`watchdog_owned` 之前的事务只属于外部恢复；从该阶段起只允许 journal、recovery plan、Manager state、stable 和 `/proc/self/exe` 精确证明同一 transaction 的 recovery Candidate执行完整 acknowledgement，主机重启后的空闲锁 Candidate 与外部仍持锁的 watchdog-owned Candidate 使用同一身份规则。完整验证的终态 journal 可作为历史审计证据，不能永久依赖已按策略清理的旧 version、operation 或 manifest。
+
+Manager serve 的更外层单实例边界是 Manager binary root 中的 owner-only `serve.lock`。它在 application 构造前用 `O_NOFOLLOW | O_CLOEXEC` 打开、校验当前 UID/普通文件/严格权限并以非阻塞独占 flock 取得，随后贯穿 control server、gateway、后台恢复和子进程管理的完整生命周期；第二个 serve 不得因 recovery lock 碰巧繁忙而降级为 recovery probe。全新 binary root 只能由该门安全创建为当前 UID 的非符号链接 `0700` 目录；既有 state root 仅在已证明同 UID、无符号链接且不可被其它身份写入后才可收紧为 `0700`，owner/type/path 异常始终失败关闭。锁序固定为 `serve.lock → recovery.lock → plan lock`，外部 `recover-current` 本身不取 serve lock，从而可停止旧 owner 后让 recovery Manager 在外部 recovery lock 仍持有时启动身份探针。
+
+全局 flock 已被外部恢复持有但不存在非终态 journal 时，精确匹配 stable 的登记 Current 或受管 recovery 工件只能获得 `external_recovery_probe` 权限：进程只开放 owner 认证的身份端点，所有 executor、operation、status、gateway、恢复和后台能力保持关闭；外部锁释放后必须重新取得 lease，并证明运行 inode 已成为原子登记的无 Candidate/Activation Current，未登记 recovery 必须退出。journal mutation flock 同样不得等待，只能在外部全局锁仍在时用稳定的双快照处理短暂竞争。无 journal 的普通 Candidate-only 只接受当前 Platform state、唯一 live install/update、不可变 manifest 和非终态 plan 可证明的本代 Prepare/Mark checkpoint；ownerless 或终态 Candidate 一律拒绝。普通 rollback 的 plan-first 和 commit 的 state-first 半 checkpoint也只能按当前协议的完整反向绑定补齐，不能据路径或单一 SHA 推断所有权。
+
+Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验证 control 目录中取得 `<socket>.lock` 的 durable owner-only 非阻塞 flock；锁通过目录 fd 与 `openat(O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600)` 打开，路径/fd inode 必须一致，且只能是当前 UID、严格权限、`nlink=1` 的普通文件。该锁从 probe 前持有至 listener 自身路径 unlink、监听 fd close 完成，随后才释放；文件本身保留供崩溃后复用。不同 Manager root 共享同一 socket 路径时仍由该锁串行，不能各自用 root 级 serve lock 绕开。锁繁忙或 symlink、hardlink、宽权限、owner/type/inode 异常均失败关闭。
+
+持有 bind lock 后发现既有同 UID socket 时必须做有界连接：成功即证明 live owner，超时、权限和其它模糊错误都失败关闭；只有明确 `ECONNREFUSED` 才可进入 stale 删除，并在 unlink 前用 device/inode/type/uid 完整复核抵御路径交换。listener teardown 只能删除自身绑定的 inode，旧进程不得在关闭后按路径删除继任者。pending Candidate 在 watchdog 原子提交以前只通过不可变 identity-only handler 响应 control capability 认证的 `/v1/identity`；status、executor 和所有 mutation 必须拒绝，提交成功后才以原子指针切换到完整 API。普通 rollback 半 checkpoint 对 Candidate 的 version/source/SHA/verified/platform-commit、精确受管 binary path 和精确 activation plan path 逐项验证，不能让格式无效但 hash 可读的工件获得终态补写权限。
+
+崩溃后的原子写入临时文件不能被当作未知 journal 永久锁死启动，但也不能仅凭 `.tmp-` 前缀扩大删除权限。Manager 只对原子写入器自身产生的精确安全名称执行 fd-rooted 单文件 unlink：父目录与文件的路径视图和已打开 inode 必须一致，owner 必须是当前 UID，对象必须是 `nlink=1` 的非符号链接普通文件。目录、FIFO、socket、device、硬链接、owner 异常、并发替换或任何持久引用均保留并报错。受管根只能从已验证的 Manager 配置和固定子目录派生，不能把 state/journal 中的路径字符串直接升格为删除权限；根外 Version 路径必须在任何清理副作用前失败。无独占 writer 证明时还必须等待统一宽限；只有能证明覆盖该目录全部 writer 的单实例启动门或域锁才可立即删除，全局 recovery flock 不能被误当作对不取该锁的 watchdog writer 也有排他性。启动只扫描随后严格验证的 operation、recovery 和已引用 version 目录；无关新鲜工件留给宽限后维护，不因清理扩大启动拒绝面。持久身份验证仍拒绝 `.tmp-*` 引用，这一清理特例不能用于容忍缺失、损坏或未知的正式工件。
 
 ## 文件与附件
 

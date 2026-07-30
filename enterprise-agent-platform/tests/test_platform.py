@@ -6056,7 +6056,14 @@ class PlatformHTTPTests(unittest.TestCase):
                     "POST",
                     "/api/auth/login",
                     body=json.dumps({"username": "admin", "password": "admin"}),
-                    headers={"Content-Type": "application/json", "Origin": "https://agents.example"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "https://agents.example",
+                        # Forwarding headers are untrusted in this deployment
+                        # mode and cannot downgrade the public HTTPS cookie.
+                        "X-Forwarded-Proto": "http",
+                        "X-Forwarded-Host": "192.168.50.1:8081",
+                    },
                 )
                 res = conn.getresponse()
                 res.read()
@@ -6087,6 +6094,77 @@ class PlatformHTTPTests(unittest.TestCase):
                 created = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 201)
                 self.assertEqual(created["channel"]["name"], "allowed")
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_trusted_manager_scheme_supports_https_and_plaintext_lan_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(
+                make_config(Path(td)),
+                public_base_url="https://agents.example",
+                trust_forwarded_headers=True,
+            )
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                lan_origin = "http://192.168.50.1:8081"
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Host": "192.168.50.1:8081",
+                        "Origin": lan_origin,
+                        "X-Forwarded-Proto": "http",
+                        "X-Forwarded-Host": "192.168.50.1:8081",
+                    },
+                )
+                response = conn.getresponse()
+                response.read()
+                lan_cookie = response.getheader("Set-Cookie")
+                self.assertEqual(response.status, 200)
+                self.assertTrue(lan_cookie)
+                self.assertNotIn("Secure", lan_cookie)
+
+                conn.request(
+                    "GET",
+                    "/api/auth/me",
+                    headers={
+                        "Host": "192.168.50.1:8081",
+                        "Cookie": lan_cookie.split(";", 1)[0],
+                        "X-Forwarded-Proto": "http",
+                        "X-Forwarded-Host": "192.168.50.1:8081",
+                    },
+                )
+                response = conn.getresponse()
+                me = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(me["user"]["username"], "admin")
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Host": "agents.example",
+                        "Origin": "https://agents.example",
+                        "X-Forwarded-Proto": "https",
+                        "X-Forwarded-Host": "agents.example",
+                    },
+                )
+                response = conn.getresponse()
+                response.read()
+                public_cookie = response.getheader("Set-Cookie")
+                self.assertEqual(response.status, 200)
+                self.assertTrue(public_cookie)
+                self.assertIn("Secure", public_cookie)
             finally:
                 server.shutdown()
                 server.server_close()

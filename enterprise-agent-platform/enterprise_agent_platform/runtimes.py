@@ -294,9 +294,6 @@ class PlatformRuntimeManager:
             "Camoufox is managed by ubitech-manager",
         )
 
-    def ensure_searxng_ready(self, *, wait: bool = True) -> RuntimeStatus:
-        return self._wait_for_status(self.searxng_status, wait=wait)
-
     def searxng_status(self, *, refresh: bool = True) -> RuntimeStatus:
         url = self._effective_searxng_api_url()
         error = self._endpoint_error("SearXNG", url)
@@ -308,9 +305,6 @@ class PlatformRuntimeManager:
             available,
             "SearXNG is managed by ubitech-manager",
         )
-
-    def ensure_firecrawl_ready(self, *, wait: bool = True) -> RuntimeStatus:
-        return self._wait_for_status(self.firecrawl_status, wait=wait)
 
     def firecrawl_status(self, *, refresh: bool = True) -> RuntimeStatus:
         url = self._effective_firecrawl_api_url()

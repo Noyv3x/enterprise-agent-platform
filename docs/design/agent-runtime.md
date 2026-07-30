@@ -15,6 +15,8 @@ Runtime 直接依赖 lockfile 中精确版本的 Pi Core 与 Pi AI，不经由�
 
 Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、知识、技能、计划、邮箱和浏览器业务接口。宿主管理器拥有 Sandbox/host 进程、文件执行和容器生命周期。Runtime 不复制这些状态，也不访问 Docker socket。
 
+邮件唤醒的 durable Agent job 只保存 Platform 权威源消息引用；Platform 在队列调度和重启/中断恢复边界严格校验该引用后，在内存中重建有界预览任务再提交 Runtime。Runtime 不从 job 键、邮件正文或其它文本猜测账户与 scope 身份。
+
 ## Run 状态机
 
 顶层 Run 先进入 FIFO 并发队列，再依次经历 `queued`、`running` 和一个终态。终态为 `completed`、`failed`、`cancelled` 或 `needs_review`。只有顶层 Run 消耗全局并发名额；委派子 Run 共享父 Run 的执行槽、Sandbox 与工作区，但保持派生 scope、独立 session 和事件。

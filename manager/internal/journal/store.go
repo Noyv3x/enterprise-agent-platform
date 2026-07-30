@@ -226,6 +226,9 @@ func (s *Store) Operation(id string) (model.Operation, error) {
 func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.cleanupOperationAtomicResiduesLocked(); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(s.operations)
 	if err != nil {
 		return nil, err
@@ -340,6 +343,56 @@ func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerSta
 	return op, nil
 }
 
+// CompletePreparedCleanup closes the durable inverse-update protocol. The
+// terminal operation is persisted before the active Platform owner is cleared,
+// so a crash between the two files is recovered as an ordinary terminal/state
+// half-commit and can never re-enter runUpdate.
+func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, err := s.readOperationLocked(id)
+	if err != nil {
+		return model.Operation{}, err
+	}
+	if !op.PreparedCleanupPending || (op.Kind != model.OperationInstall && op.Kind != model.OperationUpdate) ||
+		op.TargetGeneration == "" || op.Error == "" {
+		return model.Operation{}, errors.New("prepared cleanup operation is not an active inverse-update owner")
+	}
+	if op.Finalized || op.CompletedAt != nil ||
+		(op.Status != model.OperationPending && op.Status != model.OperationRunning) {
+		return model.Operation{}, errors.New("prepared cleanup operation has an invalid terminal boundary")
+	}
+	if s.state.ActiveOperationID != id || s.state.FinalizePendingOperationID != "" || s.state.Candidate != nil {
+		return model.Operation{}, errors.New("prepared cleanup Platform state is not ready for terminal commit")
+	}
+	completed := now.UTC()
+	op.Status = model.OperationFailed
+	op.Finalized = true
+	op.PreparedCleanupPending = false
+	op.UpdatedAt = completed
+	op.CompletedAt = &completed
+	// Clearing the marker is atomic with making the operation terminal. A crash
+	// after this write cannot re-enter runUpdate; RecoverActive observes failed
+	// and only clears the still-active Platform projection.
+	if err := s.persistOperationLocked(&op); err != nil {
+		return model.Operation{}, err
+	}
+	next := cloneState(s.state)
+	next.Generation++
+	next.ActiveOperationID = ""
+	next.Phase = ""
+	next.PublicState = model.StateIdle
+	next.Maintenance = false
+	next.LastError = op.Error
+	next.RetryAfterSeconds = 0
+	next.UpdatedAt, next.HeartbeatAt = completed, completed
+	if err := s.persistStateValueLocked(&next); err != nil {
+		return model.Operation{}, err
+	}
+	s.state = next
+	return op, nil
+}
+
 func (s *Store) RecoverActive() (*model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -387,6 +440,9 @@ func (s *Store) readOperationLocked(id string) (model.Operation, error) {
 }
 
 func (s *Store) findByIdempotencyLocked(key string) (model.Operation, bool, error) {
+	if err := s.cleanupOperationAtomicResiduesLocked(); err != nil {
+		return model.Operation{}, false, err
+	}
 	entries, err := os.ReadDir(s.operations)
 	if err != nil {
 		return model.Operation{}, false, err

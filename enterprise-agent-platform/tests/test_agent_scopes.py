@@ -239,6 +239,11 @@ class AgentScopeSessionTests(unittest.TestCase):
                     sqlite3.DatabaseError,
                     "workspace does not match the current baseline",
                 ):
+                    manager.get_scope(scope.scope_key)
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "workspace does not match the current baseline",
+                ):
                     AgentScopeManager(config, db)
             finally:
                 db.close()

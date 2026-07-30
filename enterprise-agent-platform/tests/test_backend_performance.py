@@ -23,6 +23,60 @@ class BackendPerformanceServiceTests(unittest.TestCase):
             service_module.MAX_ATTACHMENTS_TOTAL_BYTES + 1024 * 1024,
         )
 
+    def test_startup_reply_index_scans_agent_messages_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)), agent_client=RecordingAgent()
+            )
+            try:
+                service.db.execute(
+                    """
+                    INSERT INTO messages(
+                        scope_type, scope_id, author_type, user_id, username,
+                        content, metadata_json, created_at
+                    ) VALUES ('private', '1', 'agent', NULL, 'Private Agent', '', ?, 1)
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "durable_job_id": 3,
+                                "durable_job_ids": [1, "2", "invalid"],
+                                "agent_work": {"state": "complete"},
+                            }
+                        ),
+                    ),
+                )
+                service.db.execute(
+                    """
+                    INSERT INTO messages(
+                        scope_type, scope_id, author_type, user_id, username,
+                        content, metadata_json, created_at
+                    ) VALUES ('channel', '1', 'agent', NULL, 'Channel Agent', '', ?, 2)
+                    """,
+                    (json.dumps({"durable_job_ids": [4]}),),
+                )
+                original_query = service.db.query
+                scans = 0
+
+                def counting_query(sql, params=()):
+                    nonlocal scans
+                    if "SELECT metadata_json FROM messages" in sql:
+                        scans += 1
+                    return original_query(sql, params)
+
+                with mock.patch.object(
+                    service.db, "query", side_effect=counting_query
+                ):
+                    all_jobs, completed_jobs = (
+                        service._durable_agent_message_job_index()
+                    )
+
+                self.assertEqual(scans, 1)
+                self.assertEqual(all_jobs, {1, 2, 3, 4})
+                self.assertEqual(completed_jobs, {1, 2, 3})
+            finally:
+                service.close()
+
     def test_message_history_pages_backward_without_changing_forward_cursor(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(

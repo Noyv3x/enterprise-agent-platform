@@ -551,6 +551,58 @@ jobs:
           overwrite: true
           retention-days: 7
 
+  manager-systemd-integration:
+    name: Manager user-systemd activation gate
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: manager/go.mod
+          cache: false
+
+      - name: Start the runner user-systemd manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          runtime_dir="/run/user/${uid}"
+          bus="unix:path=${runtime_dir}/bus"
+          for _ in $(seq 1 30); do
+            if XDG_RUNTIME_DIR="$runtime_dir" DBUS_SESSION_BUS_ADDRESS="$bus" \
+              systemctl --user show-environment >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="$runtime_dir" DBUS_SESSION_BUS_ADDRESS="$bus" \
+            systemctl --user show-environment >/dev/null
+          XDG_RUNTIME_DIR="$runtime_dir" DBUS_SESSION_BUS_ADDRESS="$bus" \
+            systemd-run --user --quiet --wait --collect --property=Type=oneshot /usr/bin/true
+          {
+            echo "XDG_RUNTIME_DIR=$runtime_dir"
+            echo "DBUS_SESSION_BUS_ADDRESS=$bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify real Manager restart and watchdog cgroups
+        working-directory: manager
+        env:
+          UBITECH_SYSTEMD_INTEGRATION: "1"
+        run: >-
+          go test -count=1 -v
+          -run '^Test(RecoverySystemdQuiescenceIntegration|OrdinarySystemdActivationRestartIntegration)$'
+          ./internal/selfupdate
+
   compose-smoke:
     name: Core Compose smoke test
     needs:
@@ -983,6 +1035,7 @@ jobs:
       - upstream-contracts
       - images
       - manager-binaries
+      - manager-systemd-integration
       - compose-smoke
       - public-images
     runs-on: ubuntu-latest

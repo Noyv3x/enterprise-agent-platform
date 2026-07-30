@@ -104,7 +104,6 @@ class DocsSyncTests(unittest.TestCase):
                     "id": "integrations",
                     "documents": ["docs/design/integrations.md"],
                     "code": [
-                        "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
                         "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
                         "enterprise-agent-platform/camofox-runtime/**",
                     ],
@@ -161,12 +160,7 @@ class DocsSyncTests(unittest.TestCase):
                     "id": "upstream-sources",
                     "source": "docs/contracts/upstream-sources.json",
                     "domains": ["integrations", "platform"],
-                    "targets": [
-                        {
-                            "path": "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py",
-                            "format": "python-upstream-sources",
-                        }
-                    ],
+                    "targets": [],
                 },
                 {
                     "id": "runtime-policy",
@@ -1093,6 +1087,13 @@ class DocsSyncTests(unittest.TestCase):
     def test_upstream_source_contract_rejects_floating_or_credentialed_sources(self) -> None:
         self.initialize_git()
         self.write_fixture()
+        self.run_command("sync", expect=0)
+        self.assertFalse(
+            (
+                self.root
+                / "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py"
+            ).exists()
+        )
         path = self.root / "docs/contracts/upstream-sources.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
         contract["sources"]["cognee"]["revision"] = "main"
@@ -1115,6 +1116,21 @@ class DocsSyncTests(unittest.TestCase):
         path.write_text(json.dumps(contract), encoding="utf-8")
         unsorted = self.run_command("sync", expect=1)
         self.assertIn("compose_services must be sorted", unsorted.stderr)
+
+    def test_upstream_source_contract_rejects_generated_targets(self) -> None:
+        self.initialize_git()
+        manifest = self.manifest()
+        self.manifest_contract(manifest, "upstream-sources")["targets"] = [
+            {
+                "path": "src/generated.py",
+                "format": "python-runtime-policy",
+            }
+        ]
+        self.write_fixture(manifest)
+
+        result = self.run_command("sync", expect=1)
+
+        self.assertIn("must not define generated targets", result.stderr)
 
     def test_each_code_and_test_pattern_must_match_a_real_corresponding_file(self) -> None:
         self.initialize_git()

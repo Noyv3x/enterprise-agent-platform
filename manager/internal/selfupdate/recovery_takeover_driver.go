@@ -145,7 +145,63 @@ func (m *Manager) validateRecoveryPreHandoffCheckpoint(journal recoveryTakeoverJ
 		return errors.New("Manager state left registered Current before recovery watchdog handoff")
 	}
 	if state.Candidate != nil && reflect.DeepEqual(*state.Candidate, journal.OriginalCandidate) {
-		if state.Activation == nil || reflect.DeepEqual(*state.Activation, journal.OriginalActivation) {
+		if state.Activation != nil && reflect.DeepEqual(*state.Activation, journal.OriginalActivation) {
+			return nil
+		}
+		if state.Activation == nil &&
+			(journal.Phase == recoveryTakeoverPlanSuperseded || journal.Phase == recoveryTakeoverActivationCleared) {
+			_, plan, planErr := readRecoveryActivationPlan(journal.OriginalPlanPath)
+			if planErr != nil {
+				return planErr
+			}
+			settledState := journal.OriginalState
+			settledState.Activation = nil
+			if err := m.validateRecoveryPlanBinding(plan, settledState, journal.OriginalCandidate, journal.PlatformCommit, false); err != nil {
+				return fmt.Errorf("validate journaled activation-cleared plan: %w", err)
+			}
+			wantError := "ordinary Manager activation was superseded by controlled Current recovery transaction " + journal.TransactionID
+			if plan.Status != recoverySupersededStatus || plan.Error != wantError {
+				return errors.New("journaled activation-cleared checkpoint has no exact superseded plan evidence")
+			}
+			stableSHA, stableErr := fileSHA256(journal.InstallPath)
+			if stableErr != nil {
+				return stableErr
+			}
+			if journal.Phase == recoveryTakeoverPlanSuperseded {
+				if stableSHA != journal.OriginalCurrent.SHA256 {
+					return errors.New("journaled plan-superseded checkpoint does not retain stable Current")
+				}
+				if _, statErr := os.Lstat(journal.RecoveryPlanPath); !os.IsNotExist(statErr) {
+					if statErr != nil {
+						return statErr
+					}
+					return errors.New("journaled plan-superseded checkpoint unexpectedly has a recovery plan")
+				}
+				return nil
+			}
+			if stableSHA != journal.OriginalCurrent.SHA256 && stableSHA != journal.RecoverySHA256 {
+				return errors.New("journaled activation-cleared stable is outside the recovery transaction")
+			}
+			_, recoveryPlanErr := os.Lstat(journal.RecoveryPlanPath)
+			if os.IsNotExist(recoveryPlanErr) {
+				return nil
+			}
+			if recoveryPlanErr != nil {
+				return recoveryPlanErr
+			}
+			if stableSHA != journal.RecoverySHA256 {
+				return errors.New("journaled activation-cleared plan exists before stable recovery replacement")
+			}
+			_, recoveryPlan, recoveryPlanErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if recoveryPlanErr != nil {
+				return recoveryPlanErr
+			}
+			if err := validateRecoveryPlanOwnership(recoveryPlan, journal); err != nil {
+				return fmt.Errorf("validate journaled pre-intent recovery plan: %w", err)
+			}
+			if recoveryPlan.Status != "prepared" || recoveryPlan.Activated || recoveryPlan.Acknowledged {
+				return errors.New("journaled pre-intent recovery plan is not prepared")
+			}
 			return nil
 		}
 	}
@@ -198,9 +254,14 @@ func (m *Manager) validateRecoveryTakeoverRequest(request recoveryActivationRequ
 	artifact, ok := evidence.manifest.Manager.Artifacts[runtime.GOARCH]
 	if !ok || journal.OriginalCandidate.Version != evidence.manifest.Manager.Version ||
 		journal.OriginalCandidate.SourceCommit != journal.PlatformCommit || journal.OriginalCandidate.SHA256 != artifact.SHA256 ||
-		!journal.OriginalCandidate.PlatformCommitted || journal.OriginalActivation.CandidateSHA != journal.OriginalCandidate.SHA256 ||
-		journal.OriginalActivation.CandidatePath != journal.OriginalCandidate.Path || journal.OriginalActivation.PlanPath != journal.OriginalPlanPath {
+		!journal.OriginalCandidate.PlatformCommitted {
 		return errors.New("takeover journal does not preserve the committed original Candidate identity")
+	}
+	if journal.OriginalState.Activation == nil ||
+		journal.OriginalActivation.CandidateSHA != journal.OriginalCandidate.SHA256 ||
+		journal.OriginalActivation.CandidatePath != journal.OriginalCandidate.Path ||
+		journal.OriginalActivation.PlanPath != journal.OriginalPlanPath {
+		return errors.New("takeover journal does not preserve the original Activation identity")
 	}
 	recoveryBinary, _, err := readRecoveryRegularFile(journal.RecoveryPath, recoveryMaxBinaryBytes, false)
 	if err != nil || sha256Hex(recoveryBinary) != request.newSHA || !bytes.Equal(recoveryBinary, request.newBinary) {
@@ -276,7 +337,7 @@ func (m *Manager) ensureOriginalPlanSuperseded(journal recoveryTakeoverJournal) 
 		plan.UpdatedAt = m.now()
 		return persistActivationPlan(plan.PlanPath, plan)
 	}
-	if plan.Status != recoverySupersededStatus && plan.Status != "aborted_before_replace" && plan.Status != "rolled_back" {
+	if plan.Status != recoverySupersededStatus && plan.Status != "rolled_back" {
 		return errors.New("original Manager activation plan changed outside the takeover transaction")
 	}
 	settledState := journal.OriginalState
@@ -344,30 +405,7 @@ func (m *Manager) ensureRecoveryActivationIntent(journal recoveryTakeoverJournal
 		return err
 	}
 	now := m.now()
-	plan := Plan{
-		SchemaVersion:         1,
-		Mode:                  recoveryActivationMode,
-		PlanPath:              journal.RecoveryPlanPath,
-		Status:                "prepared",
-		StatePath:             journal.ManagerStatePath,
-		InstallPath:           journal.InstallPath,
-		SocketPath:            journal.SocketPath,
-		ControlTokenFile:      journal.ControlTokenFile,
-		UnitName:              journal.UnitName,
-		CandidateVersion:      journal.RecoveryVersion,
-		CandidateSHA:          journal.RecoverySHA256,
-		CandidatePath:         journal.RecoveryPath,
-		PlatformCommit:        journal.PlatformCommit,
-		RecoveryTransactionID: journal.TransactionID,
-		RecoveryJournalPath:   journal.Path,
-		SupersededPlanPath:    journal.OriginalPlanPath,
-		SupersededPlanSHA:     journal.OriginalPlanSHA256,
-		PreviousPath:          journal.OriginalCurrent.Path,
-		CreatedAt:             now,
-		UpdatedAt:             now,
-		HealthTimeoutMS:       journal.RecoveryHealthTimeoutMS,
-		BootID:                journal.InitialBootID,
-	}
+	plan := recoveryActivationPlanFromJournal(journal)
 	if recoveryStateHasOriginalBase(state, journal) && recoveryCandidateMatches(state.Candidate, journal) &&
 		recoveryActivationMatches(state.Activation, journal) {
 		_, existing, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
@@ -411,6 +449,33 @@ func (m *Manager) ensureRecoveryActivationIntent(journal recoveryTakeoverJournal
 	state.Activation = &Activation{PlanPath: journal.RecoveryPlanPath, CandidateSHA: candidate.SHA256, CandidatePath: candidate.Path, StartedAt: now}
 	state.UpdatedAt = now
 	return atomicfile.WriteJSON(m.StatePath, state, 0o600)
+}
+
+func recoveryActivationPlanFromJournal(journal recoveryTakeoverJournal) Plan {
+	return Plan{
+		SchemaVersion:         1,
+		Mode:                  recoveryActivationMode,
+		PlanPath:              journal.RecoveryPlanPath,
+		Status:                "prepared",
+		StatePath:             journal.ManagerStatePath,
+		InstallPath:           journal.InstallPath,
+		SocketPath:            journal.SocketPath,
+		ControlTokenFile:      journal.ControlTokenFile,
+		UnitName:              journal.UnitName,
+		CandidateVersion:      journal.RecoveryVersion,
+		CandidateSHA:          journal.RecoverySHA256,
+		CandidatePath:         journal.RecoveryPath,
+		PlatformCommit:        journal.PlatformCommit,
+		RecoveryTransactionID: journal.TransactionID,
+		RecoveryJournalPath:   journal.Path,
+		SupersededPlanPath:    journal.OriginalPlanPath,
+		SupersededPlanSHA:     journal.OriginalPlanSHA256,
+		PreviousPath:          journal.OriginalCurrent.Path,
+		CreatedAt:             journal.CreatedAt,
+		UpdatedAt:             journal.CreatedAt,
+		HealthTimeoutMS:       journal.RecoveryHealthTimeoutMS,
+		BootID:                journal.InitialBootID,
+	}
 }
 
 func (m *Manager) ensureRecoveryWatchdog(ctx context.Context, journal recoveryTakeoverJournal) error {
@@ -550,63 +615,112 @@ func (m *Manager) completeRecoveryTerminalCheckpoint(ctx context.Context, journa
 			return errors.New("current recovery terminal replay lost immutable takeover binding")
 		}
 		journal = latest
-		if journal.Phase == recoveryTakeoverCommitted {
-			phase, completed = journal.Phase, true
-			return nil
-		}
-		if journal.Phase == recoveryTakeoverRolledBack {
-			if err := m.convergeRecoveryRollbackService(ctx, journal); err != nil {
-				return err
-			}
-			phase, completed = journal.Phase, true
-			return nil
-		}
 		if recoveryPhaseBefore(journal.Phase, recoveryTakeoverWatchdogOwned) {
 			return nil
 		}
 		if err := validateRecoveryPlatformCurrentIdentity(journal); err != nil {
 			return err
 		}
-		_, plan, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+		_, state, readErr := readRecoverySelfUpdateState(journal.ManagerStatePath)
 		if readErr != nil {
 			return readErr
 		}
-		owned, readErr := readRecoveryTakeoverOwnership(plan)
-		if readErr != nil || owned.TransactionID != journal.TransactionID || !sameRecoveryTakeoverBinding(owned, journal) {
-			if readErr != nil {
-				return readErr
+		plan := recoveryActivationPlanFromJournal(journal)
+		planValid := false
+		var planReadErr error
+		planData, _, rawPlanErr := readRecoveryRegularFile(journal.RecoveryPlanPath, recoveryMaxJSONBytes, true)
+		if rawPlanErr != nil {
+			if !os.IsNotExist(rawPlanErr) {
+				return rawPlanErr
 			}
-			return errors.New("current recovery terminal replay lost complete plan ownership")
-		}
-		if err := validateRecoveryPlanOwnership(plan, journal); err != nil {
-			return err
-		}
-		_, state, readErr := readRecoverySelfUpdateState(plan.StatePath)
-		if readErr != nil {
-			return readErr
+			planReadErr = rawPlanErr
+		} else {
+			var observed Plan
+			if decodeErr := decodeRecoveryJSON(planData, &observed); decodeErr != nil {
+				planReadErr = fmt.Errorf("decode current recovery activation plan: %w", decodeErr)
+			} else {
+				owned, ownershipErr := readRecoveryTakeoverOwnership(observed)
+				if ownershipErr != nil {
+					return ownershipErr
+				}
+				if owned.TransactionID != journal.TransactionID || !sameRecoveryTakeoverBinding(owned, journal) {
+					return errors.New("current recovery terminal replay lost complete plan ownership")
+				}
+				plan = observed
+				planValid = true
+			}
 		}
 		switch {
 		case recoveryCommittedStateMatches(state, journal):
-			if (plan.Status != "acknowledged" && plan.Status != "committed") || !plan.Activated || !plan.Acknowledged ||
-				!binaryMatches(plan.InstallPath, journal.RecoverySHA256) {
+			if journal.Phase == recoveryTakeoverRolledBack {
+				return errors.New("rolled-back current recovery journal conflicts with committed Manager state")
+			}
+			if !binaryMatches(journal.InstallPath, journal.RecoverySHA256) {
 				return errors.New("current recovery committed checkpoint has an invalid plan or stable executable")
 			}
-			plan.Status = "committed"
-			plan.UpdatedAt = m.now()
-			if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
-				return fmt.Errorf("complete current recovery committed plan: %w", err)
+			if planValid {
+				validStatus := plan.Status == "acknowledged" || plan.Status == "committed"
+				if journal.Phase == recoveryTakeoverCommitted {
+					validStatus = plan.Status == "committed"
+				}
+				if !validStatus || !plan.Activated || !plan.Acknowledged {
+					return errors.New("current recovery committed checkpoint has an invalid plan or stable executable")
+				}
+			} else {
+				if err := validateSupersededRecoveryPlanConfiguration(plan, journal); err != nil {
+					return err
+				}
+				plan.Activated = true
+				plan.Acknowledged = true
 			}
-			if err := persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverCommitted); err != nil {
-				return fmt.Errorf("complete current recovery committed journal: %w", err)
+			if !planValid || plan.Status != "committed" || journal.Phase != recoveryTakeoverCommitted {
+				plan.Status = "committed"
+				plan.UpdatedAt = m.now()
+				if err := validateRecoveryPlanOwnership(plan, journal); err != nil {
+					return fmt.Errorf("validate reconstructed current recovery commit plan: %w", err)
+				}
+				if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+					return fmt.Errorf("complete current recovery committed plan: %w", err)
+				}
+				if err := persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverCommitted); err != nil {
+					return fmt.Errorf("complete current recovery committed journal: %w", err)
+				}
+			}
+			if err := m.convergeRecoveryCommitService(ctx, journal); err != nil {
+				return err
 			}
 			phase, completed = recoveryTakeoverCommitted, true
 			return nil
 		case recoveryStateHasOriginalBase(state, journal) && state.Candidate == nil && state.Activation == nil:
-			if plan.Status != "rolled_back" || !binaryMatches(plan.InstallPath, journal.OriginalCurrent.SHA256) {
+			if journal.Phase == recoveryTakeoverCommitted {
+				return errors.New("committed current recovery journal conflicts with rolled-back Manager state")
+			}
+			if !binaryMatches(journal.InstallPath, journal.OriginalCurrent.SHA256) {
 				return errors.New("current recovery rollback checkpoint has an invalid plan or stable executable")
 			}
-			if err := persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverRolledBack); err != nil {
-				return fmt.Errorf("complete current recovery rollback journal: %w", err)
+			if planValid {
+				if plan.Status == "committed" || journal.Phase == recoveryTakeoverRolledBack && plan.Status != "rolled_back" {
+					return errors.New("current recovery rollback checkpoint has an invalid plan or stable executable")
+				}
+			}
+			if !planValid {
+				if err := validateSupersededRecoveryPlanConfiguration(plan, journal); err != nil {
+					return err
+				}
+			}
+			if !planValid || plan.Status != "rolled_back" || journal.Phase != recoveryTakeoverRolledBack {
+				plan.Status = "rolled_back"
+				plan.Error = boundRecoveryPlanError(plan.Error)
+				plan.UpdatedAt = m.now()
+				if err := validateRecoveryPlanOwnership(plan, journal); err != nil {
+					return fmt.Errorf("validate reconstructed current recovery rollback plan: %w", err)
+				}
+				if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+					return fmt.Errorf("complete current recovery rolled-back plan: %w", err)
+				}
+				if err := persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverRolledBack); err != nil {
+					return fmt.Errorf("complete current recovery rollback journal: %w", err)
+				}
 			}
 			if err := m.convergeRecoveryRollbackService(ctx, journal); err != nil {
 				return err
@@ -614,10 +728,46 @@ func (m *Manager) completeRecoveryTerminalCheckpoint(ctx context.Context, journa
 			phase, completed = recoveryTakeoverRolledBack, true
 			return nil
 		default:
+			if journal.Phase == recoveryTakeoverCommitted || journal.Phase == recoveryTakeoverRolledBack {
+				return errors.New("terminal current recovery journal no longer matches its live Manager checkpoint")
+			}
+			if planReadErr != nil {
+				return planReadErr
+			}
 			return nil
 		}
 	})
 	return phase, completed, err
+}
+
+func (m *Manager) convergeRecoveryCommitService(ctx context.Context, journal recoveryTakeoverJournal) error {
+	_, state, err := readRecoverySelfUpdateState(journal.ManagerStatePath)
+	if err != nil || !recoveryCommittedStateMatches(state, journal) ||
+		!binaryMatches(journal.InstallPath, journal.RecoverySHA256) {
+		return errors.New("current recovery committed checkpoint is not durable")
+	}
+	_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil || validateRecoveryPlanOwnership(plan, journal) != nil || plan.Status != "committed" ||
+		!plan.Activated || !plan.Acknowledged {
+		return errors.New("current recovery committed plan is not durable")
+	}
+	if err := m.setRecoveryUnitEnabled(ctx, journal.UnitName, true); err != nil {
+		return fmt.Errorf("restore Manager unit enablement after current recovery commit: %w", err)
+	}
+	if recoveryManagerIdentityMatches(ctx, journal.SocketPath, journal.ControlTokenFile, journal.RecoveryVersion, journal.RecoverySHA256) &&
+		m.verifyRecoveryServiceProcess(ctx, journal.UnitName, journal.RecoverySHA256) == nil {
+		return nil
+	}
+	if err := m.runner().Run(ctx, "systemctl", "--user", "start", journal.UnitName); err != nil {
+		return fmt.Errorf("start registered recovery Current after commit: %w", err)
+	}
+	if err := waitRecoveryManagerIdentity(ctx, journal.SocketPath, journal.ControlTokenFile, journal.RecoveryVersion, journal.RecoverySHA256); err != nil {
+		return fmt.Errorf("verify registered recovery Current identity after commit: %w", err)
+	}
+	if err := m.verifyRecoveryServiceProcess(ctx, journal.UnitName, journal.RecoverySHA256); err != nil {
+		return fmt.Errorf("verify registered recovery Current process after commit: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) convergeRecoveryRollbackService(ctx context.Context, journal recoveryTakeoverJournal) error {
@@ -694,17 +844,96 @@ func (m *Manager) verifyCommittedRecovery(ctx context.Context, request recoveryA
 }
 
 func restoreRecoveryActivationPrevious(plan Plan, runner Runner, journal recoveryTakeoverJournal) error {
+	return restoreRecoveryActivationPreviousOwned(plan, runner, journal, false)
+}
+
+// restoreRecoveryActivationPreviousFromVerifiedPlan is used only while the
+// recovery watchdog holds the takeover mutation lock and its plan file became
+// missing or invalid after a previously verified read.  The takeover journal
+// remains the durable owner; the last verified plan may recreate only the
+// transaction's exact managed plan as part of the same rollback checkpoint.
+func restoreRecoveryActivationPreviousFromVerifiedPlan(plan Plan, runner Runner, journal recoveryTakeoverJournal) error {
+	return restoreRecoveryActivationPreviousOwned(plan, runner, journal, true)
+}
+
+// completeRecoveryActivationCommitFromVerifiedPlan is used only while the
+// recovery watchdog holds the takeover mutation lock and its plan became
+// unreadable after the atomic Current promotion. The last verified plan may
+// rebuild terminal evidence only when state and stable still prove that exact
+// commit; it never moves Current or Previous again.
+func completeRecoveryActivationCommitFromVerifiedPlan(plan Plan, journal recoveryTakeoverJournal) error {
+	if journal.Phase == recoveryTakeoverRolledBack || recoveryPhaseBefore(journal.Phase, recoveryTakeoverWatchdogOwned) {
+		return errors.New("current recovery journal does not own commit reconstruction")
+	}
+	if err := validateRecoveryPlanOwnership(plan, journal); err != nil {
+		return fmt.Errorf("validate last verified recovery plan before commit recreation: %w", err)
+	}
+	durablePlan := plan
+	planData, _, planReadErr := readRecoveryRegularFile(journal.RecoveryPlanPath, recoveryMaxJSONBytes, true)
+	if planReadErr == nil {
+		var observed Plan
+		if decodeErr := decodeRecoveryJSON(planData, &observed); decodeErr == nil {
+			if err := validateRecoveryPlanOwnership(observed, journal); err != nil {
+				return err
+			}
+			durablePlan = observed
+		}
+	} else if !os.IsNotExist(planReadErr) {
+		return planReadErr
+	}
+	if (durablePlan.Status != "acknowledged" && durablePlan.Status != "committed") ||
+		!durablePlan.Activated || !durablePlan.Acknowledged {
+		return errors.New("last verified recovery plan is not an acknowledged commit checkpoint")
+	}
+	_, state, err := readRecoverySelfUpdateState(journal.ManagerStatePath)
+	if err != nil {
+		return err
+	}
+	if !recoveryCommittedStateMatches(state, journal) || !binaryMatches(journal.InstallPath, journal.RecoverySHA256) {
+		return errors.New("lost recovery plan does not match the committed Manager checkpoint")
+	}
+	durablePlan.Status = "committed"
+	durablePlan.UpdatedAt = time.Now().UTC()
+	if err := persistActivationPlan(durablePlan.PlanPath, durablePlan); err != nil {
+		return fmt.Errorf("recreate committed current recovery plan: %w", err)
+	}
+	if err := persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverCommitted); err != nil {
+		return fmt.Errorf("complete committed current recovery journal: %w", err)
+	}
+	return nil
+}
+
+func restoreRecoveryActivationPreviousOwned(plan Plan, runner Runner, journal recoveryTakeoverJournal, allowPlanRecreate bool) error {
 	plan.Error = boundRecoveryPlanError(plan.Error)
 	previous, _, err := readRecoveryRegularFile(journal.OriginalCurrent.Path, recoveryMaxBinaryBytes, false)
 	if err != nil || sha256Hex(previous) != journal.OriginalCurrent.SHA256 || plan.PreviousPath != journal.OriginalCurrent.Path {
 		return errors.New("current recovery rollback Current executable is invalid")
 	}
-	_, durablePlan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
-	if err != nil {
-		return err
+	durablePlan := plan
+	planData, _, planReadErr := readRecoveryRegularFile(journal.RecoveryPlanPath, recoveryMaxJSONBytes, true)
+	if planReadErr == nil {
+		var observed Plan
+		if decodeErr := decodeRecoveryJSON(planData, &observed); decodeErr == nil {
+			if err := validateRecoveryPlanOwnership(observed, journal); err != nil {
+				return err
+			}
+			durablePlan = observed
+		} else if !allowPlanRecreate {
+			return decodeErr
+		}
+	} else if !allowPlanRecreate || !os.IsNotExist(planReadErr) {
+		return planReadErr
 	}
-	if err := validateRecoveryPlanOwnership(durablePlan, journal); err != nil {
-		return err
+	if allowPlanRecreate {
+		if err := validateRecoveryPlanOwnership(plan, journal); err != nil {
+			return fmt.Errorf("validate last verified recovery plan before rollback recreation: %w", err)
+		}
+		if durablePlan.PlanPath != plan.PlanPath || durablePlan.RecoveryTransactionID != plan.RecoveryTransactionID {
+			return errors.New("last verified recovery plan lost takeover ownership")
+		}
+	}
+	if durablePlan.Status == "committed" {
+		return errors.New("committed current recovery activation cannot be rolled back")
 	}
 	_, state, err := readRecoverySelfUpdateState(plan.StatePath)
 	if err != nil {

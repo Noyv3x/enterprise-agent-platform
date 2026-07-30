@@ -113,6 +113,7 @@ type Operation struct {
 	SnapshotPath              string            `json:"snapshot_path,omitempty"`
 	SnapshotRestored          bool              `json:"snapshot_restored,omitempty"`
 	ReservationReleased       bool              `json:"reservation_released,omitempty"`
+	PreparedCleanupPending    bool              `json:"prepared_cleanup_pending,omitempty"`
 	ManagerActivationRollback bool              `json:"manager_activation_rollback,omitempty"`
 	ManagerRollbackGeneration string            `json:"manager_rollback_generation,omitempty"`
 	Error                     string            `json:"error,omitempty"`

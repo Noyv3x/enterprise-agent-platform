@@ -59,9 +59,11 @@ type recordingMaintenanceCleanup struct {
 	heldImages         map[string]struct{}
 	snapshotErr        error
 	releaseErr         error
+	operationErr       error
 	managerErr         error
 	snapshotAction     func(release.RemovalGuard)
 	releaseAction      func(release.RemovalGuard)
+	operationAction    func(release.RemovalGuard)
 }
 
 type maintenanceDockerRunner struct {
@@ -102,6 +104,14 @@ func (c *recordingMaintenanceCleanup) PruneReleases(_ context.Context, _ time.Ti
 		c.releaseAction(guard)
 	}
 	return 2, c.releaseErr
+}
+
+func (c *recordingMaintenanceCleanup) PruneTerminalOperations(_ context.Context, _ time.Time, guard release.RemovalGuard) (int, error) {
+	c.calls = append(c.calls, "operations")
+	if c.operationAction != nil {
+		c.operationAction(guard)
+	}
+	return 4, c.operationErr
 }
 
 func (c *recordingMaintenanceCleanup) PruneManagerVersions(_ context.Context, _ time.Time, _ time.Duration) (int, error) {
@@ -244,7 +254,7 @@ func TestReconcileMaintenanceProtectsEveryReachableResource(t *testing.T) {
 	if _, included := cleanup.protectedImages[maintenanceImage("future")]; included {
 		t.Fatal("unknown additional image crossed the managed-image protection boundary")
 	}
-	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,manager-versions" {
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,operations,manager-versions" {
 		t.Fatalf("maintenance calls = %s", got)
 	}
 }
@@ -327,28 +337,29 @@ func TestReconcileMaintenanceAbortsDeletionWhenOperationChangesAfterPlanning(t *
 	if guardAccepted {
 		t.Fatal("operation journal changed after planning but the deletion guard remained open")
 	}
-	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images" {
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,operations" {
 		t.Fatalf("cleanup after concurrent mutation = %s; Manager binary cleanup must not start", got)
 	}
 }
 
 func TestReconcileMaintenanceIsolatesCleanupDomainFailures(t *testing.T) {
 	cleanup := &recordingMaintenanceCleanup{
-		snapshotErr: errors.New("snapshot cleanup failed"),
-		releaseErr:  errors.New("release cleanup failed"),
-		managerErr:  errors.New("manager cleanup failed"),
+		snapshotErr:  errors.New("snapshot cleanup failed"),
+		releaseErr:   errors.New("release cleanup failed"),
+		operationErr: errors.New("operation cleanup failed"),
+		managerErr:   errors.New("manager cleanup failed"),
 	}
 	app, _ := newMaintenanceTestApplication(t, cleanup, nil)
 	err := app.reconcileMaintenance(context.Background())
 	if err == nil {
 		t.Fatal("independent cleanup failures were discarded")
 	}
-	for _, message := range []string{"snapshot cleanup failed", "release cleanup failed", "manager cleanup failed"} {
+	for _, message := range []string{"snapshot cleanup failed", "release cleanup failed", "operation cleanup failed", "manager cleanup failed"} {
 		if !strings.Contains(err.Error(), message) {
 			t.Fatalf("combined maintenance error %q omitted %q", err, message)
 		}
 	}
-	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,manager-versions" {
+	if got := strings.Join(cleanup.calls, ","); got != "snapshots,releases-and-images,operations,manager-versions" {
 		t.Fatalf("one cleanup failure suppressed another domain: %s", got)
 	}
 }
@@ -408,7 +419,7 @@ func TestReconcileMaintenanceJointlyReclaimsSnapshotsReleasesImagesAndManagerVer
 		config: cfg, state: store, docker: docker, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots,
 		maintenanceMu: &maintenance.Admission{},
 	}
-	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, operations: store, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
 
 	if err := app.reconcileMaintenance(context.Background()); err != nil {
 		t.Fatal(err)

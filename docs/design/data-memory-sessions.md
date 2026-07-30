@@ -24,7 +24,7 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 规范私人 scope 为 `private:<user-id>`，频道主 Agent scope 为 `channel:<channel-id>:main-agent`。scope 保存稳定的相对 workspace 标识和不可由模型覆盖的主 Agent sandbox identity；Runtime lifecycle 和 session 可以独立轮换。委派 scope 继承父 sandbox identity，不建立新的工作目录。当前架构只有 Sandbox 执行路径，因此数据库和 workspace marker 不保存可选择的执行后端字段。
 
-每个 workspace 写入 `.ubitech-agent-scope.json`，只记录 scope、lifecycle、sandbox identity、workspace identity 和固定隔离边界。字段集合必须精确匹配当前格式；多余或缺失字段触发受控重写，不能把已退役的状态维度继续带入新基线。数据库不得保存容器内或宿主绝对 workspace 路径；Platform 在自己的数据根解析相对标识，Manager 将同一目录映射为 Sandbox `/workspace`。当前基线发现非规范 workspace 标识时必须拒绝启动，不能静默改写记录。每次使用都重新检查路径组成与符号链接，缓存不得绕过。
+每个 workspace 写入 `.ubitech-agent-scope.json`，只记录 scope、lifecycle、sandbox identity、workspace identity 和固定隔离边界。字段集合必须精确匹配当前格式；多余或缺失字段触发受控重写，不能把已退役的状态维度继续带入新基线。数据库不得保存容器内或宿主绝对 workspace 路径；Platform 在自己的数据根解析相对标识，Manager 将同一目录映射为 Sandbox `/workspace`。当前基线发现绝对路径、越界相对路径或任何不等于 scope 规范 identity 的 workspace 标识时，启动和后续读取都必须明确拒绝，不能把旧绝对路径静默换算或改写为当前 identity。每次使用都重新检查路径组成与符号链接，缓存不得绕过。
 
 停用账号保留私人 workspace、session 和 memory，以便重新启用。账号停用和产品消息隐藏都不隐式销毁这些持久上下文；需要重置时必须使用独立、显式的 lifecycle/session cleanup 语义。
 
@@ -39,6 +39,10 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 ## 持久任务与追加输入
 
 Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO worker 消费，全局并发门只限制实际进入 Runtime 的任务。
+
+用户消息任务可以把完整任务快照持久化在 job payload 中；邮件唤醒例外地使用引用载荷，只保存任务类型与权威 `source_message_id`。所有队列唤醒、重启恢复、中断复核和失败消息补偿路径都先校验 job scope 与源消息归属，再从消息和其可信 metadata 重建任务。源消息丢失、归属不一致或 metadata 不完整时失败关闭，不能从去重键或文本猜测身份。
+
+Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构建本次恢复使用的 `durable_job_id` 与完成状态索引；随后对失败、待复核和分组任务只做集合查询。不得为每条历史 job 重复读取并解析整张消息表，使启动成本退化为任务数与消息数的乘积。该索引只是一轮启动内的派生数据，不替代 SQLite 中的消息和 job 权威记录。
 
 当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
 

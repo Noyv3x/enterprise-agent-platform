@@ -137,7 +137,29 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 		return m.driveRecoveryTakeoverJournal(ctx, activationRequest, evidence, journal)
 	}
 	if state.Candidate != nil || state.Activation != nil {
-		return m.recoverCurrentActivation(ctx, activationRequest)
+		settled, settleErr := m.settleOrdinaryRollbackCheckpointForRecovery(platformCommit)
+		if settleErr != nil {
+			return settleErr
+		}
+		if !settled {
+			return m.recoverCurrentActivation(ctx, activationRequest)
+		}
+		originalStateData, state, err = readRecoverySelfUpdateState(m.StatePath)
+		if err != nil {
+			return err
+		}
+		if state.Current == nil || state.Candidate != nil || state.Activation != nil {
+			return errors.New("ordinary rollback checkpoint did not settle to a registered Current")
+		}
+		oldCurrent = *state.Current
+		oldBinary, _, err = readRecoveryRegularFile(oldCurrent.Path, recoveryMaxBinaryBytes, false)
+		if err != nil || sha256Hex(oldBinary) != oldCurrent.SHA256 {
+			return errors.New("settled ordinary rollback Current executable is invalid")
+		}
+		activationRequest.originalStateData = originalStateData
+		activationRequest.state = state
+		activationRequest.oldCurrent = oldCurrent
+		activationRequest.oldBinary = oldBinary
 	}
 
 	stableBinary, _, err := readRecoveryRegularFile(m.InstallPath, recoveryMaxBinaryBytes, false)
@@ -250,6 +272,68 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 		)
 	}
 	return nil
+}
+
+// settleOrdinaryRollbackCheckpointForRecovery handles only a standard
+// ordinary-watchdog rollback whose plan is already terminal while its exact
+// Candidate/Activation references remain. The caller owns the broader recovery
+// lock; this function takes the plan lock second and never admits a state that
+// lacks either reference.
+func (m *Manager) settleOrdinaryRollbackCheckpointForRecovery(platformCommit string) (bool, error) {
+	_, snapshot, err := readRecoverySelfUpdateState(m.StatePath)
+	if err != nil {
+		return false, err
+	}
+	if snapshot.Candidate == nil || snapshot.Activation == nil {
+		return false, nil
+	}
+	planPath := snapshot.Activation.PlanPath
+	if !pathWithin(filepath.Join(m.Root, "activations"), planPath) {
+		return false, errors.New("ordinary rollback activation plan is outside the managed activations directory")
+	}
+	settled := false
+	err = withOrdinaryActivationMutationLock(planPath, func() error {
+		_, state, readErr := readRecoverySelfUpdateState(m.StatePath)
+		if readErr != nil {
+			return readErr
+		}
+		if state.Candidate == nil && state.Activation == nil {
+			settled = true
+			return nil
+		}
+		if state.Current == nil || state.Candidate == nil || state.Activation == nil ||
+			state.Activation.PlanPath != planPath {
+			return errors.New("ordinary rollback state changed before recovery settlement")
+		}
+		_, plan, readErr := readRecoveryActivationPlan(planPath)
+		if readErr != nil {
+			return readErr
+		}
+		if plan.Status != ordinaryRolledBackStatus {
+			return nil
+		}
+		settledState := state
+		settledState.Activation = nil
+		if err := m.validateRecoveryPlanBinding(plan, settledState, *state.Candidate, platformCommit, false); err != nil {
+			return fmt.Errorf("validate ordinary rollback before external recovery: %w", err)
+		}
+		if state.Activation.CandidateSHA != plan.CandidateSHA ||
+			state.Activation.CandidatePath != plan.CandidatePath || state.Activation.StartedAt.IsZero() ||
+			state.Activation.StartedAt.Before(plan.CreatedAt) {
+			return errors.New("ordinary rollback Activation does not match its terminal plan")
+		}
+		if !binaryMatches(state.Current.Path, state.Current.SHA256) ||
+			!binaryMatches(state.Candidate.Path, state.Candidate.SHA256) ||
+			!binaryMatches(plan.InstallPath, state.Current.SHA256) {
+			return errors.New("ordinary rollback immutable or stable executable is invalid")
+		}
+		if err := settleOrdinaryRollbackState(plan); err != nil {
+			return err
+		}
+		settled = true
+		return nil
+	})
+	return settled, err
 }
 
 func acquireRecoveryLock(root string) (func(), error) {

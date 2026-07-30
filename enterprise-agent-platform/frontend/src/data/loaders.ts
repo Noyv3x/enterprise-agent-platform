@@ -620,13 +620,3 @@ export async function loadMessageAudit(store: AppStore): Promise<void> {
   ]);
   await loadAuditPrivateMessages(store, store.getState().messageAudit.auditPrivateUserId);
 }
-
-export async function loadAdminPanel(store: AppStore): Promise<void> {
-  await Promise.all([
-    loadUsers(store),
-    loadPermissionGroups(store),
-    loadSettings(store),
-    loadMessageAudit(store),
-    loadTokenUsage(store),
-  ]);
-}

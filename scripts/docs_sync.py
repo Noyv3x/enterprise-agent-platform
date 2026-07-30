@@ -53,9 +53,7 @@ REQUIRED_RUNTIME_POLICY_TARGETS = {
 }
 REQUIRED_UPSTREAM_SOURCES_SOURCE = "docs/contracts/upstream-sources.json"
 REQUIRED_UPSTREAM_SOURCES_DOMAINS = frozenset({"integrations", "platform"})
-REQUIRED_UPSTREAM_SOURCES_TARGETS = {
-    "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py": "python-upstream-sources",
-}
+REQUIRED_UPSTREAM_SOURCES_TARGETS: dict[str, str] = {}
 REQUIRED_CONTAINER_PLATFORM_SOURCE = "docs/contracts/container-platform.json"
 REQUIRED_CONTAINER_PLATFORM_DOMAINS = frozenset(
     {"deployment", "platform", "agent-runtime", "frontend"}
@@ -72,7 +70,6 @@ REQUIRED_OWNED_CODE_PROBES = {
     "scripts/docs_sync.py": frozenset({"documentation-governance"}),
     "scripts/release.sh": frozenset({"documentation-governance"}),
     "enterprise-agent-platform/pyproject.toml": frozenset({"platform"}),
-    "enterprise-agent-platform/enterprise_agent_platform/upstream_sources_generated.py": frozenset({"integrations"}),
     "enterprise-agent-platform/enterprise_agent_platform/service.py": frozenset({"platform"}),
     "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": frozenset({"integrations"}),
     "enterprise-agent-platform/agent-runtime/package-lock.json": frozenset({"agent-runtime"}),
@@ -387,8 +384,8 @@ def load_manifest(root: Path) -> Manifest:
         # All domains are available in seen_domain_ids only if the manifest is
         # ordered. Re-check against the complete set after parsing as well.
         targets_raw = contract_raw.get("targets")
-        if not isinstance(targets_raw, list) or not targets_raw:
-            raise DocsSyncError(f"{label}.targets must be a non-empty JSON array")
+        if not isinstance(targets_raw, list):
+            raise DocsSyncError(f"{label}.targets must be a JSON array")
         targets: list[ContractTarget] = []
         for target_index, target_item in enumerate(targets_raw):
             target_label = f"{label}.targets[{target_index}]"
@@ -401,7 +398,6 @@ def load_manifest(root: Path) -> Manifest:
             if target_format not in {
                 "python-runtime-policy",
                 "typescript-runtime-policy",
-                "python-upstream-sources",
                 "python-container-platform",
                 "typescript-container-platform",
                 "go-container-platform",
@@ -500,7 +496,7 @@ def load_manifest(root: Path) -> Manifest:
         or upstream_targets != REQUIRED_UPSTREAM_SOURCES_TARGETS
     ):
         raise DocsSyncError(
-            "upstream-sources targets and formats must match the required Python target"
+            "upstream-sources must not define generated targets; direct consumers read its validated JSON"
         )
 
     container_contracts = [
@@ -1408,22 +1404,6 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     return contract
 
 
-def _render_python_upstream_sources(contract: dict[str, Any], source: str) -> str:
-    serialized = json.dumps(
-        contract["sources"],
-        ensure_ascii=False,
-        indent=4,
-        sort_keys=True,
-    )
-    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
-from __future__ import annotations
-
-UPSTREAM_SOURCE_SCHEMA_VERSION = {contract["schema_version"]}
-
-UPSTREAM_SOURCES = {serialized}
-'''
-
-
 def render_contract(root: Path, contract: Contract) -> dict[str, str]:
     raw = _read_json(_safe_path(root, contract.source), f"contract {contract.identifier}")
     if contract.identifier == "runtime-policy":
@@ -1444,8 +1424,6 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_python_runtime_policy(parsed, contract.source)
         elif target.format == "typescript-runtime-policy":
             content = _render_typescript_runtime_policy(parsed, contract.source)
-        elif target.format == "python-upstream-sources":
-            content = _render_python_upstream_sources(parsed, contract.source)
         elif target.format == "python-container-platform":
             content = _render_python_container_platform(parsed, contract.source)
         elif target.format == "typescript-container-platform":

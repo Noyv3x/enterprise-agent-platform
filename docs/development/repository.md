@@ -28,7 +28,7 @@
 
 ## 上游源码
 
-Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。它们的官方 URL 和精确 revision 只在 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义，由 CI 在隔离构建上下文中获取和验证；部署机只拉取发布清单中的镜像。常规平台任务不得：
+Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。它们的官方 URL 和精确 revision 只在 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义，由 CI 和容器验收直接读取、在隔离构建上下文中获取和验证；该契约不生成或打包无运行时消费者的 Python 副本，部署机只拉取发布清单中的镜像。常规平台任务不得：
 
 - 在临时上游 checkout 中实现产品修改、创建提交、分支或 PR；
 - 从构建缓存推送上游；

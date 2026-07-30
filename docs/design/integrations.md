@@ -5,13 +5,14 @@
 ## 发布与通用原则
 
 - 集成适配器属于产品代码；上游 Git 仓库和缓存不属于产品运行数据。
-- Cognee 与 Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。CI 在隔离构建上下文中获取、验证和构建，部署机只按 release manifest 拉取镜像，不下载上游源码。
+- Cognee 与 Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。发布工作流和容器验收直接读取并校验该 JSON，在隔离构建上下文中获取、验证和构建；Platform 运行时不生成、导入或携带其 Python 副本，部署机只按 release manifest 拉取镜像，不下载上游源码。
 - Platform、Runtime 和集成容器不得访问 Docker socket；生命周期由宿主管理器统一控制。
 - 容器模式下 Platform 只读取 Manager 注入的 Camoufox、SearXNG、Firecrawl 私有 service URL。SQLite 中任何 manage、URL、command 或 source repo 行都不参与解析，Platform API 也不提供安装或重启这些固定服务的入口；修复和重启通过 Manager operation 完成。
 - Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
+- Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
 
 ## 模型 OAuth
 
@@ -69,7 +70,13 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 保存邮件附件时，Platform 必须从可信 scope 的工作区根目录 fd 开始，逐段以 `O_DIRECTORY | O_NOFOLLOW` 打开或以 `mkdirat` 创建目标父目录，并验证每一段都是部署用户拥有的真实目录。最终文件只能相对已固定的父目录 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，再验证其类型与 owner；不得先按路径检查、随后重新按字符串路径打开。父目录在保存过程中被替换、重命名或改成符号链接时，写入也不能越过当前 scope 的工作区边界。
 
-启用收信唤醒后，一个有界轮询器按 `UIDVALIDITY + UID` 做 checkpoint 和去重。首次启用或 `UIDVALIDITY` 变化时必须用服务器 `UIDNEXT` 建立当前高水位，不能执行 `SEARCH ALL`、把整个邮箱 UID 列表载入内存或把历史邮箱当成新邮件；服务器未返回有效 `UIDVALIDITY/UIDNEXT` 时 fail closed。增量检查只搜索从 checkpoint 开始的有界 UID 数值窗口，每批新邮件数量另有更小上限；有剩余窗口时把账户标记为立即到期，由公平的后台轮询循环继续追赶，而不是等待用户配置的常规周期。公平顺序按持久化的下次到期时间排列；追赶一个窗口后，该账户仍立即到期，但必须移到其他已到期账户之后。这个顺序必须跨轮询循环和进程重启保留，不能让前一批持续积压的账户固定占满批次。只有成功处理完整窗口才持久化已扫描边界；批内超过上限时只能推进到最后一个已选择 UID，读取或落库失败不得越过失败 UID。这样既不让大邮箱一次占满 worker，也不会让稀疏 UID 或持续流量积压数小时。后台 IMAP 网络读取不持有更新写准入；每个 checkpoint、触发消息/durable job 事务和检查状态落库前重新取得短准入，更新已经预约时放弃未提交结果并在新 generation 从原 checkpoint 重试。新邮件以 system trigger 写入私人对话，并和 Agent durable job、checkpoint 在同一事务提交。唤醒 Run 标记为 unattended，只能读取和汇报，不能因邮件正文自行发送、移动、删除、修改记忆或执行宿主命令。维护期间不开始轮询、投递或唤醒，解除后从 checkpoint 继续。
+启用收信唤醒后，一个有界轮询器按 `UIDVALIDITY + UID` 做 checkpoint 和去重。首次启用或 `UIDVALIDITY` 变化时必须用服务器 `UIDNEXT` 建立当前高水位，不能执行 `SEARCH ALL`、把整个邮箱 UID 列表载入内存或把历史邮箱当成新邮件；服务器未返回有效 `UIDVALIDITY/UIDNEXT` 时 fail closed。增量检查只搜索从 checkpoint 开始的有界 UID 数值窗口，每批新邮件数量另有更小上限；有剩余窗口时把账户标记为立即到期，由公平的后台轮询循环继续追赶，而不是等待用户配置的常规周期。公平顺序按持久化的下次到期时间排列；追赶一个窗口后，该账户仍立即到期，但必须移到其他已到期账户之后。这个顺序必须跨轮询循环和进程重启保留，不能让前一批持续积压的账户固定占满批次。只有成功处理完整窗口才持久化已扫描边界；批内超过上限时只能推进到最后一个已选择 UID，读取或落库失败不得越过失败 UID。这样既不让大邮箱一次占满 worker，也不会让稀疏 UID 或持续流量积压数小时。
+
+唤醒背压是 IMAP 读取的前置门。每个邮箱账户最多同时保留 `4` 个、每个私人 scope 最多同时保留 `8` 个处于 `queued/running` 的邮件唤醒 Agent job；任一上限到达时，本轮不建立 IMAP 读取、不获取正文、不推进 `UIDVALIDITY/last_uid` checkpoint，只按账户的正常轮询周期退避。同一私人 scope 的后台轮询与手工“立即检查”共用同一串行门，并在落库事务内再次检查两级容量；因此释放容量后必须从原 checkpoint 的同一 UID 精确续跑，不能丢信或产生重复模型调用。
+
+唤醒触发消息只保留严格有界的预览：主题、发件人、收件人、抄送、日期和 Message-ID 每字段最多 `512` 字符，正文预览最多 `4096` 字符，只附带附件数量而不嵌入附件内容。触发文案必须明确告知 Agent 使用 `mail/read` 和可信的 `account/folder/uid` 重新读取权威全文。权威预览只存于产品消息；durable job 只持久化 `source_message_id` 和最小任务类型，调度、重启恢复和终态补偿都必须从该权威消息重建内存任务，不得在 `task.content`、`user_message.content` 和 job payload 中重复持久化正文。
+
+后台 IMAP 网络读取不持有更新写准入；每个 checkpoint、触发消息/durable job 事务和检查状态落库前重新取得短准入，更新已经预约时放弃未提交结果并在新 generation 从原 checkpoint 重试。新邮件以 system trigger 写入私人对话，并和 Agent durable job、checkpoint 在同一事务提交。唤醒 Run 标记为 unattended，只能读取和汇报，不能因邮件正文自行发送、移动、删除、修改记忆或执行宿主命令。维护期间不开始轮询、投递或唤醒，解除后从 checkpoint 继续。
 
 公平轮转中的“立即到期”指下一调度秒即可再次被领取，不等待账户的常规周期。每次追赶后持久化的到期边界必须严格前进，不能因秒级时钟相同而再次与未处理账户并列。
 

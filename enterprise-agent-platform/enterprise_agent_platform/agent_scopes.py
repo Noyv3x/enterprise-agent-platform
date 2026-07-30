@@ -344,20 +344,6 @@ class AgentScopeManager:
             (now_ts(), self.private_scope_key(int(user_id))),
         )
 
-    def session_belongs_to_current_lifecycle(self, scope_key: str, session_id: str) -> bool:
-        scope = self.get_scope(str(scope_key))
-        if scope is None or not self._valid_session_id(session_id):
-            return False
-        return bool(
-            self.db.scalar(
-                """
-                SELECT 1 FROM agent_runtime_scope_sessions
-                WHERE scope_key = ? AND lifecycle_id = ? AND session_id = ?
-                """,
-                (scope.scope_key, scope.lifecycle_id, str(session_id)),
-            )
-        )
-
     def _record_session_alias(self, scope: AgentExecutionScope, *, conn=None, timestamp: int | None = None) -> None:
         ts = now_ts() if timestamp is None else int(timestamp)
 
@@ -379,16 +365,20 @@ class AgentScopeManager:
 
     def _from_row(self, row: dict[str, Any]) -> AgentExecutionScope:
         workspace_id = str(row["workspace_path"])
+        expected_workspace_id = self._workspace_id(
+            str(row["scope_type"]), str(row["scope_id"])
+        )
+        if workspace_id != expected_workspace_id:
+            raise sqlite3.DatabaseError(
+                "Agent scope workspace does not match the current baseline: "
+                + str(row["scope_key"])
+            )
         stored = Path(workspace_id)
-        if stored.is_absolute():
-            workspace_id = self._workspace_id(str(row["scope_type"]), str(row["scope_id"]))
-            workspace = self._expected_workspace(str(row["scope_type"]), str(row["scope_id"]))
-        else:
-            workspace = (self._workspace_root / stored).resolve()
-            try:
-                workspace.relative_to(self._workspace_root)
-            except ValueError as exc:
-                raise ValueError("stored Agent workspace escapes the workspace root") from exc
+        workspace = (self._workspace_root / stored).resolve()
+        try:
+            workspace.relative_to(self._workspace_root)
+        except ValueError as exc:
+            raise ValueError("stored Agent workspace escapes the workspace root") from exc
         return AgentExecutionScope(
             scope_key=str(row["scope_key"]),
             scope_type=str(row["scope_type"]),

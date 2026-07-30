@@ -37,7 +37,7 @@ ubitech agent 面向彼此可信的小规模成员，为每位用户提供私人
 - 运行中终端的只读预览。
 - 每主 Agent 独立、可停止后重建且保留工作目录/HOME/环境的 Sandbox。
 - 仅面向私人聊天的 Telegram Gateway。
-- 私人 Agent 的 IMAP/SMTP 邮箱管理，以及可选的收信唤醒。
+- 私人 Agent 的 IMAP/SMTP 邮箱管理，以及带每账户/每私人 Agent 积压上限、有界预览和可恢复去重的收信唤醒。
 - 回复完成时的浏览器系统通知，以及默认关闭、可显式开启的可信局域网入口。
 - Codex OAuth 与 Grok OAuth；不提供模型 API key 产品入口。
 - 等待空闲后执行、全程阻断使用并可失败回滚的自动更新。

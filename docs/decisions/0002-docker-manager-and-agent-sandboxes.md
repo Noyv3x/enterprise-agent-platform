@@ -1,6 +1,6 @@
 # 0002：Docker 管理平面与 Agent Sandbox
 
-- 状态：accepted
+- 状态：superseded（宿主执行审批部分由 [0003](0003-host-execution-requires-per-call-approval.md) 取代；其余决定继续有效）
 - 日期：2026-07-24
 
 ## 背景
@@ -29,3 +29,7 @@
 ## 替代方案
 
 继续共享宿主 Runtime 无法提供每 Agent 环境隔离；给应用容器挂载 Docker socket 会混淆业务与编排边界；让 Sandbox 通过特权挂载模拟宿主机会扩大所有普通调用的权限。以上方案均不采用。
+
+## 后续决定
+
+本记录中“宿主目标不等待用户审批”的决定已被 [0003：宿主执行逐次审批](0003-host-execution-requires-per-call-approval.md) 取代。本文保留当时的设计背景，不再作为当前审批行为的依据。

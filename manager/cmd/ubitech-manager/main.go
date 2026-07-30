@@ -61,11 +61,13 @@ type application struct {
 type maintenanceCleanup interface {
 	PruneSnapshots(context.Context, time.Time, map[string]struct{}, release.RemovalGuard) (int, error)
 	PruneReleases(context.Context, time.Time, map[string]struct{}, map[string]struct{}, map[string]struct{}, release.RemovalGuard) (int, error)
+	PruneTerminalOperations(context.Context, time.Time, release.RemovalGuard) (int, error)
 	PruneManagerVersions(context.Context, time.Time, time.Duration) (int, error)
 }
 
 type liveMaintenanceCleanup struct {
 	config     config.Config
+	operations *journal.Store
 	snapshots  snapshot.Store
 	selfUpdate *selfupdate.Manager
 	images     maintenance.ImagePruner
@@ -88,6 +90,13 @@ func (c liveMaintenanceCleanup) PruneReleases(ctx context.Context, now time.Time
 		Images:          c.images,
 		RemovalGuard:    guard,
 	})
+}
+
+func (c liveMaintenanceCleanup) PruneTerminalOperations(ctx context.Context, now time.Time, guard release.RemovalGuard) (int, error) {
+	if c.operations == nil {
+		return 0, errors.New("operation journal cleanup store is unavailable")
+	}
+	return c.operations.PruneTerminalOperations(ctx, now, journal.TerminalOperationRemovalGuard(guard))
 }
 
 func (c liveMaintenanceCleanup) PruneManagerVersions(ctx context.Context, now time.Time, retention time.Duration) (int, error) {
@@ -309,7 +318,7 @@ func build(path string) (*application, error) {
 	}
 	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken, ManagerVersion: version, ManagerSHA256: runningSHA}
 	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake, maintenanceActiveProcesses: processes.ActiveBackgroundCount}
-	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, operations: state, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
 	sandboxes.ReclaimCapacity = app.reconcileMaintenance
 	ops.ReclaimCapacity = func(ctx context.Context, operationID string, manifest release.Manifest) error {
 		return app.reconcileMaintenanceWithProtection(ctx, operationID, &manifest)
@@ -342,27 +351,54 @@ func preflightCommand(arguments []string) error {
 }
 
 func serveCommand(arguments []string) error {
+	return serveCommandWithBuild(arguments, build)
+}
+
+func serveCommandWithBuild(arguments []string, builder func(string) (*application, error)) error {
 	set, path := commonFlags("serve")
 	if err := set.Parse(arguments); err != nil {
 		return err
 	}
-	app, err := build(*path)
+	startup, err := acquireServeStartupOwnership(*path)
+	if err != nil {
+		return fmt.Errorf("validate Manager startup ownership before construction: %w", err)
+	}
+	defer startup.release()
+	if startup.lease.ExternalRecoveryProbe() {
+		startup.lease, err = serveExternalRecoveryProbe(startup)
+		if err != nil {
+			return fmt.Errorf("serve fenced external recovery identity: %w", err)
+		}
+	}
+	app, err := builder(*path)
 	if err != nil {
 		return err
+	}
+	startup.lease, err = ensureServeStartupOwnership(app.selfUpdate, startup.lease)
+	if err != nil {
+		return fmt.Errorf("validate Manager startup ownership after construction: %w", err)
 	}
 	pendingActivation, err := app.selfUpdate.PendingActivation()
 	if err != nil {
 		return err
 	}
+	// A recovery watchdog may settle between the ownership snapshot and the
+	// pending read. Revalidation makes that transition part of the gate rather
+	// than allowing a rolled-back candidate to enter normal background work.
+	startup.lease, err = ensureServeStartupOwnership(app.selfUpdate, startup.lease)
+	if err != nil {
+		return fmt.Errorf("revalidate Manager startup ownership after pending activation read: %w", err)
+	}
 	listener, err := control.Listen(app.config.SocketPath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = listener.Close(); _ = os.Remove(app.config.SocketPath) }()
+	defer func() { _ = listener.Close() }()
 	gatewayControl := newGatewayController(app)
 	app.configs.SetLANApply(gatewayControl.ApplyLANConfig)
 	app.operations.PublicProbe = gatewayControl.Health
-	server := &http.Server{Handler: app.api, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
+	controlHandler := newServeControlHandler(app.api, pendingActivation)
+	server := &http.Server{Handler: controlHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
 	serveErrors := make(chan error, 1)
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -397,7 +433,12 @@ func serveCommand(arguments []string) error {
 		if err != nil {
 			return fmt.Errorf("wait for Manager watchdog commit: %w", err)
 		}
+		controlHandler.promote(app.api)
 	}
+	// A free-lock startup retains exclusion until its control identity is live
+	// and any pending candidate is durably promoted. A busy-lock startup is
+	// already protected by the external recover-current process probing it.
+	startup.lease.Release()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// Once the watchdog has promoted this binary to Current, a child-service or
@@ -428,6 +469,128 @@ func serveCommand(arguments []string) error {
 		return server.Shutdown(shutdown)
 	case err := <-serveErrors:
 		return err
+	}
+}
+
+type serveStartupAdmission struct {
+	config     config.Config
+	manager    *selfupdate.Manager
+	serveLease *selfupdate.ServeLease
+	lease      *selfupdate.StartupOwnershipLease
+}
+
+func (s *serveStartupAdmission) release() {
+	if s == nil {
+		return
+	}
+	s.lease.Release()
+	s.serveLease.Release()
+}
+
+func acquireServeStartupOwnership(path string) (*serveStartupAdmission, error) {
+	cfg, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	manager := &selfupdate.Manager{
+		Root:             filepath.Join(cfg.StateDir, "manager-binaries"),
+		StatePath:        filepath.Join(cfg.StateDir, "manager-binaries.json"),
+		InstallPath:      managerInstallPath(),
+		SocketPath:       cfg.SocketPath,
+		ControlTokenFile: cfg.ControlTokenFile(),
+		UnitName:         "ubitech-agent-manager.service",
+		RunningVersion:   version,
+	}
+	serveLease, err := manager.AcquireServeLock()
+	if err != nil {
+		return nil, err
+	}
+	releaseServe := true
+	defer func() {
+		if releaseServe {
+			serveLease.Release()
+		}
+	}()
+	// Keep the requested public guard in the pre-construction path, then close
+	// its point-in-time race by acquiring and retaining a freshly revalidated
+	// lease for the rest of serve startup.
+	if err := manager.ValidateStartupOwnership(); err != nil {
+		return nil, err
+	}
+	lease, err := manager.AcquireStartupOwnership()
+	if err != nil {
+		return nil, err
+	}
+	releaseServe = false
+	return &serveStartupAdmission{config: cfg, manager: manager, serveLease: serveLease, lease: lease}, nil
+}
+
+func ensureServeStartupOwnership(manager *selfupdate.Manager, lease *selfupdate.StartupOwnershipLease) (*selfupdate.StartupOwnershipLease, error) {
+	if lease != nil && lease.RetainsRecoveryLock() {
+		if err := manager.ValidateStartupOwnershipWithLease(lease); err != nil {
+			return lease, err
+		}
+		return lease, nil
+	}
+	next, err := manager.AcquireStartupOwnership()
+	if err != nil {
+		return lease, err
+	}
+	if next.ExternalRecoveryProbe() {
+		return next, errors.New("external recovery began after full Manager construction")
+	}
+	return next, nil
+}
+
+func serveExternalRecoveryProbe(startup *serveStartupAdmission) (*selfupdate.StartupOwnershipLease, error) {
+	token, err := driver.ReadOwnerSecret(startup.config.ControlTokenFile())
+	if err != nil {
+		return nil, fmt.Errorf("read Manager control capability for recovery identity: %w", err)
+	}
+	runningSHA, err := runningExecutableSHA256()
+	if err != nil {
+		return nil, fmt.Errorf("identify recovery Manager executable: %w", err)
+	}
+	listener, err := control.Listen(startup.config.SocketPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = listener.Close() }()
+	api := &control.API{
+		ControlToken: token, ManagerVersion: version, ManagerSHA256: runningSHA, IdentityOnly: true,
+	}
+	server := &http.Server{Handler: api, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8 << 10}
+	serveErrors := make(chan error, 1)
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrors <- err
+		}
+	}()
+	defer server.Close()
+
+	waitContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	type ownershipResult struct {
+		lease *selfupdate.StartupOwnershipLease
+		err   error
+	}
+	results := make(chan ownershipResult, 1)
+	go func() {
+		lease, waitErr := startup.manager.AwaitExternalRecoveryOwnership(waitContext, 50*time.Millisecond)
+		results <- ownershipResult{lease: lease, err: waitErr}
+	}()
+	select {
+	case result := <-results:
+		return result.lease, result.err
+	case serveErr := <-serveErrors:
+		stop()
+		result := <-results
+		result.lease.Release()
+		return nil, serveErr
+	case <-waitContext.Done():
+		result := <-results
+		result.lease.Release()
+		return nil, waitContext.Err()
 	}
 }
 
@@ -852,7 +1015,7 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 	}
 	jobs := a.maintenanceJobs
 	if jobs == nil {
-		jobs = liveMaintenanceCleanup{config: a.config, snapshots: a.snapshots, selfUpdate: a.selfUpdate, images: a.docker}
+		jobs = liveMaintenanceCleanup{config: a.config, operations: a.state, snapshots: a.snapshots, selfUpdate: a.selfUpdate, images: a.docker}
 	}
 	a.maintenanceMu.Lock()
 	state := a.state.State()
@@ -980,6 +1143,7 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 	now := time.Now().UTC()
 	snapshotCount, snapshotErr := jobs.PruneSnapshots(ctx, now, protectedSnapshots, removalGuard)
 	releaseCount, releaseErr := jobs.PruneReleases(ctx, now, protectedIDs, protectedImages, heldImages, removalGuard)
+	operationCount, operationErr := jobs.PruneTerminalOperations(ctx, now, removalGuard)
 	// Manager binaries are serialized by their dedicated recovery lock inside
 	// PruneManagerVersions. The admission guard is released before taking that
 	// lock, while the cleanup itself re-reads Manager state under the recovery
@@ -990,12 +1154,12 @@ func (a *application) reconcileMaintenanceWithProtection(ctx context.Context, al
 		releaseAdmission()
 		managerVersionCount, managerVersionErr = jobs.PruneManagerVersions(ctx, now, time.Duration(contract.ObsoleteArtifactRetentionSeconds)*time.Second)
 	}
-	err = errors.Join(snapshotErr, releaseErr, managerVersionErr)
-	if a.audit != nil && (snapshotCount > 0 || releaseCount > 0 || managerVersionCount > 0 || err != nil) {
+	err = errors.Join(snapshotErr, releaseErr, operationErr, managerVersionErr)
+	if a.audit != nil && (snapshotCount > 0 || releaseCount > 0 || operationCount > 0 || managerVersionCount > 0 || err != nil) {
 		event := logstore.Event{
 			At:      now,
 			Type:    "manager.maintenance",
-			Details: map[string]any{"snapshots_removed": snapshotCount, "releases_removed": releaseCount, "manager_versions_removed": managerVersionCount},
+			Details: map[string]any{"snapshots_removed": snapshotCount, "releases_removed": releaseCount, "operations_removed": operationCount, "manager_versions_removed": managerVersionCount},
 		}
 		if err != nil {
 			event.Error = journal.BoundDiagnostic(err.Error())

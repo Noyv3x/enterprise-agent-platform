@@ -34,6 +34,7 @@ type API struct {
 	ExecutorToken  string
 	ManagerVersion string
 	ManagerSHA256  string
+	IdentityOnly   bool
 	mu             sync.Mutex
 	checks         map[string]release.Manifest
 }
@@ -41,6 +42,18 @@ type API struct {
 func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Set("Cache-Control", "no-store")
+	if a.IdentityOnly {
+		if !authorized(request, a.ControlToken) {
+			writeError(response, http.StatusUnauthorized, "control authentication failed")
+			return
+		}
+		if request.Method == http.MethodGet && request.URL.Path == "/v1/identity" {
+			a.identity(response)
+			return
+		}
+		writeError(response, http.StatusNotFound, "not found")
+		return
+	}
 	if strings.HasPrefix(request.URL.Path, "/v1/executor/") {
 		if !authorized(request, a.ExecutorToken) {
 			writeError(response, http.StatusUnauthorized, "executor authentication failed")
@@ -53,9 +66,11 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusUnauthorized, "control authentication failed")
 		return
 	}
-	switch {
-	case request.Method == http.MethodGet && request.URL.Path == "/v1/identity":
+	if request.Method == http.MethodGet && request.URL.Path == "/v1/identity" {
 		a.identity(response)
+		return
+	}
+	switch {
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
 		a.status(response, request.Context())
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/config":

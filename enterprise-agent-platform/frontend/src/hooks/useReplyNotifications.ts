@@ -5,6 +5,7 @@ import {
   subscribeBrowserNotifications,
 } from "../lib/browserNotifications";
 import { endpoints } from "../lib/endpoints";
+import { navigateToView, selectChannel } from "../data/chatActions";
 import { registerSessionTeardown } from "../data/sessionActions";
 import { useI18n } from "../i18n";
 import { useStore, useStoreHandle } from "../store/useStore";
@@ -107,11 +108,12 @@ export function useReplyNotifications(): void {
       });
       notification.onclick = () => {
         window.focus();
-        if (mode === "channel") {
-          store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: scopeId });
-        }
-        store.dispatch({ type: "SET_ACTIVE_VIEW", payload: mode });
         notification.close();
+        if (mode === "channel") {
+          void selectChannel(store, scopeId);
+        } else {
+          void navigateToView(store, "private");
+        }
       };
     };
 

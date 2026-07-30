@@ -1850,7 +1850,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         return "; ".join(attrs)
 
     def _secure_cookie_enabled(self) -> bool:
-        return urllib.parse.urlparse(self.server.service.public_base_url()).scheme == "https"
+        return self._request_scheme() == "https"
+
+    def _request_scheme(self) -> str:
+        """Return the scheme established by the trusted Manager boundary.
+
+        Container deployments receive forwarding metadata only after Manager
+        has discarded client-supplied values and rebuilt them from the accepted
+        TCP peer. Direct/test deployments that do not enable that trust boundary
+        must ignore forwarding headers and retain the configured public scheme.
+        """
+
+        if self._trusts_forwarded_headers():
+            forwarded = first_forwarded(
+                self.headers.get("X-Forwarded-Proto", "")
+            ).lower()
+            if forwarded in {"http", "https"}:
+                return forwarded
+        public_scheme = urllib.parse.urlparse(
+            self.server.service.public_base_url()
+        ).scheme.lower()
+        return "https" if public_scheme == "https" else "http"
 
     def _require_same_origin(self) -> None:
         # CSRF defenses only apply to ambient cookie auth. A request that carries
@@ -1889,13 +1909,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         # reverse proxy; otherwise a client could forge X-Forwarded-Host to
         # spoof an allowed origin.
         if self._trusts_forwarded_headers():
-            proto = first_forwarded(self.headers.get("X-Forwarded-Proto", "")) or "http"
             host = first_forwarded(self.headers.get("X-Forwarded-Host", "")) or self.headers.get("Host", "")
         else:
-            proto = "https" if self._secure_cookie_enabled() else "http"
             host = self.headers.get("Host", "")
-        if proto not in {"http", "https"}:
-            proto = "http"
+        proto = self._request_scheme()
         return f"{proto}://{host}" if host else ""
 
     def _client_identity(self) -> str:

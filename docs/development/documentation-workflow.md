@@ -23,7 +23,7 @@ python3 scripts/docs_sync.py check-change --base HEAD --head INDEX
 python3 scripts/docs_sync.py check-change --base HEAD --head WORKTREE
 ```
 
-`sync` 只写由契约完整生成的文件，输出不包含时间戳，因此相同输入始终得到相同结果。生成文件禁止手工编辑。
+`sync` 只写由契约完整生成的文件，输出不包含时间戳，因此相同输入始终得到相同结果。生成文件禁止手工编辑。由 CI、发布脚本或验收程序直接读取的机器契约可以是无生成目标的 validation-only contract；同步器仍必须完整校验其 schema 和安全边界，不能因为没有生成消费者而跳过验证。
 
 Manifest、canonical 文档、机器契约及生成目标都必须位于仓库内，路径链不能借助符号链接改写其它文件。生成目标必须是普通文件且不可执行。校验不要求固定为 `0644`：Git 只保存可执行位，实际读取权限会受部署机 `umask` 影响；`sync` 创建或修复目标时使用安全的非执行权限。生成到 JavaScript/TypeScript 的全部整数及单位换算结果必须保持在 `Number.MAX_SAFE_INTEGER` 内；直接交给 Node timer 的毫秒值还必须位于其有效延迟范围内。
 
@@ -58,4 +58,4 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 `documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。仓库级回归测试直接锁定这些 owner 关系，避免调整 manifest 时使迁移或发布验收失去规范文档。
 
-Cognee 与 Firecrawl 不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；修改契约必须同步部署实现或验收测试。数据目录中的受管 checkout 不是 canonical 文档或受管产品代码。
+Cognee 与 Firecrawl 不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；该 validation-only contract 由发布工作流和容器验收直接消费，不生成 Platform Python 模块。修改契约必须同步部署实现或验收测试。数据目录中的受管 checkout 不是 canonical 文档或受管产品代码。

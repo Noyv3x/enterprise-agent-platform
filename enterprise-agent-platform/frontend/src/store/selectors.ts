@@ -10,7 +10,6 @@ import type {
   Channel,
   ChatMode,
   Id,
-  MessageAudit,
   ScopeType,
   TopbarInfo,
 } from "../types";
@@ -33,10 +32,6 @@ export function hasPermission(state: AppState, permission: string): boolean {
   return isAdmin(state) || userPermissions(state).has(permission);
 }
 
-export function isOperationPending(state: AppState, operationKey: string): boolean {
-  return state.pendingOperations.includes(operationKey);
-}
-
 /* --------------------------------------------------------------- scope */
 
 export function activeChannel(state: AppState): Channel | undefined {
@@ -53,14 +48,6 @@ export function scopeIdFor(
   channelId: Id | null = state.activeChannelId,
 ): string {
   return mode === "private" ? String(state.user?.id || "") : String(channelId || "");
-}
-
-export function composerDraftKey(
-  state: AppState,
-  mode: ChatMode,
-  scopeId: string = scopeIdFor(state, mode),
-): string {
-  return `${scopeTypeFor(mode)}:${scopeId}`;
 }
 
 /* --------------------------------------------------------- agent status */
@@ -98,10 +85,6 @@ export function agentStatusText(
 
 export function activeAdminPage(state: AppState): AdminPage {
   return ADMIN_PAGES.find((page) => page.id === state.activeAdminPage) || ADMIN_PAGES[0];
-}
-
-export function messageAuditState(state: AppState): MessageAudit {
-  return state.messageAudit;
 }
 
 /* --------------------------------------------------------------- topbar */

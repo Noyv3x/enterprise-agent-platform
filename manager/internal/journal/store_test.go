@@ -309,6 +309,64 @@ func TestCompletePersistsTerminalOperationBeforeStateAndLeavesRecoverableWindow(
 	}
 }
 
+func TestCompletePreparedCleanupTerminalizesMarkerBeforeState(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "prepared-cleanup-half", ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationRunning
+		value.TargetGeneration = strings.Repeat("a", 40)
+		value.PreparedCleanupPending = true
+		value.Error = "original pull failure"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	store.beforePersistState = func(next model.ManagerState) error {
+		if next.ActiveOperationID == "" && !injected {
+			injected = true
+			return errors.New("injected prepared cleanup state fsync failure")
+		}
+		return nil
+	}
+	if _, err := store.CompletePreparedCleanup(op.ID, time.Now()); err == nil {
+		t.Fatal("expected prepared cleanup state persistence failure")
+	}
+
+	reopened, err := Open(dir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := reopened.RecoverActive()
+	if err != nil || active == nil || active.Status != model.OperationFailed || !active.Finalized ||
+		active.PreparedCleanupPending || active.CompletedAt == nil || active.Error != "original pull failure" {
+		t.Fatalf("terminal cleanup half-commit retained a resumable marker: %#v %v", active, err)
+	}
+	completed, err := reopened.Complete(op.ID, false, func(state *model.ManagerState) {
+		state.Candidate = nil
+		state.PublicState = model.StateIdle
+		state.Maintenance = false
+		state.LastError = active.Error
+		state.RetryAfterSeconds = 0
+	}, active.Error, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.PreparedCleanupPending || completed.Status != model.OperationFailed || !completed.Finalized ||
+		reopened.State().ActiveOperationID != "" || reopened.State().PublicState != model.StateIdle {
+		t.Fatalf("terminal cleanup half-commit did not converge: operation=%#v state=%#v", completed, reopened.State())
+	}
+}
+
 func TestUnfinishedOperationsFailsClosedAndExcludesFinalizedHistory(t *testing.T) {
 	store, err := Open(t.TempDir(), time.Now())
 	if err != nil {

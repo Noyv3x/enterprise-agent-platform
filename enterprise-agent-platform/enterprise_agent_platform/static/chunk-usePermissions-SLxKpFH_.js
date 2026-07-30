@@ -1,1 +1,0 @@
-import{r as e}from"./chunk-rolldown-runtime-QTnfLwEv.js";import{i as t}from"./chunk-vendor-react-SNKMMqOR.js";import{c as n,it as r}from"./app-BNX-qOaO.js";var i=e(t(),1);function a(){let e=n(r),t=n(e=>e.user?.permissions);return(0,i.useMemo)(()=>{let n=new Set(t||[]);return{isAdmin:e,has:t=>e||n.has(t)}},[e,t])}export{a as t};

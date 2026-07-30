@@ -185,11 +185,6 @@ def read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def write_env_file(path: Path, values: dict[str, str]) -> None:
-    with _CONFIG_UPDATE_LOCK:
-        _write_env_file_locked(path, values)
-
-
 def _write_env_file_locked(path: Path, values: dict[str, str]) -> None:
     lines = [
         f"{key}={quote_env(value)}"

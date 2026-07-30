@@ -1,11 +1,13 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -424,12 +426,15 @@ func (f *activationTakeoverFixture) runHook(name string, arguments []string) err
 			return nil
 		}
 		f.identity.set(true, f.recoveryCommit, f.recoverySHA)
+		state := activationTakeoverReadState(f.statePath)
+		if state.Candidate == nil && state.Activation == nil && state.Current != nil && state.Current.SHA256 == f.recoverySHA {
+			return nil
+		}
 		f.mu.Lock()
 		acknowledge := f.acknowledgeOnStart || f.commitOnMainStart
 		commit := f.commitOnMainStart
 		f.mu.Unlock()
 		if acknowledge {
-			state := activationTakeoverReadState(f.statePath)
 			if state.Candidate == nil {
 				return errors.New("recovery start had no Candidate")
 			}
@@ -438,7 +443,7 @@ func (f *activationTakeoverFixture) runHook(name string, arguments []string) err
 			}
 		}
 		if commit {
-			state := activationTakeoverReadState(f.statePath)
+			state = activationTakeoverReadState(f.statePath)
 			if state.Activation == nil {
 				return errors.New("recovery start had no Activation")
 			}
@@ -663,6 +668,33 @@ func TestIncompleteActivationPlanBindingFailsClosed(t *testing.T) {
 				t.Fatalf("rejected activation binding reached systemd: %#v", calls)
 			}
 		})
+	}
+}
+
+func TestRecoverCurrentRejectsCandidateOnlyStateWithoutTakeoverJournal(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	state := fixture.originalState
+	state.Activation = nil
+	activationTakeoverWriteJSON(t, fixture.statePath, state)
+	plan := fixture.originalPlan
+	plan.Status = ordinaryRolledBackStatus
+	plan.Error = "unsupported candidate-only checkpoint"
+	activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+	if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stateBefore := activationTakeoverFileSHA(t, fixture.statePath)
+	planBefore := activationTakeoverFileSHA(t, fixture.oldPlanPath)
+	if err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err == nil {
+		t.Fatal("candidate-only state without a takeover journal entered recovery")
+	}
+	if activationTakeoverFileSHA(t, fixture.statePath) != stateBefore ||
+		activationTakeoverFileSHA(t, fixture.oldPlanPath) != planBefore ||
+		!binaryMatches(fixture.stablePath, fixture.currentSHA) {
+		t.Fatal("candidate-only rejection changed state, plan, or stable")
+	}
+	if calls := fixture.runner.snapshot(); len(calls) != 0 {
+		t.Fatalf("candidate-only rejection reached systemd: %#v", calls)
 	}
 }
 
@@ -1171,6 +1203,130 @@ func TestRecoveryBootstrapReplaysCompletedSideEffectBeforePhaseWrite(t *testing.
 	}
 }
 
+func TestRecoverCurrentReplaysJournalOwnedActivationClearedCrashCheckpoint(t *testing.T) {
+	fixture, journal := activationTakeoverActivationClearedCrashCheckpoint(t)
+	checkpoint := activationTakeoverReadState(fixture.statePath)
+	if checkpoint.Candidate == nil || checkpoint.Candidate.SHA256 != fixture.candidateSHA || checkpoint.Activation != nil {
+		t.Fatalf("invalid injected activation-cleared checkpoint: %#v", checkpoint)
+	}
+	if !binaryMatches(fixture.stablePath, fixture.currentSHA) {
+		t.Fatal("activation-cleared checkpoint did not retain stable Current")
+	}
+	if err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+		t.Fatalf("journal-owned activation-cleared checkpoint did not replay: %v", err)
+	}
+	committed := activationTakeoverReadState(fixture.statePath)
+	if committed.Current == nil || committed.Current.SHA256 != fixture.recoverySHA ||
+		committed.Candidate != nil || committed.Activation != nil {
+		t.Fatalf("replayed recovery did not commit: %#v", committed)
+	}
+	_ = journal
+}
+
+func TestRecoverCurrentReplaysPreIntentStableAndPlanCrashCheckpoints(t *testing.T) {
+	for _, mode := range []string{"stable-replaced", "plan-persisted", "plan-tampered"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture, journal := activationTakeoverActivationClearedCrashCheckpoint(t)
+			if err := fixture.manager.advanceRecoveryTakeoverJournal(&journal, recoveryTakeoverActivationCleared); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.manager.ensureRecoveryStableReplaced(journal); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "plan-persisted" || mode == "plan-tampered" {
+				plan := recoveryActivationPlanFromJournal(journal)
+				if mode == "plan-tampered" {
+					plan.CandidateSHA = strings.Repeat("f", 64)
+				}
+				if err := persistActivationPlan(journal.RecoveryPlanPath, plan); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checkpoint := activationTakeoverReadState(fixture.statePath)
+			if checkpoint.Candidate == nil || checkpoint.Candidate.SHA256 != fixture.candidateSHA || checkpoint.Activation != nil ||
+				!binaryMatches(fixture.stablePath, fixture.recoverySHA) {
+				t.Fatalf("invalid injected pre-intent checkpoint: %#v", checkpoint)
+			}
+			err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
+			if mode == "plan-tampered" {
+				if err == nil {
+					t.Fatal("tampered pre-intent recovery plan was overwritten")
+				}
+				unchanged := activationTakeoverReadState(fixture.statePath)
+				if !reflect.DeepEqual(unchanged, checkpoint) || !binaryMatches(fixture.stablePath, fixture.recoverySHA) {
+					t.Fatalf("tampered pre-intent rejection changed state or stable: before=%#v after=%#v", checkpoint, unchanged)
+				}
+				_, observed, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+				if readErr != nil || observed.CandidateSHA != strings.Repeat("f", 64) {
+					t.Fatalf("tampered pre-intent plan was replaced: %#v %v", observed, readErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s checkpoint did not replay: %v", mode, err)
+			}
+			committed := activationTakeoverReadState(fixture.statePath)
+			if committed.Current == nil || committed.Current.SHA256 != fixture.recoverySHA ||
+				committed.Candidate != nil || committed.Activation != nil {
+				t.Fatalf("%s checkpoint did not commit recovery: %#v", mode, committed)
+			}
+		})
+	}
+}
+
+func activationTakeoverActivationClearedCrashCheckpoint(t *testing.T) (*activationTakeoverFixture, recoveryTakeoverJournal) {
+	t.Helper()
+	fixture := newActivationTakeoverFixture(t)
+	stateData, state, err := readRecoverySelfUpdateState(fixture.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planData, plan, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := readRecoveryFinalizeEvidence(fixture.platformPath, fixture.candidateCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagedPath, err := fixture.manager.stageRecoveryBinary(fixture.recoveryBinary, fixture.recoverySHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := recoveryActivationRequest{
+		platformStatePath: fixture.platformPath,
+		platformCommit:    fixture.candidateCommit,
+		newSHA:            fixture.recoverySHA,
+		unit:              fixture.manager.UnitName,
+	}
+	journal, err := fixture.manager.newRecoveryTakeoverJournal(request, evidence, recoveryTakeover{
+		stateData: stateData, state: state, planData: planData, plan: plan,
+		stableSHA: fixture.candidateSHA, candidate: *state.Candidate, unitWasEnabled: true,
+	}, stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.persistRecoveryTakeoverJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.runRecoveryBootstrapTransition(&journal, recoveryTakeoverStableCurrent, func(latest recoveryTakeoverJournal) error {
+		return fixture.manager.ensureRecoveryStable(latest.OriginalCurrent, latest.InitialStableSHA256)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.runRecoveryBootstrapTransition(&journal, recoveryTakeoverPlanSuperseded, func(latest recoveryTakeoverJournal) error {
+		return fixture.manager.ensureOriginalPlanSuperseded(latest)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate power loss after the atomic state side effect but before the
+	// journal phase advances from plan_superseded to activation_cleared.
+	if err := fixture.manager.ensureOriginalActivationCleared(journal); err != nil {
+		t.Fatal(err)
+	}
+	return fixture, journal
+}
+
 func TestRecoveryMainStartReplayAdvancesMissingPhaseWithoutDuplicateWatchdog(t *testing.T) {
 	fixture := newActivationTakeoverFixture(t)
 	journal := activationTakeoverPauseAtMainStarted(t, fixture)
@@ -1194,57 +1350,59 @@ func TestRecoveryMainStartReplayAdvancesMissingPhaseWithoutDuplicateWatchdog(t *
 	}
 }
 
-func TestRecoverCurrentRebindsOldWatchdogRollbackWonDuringStopRace(t *testing.T) {
+func TestRecoverCurrentSettlesFullOrdinaryRollbackCheckpointBeforeRecovery(t *testing.T) {
 	fixture := newActivationTakeoverFixture(t)
-	quiesceCalls := 0
-	fixture.manager.RecoveryUnitQuiescer = func(_ context.Context, _ string, _ []string, planPath string) error {
-		quiesceCalls++
-		if quiesceCalls != 1 {
-			return nil
-		}
-		if planPath != fixture.oldPlanPath {
-			return errors.New("stop-race quiescer received the wrong old plan")
-		}
-		// The ordinary watchdog wins exactly while the external command is
-		// stopping/quiescing it: stable is restored to C, its Activation is
-		// cleared while Candidate X remains, and its plan becomes rolled_back.
-		state := fixture.originalState
-		state.Activation = nil
-		activationTakeoverWriteJSON(t, fixture.statePath, state)
-		plan := fixture.originalPlan
-		plan.Status = "rolled_back"
-		plan.Error = "candidate did not acknowledge before old watchdog deadline"
-		plan.UpdatedAt = plan.UpdatedAt.Add(time.Second)
-		activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
-		if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+	fixture.setCommitBehavior(false, false)
+	plan := fixture.originalPlan
+	plan.Status = ordinaryRolledBackStatus
+	plan.Error = "candidate watchdog restored Current before state cleanup"
+	plan.UpdatedAt = plan.UpdatedAt.Add(time.Second)
+	activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+	if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+		t.Fatalf("full ordinary rollback checkpoint did not settle before recovery: %v", err)
 	}
 	state := activationTakeoverReadState(fixture.statePath)
 	if state.Current == nil || state.Current.SHA256 != fixture.recoverySHA ||
 		state.Previous == nil || state.Previous.SHA256 != fixture.currentSHA ||
 		state.Candidate != nil || state.Activation != nil {
-		t.Fatalf("stop-race rollback was not rebound into recovery activation: %#v", state)
+		t.Fatalf("ordinary rollback settlement did not reach recovered Current: %#v", state)
 	}
-	_, oldPlan, err := readRecoveryActivationPlan(fixture.oldPlanPath)
-	if err != nil || oldPlan.Status != recoverySupersededStatus {
-		t.Fatalf("rolled-back old plan was not rebound as superseded: %#v err=%v", oldPlan, err)
+	_, terminal, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+	if err != nil || terminal.Status != ordinaryRolledBackStatus || terminal.Error != plan.Error {
+		t.Fatalf("ordinary rollback evidence changed during recovery: %#v %v", terminal, err)
 	}
-	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(
-		fixture.manager.recoveryTakeoverJournalPath(fixture.candidateCommit, fixture.recoverySHA),
-	)
-	if err != nil || !exists || journal.Phase != recoveryTakeoverCommitted ||
-		journal.OriginalCandidate.SHA256 != fixture.candidateSHA || journal.OriginalCurrent.SHA256 != fixture.currentSHA {
-		t.Fatalf("stop-race takeover journal lost C/X identity: %#v exists=%v err=%v", journal, exists, err)
+}
+
+func TestRecoverCurrentRejectsTamperedFullOrdinaryRollbackCheckpoint(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	plan := fixture.originalPlan
+	plan.Status = ordinaryRolledBackStatus
+	plan.Error = "candidate watchdog restored Current before state cleanup"
+	activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+	if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if quiesceCalls < 2 {
-		t.Fatalf("stop-race path did not re-quiesce journal ownership: calls=%d", quiesceCalls)
+	state := fixture.originalState
+	state.Activation = &Activation{
+		PlanPath: fixture.oldPlanPath, CandidateSHA: strings.Repeat("f", 64),
+		CandidatePath: state.Candidate.Path, StartedAt: state.Activation.StartedAt,
+	}
+	activationTakeoverWriteJSON(t, fixture.statePath, state)
+	before := fixture.keyFiles()
+	if err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err == nil {
+		t.Fatal("tampered ordinary rollback checkpoint unexpectedly entered recovery")
+	}
+	for path, expected := range before {
+		actual, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(actual, expected) {
+			t.Fatalf("tampered rollback rejection changed %s", path)
+		}
+	}
+	if calls := fixture.runner.snapshot(); len(calls) != 0 {
+		t.Fatalf("tampered rollback checkpoint reached systemd: %#v", calls)
 	}
 }
 
@@ -1465,6 +1623,368 @@ func TestRecoverCurrentConvergesRollbackAfterTerminalWriteBeforeServiceRestore(t
 	}
 }
 
+func TestRecoveryRollbackRecreatesLostPlanFromLastVerifiedOwnership(t *testing.T) {
+	for _, mode := range []string{"deleted", "corrupt"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			journal := activationTakeoverPauseAtMainStarted(t, fixture)
+			_, lastVerified, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lastVerified.Error = "recovery plan became " + mode
+			switch mode {
+			case "deleted":
+				if err := os.Remove(journal.RecoveryPlanPath); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := atomicfile.WriteFile(journal.RecoveryPlanPath, []byte("{corrupt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err = withRecoveryTakeoverMutationLock(journal.Path, func() error {
+				latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+				if readErr != nil || !exists {
+					return fmt.Errorf("read recovery ownership: exists=%v err=%v", exists, readErr)
+				}
+				return restoreRecoveryActivationPreviousFromVerifiedPlan(lastVerified, fixture.runner, latest)
+			})
+			if err == nil || !strings.Contains(err.Error(), lastVerified.Error) {
+				t.Fatalf("lost recovery plan rollback result = %v", err)
+			}
+			state := activationTakeoverReadState(fixture.statePath)
+			if state.Current == nil || state.Current.SHA256 != fixture.currentSHA ||
+				state.Candidate != nil || state.Activation != nil ||
+				!binaryMatches(fixture.stablePath, fixture.currentSHA) {
+				t.Fatalf("lost recovery plan did not restore Current: %#v", state)
+			}
+			_, terminalPlan, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if readErr != nil || terminalPlan.Status != "rolled_back" || terminalPlan.Error != lastVerified.Error {
+				t.Fatalf("lost recovery plan terminal evidence was not recreated: %#v err=%v", terminalPlan, readErr)
+			}
+			latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+			if readErr != nil || !exists || latest.Phase != recoveryTakeoverRolledBack {
+				t.Fatalf("lost recovery plan journal did not reach rollback: %#v exists=%v err=%v", latest, exists, readErr)
+			}
+		})
+	}
+}
+
+func TestRecoveryCommitRecreatesLostPlanAfterStatePromotion(t *testing.T) {
+	for _, mode := range []string{"deleted", "corrupt", "valid-tampered"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			journal := activationTakeoverPauseAtMainStarted(t, fixture)
+			_, lastVerified, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if err != nil || lastVerified.Status != "acknowledged" {
+				t.Fatalf("recovery plan is not at the acknowledged checkpoint: %#v %v", lastVerified, err)
+			}
+			state := activationTakeoverReadState(fixture.statePath)
+			state.Previous = state.Current
+			state.Current = state.Candidate
+			state.Candidate = nil
+			state.Activation = nil
+			activationTakeoverWriteJSON(t, fixture.statePath, state)
+			switch mode {
+			case "deleted":
+				if err := os.Remove(journal.RecoveryPlanPath); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := atomicfile.WriteFile(journal.RecoveryPlanPath, []byte("{corrupt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "valid-tampered":
+				lastVerified.CandidateSHA = strings.Repeat("f", 64)
+				activationTakeoverWriteJSON(t, journal.RecoveryPlanPath, lastVerified)
+			}
+			callsBefore := len(fixture.runner.snapshot())
+			err = fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
+			if mode == "valid-tampered" {
+				if err == nil {
+					t.Fatal("valid but differently bound recovery plan was overwritten")
+				}
+				unchanged := activationTakeoverReadState(fixture.statePath)
+				if !reflect.DeepEqual(unchanged, state) || !binaryMatches(fixture.stablePath, fixture.recoverySHA) {
+					t.Fatalf("tampered-plan rejection changed state or stable: before=%#v after=%#v", state, unchanged)
+				}
+				_, observed, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+				if readErr != nil || observed.CandidateSHA != strings.Repeat("f", 64) {
+					t.Fatalf("tampered recovery plan was replaced: %#v %v", observed, readErr)
+				}
+				latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+				if readErr != nil || !exists || latest.Phase != recoveryTakeoverMainStarted {
+					t.Fatalf("tampered recovery plan changed journal: %#v exists=%v err=%v", latest, exists, readErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("lost plan did not complete committed recovery metadata: %v", err)
+			}
+			committed := activationTakeoverReadState(fixture.statePath)
+			if !reflect.DeepEqual(committed, state) || !binaryMatches(fixture.stablePath, fixture.recoverySHA) {
+				t.Fatalf("lost-plan commit replay moved state or stable: before=%#v after=%#v", state, committed)
+			}
+			_, terminalPlan, readErr := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if readErr != nil || terminalPlan.Status != "committed" || !terminalPlan.Activated || !terminalPlan.Acknowledged {
+				t.Fatalf("lost-plan commit evidence was not recreated: %#v %v", terminalPlan, readErr)
+			}
+			latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+			if readErr != nil || !exists || latest.Phase != recoveryTakeoverCommitted {
+				t.Fatalf("lost-plan commit journal was not terminalized: %#v exists=%v err=%v", latest, exists, readErr)
+			}
+			if calls := fixture.runner.snapshot(); len(calls) != callsBefore {
+				t.Fatalf("metadata-only commit replay submitted service work: %#v", calls[callsBefore:])
+			}
+		})
+	}
+}
+
+func TestRecoveryCommittedCheckpointRestartsInactiveCurrentAfterReboot(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	journal := activationTakeoverPauseAtMainStarted(t, fixture)
+	state := activationTakeoverReadState(fixture.statePath)
+	state.Previous = state.Current
+	state.Current = state.Candidate
+	state.Candidate = nil
+	state.Activation = nil
+	activationTakeoverWriteJSON(t, fixture.statePath, state)
+	fixture.identity.set(false, "", "")
+	fixture.mu.Lock()
+	fixture.unitEnabled = false
+	fixture.mu.Unlock()
+	startsBefore := 0
+	for _, call := range fixture.runner.snapshot() {
+		if len(call) >= 3 && call[0] == "systemctl" && call[1] == "--user" && call[2] == "start" {
+			startsBefore++
+		}
+	}
+	if err := fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+		t.Fatalf("committed reboot checkpoint did not restart recovery Current: %v", err)
+	}
+	latest, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if err != nil || !exists || latest.Phase != recoveryTakeoverCommitted {
+		t.Fatalf("committed reboot checkpoint did not terminalize journal: %#v exists=%v err=%v", latest, exists, err)
+	}
+	fixture.mu.Lock()
+	enabled := fixture.unitEnabled
+	fixture.mu.Unlock()
+	startsAfter := 0
+	for _, call := range fixture.runner.snapshot() {
+		if len(call) >= 3 && call[0] == "systemctl" && call[1] == "--user" && call[2] == "start" {
+			startsAfter++
+		}
+	}
+	if !enabled || startsAfter != startsBefore+1 {
+		t.Fatalf("committed reboot checkpoint did not enable/start exactly once: enabled=%v calls=%#v", enabled, fixture.runner.snapshot())
+	}
+}
+
+func TestRecoveryTerminalCommitRecreatesMissingOrCorruptPlan(t *testing.T) {
+	for _, mode := range []string{"deleted", "corrupt", "valid-tampered"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			journal := activationTakeoverPauseAtMainStarted(t, fixture)
+			_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := activationTakeoverReadState(fixture.statePath)
+			state.Previous = state.Current
+			state.Current = state.Candidate
+			state.Candidate = nil
+			state.Activation = nil
+			activationTakeoverWriteJSON(t, fixture.statePath, state)
+			plan.Status = "committed"
+			plan.Activated = true
+			plan.Acknowledged = true
+			plan.UpdatedAt = plan.UpdatedAt.Add(time.Second)
+			if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := withRecoveryTakeoverMutationLock(journal.Path, func() error {
+				return persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverCommitted)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "deleted":
+				if err := os.Remove(plan.PlanPath); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := atomicfile.WriteFile(plan.PlanPath, []byte("{corrupt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "valid-tampered":
+				plan.CandidateSHA = strings.Repeat("f", 64)
+				activationTakeoverWriteJSON(t, plan.PlanPath, plan)
+			}
+			err = fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
+			if mode == "valid-tampered" {
+				if err == nil {
+					t.Fatal("terminal committed plan with changed identity was overwritten")
+				}
+				_, observed, readErr := readRecoveryActivationPlan(plan.PlanPath)
+				if readErr != nil || observed.CandidateSHA != strings.Repeat("f", 64) {
+					t.Fatalf("terminal tampered plan was replaced: %#v %v", observed, readErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("terminal committed plan did not self-heal: %v", err)
+			}
+			_, rebuilt, readErr := readRecoveryActivationPlan(plan.PlanPath)
+			if readErr != nil || rebuilt.Status != "committed" || !rebuilt.Activated || !rebuilt.Acknowledged {
+				t.Fatalf("terminal committed plan was not rebuilt: %#v %v", rebuilt, readErr)
+			}
+		})
+	}
+}
+
+func TestRecoveryTerminalRollbackRecreatesMissingOrCorruptPlan(t *testing.T) {
+	for _, mode := range []string{"deleted", "corrupt", "valid-tampered"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newActivationTakeoverFixture(t)
+			journal := activationTakeoverPauseAtMainStarted(t, fixture)
+			_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			state := activationTakeoverReadState(fixture.statePath)
+			state.Candidate = nil
+			state.Activation = nil
+			activationTakeoverWriteJSON(t, fixture.statePath, state)
+			plan.Status = "rolled_back"
+			plan.Error = "injected terminal recovery rollback"
+			plan.UpdatedAt = plan.UpdatedAt.Add(time.Second)
+			if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := withRecoveryTakeoverMutationLock(journal.Path, func() error {
+				return persistRecoveryTakeoverTerminalLocked(journal, recoveryTakeoverRolledBack)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "deleted":
+				if err := os.Remove(plan.PlanPath); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := atomicfile.WriteFile(plan.PlanPath, []byte("{corrupt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "valid-tampered":
+				plan.CandidateSHA = strings.Repeat("f", 64)
+				activationTakeoverWriteJSON(t, plan.PlanPath, plan)
+			}
+			err = fixture.manager.RecoverCurrent(context.Background(), fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
+			if mode == "valid-tampered" {
+				if err == nil {
+					t.Fatal("terminal rolled-back plan with changed identity was overwritten")
+				}
+				_, observed, readErr := readRecoveryActivationPlan(plan.PlanPath)
+				if readErr != nil || observed.CandidateSHA != strings.Repeat("f", 64) {
+					t.Fatalf("terminal tampered rollback plan was replaced: %#v %v", observed, readErr)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "rolled back") {
+				t.Fatalf("terminal rollback plan did not self-heal and report rollback: %v", err)
+			}
+			_, rebuilt, readErr := readRecoveryActivationPlan(plan.PlanPath)
+			if readErr != nil || rebuilt.Status != "rolled_back" {
+				t.Fatalf("terminal rollback plan was not rebuilt: %#v %v", rebuilt, readErr)
+			}
+		})
+	}
+}
+
+func TestRecoveryRebootReconcilesRollbackStateBeforePlanAndJournal(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	journal := activationTakeoverPauseAtMainStarted(t, fixture)
+	state := activationTakeoverReadState(fixture.statePath)
+	if state.Current == nil || state.Candidate == nil || state.Activation == nil {
+		t.Fatalf("missing recovery activation before rollback crash: %#v", state)
+	}
+	if err := atomicfile.WriteFile(fixture.stablePath, fixture.currentBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state.Candidate = nil
+	state.Activation = nil
+	activationTakeoverWriteJSON(t, fixture.statePath, state)
+	fixture.manager.BootID = func() string { return "boot-after-rollback-state-checkpoint" }
+	fixture.identity.set(false, "", "")
+	fixture.mu.Lock()
+	fixture.activeUnits[journal.RecoveryWatchdogUnit] = false
+	fixture.mu.Unlock()
+	spawnsBefore := fixture.runner.countCommand("systemd-run")
+	restartsBefore := activationTakeoverSystemctlSubcommandCount(fixture.runner.snapshot(), "restart")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("reboot replay did not report reconciled rollback: %v", err)
+	}
+	checkpoint := activationTakeoverReadState(fixture.statePath)
+	if !reflect.DeepEqual(checkpoint, state) || !binaryMatches(fixture.stablePath, fixture.currentSHA) {
+		t.Fatalf("rollback terminal replay moved Current or stable: before=%#v after=%#v", state, checkpoint)
+	}
+	_, terminalPlan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil || terminalPlan.Status != "rolled_back" || terminalPlan.Error == "" {
+		t.Fatalf("rollback terminal plan was not reconciled: %#v %v", terminalPlan, err)
+	}
+	latest, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if err != nil || !exists || latest.Phase != recoveryTakeoverRolledBack {
+		t.Fatalf("rollback terminal journal was not reconciled: %#v exists=%v err=%v", latest, exists, err)
+	}
+	if fixture.runner.countCommand("systemd-run") != spawnsBefore {
+		t.Fatal("rollback replay rearmed a superseded recovery watchdog")
+	}
+	if got := activationTakeoverSystemctlSubcommandCount(fixture.runner.snapshot(), "restart"); got != restartsBefore+1 {
+		t.Fatalf("rollback replay restart count = %d, want exactly one new restart", got-restartsBefore)
+	}
+}
+
+func TestRecoveryRollbackRefusesValidTamperedPlanDespiteLastVerifiedSnapshot(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	journal := activationTakeoverPauseAtMainStarted(t, fixture)
+	_, lastVerified, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := lastVerified
+	tampered.CandidateSHA = strings.Repeat("f", 64)
+	activationTakeoverWriteJSON(t, journal.RecoveryPlanPath, tampered)
+	stateBefore := activationTakeoverReadState(fixture.statePath)
+	stableBefore := activationTakeoverFileSHA(t, fixture.stablePath)
+
+	err = withRecoveryTakeoverMutationLock(journal.Path, func() error {
+		latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+		if readErr != nil || !exists {
+			return fmt.Errorf("read recovery ownership: exists=%v err=%v", exists, readErr)
+		}
+		return restoreRecoveryActivationPreviousFromVerifiedPlan(lastVerified, fixture.runner, latest)
+	})
+	if err == nil {
+		t.Fatal("valid but tampered recovery plan was recreated from stale ownership")
+	}
+	if state := activationTakeoverReadState(fixture.statePath); !reflect.DeepEqual(state, stateBefore) ||
+		activationTakeoverFileSHA(t, fixture.stablePath) != stableBefore {
+		t.Fatal("tampered recovery plan changed state or stable before rejection")
+	}
+	latest, exists, readErr := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if readErr != nil || !exists || latest.Phase != recoveryTakeoverMainStarted {
+		t.Fatalf("tampered recovery plan changed journal ownership: %#v exists=%v err=%v", latest, exists, readErr)
+	}
+}
+
 func TestRecoveryHostRebootRearmsWatcherFromRecoveryArtifact(t *testing.T) {
 	for _, outcome := range []string{recoveryTakeoverCommitted, recoveryTakeoverRolledBack} {
 		t.Run(outcome, func(t *testing.T) {
@@ -1580,6 +2100,16 @@ func activationTakeoverHasWatchdogLaunch(calls [][]string, unit, executable, pla
 		}
 	}
 	return false
+}
+
+func activationTakeoverSystemctlSubcommandCount(calls [][]string, subcommand string) int {
+	count := 0
+	for _, call := range calls {
+		if len(call) >= 3 && call[0] == "systemctl" && call[1] == "--user" && call[2] == subcommand {
+			count++
+		}
+	}
+	return count
 }
 
 func activationTakeoverWriteJSON(t *testing.T, path string, value any) {

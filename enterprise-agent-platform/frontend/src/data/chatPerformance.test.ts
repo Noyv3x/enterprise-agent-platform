@@ -5,6 +5,7 @@ import { initialAppState, rootReducer } from "../store/reducer";
 import type { Message, User } from "../types";
 import {
   applyScopeRealtimeUpdate,
+  navigateToView,
   refreshActiveChat,
   selectChannel,
 } from "./chatActions";
@@ -474,5 +475,133 @@ describe("chat transport performance", () => {
     expect(store.getState().messages).toEqual([channelOne]);
     responses.shift()?.(response(200, { messages: [channelOne], message_revision: 1 }));
     await toOne;
+  });
+
+  it("retains 200 cached channel messages when leaving and returning", async () => {
+    const channelOne = Array.from({ length: 200 }, (_, index) => message(index + 1, `one ${index}`));
+    const channelTwo = { ...message(300, "channel two"), scope_id: "2" };
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/channels/2/messages") {
+        return response(200, {
+          mode: "full",
+          messages: [channelTwo],
+          message_revision: 300,
+          reset_revision: 0,
+        });
+      }
+      if (path === "/api/channels/1/messages?after_id=200&since_revision=200") {
+        return response(200, {
+          mode: "delta",
+          messages: [],
+          next_after_id: 200,
+          message_revision: 200,
+          reset_revision: 0,
+        });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "channel",
+      activeChannelId: 1,
+      channels: [{ id: 1, name: "one" }, { id: 2, name: "two" }],
+      messages: channelOne,
+      messageSyncCursors: {
+        "channel:1": { afterId: "200", revision: 200, resetRevision: 0 },
+      },
+      messageHistory: {
+        "channel:1": {
+          nextBeforeId: null,
+          hasMore: false,
+          loading: false,
+          error: "",
+          prependVersion: 1,
+        },
+      },
+    });
+
+    await selectChannel(store, 2);
+    const returning = selectChannel(store, 1);
+    expect(store.getState().messages).toHaveLength(200);
+    expect(store.getState().messages[0]?.id).toBe(1);
+    await returning;
+
+    expect(store.getState().messages).toHaveLength(200);
+    expect(store.getState().messages[0]?.id).toBe(1);
+    expect(store.getState().messages[199]?.id).toBe(200);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/channels/2/messages",
+      "/api/channels/1/messages?after_id=200&since_revision=200",
+    ]);
+  });
+
+  it("retains 200 cached private messages when leaving and returning", async () => {
+    const privateMessages = Array.from({ length: 200 }, (_, index) => ({
+      ...message(index + 1, `private ${index}`),
+      scope_type: "private" as const,
+      scope_id: "7",
+    }));
+    const channelMessage = { ...message(300, "channel two"), scope_id: "2" };
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/channels/2/messages") {
+        return response(200, {
+          mode: "full",
+          messages: [channelMessage],
+          message_revision: 300,
+          reset_revision: 0,
+        });
+      }
+      if (path === "/api/private-agent/messages?after_id=200&since_revision=200") {
+        return response(200, {
+          mode: "delta",
+          messages: [],
+          next_after_id: 200,
+          message_revision: 200,
+          reset_revision: 0,
+        });
+      }
+      if (path === "/api/private-agent/telegram") {
+        return response(200, { telegram: null });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "private",
+      activeChannelId: 2,
+      channels: [{ id: 2, name: "two" }],
+      privateMessages,
+      messageSyncCursors: {
+        "private:7": { afterId: "200", revision: 200, resetRevision: 0 },
+      },
+      messageHistory: {
+        "private:7": {
+          nextBeforeId: null,
+          hasMore: false,
+          loading: false,
+          error: "",
+          prependVersion: 1,
+        },
+      },
+    });
+
+    await selectChannel(store, 2);
+    const returning = navigateToView(store, "private");
+    expect(store.getState().privateMessages).toHaveLength(200);
+    expect(store.getState().privateMessages[0]?.id).toBe(1);
+    await returning;
+
+    expect(store.getState().privateMessages).toHaveLength(200);
+    expect(store.getState().privateMessages[0]?.id).toBe(1);
+    expect(store.getState().privateMessages[199]?.id).toBe(200);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/channels/2/messages",
+      "/api/private-agent/messages?after_id=200&since_revision=200",
+      "/api/private-agent/telegram",
+    ]);
   });
 });

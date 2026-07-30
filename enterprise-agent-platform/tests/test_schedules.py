@@ -792,7 +792,10 @@ class ScheduleServiceTests(unittest.TestCase):
             try:
                 # Exercise the repair directly as well as through startup; it
                 # must remain silent and idempotent after the permission loss.
-                recovered._surface_failed_agent_jobs_without_message()
+                message_job_ids, _ = recovered._durable_agent_message_job_index()
+                recovered._surface_failed_agent_jobs_without_message(
+                    message_job_ids=message_job_ids
+                )
                 self.assertIsNone(
                     recovered.agent_message_replying_to(
                         "private", str(user["id"]), source_message_id
