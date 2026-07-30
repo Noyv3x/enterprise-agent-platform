@@ -96,7 +96,7 @@ operation 终态与 Manager state 的半提交窗口必须显式收敛：失败 
 
 候选 Manager 尚未被 watchdog 接纳时，journal 损坏、核心 readiness 失败或控制入口不可用必须使候选进程退出，由 watchdog 恢复 previous Manager。候选已经成为 current 后，恢复或 finalize 的暂时错误不再是 Manager 进程级致命错误：Manager 必须保持公网维护页和控制接口在线，持久保留原 operation，并由后台循环带退避重试。不可恢复错误同样不得形成 systemd 崩溃循环；它保持安全维护状态并向宿主 CLI 提供有界诊断和受控恢复入口。
 
-唯一部署点从 `b121de2892497ff1cc3a786a4e42c3119dcb22a9` 跨越到下一代 Manager 时允许一次严格限定的 activation-plan 补全：只有 Current 的 version 与 source commit 都精确等于该提交、普通 plan 同时缺少 `candidate_path` 与 `platform_commit`、其余 Manager state、Candidate、activation、Platform manifest 和 operation 证据全部一致时，才可从已经校验的 Candidate 与 Platform generation 补回这两个字段。单字段缺失、其它生产者、身份漂移或文件篡改必须失败关闭；原始 plan 字节哈希仍作为接管 journal 的证据。部署点提交下一代 Current 后必须删除这条临时桥接。
+唯一部署点从 `b121de2892497ff1cc3a786a4e42c3119dcb22a9` 跨越到下一代 Manager 时允许一次严格限定的 activation-plan 补全：只有 Current 的 version 与 source commit 都精确等于该提交、普通 plan 的原始 JSON 同时没有 `candidate_path` 与 `platform_commit`、其余 Manager state、Candidate、activation、Platform manifest 和 operation 证据全部一致时，才可从已经校验的 Candidate 与 Platform generation 补回这两个字段。单字段缺失、其它生产者、身份漂移或文件篡改必须失败关闭；原始 plan 字节哈希仍作为接管 journal 的证据。部署点持久提交下一代 Current 且 operation 完成 finalize 后必须删除这条临时桥接。
 
 候选固定服务启动或探针失败时，Manager 在删除容器前采集有界的 healthcheck 和日志诊断。所有诊断先脱敏再截断；采集失败可以附加错误，但不能阻止安全回滚。
 

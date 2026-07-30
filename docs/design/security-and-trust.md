@@ -64,7 +64,7 @@ Manager 的预约从首次 Platform reserve 到持久 `maintenance=true`、再�
 
 快照完整验证、候选 generation 核心 readiness、Manager watchdog 提交和 reservation release 完成前不能开放业务。核心 readiness 只包含 Manager 控制面、Platform 与 Agent Runtime；Camoufox、SearXNG、Firecrawl 和 Cognee 失败时保持能力级 degraded，不能终止 Manager、关闭控制接口或阻止健康核心 generation 完成 finalize。Manager 自更新的 activation plan 与独立 watchdog 是持久安全所有者；外部恢复不能仅凭主 unit 停止或 recovery lock 抢占它，必须验证完整提交链、停止并证明相关 watchdog 退出，再通过新的持久 recovery activation 转移所有权。Docker 资源清理只能处理同时匹配 Manager ownership label、Compose project/resource label 且无 attachment 的对象，禁止全局 prune。Manager `/v1/status` 的 generation 只返回 id、source commit、数据库版本、镜像与激活时间，不投影 manifest、快照或其它宿主绝对路径。
 
-唯一部署点从 `b121de2892497ff1cc3a786a4e42c3119dcb22a9` 跨越时，只允许为该精确 Current 同时补全旧普通 activation plan 缺少的 `candidate_path` 与 `platform_commit`。补全值只能来自已验证且已提交的 Candidate 与 Platform generation；两个字段仅缺一个、Current 的 version/source commit 不完全匹配、其它 plan/state/manifest/operation 身份不一致或原文件发生变化时必须失败关闭。接管 journal 保留补全前原始 plan 的字节哈希，部署点提交下一代 Current 后删除该一次性分支。
+唯一部署点从 `b121de2892497ff1cc3a786a4e42c3119dcb22a9` 跨越时，只允许为该精确 Current 同时补全旧普通 activation plan 原始 JSON 中不存在的 `candidate_path` 与 `platform_commit`。补全值只能来自已验证且已提交的 Candidate 与 Platform generation；两个字段仅缺一个、Current 的 version/source commit 不完全匹配、其它 plan/state/manifest/operation 身份不一致或原文件发生变化时必须失败关闭。接管 journal 保留补全前原始 plan 的字节哈希，下一代 Current 持久提交且 operation 完成 finalize 后删除该一次性分支。
 
 ## 文件与附件
 

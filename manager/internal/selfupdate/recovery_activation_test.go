@@ -702,6 +702,17 @@ func TestIncompleteActivationPlanBindingFailsClosedOutsideExactB121Producer(t *t
 				activationTakeoverWriteJSON(t, fixture.statePath, state)
 			},
 		},
+		{
+			name: "producer version changed",
+			mutate: func(t *testing.T, fixture *activationTakeoverFixture) {
+				configureB121ActivationPlanProducer(t, fixture)
+				state := fixture.originalState
+				current := *state.Current
+				current.Version = strings.Repeat("4", 40)
+				state.Current = &current
+				activationTakeoverWriteJSON(t, fixture.statePath, state)
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
