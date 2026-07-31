@@ -56,7 +56,7 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	defer releaseLock()
 	unit := m.UnitName
 	if unit == "" {
-		unit = "ubitech-agent-manager.service"
+		unit = sourceManagerUnitName()
 	}
 	if !validRecoveryUnit(unit) {
 		return errors.New("Manager user service name is invalid")
@@ -417,7 +417,7 @@ func (m *Manager) stageRecoveryBinary(data []byte, digest string) (string, error
 	if err := ensureRecoveryDirectory(dir); err != nil {
 		return "", fmt.Errorf("prepare recovered Manager version directory: %w", err)
 	}
-	path := filepath.Join(dir, "ubitech-manager")
+	path := filepath.Join(dir, sourceManagerBinaryName())
 	if info, err := os.Lstat(path); err == nil {
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return "", errors.New("recovered Manager version path is not a regular file")

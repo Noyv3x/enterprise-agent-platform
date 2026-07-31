@@ -244,7 +244,7 @@ func (m *Manager) runRecoveryBootstrapTransition(
 
 func (m *Manager) validateRecoveryTakeoverRequest(request recoveryActivationRequest, evidence recoveryFinalizeEvidence, journal recoveryTakeoverJournal) error {
 	if journal.RecoveryVersion != m.RunningVersion || journal.RecoverySHA256 != request.newSHA ||
-		journal.RecoveryPath != filepath.Join(m.Root, "versions", "recovery-"+request.newSHA[:12], "ubitech-manager") ||
+		journal.RecoveryPath != filepath.Join(m.Root, "versions", "recovery-"+request.newSHA[:12], sourceManagerBinaryName()) ||
 		journal.PlatformCommit != request.platformCommit || journal.PlatformStatePath != request.platformStatePath ||
 		journal.OperationID != evidence.operation.ID || journal.OperationPath != evidence.operationPath ||
 		journal.ManifestPath != evidence.manifestPath || journal.PlatformStateSHA256 != sha256Hex(evidence.stateData) ||

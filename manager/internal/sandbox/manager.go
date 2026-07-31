@@ -14,6 +14,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
 type Record struct {
@@ -119,7 +120,7 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	}
 	hash := stableHash(sandboxID)
 	envRoot := filepath.Join(m.DataDir, "agent-envs", hash)
-	spec := driver.SandboxSpec{ContainerName: "ubitech-sandbox-" + hash[:16], AgentHash: hash, Image: image, Network: network, Workspace: workspacePath, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: uid, GID: gid}
+	spec := driver.SandboxSpec{ContainerName: identity.SourceProfile().SandboxContainerPrefix + hash[:16], AgentHash: hash, Image: image, Network: network, Workspace: workspacePath, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: uid, GID: gid}
 	if attachmentPath, ok := m.attachmentPath(workspaceID); ok {
 		spec.Attachments = attachmentPath
 	}
@@ -449,7 +450,7 @@ func (m *Manager) validateRegistry() error {
 		if record.SandboxHash != hash {
 			return fmt.Errorf("sandbox registry %q has an invalid identity hash", key)
 		}
-		if record.ContainerName != "ubitech-sandbox-"+hash[:16] {
+		if record.ContainerName != identity.SourceProfile().SandboxContainerPrefix+hash[:16] {
 			return fmt.Errorf("sandbox registry %q has an invalid container name", key)
 		}
 		if _, err := m.workspacePath(record.WorkspaceID); err != nil {

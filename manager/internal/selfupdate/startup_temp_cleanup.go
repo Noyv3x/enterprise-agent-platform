@@ -80,7 +80,7 @@ func validatedStartupVersionDirectories(m *Manager, state State) ([]string, erro
 		}
 		path := version.Path
 		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
-			filepath.Base(path) != "ubitech-manager" || filepath.Dir(filepath.Dir(path)) != versionsRoot {
+			filepath.Base(path) != sourceManagerBinaryName() || filepath.Dir(filepath.Dir(path)) != versionsRoot {
 			return nil, errors.New("durable Manager version path is outside the fixed versions root")
 		}
 		directory := filepath.Dir(path)

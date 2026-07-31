@@ -22,23 +22,7 @@
     "generated_at": { "type": "string", "format": "date-time" },
     "protocol_version": { "const": 1 },
     "database_schema_version": { "type": "integer", "minimum": 1 },
-    "manager": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["version", "artifacts"],
-      "properties": {
-        "version": { "type": "string", "minLength": 1 },
-        "artifacts": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["amd64", "arm64"],
-          "properties": {
-            "amd64": { "$ref": "#/$defs/artifact" },
-            "arm64": { "$ref": "#/$defs/artifact" }
-          }
-        }
-      }
-    },
+    "manager": { "$ref": "#/$defs/manager_release" },
     "compose": { "$ref": "#/$defs/artifact" },
     "images": {
       "type": "object",
@@ -58,7 +42,8 @@
         "firecrawl-redis",
         "firecrawl-rabbitmq"
       ]
-    }
+    },
+    "namespace_handoff": { "$ref": "#/$defs/namespace_handoff" }
   },
   "$defs": {
     "artifact": {
@@ -70,9 +55,84 @@
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     },
+    "manager_release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "artifacts"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amd64", "arm64"],
+          "properties": {
+            "amd64": { "$ref": "#/$defs/artifact" },
+            "arm64": { "$ref": "#/$defs/artifact" }
+          }
+        }
+      }
+    },
+    "handoff_manager_release": {
+      "allOf": [
+        { "$ref": "#/$defs/manager_release" },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        }
+      ]
+    },
+    "source_namespace_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "manager", "compose"],
+      "properties": {
+        "profile_id": { "const": "ubitech-agent-v1" },
+        "manager": { "$ref": "#/$defs/handoff_manager_release" },
+        "compose": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "target_namespace_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "manager", "compose"],
+      "properties": {
+        "profile_id": { "const": "agent-platform-v1" },
+        "manager": { "$ref": "#/$defs/handoff_manager_release" },
+        "compose": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "namespace_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "predecessor_generation",
+        "bridge_generation",
+        "source",
+        "target"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "predecessor_generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "bridge_generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "source": { "$ref": "#/$defs/source_namespace_binding" },
+        "target": { "$ref": "#/$defs/target_namespace_binding" }
+      }
+    },
     "image": {
       "type": "string",
-      "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"
+      "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$"
     }
   }
 }

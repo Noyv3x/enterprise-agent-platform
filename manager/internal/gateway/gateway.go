@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
@@ -120,14 +121,15 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 	metadata := forwardingMetadataFor(access, request, peer)
 	request = request.WithContext(context.WithValue(request.Context(), forwardingContextKey{}, metadata))
 	state := h.State.State()
-	if request.URL.Path == "/__ubitech/status" {
+	profile := identity.SourceProfile()
+	if request.URL.Path == profile.GatewayStatusPath {
 		safeHeaders(response.Header())
 		response.Header().Set("Content-Type", "application/json")
 		response.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(response).Encode(publicState(state))
 		return
 	}
-	if request.URL.Path == "/__ubitech/health" {
+	if request.URL.Path == profile.GatewayHealthPath {
 		safeHeaders(response.Header())
 		response.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(response).Encode(map[string]any{"healthy": state.PublicState != model.StateFailed, "state": state.PublicState})

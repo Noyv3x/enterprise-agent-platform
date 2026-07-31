@@ -23,6 +23,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/snapshot"
@@ -971,11 +972,12 @@ func (d DockerCLI) Migrate(ctx context.Context, manifest release.Manifest) error
 		return err
 	}
 	name := d.migrationContainerName(manifest.ID())
+	migrationLabel := identity.SourceProfile().Label("migration")
 	_, runErr := d.runner().Run(ctx, d.binary(), d.composeArgs(
 		env,
 		"run", "--rm", "--no-deps",
 		"--name", name,
-		"--label", "org.ubitech.agent.migration=true",
+		"--label", migrationLabel+"=true",
 		"platform", "migrate",
 	), nil)
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -989,13 +991,14 @@ func (d DockerCLI) migrationContainerName(generation string) string {
 	if !validGenerationID(generation) {
 		generation = strings.Repeat("0", 40)
 	}
-	return "ubitech-migration-" + hex.EncodeToString(project[:8]) + "-" + generation[:12]
+	return identity.SourceProfile().MigrationContainerPrefix + hex.EncodeToString(project[:8]) + "-" + generation[:12]
 }
 
 func (d DockerCLI) stopMigrationContainers(ctx context.Context) error {
+	migrationLabel := identity.SourceProfile().Label("migration")
 	filters := []string{
 		"ps", "-aq",
-		"--filter", "label=org.ubitech.agent.migration=true",
+		"--filter", "label=" + migrationLabel + "=true",
 		"--filter", "label=com.docker.compose.project=" + d.ComposeProject,
 	}
 	result, err := d.runner().Run(ctx, d.binary(), filters, nil)
@@ -1297,11 +1300,12 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 	if err := d.PrepareManagedImage(ctx, "agent-sandbox", spec.Image); err != nil {
 		return SandboxEnsureResult{}, fmt.Errorf("prepare sandbox image: %w", err)
 	}
-	args := []string{"create", "--name", spec.ContainerName, "--label", "org.ubitech.agent.sandbox=true", "--label", "org.ubitech.agent.id=" + spec.AgentHash,
-		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("UBITECH_AGENT_UID=%d", spec.UID), "--env", fmt.Sprintf("UBITECH_AGENT_GID=%d", spec.GID), "--workdir", contract.ContainerWorkspace,
+	profile := identity.SourceProfile()
+	args := []string{"create", "--name", spec.ContainerName, "--label", profile.Label("sandbox") + "=true", "--label", profile.Label("id") + "=" + spec.AgentHash,
+		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("%s_AGENT_UID=%d", profile.EnvironmentPrefix, spec.UID), "--env", fmt.Sprintf("%s_AGENT_GID=%d", profile.EnvironmentPrefix, spec.GID), "--workdir", contract.ContainerWorkspace,
 		"--mount", bindMount(spec.Workspace, contract.ContainerWorkspace), "--mount", bindMount(spec.Home, contract.ContainerAgentHome), "--mount", bindMount(spec.Environment, contract.ContainerAgentEnv)}
 	if spec.Attachments != "" {
-		args = append(args, "--mount", bindMount(spec.Attachments, contract.ContainerWorkspace+"/.ubitech/attachments")+",readonly")
+		args = append(args, "--mount", bindMount(spec.Attachments, contract.ContainerWorkspace+"/"+profile.InternalWorkspaceDirectory+"/attachments")+",readonly")
 	}
 	args = append(args, spec.Image, "sleep", "infinity")
 	_, err = d.runner().Run(ctx, d.binary(), args, nil)
@@ -1340,9 +1344,10 @@ func (d DockerCLI) InspectManagedSandbox(ctx context.Context, name, agentHash st
 	if !safeName(name) || !validAgentHash(agentHash) {
 		return ManagedSandboxState{}, errors.New("invalid managed sandbox identity")
 	}
+	profile := identity.SourceProfile()
 	result, err := d.runner().Run(ctx, d.binary(), []string{
 		"inspect", "--format",
-		"{{.State.Running}}\t{{index .Config.Labels \"org.ubitech.agent.sandbox\"}}\t{{index .Config.Labels \"org.ubitech.agent.id\"}}",
+		fmt.Sprintf("{{.State.Running}}\t{{index .Config.Labels %q}}\t{{index .Config.Labels %q}}", profile.Label("sandbox"), profile.Label("id")),
 		name,
 	}, nil)
 	if err != nil {
@@ -1420,7 +1425,8 @@ func (d DockerCLI) EnsureCoreNetwork(ctx context.Context) error {
 	if !safeName(d.CoreNetwork) {
 		return errors.New("invalid core network name")
 	}
-	format := `{{.Driver}} {{index .Labels "org.ubitech.agent.network"}}`
+	networkLabel := identity.SourceProfile().Label("network")
+	format := fmt.Sprintf(`{{.Driver}} {{index .Labels %q}}`, networkLabel)
 	result, inspectErr := d.runner().Run(ctx, d.binary(), []string{"network", "inspect", "--format", format, d.CoreNetwork}, nil)
 	if inspectErr == nil {
 		if strings.TrimSpace(result.Stdout) != "bridge core" {
@@ -1428,7 +1434,7 @@ func (d DockerCLI) EnsureCoreNetwork(ctx context.Context) error {
 		}
 		return nil
 	}
-	if _, err := d.runner().Run(ctx, d.binary(), []string{"network", "create", "--driver", "bridge", "--label", "org.ubitech.agent.network=core", d.CoreNetwork}, nil); err != nil {
+	if _, err := d.runner().Run(ctx, d.binary(), []string{"network", "create", "--driver", "bridge", "--label", networkLabel + "=core", d.CoreNetwork}, nil); err != nil {
 		return fmt.Errorf("create core Docker network %s: %w", d.CoreNetwork, err)
 	}
 	return nil
@@ -1520,7 +1526,8 @@ func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string
 	}
 	sort.Strings(names)
 	var content strings.Builder
-	fixed := map[string]string{"UBITECH_DATA_ROOT": d.DataRoot, "UBITECH_SECRETS_DIR": filepath.Join(d.StateDir, "secrets"), "UBITECH_MANAGER_CONTROL_DIR": filepath.Join(d.StateDir, "control"), "UBITECH_UID": strconv.Itoa(d.UID), "UBITECH_GID": strconv.Itoa(d.GID), "UBITECH_PLATFORM_BIND": d.PlatformBind, "UBITECH_PUBLIC_BASE_URL": "http://" + d.GatewayAddress, "UBITECH_CORE_NETWORK": d.CoreNetwork, "UBITECH_LOG_MAX_SIZE": d.LogMaxSize, "UBITECH_LOG_MAX_FILES": strconv.Itoa(d.LogMaxFiles), "UBITECH_COMPOSE_PROJECT": d.ComposeProject}
+	prefix := identity.SourceProfile().EnvironmentPrefix + "_"
+	fixed := map[string]string{prefix + "DATA_ROOT": d.DataRoot, prefix + "SECRETS_DIR": filepath.Join(d.StateDir, "secrets"), prefix + "MANAGER_CONTROL_DIR": filepath.Join(d.StateDir, "control"), prefix + "UID": strconv.Itoa(d.UID), prefix + "GID": strconv.Itoa(d.GID), prefix + "PLATFORM_BIND": d.PlatformBind, prefix + "PUBLIC_BASE_URL": "http://" + d.GatewayAddress, prefix + "CORE_NETWORK": d.CoreNetwork, prefix + "LOG_MAX_SIZE": d.LogMaxSize, prefix + "LOG_MAX_FILES": strconv.Itoa(d.LogMaxFiles), prefix + "COMPOSE_PROJECT": d.ComposeProject}
 	fixedNames := make([]string, 0, len(fixed))
 	for name := range fixed {
 		fixedNames = append(fixedNames, name)
@@ -1532,7 +1539,7 @@ func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string
 		}
 	}
 	for _, name := range names {
-		key := "UBITECH_" + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(name)) + "_IMAGE"
+		key := prefix + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(name)) + "_IMAGE"
 		fmt.Fprintf(&content, "%s=%s\n", key, manifest.Images[name])
 	}
 	return path, atomicfile.WriteFile(path, []byte(content.String()), 0o600)

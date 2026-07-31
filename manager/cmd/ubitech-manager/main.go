@@ -26,6 +26,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/executor"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/gateway"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/maintenance"
@@ -161,7 +162,7 @@ func run(arguments []string) int {
 }
 func usage() {
 	fmt.Fprintln(os.Stderr, managerDisplayName)
-	fmt.Fprintln(os.Stderr, "usage: ubitech-manager <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|logs|version> [options]")
+	fmt.Fprintf(os.Stderr, "usage: %s <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|logs|version> [options]\n", identity.SourceProfile().ManagerBinary)
 }
 
 func commonFlags(name string) (*flag.FlagSet, *string) {
@@ -204,7 +205,7 @@ func recoverCurrentCommand(arguments []string) error {
 		InstallPath:      managerInstallPath(),
 		SocketPath:       cfg.SocketPath,
 		ControlTokenFile: cfg.ControlTokenFile(),
-		UnitName:         "ubitech-agent-manager.service",
+		UnitName:         identity.SourceProfile().ManagerUnit,
 		RunningVersion:   version,
 	}
 	timeout := cfg.HealthTimeout
@@ -289,7 +290,7 @@ func build(path string) (*application, error) {
 	audit := logstore.New(filepath.Join(cfg.StateDir, "logs", "audit.jsonl"), cfg.LogMaxBytes, cfg.LogBackups)
 	dataDir := cfg.PlatformDataDir()
 	snapshots := snapshot.Store{DataDir: dataDir, BackupDir: filepath.Join(cfg.DataRoot, "backups"), Retention: time.Duration(contract.MigrationBackupRetentionSeconds) * time.Second, StagingRetention: time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second}
-	selfUpdater := &selfupdate.Manager{Root: filepath.Join(cfg.StateDir, "manager-binaries"), StatePath: filepath.Join(cfg.StateDir, "manager-binaries.json"), InstallPath: managerInstallPath(), SocketPath: cfg.SocketPath, ControlTokenFile: controlTokenPath, UnitName: "ubitech-agent-manager.service", RunningVersion: version}
+	selfUpdater := &selfupdate.Manager{Root: filepath.Join(cfg.StateDir, "manager-binaries"), StatePath: filepath.Join(cfg.StateDir, "manager-binaries.json"), InstallPath: managerInstallPath(), SocketPath: cfg.SocketPath, ControlTokenFile: controlTokenPath, UnitName: identity.SourceProfile().ManagerUnit, RunningVersion: version}
 	fixedStackMu := &sync.Mutex{}
 	maintenanceMu := &maintenance.Admission{}
 	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, SelfUpdate: selfUpdater, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval, FixedStackMu: fixedStackMu, MaintenanceMu: maintenanceMu}
@@ -501,7 +502,7 @@ func acquireServeStartupOwnership(path string) (*serveStartupAdmission, error) {
 		InstallPath:      managerInstallPath(),
 		SocketPath:       cfg.SocketPath,
 		ControlTokenFile: cfg.ControlTokenFile(),
-		UnitName:         "ubitech-agent-manager.service",
+		UnitName:         identity.SourceProfile().ManagerUnit,
 		RunningVersion:   version,
 	}
 	serveLease, err := manager.AcquireServeLock()
@@ -598,14 +599,15 @@ func serveExternalRecoveryProbe(startup *serveStartupAdmission) (*selfupdate.Sta
 }
 
 func managerInstallPath() string {
+	profile := identity.SourceProfile()
 	if root := os.Getenv("XDG_BIN_HOME"); root != "" {
-		return filepath.Join(root, "ubitech-manager")
+		return profile.ManagerInstallPath(root)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".local", "bin", "ubitech-manager")
+	return profile.ManagerInstallPath(filepath.Join(home, ".local", "bin"))
 }
 
 func selfUpdateWatchdogCommand(arguments []string) error {

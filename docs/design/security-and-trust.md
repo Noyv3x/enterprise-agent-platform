@@ -58,6 +58,8 @@ Manager control socket、配置、release manifest、operation journal 和 regis
 
 发布清单锁定 source commit、数据库版本、Manager 校验和与镜像 digest。Manager 不运行清单中的任意 shell，不接受 mutable tag 作为运行身份。更新先预拉取、等待业务空闲、原子关闭准入和进入维护；current Platform 停止后才能迁移 SQLite。任何时刻只允许一个可写 Platform writer。
 
+现役 Manager 的二进制、unit、配置/数据根、control 与 Gateway 路径、Compose/network、环境变量、ownership label、Sandbox/迁移容器、watchdog 和内部工作目录来自同一个编译期 source profile；管理员品牌不能修改它们。source-profile 只固定后续清单使用的目标 profile ID，不提前固化没有执行消费者的目标路径。可选命名空间交接描述符必须使用闭世界、ASCII、大小写敏感且无重复字段的 JSON，并在源侧 owner 尚未完整接通时于 generation/Candidate/maintenance 副作用前拒绝。release 和工件地址只允许 HTTPS 或精确 `127.0.0.1`/`::1` 回环 HTTP；每次重定向重新验证，策略拒绝属于确定性失败而非可重试网络故障。
+
 更新预拉取只把 Platform 与 Agent Runtime 作为切换前核心镜像。Manager 先用本地精确 RepoDigest 判断是否已经存在，不能为本地命中无条件访问 registry；缺失镜像的命令输出只用于刷新内存中的空闲期限，原始 registry 输出不得写入 operation、公共状态或长期日志。无进展和绝对超时都在 maintenance 前结束为可重试失败。Camoufox、SearXNG、Firecrawl 与 Sandbox 镜像由各自受限路径拉取，第三方 registry 故障不能扩展核心更新的信任或锁边界。
 
 Manager 只把当前镜像白名单写入 Compose 环境和服务状态投影；未被当前契约命名的 manifest 扩展项即使通过格式校验，也只能保留为不可执行的 opaque metadata，不能获得环境变量、Compose 引用、镜像拉取或控制 API 可见性。已经退出当前 Compose 的服务不能因 journal、额外 manifest 键或 Docker 残留重新进入运行边界。

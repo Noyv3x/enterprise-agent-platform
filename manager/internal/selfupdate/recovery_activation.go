@@ -23,8 +23,6 @@ const (
 	recoverySupersededStatus          = "superseded_by_recovery"
 	recoveryActivationHealthTimeoutMS = 45_000
 	recoveryActivationObservationPoll = 100 * time.Millisecond
-	recoveryWatchdogUnitPrefix        = "ubitech-agent-manager-watchdog-"
-	recoveryCurrentWatchdogUnitPrefix = "ubitech-agent-manager-watchdog-current-recovery-"
 )
 
 type recoveryActivationRequest struct {

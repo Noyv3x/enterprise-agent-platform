@@ -22,6 +22,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
@@ -521,6 +522,42 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 	return server, server.URL + "/manifest"
 }
 
+func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	predecessor := strings.Repeat("a", 40)
+	bridge := strings.Repeat("b", 40)
+	compose := release.Artifact{URL: "https://example.invalid/target-compose", SHA256: strings.Repeat("1", 64)}
+	targetManager := release.ManagerRelease{Version: bridge, Artifacts: map[string]release.Artifact{
+		"amd64": {URL: "https://example.invalid/target-manager-amd64", SHA256: strings.Repeat("2", 64)},
+		"arm64": {URL: "https://example.invalid/target-manager-arm64", SHA256: strings.Repeat("3", 64)},
+	}}
+	sourceManager := release.ManagerRelease{Version: predecessor, Artifacts: map[string]release.Artifact{
+		"amd64": {URL: "https://example.invalid/source-manager-amd64", SHA256: strings.Repeat("4", 64)},
+		"arm64": {URL: "https://example.invalid/source-manager-arm64", SHA256: strings.Repeat("5", 64)},
+	}}
+	images := map[string]string{}
+	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("a", 64)
+	}
+	manifest := release.Manifest{
+		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: bridge,
+		GeneratedAt: time.Now().UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
+		Manager: targetManager, Compose: compose, Images: images,
+		NamespaceHandoff: &release.NamespaceHandoff{
+			SchemaVersion: 1, PredecessorGeneration: predecessor, BridgeGeneration: bridge,
+			Source: release.NamespaceBinding{
+				ProfileID: identity.SourceProfile().ProfileID, Manager: sourceManager,
+				Compose: release.Artifact{URL: "https://example.invalid/source-compose", SHA256: strings.Repeat("6", 64)},
+			},
+			Target: release.NamespaceBinding{ProfileID: identity.TargetProfileID(), Manager: targetManager, Compose: compose},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(manifest)
+	}))
+	return server, server.URL
+}
+
 func TestInstallWaitsWhenManagerExistsBeforeManifestPublication(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -770,6 +807,59 @@ func TestCheckPublishesReleaseArtifactsImmutably(t *testing.T) {
 	actual, err := os.ReadFile(filepath.Join(dir, "compose.yaml"))
 	if err != nil || string(actual) != "tampered\n" {
 		t.Fatalf("collision overwrote the existing artifact: %q, %v", actual, err)
+	}
+}
+
+func TestInertCapabilityRejectsNamespaceHandoffBeforeOrdinaryUpdateSideEffects(t *testing.T) {
+	server, url := testNamespaceHandoffReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40), SourceCommit: strings.Repeat("a", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releases := t.TempDir()
+	engine := &fakeEngine{}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: releases, ManifestURL: url, Channel: contract.ReleaseChannel,
+		ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	if _, err := orchestrator.Check(context.Background(), url); err == nil || !strings.Contains(err.Error(), "complete handoff owner") {
+		t.Fatalf("Check accepted an unowned namespace handoff: %v", err)
+	}
+	if entries, err := os.ReadDir(releases); err != nil || len(entries) != 0 {
+		t.Fatalf("rejected Check published release artifacts: entries=%v err=%v", entries, err)
+	}
+	if state := store.State(); state.Candidate != nil {
+		t.Fatalf("rejected Check wrote a Candidate: %#v", state.Candidate)
+	}
+
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "reject-unowned-handoff",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.OperationFailed || !completed.Finalized || !strings.Contains(completed.Error, "complete handoff owner") {
+		t.Fatalf("unowned handoff did not fail before maintenance: %#v", completed)
+	}
+	if len(engine.calls) != 0 {
+		t.Fatalf("ordinary update engine observed rejected handoff: %#v", engine.calls)
+	}
+	state := store.State()
+	if state.Candidate != nil || state.Maintenance || state.ActiveOperationID != "" || state.PublicState != model.StateIdle {
+		t.Fatalf("rejected handoff changed ordinary update state: %#v", state)
 	}
 }
 

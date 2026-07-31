@@ -7,6 +7,7 @@ import (
 	"unicode"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
 // HostPathAccess selects the hard-block policy applied at the Manager's
@@ -150,10 +151,11 @@ func protectedManagerHostPath(path, stateRoot string) bool {
 	if filepath.IsAbs(stateRoot) && isAtOrBelow(clean, stateRoot) {
 		return true
 	}
+	profile := identity.SourceProfile()
 	for _, root := range []string{
-		"/run/ubitech-agent",
-		"/var/run/ubitech-agent",
-		"/var/lib/ubitech-agent/manager",
+		filepath.Join("/run", profile.DataDirectory),
+		filepath.Join("/var/run", profile.DataDirectory),
+		filepath.Join(profile.ContainerDataRoot, profile.ManagerStateDirectory),
 	} {
 		if isAtOrBelow(clean, root) {
 			return true
@@ -168,8 +170,8 @@ func protectedManagerHostPath(path, stateRoot string) bool {
 	}
 	if homeOffset >= 0 {
 		rest := parts[homeOffset:]
-		if hasPathPrefix(rest, []string{".config", "ubitech-agent"}) ||
-			hasPathPrefix(rest, []string{".local", "share", "ubitech-agent", "manager"}) {
+		if hasPathPrefix(rest, []string{".config", profile.ConfigDirectory}) ||
+			hasPathPrefix(rest, []string{".local", "share", profile.DataDirectory, profile.ManagerStateDirectory}) {
 			return true
 		}
 	}

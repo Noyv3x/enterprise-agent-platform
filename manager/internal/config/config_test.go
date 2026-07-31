@@ -20,6 +20,26 @@ func TestDefaultsKeepLANClosedOnLoopback(t *testing.T) {
 	}
 }
 
+func TestDefaultsKeepSourceIdentityPaths(t *testing.T) {
+	configHome := filepath.Join(t.TempDir(), "config")
+	dataHome := filepath.Join(t.TempDir(), "data")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+
+	cfg, err := Defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := filepath.Join(dataHome, "ubitech-agent")
+	if cfg.ConfigPath != filepath.Join(configHome, "ubitech-agent", "manager.toml") ||
+		cfg.DataRoot != wantRoot ||
+		cfg.StateDir != filepath.Join(wantRoot, "manager") ||
+		cfg.SocketPath != filepath.Join(wantRoot, "manager", "control", "manager.sock") ||
+		cfg.ComposeProject != "ubitech-agent" || cfg.SandboxNetwork != "ubitech-agent_core" {
+		t.Fatalf("source identity defaults changed: %#v", cfg)
+	}
+}
+
 func TestLoadStandardManagerConfig(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "data root")
 	path := filepath.Join(t.TempDir(), "manager.toml")

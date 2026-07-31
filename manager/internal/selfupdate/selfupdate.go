@@ -197,7 +197,7 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "ubitech-manager")
+	path := filepath.Join(dir, sourceManagerBinaryName())
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return err
 	}
@@ -244,7 +244,7 @@ func (m *Manager) DiscardPrepared(manifest release.Manifest) error {
 	if !ok || !validSHA256(artifact.SHA256) {
 		return errors.New("release Manager artifact identity is invalid")
 	}
-	expectedPath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), "ubitech-manager")
+	expectedPath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
 	if _, err := os.Lstat(m.Root); err != nil {
 		if os.IsNotExist(err) {
 			if _, stateErr := os.Lstat(m.StatePath); os.IsNotExist(stateErr) {
@@ -367,7 +367,7 @@ func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error
 	}
 	unit := m.UnitName
 	if unit == "" {
-		unit = "ubitech-agent-manager.service"
+		unit = sourceManagerUnitName()
 	}
 	activationsRoot := filepath.Join(m.Root, "activations")
 	if err := ensureRecoveryDirectory(activationsRoot); err != nil {
@@ -818,7 +818,7 @@ func (m *Manager) recoveryUnitName() string {
 	if m.UnitName != "" {
 		return m.UnitName
 	}
-	return "ubitech-agent-manager.service"
+	return sourceManagerUnitName()
 }
 
 func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
@@ -1369,7 +1369,7 @@ func (m *Manager) backupRunningVersion() (*Version, error) {
 	}
 	hash := sha256Hex(data)
 	dir := filepath.Join(m.Root, "versions", "running-"+hash[:12])
-	path := filepath.Join(dir, "ubitech-manager")
+	path := filepath.Join(dir, sourceManagerBinaryName())
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return nil, err
 	}
@@ -1465,7 +1465,7 @@ func (m *Manager) PruneVersions(ctx context.Context, now time.Time, retention ti
 			continue
 		}
 		dir := filepath.Join(root, entry.Name())
-		binary := filepath.Join(dir, "ubitech-manager")
+		binary := filepath.Join(dir, sourceManagerBinaryName())
 		if _, keep := protected[binary]; keep {
 			continue
 		}
@@ -1528,7 +1528,7 @@ func (m *Manager) ensureVersionMetadata(version Version) error {
 	if err != nil {
 		return err
 	}
-	if filepath.Dir(filepath.Dir(path)) != root || filepath.Base(path) != "ubitech-manager" {
+	if filepath.Dir(filepath.Dir(path)) != root || filepath.Base(path) != sourceManagerBinaryName() {
 		return errors.New("referenced Manager version is outside the version root")
 	}
 	dir := filepath.Dir(path)
@@ -1565,7 +1565,7 @@ func validateVersionDirectoryContents(dir string) error {
 	if err != nil {
 		return err
 	}
-	allowed := map[string]struct{}{"ubitech-manager": {}, "metadata.json": {}}
+	allowed := map[string]struct{}{sourceManagerBinaryName(): {}, "metadata.json": {}}
 	if len(contents) != len(allowed) {
 		return errors.New("Manager version directory contains unknown files")
 	}
@@ -1646,9 +1646,9 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 		}
 		unit := m.UnitName
 		if unit == "" {
-			unit = "ubitech-agent-manager.service"
+			unit = sourceManagerUnitName()
 		}
-		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), "ubitech-manager")
+		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
 		if plan.Mode != "" || plan.SchemaVersion != 1 || plan.PlanPath != planPath ||
 			plan.StatePath != m.StatePath || plan.InstallPath != installPath || plan.SocketPath != m.SocketPath ||
 			plan.ControlTokenFile != m.ControlTokenFile || plan.UnitName != unit ||
@@ -1725,7 +1725,7 @@ func (m *Manager) ActivationRolledBack(manifest release.Manifest) (bool, error) 
 			}
 			return err
 		}
-		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), "ubitech-manager")
+		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
 		if plan.Mode != "" || plan.PlanPath != planPath || plan.StatePath != m.StatePath ||
 			plan.InstallPath != m.InstallPath || plan.CandidateVersion != manifest.Manager.Version ||
 			!strings.EqualFold(plan.CandidateSHA, artifact.SHA256) || plan.CandidatePath != expectedCandidatePath ||
@@ -1816,7 +1816,7 @@ func (m *Manager) activationRejected(manifest release.Manifest) (bool, error) {
 	if plan.Status != ordinaryRolledBackStatus {
 		return false, nil
 	}
-	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), "ubitech-manager")
+	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
 	if plan.Mode != "" || plan.PlanPath != planPath || plan.StatePath != m.StatePath ||
 		plan.InstallPath != m.InstallPath || plan.CandidateVersion != manifest.Manager.Version ||
 		!strings.EqualFold(plan.CandidateSHA, artifact.SHA256) || plan.CandidatePath != expectedCandidatePath ||

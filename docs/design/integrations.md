@@ -14,6 +14,7 @@
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
+- release manifest 的可选 `namespace_handoff` 只描述一次受签名技术命名空间交接，不是普通集成扩展。source-profile 基线严格解析其源/目标 Manager 与 Compose 工件、profile ID 和 generation 绑定，但在保存 generation 工件、下载工件、写入 Candidate 或进入维护之前拒绝执行；只有后续完整 source-owner 基线才可消费该字段。字段名必须使用规范 ASCII 大小写，重复、大小写别名、未知字段和不完整 binding 全部失败关闭。
 
 ## 模型 OAuth
 

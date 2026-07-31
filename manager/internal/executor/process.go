@@ -22,6 +22,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	technicalidentity "github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
@@ -350,7 +351,7 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 		}
 		cwd = resolved.Canonical
 		name = "/bin/sh"
-		commandArgs = []string{"-c", hostProcessWrapper, "ubitech-manager", args.Command}
+		commandArgs = []string{"-c", hostProcessWrapper, technicalidentity.SourceProfile().ManagerBinary, args.Command}
 	} else {
 		return ProcessSnapshot{}, errors.New("invalid target")
 	}
@@ -643,7 +644,7 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 }
 
 func (m *ProcessManager) sandboxCommand(process *managedProcess, script string) (string, error) {
-	name, args := m.Engine.ExecArgs(process.spec, contract.ContainerAgentEnv, "/bin/sh", []string{"-c", script, "ubitech-manager", process.pidFile})
+	name, args := m.Engine.ExecArgs(process.spec, contract.ContainerAgentEnv, "/bin/sh", []string{"-c", script, technicalidentity.SourceProfile().ManagerBinary, process.pidFile})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()

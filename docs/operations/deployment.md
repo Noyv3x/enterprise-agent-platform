@@ -37,7 +37,7 @@ Platform、Agent Runtime 与 Camoufox 必须以同一发布 generation 实现浏
 
 这些名称是当前部署协议的技术身份，不是产品品牌。管理员设置的名称或标识图不得改变这里的路径、`ubitech-manager` 命令、systemd unit、Compose project、网络、容器、label、socket、环境变量、release asset 或数据库与 Sandbox identity。维护页与安装器等面向人的说明使用中性文案；运维命令仍须展示真实技术名称，不能用品牌别名掩盖实际操作对象。
 
-它们只作为本次白标发布及随后源侧交接能力发布可被现役 Manager 发现的桥接源身份，不是长期基线。源侧能力完整到达并稳定后，连续的桥接与清理发布将它们交接为：
+它们只作为本次白标发布、source-profile 发布及 source-owner 发布可被现役 Manager 发现的桥接源身份，不是长期基线。完整 source-owner 能力到达并稳定后，连续的桥接与清理发布将它们交接为：
 
 ```text
 ~/.local/bin/agent-platform-manager
@@ -66,15 +66,15 @@ Manager 已激活但首次容器 operation 失败时，不得重跑安装脚本�
 
 ## 技术命名空间交接
 
-根据 [ADR 0004](../decisions/0004-configurable-branding-and-neutral-runtime-identity.md)，当前白标发布之后先发布一个不触发迁移的源侧交接能力 generation；只有它在全部现役实例上稳定并通过断电恢复矩阵后，才执行桥接发布与清理发布组成的两发布交接。目标是上一节固定的 `agent-platform` 命名空间，并由桥接 release 的签名清单再次绑定，不能取自管理员品牌字段或任意请求参数。
+根据 [ADR 0004](../decisions/0004-configurable-branding-and-neutral-runtime-identity.md)，当前白标发布之后先发布不触发迁移的 source-profile generation，再发布同样不触发迁移但已完整接通 coordinator、journal、持久 helper、恢复与启动发现的 source-owner generation。只有 source-owner 在全部现役实例上稳定并通过断电恢复矩阵后，才执行桥接发布与清理发布组成的两发布交接。目标是上一节固定的 `agent-platform` 命名空间，并由桥接 release 的签名清单再次绑定，不能取自管理员品牌字段或任意请求参数。
 
-第一发布是唯一迁移所有者，仍以当前二进制、unit、release asset 和数据根被现役 Manager 安全发现。它只能在 Manager 为 `idle`、`maintenance=false`，且没有 active/finalize operation、Candidate、Activation、watchdog、活动 Sandbox 调用或宿主执行时建立 owner-only handoff journal。journal 必须绑定源与目标 unit、stable binary、配置、数据根、socket、Compose project、网络、label namespace、当前 generation、数据库与 Runtime identity摘要、初始启用状态和每个单调阶段；任何身份不一致都在产生副作用前拒绝。
+桥接发布由已经稳定运行的 source-owner Manager 唯一拥有，仍以当前二进制、unit、release asset 和数据根被现役 Manager 安全发现。它只能在 Manager 为 `idle`、`maintenance=false`，且没有 active/finalize operation、Candidate、Activation、watchdog、活动 Sandbox 调用或宿主执行时建立 owner-only handoff journal。journal 必须绑定源与目标 unit、stable binary、配置、数据根、socket、Compose project、网络、label namespace、当前 generation、数据库与 Runtime identity摘要、初始启用状态和每个单调阶段；任何身份不一致都在产生副作用前拒绝。
 
 桥接先关闭业务准入并建立可验证快照，再停止全部 writer 和动态 Sandbox。新 Manager、配置、数据根与 unit 只能在经过 owner、类型、无符号链接、同文件系统和空目标检查后创建；数据库 marker、Runtime/session 引用、workspace marker、内部工作目录、Sandbox registry 及 Docker ownership 必须按同一 journal 迁移。固定容器、网络和 Sandbox 使用目标 Compose/label identity 重建，只复用经过验证的 bind 数据，不接管未知 Docker 对象。不得用符号链接、双写、两个同时启用的 Manager unit或品牌名派生路径来跨越交接。
 
 在目标 Manager 身份探针、核心 Platform/Runtime readiness、数据库完整性、工作区映射、自动更新通道和回滚点全部通过以前，源 Manager、unit、配置和恢复证据保持可回滚且不得报告更新成功。失败只按 journal 恢复源 unit、stable identity、容器 ownership 与业务入口；不能留下两个控制平面。提交后由目标 Manager禁用并删除源 unit，精确清理已无消费者的源控制工件，并保留有界恢复快照。
 
-第二发布只面向已经提交的目标命名空间，删除桥接命令、源常量、源资源识别和其它一次性兼容路径，并把目标身份作为唯一基线。它还必须把内部 API、Cookie、workspace/session marker、release asset 和语言包/import namespace 中的源名称换成对应的中性 `agent-platform` 身份；其中需要跨页面保存的浏览器状态只允许由桥接发布搬运一次。发布门必须从当前真实部署拓扑演练第一发布的每个崩溃边界、成功交接、失败回滚和第二发布清理；不能在第一发布尚未覆盖全部现役实例时提前停止发布桥接资产。
+清理发布只面向已经提交的目标命名空间，删除桥接命令、源常量、源资源识别和其它一次性兼容路径，并把目标身份作为唯一基线。它还必须把内部 API、Cookie、workspace/session marker、release asset 和语言包/import namespace 中的源名称换成对应的中性 `agent-platform` 身份；其中需要跨页面保存的浏览器状态只允许由桥接发布搬运一次。发布门必须从当前真实部署拓扑演练桥接发布的每个崩溃边界、成功交接、失败回滚和清理发布；不能在 source-owner 尚未覆盖全部现役实例时提前停止发布桥接资产。
 
 ## 唯一管理入口
 

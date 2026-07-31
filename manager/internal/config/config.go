@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
 type Config struct {
@@ -60,13 +61,15 @@ func Defaults() (Config, error) {
 	if dataHome == "" {
 		dataHome = filepath.Join(home, ".local", "share")
 	}
-	dataRoot := filepath.Join(dataHome, "ubitech-agent")
-	stateDir := filepath.Join(dataRoot, "manager")
+	profile := identity.SourceProfile()
+	dataRoot := profile.DefaultDataRoot(dataHome)
+	stateDir := profile.ManagerStateRoot(dataRoot)
+	socketPath := profile.ControlSocketPath(dataRoot)
 	return Config{
-		ConfigPath:          filepath.Join(configHome, "ubitech-agent", "manager.toml"),
+		ConfigPath:          profile.DefaultConfigPath(configHome),
 		DataRoot:            dataRoot,
 		StateDir:            stateDir,
-		SocketPath:          filepath.Join(stateDir, "control", "manager.sock"),
+		SocketPath:          socketPath,
 		GatewayAddress:      "127.0.0.1:8080",
 		LANEnabled:          false,
 		LANAddress:          "127.0.0.1:8081",
@@ -77,9 +80,9 @@ func Defaults() (Config, error) {
 		ReleaseChannel:      contract.ReleaseChannel,
 		UpdateEnabled:       true,
 		UpdateInterval:      5 * time.Minute,
-		ComposeProject:      "ubitech-agent",
+		ComposeProject:      profile.ComposeProject,
 		DockerBinary:        "docker",
-		SandboxNetwork:      "ubitech-agent_core",
+		SandboxNetwork:      profile.CoreNetwork,
 		SandboxIdle:         time.Duration(contract.SandboxIdleSeconds) * time.Second,
 		HealthTimeout:       2 * time.Minute,
 		DrainTimeout:        5 * time.Minute,
@@ -133,9 +136,11 @@ func set(c *Config, key, value string) error {
 	switch key {
 	case "data_root":
 		root := expandHome(value)
+		profile := identity.SourceProfile()
+		socketPath := profile.ControlSocketPath(root)
 		c.DataRoot = root
-		c.StateDir = filepath.Join(root, "manager")
-		c.SocketPath = filepath.Join(root, "manager", "control", "manager.sock")
+		c.StateDir = profile.ManagerStateRoot(root)
+		c.SocketPath = socketPath
 	case "state_dir":
 		c.StateDir = expandHome(value)
 	case "socket_path":

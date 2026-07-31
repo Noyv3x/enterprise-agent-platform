@@ -797,7 +797,7 @@ func (m *Manager) validateStartupSettledActivationPlan(state State) error {
 		return fmt.Errorf("settled Manager Current has nonterminal activation plan status %q", plan.Status)
 	}
 	unit := m.recoveryUnitName()
-	expectedPath := filepath.Join(m.Root, "versions", safeID(state.Current.Version+"-"+state.Current.SourceCommit[:12]), "ubitech-manager")
+	expectedPath := filepath.Join(m.Root, "versions", safeID(state.Current.Version+"-"+state.Current.SourceCommit[:12]), sourceManagerBinaryName())
 	if plan.Mode != "" || plan.SchemaVersion != 1 || plan.PlanPath != planPath ||
 		plan.StatePath != m.StatePath || plan.InstallPath != m.InstallPath || plan.SocketPath != m.SocketPath ||
 		plan.ControlTokenFile != m.ControlTokenFile || plan.UnitName != unit ||
@@ -1170,7 +1170,7 @@ func (m *Manager) validateStartupOrdinaryRollbackHalf(state State, plan Plan) er
 		m.Root,
 		"versions",
 		safeID(candidate.Version+"-"+candidate.SourceCommit[:12]),
-		"ubitech-manager",
+		sourceManagerBinaryName(),
 	)
 	expectedPlanPath := filepath.Join(m.Root, "activations", safeID(candidate.SourceCommit)+".json")
 	if candidate.Path != expectedCandidatePath || plan.PlanPath != expectedPlanPath ||
@@ -1272,7 +1272,7 @@ func (m *Manager) readStartupHealthyRecoverySnapshot() (startupHealthyRecoverySn
 	if !validSourceCommit(m.RunningVersion) {
 		return snapshot, errors.New("running recovery Manager version is invalid")
 	}
-	recoveryPath := filepath.Join(m.Root, "versions", "recovery-"+stableSHA[:12], "ubitech-manager")
+	recoveryPath := filepath.Join(m.Root, "versions", "recovery-"+stableSHA[:12], sourceManagerBinaryName())
 	recoveryBinary, _, err := readRecoveryRegularFile(recoveryPath, recoveryMaxBinaryBytes, false)
 	if err != nil || sha256Hex(recoveryBinary) != stableSHA {
 		return snapshot, errors.New("stable recovery Manager has no matching immutable recovery artifact")

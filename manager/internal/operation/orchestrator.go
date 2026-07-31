@@ -90,6 +90,9 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	if err != nil {
 		return release.Manifest{}, err
 	}
+	if err := rejectUnownedNamespaceHandoff(manifest); err != nil {
+		return release.Manifest{}, err
+	}
 	unlockMaintenance := o.lockMaintenanceAdmission()
 	defer unlockMaintenance()
 	path, err := o.saveManifest(ctx, manifest, data)
@@ -388,6 +391,10 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			return
 		}
 	}
+	if err = rejectUnownedNamespaceHandoff(manifest); err != nil {
+		o.failBeforeMaintenance(op, err)
+		return
+	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
 		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreDownload, manifest); err != nil {
 			o.failBeforeMaintenanceRetryable(op, err)
@@ -549,6 +556,13 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	if err == nil {
 		_ = o.finalizeCommitted(context.Background(), op, manifest)
 	}
+}
+
+func rejectUnownedNamespaceHandoff(manifest release.Manifest) error {
+	if manifest.NamespaceHandoff != nil {
+		return errors.New("namespace handoff requires the complete handoff owner and cannot run as an ordinary update")
+	}
+	return nil
 }
 
 func (o *Orchestrator) checkCapacity(ctx context.Context, checker driver.CapacityChecker, operationID, stage string, manifest release.Manifest) error {

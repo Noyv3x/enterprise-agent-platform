@@ -296,7 +296,7 @@ func validateRecoveryTakeoverJournal(journal recoveryTakeoverJournal, manager *M
 		!pathWithin(filepath.Join(manager.Root, "activations"), journal.RecoveryPlanPath) {
 		return errors.New("current recovery takeover journal references an unmanaged Manager path")
 	}
-	if journal.RecoveryPath != filepath.Join(manager.Root, "versions", "recovery-"+journal.RecoverySHA256[:12], "ubitech-manager") {
+	if journal.RecoveryPath != filepath.Join(manager.Root, "versions", "recovery-"+journal.RecoverySHA256[:12], sourceManagerBinaryName()) {
 		return errors.New("current recovery takeover journal recovery artifact path is inconsistent")
 	}
 	if !validRecoveryOperationID(journal.OperationID) ||

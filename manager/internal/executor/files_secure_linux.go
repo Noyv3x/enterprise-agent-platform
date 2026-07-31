@@ -18,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	technicalidentity "github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
@@ -48,7 +49,7 @@ func (s FileService) sandboxPath(call Call, value string) (managedFilePath, erro
 	if !filepath.IsAbs(logical) {
 		logical = filepath.Join(contract.ContainerWorkspace, logical)
 	}
-	attachmentRoot := filepath.Join(contract.ContainerWorkspace, ".ubitech", "attachments")
+	attachmentRoot := filepath.Join(contract.ContainerWorkspace, technicalidentity.SourceProfile().InternalWorkspaceDirectory, "attachments")
 	type mapping struct {
 		logical  string
 		host     string
@@ -304,7 +305,7 @@ func createTemporaryAt(parent *os.File) (string, *os.File, error) {
 		if _, err := rand.Read(random); err != nil {
 			return "", nil, err
 		}
-		name := ".ubitech-write-" + hex.EncodeToString(random)
+		name := technicalidentity.SourceProfile().InternalWorkspaceDirectory + "-write-" + hex.EncodeToString(random)
 		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 		if errors.Is(err, syscall.EEXIST) {
 			continue
