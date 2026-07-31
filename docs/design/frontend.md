@@ -140,6 +140,8 @@ Manager 服务状态区必须逐项呈现当前固定服务目录：`platform`�
 
 候选镜像预拉取和 `waiting_for_tasks` 不阻断其它页面；进入 `updating` 后，全局 `UpdateGate` 禁止使用并显示管理器维护状态。失败时如果 Platform 仍可用，管理页展示 operation id 和使用宿主 CLI 的恢复提示；不得向普通页面泄露 Docker socket、registry 凭据、宿主绝对路径或完整管理日志。
 
+旧 P1 中“Agent 已登记但从未执行”的 workspace 归一化属于候选提交内部步骤：readiness 阶段不得把尚未创建的目录误报成用户可操作的 Agent 故障，commit 前仍由同一 `UpdateGate` 阻断使用；若安全校验失败，只展示有界 operation 错误并保持旧 generation 可用。
+
 Manager 状态不可达时不能伪造为 `idle`。管理页必须显示控制平面不可用，禁用保存配置、检查更新、更新、重启和回滚等所有变更入口，不能让用户点击后才收到 400/503；写操作不存在其它回退控制器。
 
 ## 验证

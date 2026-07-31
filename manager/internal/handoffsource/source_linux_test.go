@@ -309,6 +309,9 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 	sourceData := filepath.Join(root, "d", sourceProfile.DataDirectory)
 	targetData := filepath.Join(root, "d", targetProfile.DataDirectory)
 	mustMkdir(t, filepath.Join(sourceData, "manager", "control"), 0o700)
+	// A canonical deployed source always has the Manager-created workspace
+	// root, even when this handoff fixture carries no Agent scope rows.
+	mustMkdir(t, filepath.Join(sourceData, "data", "workspaces"), 0o700)
 	sourceStable := filepath.Join(root, "b", sourceProfile.ManagerBinary)
 	targetStable := filepath.Join(root, "b", targetProfile.ManagerBinary)
 	// P1 allows an arbitrary source config destination.  The target config is

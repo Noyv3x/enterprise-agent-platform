@@ -108,6 +108,7 @@ from .oauth_flows import (
     oauth_provider_info,
 )
 from .prompt_security import format_untrusted_context_data
+from .release_transition_contract_generated import SOURCE_OWNER_COMPAT_GENERATION
 from .runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
     AGENT_SETTING_MAX_CONCURRENCY,
@@ -373,6 +374,18 @@ MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING = (
 MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION = 1
 MANAGER_HANDOFF_OPERATION_RE = re.compile(r"^handoff_[0-9a-f]{32}$")
 MANAGER_HANDOFF_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
+MANAGER_WORKSPACE_SCHEMA_COMMIT_FIELDS = {
+    "schema_version",
+    "operation_id",
+    "predecessor_generation",
+    "target_generation",
+}
+MANAGER_GATE_SETTLEMENT_FIELDS = {
+    "schema_version",
+    "operation_id",
+    "action",
+}
+MANAGER_OPERATION_RE = re.compile(r"^op_[0-9a-f]{32}$")
 MANAGER_HANDOFF_BINDING_RE = re.compile(r"^[0-9a-f]{64}$")
 MANAGER_HANDOFF_RECEIPT_RE = re.compile(r"^[0-9a-f]{64}$")
 MANAGER_HANDOFF_RECEIPT_FIELDS = frozenset(
@@ -556,10 +569,17 @@ class EnterpriseService:
         )
         startup_reservation_id = ""
         startup_reservation_owner = ""
+        startup_gate_settlement: dict[str, str | int] | None = None
+        startup_manager_status: dict[str, Any] = {}
         if self.manager_client is not None:
             try:
+                startup_manager_status = self.manager_client.status()
+                startup_gate_settlement = self._manager_startup_gate_settlement(
+                    startup_manager_status
+                )
                 startup_reservation_id = self._manager_startup_reservation_id(
-                    self.manager_client.status()
+                    startup_manager_status,
+                    gate_settlement=startup_gate_settlement,
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -567,13 +587,21 @@ class EnterpriseService:
                 ) from exc
             if startup_reservation_id:
                 startup_reservation_owner = "manager"
+        startup_settlement_action = (
+            str(startup_gate_settlement["action"])
+            if startup_gate_settlement is not None
+            else ""
+        )
+        startup_schema_writes_committed = bool(
+            not startup_reservation_id and startup_settlement_action != "abort"
+        )
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
         self._instance_lock_finalizer: weakref.finalize | None = None
         self._acquire_instance_lock()
         self._camofox_sidecar = ensure_camofox_runtime_sidecar(
             self.config.data_dir,
-            commit_schema_upgrade=not bool(startup_reservation_id),
+            commit_schema_upgrade=startup_schema_writes_committed,
         )
         self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
@@ -612,8 +640,20 @@ class EnterpriseService:
         self.agent_scopes = AgentScopeManager(
             config,
             self.db,
-            commit_schema_upgrade=not bool(startup_reservation_id),
+            commit_schema_upgrade=startup_schema_writes_committed,
+            allow_unmaterialized_p1_workspaces=(
+                bool(startup_reservation_id)
+                and self._manager_allows_source_owner_workspace_commit(
+                    startup_manager_status,
+                    startup_reservation_id,
+                )
+            ),
         )
+        if startup_settlement_action == "abort":
+            # The first abort Gate already proved that no schema transition is
+            # authorized. Revalidate the complete current baseline and reopen
+            # only the in-memory write gate; startup must not publish anything.
+            self.agent_scopes.release_schema_write_gate_after_abort()
         self.skills = SkillStore(config.data_dir)
         if not self.get_setting("agent_tool_token"):
             self.set_setting(
@@ -676,8 +716,18 @@ class EnterpriseService:
         self._auto_update_reserved = bool(startup_reservation_id)
         self._auto_update_reservation_id = startup_reservation_id
         self._auto_update_reservation_owner = startup_reservation_owner
-        self._auto_update_last_released_id = ""
-        self._auto_update_last_committed_id = ""
+        startup_settlement_id = (
+            str(startup_gate_settlement["operation_id"])
+            if startup_gate_settlement is not None
+            else ""
+        )
+        self._auto_update_last_released_id = (
+            startup_settlement_id if startup_settlement_action == "abort" else ""
+        )
+        self._auto_update_last_committed_id = (
+            startup_settlement_id if startup_settlement_action == "commit" else ""
+        )
+        self._auto_update_quiesced_abort_id = ""
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
@@ -746,7 +796,94 @@ class EnterpriseService:
         self._start_telegram_gateway()
 
     @staticmethod
-    def _manager_startup_reservation_id(status: dict[str, Any]) -> str:
+    def _manager_startup_gate_settlement(
+        status: dict[str, Any],
+    ) -> dict[str, str | int] | None:
+        """Validate a finalized Gate effect that still awaits state clearing."""
+
+        if not isinstance(status, dict):
+            raise ManagerClientError("manager status must be a JSON object")
+        if "gate_settlement" not in status:
+            active_id = status.get("active_operation_id")
+            finalize_id = status.get("finalize_pending_operation_id")
+            public_id = status.get("operation_id")
+            current = status.get("current")
+            target = status.get("target")
+            target_id = target.get("id") if isinstance(target, dict) else None
+            if not (
+                status.get("maintenance") is True
+                and status.get("public_state") == "updating"
+                and isinstance(active_id, str)
+                and MANAGER_OPERATION_RE.fullmatch(active_id)
+                and finalize_id == ""
+                and public_id == active_id
+                and isinstance(current, dict)
+                and current.get("id") == SOURCE_OWNER_COMPAT_GENERATION
+                and current.get("source_commit") == SOURCE_OWNER_COMPAT_GENERATION
+                and isinstance(target_id, str)
+                and target_id != SOURCE_OWNER_COMPAT_GENERATION
+                and MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_id)
+                and target.get("source_commit") == target_id
+            ):
+                raise ManagerClientError(
+                    "manager status is missing the Gate settlement capability"
+                )
+            # The sole deployed P1 Manager predates this field. Its exact active
+            # source-owner update boundary retains the old reservation path;
+            # no other generation may treat an absent field as explicit null.
+            return None
+        if status.get("gate_settlement") is None:
+            return None
+        settlement = status.get("gate_settlement")
+        if (
+            not isinstance(settlement, dict)
+            or set(settlement) != MANAGER_GATE_SETTLEMENT_FIELDS
+            or type(settlement.get("schema_version")) is not int
+            or settlement.get("schema_version") != 1
+        ):
+            raise ManagerClientError("manager Gate settlement is invalid")
+        operation_id = settlement.get("operation_id")
+        action = settlement.get("action")
+        if (
+            not isinstance(operation_id, str)
+            or not MANAGER_OPERATION_RE.fullmatch(operation_id)
+            or action not in {"commit", "abort"}
+        ):
+            raise ManagerClientError("manager Gate settlement is invalid")
+
+        maintenance = status.get("maintenance")
+        active_id = status.get("active_operation_id", "")
+        finalize_id = status.get("finalize_pending_operation_id", "")
+        public_id = status.get("operation_id", "")
+        current = status.get("current")
+        current_id = current.get("id") if isinstance(current, dict) else None
+        current_source = (
+            current.get("source_commit") if isinstance(current, dict) else None
+        )
+        if (
+            maintenance is not True
+            or status.get("public_state") != "updating"
+            or active_id != ""
+            or finalize_id != operation_id
+            or public_id != operation_id
+            or status.get("target") is not None
+            or not isinstance(current_id, str)
+            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(current_id)
+            or current_source != current_id
+        ):
+            raise ManagerClientError("manager Gate settlement state is inconsistent")
+        return {
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "action": str(action),
+        }
+
+    @staticmethod
+    def _manager_startup_reservation_id(
+        status: dict[str, Any],
+        *,
+        gate_settlement: dict[str, str | int] | None = None,
+    ) -> str:
         """Validate and recover the Manager-owned maintenance reservation."""
 
         if not isinstance(status, dict):
@@ -777,6 +914,10 @@ class EnterpriseService:
             raise ManagerClientError(
                 "manager status has an unreserved finalize operation"
             )
+        if gate_settlement is None:
+            gate_settlement = EnterpriseService._manager_startup_gate_settlement(status)
+        if gate_settlement is not None:
+            return ""
         if not maintenance:
             return ""
         reservation_id = finalize_id or active_id
@@ -789,6 +930,95 @@ class EnterpriseService:
                 "manager maintenance operation identity is inconsistent"
             )
         return reservation_id
+
+    @staticmethod
+    def _manager_allows_source_owner_workspace_commit(
+        status: dict[str, Any],
+        reservation_id: str,
+    ) -> bool:
+        """Validate the one-generation P1 workspace-normalization capability.
+
+        The historical P1 Manager cannot project the durable capability added
+        by A2, so candidate startup accepts its exact active Current/Target
+        boundary.  Once A2 has become Current, only A2's operation-journal-
+        derived capability can preserve the permission across a Platform crash.
+        """
+
+        if (
+            not isinstance(SOURCE_OWNER_COMPAT_GENERATION, str)
+            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(
+                SOURCE_OWNER_COMPAT_GENERATION
+            )
+            or not isinstance(status, dict)
+            or not isinstance(reservation_id, str)
+            or not reservation_id
+        ):
+            return False
+
+        def operation_id(field: str) -> str:
+            value = status.get(field, "")
+            return value if isinstance(value, str) else ""
+
+        def exact_generation(value: Any, generation: str) -> bool:
+            return bool(
+                isinstance(value, dict)
+                and value.get("id") == generation
+                and value.get("source_commit") == generation
+            )
+
+        active_id = operation_id("active_operation_id")
+        finalize_id = operation_id("finalize_pending_operation_id")
+        current = status.get("current")
+        previous = status.get("previous")
+        target = status.get("target")
+        capability_present = "workspace_schema_commit" in status
+        capability = status.get("workspace_schema_commit")
+
+        # The one deployed P1 predates workspace_schema_commit. Bind its narrow
+        # fallback to the exact update Candidate as well as the reservation so
+        # a generic maintenance operation cannot gain schema-write authority.
+        if not capability_present:
+            target_generation = target.get("id") if isinstance(target, dict) else None
+            return bool(
+                active_id == reservation_id
+                and not finalize_id
+                and exact_generation(current, SOURCE_OWNER_COMPAT_GENERATION)
+                and isinstance(target_generation, str)
+                and target_generation != SOURCE_OWNER_COMPAT_GENERATION
+                and MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation)
+                and exact_generation(target, target_generation)
+            )
+
+        if (
+            not isinstance(capability, dict)
+            or set(capability) != MANAGER_WORKSPACE_SCHEMA_COMMIT_FIELDS
+            or type(capability.get("schema_version")) is not int
+            or capability["schema_version"] != 1
+            or capability.get("operation_id") != reservation_id
+            or capability.get("predecessor_generation")
+            != SOURCE_OWNER_COMPAT_GENERATION
+        ):
+            return False
+        target_generation = capability.get("target_generation")
+        if (
+            not isinstance(target_generation, str)
+            or target_generation == SOURCE_OWNER_COMPAT_GENERATION
+            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation)
+        ):
+            return False
+
+        if active_id == reservation_id and not finalize_id:
+            return bool(
+                exact_generation(current, SOURCE_OWNER_COMPAT_GENERATION)
+                and exact_generation(target, target_generation)
+            )
+        if finalize_id == reservation_id and not active_id:
+            return bool(
+                exact_generation(previous, SOURCE_OWNER_COMPAT_GENERATION)
+                and exact_generation(current, target_generation)
+                and target is None
+            )
+        return False
 
     def _new_agent_runtime_client(self) -> AgentRuntimeClient:
         runtime = self.runtimes.agent_runtime_config()
@@ -4144,10 +4374,34 @@ class EnterpriseService:
     def manager_update_abort_release(self, operation_id: str) -> dict[str, Any]:
         if self.manager_client is None:
             raise ServiceError(404, "manager integration is not active")
-        released = self.release_auto_update_reservation(
-            str(operation_id or "").strip(),
-            expected_owner="manager",
-        )
+        clean_operation_id = str(operation_id or "").strip()
+        with self._conversation_lock:
+            if (
+                clean_operation_id
+                and self._auto_update_quiesced_abort_id == clean_operation_id
+            ):
+                return {"released": True}
+            if (
+                self._auto_update_reserved
+                and self._auto_update_reservation_owner == "manager"
+                and self._auto_update_reservation_id == clean_operation_id
+            ):
+                if self.agent_scopes.abort_requires_process_quiescence():
+                    # The canonical P1 candidate may have observed missing or
+                    # legacy machine state. A successful abort only settles the
+                    # Manager Gate; this process must remain a frozen 503
+                    # participant until Manager stops the container.
+                    self._auto_update_quiesced_abort_id = clean_operation_id
+                    self._auto_update_last_released_id = clean_operation_id
+                    return {"released": True}
+                # This performs pure-read validation plus an in-memory gate
+                # transition. Exact P1 compatibility remains write-disabled;
+                # abort never publishes a marker, directory or alias.
+                self.agent_scopes.release_schema_write_gate_after_abort()
+            released = self.release_auto_update_reservation(
+                clean_operation_id,
+                expected_owner="manager",
+            )
         if not released:
             raise ServiceError(
                 409, "maintenance reservation does not match the Manager operation"
@@ -4161,6 +4415,8 @@ class EnterpriseService:
             raise ServiceError(404, "manager integration is not active")
         clean_operation_id = str(operation_id or "").strip()
         with self._conversation_lock:
+            if self._auto_update_quiesced_abort_id == clean_operation_id:
+                raise ServiceError(409, "maintenance reservation was already aborted")
             if (
                 not self._auto_update_reserved
                 and clean_operation_id

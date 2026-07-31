@@ -19,6 +19,7 @@ from test_platform import RecordingAgent as RuntimeAgentStub
 
 
 def make_config(tmp: Path) -> PlatformConfig:
+    (tmp / "workspaces").mkdir(mode=0o700, exist_ok=True)
     return PlatformConfig(
         data_dir=tmp,
         host_data_root=tmp / "host-data-root",

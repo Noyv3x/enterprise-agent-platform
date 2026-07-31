@@ -120,6 +120,36 @@ func (s *Store) State() model.ManagerState {
 	return state
 }
 
+// StateWithReferencedOperation returns one lock-consistent status snapshot.
+// The operation is nil when the state has no active or finalize-pending owner.
+// Ambiguous or unreadable references are errors so callers cannot combine a
+// state snapshot with an unrelated operation journal entry.
+func (s *Store) StateWithReferencedOperation() (model.ManagerState, *model.Operation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := cloneState(s.state)
+	state.LastError = BoundDiagnostic(state.LastError)
+	if state.ActiveOperationID != "" && state.FinalizePendingOperationID != "" {
+		return state, nil, errors.New("manager state references overlapping operations")
+	}
+	operationID := state.ActiveOperationID
+	if operationID == "" {
+		operationID = state.FinalizePendingOperationID
+	}
+	if operationID == "" {
+		return state, nil, nil
+	}
+	operation, err := s.readOperationLocked(operationID)
+	if err != nil {
+		return state, nil, fmt.Errorf("read manager state operation: %w", err)
+	}
+	if operation.SchemaVersion != 1 || operation.ID != operationID {
+		return state, nil, errors.New("manager state operation identity is invalid")
+	}
+	operation = BoundOperation(operation)
+	return state, &operation, nil
+}
+
 func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (model.ManagerState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -333,6 +363,9 @@ func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerSta
 		stateFn(&next)
 	}
 	op.Finalized = !success || next.FinalizePendingOperationID != id
+	if !op.Finalized || !success {
+		op.GateSettlementAction = ""
+	}
 	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, err
 	}
@@ -368,6 +401,7 @@ func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operati
 	completed := now.UTC()
 	op.Status = model.OperationFailed
 	op.Finalized = true
+	op.GateSettlementAction = ""
 	op.PreparedCleanupPending = false
 	op.UpdatedAt = completed
 	op.CompletedAt = &completed

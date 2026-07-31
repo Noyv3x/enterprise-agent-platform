@@ -132,6 +132,22 @@ func validateObservedOperation(id string, operation model.Operation) error {
 	default:
 		return fmt.Errorf("operation %q has unknown phase %q", id, operation.Phase)
 	}
+	switch operation.GateSettlementAction {
+	case "":
+	case model.GateSettlementCommit:
+		if operation.Status != model.OperationSucceeded || !operation.Finalized ||
+			operation.CompletedAt == nil || operation.Phase != model.PhaseCommitting ||
+			(operation.Kind != model.OperationInstall && operation.Kind != model.OperationUpdate) {
+			return fmt.Errorf("operation %q has an invalid commit Gate settlement", id)
+		}
+	case model.GateSettlementAbort:
+		if operation.Status != model.OperationSucceeded || !operation.Finalized ||
+			operation.CompletedAt == nil || operation.Phase != model.PhaseCommitting {
+			return fmt.Errorf("operation %q has an invalid abort Gate settlement", id)
+		}
+	default:
+		return fmt.Errorf("operation %q has unknown Gate settlement %q", id, operation.GateSettlementAction)
+	}
 	if operation.IdempotencyKey == "" || operation.Attempt < 1 || operation.CreatedAt.IsZero() || operation.UpdatedAt.IsZero() {
 		return fmt.Errorf("operation %q has an incomplete durable identity", id)
 	}

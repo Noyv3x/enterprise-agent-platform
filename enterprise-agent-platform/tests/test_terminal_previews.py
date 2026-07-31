@@ -61,6 +61,7 @@ class PreviewAgent(RecordingAgent):
 
 
 def make_config(root: Path) -> PlatformConfig:
+    (root / "workspaces").mkdir(mode=0o700, exist_ok=True)
     return PlatformConfig(
         data_dir=root,
         host="127.0.0.1",

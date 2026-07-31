@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform import db as db_module
+from enterprise_agent_platform import agent_scopes as agent_scopes_module
 from enterprise_agent_platform import secure_fs
 from enterprise_agent_platform.agent_scopes import AgentScopeManager
 from enterprise_agent_platform.container_contract_generated import DATABASE_SCHEMA_VERSION
@@ -17,6 +20,88 @@ from test_platform import make_config
 
 
 class AgentScopeSessionTests(unittest.TestCase):
+    def test_marker_staging_open_failure_does_not_leak_directory_fds(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("file-descriptor accounting requires procfs")
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                scope = manager.ensure_private_scope(1)
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+                real_open = agent_scopes_module.open_private_directory_fd
+
+                def fail_machine_staging(path):
+                    if Path(path) == manager._machine_staging_root:
+                        raise RuntimeError("simulated staging open failure")
+                    return real_open(path)
+
+                calls = (
+                    lambda: manager._write_scope_marker(scope),
+                    lambda: manager._prepare_scope_marker_transition(scope, scope),
+                    lambda: manager._replay_pre_exchange_scope_marker(scope, marker),
+                )
+                for call in calls:
+                    with self.subTest(call=call):
+                        before = set(os.listdir("/proc/self/fd"))
+                        with mock.patch.object(
+                            agent_scopes_module,
+                            "open_private_directory_fd",
+                            side_effect=fail_machine_staging,
+                        ):
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                "staging open failure",
+                            ):
+                                call()
+                        after = set(os.listdir("/proc/self/fd"))
+                        self.assertFalse(after - before)
+            finally:
+                db.close()
+
+    def test_candidate_does_not_create_a_missing_workspace_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            config.workspace_dir.rmdir()
+            db = Database(config.db_path)
+            try:
+                self.assertFalse(config.workspace_dir.exists())
+                with self.assertRaises(FileNotFoundError):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                    )
+                self.assertFalse(config.workspace_dir.exists())
+                with self.assertRaises(FileNotFoundError):
+                    AgentScopeManager(config, db)
+                self.assertFalse(config.workspace_dir.exists())
+            finally:
+                db.close()
+
+    def test_candidate_does_not_repair_workspace_root_permissions(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            config.workspace_dir.chmod(0o755)
+            sentinel = config.workspace_dir / "sentinel"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            before = config.workspace_dir.stat()
+            db = Database(config.db_path)
+            try:
+                with self.assertRaises(secure_fs.UnsafePrivatePathError):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                    )
+                after = config.workspace_dir.stat()
+                self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+                self.assertEqual(after.st_mode & 0o777, 0o755)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+            finally:
+                db.close()
+
     def test_scope_marker_has_versioned_technical_and_relative_identity(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
@@ -95,8 +180,31 @@ class AgentScopeSessionTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 marker.chmod(0o600)
+                original = marker.read_bytes()
 
-                AgentScopeManager(config, db)
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "scope marker does not match",
+                ):
+                    AgentScopeManager(config, db)
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "scope marker does not match",
+                ):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                    )
+                self.assertEqual(marker.read_bytes(), original)
+
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                candidate.commit_schema_upgrade()
 
                 upgraded = json.loads(marker.read_text(encoding="utf-8"))
                 self.assertEqual(upgraded["schema_version"], 1)
@@ -133,6 +241,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                     config,
                     db,
                     commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
                 )
                 self.assertEqual(marker.read_bytes(), original)
                 candidate.commit_schema_upgrade()
@@ -165,7 +274,12 @@ class AgentScopeSessionTests(unittest.TestCase):
                 }
                 marker.write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
                 marker.chmod(0o600)
-                candidate = AgentScopeManager(config, db, commit_schema_upgrade=False)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
                 real_unlink = secure_fs.os.unlink
 
                 def crash_before_old_inode_cleanup(name, *args, **kwargs):
@@ -325,10 +439,26 @@ class AgentScopeSessionTests(unittest.TestCase):
                 scope = AgentScopeManager(config, db).ensure_private_scope(1)
                 marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
                 marker.unlink()
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "scope marker does not match",
+                ):
+                    AgentScopeManager(config, db)
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "scope marker does not match",
+                ):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                    )
+                self.assertFalse(marker.exists())
                 candidate = AgentScopeManager(
                     config,
                     db,
                     commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
                 )
                 self.assertFalse(marker.exists())
                 candidate.commit_schema_upgrade()
@@ -347,6 +477,700 @@ class AgentScopeSessionTests(unittest.TestCase):
                     AgentScopeManager(config, db)
             finally:
                 db.close()
+
+    def test_p1_commit_rejects_same_bytes_marker_inode_replacement(self):
+        for marker_state in ("current", "legacy"):
+            with self.subTest(marker_state=marker_state):
+                with tempfile.TemporaryDirectory() as td:
+                    config = make_config(Path(td))
+                    db = Database(config.db_path)
+                    try:
+                        scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                        marker = (
+                            Path(scope.workspace_path)
+                            / ".ubitech-agent-scope.json"
+                        )
+                        if marker_state == "legacy":
+                            current = json.loads(marker.read_text(encoding="utf-8"))
+                            legacy = {
+                                key: current[key]
+                                for key in (
+                                    "scope_key",
+                                    "scope_type",
+                                    "scope_id",
+                                    "lifecycle_id",
+                                    "sandbox_id",
+                                    "workspace_id",
+                                    "isolation",
+                                )
+                            }
+                            marker.write_text(
+                                json.dumps(legacy, sort_keys=True) + "\n",
+                                encoding="utf-8",
+                            )
+                            marker.chmod(0o600)
+
+                        candidate = AgentScopeManager(
+                            config,
+                            db,
+                            commit_schema_upgrade=False,
+                            allow_unmaterialized_p1_workspaces=True,
+                        )
+                        observed = marker.stat()
+                        original = marker.read_bytes()
+                        replacement = marker.with_name(".same-bytes-replacement")
+                        replacement.write_bytes(original)
+                        replacement.chmod(0o600)
+                        replacement_identity = replacement.stat()
+                        self.assertNotEqual(
+                            (observed.st_dev, observed.st_ino),
+                            (
+                                replacement_identity.st_dev,
+                                replacement_identity.st_ino,
+                            ),
+                        )
+                        os.replace(replacement, marker)
+
+                        with self.assertRaisesRegex(
+                            sqlite3.DatabaseError,
+                            "marker identity changed",
+                        ):
+                            candidate.commit_schema_upgrade()
+                        self.assertEqual(marker.read_bytes(), original)
+                        self.assertEqual(
+                            (marker.stat().st_dev, marker.stat().st_ino),
+                            (
+                                replacement_identity.st_dev,
+                                replacement_identity.st_ino,
+                            ),
+                        )
+                    finally:
+                        db.close()
+
+    def test_candidate_keeps_unmaterialized_p1_scope_read_only_until_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                workspace = Path(scope.workspace_path)
+                channel_root = workspace.parent
+                shutil.rmtree(channel_root)
+
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                self.assertFalse(channel_root.exists())
+
+                candidate.commit_schema_upgrade()
+                self.assertEqual(channel_root.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
+                marker = workspace / ".ubitech-agent-scope.json"
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                self.assertEqual(payload["schema_version"], 1)
+                self.assertEqual(payload["scope_key"], "channel:1:main-agent")
+                self.assertEqual(payload["workspace_id"], "channels/channel-1")
+            finally:
+                db.close()
+
+    def test_candidate_rejects_unsafe_prefix_for_unmaterialized_p1_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+                redirect = Path(td) / "redirect"
+                redirect.mkdir(mode=0o700)
+                channel_root.symlink_to(redirect, target_is_directory=True)
+
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "workspace directory has unsafe metadata",
+                ):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                        allow_unmaterialized_p1_workspaces=True,
+                    )
+                self.assertTrue(channel_root.is_symlink())
+            finally:
+                db.close()
+
+    def test_unmaterialized_p1_commit_replays_after_marker_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                workspace = Path(scope.workspace_path)
+                shutil.rmtree(workspace.parent)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+
+                with mock.patch.object(
+                    candidate,
+                    "_write_scope_marker",
+                    side_effect=RuntimeError("simulated marker failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "marker failure"):
+                        candidate.commit_schema_upgrade()
+                self.assertTrue(workspace.is_dir())
+                self.assertFalse(
+                    (workspace / ".ubitech-agent-scope.json").exists()
+                )
+
+                candidate.commit_schema_upgrade()
+                self.assertEqual(
+                    json.loads(
+                        (workspace / ".ubitech-agent-scope.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["scope_key"],
+                    scope.scope_key,
+                )
+            finally:
+                db.close()
+
+    def test_unmaterialized_p1_commit_retries_after_directory_durability_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                workspace = Path(scope.workspace_path)
+                shutil.rmtree(workspace.parent)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                real_rename = secure_fs._rename_noreplace
+                real_fsync = secure_fs.os.fsync
+                renamed = False
+                failed = False
+
+                def rename_then_arm(*args, **kwargs):
+                    nonlocal renamed
+                    result = real_rename(*args, **kwargs)
+                    renamed = True
+                    return result
+
+                def fail_first_post_rename_fsync(fd):
+                    nonlocal failed
+                    if renamed and not failed:
+                        failed = True
+                        raise OSError("simulated post-rename durability failure")
+                    return real_fsync(fd)
+
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=rename_then_arm,
+                ), mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=fail_first_post_rename_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "publication was not durable",
+                    ):
+                        candidate.commit_schema_upgrade()
+
+                self.assertTrue(workspace.parent.is_dir())
+                self.assertFalse(workspace.exists())
+                candidate.commit_schema_upgrade()
+                self.assertTrue(workspace.is_dir())
+                self.assertTrue(
+                    (workspace / ".ubitech-agent-scope.json").is_file()
+                )
+            finally:
+                db.close()
+
+    def test_missing_p1_marker_retries_after_link_durability_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+                marker.unlink()
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                real_link = secure_fs._link_anonymous_file_at
+                real_fsync = secure_fs.os.fsync
+                linked = False
+                failed = False
+
+                def link_then_arm(file_fd, parent_fd, name):
+                    nonlocal linked
+                    result = real_link(file_fd, parent_fd, name)
+                    if name == marker.name:
+                        linked = True
+                    return result
+
+                def fail_first_post_link_fsync(fd):
+                    nonlocal failed
+                    if linked and not failed:
+                        failed = True
+                        raise OSError("simulated post-link durability failure")
+                    return real_fsync(fd)
+
+                with mock.patch.object(
+                    secure_fs,
+                    "_link_anonymous_file_at",
+                    side_effect=link_then_arm,
+                ), mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=fail_first_post_link_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "publication was not durable",
+                    ):
+                        candidate.commit_schema_upgrade()
+
+                published = marker.stat()
+                candidate.commit_schema_upgrade()
+                self.assertEqual(
+                    (marker.stat().st_dev, marker.stat().st_ino),
+                    (published.st_dev, published.st_ino),
+                )
+                self.assertEqual(
+                    json.loads(marker.read_text(encoding="utf-8"))["schema_version"],
+                    1,
+                )
+            finally:
+                db.close()
+
+    def test_legacy_p1_marker_retries_after_old_inode_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+                current = json.loads(marker.read_text(encoding="utf-8"))
+                legacy = {
+                    key: current[key]
+                    for key in (
+                        "scope_key",
+                        "scope_type",
+                        "scope_id",
+                        "lifecycle_id",
+                        "sandbox_id",
+                        "workspace_id",
+                        "isolation",
+                    )
+                }
+                marker.write_text(
+                    json.dumps(legacy, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                marker.chmod(0o600)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                real_unlink = secure_fs.os.unlink
+                failed = False
+
+                def fail_first_old_inode_cleanup(name, *args, **kwargs):
+                    nonlocal failed
+                    if (
+                        not failed
+                        and isinstance(name, str)
+                        and name.startswith(".platform-machine-scope-")
+                    ):
+                        failed = True
+                        raise OSError("simulated old inode cleanup failure")
+                    return real_unlink(name, *args, **kwargs)
+
+                with mock.patch.object(
+                    secure_fs.os,
+                    "unlink",
+                    side_effect=fail_first_old_inode_cleanup,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "publication was not durable",
+                    ):
+                        candidate.commit_schema_upgrade()
+
+                published = marker.stat()
+                self.assertEqual(
+                    len(list(config.data_dir.glob(".platform-machine-scope-*.stage"))),
+                    1,
+                )
+                candidate.commit_schema_upgrade()
+                self.assertEqual(
+                    (marker.stat().st_dev, marker.stat().st_ino),
+                    (published.st_dev, published.st_ino),
+                )
+                self.assertEqual(
+                    list(config.data_dir.glob(".platform-machine-scope-*.stage")),
+                    [],
+                )
+            finally:
+                db.close()
+
+    def test_unmaterialized_p1_commit_rejects_workspace_replacement_after_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                workspace = Path(scope.workspace_path)
+                shutil.rmtree(workspace.parent)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                displaced = workspace.parent / "channel-1-created-away"
+                real_write = candidate._write_scope_marker
+
+                def write_then_replace(marker_scope, **kwargs):
+                    real_write(marker_scope, **kwargs)
+                    workspace.rename(displaced)
+                    workspace.mkdir(mode=0o700)
+
+                with mock.patch.object(
+                    candidate,
+                    "_write_scope_marker",
+                    side_effect=write_then_replace,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "changed during schema commit",
+                    ):
+                        candidate.commit_schema_upgrade()
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "could not be committed safely",
+                ):
+                    candidate.commit_schema_upgrade()
+                self.assertTrue(
+                    (displaced / ".ubitech-agent-scope.json").is_file()
+                )
+                self.assertFalse(
+                    (workspace / ".ubitech-agent-scope.json").exists()
+                )
+            finally:
+                db.close()
+
+    def test_p1_commit_never_recreates_a_candidate_observed_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                workspace = Path(scope.workspace_path)
+                sentinel = workspace / "user-file.txt"
+                sentinel.write_text("preserve", encoding="utf-8")
+                displaced = workspace.with_name("user-1-displaced")
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                workspace.rename(displaced)
+
+                for _ in range(2):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "could not be committed safely",
+                    ):
+                        candidate.commit_schema_upgrade()
+                    self.assertFalse(workspace.exists())
+                    self.assertEqual(
+                        (displaced / sentinel.name).read_text(encoding="utf-8"),
+                        "preserve",
+                    )
+            finally:
+                db.close()
+
+    def test_p1_commit_rejects_an_externally_materialized_missing_prefix_on_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                channel_root.mkdir(mode=0o700)
+
+                for _ in range(2):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "could not be committed safely",
+                    ):
+                        candidate.commit_schema_upgrade()
+                self.assertTrue(channel_root.is_dir())
+                self.assertFalse(Path(scope.workspace_path).exists())
+            finally:
+                db.close()
+
+    def test_non_p1_candidate_rejects_unmaterialized_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "workspace directory is missing",
+                ):
+                    AgentScopeManager(
+                        config,
+                        db,
+                        commit_schema_upgrade=False,
+                    )
+                self.assertFalse(channel_root.exists())
+            finally:
+                db.close()
+
+    def test_current_scope_reads_reject_marker_deletion_or_legacy_downgrade(self):
+        for cached, marker_state in (
+            (True, "missing"),
+            (False, "legacy"),
+        ):
+            with self.subTest(cached=cached, marker_state=marker_state):
+                with tempfile.TemporaryDirectory() as td:
+                    config = make_config(Path(td))
+                    db = Database(config.db_path)
+                    try:
+                        manager = AgentScopeManager(config, db)
+                        scope = manager.ensure_private_scope(1)
+                        marker = (
+                            Path(scope.workspace_path)
+                            / ".ubitech-agent-scope.json"
+                        )
+                        if not cached:
+                            manager._scope_cache.clear()
+                        if marker_state == "missing":
+                            marker.unlink()
+                            expected = "scope marker is missing"
+                        else:
+                            current = json.loads(marker.read_text(encoding="utf-8"))
+                            legacy = {
+                                key: current[key]
+                                for key in (
+                                    "scope_key",
+                                    "scope_type",
+                                    "scope_id",
+                                    "lifecycle_id",
+                                    "sandbox_id",
+                                    "workspace_id",
+                                    "isolation",
+                                )
+                            }
+                            marker.write_text(
+                                json.dumps(legacy, sort_keys=True) + "\n",
+                                encoding="utf-8",
+                            )
+                            marker.chmod(0o600)
+                            expected = "scope marker does not match"
+
+                        with self.assertRaisesRegex(sqlite3.DatabaseError, expected):
+                            manager.ensure_private_scope(1)
+                        if marker_state == "missing":
+                            self.assertFalse(marker.exists())
+                        else:
+                            self.assertEqual(
+                                json.loads(marker.read_text(encoding="utf-8")),
+                                legacy,
+                            )
+                    finally:
+                        db.close()
+
+    def test_rotate_session_rejects_deleted_or_legacy_marker_without_db_writes(self):
+        for marker_state in ("missing", "legacy"):
+            with self.subTest(marker_state=marker_state):
+                with tempfile.TemporaryDirectory() as td:
+                    config = make_config(Path(td))
+                    db = Database(config.db_path)
+                    try:
+                        manager = AgentScopeManager(config, db)
+                        scope = manager.ensure_private_scope(1)
+                        marker = (
+                            Path(scope.workspace_path)
+                            / ".ubitech-agent-scope.json"
+                        )
+                        before = db.query_one(
+                            "SELECT session_id, lifecycle_id, updated_at "
+                            "FROM agent_runtime_scopes WHERE scope_key = ?",
+                            (scope.scope_key,),
+                        )
+                        aliases_before = db.scalar(
+                            "SELECT COUNT(*) FROM agent_runtime_scope_sessions "
+                            "WHERE scope_key = ?",
+                            (scope.scope_key,),
+                        )
+                        if marker_state == "missing":
+                            marker.unlink()
+                            expected = "scope marker is missing"
+                            marker_bytes = None
+                        else:
+                            current = json.loads(marker.read_text(encoding="utf-8"))
+                            legacy = {
+                                key: current[key]
+                                for key in (
+                                    "scope_key",
+                                    "scope_type",
+                                    "scope_id",
+                                    "lifecycle_id",
+                                    "sandbox_id",
+                                    "workspace_id",
+                                    "isolation",
+                                )
+                            }
+                            marker_bytes = (
+                                json.dumps(legacy, sort_keys=True) + "\n"
+                            ).encode("utf-8")
+                            marker.write_bytes(marker_bytes)
+                            marker.chmod(0o600)
+                            expected = "scope marker does not match"
+
+                        with self.assertRaisesRegex(sqlite3.DatabaseError, expected):
+                            manager.rotate_session(scope.scope_key)
+                        self.assertEqual(
+                            db.query_one(
+                                "SELECT session_id, lifecycle_id, updated_at "
+                                "FROM agent_runtime_scopes WHERE scope_key = ?",
+                                (scope.scope_key,),
+                            ),
+                            before,
+                        )
+                        self.assertEqual(
+                            db.scalar(
+                                "SELECT COUNT(*) FROM agent_runtime_scope_sessions "
+                                "WHERE scope_key = ?",
+                                (scope.scope_key,),
+                            ),
+                            aliases_before,
+                        )
+                        if marker_bytes is None:
+                            self.assertFalse(marker.exists())
+                        else:
+                            self.assertEqual(marker.read_bytes(), marker_bytes)
+                    finally:
+                        db.close()
+
+    def test_existing_scope_never_repairs_missing_or_wrong_mode_workspace(self):
+        for cached in (True, False):
+            for workspace_state in ("missing", "wrong-mode"):
+                with self.subTest(cached=cached, workspace_state=workspace_state):
+                    with tempfile.TemporaryDirectory() as td:
+                        config = make_config(Path(td))
+                        db = Database(config.db_path)
+                        try:
+                            manager = AgentScopeManager(config, db)
+                            scope = manager.ensure_private_scope(1)
+                            workspace = Path(scope.workspace_path)
+                            before = db.query_one(
+                                "SELECT * FROM agent_scopes WHERE scope_key = ?",
+                                (scope.scope_key,),
+                            )
+                            if not cached:
+                                manager._scope_cache.clear()
+                            if workspace_state == "missing":
+                                shutil.rmtree(workspace)
+                                expected = "workspace directory is missing"
+                            else:
+                                workspace.chmod(0o755)
+                                expected = "workspace directory has unsafe metadata"
+
+                            with self.assertRaisesRegex(
+                                sqlite3.DatabaseError,
+                                expected,
+                            ):
+                                manager.ensure_private_scope(1)
+                            self.assertEqual(
+                                db.query_one(
+                                    "SELECT * FROM agent_scopes WHERE scope_key = ?",
+                                    (scope.scope_key,),
+                                ),
+                                before,
+                            )
+                            if workspace_state == "missing":
+                                self.assertFalse(workspace.exists())
+                            else:
+                                self.assertEqual(
+                                    workspace.stat().st_mode & 0o777,
+                                    0o755,
+                                )
+                        finally:
+                            db.close()
+
+    def test_rotate_session_never_repairs_missing_or_wrong_mode_workspace(self):
+        for workspace_state in ("missing", "wrong-mode"):
+            with self.subTest(workspace_state=workspace_state):
+                with tempfile.TemporaryDirectory() as td:
+                    config = make_config(Path(td))
+                    db = Database(config.db_path)
+                    try:
+                        manager = AgentScopeManager(config, db)
+                        scope = manager.ensure_private_scope(1)
+                        workspace = Path(scope.workspace_path)
+                        before = db.query_one(
+                            "SELECT * FROM agent_runtime_scopes WHERE scope_key = ?",
+                            (scope.scope_key,),
+                        )
+                        if workspace_state == "missing":
+                            shutil.rmtree(workspace)
+                            expected = "workspace directory is missing"
+                        else:
+                            workspace.chmod(0o755)
+                            expected = "workspace directory has unsafe metadata"
+
+                        with self.assertRaisesRegex(sqlite3.DatabaseError, expected):
+                            manager.rotate_session(scope.scope_key)
+                        self.assertEqual(
+                            db.query_one(
+                                "SELECT * FROM agent_runtime_scopes WHERE scope_key = ?",
+                                (scope.scope_key,),
+                            ),
+                            before,
+                        )
+                        if workspace_state == "missing":
+                            self.assertFalse(workspace.exists())
+                        else:
+                            self.assertEqual(
+                                workspace.stat().st_mode & 0o777,
+                                0o755,
+                            )
+                    finally:
+                        db.close()
 
     def test_scope_uses_stable_sandbox_identity_and_relative_database_workspace(self):
         with tempfile.TemporaryDirectory() as td:
@@ -596,8 +1420,8 @@ class AgentScopeSessionTests(unittest.TestCase):
                 workspace.symlink_to(escape, target_is_directory=True)
 
                 with self.assertRaisesRegex(
-                    ValueError,
-                    "outside the managed workspace root|must not contain symlink",
+                    sqlite3.DatabaseError,
+                    "workspace directory has unsafe metadata",
                 ):
                     manager.ensure_private_scope(1)
             finally:

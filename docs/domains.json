@@ -252,9 +252,14 @@
       "id": "release-transition",
       "source": "docs/contracts/release-transition.json",
       "domains": [
-        "deployment"
+        "deployment",
+        "platform"
       ],
       "targets": [
+        {
+          "path": "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py",
+          "format": "python-release-transition"
+        },
         {
           "path": "manager/internal/contract/release_transition_generated.go",
           "format": "go-release-transition"

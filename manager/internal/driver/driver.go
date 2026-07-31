@@ -173,6 +173,13 @@ type Engine interface {
 	ExecArgs(SandboxSpec, string, string, []string) (string, []string)
 }
 
+// FreshInstallDataPreparer owns the sole path that may create a missing
+// workspace root. Ordinary migration/start paths only validate the root, so an
+// update cannot conceal source-data damage before candidate readiness.
+type FreshInstallDataPreparer interface {
+	PrepareFreshInstallDataLayout() error
+}
+
 type FixedServiceState struct {
 	Status string `json:"status"`
 }
@@ -2199,11 +2206,18 @@ func (d DockerCLI) controlDirectory() string {
 	return filepath.Join(d.StateDir, "control")
 }
 func (d DockerCLI) ensureDataLayout() error {
+	workspaceRoot := filepath.Join(d.DataRoot, "data", "workspaces")
 	directories := []string{filepath.Join(d.DataRoot, "data"), filepath.Join(d.DataRoot, "data", "runtimes", "agent"), filepath.Join(d.DataRoot, "data", "runtimes", "camofox"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "config"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "cache"), filepath.Join(d.DataRoot, "data", "runtimes", "firecrawl")}
 	for _, path := range directories {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
 		}
+	}
+	// Every non-install path is validation-only. A missing root is data damage,
+	// not a directory that an update may silently recreate before the candidate
+	// Platform inspects it.
+	if err := validateExactOwnerDirectory(workspaceRoot); err != nil {
+		return fmt.Errorf("validate Agent workspace root: %w", err)
 	}
 	settings := filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "config", "settings.yml")
 	if _, err := os.Stat(settings); os.IsNotExist(err) {
@@ -2217,6 +2231,50 @@ func (d DockerCLI) ensureDataLayout() error {
 		}
 	} else if err != nil {
 		return err
+	}
+	return nil
+}
+
+// PrepareFreshInstallDataLayout is called only after the Orchestrator proves
+// OperationInstall with no Current generation. It is intentionally separate
+// from ensureDataLayout, which is shared by update/recovery paths.
+func (d DockerCLI) PrepareFreshInstallDataLayout() error {
+	dataRoot := filepath.Join(d.DataRoot, "data")
+	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+		return fmt.Errorf("prepare fresh-install data root: %w", err)
+	}
+	workspaceRoot := filepath.Join(dataRoot, "workspaces")
+	if err := createExactOwnerDirectory(workspaceRoot); err != nil {
+		return fmt.Errorf("prepare fresh-install Agent workspace root: %w", err)
+	}
+	return nil
+}
+
+func createExactOwnerDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return fmt.Errorf("create private directory %s: %w", path, err)
+		}
+		info, err = os.Lstat(path)
+	}
+	return validateExactOwnerDirectoryInfo(path, info, err)
+}
+
+func validateExactOwnerDirectory(path string) error {
+	info, err := os.Lstat(path)
+	return validateExactOwnerDirectoryInfo(path, info, err)
+}
+
+func validateExactOwnerDirectoryInfo(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return fmt.Errorf("inspect private directory %s: %w", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || !ok ||
+		stat.Uid != uint32(os.Getuid()) || stat.Gid != uint32(os.Getgid()) ||
+		info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("private directory %s does not have exact owner-only metadata", path)
 	}
 	return nil
 }

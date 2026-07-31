@@ -57,6 +57,49 @@ func TestBoundComposeIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
 	}
 }
 
+func TestFreshInstallCreatesWorkspaceRootAndSharedLayoutOnlyValidatesIt(t *testing.T) {
+	root := t.TempDir()
+	docker := DockerCLI{DataRoot: root}
+	workspaceRoot := filepath.Join(root, "data", "workspaces")
+	if err := docker.ensureDataLayout(); err == nil || !strings.Contains(err.Error(), "validate Agent workspace root") {
+		t.Fatalf("ordinary layout unexpectedly created a missing workspace root: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRoot); !os.IsNotExist(err) {
+		t.Fatalf("ordinary layout mutated the missing workspace root: %v", err)
+	}
+	if err := docker.PrepareFreshInstallDataLayout(); err != nil {
+		t.Fatal(err)
+	}
+	if err := docker.ensureDataLayout(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(workspaceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		t.Fatalf("workspace root has unsafe metadata: %v", info.Mode())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Getuid()) {
+		t.Fatalf("workspace root is not Manager-owned: %#v", info.Sys())
+	}
+
+	if err := os.Chmod(workspaceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := docker.ensureDataLayout(); err == nil || !strings.Contains(err.Error(), "exact owner-only metadata") {
+		t.Fatalf("unsafe existing workspace root was repaired or accepted: %v", err)
+	}
+	info, err = os.Lstat(workspaceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("unsafe existing workspace root was mutated: mode=%v", info.Mode())
+	}
+}
+
 func TestBoundManifestIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
 	root := t.TempDir()
 	manifest := strictDriverManifest(strings.Repeat("a", 40))
@@ -761,6 +804,9 @@ func TestStartFixedOnlyStartsCoreServices(t *testing.T) {
 		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
 		StateDir: stateDir, CoreNetwork: "ubitech-agent-core",
 	}
+	if err := docker.PrepareFreshInstallDataLayout(); err != nil {
+		t.Fatal(err)
+	}
 	if err := docker.StartFixed(context.Background(), release.Manifest{SourceCommit: generation, Images: map[string]string{}}); err != nil {
 		t.Fatalf("StartFixed() failed to start core services: %v", err)
 	}
@@ -893,6 +939,9 @@ func TestStartFixedPreservesPrepublishedGenerationInventory(t *testing.T) {
 		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
 		StateDir: stateDir, CoreNetwork: "ubitech-agent-core",
 		UID: os.Getuid(), GID: os.Getgid(),
+	}
+	if err := docker.PrepareFreshInstallDataLayout(); err != nil {
+		t.Fatal(err)
 	}
 	manifest := release.Manifest{SourceCommit: generation, Images: map[string]string{}}
 	environment, err := docker.writeGenerationEnvironment(manifest)
@@ -1117,6 +1166,9 @@ func TestMigrateUsesManagedIdentityAndCleansAfterRunnerFailure(t *testing.T) {
 	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: root, DataRoot: filepath.Join(root, "data-root"), StateDir: filepath.Join(root, "state"),
+	}
+	if err := docker.PrepareFreshInstallDataLayout(); err != nil {
+		t.Fatal(err)
 	}
 	manifest := release.Manifest{SourceCommit: generation, Images: map[string]string{}}
 	err := docker.Migrate(context.Background(), manifest)

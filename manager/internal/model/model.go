@@ -54,6 +54,13 @@ const (
 	ReservationReleaseUncertain    ReservationStatus = "release_uncertain"
 )
 
+type GateSettlementAction string
+
+const (
+	GateSettlementCommit GateSettlementAction = "commit"
+	GateSettlementAbort  GateSettlementAction = "abort"
+)
+
 type Generation struct {
 	ID                   string            `json:"id"`
 	ManifestPath         string            `json:"manifest_path,omitempty"`
@@ -97,30 +104,31 @@ type PhaseEvent struct {
 }
 
 type Operation struct {
-	SchemaVersion             int               `json:"schema_version"`
-	ID                        string            `json:"id"`
-	Kind                      OperationKind     `json:"kind"`
-	IdempotencyKey            string            `json:"idempotency_key"`
-	Attempt                   int               `json:"attempt"`
-	ExpectedGeneration        uint64            `json:"expected_generation"`
-	TargetManifestURL         string            `json:"target_manifest_url,omitempty"`
-	TargetGeneration          string            `json:"target_generation,omitempty"`
-	Status                    OperationStatus   `json:"status"`
-	Finalized                 bool              `json:"finalized"`
-	Retryable                 bool              `json:"retryable,omitempty"`
-	Phase                     OperationPhase    `json:"phase"`
-	ReservationStatus         ReservationStatus `json:"reservation_status,omitempty"`
-	SnapshotPath              string            `json:"snapshot_path,omitempty"`
-	SnapshotRestored          bool              `json:"snapshot_restored,omitempty"`
-	ReservationReleased       bool              `json:"reservation_released,omitempty"`
-	PreparedCleanupPending    bool              `json:"prepared_cleanup_pending,omitempty"`
-	ManagerActivationRollback bool              `json:"manager_activation_rollback,omitempty"`
-	ManagerRollbackGeneration string            `json:"manager_rollback_generation,omitempty"`
-	Error                     string            `json:"error,omitempty"`
-	History                   []PhaseEvent      `json:"history"`
-	CreatedAt                 time.Time         `json:"created_at"`
-	UpdatedAt                 time.Time         `json:"updated_at"`
-	CompletedAt               *time.Time        `json:"completed_at,omitempty"`
+	SchemaVersion             int                  `json:"schema_version"`
+	ID                        string               `json:"id"`
+	Kind                      OperationKind        `json:"kind"`
+	IdempotencyKey            string               `json:"idempotency_key"`
+	Attempt                   int                  `json:"attempt"`
+	ExpectedGeneration        uint64               `json:"expected_generation"`
+	TargetManifestURL         string               `json:"target_manifest_url,omitempty"`
+	TargetGeneration          string               `json:"target_generation,omitempty"`
+	Status                    OperationStatus      `json:"status"`
+	Finalized                 bool                 `json:"finalized"`
+	Retryable                 bool                 `json:"retryable,omitempty"`
+	Phase                     OperationPhase       `json:"phase"`
+	ReservationStatus         ReservationStatus    `json:"reservation_status,omitempty"`
+	SnapshotPath              string               `json:"snapshot_path,omitempty"`
+	SnapshotRestored          bool                 `json:"snapshot_restored,omitempty"`
+	ReservationReleased       bool                 `json:"reservation_released,omitempty"`
+	GateSettlementAction      GateSettlementAction `json:"gate_settlement_action,omitempty"`
+	PreparedCleanupPending    bool                 `json:"prepared_cleanup_pending,omitempty"`
+	ManagerActivationRollback bool                 `json:"manager_activation_rollback,omitempty"`
+	ManagerRollbackGeneration string               `json:"manager_rollback_generation,omitempty"`
+	Error                     string               `json:"error,omitempty"`
+	History                   []PhaseEvent         `json:"history"`
+	CreatedAt                 time.Time            `json:"created_at"`
+	UpdatedAt                 time.Time            `json:"updated_at"`
+	CompletedAt               *time.Time           `json:"completed_at,omitempty"`
 }
 
 type OperationRequest struct {

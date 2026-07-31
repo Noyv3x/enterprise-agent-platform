@@ -540,6 +540,40 @@ class DocsSyncTests(unittest.TestCase):
         policy = self.run_command("sync", expect=1)
         self.assertIn("direct-predecessor draft gates", policy.stderr)
 
+    def test_release_transition_generates_python_p1_compatibility_identity(self) -> None:
+        self.initialize_git()
+        manifest = self.manifest()
+        manifest["contracts"].append(  # type: ignore[index,union-attr]
+            {
+                "id": "release-transition",
+                "source": "docs/contracts/release-transition.json",
+                "domains": ["deployment", "platform"],
+                "targets": [
+                    {
+                        "path": "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py",
+                        "format": "python-release-transition",
+                    },
+                    {
+                        "path": "manager/internal/contract/release_transition_generated.go",
+                        "format": "go-release-transition",
+                    },
+                ],
+            }
+        )
+        self.write_fixture(manifest)
+
+        self.run_command("sync", expect=0)
+        generated = (
+            self.root
+            / "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RELEASE_TRANSITION_STAGE = 'source_owner'", generated)
+        self.assertIn(
+            "SOURCE_OWNER_COMPAT_GENERATION = "
+            "'983f79b4900502f35fac6de8154eb344fc9f143b'",
+            generated,
+        )
+
     def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:
         self.initialize_git()
         self.write_fixture()

@@ -436,6 +436,7 @@ func TestRetainedSourcePredecessorRestartCompletesThroughLegacyAbortEndpoint(t *
 	wantPaths := []string{
 		"/internal/manager/update/readiness", "/internal/manager/update/readiness",
 		"/internal/manager/update/abort-release", "/internal/manager/update/release",
+		"/internal/manager/update/abort-release", "/internal/manager/update/release",
 	}
 	if !reflect.DeepEqual(paths, wantPaths) {
 		t.Fatalf("paths=%v, want %v", paths, wantPaths)

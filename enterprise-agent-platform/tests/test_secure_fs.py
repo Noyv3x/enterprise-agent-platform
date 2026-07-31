@@ -10,6 +10,7 @@ from unittest import mock
 from enterprise_agent_platform import secure_fs
 from enterprise_agent_platform.secure_fs import (
     UnsafePrivatePathError,
+    ensure_private_child_directory_fd,
     ensure_private_directory,
     ensure_private_file,
     open_private_directory_fd,
@@ -21,6 +22,251 @@ from enterprise_agent_platform.secure_fs import (
 
 
 class SecureFilesystemTests(unittest.TestCase):
+    def test_child_directory_eexist_cleans_stage_and_retry_stays_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+
+            def publish_competing_final(_left_fd, _left_name, right_fd, right_name):
+                os.mkdir(right_name, mode=0o700, dir_fd=right_fd)
+                raise FileExistsError(right_name)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=publish_competing_final,
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafePrivatePathError,
+                        "appeared during publication",
+                    ):
+                        ensure_private_child_directory_fd(
+                            root_fd,
+                            "child",
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                        )
+                self.assertFalse((staging / "child.stage").exists())
+                with self.assertRaisesRegex(
+                    UnsafePrivatePathError,
+                    "appeared before publication",
+                ):
+                    ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                    )
+                self.assertFalse((staging / "child.stage").exists())
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+
+    def test_child_directory_existing_identity_consumes_exact_empty_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            (staging / "child.stage").mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            returned_fd: int | None = None
+            try:
+                returned_fd = ensure_private_child_directory_fd(
+                    root_fd,
+                    "child",
+                    staging_fd=staging_fd,
+                    staging_name="child.stage",
+                    expected_existing_identity=identity,
+                )
+                self.assertFalse((staging / "child.stage").exists())
+                opened = os.fstat(returned_fd)
+                self.assertEqual((opened.st_dev, opened.st_ino), identity)
+            finally:
+                if returned_fd is not None:
+                    os.close(returned_fd)
+                os.close(staging_fd)
+                os.close(root_fd)
+
+    def test_child_directory_never_consumes_nonempty_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staged = staging / "child.stage"
+            staging.mkdir(mode=0o700)
+            staged.mkdir(mode=0o700)
+            (staged / "sentinel").write_text("keep", encoding="utf-8")
+            (staged / "sentinel").chmod(0o600)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            try:
+                with self.assertRaisesRegex(
+                    UnsafePrivatePathError,
+                    "staging is not empty",
+                ):
+                    ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                        expected_existing_identity=identity,
+                    )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual(
+                (staged / "sentinel").read_text(encoding="utf-8"),
+                "keep",
+            )
+
+    def test_child_directory_never_consumes_stage_with_unsafe_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staged = staging / "child.stage"
+            staging.mkdir(mode=0o700)
+            staged.mkdir(mode=0o700)
+            staged.chmod(0o755)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            try:
+                with self.assertRaisesRegex(
+                    UnsafePrivatePathError,
+                    "unsafe mode",
+                ):
+                    ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                        expected_existing_identity=identity,
+                    )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertTrue(staged.is_dir())
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o755)
+
+    def test_child_directory_never_consumes_replaced_stage_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staged = staging / "child.stage"
+            displaced = staging / "child.stage.displaced"
+            staging.mkdir(mode=0o700)
+            staged.mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            real_verify = secure_fs.verify_private_child_directory_fd
+            verify_calls = 0
+
+            def replace_before_cleanup(parent_fd, name, child_fd, *, mode=0o700):
+                nonlocal verify_calls
+                verify_calls += 1
+                if verify_calls == 3:
+                    staged.rename(displaced)
+                    staged.mkdir(mode=0o700)
+                return real_verify(parent_fd, name, child_fd, mode=mode)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "verify_private_child_directory_fd",
+                    side_effect=replace_before_cleanup,
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafePrivatePathError,
+                        "changed identity",
+                    ):
+                        ensure_private_child_directory_fd(
+                            root_fd,
+                            "child",
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                            expected_existing_identity=identity,
+                        )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertTrue(staged.is_dir())
+            self.assertTrue(displaced.is_dir())
+
+    def test_child_directory_creation_never_repairs_an_existing_entry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            child.chmod(0o755)
+            root_fd = open_private_directory_fd(root)
+            try:
+                with self.assertRaises(UnsafePrivatePathError):
+                    ensure_private_child_directory_fd(root_fd, child.name)
+            finally:
+                os.close(root_fd)
+            self.assertEqual(child.stat().st_mode & 0o777, 0o755)
+
+    def test_child_directory_creation_rejects_replacement_before_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            displaced = root / "child-created-away"
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            real_rename = secure_fs._rename_noreplace
+
+            def rename_then_replace(left_fd, left_name, right_fd, right_name):
+                real_rename(left_fd, left_name, right_fd, right_name)
+                child.rename(displaced)
+                child.mkdir(mode=0o755)
+                child.chmod(0o755)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=rename_then_replace,
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafePrivatePathError,
+                        "unsafe mode|changed identity",
+                    ):
+                        ensure_private_child_directory_fd(
+                            root_fd,
+                            child.name,
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                        )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual(child.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(displaced.stat().st_mode & 0o777, 0o700)
+
     def test_atomic_support_check_never_exchanges_existing_probe_names(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

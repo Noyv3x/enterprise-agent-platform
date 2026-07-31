@@ -724,6 +724,7 @@ def load_manifest(root: Path) -> Manifest:
                 "typescript-container-platform",
                 "go-container-platform",
                 "go-release-transition",
+                "python-release-transition",
             }:
                 raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
             _reject_symlink_chain(root, target_path, f"{target_label}.path")
@@ -2253,6 +2254,22 @@ var SourceOwnerCompatManagedImages = []string{{{images}}}
 '''
 
 
+def _render_python_release_transition(
+    contract: dict[str, Any], source: str
+) -> str:
+    compat = contract.get("source_owner_compat")
+    compat_generation = compat["generation"] if compat is not None else None
+    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
+from __future__ import annotations
+
+RELEASE_TRANSITION_STAGE = {contract["stage"]!r}
+PREDECESSOR_GENERATION = {contract["predecessor_generation"]!r}
+SOURCE_PROFILE_ID = {contract["source_profile_id"]!r}
+TARGET_PROFILE_ID = {contract["target_profile_id"]!r}
+SOURCE_OWNER_COMPAT_GENERATION = {compat_generation!r}
+'''
+
+
 def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     contract = _expect_object(raw, label)
     _reject_unknown_keys(contract, {"schema_version", "sources"}, label)
@@ -2358,6 +2375,8 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_go_container_platform(parsed, contract.source)
         elif target.format == "go-release-transition":
             content = _render_go_release_transition(parsed, contract.source)
+        elif target.format == "python-release-transition":
+            content = _render_python_release_transition(parsed, contract.source)
         else:  # Protected by manifest validation; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -11,9 +13,15 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform.agent_runtime_client import AgentResult
+from enterprise_agent_platform.agent_scopes import AgentScopeManager
+from enterprise_agent_platform.camofox_state import ensure_camofox_runtime_sidecar
 from enterprise_agent_platform.config import PlatformConfig
+from enterprise_agent_platform.db import Database
 from enterprise_agent_platform.learning import LEARNING_REVIEW_JOB_KIND
 from enterprise_agent_platform.manager_client import ManagerClientError
+from enterprise_agent_platform.release_transition_contract_generated import (
+    SOURCE_OWNER_COMPAT_GENERATION,
+)
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
     EnterpriseService,
@@ -52,6 +60,7 @@ class _ManagerStub:
             "active_operation_id": "",
             "finalize_pending_operation_id": "",
             "operation_id": "",
+            "gate_settlement": None,
             "current": {
                 "id": "release-current",
                 "source_commit": "a" * 40,
@@ -99,7 +108,7 @@ class _ManagerStub:
 
 
 def _config(data_dir: Path) -> PlatformConfig:
-    return PlatformConfig(
+    config = PlatformConfig(
         data_dir=data_dir,
         host="127.0.0.1",
         port=0,
@@ -120,6 +129,8 @@ def _config(data_dir: Path) -> PlatformConfig:
         agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
+    config.workspace_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return config
 
 
 def _container_config(data_dir: Path) -> PlatformConfig:
@@ -258,6 +269,7 @@ class ManagerUpdateControlTests(unittest.TestCase):
                     "active_operation_id": operation_id,
                     "finalize_pending_operation_id": "",
                     "operation_id": operation_id,
+                    "gate_settlement": None,
                 }
             ),
             operation_id,
@@ -267,15 +279,46 @@ class ManagerUpdateControlTests(unittest.TestCase):
                 {"active_operation_id": operation_id, "operation_id": operation_id}
             )
 
+    def test_gate_settlement_absence_is_only_accepted_for_exact_p1_boundary(self):
+        idle = dict(_ManagerStub().status_payload)
+        idle.pop("gate_settlement")
+        with self.assertRaisesRegex(ManagerClientError, "missing the Gate settlement"):
+            EnterpriseService._manager_startup_gate_settlement(idle)
+
+        explicit_null = dict(idle)
+        explicit_null["gate_settlement"] = None
+        self.assertIsNone(
+            EnterpriseService._manager_startup_gate_settlement(explicit_null)
+        )
+        self.assertEqual(
+            EnterpriseService._manager_startup_reservation_id(explicit_null), ""
+        )
+
+        operation_id = "op_" + "9" * 32
+        legacy = ServiceUpdateReservationTests._p1_status(operation_id)
+        self.assertNotIn("gate_settlement", legacy)
+        self.assertIsNone(
+            EnterpriseService._manager_startup_gate_settlement(legacy)
+        )
+        self.assertEqual(
+            EnterpriseService._manager_startup_reservation_id(legacy), operation_id
+        )
+
+        legacy["current"] = {"id": "b" * 40, "source_commit": "b" * 40}
+        with self.assertRaisesRegex(ManagerClientError, "missing the Gate settlement"):
+            EnterpriseService._manager_startup_gate_settlement(legacy)
+
     def test_handoff_commit_http_contract_is_authenticated_and_closed_world(self):
         operation_id = "handoff_" + "6" * 32
         target_generation = "7" * 40
         binding_sha256 = "8" * 64
         status = {
             "maintenance": True,
+            "public_state": "updating",
             "active_operation_id": operation_id,
             "finalize_pending_operation_id": "",
             "operation_id": operation_id,
+            "gate_settlement": None,
         }
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
@@ -399,10 +442,550 @@ class ServiceUpdateReservationTests(unittest.TestCase):
     def _handoff_status(operation_id: str) -> dict[str, object]:
         return {
             "maintenance": True,
+            "public_state": "updating",
             "active_operation_id": operation_id,
             "finalize_pending_operation_id": "",
             "operation_id": operation_id,
+            "gate_settlement": None,
         }
+
+    @staticmethod
+    def _p1_status(operation_id: str) -> dict[str, object]:
+        status = ServiceUpdateReservationTests._handoff_status(operation_id)
+        status.pop("gate_settlement")
+        status["current"] = {
+            "id": SOURCE_OWNER_COMPAT_GENERATION,
+            "source_commit": SOURCE_OWNER_COMPAT_GENERATION,
+        }
+        status["target"] = {
+            "id": "a" * 40,
+            "source_commit": "a" * 40,
+        }
+        return status
+
+    @staticmethod
+    def _post_switch_p1_status(operation_id: str) -> dict[str, object]:
+        target_generation = "a" * 40
+        return {
+            "maintenance": True,
+            "active_operation_id": "",
+            "finalize_pending_operation_id": operation_id,
+            "operation_id": operation_id,
+            "public_state": "updating",
+            "current": {
+                "id": target_generation,
+                "source_commit": target_generation,
+            },
+            "previous": {
+                "id": SOURCE_OWNER_COMPAT_GENERATION,
+                "source_commit": SOURCE_OWNER_COMPAT_GENERATION,
+            },
+            "target": None,
+            "workspace_schema_commit": {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "predecessor_generation": SOURCE_OWNER_COMPAT_GENERATION,
+                "target_generation": target_generation,
+            },
+            "gate_settlement": None,
+        }
+
+    @staticmethod
+    def _settled_status(operation_id: str, action: str) -> dict[str, object]:
+        generation = "c" * 40
+        return {
+            "maintenance": True,
+            "public_state": "updating",
+            "active_operation_id": "",
+            "finalize_pending_operation_id": operation_id,
+            "operation_id": operation_id,
+            "current": {"id": generation, "source_commit": generation},
+            "previous": None,
+            "target": None,
+            "workspace_schema_commit": None,
+            "gate_settlement": {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "action": action,
+            },
+        }
+
+    def test_settled_commit_restart_is_unreserved_and_second_gate_is_idempotent(self):
+        operation_id = "op_" + "a" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            baseline = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(),
+            )
+            baseline.close()
+
+            service = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(
+                    status=self._settled_status(operation_id, "commit")
+                ),
+            )
+            try:
+                self.assertFalse(service.platform_update_is_blocking())
+                self.assertEqual(service._auto_update_last_committed_id, operation_id)
+                with mock.patch.object(
+                    service.agent_scopes,
+                    "commit_schema_upgrade",
+                    side_effect=AssertionError("settled schema commit repeated"),
+                ), mock.patch(
+                    "enterprise_agent_platform.service.ensure_camofox_runtime_sidecar",
+                    side_effect=AssertionError("settled Camoufox commit repeated"),
+                ):
+                    self.assertEqual(
+                        service.manager_update_commit_release(operation_id),
+                        {"released": True},
+                    )
+            finally:
+                service.close()
+
+    def test_settled_abort_restart_reopens_only_current_in_memory_gate(self):
+        operation_id = "op_" + "b" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            baseline = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(),
+            )
+            baseline.close()
+
+            calls: list[bool] = []
+
+            def observe_sidecar(data_dir, *, commit_schema_upgrade=False):
+                calls.append(bool(commit_schema_upgrade))
+                return ensure_camofox_runtime_sidecar(
+                    data_dir, commit_schema_upgrade=commit_schema_upgrade
+                )
+
+            with mock.patch(
+                "enterprise_agent_platform.service.ensure_camofox_runtime_sidecar",
+                side_effect=observe_sidecar,
+            ):
+                service = EnterpriseService(
+                    config,
+                    agent_client=_BlockingAgent(),
+                    manager_client=_ManagerStub(
+                        status=self._settled_status(operation_id, "abort")
+                    ),
+                )
+            try:
+                self.assertEqual(calls, [False])
+                self.assertFalse(service.platform_update_is_blocking())
+                self.assertTrue(service.agent_scopes._schema_writes_enabled)
+                self.assertEqual(service._auto_update_last_released_id, operation_id)
+                self.assertEqual(
+                    service.manager_update_abort_release(operation_id),
+                    {"released": True},
+                )
+            finally:
+                service.close()
+
+    def test_gate_settlement_rejects_closed_world_and_slot_drift(self):
+        operation_id = "op_" + "c" * 32
+        mutations = {
+            "boolean schema": lambda status: status["gate_settlement"].__setitem__(
+                "schema_version", True
+            ),
+            "extra field": lambda status: status["gate_settlement"].__setitem__(
+                "extra", "unexpected"
+            ),
+            "wrong operation": lambda status: status["gate_settlement"].__setitem__(
+                "operation_id", "op_" + "d" * 32
+            ),
+            "wrong action": lambda status: status["gate_settlement"].__setitem__(
+                "action", "release"
+            ),
+            "active overlap": lambda status: status.__setitem__(
+                "active_operation_id", operation_id
+            ),
+            "candidate appeared": lambda status: status.__setitem__(
+                "target", {"id": "d" * 40, "source_commit": "d" * 40}
+            ),
+            "current drift": lambda status: status["current"].__setitem__(
+                "source_commit", "d" * 40
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                status = self._settled_status(operation_id, "commit")
+                mutate(status)
+                with self.assertRaisesRegex(ManagerClientError, "settlement"):
+                    EnterpriseService._manager_startup_gate_settlement(status)
+
+    def test_exact_p1_reservation_materializes_workspace_only_at_commit(self):
+        operation_id = "op_" + "1" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                workspace = Path(scope.workspace_path)
+                channel_root = workspace.parent
+                shutil.rmtree(channel_root)
+                db.execute(
+                    "DELETE FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                    (scope.scope_key,),
+                )
+            finally:
+                db.close()
+
+            service = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(status=self._p1_status(operation_id)),
+            )
+            try:
+                self.assertFalse(channel_root.exists())
+                self.assertIsNone(
+                    service.db.query_one(
+                        "SELECT 1 FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                        (scope.scope_key,),
+                    )
+                )
+
+                self.assertEqual(
+                    service.manager_update_commit_release(operation_id),
+                    {"released": True},
+                )
+                self.assertEqual(channel_root.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
+                marker = workspace / ".ubitech-agent-scope.json"
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    json.loads(marker.read_text(encoding="utf-8"))["scope_key"],
+                    scope.scope_key,
+                )
+                self.assertIsNotNone(
+                    service.db.query_one(
+                        "SELECT 1 FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                        (scope.scope_key,),
+                    )
+                )
+            finally:
+                service.close()
+
+    def test_exact_p1_abort_keeps_unmaterialized_workspace_absent(self):
+        operation_id = "op_" + "3" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+            finally:
+                db.close()
+
+            service = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(status=self._p1_status(operation_id)),
+            )
+            try:
+                with mock.patch.object(
+                    service,
+                    "_resume_deferred_background_workers",
+                    side_effect=AssertionError("P1 abort resumed background workers"),
+                ), mock.patch.object(
+                    service,
+                    "_start_deferred_agent_workers_locked",
+                    side_effect=AssertionError("P1 abort resumed Agent workers"),
+                ):
+                    self.assertEqual(
+                        service.manager_update_abort_release(operation_id),
+                        {"released": True},
+                    )
+                    self.assertEqual(
+                        service.manager_update_abort_release(operation_id),
+                        {"released": True},
+                    )
+                self.assertFalse(channel_root.exists())
+                self.assertTrue(service.platform_update_is_blocking())
+                self.assertEqual(
+                    service._auto_update_reservation_id,
+                    operation_id,
+                )
+                self.assertFalse(service.agent_scopes._schema_writes_enabled)
+            finally:
+                service.close()
+
+    def test_exact_p1_abort_quiescence_is_rederived_after_platform_restart(self):
+        operation_id = "op_" + "e" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+            finally:
+                db.close()
+
+            status = self._p1_status(operation_id)
+            first = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(status=status),
+            )
+            try:
+                self.assertEqual(
+                    first.manager_update_abort_release(operation_id),
+                    {"released": True},
+                )
+                self.assertTrue(first.platform_update_is_blocking())
+            finally:
+                first.close()
+
+            restarted = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(status=status),
+            )
+            try:
+                self.assertTrue(restarted.platform_update_is_blocking())
+                self.assertTrue(
+                    restarted.agent_scopes.abort_requires_process_quiescence()
+                )
+                self.assertEqual(
+                    restarted.manager_update_abort_release(operation_id),
+                    {"released": True},
+                )
+                self.assertTrue(restarted.platform_update_is_blocking())
+                self.assertFalse(channel_root.exists())
+            finally:
+                restarted.close()
+
+    def test_p1_workspace_commit_resumes_across_platform_restart(self):
+        operation_id = "op_" + "4" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                scopes = [
+                    manager.ensure_channel_scope(1),
+                    manager.ensure_channel_scope(2),
+                ]
+                channel_root = Path(scopes[0].workspace_path).parent
+                shutil.rmtree(channel_root)
+                for scope in scopes:
+                    db.execute(
+                        "DELETE FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                        (scope.scope_key,),
+                    )
+            finally:
+                db.close()
+
+            first = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(status=self._p1_status(operation_id)),
+            )
+            real_write = first.agent_scopes._write_scope_marker
+            marker_writes = 0
+
+            def fail_after_first_marker(scope, **kwargs):
+                nonlocal marker_writes
+                real_write(scope, **kwargs)
+                marker_writes += 1
+                if marker_writes == 1:
+                    raise RuntimeError("simulated process loss after first marker")
+
+            try:
+                with mock.patch.object(
+                    first.agent_scopes,
+                    "_write_scope_marker",
+                    side_effect=fail_after_first_marker,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "process loss"):
+                        first.manager_update_commit_release(operation_id)
+            finally:
+                first.close()
+
+            self.assertTrue(
+                (
+                    Path(scopes[0].workspace_path)
+                    / ".ubitech-agent-scope.json"
+                ).is_file()
+            )
+            self.assertFalse(Path(scopes[1].workspace_path).exists())
+
+            recovered = EnterpriseService(
+                config,
+                agent_client=_BlockingAgent(),
+                manager_client=_ManagerStub(
+                    status=self._post_switch_p1_status(operation_id)
+                ),
+            )
+            try:
+                self.assertEqual(
+                    recovered.manager_update_commit_release(operation_id),
+                    {"released": True},
+                )
+                for scope in scopes:
+                    marker = (
+                        Path(scope.workspace_path)
+                        / ".ubitech-agent-scope.json"
+                    )
+                    self.assertEqual(
+                        json.loads(marker.read_text(encoding="utf-8"))["scope_key"],
+                        scope.scope_key,
+                    )
+                    self.assertIsNotNone(
+                        recovered.db.query_one(
+                            "SELECT 1 FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                            (scope.scope_key,),
+                        )
+                    )
+            finally:
+                recovered.close()
+
+    def test_non_p1_reservation_does_not_gain_workspace_compatibility(self):
+        operation_id = "op_" + "2" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                channel_root = Path(scope.workspace_path).parent
+                shutil.rmtree(channel_root)
+            finally:
+                db.close()
+            status = self._handoff_status(operation_id)
+            status["current"] = {"id": "a" * 40, "source_commit": "a" * 40}
+
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "workspace directory is missing",
+            ):
+                EnterpriseService(
+                    config,
+                    agent_client=_BlockingAgent(),
+                    manager_client=_ManagerStub(status=status),
+                )
+            self.assertFalse(channel_root.exists())
+
+    def test_explicit_null_reservation_does_not_repair_marker_or_alias(self):
+        operation_id = "op_" + "8" * 32
+        with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
+            db = Database(config.db_path)
+            try:
+                scope = AgentScopeManager(config, db).ensure_private_scope(1)
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+                marker.unlink()
+                db.execute(
+                    "DELETE FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                    (scope.scope_key,),
+                )
+            finally:
+                db.close()
+
+            status = self._p1_status(operation_id)
+            status["workspace_schema_commit"] = None
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "current alias is missing",
+            ):
+                EnterpriseService(
+                    config,
+                    agent_client=_BlockingAgent(),
+                    manager_client=_ManagerStub(status=status),
+                )
+
+            self.assertFalse(marker.exists())
+            verification = Database(config.db_path)
+            try:
+                self.assertIsNone(
+                    verification.query_one(
+                        "SELECT 1 FROM agent_runtime_scope_sessions WHERE scope_key = ?",
+                        (scope.scope_key,),
+                    )
+                )
+            finally:
+                verification.close()
+
+    def test_workspace_commit_capability_rejects_slot_and_field_drift(self):
+        operation_id = "op_" + "5" * 32
+        mutations = {
+            "boolean schema": lambda status: status["workspace_schema_commit"].__setitem__(
+                "schema_version", True
+            ),
+            "extra field": lambda status: status["workspace_schema_commit"].__setitem__(
+                "extra", "unexpected"
+            ),
+            "operation mismatch": lambda status: status[
+                "workspace_schema_commit"
+            ].__setitem__("operation_id", "op_" + "6" * 32),
+            "predecessor mismatch": lambda status: status[
+                "workspace_schema_commit"
+            ].__setitem__("predecessor_generation", "b" * 40),
+            "current source mismatch": lambda status: status["current"].__setitem__(
+                "source_commit", "b" * 40
+            ),
+            "previous id mismatch": lambda status: status["previous"].__setitem__(
+                "id", "b" * 40
+            ),
+            "candidate reappeared": lambda status: status.__setitem__(
+                "target", {"id": "a" * 40, "source_commit": "a" * 40}
+            ),
+            "active overlap": lambda status: status.__setitem__(
+                "active_operation_id", operation_id
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                status = self._post_switch_p1_status(operation_id)
+                mutate(status)
+                self.assertFalse(
+                    EnterpriseService._manager_allows_source_owner_workspace_commit(
+                        status,
+                        operation_id,
+                    )
+                )
+
+    def test_legacy_p1_workspace_capability_requires_exact_target_and_slots(self):
+        operation_id = "op_" + "7" * 32
+        valid = self._p1_status(operation_id)
+        self.assertTrue(
+            EnterpriseService._manager_allows_source_owner_workspace_commit(
+                valid,
+                operation_id,
+            )
+        )
+        explicit_null = self._p1_status(operation_id)
+        explicit_null["workspace_schema_commit"] = None
+        self.assertFalse(
+            EnterpriseService._manager_allows_source_owner_workspace_commit(
+                explicit_null,
+                operation_id,
+            )
+        )
+        for field, value in (
+            ("target", None),
+            (
+                "target",
+                {"id": "a" * 40, "source_commit": "b" * 40},
+            ),
+            ("finalize_pending_operation_id", operation_id),
+        ):
+            with self.subTest(field=field, value=value):
+                status = self._p1_status(operation_id)
+                status[field] = value
+                self.assertFalse(
+                    EnterpriseService._manager_allows_source_owner_workspace_commit(
+                        status,
+                        operation_id,
+                    )
+                )
 
     def test_handoff_receipt_digest_uses_cross_runtime_canonical_form(self):
         receipt = {
@@ -437,9 +1020,10 @@ class ServiceUpdateReservationTests(unittest.TestCase):
         binding_sha256 = "c" * 64
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
+            config = _config(data_dir)
             manager = _ManagerStub(status=self._handoff_status(operation_id))
             service = EnterpriseService(
-                _config(data_dir),
+                config,
                 agent_client=_BlockingAgent(),
                 manager_client=manager,
             )
@@ -467,7 +1051,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 service.close()
 
             restarted = EnterpriseService(
-                _config(data_dir),
+                config,
                 agent_client=_BlockingAgent(),
                 manager_client=_ManagerStub(
                     status=self._handoff_status(operation_id)
@@ -496,8 +1080,9 @@ class ServiceUpdateReservationTests(unittest.TestCase):
         binding_sha256 = "f" * 64
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
+            config = _config(data_dir)
             service = EnterpriseService(
-                _config(data_dir),
+                config,
                 agent_client=_BlockingAgent(),
                 manager_client=_ManagerStub(
                     status=self._handoff_status(operation_id)
@@ -522,7 +1107,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 service.close()
 
             restarted = EnterpriseService(
-                _config(data_dir),
+                config,
                 agent_client=_BlockingAgent(),
                 manager_client=_ManagerStub(
                     status=self._handoff_status(operation_id)
@@ -550,8 +1135,9 @@ class ServiceUpdateReservationTests(unittest.TestCase):
         target_generation = "2" * 40
         binding_sha256 = "3" * 64
         with tempfile.TemporaryDirectory() as td:
+            config = _config(Path(td))
             service = EnterpriseService(
-                _config(Path(td)),
+                config,
                 agent_client=_BlockingAgent(),
                 manager_client=_ManagerStub(
                     status=self._handoff_status(operation_id)
@@ -833,6 +1419,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     "active_operation_id": "",
                     "finalize_pending_operation_id": operation_id,
                     "operation_id": operation_id,
+                    "gate_settlement": None,
                 }
             )
             recovered_agent = _BlockingAgent()

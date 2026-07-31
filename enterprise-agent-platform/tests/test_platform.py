@@ -584,7 +584,7 @@ class FakeOAuthHTTPClient:
 
 
 def make_config(tmp: Path) -> PlatformConfig:
-    return PlatformConfig(
+    config = PlatformConfig(
         data_dir=tmp,
         host_data_root=tmp / "host-data-root",
         host="127.0.0.1",
@@ -606,6 +606,11 @@ def make_config(tmp: Path) -> PlatformConfig:
         agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
+    # The production Manager owns fresh-install workspace-root creation.
+    # Service tests start at the post-Manager boundary unless a test removes or
+    # corrupts this directory explicitly.
+    config.workspace_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return config
 
 class PlatformServiceTests(unittest.TestCase):
     def test_agent_reply_events_use_a_cross_scope_user_visible_watermark(self):
@@ -708,6 +713,7 @@ class PlatformServiceTests(unittest.TestCase):
                     "active_operation_id": "",
                     "finalize_pending_operation_id": "",
                     "operation_id": "",
+                    "gate_settlement": None,
                 }
             )
             initial_config = replace(

@@ -131,6 +131,7 @@ func (e *fakeEngine) add(value string) error {
 func (e *fakeEngine) Preflight(context.Context) error                 { return e.add("preflight") }
 func (e *fakeEngine) Pull(context.Context, release.Manifest) error    { return e.add("pull") }
 func (e *fakeEngine) Prepare(context.Context, release.Manifest) error { return e.add("prepare") }
+func (e *fakeEngine) PrepareFreshInstallDataLayout() error            { return e.add("fresh-layout") }
 func (e *fakeEngine) StopFixed(context.Context) error                 { return e.add("stop") }
 func (e *fakeEngine) StartFixed(_ context.Context, manifest release.Manifest) error {
 	e.mu.Lock()
@@ -748,6 +749,12 @@ func TestUpdatePreparesAndReservesBeforeTakingFixedStackMutex(t *testing.T) {
 	if completed.Status != model.OperationSucceeded {
 		t.Fatalf("operation did not resume after fixed-stack mutex release: %#v", completed)
 	}
+	engine.mu.Lock()
+	finalCalls := strings.Join(engine.calls, ",")
+	engine.mu.Unlock()
+	if strings.Contains(finalCalls, "fresh-layout") {
+		t.Fatalf("ordinary update invoked fresh-install workspace creation: %s", finalCalls)
+	}
 }
 
 func TestRestartWaitsForTasksBeforeTakingFixedStackMutex(t *testing.T) {
@@ -1104,7 +1111,7 @@ func TestFreshInstallCommitsOnlyAfterProbe(t *testing.T) {
 	engine.mu.Lock()
 	calls := strings.Join(engine.calls, ",")
 	engine.mu.Unlock()
-	if calls != "pull,prepare,stop,migrate,start,probe,probe" {
+	if calls != "pull,prepare,fresh-layout,stop,migrate,start,probe,probe" {
 		t.Fatalf("unexpected engine sequence: %s", calls)
 	}
 }
@@ -2481,8 +2488,64 @@ func TestRecoverFinalizesCrashBetweenOperationAndStateCommit(t *testing.T) {
 	if state.Current == nil || state.Current.ID != manifest.ID() || state.Current.RollbackSnapshotPath != "/backup/before-update" || state.Candidate != nil || state.ActiveOperationID != "" {
 		t.Fatalf("recovery did not finish durable state commit: %#v", state)
 	}
-	if gate.releases != 1 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 || finalized != 1 {
+	if gate.releases != 2 || gate.commits != 2 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 || finalized != 1 {
 		t.Fatalf("recovery skipped finalize hooks: gate=%d self=%#v commits=%d finalized=%d", gate.releases, selfUpdate, commits, finalized)
+	}
+}
+
+func TestP1NormalizationWithoutManagerCommitFailsBeforeFirstGate(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	_, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{
+			ID:           contract.SourceOwnerCompatGeneration,
+			SourceCommit: contract.SourceOwnerCompatGeneration,
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &recordingGate{}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{},
+		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main",
+		ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	manifest, err := orchestrator.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "p1-without-manager-commit",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationSucceeded
+		value.TargetGeneration = manifest.ID()
+		value.SnapshotPath = "/backup/p1-before-a2"
+		value.ReservationStatus = model.ReservationMutationStarted
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = orchestrator.Recover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "P1 workspace normalization") {
+		t.Fatalf("P1 update without watchdog proof did not fail closed: %v", err)
+	}
+	state := store.State()
+	durable, readErr := store.Operation(op.ID)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if gate.releases != 0 || state.FinalizePendingOperationID != op.ID || !state.Maintenance ||
+		durable.Finalized || durable.GateSettlementAction != "" {
+		t.Fatalf("P1 update crossed the Gate without watchdog proof: state=%#v operation=%#v gate=%#v", state, durable, gate)
 	}
 }
 
@@ -2571,7 +2634,7 @@ func TestRecoverRetriesDurableFinalizePendingAfterStateCommit(t *testing.T) {
 	if state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
 		t.Fatalf("retried finalize did not open the committed generation: %#v", state)
 	}
-	if gate.releases != 2 || selfUpdate.activated != 2 || commits != 2 {
+	if gate.releases != 3 || gate.commits != 3 || selfUpdate.activated != 2 || commits != 2 {
 		t.Fatalf("unexpected idempotent finalize calls: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
 	}
 }
@@ -2725,13 +2788,14 @@ func TestRecoverManagerRollbackIntentPersistedBeforeStateTransition(t *testing.T
 	}
 }
 
-func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
+func TestRecoverReplaysGenerationCommitBeforeClearingFinalizedPendingState(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
 	store, _ := journal.Open(t.TempDir(), time.Now())
 	gate := &recordingGate{}
 	selfUpdate := &recordingSelfUpdate{}
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	commitHooks := 0
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}, OnCommit: func(release.Manifest) { commitHooks++ }}
 	manifest, err := orchestrator.Check(context.Background(), url)
 	if err != nil {
 		t.Fatal(err)
@@ -2744,6 +2808,7 @@ func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
 		value.Status = model.OperationSucceeded
 		value.TargetGeneration = manifest.ID()
 		value.Finalized = true
+		value.GateSettlementAction = model.GateSettlementCommit
 		return nil
 	})
 	if err != nil {
@@ -2767,8 +2832,63 @@ func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
 	if state := store.State(); state.FinalizePendingOperationID != "" || state.Maintenance {
 		t.Fatalf("finalized/state split did not converge: %#v", state)
 	}
-	if gate.releases != 0 || selfUpdate.marked != 0 || selfUpdate.activated != 0 {
-		t.Fatalf("already finalized hooks were repeated: gate=%d self=%#v", gate.releases, selfUpdate)
+	if gate.releases != 1 || gate.commits != 1 || gate.aborts != 0 {
+		t.Fatalf("finalized generation Gate was not reconciled exactly once: %#v", gate)
+	}
+	if selfUpdate.marked != 0 || selfUpdate.activated != 0 || commitHooks != 0 {
+		t.Fatalf("already finalized non-Gate hooks were repeated: self=%#v commits=%d", selfUpdate, commitHooks)
+	}
+}
+
+func TestRecoverReplaysNonGenerationReleaseBeforeClearingFinalizedPendingState(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, _ := journal.Open(t.TempDir(), time.Now())
+	gate := &recordingGate{}
+	selfUpdate := &recordingSelfUpdate{}
+	commitHooks := 0
+	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}, OnCommit: func(release.Manifest) { commitHooks++ }}
+	manifest, err := orchestrator.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationRestart, IdempotencyKey: "finalized-restart-before-state", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		value.Status = model.OperationSucceeded
+		value.TargetGeneration = manifest.ID()
+		value.Finalized = true
+		value.GateSettlementAction = model.GateSettlementAbort
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.MutateState(time.Now(), func(value *model.ManagerState) error {
+		value.ActiveOperationID = ""
+		value.Current = value.Candidate
+		value.Candidate = nil
+		value.FinalizePendingOperationID = op.ID
+		value.PublicState = model.StateUpdating
+		value.Maintenance = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state := store.State(); state.FinalizePendingOperationID != "" || state.Maintenance {
+		t.Fatalf("finalized/state split did not converge: %#v", state)
+	}
+	if gate.releases != 1 || gate.commits != 0 || gate.aborts != 1 {
+		t.Fatalf("finalized non-generation Gate was not reconciled exactly once: %#v", gate)
+	}
+	if selfUpdate.marked != 0 || selfUpdate.activated != 0 || commitHooks != 0 {
+		t.Fatalf("already finalized non-Gate hooks were repeated: self=%#v commits=%d", selfUpdate, commitHooks)
 	}
 }
 
@@ -3008,11 +3128,11 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 	if state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || !completed.Finalized {
 		t.Fatalf("post-watchdog recovery did not finalize: state=%#v operation=%#v", state, completed)
 	}
-	if gate.releases != 1 || gate.commits != 1 || gate.aborts != 0 ||
+	if gate.releases != 2 || gate.commits != 2 || gate.aborts != 0 ||
 		selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 {
 		t.Fatalf("post-watchdog hooks were not run exactly once: gate=%#v self=%#v commits=%d", gate, selfUpdate, commits)
 	}
-	if want := []string{"watchdog_durable_commit", "platform_schema_commit_release"}; !reflect.DeepEqual(sequence, want) {
+	if want := []string{"watchdog_durable_commit", "platform_schema_commit_release", "platform_schema_commit_release"}; !reflect.DeepEqual(sequence, want) {
 		t.Fatalf("schema commit release crossed the watchdog durability boundary: got %v, want %v", sequence, want)
 	}
 }
@@ -3111,7 +3231,7 @@ func TestOperationalMutationsKeepMaintenanceUntilGateReleaseIsDurable(t *testing
 			if finalState.FinalizePendingOperationID != "" || finalState.Maintenance || finalState.PublicState != model.StateIdle || !completed.Finalized {
 				t.Fatalf("recovered gate release did not finalize %s: state=%#v operation=%#v", kind, finalState, completed)
 			}
-			if gate.releases != 2 {
+			if gate.releases != 3 {
 				t.Fatalf("release retry count for %s = %d", kind, gate.releases)
 			}
 		})

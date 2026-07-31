@@ -95,4 +95,6 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，Cognee 摄取、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
 
+候选启动对旧 P1 未物化 workspace 的只读识别不构成解除预约，也不能唤醒邮件、Telegram、计划任务、学习或知识摄取；只有同一 operation 的 commit-release 完成目录/marker 归一化并明确释放 reservation 后，这些 worker 才按原 checkpoint 恢复。
+
 开发环境同样通过外部 Compose/Manager 启动固定服务，再把私有 service URL 注入 Platform；Platform 不提供进程 runner、安装器、Compose 包装器或源码目录配置。测试替身只实现 HTTP 契约，不能重新引入第二套生命周期。

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
@@ -571,6 +572,15 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("persist fresh-install maintenance phase: %w", err), false)
 			return
 		}
+		preparer, ok := o.Engine.(driver.FreshInstallDataPreparer)
+		if !ok {
+			o.failAfterMaintenance(ctx, op, nil, errors.New("fresh install data layout preparation is unavailable"))
+			return
+		}
+		if err = preparer.PrepareFreshInstallDataLayout(); err != nil {
+			o.failAfterMaintenance(ctx, op, nil, fmt.Errorf("prepare fresh-install data layout: %w", err))
+			return
+		}
 	}
 	if !freshInstall {
 		if err = o.beginReservedMutation(op.ID); err != nil {
@@ -747,29 +757,48 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 		return o.finalizeFailure("final committed generation readiness is pending", err)
 	}
 	if !op.Finalized {
-		// Admission release is the final externally visible hook. Only the
-		// generation-change path with durable watchdog evidence receives the
-		// Platform capability that commits workspace/Camoufox machine schemas.
-		var releaseErr error
+		// Persist the exact effect that really crossed the external Gate. A
+		// generation operation without a SelfUpdate owner retains its supported
+		// abort behavior; only durable watchdog evidence grants commit authority.
+		action := model.GateSettlementAbort
 		if watchdogCommitted {
-			releaseErr = o.Gate.Commit(ctx, op.ID)
-		} else {
-			releaseErr = o.releaseGate(ctx, o.Gate, op.ID)
+			action = model.GateSettlementCommit
 		}
+		if action == model.GateSettlementAbort && op.Kind == model.OperationUpdate &&
+			stateBefore.Previous != nil &&
+			stateBefore.Previous.ID == contract.SourceOwnerCompatGeneration &&
+			stateBefore.Previous.SourceCommit == contract.SourceOwnerCompatGeneration {
+			return o.finalizeFailure(
+				"P1 workspace normalization requires a committed Manager activation",
+				errors.New("watchdog did not authorize the machine-schema commit Gate"),
+			)
+		}
+		releaseErr := o.settleGate(ctx, op.ID, op.Kind, action)
 		if releaseErr != nil {
 			return o.finalizeFailure("update reservation release is pending", releaseErr)
 		}
 		o.event(op.ID, "operation.committed", manifest.ID(), nil)
-		if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+		var err error
+		if op, err = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 			if value.Status != model.OperationSucceeded {
 				return errors.New("cannot finalize a non-succeeded operation")
 			}
 			value.Finalized = true
+			value.GateSettlementAction = action
 			value.UpdatedAt = o.now()
 			return nil
 		}); err != nil {
 			return err
 		}
+	}
+	// Finalized and finalize_pending are separate durable files. Persisting
+	// Finalized first makes /v1/status.gate_settlement authoritative for a
+	// Platform that restarts in this window. Always replay the idempotent Gate
+	// after that checkpoint, then and only then clear Manager maintenance state.
+	// Recovery enters here with Finalized already true and therefore repeats no
+	// SelfUpdate, OnCommit, or audit hook.
+	if releaseErr := o.reconcileFinalizedGate(ctx, op); releaseErr != nil {
+		return o.finalizeFailure("update reservation reconciliation is pending", releaseErr)
 	}
 	_, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
 		if state.FinalizePendingOperationID != op.ID {
@@ -789,6 +818,32 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 		o.OnFinalized(manifest)
 	}
 	return nil
+}
+
+func (o *Orchestrator) reconcileFinalizedGate(ctx context.Context, op model.Operation) error {
+	return o.settleGate(ctx, op.ID, op.Kind, op.GateSettlementAction)
+}
+
+func (o *Orchestrator) settleGate(ctx context.Context, operationID string, kind model.OperationKind, action model.GateSettlementAction) error {
+	switch action {
+	case model.GateSettlementCommit:
+		if kind != model.OperationInstall && kind != model.OperationUpdate {
+			return fmt.Errorf("operation kind %q cannot commit the reservation Gate", kind)
+		}
+		if o.Gate == nil {
+			return errors.New("platform admission gate is not configured for commit")
+		}
+		return o.Gate.Commit(ctx, operationID)
+	case model.GateSettlementAbort:
+		switch kind {
+		case model.OperationInstall, model.OperationUpdate, model.OperationRestart, model.OperationRollback, model.OperationRepair:
+			return o.releaseGate(ctx, o.Gate, operationID)
+		default:
+			return fmt.Errorf("operation kind %q cannot abort the reservation Gate", kind)
+		}
+	default:
+		return fmt.Errorf("operation %s has invalid reservation Gate settlement %q", operationID, action)
+	}
 }
 
 func (o *Orchestrator) beginManagerActivationRollback(ctx context.Context, op model.Operation, manifest release.Manifest) error {
@@ -813,6 +868,7 @@ func (o *Orchestrator) beginManagerActivationRollback(ctx context.Context, op mo
 		value.ManagerRollbackGeneration = state.Previous.ID
 		value.Status = model.OperationRunning
 		value.Finalized = false
+		value.GateSettlementAction = ""
 		value.Retryable = true
 		value.Phase = model.PhaseRollingBack
 		value.CompletedAt = nil
@@ -1321,6 +1377,7 @@ func (o *Orchestrator) holdUnconfirmedReservation(op model.Operation, cause erro
 	if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.Status = model.OperationRunning
 		value.Finalized = false
+		value.GateSettlementAction = ""
 		value.CompletedAt = nil
 		value.Phase = model.PhaseDraining
 		value.ReservationStatus = model.ReservationReleaseUncertain
@@ -1454,6 +1511,7 @@ func (o *Orchestrator) beginPreparedCleanup(op model.Operation, target string, c
 		value.PreparedCleanupPending = true
 		value.Status = model.OperationRunning
 		value.Finalized = false
+		value.GateSettlementAction = ""
 		value.CompletedAt = nil
 		value.Retryable = retryable
 		value.Error = message
@@ -1596,6 +1654,7 @@ func (o *Orchestrator) holdPreparedCleanup(op model.Operation, cleanupErr error)
 		}
 		value.Status = model.OperationRunning
 		value.Finalized = false
+		value.GateSettlementAction = ""
 		value.CompletedAt = nil
 		// Preserve Error as the immutable original cause. The latest cleanup
 		// diagnostic is projected through Manager state without recursive growth.
@@ -1686,6 +1745,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 	if _, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.Status = model.OperationRunning
 		value.Finalized = false
+		value.GateSettlementAction = ""
 		value.CompletedAt = nil
 		value.Error = originalError
 		value.UpdatedAt = o.now()
@@ -1814,6 +1874,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 			value.Error = originalError
 			value.CompletedAt = nil
 			value.Finalized = false
+			value.GateSettlementAction = ""
 			value.UpdatedAt = o.now()
 			return nil
 		})

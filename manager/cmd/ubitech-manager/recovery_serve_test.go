@@ -308,13 +308,13 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 		t.Fatalf("gateway did not resume proxying after finalize: HTTP %d", status)
 	}
 
-	if calls := releaseCalls.Load(); calls != 2 {
-		t.Fatalf("reservation release attempts = %d, want one failure and one retry", calls)
+	if calls := releaseCalls.Load(); calls != 3 {
+		t.Fatalf("reservation release attempts = %d, want one failure, one successful retry, and one post-checkpoint replay", calls)
 	}
 	releaseIDsMu.Lock()
 	ids := append([]string(nil), releaseIDs...)
 	releaseIDsMu.Unlock()
-	if len(ids) != 2 || ids[0] != operationID || ids[1] != operationID {
+	if len(ids) != 3 || ids[0] != operationID || ids[1] != operationID || ids[2] != operationID {
 		t.Fatalf("finalize retry did not preserve the operation identity: %v", ids)
 	}
 
