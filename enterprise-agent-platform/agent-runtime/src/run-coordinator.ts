@@ -823,11 +823,20 @@ export class RunCoordinator {
               target: receipt.target,
             } : {}),
           });
+          const foregroundTerminal = tool.name === "terminal"
+            && recordValue(executionParams).background !== true;
+          if (foregroundTerminal) {
+            this.pauseRunIdle(record.id, "foreground terminal command running");
+          }
           try {
             return await tool.execute(toolCallId, executionParams, signal, onUpdate);
           } finally {
             executionReceipts.delete(toolCallId);
-            this.touchRunActivity(record.id, `tool settled: ${tool.name}`);
+            if (foregroundTerminal) {
+              this.resumeRunIdle(record.id, "foreground terminal command settled");
+            } else {
+              this.touchRunActivity(record.id, `tool settled: ${tool.name}`);
+            }
           }
         },
       }));

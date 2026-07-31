@@ -7,7 +7,7 @@
     "maximum_seconds": 86400,
     "platform_environment_variable": "ENTERPRISE_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS",
     "runtime_environment_variable": "AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS",
-    "semantics": "The run has no ordinary wall-clock deadline. Sustained model, tool, input, memory, session, or child-run activity refreshes the idle deadline; zero disables this idle guard."
+    "semantics": "The run has no ordinary wall-clock deadline. Sustained model, tool, input, memory, session, or child-run activity refreshes the idle deadline; a bounded foreground terminal execution remains active for its complete execution lifecycle instead of depending only on scheduler-driven heartbeat callbacks; zero disables this idle guard."
   },
   "max_turns_per_run": {
     "default": 90,

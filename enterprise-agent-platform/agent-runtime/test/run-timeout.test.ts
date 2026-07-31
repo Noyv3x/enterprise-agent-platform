@@ -87,7 +87,7 @@ test("active foreground terminal work can exceed the run idle duration", async (
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("terminal", {
-      command: "sleep 0.16; printf finished",
+      command: "sleep 0.20; printf finished",
       timeout_ms: 1_000,
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("terminal complete"),
@@ -103,6 +103,10 @@ test("active foreground terminal work can exceed the run idle duration", async (
       (event) => event.type === "approval.requested",
     ), 10_000);
     await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
+    await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
+      (event) => event.type === "tool.started" && event.data.tool_name === "terminal",
+    ), 10_000);
+    blockEventLoop(100);
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "terminal complete");
@@ -318,21 +322,32 @@ test("an uncooperative provider cannot hold the run slot past idle cleanup grace
   const faux = fauxProvider();
   faux.setResponses([
     async () => await new Promise<never>(() => undefined),
+    fauxAssistantMessage("the next run acquired the released slot"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 30, cleanupGraceMs: 40 }),
+    config: testConfig(home, { runIdleTimeoutMs: 30, cleanupGraceMs: 40, maxConcurrency: 1 }),
     streamFn: faux.provider.streamSimple,
   });
   try {
-    const started = Date.now();
     const run = coordinator.createRun(baseRequest(workspace));
-    const completed = await withDeadline(coordinator.wait(run.id));
+    await waitUntil(() => faux.state.callCount === 1 ? true : undefined);
+    const next = coordinator.createRun({
+      ...baseRequest(workspace),
+      scope_key: "next-scope",
+      lifecycle_id: "next-life",
+      session_id: "next-session",
+    });
+    const [completed, nextCompleted] = await withDeadline(Promise.all([
+      coordinator.wait(run.id),
+      coordinator.wait(next.id),
+    ]), 5_000);
     assert.equal(completed.status, "needs_review");
-    assert.ok(Date.now() - started < 500);
     assert.match(completed.error || "", /cleanup did not settle/);
     assert.ok(coordinator.getJournal(run.id)?.list().some(
       (event) => event.type === "run.cleanup_timeout",
     ));
+    assert.equal(nextCompleted.status, "completed");
+    assert.equal(nextCompleted.result?.content, "the next run acquired the released slot");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -417,6 +432,14 @@ function baseRequest(workspace: string): RunRequest {
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function blockEventLoop(milliseconds: number): void {
+  const deadline = Date.now() + milliseconds;
+  while (Date.now() < deadline) {
+    // Deliberately simulate a contended CI event loop. The foreground process
+    // continues in the operating system while JavaScript timers cannot fire.
+  }
 }
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> {
