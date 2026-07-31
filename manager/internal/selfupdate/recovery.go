@@ -29,17 +29,22 @@ const (
 	recoveryIdentityChecks = 7
 )
 
-// RecoverCurrent is the deliberately external escape hatch for a Current
-// Manager which cannot stay alive long enough to self-update. The caller is a
-// separately downloaded and checksum-verified Manager binary; normal updates
-// must continue to use Prepare/Activate and the independent watchdog.
-//
-// The stable executable is the only pre-commit recovery marker. Before the
-// final self-update state write it may contain either the old Current bytes or
-// the requested recovery bytes, so interruption at every earlier boundary is
-// safe to retry. Candidate/Activation state is rejected because that state is
-// owned by the regular watchdog protocol.
-func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformStatePath, expectedSHA256 string) error {
+// RecoverCurrentWithAuthorityTransfer acquires recovery.lock while the caller
+// still owns its retained handoff observation. transfer must re-read and close
+// that same observation; only after it succeeds may recovery proceed while
+// holding recovery.lock alone. This is the deliberately external escape hatch
+// for a Current Manager which cannot stay alive long enough to self-update;
+// normal updates use Prepare/Activate and the independent watchdog. The
+// mandatory callback makes the global handoff -> recovery lock order part of
+// the production API rather than a caller convention.
+func (m *Manager) RecoverCurrentWithAuthorityTransfer(
+	ctx context.Context,
+	executablePath, platformStatePath, expectedSHA256 string,
+	transfer func() error,
+) error {
+	if transfer == nil {
+		return errors.New("external recovery requires a retained handoff authority transfer")
+	}
 	if !validSHA256(expectedSHA256) {
 		return errors.New("expected Manager SHA-256 must be 64 lowercase hexadecimal characters")
 	}
@@ -56,7 +61,7 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	defer releaseLock()
 	unit := m.UnitName
 	if unit == "" {
-		unit = sourceManagerUnitName()
+		unit = m.managerUnitName()
 	}
 	if !validRecoveryUnit(unit) {
 		return errors.New("Manager user service name is invalid")
@@ -74,7 +79,13 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 		return err
 	}
 
-	newBinary, _, err := readRecoveryRegularFile(executablePath, recoveryMaxBinaryBytes, false)
+	reader := m.recoveryExecutableReader
+	if reader == nil {
+		reader = func(path, expected string) ([]byte, error) {
+			return readBoundRunningExecutable("/proc/self/exe", path, expected)
+		}
+	}
+	newBinary, err := reader(executablePath, expectedSHA256)
 	if err != nil {
 		return fmt.Errorf("validate recovery Manager executable: %w", err)
 	}
@@ -99,6 +110,12 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	}
 	if !pathWithin(filepath.Join(m.Root, "versions"), oldCurrent.Path) {
 		return errors.New("registered Current Manager path is outside the Manager versions directory")
+	}
+	if transfer != nil {
+		if err := transfer(); err != nil {
+			return fmt.Errorf("transfer handoff authority to external recovery ownership: %w", err)
+		}
+		transfer = nil
 	}
 	activationRequest := recoveryActivationRequest{
 		executablePath:    executablePath,
@@ -417,7 +434,7 @@ func (m *Manager) stageRecoveryBinary(data []byte, digest string) (string, error
 	if err := ensureRecoveryDirectory(dir); err != nil {
 		return "", fmt.Errorf("prepare recovered Manager version directory: %w", err)
 	}
-	path := filepath.Join(dir, sourceManagerBinaryName())
+	path := filepath.Join(dir, m.managerBinaryName())
 	if info, err := os.Lstat(path); err == nil {
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return "", errors.New("recovered Manager version path is not a regular file")

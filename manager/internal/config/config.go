@@ -2,8 +2,10 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -19,8 +21,10 @@ import (
 
 type Config struct {
 	ConfigPath          string
+	DataHome            string
 	DataRoot            string
 	StateDir            string
+	StateHome           string
 	SocketPath          string
 	GatewayAddress      string
 	LANEnabled          bool
@@ -46,10 +50,18 @@ type Config struct {
 	LogMaxBytes         int64
 	LogBackups          int
 	CommandMaxBytes     int64
+	activeProfile       identity.ActiveProfile
 }
 
-func Defaults() (Config, error) {
-	home, err := os.UserHomeDir()
+func Defaults(active identity.ActiveProfile) (Config, error) {
+	if err := active.Validate(); err != nil {
+		return Config{}, fmt.Errorf("validate active technical profile: %w", err)
+	}
+	profile, err := active.Profile()
+	if err != nil {
+		return Config{}, err
+	}
+	home, err := accountHome()
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve home directory: %w", err)
 	}
@@ -61,14 +73,25 @@ func Defaults() (Config, error) {
 	if dataHome == "" {
 		dataHome = filepath.Join(home, ".local", "share")
 	}
-	profile := identity.SourceProfile()
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	if !filepath.IsAbs(stateHome) || filepath.Clean(stateHome) != stateHome {
+		return Config{}, errors.New("XDG_STATE_HOME must resolve to an absolute canonical path")
+	}
 	dataRoot := profile.DefaultDataRoot(dataHome)
 	stateDir := profile.ManagerStateRoot(dataRoot)
-	socketPath := profile.ControlSocketPath(dataRoot)
+	socketPath, err := profile.ControlSocketPath(dataRoot, os.Getenv("XDG_RUNTIME_DIR"))
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve Manager control socket: %w", err)
+	}
 	return Config{
 		ConfigPath:          profile.DefaultConfigPath(configHome),
+		DataHome:            dataHome,
 		DataRoot:            dataRoot,
 		StateDir:            stateDir,
+		StateHome:           stateHome,
 		SocketPath:          socketPath,
 		GatewayAddress:      "127.0.0.1:8080",
 		LANEnabled:          false,
@@ -89,11 +112,28 @@ func Defaults() (Config, error) {
 		LogMaxBytes:         10 << 20,
 		LogBackups:          5,
 		CommandMaxBytes:     1 << 20,
+		activeProfile:       active,
 	}, nil
 }
 
-func Load(path string) (Config, error) {
-	cfg, err := Defaults()
+// accountHome resolves the deployment owner's home from the operating-system
+// account database. Environment HOME is intentionally not an authority for
+// technical identity paths: systemd units, recovery helpers, and an invoking
+// shell may all provide different mutable HOME values.
+func accountHome() (string, error) {
+	account, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	home := filepath.Clean(account.HomeDir)
+	if account.Uid != strconv.Itoa(os.Getuid()) || home == "." || !filepath.IsAbs(home) || home != account.HomeDir {
+		return "", errors.New("operating-system account has an invalid home directory")
+	}
+	return home, nil
+}
+
+func Load(active identity.ActiveProfile, path string) (Config, error) {
+	cfg, err := Defaults(active)
 	if err != nil {
 		return Config{}, err
 	}
@@ -102,13 +142,57 @@ func Load(path string) (Config, error) {
 	}
 	f, err := os.Open(cfg.ConfigPath)
 	if os.IsNotExist(err) {
-		return cfg, nil
+		return cfg, cfg.Validate()
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("open config: %w", err)
 	}
 	defer f.Close()
-	s := bufio.NewScanner(f)
+	return loadReader(cfg, f)
+}
+
+// LoadStartupSnapshot parses an already authenticated configuration snapshot.
+// stateHome is the profile-neutral locator result and deliberately replaces
+// any ambient XDG_STATE_HOME default before the full profile parse.  A missing
+// snapshot has the same defaults-only semantics as Load observing
+// os.ErrNotExist, except that its startup state-home remains authoritative.
+func LoadStartupSnapshot(active identity.ActiveProfile, path string, raw []byte, exists bool, stateHome string) (Config, error) {
+	cfg, err := Defaults(active)
+	if err != nil {
+		return Config{}, err
+	}
+	if stateHome == "" || !filepath.IsAbs(stateHome) || filepath.Clean(stateHome) != stateHome {
+		return Config{}, errors.New("startup state_home must be canonical and absolute")
+	}
+	cfg.StateHome = stateHome
+	if path != "" {
+		cfg.ConfigPath = path
+	}
+	if !exists {
+		if len(raw) != 0 {
+			return Config{}, errors.New("missing config snapshot carries bytes")
+		}
+		return cfg, cfg.Validate()
+	}
+	return loadReader(cfg, bytes.NewReader(raw))
+}
+
+// ValidateFor proves that an already parsed configuration belongs to the
+// technical profile selected by the authenticated startup router.  Routed
+// serve paths keep Config in memory rather than reopening its pathname after
+// acquiring startup ownership.
+func (c Config) ValidateFor(active identity.ActiveProfile) error {
+	if err := active.Validate(); err != nil {
+		return fmt.Errorf("validate requested technical profile: %w", err)
+	}
+	if c.activeProfile != active {
+		return errors.New("configuration belongs to a different technical profile")
+	}
+	return c.Validate()
+}
+
+func loadReader(cfg Config, reader io.Reader) (Config, error) {
+	s := bufio.NewScanner(reader)
 	line := 0
 	for s.Scan() {
 		line++
@@ -136,13 +220,21 @@ func set(c *Config, key, value string) error {
 	switch key {
 	case "data_root":
 		root := expandHome(value)
-		profile := identity.SourceProfile()
-		socketPath := profile.ControlSocketPath(root)
+		profile, err := c.activeProfile.Profile()
+		if err != nil {
+			return fmt.Errorf("active technical profile: %w", err)
+		}
+		socketPath, err := profile.ControlSocketPath(root, os.Getenv("XDG_RUNTIME_DIR"))
+		if err != nil {
+			return err
+		}
 		c.DataRoot = root
 		c.StateDir = profile.ManagerStateRoot(root)
 		c.SocketPath = socketPath
 	case "state_dir":
 		c.StateDir = expandHome(value)
+	case "state_home":
+		c.StateHome = expandHome(value)
 	case "socket_path":
 		c.SocketPath = expandHome(value)
 	case "listen":
@@ -244,9 +336,15 @@ func set(c *Config, key, value string) error {
 }
 
 func (c Config) Validate() error {
-	for name, path := range map[string]string{"data_root": c.DataRoot, "state_dir": c.StateDir, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
+	if err := c.activeProfile.Validate(); err != nil {
+		return fmt.Errorf("active technical profile: %w", err)
+	}
+	for name, path := range map[string]string{"data_home": c.DataHome, "data_root": c.DataRoot, "state_dir": c.StateDir, "state_home": c.StateHome, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("%s must be absolute", name)
+		}
+		if filepath.Clean(path) != path {
+			return fmt.Errorf("%s must be canonical", name)
 		}
 	}
 	if c.ReleaseChannel == "" || c.ComposeProject == "" || c.DockerBinary == "" {
@@ -397,6 +495,27 @@ func parseStringArray(value string) ([]string, error) {
 // Platform container.
 func (c Config) PlatformDataDir() string {
 	return filepath.Join(filepath.Clean(c.DataRoot), "data")
+}
+
+// TransitionStateRoot is the neutral owner-only root for deployment
+// attestation material. It is deliberately outside either technical
+// profile's mutable data root.
+func (c Config) TransitionStateRoot() string {
+	return filepath.Join(c.StateHome, "agent-platform", "release-transition")
+}
+
+// HandoffRoot is the neutral owner-only root for the one-time technical
+// namespace handoff journal.
+func (c Config) HandoffRoot() string {
+	return filepath.Join(c.StateHome, "agent-platform", "handoff")
+}
+
+// TargetDataRoot derives the immutable target namespace beside the live data
+// root. This preserves an administrator's explicit filesystem placement and
+// the handoff same-filesystem invariant without accepting an arbitrary target
+// path from a release or request.
+func (c Config) TargetDataRoot() string {
+	return filepath.Join(filepath.Dir(c.DataRoot), identity.TargetProfile().DataDirectory)
 }
 
 // ControlTokenFile returns the effective Manager control capability path. An

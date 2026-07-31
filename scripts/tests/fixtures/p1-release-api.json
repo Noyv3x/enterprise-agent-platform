@@ -1,0 +1,17 @@
+{
+  "release_id": 363003366,
+  "tag_name": "container-983f79b4900502f35fac6de8154eb344fc9f143b",
+  "target_commitish": "983f79b4900502f35fac6de8154eb344fc9f143b",
+  "draft": false,
+  "prerelease": false,
+  "assets": [
+    {"id": 496585075, "name": "install.sh", "digest": "sha256:a7d198f8d4ccd9fd35759abbe9b381e29bd5e47a17972ec644fb82510b353396", "size": 11004, "state": "uploaded"},
+    {"id": 496585079, "name": "install.sh.sha256", "digest": "sha256:be376b91c18765d37febcd703a6a14e81e878a5a144ab70a8bd903e5dd982dbd", "size": 77, "state": "uploaded"},
+    {"id": 496585109, "name": "release.json", "digest": "sha256:8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1", "size": 2458, "state": "uploaded"},
+    {"id": 496585067, "name": "ubitech-compose.yaml", "digest": "sha256:ebe1ce922cd33c9acb816bf9af175fc7e3838835cb413ab3ee91b91808698954", "size": 10900, "state": "uploaded"},
+    {"id": 496585068, "name": "ubitech-manager-linux-amd64", "digest": "sha256:c64a59ec6b11d3fed8b4c512684ca115510444d9860fdf29eaca2b1eaf4afc40", "size": 9838727, "state": "uploaded"},
+    {"id": 496585062, "name": "ubitech-manager-linux-amd64.sha256", "digest": "sha256:920597e85660ef00009497f4750c60d25a16bd8098e94db41954e74875b81e70", "size": 94, "state": "uploaded"},
+    {"id": 496585066, "name": "ubitech-manager-linux-arm64", "digest": "sha256:47579ad593fc780e8212165568db0bf1805f76585bd008d96c440450c1832ef1", "size": 9371783, "state": "uploaded"},
+    {"id": 496585065, "name": "ubitech-manager-linux-arm64.sha256", "digest": "sha256:da0e7a12be1e67c3ca9dbce0c42fcb5dc23162ca8834ae1ffb5e9176b150c0c9", "size": 94, "state": "uploaded"}
+  ]
+}

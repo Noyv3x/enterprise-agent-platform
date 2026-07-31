@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
@@ -134,6 +137,8 @@ func (CommandRunner) Run(ctx context.Context, name string, args ...string) error
 }
 
 type Manager struct {
+	Profile                  identity.ActiveProfile
+	ConfigPath               string
 	Root                     string
 	StatePath                string
 	InstallPath              string
@@ -152,6 +157,7 @@ type Manager struct {
 	RecoveryUnitFencer       func(context.Context, string, bool) error
 	RecoveryWatchdogVerifier func(context.Context, string, string, string, string) error
 	OrdinaryWatchdogVerifier func(context.Context, string, string, string, string) error
+	recoveryExecutableReader func(string, string) ([]byte, error)
 }
 
 // ProbeTransientUnit proves that the current user-systemd session can host
@@ -197,7 +203,7 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, sourceManagerBinaryName())
+	path := filepath.Join(dir, m.managerBinaryName())
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return err
 	}
@@ -244,7 +250,7 @@ func (m *Manager) DiscardPrepared(manifest release.Manifest) error {
 	if !ok || !validSHA256(artifact.SHA256) {
 		return errors.New("release Manager artifact identity is invalid")
 	}
-	expectedPath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
+	expectedPath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), m.managerBinaryName())
 	if _, err := os.Lstat(m.Root); err != nil {
 		if os.IsNotExist(err) {
 			if _, stateErr := os.Lstat(m.StatePath); os.IsNotExist(stateErr) {
@@ -294,7 +300,7 @@ func (m *Manager) DiscardPrepared(manifest release.Manifest) error {
 	if err := atomicfile.ReadJSON(filepath.Join(filepath.Dir(candidate.Path), "metadata.json"), &metadata); err != nil || metadata != candidate {
 		return errors.New("prepared Manager Candidate metadata does not exactly match state")
 	}
-	if err := validateVersionDirectoryContents(filepath.Dir(candidate.Path)); err != nil {
+	if err := validateVersionDirectoryContents(filepath.Dir(candidate.Path), m.managerBinaryName()); err != nil {
 		return fmt.Errorf("validate prepared Manager Candidate directory: %w", err)
 	}
 	state.Candidate = nil
@@ -367,7 +373,7 @@ func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error
 	}
 	unit := m.UnitName
 	if unit == "" {
-		unit = sourceManagerUnitName()
+		unit = m.managerUnitName()
 	}
 	activationsRoot := filepath.Join(m.Root, "activations")
 	if err := ensureRecoveryDirectory(activationsRoot); err != nil {
@@ -513,13 +519,21 @@ func (m *Manager) ensureOrdinaryWatchdog(ctx context.Context, plan Plan, previou
 	if !validSourceCommit(plan.PlatformCommit) || !validSHA256(previous.SHA256) || previous.Path == "" {
 		return errors.New("ordinary Manager watchdog identity is incomplete")
 	}
-	unit := recoveryWatchdogUnitPrefix + safeID(plan.PlatformCommit[:12])
+	unit := m.watchdogUnitPrefix() + safeID(plan.PlatformCommit[:12])
 	active, err := m.recoveryUnitIsActive(ctx, unit)
 	if err != nil {
 		return fmt.Errorf("inspect ordinary Manager activation watchdog: %w", err)
 	}
 	if !active {
-		if err := m.runner().Run(ctx, "systemd-run", "--user", "--quiet", "--collect", "--unit", unit, "--property=Type=exec", previous.Path, "self-update-watchdog", "--plan", plan.PlanPath); err != nil {
+		watchdogArguments := []string{"self-update-watchdog", "--plan", plan.PlanPath}
+		if previous.SourceCommit != contract.SourceOwnerCompatGeneration {
+			if !validManagerConfigPath(m.ConfigPath) {
+				return errors.New("ordinary Manager watchdog config binding is invalid")
+			}
+			watchdogArguments = append(watchdogArguments, "--config", m.ConfigPath)
+		}
+		arguments := append([]string{"--user", "--quiet", "--collect", "--unit", unit, "--property=Type=exec", previous.Path}, watchdogArguments...)
+		if err := m.runner().Run(ctx, "systemd-run", arguments...); err != nil {
 			return fmt.Errorf("start manager activation watchdog: %w", err)
 		}
 		active, err = m.recoveryUnitIsActive(ctx, unit)
@@ -530,10 +544,10 @@ func (m *Manager) ensureOrdinaryWatchdog(ctx context.Context, plan Plan, previou
 			return errors.New("ordinary Manager activation watchdog was not proven active after launch")
 		}
 	}
-	return m.verifyOrdinaryWatchdogProcess(ctx, unit, previous.Path, previous.SHA256, plan.PlanPath)
+	return m.verifyOrdinaryWatchdogProcess(ctx, unit, previous.Path, previous.SHA256, plan.PlanPath, previous.SourceCommit == contract.SourceOwnerCompatGeneration)
 }
 
-func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, executablePath, expectedSHA, planPath string) error {
+func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, executablePath, expectedSHA, planPath string, allowP1Arguments bool) error {
 	if m.OrdinaryWatchdogVerifier != nil {
 		return m.OrdinaryWatchdogVerifier(ctx, unit, executablePath, expectedSHA, planPath)
 	}
@@ -572,7 +586,12 @@ func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, execu
 		return fmt.Errorf("read ordinary Manager watchdog command line: %w", err)
 	}
 	arguments := strings.Split(strings.TrimRight(string(commandData), "\x00"), "\x00")
-	if len(arguments) != 4 || arguments[1] != "self-update-watchdog" || arguments[2] != "--plan" || arguments[3] != planPath {
+	want := []string{arguments[0], "self-update-watchdog", "--plan", planPath}
+	if validManagerConfigPath(m.ConfigPath) {
+		want = append(want, "--config", m.ConfigPath)
+	}
+	legacy := len(arguments) == 4 && arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath
+	if !reflect.DeepEqual(arguments, want) && !(allowP1Arguments && legacy) {
 		return errors.New("ordinary Manager watchdog command line does not exactly own the activation plan")
 	}
 	cgroupData, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(mainPID), "cgroup"))
@@ -580,6 +599,10 @@ func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, execu
 		return errors.New("ordinary Manager watchdog process is outside its systemd control group")
 	}
 	return nil
+}
+
+func validManagerConfigPath(path string) bool {
+	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.ContainsRune(path, 0)
 }
 
 // AcknowledgeStartup is called only after the new process is listening on its
@@ -765,12 +788,12 @@ func restartOrdinaryManagerAfterUnlock(runner Runner, plan Plan, result error) e
 }
 
 func (m *Manager) acknowledgeRecoveryExecutable(plan Plan) error {
-	ownership, err := readRecoveryTakeoverOwnership(plan)
+	ownership, err := readRecoveryTakeoverOwnership(m.Profile, plan)
 	if err != nil {
 		return fmt.Errorf("validate current recovery activation ownership: %w", err)
 	}
 	return withRecoveryTakeoverMutationLock(ownership.Path, func() error {
-		latestOwnership, readErr := readRecoveryTakeoverOwnership(plan)
+		latestOwnership, readErr := readRecoveryTakeoverOwnership(m.Profile, plan)
 		if readErr != nil {
 			return readErr
 		}
@@ -818,32 +841,97 @@ func (m *Manager) recoveryUnitName() string {
 	if m.UnitName != "" {
 		return m.UnitName
 	}
-	return sourceManagerUnitName()
+	return m.managerUnitName()
 }
 
-func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
+func RunWatchdog(
+	ctx context.Context,
+	binding WatchdogBinding,
+	planPath string,
+	runner Runner,
+	transferStartupAuthority func() error,
+) error {
+	if err := binding.validate(); err != nil {
+		return err
+	}
+	if transferStartupAuthority == nil {
+		return errors.New("watchdog requires a retained handoff authority transfer")
+	}
+	active := binding.active
 	if runner == nil {
 		runner = CommandRunner{}
 	}
-	var plan Plan
-	if err := atomicfile.ReadJSON(planPath, &plan); err != nil {
+	_, plan, err := readRecoveryActivationPlan(planPath)
+	if err != nil {
+		return err
+	}
+	if err := binding.validatePlan(planPath, plan); err != nil {
 		return err
 	}
 	lastOwnedPlan := plan
 	var lastRecoveryOwnership *recoveryTakeoverJournal
-	if plan.Mode == "" && (plan.Status == "prepared" || plan.Status == "activated" || plan.Status == "acknowledged") {
-		if _, err := validateOrdinaryWatchdogBinding(planPath, plan); err != nil {
+	activeStatus := plan.Status == "prepared" || plan.Status == "activated" || plan.Status == "acknowledged"
+	if plan.Mode == "" && activeStatus {
+		state, validationErr := validateOrdinaryWatchdogBinding(planPath, plan)
+		if validationErr != nil {
 			if ordinaryActivationStateAlreadyCommitted(plan) {
-				return commitActivation(planPath, plan)
+				_, committed, readErr := readRecoverySelfUpdateState(plan.StatePath)
+				if readErr != nil || committed.Previous == nil || committed.Previous.Path != plan.PreviousPath ||
+					!validSHA256(committed.Previous.SHA256) {
+					return errors.Join(validationErr, errors.New("committed activation has no immutable watchdog executable owner"), readErr)
+				}
+				if err := binding.verifyCurrentProcess(ctx, plan, committed.Previous.Path, committed.Previous.SHA256, sourceOwnerCompatWatchdog(committed.Previous)); err != nil {
+					return fmt.Errorf("verify committed ordinary watchdog executable: %w", err)
+				}
+				if transferStartupAuthority != nil {
+					if err := transferStartupAuthority(); err != nil {
+						return err
+					}
+					transferStartupAuthority = nil
+				}
+				return commitActivation(active, planPath, plan)
 			}
-			return fmt.Errorf("validate ordinary Manager activation watchdog ownership: %w", err)
+			return fmt.Errorf("validate ordinary Manager activation watchdog ownership: %w", validationErr)
 		}
-	} else if plan.Mode == recoveryActivationMode && (plan.Status == "prepared" || plan.Status == "activated" || plan.Status == "acknowledged") {
-		ownership, err := readRecoveryTakeoverOwnership(plan)
+		if state.Current == nil || state.Current.Path != plan.PreviousPath || !validSHA256(state.Current.SHA256) {
+			return errors.New("ordinary watchdog Current does not match its immutable previous executable")
+		}
+		if err := binding.verifyCurrentProcess(ctx, plan, state.Current.Path, state.Current.SHA256, sourceOwnerCompatWatchdog(state.Current)); err != nil {
+			return fmt.Errorf("verify ordinary watchdog executable: %w", err)
+		}
+	} else if plan.Mode == recoveryActivationMode && activeStatus {
+		ownership, err := readRecoveryTakeoverOwnership(active, plan)
 		if err != nil {
 			return fmt.Errorf("validate current recovery activation watchdog ownership: %w", err)
 		}
+		if err := binding.verifyCurrentProcess(ctx, plan, ownership.RecoveryPath, ownership.RecoverySHA256, false); err != nil {
+			return fmt.Errorf("verify current recovery watchdog executable: %w", err)
+		}
 		lastRecoveryOwnership = &ownership
+	} else {
+		if transferStartupAuthority != nil {
+			if err := transferStartupAuthority(); err != nil {
+				return err
+			}
+			transferStartupAuthority = nil
+		}
+		switch plan.Status {
+		case "committed":
+			return nil
+		case ordinaryRolledBackStatus, recoverySupersededStatus:
+			if plan.Error == "" {
+				return fmt.Errorf("Manager activation reached terminal status %q", plan.Status)
+			}
+			return errors.New(plan.Error)
+		default:
+			return fmt.Errorf("unsupported Manager activation watchdog status %q", plan.Status)
+		}
+	}
+	if transferStartupAuthority != nil {
+		if err := transferStartupAuthority(); err != nil {
+			return fmt.Errorf("release retained handoff authority after watchdog ownership proof: %w", err)
+		}
+		transferStartupAuthority = nil
 	}
 	timeout := time.Duration(plan.HealthTimeoutMS) * time.Millisecond
 	if timeout < time.Second {
@@ -864,7 +952,7 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 			}
 			if lastOwnedPlan.Mode == recoveryActivationMode && lastRecoveryOwnership != nil {
 				lastOwnedPlan.Error = readErr.Error()
-				return restoreRecoveryPreviousAfterPlanLoss(lastOwnedPlan, runner, *lastRecoveryOwnership)
+				return restoreRecoveryPreviousAfterPlanLoss(active, lastOwnedPlan, runner, *lastRecoveryOwnership)
 			}
 			return readErr
 		}
@@ -888,13 +976,13 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 			}
 			if _, err := validateOrdinaryWatchdogBinding(planPath, plan); err != nil {
 				if ordinaryActivationStateAlreadyCommitted(plan) {
-					return commitActivation(planPath, plan)
+					return commitActivation(active, planPath, plan)
 				}
 				return fmt.Errorf("ordinary Manager activation ownership changed while watched: %w", err)
 			}
 			lastOwnedPlan = plan
 		} else if plan.Mode == recoveryActivationMode {
-			ownership, err := readRecoveryTakeoverOwnership(plan)
+			ownership, err := readRecoveryTakeoverOwnership(active, plan)
 			if err != nil {
 				return fmt.Errorf("current recovery activation ownership changed while watched: %w", err)
 			}
@@ -915,7 +1003,7 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 		if plan.Activated && plan.Acknowledged && managerHealthy(ctx, plan.SocketPath, plan.ControlTokenFile, plan.CandidateVersion, plan.CandidateSHA) && binaryMatches(plan.InstallPath, plan.CandidateSHA) {
 			consecutive++
 			if consecutive >= 3 {
-				if err := commitActivation(planPath, plan); err != nil {
+				if err := commitActivation(active, planPath, plan); err != nil {
 					return err
 				}
 				return nil
@@ -934,7 +1022,7 @@ func RunWatchdog(ctx context.Context, planPath string, runner Runner) error {
 	} else {
 		plan.Error = "candidate did not acknowledge a healthy startup before the watchdog deadline"
 	}
-	return restorePrevious(plan, runner)
+	return restorePrevious(active, plan, runner)
 }
 
 func ordinaryActivationStateAlreadyCommitted(plan Plan) bool {
@@ -948,9 +1036,9 @@ func ordinaryActivationStateAlreadyCommitted(plan Plan) bool {
 		binaryMatches(plan.InstallPath, plan.CandidateSHA)
 }
 
-func restoreRecoveryPreviousAfterPlanLoss(plan Plan, runner Runner, ownership recoveryTakeoverJournal) error {
+func restoreRecoveryPreviousAfterPlanLoss(active identity.ActiveProfile, plan Plan, runner Runner, ownership recoveryTakeoverJournal) error {
 	return withRecoveryTakeoverMutationLock(ownership.Path, func() error {
-		latest, err := readRecoveryTakeoverOwnership(plan)
+		latest, err := readRecoveryTakeoverOwnership(active, plan)
 		if err != nil {
 			return fmt.Errorf("activation plan became unreadable and recovery watchdog ownership could not be revalidated: %w", err)
 		}
@@ -1096,14 +1184,14 @@ func restoreOrdinaryPreviousAfterPlanLoss(plan Plan, runner Runner) error {
 	return rollbackErr
 }
 
-func commitActivation(planPath string, plan Plan) error {
+func commitActivation(active identity.ActiveProfile, planPath string, plan Plan) error {
 	if plan.Mode == recoveryActivationMode {
-		journal, err := readRecoveryTakeoverOwnership(plan)
+		journal, err := readRecoveryTakeoverOwnership(active, plan)
 		if err != nil {
 			return err
 		}
 		return withRecoveryTakeoverMutationLock(journal.Path, func() error {
-			latest, readErr := readRecoveryTakeoverOwnership(plan)
+			latest, readErr := readRecoveryTakeoverOwnership(active, plan)
 			if readErr != nil {
 				return readErr
 			}
@@ -1208,15 +1296,15 @@ func commitActivationWithOwnership(planPath string, plan Plan, ownership *recove
 	return nil
 }
 
-func restorePrevious(plan Plan, runner Runner) error {
+func restorePrevious(active identity.ActiveProfile, plan Plan, runner Runner) error {
 	plan.Error = journal.BoundDiagnostic(plan.Error)
 	if plan.Mode == recoveryActivationMode {
-		ownership, err := readRecoveryTakeoverOwnership(plan)
+		ownership, err := readRecoveryTakeoverOwnership(active, plan)
 		if err != nil {
 			return err
 		}
 		return withRecoveryTakeoverMutationLock(ownership.Path, func() error {
-			latest, readErr := readRecoveryTakeoverOwnership(plan)
+			latest, readErr := readRecoveryTakeoverOwnership(active, plan)
 			if readErr != nil {
 				return readErr
 			}
@@ -1369,7 +1457,7 @@ func (m *Manager) backupRunningVersion() (*Version, error) {
 	}
 	hash := sha256Hex(data)
 	dir := filepath.Join(m.Root, "versions", "running-"+hash[:12])
-	path := filepath.Join(dir, sourceManagerBinaryName())
+	path := filepath.Join(dir, m.managerBinaryName())
 	if err := atomicfile.WriteFile(path, data, 0o700); err != nil {
 		return nil, err
 	}
@@ -1465,7 +1553,7 @@ func (m *Manager) PruneVersions(ctx context.Context, now time.Time, retention ti
 			continue
 		}
 		dir := filepath.Join(root, entry.Name())
-		binary := filepath.Join(dir, sourceManagerBinaryName())
+		binary := filepath.Join(dir, m.managerBinaryName())
 		if _, keep := protected[binary]; keep {
 			continue
 		}
@@ -1476,7 +1564,7 @@ func (m *Manager) PruneVersions(ctx context.Context, now time.Time, retention ti
 		if !validVersionDirectoryIdentity(entry.Name(), metadata) || !filepath.IsAbs(metadata.Path) || filepath.Clean(metadata.Path) != binary || metadata.VerifiedAt.IsZero() || now.Sub(metadata.VerifiedAt) <= retention {
 			continue
 		}
-		if err := validateVersionDirectoryContents(dir); err != nil {
+		if err := validateVersionDirectoryContents(dir, m.managerBinaryName()); err != nil {
 			continue
 		}
 		digest, err := fileSHA256(binary)
@@ -1490,7 +1578,7 @@ func (m *Manager) PruneVersions(ctx context.Context, now time.Time, retention ti
 		if err := atomicfile.ReadJSON(filepath.Join(dir, "metadata.json"), &latest); err != nil || latest != metadata {
 			continue
 		}
-		if err := validateVersionDirectoryContents(dir); err != nil {
+		if err := validateVersionDirectoryContents(dir, m.managerBinaryName()); err != nil {
 			continue
 		}
 		if latestDigest, err := fileSHA256(binary); err != nil || latestDigest != metadata.SHA256 {
@@ -1528,7 +1616,7 @@ func (m *Manager) ensureVersionMetadata(version Version) error {
 	if err != nil {
 		return err
 	}
-	if filepath.Dir(filepath.Dir(path)) != root || filepath.Base(path) != sourceManagerBinaryName() {
+	if filepath.Dir(filepath.Dir(path)) != root || filepath.Base(path) != m.managerBinaryName() {
 		return errors.New("referenced Manager version is outside the version root")
 	}
 	dir := filepath.Dir(path)
@@ -1557,15 +1645,15 @@ func (m *Manager) ensureVersionMetadata(version Version) error {
 	if err := atomicfile.WriteJSON(filepath.Join(dir, "metadata.json"), version, 0o600); err != nil {
 		return err
 	}
-	return validateVersionDirectoryContents(dir)
+	return validateVersionDirectoryContents(dir, m.managerBinaryName())
 }
 
-func validateVersionDirectoryContents(dir string) error {
+func validateVersionDirectoryContents(dir, managerBinaryName string) error {
 	contents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	allowed := map[string]struct{}{sourceManagerBinaryName(): {}, "metadata.json": {}}
+	allowed := map[string]struct{}{managerBinaryName: {}, "metadata.json": {}}
 	if len(contents) != len(allowed) {
 		return errors.New("Manager version directory contains unknown files")
 	}
@@ -1646,9 +1734,9 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 		}
 		unit := m.UnitName
 		if unit == "" {
-			unit = sourceManagerUnitName()
+			unit = m.managerUnitName()
 		}
-		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
+		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), m.managerBinaryName())
 		if plan.Mode != "" || plan.SchemaVersion != 1 || plan.PlanPath != planPath ||
 			plan.StatePath != m.StatePath || plan.InstallPath != installPath || plan.SocketPath != m.SocketPath ||
 			plan.ControlTokenFile != m.ControlTokenFile || plan.UnitName != unit ||
@@ -1725,7 +1813,7 @@ func (m *Manager) ActivationRolledBack(manifest release.Manifest) (bool, error) 
 			}
 			return err
 		}
-		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
+		expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), m.managerBinaryName())
 		if plan.Mode != "" || plan.PlanPath != planPath || plan.StatePath != m.StatePath ||
 			plan.InstallPath != m.InstallPath || plan.CandidateVersion != manifest.Manager.Version ||
 			!strings.EqualFold(plan.CandidateSHA, artifact.SHA256) || plan.CandidatePath != expectedCandidatePath ||
@@ -1816,7 +1904,7 @@ func (m *Manager) activationRejected(manifest release.Manifest) (bool, error) {
 	if plan.Status != ordinaryRolledBackStatus {
 		return false, nil
 	}
-	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), sourceManagerBinaryName())
+	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]), m.managerBinaryName())
 	if plan.Mode != "" || plan.PlanPath != planPath || plan.StatePath != m.StatePath ||
 		plan.InstallPath != m.InstallPath || plan.CandidateVersion != manifest.Manager.Version ||
 		!strings.EqualFold(plan.CandidateSHA, artifact.SHA256) || plan.CandidatePath != expectedCandidatePath ||

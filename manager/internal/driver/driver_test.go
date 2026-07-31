@@ -2,18 +2,97 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
+
+func TestBoundComposeIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
+	root := t.TempDir()
+	composePath := filepath.Join(root, "compose.yaml")
+	content := []byte("services:\n  platform:\n    image: exact\n")
+	if err := os.WriteFile(composePath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	runner := &recordingRunner{}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, ComposeFile: composePath,
+		ComposeSHA256: hex.EncodeToString(digest[:]),
+	}
+	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40)}
+	if err := docker.verifyBoundCompose(manifest); err != nil {
+		t.Fatalf("verify exact bound Compose: %v", err)
+	}
+	docker.ComposeSHA256 = strings.Repeat("b", 64)
+	if err := docker.StartFixed(context.Background(), manifest); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("mutated bound Compose error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("Docker mutation preceded Compose verification: %+v", runner.calls)
+	}
+	realPath := filepath.Join(root, "real.yaml")
+	if err := os.Rename(composePath, realPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, composePath); err != nil {
+		t.Fatal(err)
+	}
+	docker.ComposeSHA256 = hex.EncodeToString(digest[:])
+	if err := docker.verifyBoundCompose(manifest); err == nil {
+		t.Fatal("symlinked bound Compose was accepted")
+	}
+}
+
+func TestBoundManifestIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
+	root := t.TempDir()
+	manifest := strictDriverManifest(strings.Repeat("a", 40))
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	runner := &recordingRunner{}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, ManifestFile: path,
+		ManifestSHA256: hex.EncodeToString(digest[:]), ManifestChannel: contract.ReleaseChannel,
+	}
+	if err := docker.verifyBoundManifest(manifest); err != nil {
+		t.Fatalf("verify exact bound manifest: %v", err)
+	}
+	replacement, err := json.Marshal(strictDriverManifest(strings.Repeat("b", 40)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := docker.StartFixed(context.Background(), manifest); err == nil || !strings.Contains(err.Error(), "SHA-256 differs") {
+		t.Fatalf("replaced bound manifest error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("Docker mutation preceded manifest verification: %+v", runner.calls)
+	}
+}
+
+var testActiveProfile = identity.SourceActiveProfile()
 
 type recordedCall struct {
 	name string
@@ -55,7 +134,7 @@ func (r *pullTestRunner) Run(_ context.Context, _ string, args []string, _ []str
 }
 
 func pullTestDocker(runner Runner, idle, absolute time.Duration) DockerCLI {
-	return DockerCLI{
+	return DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", PullIdleTimeout: idle, PullAbsoluteTimeout: absolute,
 		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
 			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: 1 << 40, Favail: 1 << 20, FilesystemID: "pull-test"}, nil
@@ -66,9 +145,14 @@ func pullTestDocker(runner Runner, idle, absolute time.Duration) DockerCLI {
 func (r *pullTestRunner) RunWithActivity(ctx context.Context, _ string, args []string, _ []string, activity func()) (Result, error) {
 	r.calls = append(r.calls, append([]string(nil), args...))
 	if r.pull == nil {
+		r.present[args[len(args)-1]] = true
 		return Result{}, nil
 	}
-	return r.pull(ctx, args[len(args)-1], activity)
+	result, err := r.pull(ctx, args[len(args)-1], activity)
+	if err == nil {
+		r.present[args[len(args)-1]] = true
+	}
+	return result, err
 }
 
 func pullTestManifest() release.Manifest {
@@ -82,11 +166,34 @@ func pullTestManifest() release.Manifest {
 	}}
 }
 
+func strictDriverManifest(generation string) release.Manifest {
+	artifact := func(name string) release.Artifact {
+		return release.Artifact{URL: "https://example.invalid/" + name, SHA256: strings.Repeat("a", 64)}
+	}
+	managedNames := []string{
+		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+		"firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
+	}
+	images := make(map[string]string, len(managedNames))
+	for _, name := range managedNames {
+		images[name] = "example.invalid/" + name + "@sha256:" + strings.Repeat("b", 64)
+	}
+	return release.Manifest{
+		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: generation,
+		GeneratedAt: time.Unix(100, 0).UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 7,
+		Manager: release.ManagerRelease{Version: generation, Artifacts: map[string]release.Artifact{
+			"amd64": artifact("manager-amd64"), "arm64": artifact("manager-arm64"),
+		}},
+		Compose: artifact("compose.yaml"), Images: images,
+	}
+}
+
 func TestGenerationEnvironmentExcludesOpaqueExtraImages(t *testing.T) {
 	root := t.TempDir()
 	platform := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
 	opaque := "registry.example/future@sha256:" + strings.Repeat("b", 64)
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		GenerationDir: filepath.Join(root, "releases"),
 		DataRoot:      filepath.Join(root, "data"),
 		StateDir:      filepath.Join(root, "manager"),
@@ -115,6 +222,43 @@ func TestGenerationEnvironmentExcludesOpaqueExtraImages(t *testing.T) {
 	}
 }
 
+func TestVerifiedTargetProfileEmitsOnlyTargetComposeIdentity(t *testing.T) {
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	docker := DockerCLI{
+		Profile:        active,
+		GenerationDir:  filepath.Join(root, "releases"),
+		DataRoot:       filepath.Join(root, "data"),
+		StateDir:       filepath.Join(root, "manager"),
+		ControlDir:     filepath.Join(root, "runtime", "agent-platform-manager"),
+		ComposeProject: "agent-platform",
+		CoreNetwork:    "agent-platform_core",
+		UID:            os.Getuid(),
+		GID:            os.Getgid(),
+	}
+	image := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
+	path, err := docker.writeGenerationEnvironment(release.Manifest{
+		SourceCommit: strings.Repeat("c", 40),
+		Images:       map[string]string{"platform": image},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "AGENT_PLATFORM_PLATFORM_IMAGE="+image+"\n") ||
+		!strings.Contains(string(content), "AGENT_PLATFORM_COMPOSE_PROJECT=agent-platform\n") ||
+		!strings.Contains(string(content), "AGENT_PLATFORM_MANAGER_CONTROL_DIR="+docker.ControlDir+"\n") ||
+		strings.Contains(string(content), "UBITECH_") {
+		t.Fatalf("target Compose environment = %s", content)
+	}
+}
+
 func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	manifest := pullTestManifest()
 	runner := &pullTestRunner{present: map[string]bool{manifest.Images["platform"]: true}}
@@ -122,8 +266,8 @@ func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	if err := docker.Pull(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("pull commands = %#v, want initial inspections, one ownership recheck, and one pull", runner.calls)
+	if len(runner.calls) != 5 {
+		t.Fatalf("pull commands = %#v, want initial inspections, one ownership recheck, one pull, and one digest proof", runner.calls)
 	}
 	if got := runner.calls[0]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["platform"]}) {
 		t.Fatalf("platform inspection = %v", got)
@@ -137,11 +281,50 @@ func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	if got := runner.calls[3]; !reflect.DeepEqual(got, []string{"pull", manifest.Images["agent-runtime"]}) {
 		t.Fatalf("runtime pull = %v", got)
 	}
+	if got := runner.calls[4]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
+		t.Fatalf("runtime post-pull digest proof = %v", got)
+	}
 	joined := fmt.Sprint(runner.calls)
 	for _, capability := range []string{"agent-sandbox", "camofox", "firecrawl-api", "searxng"} {
 		if strings.Contains(joined, manifest.Images[capability]) {
 			t.Fatalf("capability image %s entered the core pull path: %s", capability, joined)
 		}
+	}
+}
+
+func TestPullRejectsSuccessfulCommandWithoutExactRepoDigestAndCleansCandidate(t *testing.T) {
+	manifest := pullTestManifest()
+	platform := manifest.Images["platform"]
+	pulled := false
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
+			return Result{Stdout: os.TempDir() + "\n"}, nil
+		case len(args) == 5 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .RepoDigests}}":
+			if args[4] == platform && pulled {
+				return Result{Stdout: "[]\n"}, nil
+			}
+			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
+		case reflect.DeepEqual(args, []string{"pull", platform}):
+			pulled = true
+			return Result{}, nil
+		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
+			return Result{}, nil
+		case reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{.Id}}", platform}):
+			return Result{Stdout: "sha256:" + strings.Repeat("c", 64)}, nil
+		case reflect.DeepEqual(args, []string{"image", "rm", platform}):
+			return Result{}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected command: %v", args)
+		}
+	}}
+	docker := pullTestDocker(runner, time.Second, 2*time.Second)
+	err := docker.Pull(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "exact RepoDigest is absent") {
+		t.Fatalf("post-pull proof error = %v", err)
+	}
+	if got := runner.calls[len(runner.calls)-1].args; !reflect.DeepEqual(got, []string{"image", "rm", platform}) {
+		t.Fatalf("unproven pulled image was not cleaned: %v", got)
 	}
 }
 
@@ -263,6 +446,9 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
 			return Result{Stdout: os.TempDir() + "\n"}, nil
 		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .RepoDigests}}":
+			if args[4] == platform && platformPulled {
+				return Result{Stdout: fmt.Sprintf("[%q]", platform)}, nil
+			}
 			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
 		case reflect.DeepEqual(args, []string{"pull", platform}):
 			platformPulled = true
@@ -312,7 +498,7 @@ func TestEnsureSandboxUsesRootEntrypointAndExecUsesMappedUser(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker"}
 	spec := SandboxSpec{
 		ContainerName: "ubitech-sandbox-test",
 		AgentHash:     "abc",
@@ -363,7 +549,7 @@ func TestEnsureSandboxRemovesCreatedContainerWhenStartFails(t *testing.T) {
 			return Result{}, nil
 		}
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker"}
 	spec := SandboxSpec{ContainerName: "ubitech-sandbox-test", AgentHash: "abc", Image: image, Network: "core", Workspace: "/data/workspace", Home: "/data/home", Environment: "/data/env", UID: 12345, GID: 23456}
 	outcome, err := docker.EnsureSandboxWithResult(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "entrypoint failed") {
@@ -381,6 +567,7 @@ func TestEnsureSandboxRemovesCreatedContainerWhenStartFails(t *testing.T) {
 func TestEnsureSandboxPullsMissingExactImageBeforeCreate(t *testing.T) {
 	const image = "registry.example/sandbox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	root := t.TempDir()
+	pulled := false
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
 			return Result{Stdout: root + "\n"}, nil
@@ -389,12 +576,18 @@ func TestEnsureSandboxPullsMissingExactImageBeforeCreate(t *testing.T) {
 		case "inspect":
 			return Result{}, errors.New("container not found")
 		case "image":
+			if pulled {
+				return Result{Stdout: fmt.Sprintf("[%q]", image)}, nil
+			}
 			return Result{Stderr: "No such image", ExitCode: 1}, errors.New("image not found")
+		case "pull":
+			pulled = true
+			return Result{}, nil
 		default:
 			return Result{}, nil
 		}
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", DataRoot: root,
 		PullIdleTimeout: time.Second, PullAbsoluteTimeout: 2 * time.Second,
 		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
@@ -431,7 +624,7 @@ func TestEnsureSandboxPullsMissingExactImageBeforeCreate(t *testing.T) {
 
 func TestStopFixedNeverRemovesLifecycleIndependentNetwork(t *testing.T) {
 	runner := &recordingRunner{}
-	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
 	if err := docker.StopFixed(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +658,7 @@ func TestStopFixedRemovesManagedMigrationWriterBeforeCompose(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
 	if err := docker.StopFixed(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +675,7 @@ func TestStopFixedRemovesManagedMigrationWriterBeforeCompose(t *testing.T) {
 
 func TestReconcileFirecrawlStartsPostgreSQLStackOnce(t *testing.T) {
 	runner := &recordingRunner{}
-	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
 	if err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env"); err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +716,7 @@ func TestReconcileFirecrawlReportsFailureWithoutMutatingServices(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "ubitech-agent"}
 	err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env")
 	if err == nil || !strings.Contains(err.Error(), "start Firecrawl PostgreSQL stack: Firecrawl API is unhealthy") || !strings.Contains(err.Error(), "api failed") {
 		t.Fatalf("reconcileFirecrawl() error = %v", err)
@@ -563,7 +756,7 @@ func TestStartFixedOnlyStartsCoreServices(t *testing.T) {
 			return Result{}, nil
 		}
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
 		StateDir: stateDir, CoreNetwork: "ubitech-agent-core",
@@ -576,7 +769,7 @@ func TestStartFixedOnlyStartsCoreServices(t *testing.T) {
 		commands = append(commands, strings.Join(call.args, " "))
 	}
 	joined := strings.Join(commands, "\n")
-	if !strings.Contains(joined, " up --detach --wait platform agent-runtime") {
+	if !strings.Contains(joined, " up --pull never --detach --wait platform agent-runtime") {
 		t.Fatalf("StartFixed() did not wait for the two core services: %s", joined)
 	}
 	for _, capability := range []string{"camofox", "searxng", "firecrawl"} {
@@ -584,6 +777,255 @@ func TestStartFixedOnlyStartsCoreServices(t *testing.T) {
 			t.Fatalf("StartFixed() synchronously attempted capability %s: %s", capability, joined)
 		}
 	}
+}
+
+func TestSourceRecoveryMissingCoreImageFailsBeforeNetworkOrComposeMutation(t *testing.T) {
+	manifest := pullTestManifest()
+	platform := manifest.Images["platform"]
+	runtimeImage := manifest.Images["agent-runtime"]
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", platform}):
+			return Result{Stdout: fmt.Sprintf("[%q]", platform)}, nil
+		case reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", runtimeImage}):
+			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
+		default:
+			return Result{}, fmt.Errorf("unexpected mutation: %v", args)
+		}
+	}}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, RequireLocalImages: true,
+		CoreNetwork: "source-core", ExpectedCoreNetworkID: strings.Repeat("d", 64),
+	}
+	if err := docker.StartFixed(context.Background(), manifest); err == nil || !strings.Contains(err.Error(), "required local managed image agent-runtime") {
+		t.Fatalf("missing source core image error = %v", err)
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && (call.args[0] == "network" || call.args[0] == "compose" || call.args[0] == "pull") {
+			t.Fatalf("source recovery mutated Docker after failed image proof: %v", call.args)
+		}
+	}
+}
+
+func TestBoundCoreNetworkIsReadOnlyAndExact(t *testing.T) {
+	expectedID := strings.Repeat("a", 64)
+	profile, err := testActiveProfile.Profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFormat := fmt.Sprintf(`{{.Id}}\t{{.Driver}}\t{{index .Labels %q}}`, profile.Label("network"))
+
+	t.Run("exact existing network is accepted", func(t *testing.T) {
+		runner := &recordingRunner{results: func(args []string) (Result, error) {
+			if reflect.DeepEqual(args, []string{"network", "inspect", "--format", wantFormat, "source-core"}) {
+				return Result{Stdout: expectedID + "\tbridge\tcore\n"}, nil
+			}
+			return Result{}, fmt.Errorf("unexpected command: %v", args)
+		}}
+		docker := DockerCLI{Profile: testActiveProfile, Runner: runner, CoreNetwork: "source-core"}
+		if err := docker.VerifyCoreNetwork(context.Background(), expectedID); err != nil {
+			t.Fatalf("exact bound network rejected: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		stdout string
+		err    error
+	}{
+		{name: "different id", stdout: strings.Repeat("b", 64) + " bridge core\n"},
+		{name: "different driver", stdout: expectedID + " overlay core\n"},
+		{name: "different label", stdout: expectedID + " bridge foreign\n"},
+		{name: "missing", err: errors.New("No such network")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				if len(args) >= 2 && args[0] == "network" && args[1] == "inspect" {
+					return Result{Stdout: test.stdout}, test.err
+				}
+				return Result{}, fmt.Errorf("unexpected mutation: %v", args)
+			}}
+			docker := DockerCLI{
+				Profile: testActiveProfile, Runner: runner, CoreNetwork: "source-core",
+				ExpectedCoreNetworkID: expectedID,
+			}
+			manifest := release.Manifest{SourceCommit: strings.Repeat("c", 40)}
+			if err := docker.StartFixed(context.Background(), manifest); err == nil {
+				t.Fatal("source recovery accepted an absent or replaced bound network")
+			}
+			for _, call := range runner.calls {
+				mutating := len(call.args) >= 2 && call.args[0] == "network" && call.args[1] == "create"
+				for _, arg := range call.args {
+					mutating = mutating || arg == "up"
+				}
+				if mutating {
+					t.Fatalf("failed bound-network proof mutated Docker: %v", call.args)
+				}
+			}
+		})
+	}
+}
+
+func TestStartFixedPreservesPrepublishedGenerationInventory(t *testing.T) {
+	root := t.TempDir()
+	generation := strings.Repeat("d", 40)
+	releaseDir := filepath.Join(root, "releases", generation)
+	stateDir := filepath.Join(root, "manager")
+	if err := os.MkdirAll(releaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"manifest.json", "compose.yaml"} {
+		if err := os.WriteFile(filepath.Join(releaseDir, name), []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if len(args) > 1 && args[0] == "network" && args[1] == "inspect" {
+			return Result{Stdout: "bridge core\n"}, nil
+		}
+		return Result{}, nil
+	}}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
+		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
+		StateDir: stateDir, CoreNetwork: "ubitech-agent-core",
+		UID: os.Getuid(), GID: os.Getgid(),
+	}
+	manifest := release.Manifest{SourceCommit: generation, Images: map[string]string{}}
+	environment, err := docker.writeGenerationEnvironment(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := docker.setActiveGeneration(generation); err != nil {
+		t.Fatal(err)
+	}
+	pointer := filepath.Join(stateDir, "active-generation")
+	stagedTime := time.Unix(1_700_000_000, 123_000_000)
+	for _, path := range []string{environment, pointer} {
+		if err := os.Chtimes(path, stagedTime, stagedTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeEnvironment, err := os.Stat(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePointer, err := os.Stat(pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := docker.StartFixed(context.Background(), manifest); err != nil {
+		t.Fatalf("StartFixed() failed to replay the staged generation: %v", err)
+	}
+	afterEnvironment, err := os.Stat(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterPointer, err := os.Stat(pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, observation := range map[string][2]os.FileInfo{
+		"compose.env":       {beforeEnvironment, afterEnvironment},
+		"active-generation": {beforePointer, afterPointer},
+	} {
+		if !os.SameFile(observation[0], observation[1]) {
+			t.Fatalf("%s inode changed while replaying identical staged inventory", name)
+		}
+		if !observation[1].ModTime().Equal(stagedTime) {
+			t.Fatalf("%s mtime = %s, want staged mtime %s", name, observation[1].ModTime(), stagedTime)
+		}
+	}
+}
+
+func TestGeneratedOwnerFileReplacesSafeMismatchAndRejectsUnsafeObjects(t *testing.T) {
+	t.Run("safe mismatch is atomically replaced", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "compose.env")
+		if err := os.WriteFile(path, []byte("old\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeGeneratedOwnerFile(path, []byte("new\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(before, after) {
+			t.Fatal("safe mismatched generated file was rewritten in place instead of atomically replaced")
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != "new\n" || after.Mode().Perm() != 0o600 {
+			t.Fatalf("replaced file content/mode = %q/%#o", content, after.Mode().Perm())
+		}
+	})
+
+	t.Run("hard link is rejected", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "active-generation")
+		peer := filepath.Join(root, "inventory-copy")
+		if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(path, peer); err != nil {
+			t.Fatal(err)
+		}
+		err := writeGeneratedOwnerFile(path, []byte("new\n"), 0o600)
+		if err == nil || !strings.Contains(err.Error(), "singly-linked regular file") {
+			t.Fatalf("hard-linked generated file error = %v", err)
+		}
+		content, err := os.ReadFile(peer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != "old\n" {
+			t.Fatalf("hard-linked inventory was modified: %q", content)
+		}
+	})
+
+	t.Run("symbolic link is rejected", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		path := filepath.Join(root, "active-generation")
+		if err := os.WriteFile(target, []byte("old\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeGeneratedOwnerFile(path, []byte("new\n"), 0o600); err == nil {
+			t.Fatal("symbolic-link generated file was accepted")
+		}
+		content, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != "old\n" {
+			t.Fatalf("symbolic-link target was modified: %q", content)
+		}
+	})
+
+	t.Run("named pipe is rejected without blocking", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "active-generation")
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := writeGeneratedOwnerFile(path, []byte("new\n"), 0o600)
+		if err == nil || !strings.Contains(err.Error(), "singly-linked regular file") {
+			t.Fatalf("named-pipe generated file error = %v", err)
+		}
+	})
 }
 
 func TestReconcileCapabilitiesRetriesEveryServiceAndJoinsFailures(t *testing.T) {
@@ -615,7 +1057,7 @@ func TestReconcileCapabilitiesRetriesEveryServiceAndJoinsFailures(t *testing.T) 
 		}
 		return Result{}, fmt.Errorf("unexpected Docker arguments: %v", args)
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data-root"),
 		StateDir: filepath.Join(root, "manager"), CoreNetwork: "ubitech-agent-core",
@@ -672,7 +1114,7 @@ func TestMigrateUsesManagedIdentityAndCleansAfterRunnerFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: root, DataRoot: filepath.Join(root, "data-root"), StateDir: filepath.Join(root, "state"),
 	}
@@ -736,7 +1178,7 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
 		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
 	}
@@ -788,7 +1230,7 @@ func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T)
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
 		ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
 	}
@@ -809,6 +1251,120 @@ func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T)
 		if status[service].Status != "healthy" {
 			t.Fatalf("service %s status = %#v", service, status[service])
 		}
+	}
+}
+
+func TestVerifyFixedWritersStoppedUsesClosedWorldContainerState(t *testing.T) {
+	manifest := strictDriverManifest(strings.Repeat("f", 40))
+	profile, err := testActiveProfile.Profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type object struct {
+		id         string
+		name       string
+		image      string
+		labels     map[string]string
+		running    bool
+		pid        int
+		inspectErr error
+	}
+	projection := func(value object) string {
+		fields := []any{value.id, "/" + value.name, value.image, value.labels, value.running, value.pid}
+		encoded := make([]string, 0, len(fields))
+		for _, field := range fields {
+			raw, marshalErr := json.Marshal(field)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			encoded = append(encoded, string(raw))
+		}
+		return strings.Join(encoded, "\t") + "\n"
+	}
+	compose := func(id, service string, running bool, pid int) object {
+		return object{
+			id: id, name: profile.ComposeProject + "-" + service + "-1", image: manifest.Images[service],
+			labels:  map[string]string{"com.docker.compose.project": profile.ComposeProject, "com.docker.compose.service": service},
+			running: running, pid: pid,
+		}
+	}
+	idA, idB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	sandboxHash := strings.Repeat("c", 64)
+	exitedSandbox := object{
+		id: strings.Repeat("d", 64), name: profile.SandboxContainerPrefix + sandboxHash[:16], image: manifest.Images["agent-sandbox"],
+		labels: map[string]string{profile.Label("sandbox"): "true", profile.Label("id"): sandboxHash},
+	}
+
+	tests := []struct {
+		name      string
+		objects   []object
+		listErr   error
+		secondIDs []string
+		wantError string
+	}{
+		{name: "all relevant containers absent"},
+		{name: "known exited service", objects: []object{compose(idA, "platform", false, 0)}},
+		{name: "known exited Sandbox", objects: []object{exitedSandbox}},
+		{name: "running unhealthy is still a writer", objects: []object{compose(idA, "platform", true, 481)}, wantError: "not explicitly stopped"},
+		{name: "partial up retains running writer", objects: []object{compose(idA, "platform", false, 0), compose(idB, "agent-runtime", true, 482)}, wantError: "not explicitly stopped"},
+		{name: "unknown same-project service", objects: []object{{
+			id: idA, name: profile.ComposeProject + "-mystery-1", image: manifest.Images["platform"],
+			labels: map[string]string{"com.docker.compose.project": profile.ComposeProject, "com.docker.compose.service": "mystery"},
+		}}, wantError: "unknown Compose service"},
+		{name: "duplicate same-project service", objects: []object{compose(idA, "platform", false, 0), compose(idB, "platform", false, 0)}, wantError: "duplicate Compose service"},
+		{name: "extra profile writer", objects: []object{{
+			id: idA, name: profile.MigrationContainerPrefix + "unexpected", image: manifest.Images["platform"],
+			labels: map[string]string{profile.Label("migration"): "true"},
+		}}, wantError: "unknown " + profile.ProfileID + " profile container"},
+		{name: "daemon list error is unknown", listErr: errors.New("permission denied"), wantError: "permission denied"},
+		{name: "inspect error is unknown", objects: []object{{id: idA, inspectErr: errors.New("daemon unavailable")}}, wantError: "daemon unavailable"},
+		{name: "inventory race is unknown", objects: []object{compose(idA, "platform", false, 0)}, secondIDs: []string{idA, idB}, wantError: "inventory changed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			byID := make(map[string]object, len(test.objects))
+			ids := make([]string, 0, len(test.objects))
+			for _, value := range test.objects {
+				byID[value.id] = value
+				ids = append(ids, value.id)
+			}
+			listCalls := 0
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				if reflect.DeepEqual(args, []string{"container", "ls", "--all", "--quiet", "--no-trunc"}) {
+					listCalls++
+					if test.listErr != nil {
+						return Result{}, test.listErr
+					}
+					listed := ids
+					if listCalls > 1 && test.secondIDs != nil {
+						listed = test.secondIDs
+					}
+					return Result{Stdout: strings.Join(listed, "\n")}, nil
+				}
+				if len(args) == 5 && args[0] == "container" && args[1] == "inspect" {
+					value, exists := byID[args[4]]
+					if !exists {
+						return Result{}, errors.New("unknown test container")
+					}
+					if value.inspectErr != nil {
+						return Result{}, value.inspectErr
+					}
+					return Result{Stdout: projection(value)}, nil
+				}
+				return Result{}, fmt.Errorf("unexpected Docker command: %v", args)
+			}}
+			docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeProject: profile.ComposeProject}
+			err := docker.VerifyFixedWritersStopped(context.Background(), manifest)
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("explicit stopped proof failed: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("writer proof error = %v, want %q", err, test.wantError)
+			}
+		})
 	}
 }
 
@@ -841,7 +1397,7 @@ func TestProbeRejectsMissingDuplicateStoppedOrUnhealthyCoreContainer(t *testing.
 				}
 				return Result{}, nil
 			}}
-			docker := DockerCLI{
+			docker := DockerCLI{Profile: testActiveProfile,
 				Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml",
 				ComposeProject: "ubitech-agent", GenerationDir: t.TempDir(),
 			}
@@ -873,7 +1429,7 @@ func TestCandidateFailureDiagnosticsCapturesPlatformLogsAndHealthHistory(t *test
 			return Result{}, fmt.Errorf("unexpected Docker arguments: %v", args)
 		}
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: root,
 	}
@@ -929,7 +1485,7 @@ func TestCandidateFailureDiagnosticsBoundsSuccessAndCollectionFailures(t *testin
 				return Result{}, nil
 			}
 		}}
-		diagnostic := (DockerCLI{Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
+		diagnostic := (DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
 			context.Background(),
 			release.Manifest{SourceCommit: generation},
 		)
@@ -955,7 +1511,7 @@ func TestCandidateFailureDiagnosticsBoundsSuccessAndCollectionFailures(t *testin
 			}
 			return Result{}, nil
 		}}
-		diagnostic := (DockerCLI{Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
+		diagnostic := (DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent", GenerationDir: t.TempDir()}).CandidateFailureDiagnostics(
 			context.Background(),
 			release.Manifest{SourceCommit: generation},
 		)
@@ -1004,7 +1560,7 @@ func TestCandidateFailureDiagnosticsRedactsKnownAndPatternCredentials(t *testing
 			return Result{}, nil
 		}
 	}}
-	diagnostic := (DockerCLI{
+	diagnostic := (DockerCLI{Profile: testActiveProfile,
 		Runner: runner, Binary: "docker", ComposeProject: "ubitech-agent",
 		GenerationDir: t.TempDir(), StateDir: stateDir,
 	}).CandidateFailureDiagnostics(context.Background(), release.Manifest{SourceCommit: generation})
@@ -1020,7 +1576,7 @@ func TestCandidateFailureDiagnosticsRedactsKnownAndPatternCredentials(t *testing
 
 func TestCandidateFailureDiagnosticsRejectsInvalidGenerationWithoutDocker(t *testing.T) {
 	runner := &recordingRunner{}
-	diagnostic := (DockerCLI{Runner: runner}).CandidateFailureDiagnostics(
+	diagnostic := (DockerCLI{Profile: testActiveProfile, Runner: runner}).CandidateFailureDiagnostics(
 		context.Background(),
 		release.Manifest{SourceCommit: "../../outside"},
 	)
@@ -1040,7 +1596,7 @@ func slicesContain(values []string, expected string) bool {
 
 func TestActiveEnvironmentUsesDurableGenerationPointer(t *testing.T) {
 	root := t.TempDir()
-	docker := DockerCLI{StateDir: filepath.Join(root, "manager"), GenerationDir: filepath.Join(root, "manager", "releases")}
+	docker := DockerCLI{Profile: testActiveProfile, StateDir: filepath.Join(root, "manager"), GenerationDir: filepath.Join(root, "manager", "releases")}
 	oldID := strings.Repeat("a", 40)
 	newID := strings.Repeat("b", 40)
 	for _, id := range []string{oldID, newID} {
@@ -1076,7 +1632,7 @@ func TestEnsureCoreNetworkFailsClosedForUnownedNetwork(t *testing.T) {
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		return Result{Stdout: "bridge \n"}, nil
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", CoreNetwork: "ubitech-agent-core"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", CoreNetwork: "ubitech-agent-core"}
 	if err := docker.EnsureCoreNetwork(context.Background()); err == nil {
 		t.Fatal("expected an existing unowned network to be rejected")
 	}
@@ -1092,12 +1648,167 @@ func TestEnsureCoreNetworkCreatesMissingManagedBridge(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{Runner: runner, Binary: "docker", CoreNetwork: "ubitech-agent-core"}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", CoreNetwork: "ubitech-agent-core"}
 	if err := docker.EnsureCoreNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(runner.calls[1].args, " "); got != "network create --driver bridge --label org.ubitech.agent.network=core ubitech-agent-core" {
 		t.Fatalf("unexpected network creation: %s", got)
+	}
+}
+
+func TestHandoffCoreNetworkIsTransactionOwnedAndCrashReplaySafe(t *testing.T) {
+	transactionID := "handoff_0123456789abcdef0123456789abcdef"
+	binding := strings.Repeat("b", 64)
+	networkID := strings.Repeat("c", 64)
+	profile, err := testActiveProfile.Profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := false
+	createCalls := 0
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) >= 2 && args[0] == "network" && args[1] == "inspect":
+			if !created {
+				return Result{}, errors.New("No such network")
+			}
+			return Result{Stdout: strings.Join([]string{networkID, "bridge", "core", transactionID, binding, "0"}, "|") + "\n"}, nil
+		case reflect.DeepEqual(args, []string{"network", "ls", "--format", "{{.Name}}"}):
+			return Result{}, nil
+		case len(args) >= 2 && args[0] == "network" && args[1] == "create":
+			createCalls++
+			created = true
+			return Result{Stdout: networkID + "\n"}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected Docker command: %v", args)
+		}
+	}}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, Binary: "docker", CoreNetwork: "ubitech-agent-core",
+		HandoffTransactionID: transactionID, HandoffBindingSHA256: binding,
+	}
+	if err := docker.EnsureCoreNetwork(context.Background()); err != nil {
+		t.Fatalf("create transaction-owned network: %v", err)
+	}
+	if err := docker.EnsureCoreNetwork(context.Background()); err != nil {
+		t.Fatalf("replay transaction-owned network: %v", err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("network created %d times", createCalls)
+	}
+	joined := ""
+	for _, call := range runner.calls {
+		if len(call.args) >= 2 && call.args[0] == "network" && call.args[1] == "create" {
+			joined = strings.Join(call.args, " ")
+		}
+	}
+	for _, expected := range []string{
+		"--label " + profile.Label("network") + "=core",
+		"--label " + profile.Label("handoff.transaction") + "=" + transactionID,
+		"--label " + profile.Label("handoff.binding-sha256") + "=" + binding,
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("network creation %q lacks %q", joined, expected)
+		}
+	}
+}
+
+func TestHandoffCoreNetworkRejectsPreexistingOrUninspectableObject(t *testing.T) {
+	transactionID := "handoff_0123456789abcdef0123456789abcdef"
+	binding := strings.Repeat("b", 64)
+	networkID := strings.Repeat("c", 64)
+	for _, test := range []struct {
+		name    string
+		inspect Result
+		err     error
+		list    string
+	}{
+		{name: "preexisting profile network lacks transaction labels", inspect: Result{Stdout: networkID + "|bridge|core|||0\n"}},
+		{name: "inspect failure cannot treat an existing name as absent", err: errors.New("permission denied"), list: "ubitech-agent-core\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				if len(args) >= 2 && args[0] == "network" && args[1] == "inspect" {
+					return test.inspect, test.err
+				}
+				if reflect.DeepEqual(args, []string{"network", "ls", "--format", "{{.Name}}"}) {
+					return Result{Stdout: test.list}, nil
+				}
+				return Result{}, fmt.Errorf("unexpected mutation: %v", args)
+			}}
+			docker := DockerCLI{
+				Profile: testActiveProfile, Runner: runner, CoreNetwork: "ubitech-agent-core",
+				HandoffTransactionID: transactionID, HandoffBindingSHA256: binding,
+			}
+			if err := docker.EnsureCoreNetwork(context.Background()); err == nil {
+				t.Fatal("preexisting or uninspectable target network was accepted")
+			}
+			for _, call := range runner.calls {
+				if len(call.args) >= 2 && call.args[0] == "network" && call.args[1] == "create" {
+					t.Fatalf("unsafe target network was modified: %v", call.args)
+				}
+			}
+		})
+	}
+}
+
+func TestRemoveTransactionCoreNetworkUsesInspectedIDAndIsIdempotent(t *testing.T) {
+	transactionID := "handoff_0123456789abcdef0123456789abcdef"
+	binding := strings.Repeat("b", 64)
+	networkID := strings.Repeat("c", 64)
+	exists := true
+	rmCalls := 0
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		switch {
+		case len(args) >= 2 && args[0] == "network" && args[1] == "inspect":
+			if !exists {
+				return Result{}, errors.New("No such network")
+			}
+			return Result{Stdout: strings.Join([]string{networkID, "bridge", "core", transactionID, binding, "0"}, "|") + "\n"}, nil
+		case reflect.DeepEqual(args, []string{"network", "ls", "--format", "{{.Name}}"}):
+			return Result{}, nil
+		case reflect.DeepEqual(args, []string{"network", "rm", networkID}):
+			rmCalls++
+			exists = false
+			return Result{}, nil
+		default:
+			return Result{}, fmt.Errorf("unexpected Docker command: %v", args)
+		}
+	}}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, CoreNetwork: "ubitech-agent-core",
+		HandoffTransactionID: transactionID, HandoffBindingSHA256: binding,
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := docker.RemoveTransactionCoreNetwork(context.Background(), transactionID, binding); err != nil {
+			t.Fatalf("rollback attempt %d: %v", attempt+1, err)
+		}
+	}
+	if rmCalls != 1 {
+		t.Fatalf("network removed %d times", rmCalls)
+	}
+}
+
+func TestRemoveTransactionCoreNetworkRefusesConsumers(t *testing.T) {
+	transactionID := "handoff_0123456789abcdef0123456789abcdef"
+	binding := strings.Repeat("b", 64)
+	networkID := strings.Repeat("c", 64)
+	runner := &recordingRunner{results: func(args []string) (Result, error) {
+		if len(args) >= 2 && args[0] == "network" && args[1] == "inspect" {
+			return Result{Stdout: strings.Join([]string{networkID, "bridge", "core", transactionID, binding, "1"}, "|") + "\n"}, nil
+		}
+		return Result{}, fmt.Errorf("unexpected mutation: %v", args)
+	}}
+	docker := DockerCLI{
+		Profile: testActiveProfile, Runner: runner, CoreNetwork: "ubitech-agent-core",
+		HandoffTransactionID: transactionID, HandoffBindingSHA256: binding,
+	}
+	if err := docker.RemoveTransactionCoreNetwork(context.Background(), transactionID, binding); err == nil || !strings.Contains(err.Error(), "consumers") {
+		t.Fatalf("network consumer fence error = %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("network with consumers was mutated: %+v", runner.calls)
 	}
 }
 
@@ -1109,7 +1820,7 @@ func TestCheckCapacityRejectsLowDiskBeforePull(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner:   runner,
 		DataRoot: root,
 		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
@@ -1134,7 +1845,7 @@ func TestPrepareManagedImageAppliesCapacityGateBeforeSandboxPull(t *testing.T) {
 			return Result{}, fmt.Errorf("unexpected command: %v", args)
 		}
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, DataRoot: root,
 		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
 			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: 19 << 30, Favail: 10000, FilesystemID: "same"}, nil
@@ -1159,7 +1870,7 @@ func TestPrepareManagedImageSkipsCapacityProbeForExactLocalDigest(t *testing.T) 
 		}
 		return Result{}, fmt.Errorf("unexpected command: %v", args)
 	}}
-	if err := (DockerCLI{Runner: runner}).PrepareManagedImage(context.Background(), "agent-sandbox", image); err != nil {
+	if err := (DockerCLI{Profile: testActiveProfile, Runner: runner}).PrepareManagedImage(context.Background(), "agent-sandbox", image); err != nil {
 		t.Fatalf("exact local digest required unrelated free capacity: %v", err)
 	}
 	if len(runner.calls) != 1 {
@@ -1175,7 +1886,7 @@ func TestCheckCapacityRejectsLowAvailableInodes(t *testing.T) {
 		}
 		return Result{}, nil
 	}}
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, DataRoot: root,
 		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
 			return CapacityFilesystemStat{BlockSize: 4096, AvailableBlock: 10 << 20, Favail: 100, FilesystemID: "same"}, nil
@@ -1206,7 +1917,7 @@ func TestCheckCapacityBudgetsOnlyMissingCoreDigests(t *testing.T) {
 		}
 	}}
 	available := uint64(19 << 30)
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, DataRoot: root,
 		FilesystemStat: func(_ context.Context, _ string) (CapacityFilesystemStat, error) {
 			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: available, Favail: 10000, FilesystemID: "same"}, nil
@@ -1243,7 +1954,7 @@ func TestCheckCapacityAddsConservativeSnapshotBytesOnlyToDataFilesystem(t *testi
 	snapshotBytes := uint64(5 << 30)
 	dataAvailable := uint64(contract.UpdatePreCutoverMinFreeBytes) + snapshotBytes - 1
 	dockerAvailable := uint64(contract.UpdatePreCutoverMinFreeBytes)
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, DataRoot: root,
 		SnapshotRequired: func(_ context.Context, path string) (uint64, error) {
 			if path != filepath.Join(root, "data") {
@@ -1279,7 +1990,7 @@ func TestCheckCapacityDeduplicatesSnapshotAndDockerOnSameFilesystem(t *testing.T
 	}}
 	snapshotBytes := uint64(3 << 30)
 	want := uint64(contract.UpdatePreCutoverMinFreeBytes) + snapshotBytes
-	docker := DockerCLI{
+	docker := DockerCLI{Profile: testActiveProfile,
 		Runner: runner, DataRoot: root,
 		SnapshotRequired: func(context.Context, string) (uint64, error) { return snapshotBytes, nil },
 		FilesystemStat: func(context.Context, string) (CapacityFilesystemStat, error) {
@@ -1308,7 +2019,7 @@ func TestPruneManagedImagesKeepsContainerReferencesAndNeverForces(t *testing.T) 
 		}
 		return Result{}, nil
 	}}
-	disposition, err := (DockerCLI{Runner: runner}).PruneManagedImages(context.Background(), []string{inUse, obsolete}, map[string]struct{}{}, nil)
+	disposition, err := (DockerCLI{Profile: testActiveProfile, Runner: runner}).PruneManagedImages(context.Background(), []string{inUse, obsolete}, map[string]struct{}{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1336,7 +2047,7 @@ func TestPruneManagedImagesProtectsContainerByResolvedImageID(t *testing.T) {
 			return Result{}, errors.New("unexpected mutation")
 		}
 	}}
-	disposition, err := (DockerCLI{Runner: runner}).PruneManagedImages(context.Background(), []string{candidate}, nil, nil)
+	disposition, err := (DockerCLI{Profile: testActiveProfile, Runner: runner}).PruneManagedImages(context.Background(), []string{candidate}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

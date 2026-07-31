@@ -35,7 +35,7 @@ func (m *Manager) driveRecoveryTakeoverJournal(
 		if err := m.runner().Run(ctx, "systemctl", "--user", "stop", request.unit); err != nil {
 			return fmt.Errorf("stop Manager while resuming current recovery takeover: %w", err)
 		}
-		exactUnits := recoveryActivationWatchdogUnits(journal.OriginalCandidate)
+		exactUnits := recoveryActivationWatchdogUnits(m.watchdogUnitPrefix(), journal.OriginalCandidate)
 		if journal.Phase == recoveryTakeoverIntentPersisted {
 			exactUnits = append(exactUnits, journal.RecoveryWatchdogUnit)
 		}
@@ -244,7 +244,7 @@ func (m *Manager) runRecoveryBootstrapTransition(
 
 func (m *Manager) validateRecoveryTakeoverRequest(request recoveryActivationRequest, evidence recoveryFinalizeEvidence, journal recoveryTakeoverJournal) error {
 	if journal.RecoveryVersion != m.RunningVersion || journal.RecoverySHA256 != request.newSHA ||
-		journal.RecoveryPath != filepath.Join(m.Root, "versions", "recovery-"+request.newSHA[:12], sourceManagerBinaryName()) ||
+		journal.RecoveryPath != filepath.Join(m.Root, "versions", "recovery-"+request.newSHA[:12], m.managerBinaryName()) ||
 		journal.PlatformCommit != request.platformCommit || journal.PlatformStatePath != request.platformStatePath ||
 		journal.OperationID != evidence.operation.ID || journal.OperationPath != evidence.operationPath ||
 		journal.ManifestPath != evidence.manifestPath || journal.PlatformStateSHA256 != sha256Hex(evidence.stateData) ||
@@ -484,7 +484,10 @@ func (m *Manager) ensureRecoveryWatchdog(ctx context.Context, journal recoveryTa
 		return err
 	}
 	if !active {
-		if err := m.runner().Run(ctx, "systemd-run", "--user", "--quiet", "--collect", "--unit", journal.RecoveryWatchdogUnit, "--property=Type=exec", journal.RecoveryPath, "self-update-watchdog", "--plan", journal.RecoveryPlanPath); err != nil {
+		if !validManagerConfigPath(m.ConfigPath) {
+			return errors.New("current recovery watchdog config binding is invalid")
+		}
+		if err := m.runner().Run(ctx, "systemd-run", "--user", "--quiet", "--collect", "--unit", journal.RecoveryWatchdogUnit, "--property=Type=exec", journal.RecoveryPath, "self-update-watchdog", "--plan", journal.RecoveryPlanPath, "--config", m.ConfigPath); err != nil {
 			return fmt.Errorf("start journaled current recovery watchdog: %w", err)
 		}
 	}
@@ -639,7 +642,7 @@ func (m *Manager) completeRecoveryTerminalCheckpoint(ctx context.Context, journa
 			if decodeErr := decodeRecoveryJSON(planData, &observed); decodeErr != nil {
 				planReadErr = fmt.Errorf("decode current recovery activation plan: %w", decodeErr)
 			} else {
-				owned, ownershipErr := readRecoveryTakeoverOwnership(observed)
+				owned, ownershipErr := readRecoveryTakeoverOwnership(m.Profile, observed)
 				if ownershipErr != nil {
 					return ownershipErr
 				}

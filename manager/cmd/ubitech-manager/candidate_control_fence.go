@@ -25,6 +25,10 @@ func newServeControlHandler(full *control.API, pendingActivation bool) *atomicCo
 			IdentityOnly:   true,
 		}
 	}
+	return newAtomicControlHandler(initial)
+}
+
+func newAtomicControlHandler(initial http.Handler) *atomicControlHandler {
 	handler := &atomicControlHandler{}
 	handler.active.Store(&controlHandlerSnapshot{handler: initial})
 	return handler

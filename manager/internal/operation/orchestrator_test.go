@@ -56,6 +56,49 @@ func (l *observedLocker) Lock() {
 
 func (l *observedLocker) Unlock() { l.mu.Unlock() }
 
+type sequenceLocker struct {
+	sequence *[]string
+}
+
+func (locker sequenceLocker) Lock()   { *locker.sequence = append(*locker.sequence, "runtime_lock") }
+func (locker sequenceLocker) Unlock() { *locker.sequence = append(*locker.sequence, "runtime_unlock") }
+
+func TestOrdinaryAdmissionUsesHandoffThenRuntimeLockOrder(t *testing.T) {
+	sequence := []string{}
+	orchestrator := &Orchestrator{
+		MaintenanceMu: sequenceLocker{sequence: &sequence},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			sequence = append(sequence, "handoff_lock")
+			return func() { sequence = append(sequence, "handoff_unlock") }, nil
+		},
+	}
+	releaseAdmission, err := orchestrator.lockMaintenanceAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseAdmission()
+	want := []string{"handoff_lock", "runtime_lock", "runtime_unlock", "handoff_unlock"}
+	if !reflect.DeepEqual(sequence, want) {
+		t.Fatalf("admission lock sequence = %v, want %v", sequence, want)
+	}
+}
+
+func TestOrdinaryAdmissionFailsBeforeRuntimeLockWhenHandoffRejects(t *testing.T) {
+	sequence := []string{}
+	orchestrator := &Orchestrator{
+		MaintenanceMu: sequenceLocker{sequence: &sequence},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			return nil, errors.New("handoff active")
+		},
+	}
+	if releaseAdmission, err := orchestrator.lockMaintenanceAdmission(context.Background()); err == nil || releaseAdmission != nil {
+		t.Fatalf("rejected handoff admission returned_release=%t err=%v", releaseAdmission != nil, err)
+	}
+	if len(sequence) != 0 {
+		t.Fatalf("runtime admission was touched after handoff rejection: %v", sequence)
+	}
+}
+
 type temporaryManifestTransport struct {
 	base     http.RoundTripper
 	attempts int
@@ -363,6 +406,7 @@ type fakeGate struct{}
 func (fakeGate) Reserve(context.Context, string) (Reservation, error) {
 	return Reservation{Reserved: true}, nil
 }
+func (fakeGate) Commit(context.Context, string) error  { return nil }
 func (fakeGate) Release(context.Context, string) error { return nil }
 func (fakeGate) Health(context.Context) error          { return nil }
 
@@ -372,34 +416,65 @@ func (g *reserveCountingGate) Reserve(context.Context, string) (Reservation, err
 	g.reservations++
 	return Reservation{Reserved: true}, nil
 }
+func (*reserveCountingGate) Commit(context.Context, string) error  { return nil }
 func (*reserveCountingGate) Release(context.Context, string) error { return nil }
 func (*reserveCountingGate) Health(context.Context) error          { return nil }
 
-type recordingGate struct{ releases int }
+type recordingGate struct {
+	releases int
+	commits  int
+	aborts   int
+	onCommit func()
+	onAbort  func()
+}
 
 func (g *recordingGate) Reserve(context.Context, string) (Reservation, error) {
 	return Reservation{Reserved: true}, nil
 }
-func (g *recordingGate) Release(context.Context, string) error { g.releases++; return nil }
-func (g *recordingGate) Health(context.Context) error          { return nil }
+func (g *recordingGate) Commit(context.Context, string) error {
+	g.releases++
+	g.commits++
+	if g.onCommit != nil {
+		g.onCommit()
+	}
+	return nil
+}
+func (g *recordingGate) Release(context.Context, string) error {
+	g.releases++
+	g.aborts++
+	if g.onAbort != nil {
+		g.onAbort()
+	}
+	return nil
+}
+func (g *recordingGate) Health(context.Context) error { return nil }
 
 type retryGate struct {
 	releases int
+	commits  int
+	aborts   int
 	failOnce bool
 }
 
 func (g *retryGate) Reserve(context.Context, string) (Reservation, error) {
 	return Reservation{Reserved: true}, nil
 }
-func (g *retryGate) Release(context.Context, string) error {
+func (g *retryGate) release(commit bool) error {
 	g.releases++
+	if commit {
+		g.commits++
+	} else {
+		g.aborts++
+	}
 	if g.failOnce {
 		g.failOnce = false
 		return errors.New("injected reservation release failure")
 	}
 	return nil
 }
-func (g *retryGate) Health(context.Context) error { return nil }
+func (g *retryGate) Commit(context.Context, string) error  { return g.release(true) }
+func (g *retryGate) Release(context.Context, string) error { return g.release(false) }
+func (g *retryGate) Health(context.Context) error          { return nil }
 
 type gateStep struct {
 	reservation Reservation
@@ -410,6 +485,8 @@ type scriptedGate struct {
 	steps           []gateStep
 	reserveIDs      []string
 	releaseIDs      []string
+	commitIDs       []string
+	abortIDs        []string
 	releaseErr      error
 	releaseHasBound bool
 	onReserve       func(int)
@@ -432,6 +509,19 @@ func (g *scriptedGate) Reserve(_ context.Context, id string) (Reservation, error
 
 func (g *scriptedGate) Release(ctx context.Context, id string) error {
 	g.releaseIDs = append(g.releaseIDs, id)
+	g.abortIDs = append(g.abortIDs, id)
+	if _, ok := ctx.Deadline(); ok {
+		g.releaseHasBound = true
+	}
+	if g.onRelease != nil {
+		g.onRelease(len(g.releaseIDs))
+	}
+	return g.releaseErr
+}
+
+func (g *scriptedGate) Commit(ctx context.Context, id string) error {
+	g.releaseIDs = append(g.releaseIDs, id)
+	g.commitIDs = append(g.commitIDs, id)
 	if _, ok := ctx.Deadline(); ok {
 		g.releaseHasBound = true
 	}
@@ -456,6 +546,8 @@ type recordingSelfUpdate struct {
 	commitChecks        int
 	rolledBack          bool
 	rollbackChecks      int
+	onCommitCheck       func()
+	onRollbackCheck     func()
 }
 
 func (s *recordingSelfUpdate) Prepare(_ context.Context, manifest release.Manifest) error {
@@ -486,6 +578,9 @@ func (s *recordingSelfUpdate) Activate(context.Context, release.Manifest) error 
 }
 func (s *recordingSelfUpdate) ActivationCommitted(release.Manifest) (bool, error) {
 	s.commitChecks++
+	if s.onCommitCheck != nil {
+		s.onCommitCheck()
+	}
 	if s.activationErr != nil {
 		return false, s.activationErr
 	}
@@ -497,6 +592,9 @@ func (s *recordingSelfUpdate) ActivationCommitted(release.Manifest) (bool, error
 }
 func (s *recordingSelfUpdate) ActivationRolledBack(release.Manifest) (bool, error) {
 	s.rollbackChecks++
+	if s.onRollbackCheck != nil {
+		s.onRollbackCheck()
+	}
 	return s.rolledBack, nil
 }
 
@@ -513,7 +611,7 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 			return
 		}
 		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
 		manifest := release.Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: generatedAt, ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2, Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}}, Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images}
@@ -526,7 +624,9 @@ func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) 
 	t.Helper()
 	predecessor := strings.Repeat("a", 40)
 	bridge := strings.Repeat("b", 40)
-	compose := release.Artifact{URL: "https://example.invalid/target-compose", SHA256: strings.Repeat("1", 64)}
+	composeBytes := []byte("services: {}\n")
+	composeSum := sha256.Sum256(composeBytes)
+	compose := release.Artifact{URL: "https://example.invalid/target-compose", SHA256: hex.EncodeToString(composeSum[:])}
 	targetManager := release.ManagerRelease{Version: bridge, Artifacts: map[string]release.Artifact{
 		"amd64": {URL: "https://example.invalid/target-manager-amd64", SHA256: strings.Repeat("2", 64)},
 		"arm64": {URL: "https://example.invalid/target-manager-arm64", SHA256: strings.Repeat("3", 64)},
@@ -536,7 +636,7 @@ func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) 
 		"arm64": {URL: "https://example.invalid/source-manager-arm64", SHA256: strings.Repeat("5", 64)},
 	}}
 	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
 	manifest := release.Manifest{
@@ -552,7 +652,14 @@ func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) 
 			Target: release.NamespaceBinding{ProfileID: identity.TargetProfileID(), Manager: targetManager, Compose: compose},
 		},
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/target-compose" {
+			_, _ = w.Write(composeBytes)
+			return
+		}
+		manifest.Compose.URL = server.URL + "/target-compose"
+		manifest.NamespaceHandoff.Target.Compose = manifest.Compose
 		_ = json.NewEncoder(w).Encode(manifest)
 	}))
 	return server, server.URL
@@ -863,6 +970,70 @@ func TestInertCapabilityRejectsNamespaceHandoffBeforeOrdinaryUpdateSideEffects(t
 	}
 }
 
+func TestSourceOwnerCheckRetainsNamespaceHandoffWithoutOrdinaryCandidate(t *testing.T) {
+	server, url := testNamespaceHandoffReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40), SourceCommit: strings.Repeat("a", 40)}
+		state.Candidate = &model.Generation{ID: strings.Repeat("c", 40), SourceCommit: strings.Repeat("c", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releases := t.TempDir()
+	var retainedPath, retainedDigest string
+	var admissionMu sync.Mutex
+	admissionHeld := false
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: releases, ManifestURL: url, Channel: contract.ReleaseChannel,
+		ReleaseClient: release.Client{HTTP: server.Client()},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			admissionMu.Lock()
+			defer admissionMu.Unlock()
+			if admissionHeld {
+				t.Fatal("ordinary handoff admission was entered twice")
+			}
+			admissionHeld = true
+			return func() {
+				admissionMu.Lock()
+				admissionHeld = false
+				admissionMu.Unlock()
+			}, nil
+		},
+		NamespaceHandoffCheck: func(_ context.Context, manifest release.Manifest, path, digest string) error {
+			admissionMu.Lock()
+			held := admissionHeld
+			admissionMu.Unlock()
+			if held {
+				t.Fatal("handoff coordinator callback re-entered while ordinary global admission was held")
+			}
+			if manifest.NamespaceHandoff == nil {
+				t.Fatal("source owner callback received an ordinary manifest")
+			}
+			retainedPath, retainedDigest = path, digest
+			return nil
+		},
+	}
+	manifest, err := orchestrator.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.NamespaceHandoff == nil || retainedPath != filepath.Join(releases, manifest.ID(), "manifest.json") || len(retainedDigest) != 64 {
+		t.Fatalf("bridge was not retained with its exact identity: path=%q digest=%q", retainedPath, retainedDigest)
+	}
+	if state := store.State(); state.Candidate != nil || state.ActiveOperationID != "" || state.Maintenance {
+		t.Fatalf("bridge Check published ordinary operation state: %#v", state)
+	}
+	if _, err := os.Stat(retainedPath); err != nil {
+		t.Fatalf("retained bridge manifest is unavailable: %v", err)
+	}
+}
+
 func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 	compose := []byte("services: {}\n")
 	composeSum := sha256.Sum256(compose)
@@ -874,7 +1045,7 @@ func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 			return
 		}
 		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
 			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 		}
 		manifest := release.Manifest{
@@ -1589,7 +1760,7 @@ func TestUpdateReservationAuthenticationRejectionIsPermanent(t *testing.T) {
 		case "/internal/manager/update/readiness":
 			reserveCalls++
 			http.Error(response, "invalid manager token", http.StatusUnauthorized)
-		case "/internal/manager/update/release":
+		case "/internal/manager/update/abort-release":
 			releaseCalls++
 			http.Error(response, "invalid manager token", http.StatusUnauthorized)
 		default:
@@ -1658,7 +1829,7 @@ func TestConfirmationAuthenticationRejectionStillReleasesFailClosed(t *testing.T
 				return
 			}
 			http.Error(response, "invalid manager token", http.StatusUnauthorized)
-		case "/internal/manager/update/release":
+		case "/internal/manager/update/abort-release":
 			releaseCalls++
 			http.Error(response, "invalid manager token", http.StatusUnauthorized)
 		default:
@@ -1758,7 +1929,7 @@ func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextAttempt(t
 		switch request.URL.Path {
 		case "/internal/manager/update/readiness":
 			_, _ = response.Write([]byte(`{"ready":true,"reserved":true}`))
-		case "/internal/manager/update/release":
+		case "/internal/manager/update/abort-release":
 			_, _ = response.Write([]byte(`{"released":true}`))
 		default:
 			http.NotFound(response, request)
@@ -1803,7 +1974,7 @@ func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextAttempt(t
 	if len(incidentRequests) != 3 ||
 		incidentRequests[0].path != "/internal/manager/update/readiness" || !incidentRequests[0].authorized ||
 		incidentRequests[1].path != "/internal/manager/update/readiness" || incidentRequests[1].authorized ||
-		incidentRequests[2].path != "/internal/manager/update/release" || incidentRequests[2].authorized {
+		incidentRequests[2].path != "/internal/manager/update/abort-release" || incidentRequests[2].authorized {
 		t.Fatalf("unexpected HTTP incident sequence: %#v", incidentRequests)
 	}
 	for _, item := range incidentRequests {
@@ -1828,7 +1999,7 @@ func TestHTTPAuthenticationRecoveryReleasesSameReservationAndAllowsNextAttempt(t
 	recoveredRequests := append([]gateRequest(nil), requests...)
 	gateMu.Unlock()
 	if len(recoveredRequests) != 4 ||
-		recoveredRequests[3].path != "/internal/manager/update/release" ||
+		recoveredRequests[3].path != "/internal/manager/update/abort-release" ||
 		!recoveredRequests[3].authorized || recoveredRequests[3].operationID != first.ID {
 		t.Fatalf("recovery did not release the original reservation id: %#v", recoveredRequests)
 	}
@@ -2471,8 +2642,9 @@ func TestRejectedManagerCandidateRestoresPreviousCommittedGeneration(t *testing.
 		t.Fatalf("original update did not become a terminal retryable failure: %#v", completed)
 	}
 	if strings.Join(snapshots.restores, ",") != "/snapshots/before-rejected-manager" || gate.releases != 1 ||
+		gate.commits != 0 || gate.aborts != 1 ||
 		selfUpdate.marked != 0 || selfUpdate.activated != 0 || selfUpdate.rollbackChecks != 1 {
-		t.Fatalf("rollback side effects are incomplete: restores=%v gate=%d self=%#v", snapshots.restores, gate.releases, selfUpdate)
+		t.Fatalf("rollback side effects are incomplete: restores=%v gate=%#v self=%#v", snapshots.restores, gate, selfUpdate)
 	}
 	engine.mu.Lock()
 	started := append([]string(nil), engine.started...)
@@ -2483,8 +2655,8 @@ func TestRejectedManagerCandidateRestoresPreviousCommittedGeneration(t *testing.
 	if err := orchestrator.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots.restores) != 1 || gate.releases != 1 {
-		t.Fatalf("terminal rollback replay repeated external effects: restores=%v releases=%d", snapshots.restores, gate.releases)
+	if len(snapshots.restores) != 1 || gate.releases != 1 || gate.commits != 0 || gate.aborts != 1 {
+		t.Fatalf("terminal rollback replay repeated external effects: restores=%v gate=%#v", snapshots.restores, gate)
 	}
 }
 
@@ -2603,7 +2775,7 @@ func TestRecoverClearsPendingStateWithoutRepeatingFinalizedHooks(t *testing.T) {
 func writeRollbackManifest(t *testing.T, dir, commit string) string {
 	t.Helper()
 	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
 		images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
 	manifest := release.Manifest{
@@ -2783,8 +2955,13 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 	defer server.Close()
 	store, _ := journal.Open(t.TempDir(), time.Now())
 	engine := &fakeEngine{}
-	gate := &recordingGate{}
-	selfUpdate := &recordingSelfUpdate{}
+	sequence := []string{}
+	gate := &recordingGate{onCommit: func() {
+		sequence = append(sequence, "platform_schema_commit_release")
+	}}
+	selfUpdate := &recordingSelfUpdate{onCommitCheck: func() {
+		sequence = append(sequence, "watchdog_durable_commit")
+	}}
 	commits := 0
 	orchestrator := &Orchestrator{
 		Store: store, Engine: engine, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate,
@@ -2831,8 +3008,12 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 	if state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || !completed.Finalized {
 		t.Fatalf("post-watchdog recovery did not finalize: state=%#v operation=%#v", state, completed)
 	}
-	if gate.releases != 1 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 {
-		t.Fatalf("post-watchdog hooks were not run exactly once: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
+	if gate.releases != 1 || gate.commits != 1 || gate.aborts != 0 ||
+		selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 {
+		t.Fatalf("post-watchdog hooks were not run exactly once: gate=%#v self=%#v commits=%d", gate, selfUpdate, commits)
+	}
+	if want := []string{"watchdog_durable_commit", "platform_schema_commit_release"}; !reflect.DeepEqual(sequence, want) {
+		t.Fatalf("schema commit release crossed the watchdog durability boundary: got %v, want %v", sequence, want)
 	}
 }
 

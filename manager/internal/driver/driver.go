@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -232,18 +234,23 @@ type CandidateFailureDiagnoser interface {
 }
 
 const (
-	candidateDiagnosticMaxBytes = 48 << 10
-	candidateLogsMaxBytes       = 32 << 10
-	candidateHealthMaxBytes     = 12 << 10
-	candidateDiagnosticTimeout  = 10 * time.Second
-	firecrawlComposeWaitSeconds = 600
-	defaultPullIdleTimeout      = 15 * time.Minute
-	defaultPullAbsoluteTimeout  = 6 * time.Hour
-	imageInspectTimeout         = 30 * time.Second
-	pullDiagnosticMaxBytes      = 8 << 10
+	candidateDiagnosticMaxBytes  = 48 << 10
+	candidateLogsMaxBytes        = 32 << 10
+	candidateHealthMaxBytes      = 12 << 10
+	candidateDiagnosticTimeout   = 10 * time.Second
+	firecrawlComposeWaitSeconds  = 600
+	defaultPullIdleTimeout       = 15 * time.Minute
+	defaultPullAbsoluteTimeout   = 6 * time.Hour
+	imageInspectTimeout          = 30 * time.Second
+	pullDiagnosticMaxBytes       = 8 << 10
+	boundComposeMaxBytes         = 4 << 20
+	boundManifestMaxBytes        = 1 << 20
+	maximumWriterProbeContainers = 4096
 )
 
 var coreUpdateImageNames = []string{"platform", "agent-runtime"}
+var exactSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var handoffTransactionIDPattern = regexp.MustCompile(`^handoff_[0-9a-f]{32}$`)
 
 var firecrawlHealthyServices = []string{
 	"firecrawl-playwright",
@@ -254,6 +261,11 @@ var firecrawlHealthyServices = []string{
 }
 
 var capabilityServices = []string{"camofox", "searxng"}
+
+var fixedWriterServices = []string{
+	"platform", "agent-runtime", "camofox", "searxng",
+	"firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres", "firecrawl-api",
+}
 
 var candidateCredentialPatterns = []struct {
 	expression  *regexp.Regexp
@@ -268,25 +280,44 @@ var candidateCredentialPatterns = []struct {
 }
 
 type DockerCLI struct {
-	Runner              Runner
-	Binary              string
-	ComposeFile         string
-	ComposeProject      string
-	GenerationDir       string
-	DataRoot            string
-	StateDir            string
-	GatewayAddress      string
-	PlatformBind        string
-	CoreNetwork         string
-	LogMaxSize          string
-	LogMaxFiles         int
-	UID                 int
-	GID                 int
-	PullIdleTimeout     time.Duration
-	PullAbsoluteTimeout time.Duration
-	FilesystemStat      func(context.Context, string) (CapacityFilesystemStat, error)
-	SnapshotRequired    func(context.Context, string) (uint64, error)
-	ManagedImageMu      *sync.Mutex
+	Profile            identity.ActiveProfile
+	Runner             Runner
+	Binary             string
+	ComposeFile        string
+	ComposeSHA256      string
+	ManifestFile       string
+	ManifestSHA256     string
+	ManifestChannel    string
+	RequireLocalImages bool
+	ComposeProject     string
+	GenerationDir      string
+	DataRoot           string
+	StateDir           string
+	ControlDir         string
+	GatewayAddress     string
+	PlatformBind       string
+	CoreNetwork        string
+	// ExpectedCoreNetworkID turns EnsureCoreNetwork into a read-only recovery
+	// proof. Namespace handoff source recovery must preserve the exact network
+	// object bound into its journal; recreating a same-named bridge would lose
+	// container endpoints while presenting a misleadingly healthy identity.
+	ExpectedCoreNetworkID string
+	// HandoffTransactionID and HandoffBindingSHA256 turn target network creation
+	// into a transaction-owned operation. Both fields must be set together. A
+	// normal post-commit Manager leaves them empty and can reuse the retained
+	// profile-owned network, while the persistent helper uses them to distinguish
+	// its own crash-replay object from any pre-existing same-named network.
+	HandoffTransactionID string
+	HandoffBindingSHA256 string
+	LogMaxSize           string
+	LogMaxFiles          int
+	UID                  int
+	GID                  int
+	PullIdleTimeout      time.Duration
+	PullAbsoluteTimeout  time.Duration
+	FilesystemStat       func(context.Context, string) (CapacityFilesystemStat, error)
+	SnapshotRequired     func(context.Context, string) (uint64, error)
+	ManagedImageMu       *sync.Mutex
 }
 
 type CapacityFilesystemStat struct {
@@ -621,6 +652,23 @@ func (d DockerCLI) PrepareManagedImage(ctx context.Context, name, image string) 
 	return d.prepareManagedImages(ctx, release.Manifest{Images: map[string]string{name: image}}, []string{name}, true)
 }
 
+// VerifyManagedImagePresent is a non-mutating exact RepoDigest proof used by
+// source recovery. It never invokes pull and does not accept a tag, image ID,
+// or a different digest from the same repository.
+func (d DockerCLI) VerifyManagedImagePresent(ctx context.Context, name, image string) error {
+	if !release.IsManagedImageName(name) || !release.IsDigestReference(image) {
+		return fmt.Errorf("managed image %s is missing an immutable digest", name)
+	}
+	present, err := d.imagePresent(ctx, name, image)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("required local managed image %s (%s) is absent", name, image)
+	}
+	return nil
+}
+
 func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Manifest, names []string, enforceCapacity bool) error {
 	if d.ManagedImageMu != nil {
 		d.ManagedImageMu.Lock()
@@ -661,14 +709,23 @@ func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Ma
 			}
 		}
 		pulledByAttempt = append(pulledByAttempt, image)
-		if err := d.pullImage(ctx, name, image); err != nil {
+		pullErr := d.pullImage(ctx, name, image)
+		if pullErr == nil {
+			present, verifyErr := d.imagePresent(ctx, name, image)
+			if verifyErr != nil {
+				pullErr = fmt.Errorf("verify pulled managed image %s: %w", name, verifyErr)
+			} else if !present {
+				pullErr = fmt.Errorf("verify pulled managed image %s: exact RepoDigest is absent", name)
+			}
+		}
+		if pullErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			_, cleanupErr := d.PruneManagedImages(cleanupCtx, pulledByAttempt, nil, nil)
 			cancel()
 			if cleanupErr != nil {
-				return errors.Join(err, fmt.Errorf("clean failed managed image pull artifacts: %w", cleanupErr))
+				return errors.Join(pullErr, fmt.Errorf("clean failed managed image pull artifacts: %w", cleanupErr))
 			}
-			return err
+			return pullErr
 		}
 	}
 	return nil
@@ -854,6 +911,19 @@ func (d DockerCLI) StopFixed(ctx context.Context) error {
 }
 
 func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) error {
+	if err := d.verifyBoundManifest(manifest); err != nil {
+		return err
+	}
+	if err := d.verifyBoundCompose(manifest); err != nil {
+		return err
+	}
+	if d.RequireLocalImages {
+		for _, name := range coreUpdateImageNames {
+			if err := d.VerifyManagedImagePresent(ctx, name, manifest.Images[name]); err != nil {
+				return fmt.Errorf("prove source recovery image: %w", err)
+			}
+		}
+	}
 	if err := d.EnsureCoreNetwork(ctx); err != nil {
 		return err
 	}
@@ -870,7 +940,7 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 	if err := d.setActiveGeneration(manifest.ID()); err != nil {
 		return err
 	}
-	_, err = d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--detach", "--wait", "platform", "agent-runtime"), nil)
+	_, err = d.runner().Run(ctx, d.binary(), d.composeArgs(env, "up", "--pull", "never", "--detach", "--wait", "platform", "agent-runtime"), nil)
 	if err != nil {
 		return err
 	}
@@ -878,6 +948,105 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 	// reconcilers. Starting them here could make a slow third-party registry hold
 	// the fixed-stack lock and the public maintenance gate.
 	return nil
+}
+
+func (d DockerCLI) verifyBoundManifest(manifest release.Manifest) error {
+	if d.ManifestSHA256 == "" && d.ManifestFile == "" {
+		return nil
+	}
+	if !exactSHA256Pattern.MatchString(d.ManifestSHA256) || d.ManifestChannel == "" {
+		return errors.New("bound manifest identity is invalid")
+	}
+	raw, err := readBoundOwnerFile(d.ManifestFile, boundManifestMaxBytes)
+	if err != nil {
+		return fmt.Errorf("read bound manifest: %w", err)
+	}
+	digest := sha256.Sum256(raw)
+	if hex.EncodeToString(digest[:]) != d.ManifestSHA256 {
+		return errors.New("bound manifest SHA-256 differs from the handoff journal")
+	}
+	decoded, err := release.DecodeManifest(raw, d.ManifestChannel, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return fmt.Errorf("decode bound manifest: %w", err)
+	}
+	if !reflect.DeepEqual(decoded, manifest) {
+		return errors.New("bound manifest differs from the requested source generation")
+	}
+	return nil
+}
+
+// verifyBoundCompose re-opens the exact generation Compose bytes immediately
+// before a fixed stack is started. Namespace handoff uses this boundary when
+// restoring the predecessor after data has moved, so a path string or remote
+// descriptor alone is not sufficient recovery evidence.
+func (d DockerCLI) verifyBoundCompose(manifest release.Manifest) error {
+	if d.ComposeSHA256 == "" {
+		return nil
+	}
+	if !exactSHA256Pattern.MatchString(d.ComposeSHA256) {
+		return errors.New("bound Compose SHA-256 is invalid")
+	}
+	path := d.ComposeFile
+	if path == "" {
+		if manifest.ID() == "" {
+			return errors.New("bound Compose generation is absent")
+		}
+		path = filepath.Join(d.GenerationDir, manifest.ID(), "compose.yaml")
+	}
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0) {
+		return errors.New("bound Compose path is not canonical and absolute")
+	}
+	raw, err := readBoundOwnerFile(path, boundComposeMaxBytes)
+	if err != nil {
+		return fmt.Errorf("read bound Compose: %w", err)
+	}
+	digest := sha256.Sum256(raw)
+	if hex.EncodeToString(digest[:]) != d.ComposeSHA256 {
+		return errors.New("bound Compose SHA-256 differs from the handoff journal")
+	}
+	return nil
+}
+
+func readBoundOwnerFile(path string, maxBytes int64) ([]byte, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0) {
+		return nil, errors.New("bound file path is not canonical and absolute")
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open bound file without following links: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("open bound file: invalid file descriptor")
+	}
+	defer file.Close()
+	var before syscall.Stat_t
+	if err := syscall.Fstat(fd, &before); err != nil {
+		return nil, fmt.Errorf("inspect bound file: %w", err)
+	}
+	if before.Mode&syscall.S_IFMT != syscall.S_IFREG || before.Uid != uint32(os.Getuid()) || before.Nlink != 1 ||
+		before.Size < 0 || before.Size > maxBytes || before.Mode&0o077 != 0 {
+		return nil, errors.New("bound file must be an owner-only, singly-linked regular file within its size limit")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) != before.Size || int64(len(raw)) > maxBytes {
+		return nil, errors.New("bound file size changed while it was read")
+	}
+	var after, pathStat syscall.Stat_t
+	if err := syscall.Fstat(fd, &after); err != nil {
+		return nil, fmt.Errorf("reinspect bound file: %w", err)
+	}
+	if err := syscall.Lstat(path, &pathStat); err != nil {
+		return nil, fmt.Errorf("reinspect bound file path: %w", err)
+	}
+	if !sameGeneratedFileObservation(before, after) || !sameGeneratedFileObservation(after, pathStat) {
+		return nil, errors.New("bound file changed while it was verified")
+	}
+	return raw, nil
 }
 
 // ReconcileCapabilities idempotently asks Compose to converge every lightweight
@@ -971,8 +1140,15 @@ func (d DockerCLI) Migrate(ctx context.Context, manifest release.Manifest) error
 	if err := d.stopMigrationContainers(ctx); err != nil {
 		return err
 	}
-	name := d.migrationContainerName(manifest.ID())
-	migrationLabel := identity.SourceProfile().Label("migration")
+	name, err := d.migrationContainerName(manifest.ID())
+	if err != nil {
+		return err
+	}
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	migrationLabel := profile.Label("migration")
 	_, runErr := d.runner().Run(ctx, d.binary(), d.composeArgs(
 		env,
 		"run", "--rm", "--no-deps",
@@ -986,16 +1162,24 @@ func (d DockerCLI) Migrate(ctx context.Context, manifest release.Manifest) error
 	return errors.Join(runErr, cleanupErr)
 }
 
-func (d DockerCLI) migrationContainerName(generation string) string {
+func (d DockerCLI) migrationContainerName(generation string) (string, error) {
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return "", err
+	}
 	project := sha256.Sum256([]byte(d.ComposeProject))
 	if !validGenerationID(generation) {
 		generation = strings.Repeat("0", 40)
 	}
-	return identity.SourceProfile().MigrationContainerPrefix + hex.EncodeToString(project[:8]) + "-" + generation[:12]
+	return profile.MigrationContainerPrefix + hex.EncodeToString(project[:8]) + "-" + generation[:12], nil
 }
 
 func (d DockerCLI) stopMigrationContainers(ctx context.Context) error {
-	migrationLabel := identity.SourceProfile().Label("migration")
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	migrationLabel := profile.Label("migration")
 	filters := []string{
 		"ps", "-aq",
 		"--filter", "label=" + migrationLabel + "=true",
@@ -1067,6 +1251,192 @@ func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServi
 		result[service] = FixedServiceState{Status: status}
 	}
 	return result
+}
+
+type fixedWriterContainer struct {
+	id      string
+	name    string
+	image   string
+	labels  map[string]string
+	running bool
+	pid     int
+}
+
+// VerifyFixedWritersStopped is the destructive-operation fence for a fixed
+// generation. Unlike FixedServiceStatus, this probe never translates a Docker
+// or Compose error into "unavailable". It enumerates the complete container
+// set, binds every relevant object to the exact technical profile, Compose
+// project/service and immutable image, and accepts only an explicit stopped
+// kernel state. Health status is deliberately irrelevant: an unhealthy process
+// is still a writer.
+func (d DockerCLI) VerifyFixedWritersStopped(ctx context.Context, manifest release.Manifest) error {
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	if !safeName(d.ComposeProject) || d.ComposeProject != profile.ComposeProject {
+		return errors.New("fixed-writer probe Compose project differs from the technical profile")
+	}
+	expected := make(map[string]string, len(fixedWriterServices))
+	for _, service := range fixedWriterServices {
+		image := manifest.Images[service]
+		if !release.IsDigestReference(image) {
+			return fmt.Errorf("fixed-writer probe service %s has no immutable image binding", service)
+		}
+		expected[service] = image
+	}
+	sandboxImage := manifest.Images["agent-sandbox"]
+	if !release.IsDigestReference(sandboxImage) {
+		return errors.New("fixed-writer probe has no immutable Sandbox image binding")
+	}
+
+	ids, err := d.listContainerIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("enumerate Docker containers for fixed-writer fence: %w", err)
+	}
+	seenServices := make(map[string]string, len(fixedWriterServices))
+	for _, id := range ids {
+		container, inspectErr := d.inspectFixedWriterContainer(ctx, id)
+		if inspectErr != nil {
+			return fmt.Errorf("inspect Docker container %s for fixed-writer fence: %w", id, inspectErr)
+		}
+		project := container.labels["com.docker.compose.project"]
+		service := container.labels["com.docker.compose.service"]
+		profileRelevant := hasDockerLabelPrefix(container.labels, profile.LabelPrefix)
+		nameRelevant := looksLikeComposeContainer(container.name, d.ComposeProject) ||
+			strings.HasPrefix(container.name, profile.SandboxContainerPrefix) ||
+			strings.HasPrefix(container.name, profile.MigrationContainerPrefix)
+
+		if project == d.ComposeProject {
+			expectedImage, known := expected[service]
+			if !known || service == "" {
+				return fmt.Errorf("fixed-writer fence found unknown Compose service %q in project %s", service, d.ComposeProject)
+			}
+			if prior, duplicate := seenServices[service]; duplicate {
+				return fmt.Errorf("fixed-writer fence found duplicate Compose service %s (%s and %s)", service, prior, container.id)
+			}
+			seenServices[service] = container.id
+			if container.image != expectedImage {
+				return fmt.Errorf("fixed-writer fence service %s has an unexpected immutable image", service)
+			}
+			if err := requireContainerExplicitlyStopped(container); err != nil {
+				return fmt.Errorf("fixed-writer fence service %s: %w", service, err)
+			}
+			continue
+		}
+
+		if !profileRelevant && !nameRelevant {
+			continue
+		}
+		sandboxHash := container.labels[profile.Label("id")]
+		if project != "" || container.labels[profile.Label("sandbox")] != "true" || !validAgentHash(sandboxHash) ||
+			container.name != profile.SandboxContainerPrefix+sandboxHash[:16] || container.image != sandboxImage {
+			return fmt.Errorf("fixed-writer fence found an unknown %s profile container %s", profile.ProfileID, container.name)
+		}
+		if err := requireContainerExplicitlyStopped(container); err != nil {
+			return fmt.Errorf("fixed-writer fence Sandbox %s: %w", container.name, err)
+		}
+	}
+
+	confirmed, err := d.listContainerIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("re-enumerate Docker containers for fixed-writer fence: %w", err)
+	}
+	if !reflect.DeepEqual(ids, confirmed) {
+		return errors.New("Docker container inventory changed during the fixed-writer fence")
+	}
+	return nil
+}
+
+func (d DockerCLI) listContainerIDs(ctx context.Context) ([]string, error) {
+	result, err := d.runner().Run(ctx, d.binary(), []string{"container", "ls", "--all", "--quiet", "--no-trunc"}, nil)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(result.Stdout)
+	if trimmed == "" {
+		return nil, nil
+	}
+	ids := strings.Fields(trimmed)
+	if len(ids) > maximumWriterProbeContainers {
+		return nil, errors.New("Docker container inventory exceeds the fixed-writer fence limit")
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if !validContainerID(id) {
+			return nil, errors.New("Docker returned an invalid container id during the fixed-writer fence")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, errors.New("Docker returned a duplicate container id during the fixed-writer fence")
+		}
+		seen[id] = struct{}{}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+func (d DockerCLI) inspectFixedWriterContainer(ctx context.Context, id string) (fixedWriterContainer, error) {
+	format := `{{json .Id}}\t{{json .Name}}\t{{json .Config.Image}}\t{{json .Config.Labels}}\t{{json .State.Running}}\t{{json .State.Pid}}`
+	result, err := d.runner().Run(ctx, d.binary(), []string{"container", "inspect", "--format", format, id}, nil)
+	if err != nil {
+		return fixedWriterContainer{}, err
+	}
+	line := strings.TrimSuffix(result.Stdout, "\n")
+	if strings.Contains(line, "\n") {
+		return fixedWriterContainer{}, errors.New("Docker inspect returned multiple fixed-writer records")
+	}
+	fields := strings.Split(line, "\t")
+	if len(fields) != 6 {
+		return fixedWriterContainer{}, errors.New("Docker inspect returned an incomplete fixed-writer projection")
+	}
+	var container fixedWriterContainer
+	for index, destination := range []any{&container.id, &container.name, &container.image, &container.labels, &container.running, &container.pid} {
+		if err := json.Unmarshal([]byte(fields[index]), destination); err != nil {
+			return fixedWriterContainer{}, fmt.Errorf("decode fixed-writer projection field %d: %w", index, err)
+		}
+	}
+	container.name = strings.TrimPrefix(container.name, "/")
+	if container.labels == nil {
+		container.labels = map[string]string{}
+	}
+	if container.id != id || !validContainerID(container.id) || !validDockerContainerName(container.name) || container.image == "" || container.pid < 0 {
+		return fixedWriterContainer{}, errors.New("Docker inspect returned an invalid fixed-writer identity")
+	}
+	return container, nil
+}
+
+func requireContainerExplicitlyStopped(container fixedWriterContainer) error {
+	if container.running || container.pid != 0 {
+		return fmt.Errorf("container %s is not explicitly stopped (running=%t pid=%d)", container.id, container.running, container.pid)
+	}
+	return nil
+}
+
+func hasDockerLabelPrefix(labels map[string]string, prefix string) bool {
+	for key := range labels {
+		if strings.HasPrefix(key, prefix+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeComposeContainer(name, project string) bool {
+	return strings.HasPrefix(name, project+"-") || strings.HasPrefix(name, project+"_")
+}
+
+func validDockerContainerName(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	for _, character := range value {
+		if !(character == '-' || character == '_' || character == '.' ||
+			character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (d DockerCLI) healthyServiceStatus(ctx context.Context, env, service string) string {
@@ -1286,6 +1656,10 @@ func (d DockerCLI) EnsureSandbox(ctx context.Context, spec SandboxSpec) error {
 }
 
 func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec) (SandboxEnsureResult, error) {
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return SandboxEnsureResult{}, err
+	}
 	running, err := d.SandboxRunning(ctx, spec.ContainerName)
 	if err == nil && running {
 		return SandboxEnsureResult{WasRunning: true}, nil
@@ -1300,7 +1674,6 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 	if err := d.PrepareManagedImage(ctx, "agent-sandbox", spec.Image); err != nil {
 		return SandboxEnsureResult{}, fmt.Errorf("prepare sandbox image: %w", err)
 	}
-	profile := identity.SourceProfile()
 	args := []string{"create", "--name", spec.ContainerName, "--label", profile.Label("sandbox") + "=true", "--label", profile.Label("id") + "=" + spec.AgentHash,
 		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("%s_AGENT_UID=%d", profile.EnvironmentPrefix, spec.UID), "--env", fmt.Sprintf("%s_AGENT_GID=%d", profile.EnvironmentPrefix, spec.GID), "--workdir", contract.ContainerWorkspace,
 		"--mount", bindMount(spec.Workspace, contract.ContainerWorkspace), "--mount", bindMount(spec.Home, contract.ContainerAgentHome), "--mount", bindMount(spec.Environment, contract.ContainerAgentEnv)}
@@ -1344,7 +1717,10 @@ func (d DockerCLI) InspectManagedSandbox(ctx context.Context, name, agentHash st
 	if !safeName(name) || !validAgentHash(agentHash) {
 		return ManagedSandboxState{}, errors.New("invalid managed sandbox identity")
 	}
-	profile := identity.SourceProfile()
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return ManagedSandboxState{}, err
+	}
 	result, err := d.runner().Run(ctx, d.binary(), []string{
 		"inspect", "--format",
 		fmt.Sprintf("{{.State.Running}}\t{{index .Config.Labels %q}}\t{{index .Config.Labels %q}}", profile.Label("sandbox"), profile.Label("id")),
@@ -1422,10 +1798,23 @@ func (d DockerCLI) ExecArgs(spec SandboxSpec, cwd, command string, args []string
 // when it has the expected driver and Manager ownership label; this avoids
 // silently attaching trusted Agent workloads to an unrelated Docker network.
 func (d DockerCLI) EnsureCoreNetwork(ctx context.Context) error {
+	if d.ExpectedCoreNetworkID != "" {
+		if d.HandoffTransactionID != "" || d.HandoffBindingSHA256 != "" {
+			return errors.New("bound source network cannot also be a handoff target network")
+		}
+		return d.VerifyCoreNetwork(ctx, d.ExpectedCoreNetworkID)
+	}
 	if !safeName(d.CoreNetwork) {
 		return errors.New("invalid core network name")
 	}
-	networkLabel := identity.SourceProfile().Label("network")
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	networkLabel := profile.Label("network")
+	if d.HandoffTransactionID != "" || d.HandoffBindingSHA256 != "" {
+		return d.ensureHandoffCoreNetwork(ctx, profile, networkLabel)
+	}
 	format := fmt.Sprintf(`{{.Driver}} {{index .Labels %q}}`, networkLabel)
 	result, inspectErr := d.runner().Run(ctx, d.binary(), []string{"network", "inspect", "--format", format, d.CoreNetwork}, nil)
 	if inspectErr == nil {
@@ -1436,6 +1825,166 @@ func (d DockerCLI) EnsureCoreNetwork(ctx context.Context) error {
 	}
 	if _, err := d.runner().Run(ctx, d.binary(), []string{"network", "create", "--driver", "bridge", "--label", networkLabel + "=core", d.CoreNetwork}, nil); err != nil {
 		return fmt.Errorf("create core Docker network %s: %w", d.CoreNetwork, err)
+	}
+	return nil
+}
+
+type handoffCoreNetworkState struct {
+	id          string
+	driver      string
+	ownership   string
+	transaction string
+	binding     string
+	consumers   int
+}
+
+func (d DockerCLI) validateHandoffNetworkBinding() error {
+	if !handoffTransactionIDPattern.MatchString(d.HandoffTransactionID) || !exactSHA256Pattern.MatchString(d.HandoffBindingSHA256) {
+		return errors.New("handoff target network transaction binding is invalid")
+	}
+	return nil
+}
+
+func (d DockerCLI) ensureHandoffCoreNetwork(ctx context.Context, profile identity.Profile, networkLabel string) error {
+	if err := d.validateHandoffNetworkBinding(); err != nil {
+		return err
+	}
+	state, exists, err := d.inspectHandoffCoreNetwork(ctx, profile, networkLabel)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return d.verifyHandoffCoreNetworkState(state)
+	}
+	transactionLabel := profile.Label("handoff.transaction")
+	bindingLabel := profile.Label("handoff.binding-sha256")
+	if _, err := d.runner().Run(ctx, d.binary(), []string{
+		"network", "create", "--driver", "bridge",
+		"--label", networkLabel + "=core",
+		"--label", transactionLabel + "=" + d.HandoffTransactionID,
+		"--label", bindingLabel + "=" + d.HandoffBindingSHA256,
+		d.CoreNetwork,
+	}, nil); err != nil {
+		return fmt.Errorf("create transaction-owned core Docker network %s: %w", d.CoreNetwork, err)
+	}
+	state, exists, err = d.inspectHandoffCoreNetwork(ctx, profile, networkLabel)
+	if err != nil {
+		return fmt.Errorf("reinspect created transaction-owned core Docker network %s: %w", d.CoreNetwork, err)
+	}
+	if !exists {
+		return fmt.Errorf("created transaction-owned core Docker network %s is absent", d.CoreNetwork)
+	}
+	return d.verifyHandoffCoreNetworkState(state)
+}
+
+func (d DockerCLI) inspectHandoffCoreNetwork(ctx context.Context, profile identity.Profile, networkLabel string) (handoffCoreNetworkState, bool, error) {
+	transactionLabel := profile.Label("handoff.transaction")
+	bindingLabel := profile.Label("handoff.binding-sha256")
+	format := fmt.Sprintf(`{{.Id}}|{{.Driver}}|{{index .Labels %q}}|{{index .Labels %q}}|{{index .Labels %q}}|{{len .Containers}}`,
+		networkLabel, transactionLabel, bindingLabel)
+	result, inspectErr := d.runner().Run(ctx, d.binary(), []string{"network", "inspect", "--format", format, d.CoreNetwork}, nil)
+	if inspectErr != nil {
+		absent, proofErr := d.proveCoreNetworkAbsent(ctx)
+		if proofErr != nil {
+			return handoffCoreNetworkState{}, false, errors.Join(fmt.Errorf("inspect Docker network %s: %w", d.CoreNetwork, inspectErr), proofErr)
+		}
+		if absent {
+			return handoffCoreNetworkState{}, false, nil
+		}
+		return handoffCoreNetworkState{}, false, fmt.Errorf("Docker network %s exists but its transaction identity cannot be inspected: %w", d.CoreNetwork, inspectErr)
+	}
+	parts := strings.Split(strings.TrimSpace(result.Stdout), "|")
+	if len(parts) != 6 {
+		return handoffCoreNetworkState{}, false, fmt.Errorf("Docker network %s returned an invalid transaction identity", d.CoreNetwork)
+	}
+	consumers, err := strconv.Atoi(parts[5])
+	if err != nil || consumers < 0 {
+		return handoffCoreNetworkState{}, false, fmt.Errorf("Docker network %s returned an invalid consumer count", d.CoreNetwork)
+	}
+	return handoffCoreNetworkState{
+		id: parts[0], driver: parts[1], ownership: parts[2], transaction: parts[3], binding: parts[4], consumers: consumers,
+	}, true, nil
+}
+
+func (d DockerCLI) proveCoreNetworkAbsent(ctx context.Context) (bool, error) {
+	result, err := d.runner().Run(ctx, d.binary(), []string{"network", "ls", "--format", "{{.Name}}"}, nil)
+	if err != nil {
+		return false, fmt.Errorf("list Docker networks after failed inspect: %w", err)
+	}
+	for _, name := range strings.Fields(result.Stdout) {
+		if name == d.CoreNetwork {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (d DockerCLI) verifyHandoffCoreNetworkState(state handoffCoreNetworkState) error {
+	if !validContainerID(state.id) || state.driver != "bridge" || state.ownership != "core" ||
+		state.transaction != d.HandoffTransactionID || state.binding != d.HandoffBindingSHA256 {
+		return fmt.Errorf("Docker network %s differs from its transaction-owned id, driver, or labels", d.CoreNetwork)
+	}
+	return nil
+}
+
+// RemoveTransactionCoreNetwork removes only the exact target bridge created by
+// this namespace-handoff transaction. The caller must first fence every target
+// writer. Docker receives the freshly inspected id rather than the reusable
+// name, so a concurrent replacement can never be mistaken for this object.
+func (d DockerCLI) RemoveTransactionCoreNetwork(ctx context.Context, transactionID, bindingSHA256 string) error {
+	if !safeName(d.CoreNetwork) {
+		return errors.New("invalid core network name")
+	}
+	if err := d.validateHandoffNetworkBinding(); err != nil {
+		return err
+	}
+	if transactionID != d.HandoffTransactionID || bindingSHA256 != d.HandoffBindingSHA256 {
+		return errors.New("handoff target network removal differs from the configured transaction binding")
+	}
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	state, exists, err := d.inspectHandoffCoreNetwork(ctx, profile, profile.Label("network"))
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if err := d.verifyHandoffCoreNetworkState(state); err != nil {
+		return err
+	}
+	if state.consumers != 0 {
+		return fmt.Errorf("refusing to remove transaction-owned Docker network %s with %d consumers", d.CoreNetwork, state.consumers)
+	}
+	if _, err := d.runner().Run(ctx, d.binary(), []string{"network", "rm", state.id}, nil); err != nil {
+		return fmt.Errorf("remove transaction-owned Docker network %s (%s): %w", d.CoreNetwork, state.id, err)
+	}
+	return nil
+}
+
+// VerifyCoreNetwork proves the exact, already-existing Docker network used by
+// source recovery. It is deliberately incapable of creating or repairing a
+// network: an absent or replaced object must stop recovery before fixed
+// services are started.
+func (d DockerCLI) VerifyCoreNetwork(ctx context.Context, expectedID string) error {
+	if !safeName(d.CoreNetwork) || !validContainerID(expectedID) {
+		return errors.New("bound core network identity is invalid")
+	}
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	networkLabel := profile.Label("network")
+	format := fmt.Sprintf(`{{.Id}}\t{{.Driver}}\t{{index .Labels %q}}`, networkLabel)
+	result, err := d.runner().Run(ctx, d.binary(), []string{"network", "inspect", "--format", format, d.CoreNetwork}, nil)
+	if err != nil {
+		return fmt.Errorf("inspect bound Docker network %s: %w", d.CoreNetwork, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(result.Stdout))
+	if len(fields) != 3 || fields[0] != expectedID || fields[1] != "bridge" || fields[2] != "core" {
+		return fmt.Errorf("Docker network %s differs from its bound id, driver, or ownership label", d.CoreNetwork)
 	}
 	return nil
 }
@@ -1510,9 +2059,13 @@ func (d DockerCLI) setActiveGeneration(id string) error {
 			return fmt.Errorf("activate generation %s: artifact is not a regular file", name)
 		}
 	}
-	return atomicfile.WriteFile(filepath.Join(d.StateDir, "active-generation"), []byte(id+"\n"), 0o600)
+	return writeGeneratedOwnerFile(filepath.Join(d.StateDir, "active-generation"), []byte(id+"\n"), 0o600)
 }
 func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string, error) {
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return "", err
+	}
 	dir := filepath.Join(d.GenerationDir, manifest.ID())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
@@ -1526,8 +2079,8 @@ func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string
 	}
 	sort.Strings(names)
 	var content strings.Builder
-	prefix := identity.SourceProfile().EnvironmentPrefix + "_"
-	fixed := map[string]string{prefix + "DATA_ROOT": d.DataRoot, prefix + "SECRETS_DIR": filepath.Join(d.StateDir, "secrets"), prefix + "MANAGER_CONTROL_DIR": filepath.Join(d.StateDir, "control"), prefix + "UID": strconv.Itoa(d.UID), prefix + "GID": strconv.Itoa(d.GID), prefix + "PLATFORM_BIND": d.PlatformBind, prefix + "PUBLIC_BASE_URL": "http://" + d.GatewayAddress, prefix + "CORE_NETWORK": d.CoreNetwork, prefix + "LOG_MAX_SIZE": d.LogMaxSize, prefix + "LOG_MAX_FILES": strconv.Itoa(d.LogMaxFiles), prefix + "COMPOSE_PROJECT": d.ComposeProject}
+	prefix := profile.EnvironmentPrefix + "_"
+	fixed := map[string]string{prefix + "DATA_ROOT": d.DataRoot, prefix + "SECRETS_DIR": filepath.Join(d.StateDir, "secrets"), prefix + "MANAGER_CONTROL_DIR": d.controlDirectory(), prefix + "UID": strconv.Itoa(d.UID), prefix + "GID": strconv.Itoa(d.GID), prefix + "PLATFORM_BIND": d.PlatformBind, prefix + "PUBLIC_BASE_URL": "http://" + d.GatewayAddress, prefix + "CORE_NETWORK": d.CoreNetwork, prefix + "LOG_MAX_SIZE": d.LogMaxSize, prefix + "LOG_MAX_FILES": strconv.Itoa(d.LogMaxFiles), prefix + "COMPOSE_PROJECT": d.ComposeProject}
 	fixedNames := make([]string, 0, len(fixed))
 	for name := range fixed {
 		fixedNames = append(fixedNames, name)
@@ -1542,14 +2095,90 @@ func (d DockerCLI) writeGenerationEnvironment(manifest release.Manifest) (string
 		key := prefix + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(name)) + "_IMAGE"
 		fmt.Fprintf(&content, "%s=%s\n", key, manifest.Images[name])
 	}
-	return path, atomicfile.WriteFile(path, []byte(content.String()), 0o600)
+	return path, writeGeneratedOwnerFile(path, []byte(content.String()), 0o600)
+}
+
+// writeGeneratedOwnerFile preserves a verified generated file when its durable
+// bytes and mode already match. Handoff publishes compose.env and
+// active-generation before the target stack starts; replacing either file with
+// identical content would needlessly change the staged inventory used by crash
+// replay and rollback validation.
+//
+// A no-op is allowed only after opening the leaf with O_NOFOLLOW and proving
+// that the opened object is an owner-owned, singly-linked regular file still
+// referenced by path. Safe mismatches continue through the existing atomic,
+// fsynced replacement path. Unsafe filesystem objects fail closed.
+func writeGeneratedOwnerFile(path string, data []byte, mode os.FileMode) error {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return atomicfile.WriteFile(path, data, mode)
+		}
+		return fmt.Errorf("open generated file %s without following links: %w", path, err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return fmt.Errorf("open generated file %s: invalid file descriptor", path)
+	}
+	defer file.Close()
+
+	var before syscall.Stat_t
+	if err := syscall.Fstat(fd, &before); err != nil {
+		return fmt.Errorf("inspect generated file %s: %w", path, err)
+	}
+	if before.Mode&syscall.S_IFMT != syscall.S_IFREG || before.Uid != uint32(os.Getuid()) || before.Nlink != 1 {
+		return fmt.Errorf("generated file %s must be an owner-owned singly-linked regular file", path)
+	}
+
+	actual, err := io.ReadAll(io.LimitReader(file, int64(len(data))+1))
+	if err != nil {
+		return fmt.Errorf("read generated file %s: %w", path, err)
+	}
+	var after, pathStat syscall.Stat_t
+	if err := syscall.Fstat(fd, &after); err != nil {
+		return fmt.Errorf("reinspect generated file %s: %w", path, err)
+	}
+	if err := syscall.Lstat(path, &pathStat); err != nil {
+		return fmt.Errorf("reinspect generated file path %s: %w", path, err)
+	}
+	if !sameGeneratedFileObservation(before, after) || !sameGeneratedFileObservation(after, pathStat) {
+		return fmt.Errorf("generated file %s changed while it was inspected", path)
+	}
+	if bytes.Equal(actual, data) && after.Mode&0o7777 == uint32(mode.Perm()) {
+		return nil
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close generated file %s before replacement: %w", path, err)
+	}
+	return atomicfile.WriteFile(path, data, mode)
+}
+
+func sameGeneratedFileObservation(left, right syscall.Stat_t) bool {
+	return left.Dev == right.Dev &&
+		left.Ino == right.Ino &&
+		left.Mode == right.Mode &&
+		left.Nlink == right.Nlink &&
+		left.Uid == right.Uid &&
+		left.Gid == right.Gid &&
+		left.Size == right.Size &&
+		left.Mtim == right.Mtim &&
+		left.Ctim == right.Ctim
+}
+
+func (d DockerCLI) technicalProfile() (identity.Profile, error) {
+	profile, err := d.Profile.Profile()
+	if err != nil {
+		return identity.Profile{}, fmt.Errorf("Docker driver technical profile: %w", err)
+	}
+	return profile, nil
 }
 
 func (d DockerCLI) EnsureHostLayout() error {
 	if d.DataRoot == "" || d.StateDir == "" {
 		return errors.New("data root and state directory are required")
 	}
-	directories := []string{d.DataRoot, d.StateDir, filepath.Join(d.StateDir, "secrets"), filepath.Join(d.StateDir, "control")}
+	directories := []string{d.DataRoot, d.StateDir, filepath.Join(d.StateDir, "secrets"), d.controlDirectory()}
 	for _, path := range directories {
 		if err := ensureOwnerDirectory(path); err != nil {
 			return err
@@ -1561,6 +2190,13 @@ func (d DockerCLI) EnsureHostLayout() error {
 		}
 	}
 	return nil
+}
+
+func (d DockerCLI) controlDirectory() string {
+	if d.ControlDir != "" {
+		return d.ControlDir
+	}
+	return filepath.Join(d.StateDir, "control")
 }
 func (d DockerCLI) ensureDataLayout() error {
 	directories := []string{filepath.Join(d.DataRoot, "data"), filepath.Join(d.DataRoot, "data", "runtimes", "agent"), filepath.Join(d.DataRoot, "data", "runtimes", "camofox"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "config"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "cache"), filepath.Join(d.DataRoot, "data", "runtimes", "firecrawl")}

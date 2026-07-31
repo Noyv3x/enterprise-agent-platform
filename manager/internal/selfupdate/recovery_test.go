@@ -1,6 +1,7 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -64,6 +65,17 @@ type recoveryIdentityResponse struct {
 	available bool
 	version   string
 	sha       string
+}
+
+func testRecoveryExecutableReader(path, expected string) ([]byte, error) {
+	data, _, err := readRecoveryRegularFile(path, recoveryMaxBinaryBytes, false)
+	if err != nil {
+		return nil, err
+	}
+	if sha256Hex(data) != expected {
+		return nil, errors.New("test recovery executable checksum mismatch")
+	}
+	return data, nil
 }
 
 func (i *recoveryIdentityResponse) set(available bool, version, sha string) {
@@ -205,16 +217,18 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 			}
 		}
 	}}
-	manager := &Manager{
-		Root:             managerRoot,
-		StatePath:        managerStatePath,
-		InstallPath:      stablePath,
-		SocketPath:       socketPath,
-		ControlTokenFile: tokenPath,
-		UnitName:         "ubitech-agent-manager.service",
-		RunningVersion:   recoveryVersion,
-		Runner:           runner,
-		Now:              func() time.Time { return time.Unix(3, 0).UTC() },
+	manager := &Manager{Profile: testActiveProfile,
+		ConfigPath:               filepath.Join(root, "config", "manager.toml"),
+		Root:                     managerRoot,
+		StatePath:                managerStatePath,
+		InstallPath:              stablePath,
+		SocketPath:               socketPath,
+		ControlTokenFile:         tokenPath,
+		UnitName:                 "ubitech-agent-manager.service",
+		RunningVersion:           recoveryVersion,
+		Runner:                   runner,
+		Now:                      func() time.Time { return time.Unix(3, 0).UTC() },
+		recoveryExecutableReader: testRecoveryExecutableReader,
 		RecoveryProcessVerifier: func(_ context.Context, unit, stable, expectedSHA string) error {
 			if unit != "ubitech-agent-manager.service" || stable != stablePath || expectedSHA != newSHA {
 				return errors.New("unexpected recovered service identity")
@@ -264,6 +278,57 @@ func TestRecoverCurrentCommitsOnlyAfterHealthyReplacementAndIsReentrant(t *testi
 	}
 	if state.Previous == nil || state.Previous.Path != previousPath || fixture.runner.count() != before+1 {
 		t.Fatalf("replayed recovery was not a stable no-op: state=%#v calls=%d", state, fixture.runner.count())
+	}
+}
+
+func TestRecoverCurrentTransfersAuthorityWhileRecoveryLockIsHeldAndBeforeMutation(t *testing.T) {
+	fixture := newRecoveryFixture(t)
+	stateBefore, err := os.ReadFile(fixture.manager.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stableBefore, err := os.ReadFile(fixture.manager.InstallPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("handoff observation changed")
+	called := false
+	err = fixture.manager.RecoverCurrentWithAuthorityTransfer(
+		context.Background(), fixture.executablePath, fixture.platformPath, fixture.newSHA,
+		func() error {
+			called = true
+			unlock, lockErr := acquireRecoveryLock(fixture.manager.Root)
+			if lockErr == nil {
+				unlock()
+				return errors.New("recovery lock was not held during handoff transfer")
+			}
+			return want
+		},
+	)
+	if !called || !errors.Is(err, want) {
+		t.Fatalf("recovery authority transfer result = %v called=%v", err, called)
+	}
+	stateAfter, stateErr := os.ReadFile(fixture.manager.StatePath)
+	stableAfter, stableErr := os.ReadFile(fixture.manager.InstallPath)
+	if stateErr != nil || stableErr != nil || !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(stableBefore, stableAfter) {
+		t.Fatalf("failed recovery authority transfer mutated state: state_err=%v stable_err=%v", stateErr, stableErr)
+	}
+	if fixture.runner.count() != 0 {
+		t.Fatalf("failed recovery authority transfer invoked systemd: %#v", fixture.runner.calls)
+	}
+}
+
+func TestRecoverCurrentProductionPathRequiresAuthorityTransfer(t *testing.T) {
+	fixture := newRecoveryFixture(t)
+	fixture.manager.recoveryExecutableReader = nil
+	err := fixture.manager.RecoverCurrentWithAuthorityTransfer(
+		context.Background(), fixture.executablePath, fixture.platformPath, fixture.newSHA, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "requires a retained handoff authority transfer") {
+		t.Fatalf("missing recovery authority transfer result = %v", err)
+	}
+	if fixture.runner.count() != 0 {
+		t.Fatalf("missing recovery authority transfer invoked systemd: %#v", fixture.runner.calls)
 	}
 }
 

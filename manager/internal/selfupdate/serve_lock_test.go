@@ -13,7 +13,7 @@ func TestAcquireServeLockCreatesFreshRootAndRetainsSingleton(t *testing.T) {
 	if err := os.Chmod(stateDirectory, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{Root: filepath.Join(stateDirectory, "manager-binaries")}
+	manager := &Manager{Profile: testActiveProfile, Root: filepath.Join(stateDirectory, "manager-binaries")}
 
 	lease, err := manager.AcquireServeLock()
 	if err != nil {
@@ -60,7 +60,7 @@ func TestAcquireServeLockRejectsUnsafeRootAndLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		root := filepath.Join(parent, "manager-binaries")
-		if lease, err := (&Manager{Root: root}).AcquireServeLock(); err == nil {
+		if lease, err := (&Manager{Profile: testActiveProfile, Root: root}).AcquireServeLock(); err == nil {
 			lease.Release()
 			t.Fatal("unsafe fresh-install parent was repaired and accepted")
 		}
@@ -83,7 +83,7 @@ func TestAcquireServeLockRejectsUnsafeRootAndLock(t *testing.T) {
 		if err := os.Symlink(target, root); err != nil {
 			t.Fatal(err)
 		}
-		if lease, err := (&Manager{Root: root}).AcquireServeLock(); err == nil {
+		if lease, err := (&Manager{Profile: testActiveProfile, Root: root}).AcquireServeLock(); err == nil {
 			lease.Release()
 			t.Fatal("symlink Manager root was accepted")
 		}
@@ -94,7 +94,7 @@ func TestAcquireServeLockRejectsUnsafeRootAndLock(t *testing.T) {
 		if err := os.Mkdir(root, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if lease, err := (&Manager{Root: root}).AcquireServeLock(); err == nil {
+		if lease, err := (&Manager{Profile: testActiveProfile, Root: root}).AcquireServeLock(); err == nil {
 			lease.Release()
 			t.Fatal("broad Manager root mode was accepted")
 		}
@@ -116,7 +116,7 @@ func TestAcquireServeLockRejectsUnsafeRootAndLock(t *testing.T) {
 			if err := test.create(filepath.Join(root, managerServeLockName)); err != nil {
 				t.Fatal(err)
 			}
-			if lease, err := (&Manager{Root: root}).AcquireServeLock(); err == nil {
+			if lease, err := (&Manager{Profile: testActiveProfile, Root: root}).AcquireServeLock(); err == nil {
 				lease.Release()
 				t.Fatalf("unsafe %s serve lock was accepted", test.name)
 			}

@@ -242,16 +242,18 @@ class MailServiceTests(unittest.TestCase):
         workspace.mkdir(mode=0o700)
         outside.mkdir(mode=0o700)
         (workspace / "mail").mkdir(mode=0o700)
-        original_open = secure_fs._open_private_file_at
+        original_link = secure_fs._link_anonymous_file_at
 
-        def replace_parent_after_it_is_pinned(parent_fd: int, name: str) -> int:
+        def replace_parent_after_it_is_pinned(
+            file_fd: int, parent_fd: int, name: str
+        ) -> None:
             (workspace / "mail").rename(workspace / "mail-pinned")
             (workspace / "mail").symlink_to(outside, target_is_directory=True)
-            return original_open(parent_fd, name)
+            original_link(file_fd, parent_fd, name)
 
         with mock.patch.object(
             secure_fs,
-            "_open_private_file_at",
+            "_link_anonymous_file_at",
             side_effect=replace_parent_after_it_is_pinned,
         ):
             relative = self.service._save_mail_attachment(

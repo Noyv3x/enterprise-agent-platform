@@ -11,6 +11,7 @@ import (
 func TestResolveHostPathMapsLogicalRootsAndRejectsProtectedPaths(t *testing.T) {
 	root := t.TempDir()
 	manager, err := Open(
+		testActiveProfile,
 		&sandboxEngine{},
 		filepath.Join(root, "data"),
 		filepath.Join(root, "manager", "sandboxes.json"),
@@ -41,6 +42,9 @@ func TestResolveHostPathMapsLogicalRootsAndRejectsProtectedPaths(t *testing.T) {
 		{name: "manager state", path: filepath.Join(root, "manager", "secrets", "manager-token"), access: HostPathRead},
 		{name: "manager cwd", path: filepath.Join(root, "manager"), access: HostPathWorkingDirectory},
 		{name: "standard config", path: "/home/deployer/.config/ubitech-agent/manager.toml", access: HostPathRead},
+		{name: "target config", path: "/home/deployer/.config/agent-platform/manager.toml", access: HostPathRead},
+		{name: "target manager state", path: "/home/deployer/.local/share/agent-platform/manager/state.json", access: HostPathRead},
+		{name: "target runtime control", path: "/run/user/1001/agent-platform-manager/manager.sock", access: HostPathRead},
 		{name: "docker socket", path: "/run/docker.sock", access: HostPathRead},
 		{name: "process credentials", path: "/proc/self/environ", access: HostPathRead},
 		{name: "system write", path: "/etc/passwd", access: HostPathWrite},

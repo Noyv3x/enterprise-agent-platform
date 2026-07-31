@@ -23,8 +23,10 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
@@ -32,7 +34,10 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/selfupdate"
 )
 
-const managerServeHelperEnvironment = "UBITECH_TEST_MANAGER_SERVE_RECOVERY"
+const (
+	managerServeHelperEnvironment       = "UBITECH_TEST_MANAGER_SERVE_RECOVERY"
+	managerServeHelperConfigEnvironment = "UBITECH_TEST_MANAGER_SERVE_CONFIG"
+)
 
 // TestManagerServeRecoveryHelper turns the Go test executable into a real
 // Manager process for TestCurrentManagerServeSurvivesFinalizeRetry. Keeping the
@@ -48,7 +53,11 @@ func TestManagerServeRecoveryHelper(t *testing.T) {
 		initialDelay:   150 * time.Millisecond,
 		maxDelay:       150 * time.Millisecond,
 	}
-	if code := run([]string{"serve", "--config", os.Getenv("UBITECH_TEST_MANAGER_CONFIG")}); code != 0 {
+	configPath := os.Getenv(managerServeHelperConfigEnvironment)
+	if configPath == "" {
+		t.Fatal("subprocess helper config path is missing")
+	}
+	if code := run([]string{"serve", "--config", configPath}); code != 0 {
 		t.Fatalf("Manager serve returned exit code %d", code)
 	}
 }
@@ -63,11 +72,30 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	dataRoot := filepath.Join(root, "data-root")
-	stateDir := filepath.Join(dataRoot, "manager")
+	xdgConfigHome := filepath.Join(root, "config")
+	xdgDataHome := filepath.Join(root, "share")
+	xdgStateHome := filepath.Join(root, "state")
+	xdgRuntimeDir := filepath.Join(root, "run")
+	xdgBinHome := filepath.Join(root, "bin")
+	for _, path := range []string{xdgConfigHome, xdgDataHome, xdgStateHome, xdgRuntimeDir, xdgBinHome} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("XDG_CONFIG_HOME", xdgConfigHome)
+	t.Setenv("XDG_DATA_HOME", xdgDataHome)
+	t.Setenv("XDG_STATE_HOME", xdgStateHome)
+	t.Setenv("XDG_RUNTIME_DIR", xdgRuntimeDir)
+	t.Setenv("XDG_BIN_HOME", xdgBinHome)
+	defaults, err := config.Defaults(testActiveProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := defaults.DataRoot
+	stateDir := defaults.StateDir
 	secretsDir := filepath.Join(stateDir, "secrets")
 	controlDir := filepath.Join(stateDir, "control")
-	for _, path := range []string{dataRoot, stateDir, secretsDir, controlDir, filepath.Join(dataRoot, "data")} {
+	for _, path := range []string{dataRoot, stateDir, secretsDir, controlDir, filepath.Join(dataRoot, "data"), filepath.Dir(defaults.ConfigPath)} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -89,7 +117,7 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	var releaseIDs []string
 	platform := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
-		case "/internal/manager/update/release":
+		case "/internal/manager/update/commit-release":
 			var body struct {
 				OperationID string `json:"operation_id"`
 			}
@@ -129,17 +157,17 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	defer platform.Close()
 
 	gatewayAddress := reserveLoopbackAddress(t)
-	socketPath := filepath.Join(controlDir, "manager.sock")
+	socketPath := defaults.SocketPath
 	fakeDocker := writeRecoveryFakeDocker(t, root)
 	composePath := filepath.Join(root, "compose.yaml")
 	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	configPath := filepath.Join(root, "manager.toml")
+	configPath := defaults.ConfigPath
 	config := fmt.Sprintf(
-		"data_root = %q\nsocket_path = %q\nlisten = %q\nplatform_url = %q\nplatform_gate_url = %q\nupdate_enabled = false\ncompose_file = %q\ncompose_project = %q\ndocker_binary = %q\nsandbox_network = %q\n",
-		dataRoot, socketPath, gatewayAddress, platform.URL, platform.URL, composePath,
-		"ubitech-recovery-test", fakeDocker, "ubitech-recovery-test-core",
+		"state_home = %q\nlisten = %q\nplatform_url = %q\nplatform_gate_url = %q\nupdate_enabled = false\ncompose_file = %q\ncompose_project = %q\ndocker_binary = %q\nsandbox_network = %q\n",
+		xdgStateHome, gatewayAddress, platform.URL, platform.URL, composePath,
+		identity.SourceProfile().ComposeProject, fakeDocker, identity.SourceProfile().CoreNetwork,
 	)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
@@ -148,18 +176,18 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 	generationID := strings.Repeat("c", 40)
 	manifestPath, images := writeRecoveryManifest(t, stateDir, generationID)
 	operationID := seedFinalizePendingUpdate(t, stateDir, generationID, manifestPath, images)
-	seedCommittedManagerBinary(t, stateDir, filepath.Join(root, "bin", "ubitech-manager"), generationID)
+	stableBinary := identity.SourceProfile().ManagerInstallPath(xdgBinHome)
+	seedCommittedManagerBinary(t, stateDir, stableBinary, generationID)
 
 	logPath := filepath.Join(root, "manager-helper.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(os.Args[0], "-test.run=^TestManagerServeRecoveryHelper$", "-test.v")
+	command := exec.Command(stableBinary, "-test.run=^TestManagerServeRecoveryHelper$", "-test.v")
 	command.Env = append(os.Environ(),
 		managerServeHelperEnvironment+"=1",
-		"UBITECH_TEST_MANAGER_CONFIG="+configPath,
-		"XDG_BIN_HOME="+filepath.Join(root, "bin"),
+		managerServeHelperConfigEnvironment+"="+configPath,
 	)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -200,7 +228,9 @@ func TestCurrentManagerServeSurvivesFinalizeRetryWithAuxiliaryUnavailable(t *tes
 		content, _ := os.ReadFile(logPath)
 		t.Fatalf("Manager exited before the first finalize attempt was observed: %v\n%s", err, content)
 	case <-time.After(5 * time.Second):
-		t.Fatal("Manager did not reach the pending finalize release")
+		logs := stop()
+		stopped = true
+		t.Fatalf("Manager did not reach the pending finalize release:\n%s", logs)
 	}
 
 	pending := readRecoveryManagerStatus(t, socketPath, controlToken)
@@ -377,7 +407,7 @@ func writeRecoveryManifest(t *testing.T, stateDir, generationID string) (string,
 	for index, name := range []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq",
+		"firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 	} {
 		digit := fmt.Sprintf("%x", (index%15)+1)
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(digit, 64)
@@ -524,8 +554,8 @@ if [ "${1:-}" = inspect ]; then
   case "$*" in
     *com.docker.compose.project*)
       case "$last" in
-        a*) printf 'registry.example/platform@sha256:%064d\tubitech-recovery-test\tplatform\n' 0 | tr 0 1 ;;
-        b*) printf 'registry.example/agent-runtime@sha256:%064d\tubitech-recovery-test\tagent-runtime\n' 0 | tr 0 2 ;;
+        a*) printf 'registry.example/platform@sha256:%064d\t__COMPOSE_PROJECT__\tplatform\n' 0 | tr 0 1 ;;
+        b*) printf 'registry.example/agent-runtime@sha256:%064d\t__COMPOSE_PROJECT__\tagent-runtime\n' 0 | tr 0 2 ;;
       esac
       exit 0
       ;;
@@ -538,6 +568,7 @@ if [ "${1:-}" = inspect ]; then
 fi
 exit 0
 `
+	script = strings.ReplaceAll(script, "__COMPOSE_PROJECT__", identity.SourceProfile().ComposeProject)
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

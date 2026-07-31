@@ -159,15 +159,25 @@ jobs:
           - component: platform
             dockerfile: containers/platform.Dockerfile
             image: platform
+            tag_suffix: ''
           - component: agent-runtime
             dockerfile: containers/agent-runtime.Dockerfile
             image: agent-runtime
+            tag_suffix: ''
           - component: camofox
             dockerfile: containers/camofox.Dockerfile
             image: camofox
+            tag_suffix: ''
           - component: agent-sandbox
             dockerfile: containers/agent-sandbox.Dockerfile
             image: agent-sandbox
+            tag_suffix: ''
+          - component: handoff-fs-helper
+            dockerfile: containers/handoff-fs-helper.Dockerfile
+            # Keep this one-shot capability in an already-public package while
+            # preserving a separate immutable image/digest and scratch rootfs.
+            image: platform
+            tag_suffix: '-handoff-fs-helper'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -203,7 +213,7 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}:${{ needs.prepare.outputs.source_commit }}
+          tags: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}:${{ needs.prepare.outputs.source_commit }}${{ matrix.tag_suffix }}
           build-args: |
             SOURCE_COMMIT=${{ needs.prepare.outputs.source_commit }}
             RELEASE_VERSION=${{ needs.prepare.outputs.source_commit }}
@@ -285,9 +295,13 @@ jobs:
             *) echo "Unsupported package owner type: $owner_type" >&2; exit 1 ;;
           esac
 
-          for component in platform agent-runtime camofox agent-sandbox; do
+          for component in platform agent-runtime camofox agent-sandbox handoff-fs-helper; do
             metadata="image-metadata/${component}.json"
-            package="${repository}/${component}"
+            package_component="$component"
+            if [[ "$component" == handoff-fs-helper ]]; then
+              package_component=platform
+            fi
+            package="${repository}/${package_component}"
             reference="$(jq -er '.reference' "$metadata")"
             expected_reference="ghcr.io/${owner}/${package}"
             [[ "$reference" == "$expected_reference" ]] || {
@@ -386,6 +400,11 @@ jobs:
               select(.digest | test("^sha256:[0-9a-f]{64}$")) |
               .reference + "@" + .digest
             ' image-metadata/agent-sandbox.json)"
+            [handoff-fs-helper]="$(jq -er '
+              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
+              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+              .reference + "@" + .digest
+            ' image-metadata/handoff-fs-helper.json)"
             [searxng]='ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812'
             [firecrawl-api]='ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c'
             [firecrawl-playwright]='ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2'
@@ -394,7 +413,7 @@ jobs:
             [firecrawl-rabbitmq]='rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
           )
           mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)
-          [[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]
+          [[ "${#components[@]}" -eq 11 && "${#images[@]}" -eq "${#components[@]}" ]]
 
           for component in "${components[@]}"; do
             image="${images[$component]-}"
@@ -403,8 +422,12 @@ jobs:
               exit 1
             }
             case "$component" in
-              platform|agent-runtime|camofox|agent-sandbox)
-                package="${repository}/${component}"
+              platform|agent-runtime|camofox|agent-sandbox|handoff-fs-helper)
+                package_component="$component"
+                if [[ "$component" == handoff-fs-helper ]]; then
+                  package_component=platform
+                fi
+                package="${repository}/${package_component}"
                 digest="${image##*@}"
                 anonymous_token="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
                   --fail --silent --show-error --get \
@@ -474,7 +497,7 @@ jobs:
             jq -n --arg key "$component" --arg value "${images[$component]}" '{key:$key,value:$value}'
           done | jq -se '
             map({(.key): .value}) | add |
-            select(length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
+            select(length == 11 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
           ' > "$verified_images"
           jq -e --slurpfile verified "$verified_images" '
             (.managed_image_capacity_estimates | keys) == ($verified[0] | keys)
@@ -650,7 +673,7 @@ jobs:
           export UBITECH_PLATFORM_BIND=127.0.0.1:18080
           export UBITECH_PUBLIC_BASE_URL=http://127.0.0.1:18080
           verified_images=artifacts/verified-managed-images.json
-          jq -e 'length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$"))' "$verified_images" >/dev/null
+          jq -e 'length == 11 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$"))' "$verified_images" >/dev/null
           UBITECH_PLATFORM_IMAGE="$(jq -er '.platform' "$verified_images")"
           UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er '."agent-runtime"' "$verified_images")"
           UBITECH_CAMOFOX_IMAGE="$(jq -er '.camofox' "$verified_images")"
@@ -661,6 +684,7 @@ jobs:
           UBITECH_FIRECRAWL_POSTGRES_IMAGE="$(jq -er '."firecrawl-postgres"' "$verified_images")"
           UBITECH_FIRECRAWL_REDIS_IMAGE="$(jq -er '."firecrawl-redis"' "$verified_images")"
           UBITECH_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er '."firecrawl-rabbitmq"' "$verified_images")"
+          handoff_helper_image="$(jq -er '."handoff-fs-helper"' "$verified_images")"
           export \
             UBITECH_PLATFORM_IMAGE UBITECH_AGENT_RUNTIME_IMAGE UBITECH_CAMOFOX_IMAGE \
             UBITECH_AGENT_SANDBOX_IMAGE UBITECH_SEARXNG_IMAGE \
@@ -807,8 +831,98 @@ jobs:
               "firecrawl-postgres": .services["firecrawl-postgres"].image,
               "firecrawl-redis": .services["firecrawl-redis"].image,
               "firecrawl-rabbitmq": .services["firecrawl-rabbitmq"].image
-            } == ($expected[0] | del(."agent-sandbox"))
+            } == ($expected[0] | del(."agent-sandbox", ."handoff-fs-helper"))
           ' <<<"$resolved_compose" >/dev/null
+          test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
+            "$UBITECH_FIRECRAWL_REDIS_IMAGE" -c 'printf "%s:%s" "$(id -u redis)" "$(id -g redis)"')" = "999:1000"
+          test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
+            "$UBITECH_FIRECRAWL_RABBITMQ_IMAGE" -c 'printf "%s:%s" "$(id -u rabbitmq)" "$(id -g rabbitmq)"')" = "999:999"
+          test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
+            "$UBITECH_FIRECRAWL_POSTGRES_IMAGE" -c 'printf "%s:%s" "$(id -u postgres)" "$(id -g postgres)"')" = "999:999"
+          docker pull "$handoff_helper_image"
+          handoff_helper_root="$root/handoff-helper"
+          mkdir -p "$handoff_helper_root/source/data" "$handoff_helper_root/target" "$handoff_helper_root/control"
+          chmod 0700 "$handoff_helper_root" "$handoff_helper_root/source" "$handoff_helper_root/target" "$handoff_helper_root/control"
+          printf 'different uid payload\n' > "$handoff_helper_root/source/data/payload.txt"
+          chmod 0700 "$handoff_helper_root/source/data"
+          chmod 0600 "$handoff_helper_root/source/data/payload.txt"
+          sudo -n chown -R 42424:42424 "$handoff_helper_root/source/data"
+          sudo -n python3 - \
+            "$handoff_helper_root/source/data" "$handoff_helper_root/control/request.json" \
+            "$handoff_helper_image" "$UBITECH_UID" "$UBITECH_GID" <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          import sys
+
+          source, output, image, manager_uid, manager_gid = sys.argv[1:]
+
+          def entry(path, relative):
+              observed = os.lstat(path)
+              result = {
+                  "resource": "different_uid_data",
+                  "path": relative,
+                  "type": "directory" if stat.S_ISDIR(observed.st_mode) else "file",
+                  "mode": stat.S_IMODE(observed.st_mode),
+                  "uid": observed.st_uid,
+                  "gid": observed.st_gid,
+                  "link_count": observed.st_nlink,
+                  "size": observed.st_size,
+                  "allocated_size": observed.st_blocks * 512,
+                  "modified_nanos": observed.st_mtime_ns,
+              }
+              if stat.S_ISREG(observed.st_mode):
+                  result["sha256"] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+              return result
+
+          request = {
+              "schema_version": 1,
+              "operation": "copy",
+              "transaction_id": "handoff_11111111111111111111111111111111",
+              "data_request_sha256": "a" * 64,
+              "resource_name": "different_uid_data",
+              "access": "container_owned_tree",
+              "image_digest": image,
+              "manager_uid": int(manager_uid),
+              "manager_gid": int(manager_gid),
+              "target_relative": "copied",
+              "source_owners": [{"uid": 42424, "gid": 42424}],
+              "target_owners": [{"uid": 42424, "gid": 42424}],
+              "expected_source": [
+                  entry(source, "."),
+                  entry(os.path.join(source, "payload.txt"), "payload.txt"),
+              ],
+              "request_sha256": "",
+          }
+          canonical = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+          request["request_sha256"] = hashlib.sha256(canonical).hexdigest()
+          with open(output, "x", encoding="utf-8") as target:
+              json.dump(request, target, ensure_ascii=False, separators=(",", ":"))
+              target.write("\n")
+              target.flush()
+              os.fsync(target.fileno())
+          os.chmod(output, 0o600)
+          os.chown(output, int(manager_uid), int(manager_gid))
+          PY
+          docker run --rm --pull=never --network=none --read-only --user=0:0 \
+            --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER \
+            --security-opt=no-new-privileges:true --pids-limit=64 \
+            --env "HANDOFF_FS_IMAGE_DIGEST=$handoff_helper_image" \
+            --mount "type=bind,src=$handoff_helper_root/control,dst=/control" \
+            --mount "type=bind,src=$handoff_helper_root/source/data,dst=/source,readonly" \
+            --mount "type=bind,src=$handoff_helper_root/target,dst=/target" \
+            "$handoff_helper_image" --request /control/request.json --receipt /control/receipt.json
+          jq -e --arg image "$handoff_helper_image" '
+            .schema_version == 1 and .operation == "copy" and .image_digest == $image and
+            .transaction_id == "handoff_11111111111111111111111111111111" and
+            (.source_entries | length) == 2 and (.target_entries | length) == 2 and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$"))
+          ' "$handoff_helper_root/control/receipt.json" >/dev/null
+          test "$(sudo -n stat -c '%u:%g:%a' "$handoff_helper_root/target/copied")" = "42424:42424:700"
+          test "$(sudo -n stat -c '%u:%g:%a' "$handoff_helper_root/target/copied/payload.txt")" = "42424:42424:600"
+          test "$(sudo -n sha256sum "$handoff_helper_root/source/data/payload.txt" | awk '{print $1}')" = \
+            "$(sudo -n sha256sum "$handoff_helper_root/target/copied/payload.txt" | awk '{print $1}')"
           docker compose -f containers/compose.yaml up --detach agent-runtime camofox searxng platform
           for service in agent-runtime camofox searxng platform; do
             container="$(docker compose -f containers/compose.yaml ps -q "$service")"
@@ -1041,6 +1155,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: write
       packages: read
     concurrency:
@@ -1052,6 +1167,13 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out publisher policy from the workflow execution head
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .publisher-policy
           persist-credentials: false
 
       - name: Download verified managed-image directory
@@ -1092,9 +1214,9 @@ jobs:
           generated_at="$(git show -s --format=%cI "$SOURCE_COMMIT")"
           database_schema_version="$(jq -er '.database_schema_version' docs/contracts/container-platform.json)"
           verified_images="$(jq -ec '
-            select(length == 10) |
+            select(length == 11) |
             with_entries(select(.key | test("^[a-z0-9]+(-[a-z0-9]+)*$"))) |
-            select(length == 10 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
+            select(length == 11 and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
           ' artifacts/verified-managed-images.json)"
           jq -n \
             --arg source_commit "$SOURCE_COMMIT" \
@@ -1137,7 +1259,7 @@ jobs:
           expected_images = {
               "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
               "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-              "firecrawl-redis", "firecrawl-rabbitmq",
+              "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
           }
           if set(data["images"]) != expected_images:
               raise SystemExit(f"release image directory mismatch: {sorted(data['images'])}")
@@ -1152,35 +1274,155 @@ jobs:
               if not artifact["url"].startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]):
                   raise SystemExit("invalid release artifact")
           PY
+          python3 scripts/release_promotion.py create-promotion \
+            --contract docs/contracts/release-transition.json \
+            --manifest "$stage/release.json" \
+            --challenge-schema docs/contracts/release-transition-challenge.schema.json \
+            --receipt-schema docs/contracts/release-transition-receipt.schema.json \
+            --generation "$SOURCE_COMMIT" \
+            --assets-root "$stage" \
+            --output "$stage/promotion.json"
           echo "stage=$stage" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish complete release as one visible generation
+        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           STAGE: ${{ steps.manifest.outputs.stage }}
           RELEASE_TAG: ${{ steps.manifest.outputs.release_tag }}
+          EXECUTION_HEAD_SHA: ${{ github.sha }}
+          UPSTREAM_QUALITY_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          UPSTREAM_QUALITY_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-            if [[ "$is_draft" != true ]]; then
-              mkdir -p "$RUNNER_TEMP/existing"
-              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/existing"
-              for asset in \
-                release.json ubitech-compose.yaml install.sh install.sh.sha256 \
-                ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
-                ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
-                test -f "$RUNNER_TEMP/existing/$asset"
-                cmp "$STAGE/$asset" "$RUNNER_TEMP/existing/$asset"
-              done
-              (
-                cd "$RUNNER_TEMP/existing"
-                bash -n install.sh
+          sealed_assets=(
+            ubitech-manager-linux-amd64
+            ubitech-manager-linux-amd64.sha256
+            ubitech-manager-linux-arm64
+            ubitech-manager-linux-arm64.sha256
+            ubitech-compose.yaml
+            install.sh
+            install.sh.sha256
+            release.json
+          )
+          assets=("${sealed_assets[@]}" promotion.json)
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc 'sort')"
+          local_identity="$RUNNER_TEMP/local-release-assets.json"
+          python3 - "$STAGE" "$local_identity" "${assets[@]}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          expected = sorted(sys.argv[3:])
+          actual = sorted(path.name for path in root.iterdir())
+          if actual != expected:
+              raise SystemExit(f"local release directory mismatch: {actual}")
+          assets = []
+          for name in expected:
+              path = root / name
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size <= 0:
+                  raise SystemExit(f"local release asset is not a non-empty regular file: {name}")
+              assets.append({
+                  "name": name,
+                  "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": info.st_size,
+              })
+          output.write_text(
+              json.dumps(assets, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python3 scripts/release_promotion.py validate-promotion \
+            --contract docs/contracts/release-transition.json \
+            --manifest "$STAGE/release.json" \
+            --challenge-schema docs/contracts/release-transition-challenge.schema.json \
+            --receipt-schema docs/contracts/release-transition-receipt.schema.json \
+            --generation "$SOURCE_COMMIT" \
+            --assets-root "$STAGE" \
+            --promotion "$STAGE/promotion.json"
+
+          fetch_release() {
+            local output="$1"
+            local api_url
+            api_url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+            [[ "$api_url" == "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"* ]]
+            gh api -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$api_url" > "${output}.tmp"
+            mv "${output}.tmp" "$output"
+          }
+
+          validate_asset_metadata() {
+            local document="$1"
+            local require_complete="$2"
+            jq -e --arg tag "$RELEASE_TAG" --arg target "$SOURCE_COMMIT" \
+              --argjson names "$expected_names" --argjson complete "$require_complete" '
+              .tag_name == $tag and
+              .target_commitish == $target and
+              .prerelease == false and
+              (.draft | type == "boolean") and
+              (.id | type == "number") and
+              (.assets | type == "array") and
+              ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
+              ([.assets[].name] - $names | length) == 0 and
+              (if $complete then ([.assets[].name] | sort) == $names else true end) and
+              all(.assets[];
+                (.id | type == "number") and .state == "uploaded" and
+                (.name | type == "string") and
+                (.size | type == "number" and . > 0) and
+                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
               )
-              exit 0
+            ' "$document" >/dev/null
+          }
+
+          verify_complete_release() {
+            local document="$1"
+            local api_identity="$2"
+            validate_asset_metadata "$document" true
+            jq -cS '[.assets[] | {name, digest, size}] | sort_by(.name)' \
+              "$document" > "$RUNNER_TEMP/api-release-assets.json"
+            cmp "$local_identity" "$RUNNER_TEMP/api-release-assets.json"
+            jq -cS '{
+              release_id: .id,
+              tag_name,
+              target_commitish,
+              draft,
+              prerelease,
+              assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+            }' "$document" > "$api_identity"
+          }
+
+          release_json="$RUNNER_TEMP/release-api.json"
+          release_complete=false
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            fetch_release "$release_json"
+            validate_asset_metadata "$release_json" false
+            is_draft="$(jq -r 'if (.draft | type) == "boolean" then .draft else error("invalid draft state") end' "$release_json")"
+            mkdir -p "$RUNNER_TEMP/existing"
+            mapfile -t existing_assets < <(jq -er '.assets[].name' "$release_json")
+            declare -A existing=()
+            for asset in "${existing_assets[@]}"; do
+              existing["$asset"]=1
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --dir "$RUNNER_TEMP/existing" --pattern "$asset"
+              cmp "$STAGE/$asset" "$RUNNER_TEMP/existing/$asset"
+            done
+            if [[ -n "${existing[promotion.json]:-}" ]]; then
+              verify_complete_release "$release_json" "$RUNNER_TEMP/published-release-identity.json"
+              (cd "$RUNNER_TEMP/existing" && bash -n install.sh)
+              release_complete=true
+            fi
+            if [[ "$release_complete" != true && "$is_draft" != true ]]; then
+              echo "Incomplete immutable release is already public" >&2
+              exit 1
             fi
           else
             gh release create "$RELEASE_TAG" \
@@ -1189,117 +1431,96 @@ jobs:
               --title "Agent Platform ${SOURCE_COMMIT:0:12}" \
               --notes "Immutable Docker release for ${SOURCE_COMMIT}." \
               --draft
+            declare -A existing=()
           fi
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            "$STAGE/ubitech-manager-linux-amd64" \
-            "$STAGE/ubitech-manager-linux-amd64.sha256" \
-            "$STAGE/ubitech-manager-linux-arm64" \
-            "$STAGE/ubitech-manager-linux-arm64.sha256" \
-            "$STAGE/ubitech-compose.yaml" \
-            "$STAGE/install.sh" \
-            "$STAGE/install.sh.sha256"
-          # release.json is deliberately the final uploaded artifact. Publish
-          # this exact generation as non-latest; the serialized promotion job
-          # below owns the mutable main channel.
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "$STAGE/release.json"
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
-
-  promote:
-    name: Promote main channel monotonically
-    needs:
-      - prepare
-      - publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    concurrency:
-      group: container-channel-main
-      cancel-in-progress: false
-    steps:
-      - name: Check out release history
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Promote newest qualified release on main
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git fetch --quiet --no-tags origin main
-          declare -A released=()
-          while IFS= read -r tag; do
-            if [[ "$tag" =~ ^container-([0-9a-f]{40})$ ]]; then
-              released["${BASH_REMATCH[1]}"]=1
-            fi
-          done < <(gh api --paginate \
-            -H 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '.[] | select(.draft == false) | .tag_name')
-          release_tag=""
-          while IFS= read -r commit; do
-            if [[ -n "${released[$commit]:-}" ]]; then
-              release_tag="container-${commit}"
-              break
-            fi
-          done < <(git rev-list origin/main)
-          if [[ -z "$release_tag" ]]; then
-            echo "No public qualified container release is reachable from main" >&2
+          if [[ "$release_complete" != true ]]; then
+            # Fill an interrupted draft without replacing any existing byte.
+            # promotion.json is uploaded last and seals the immutable directory.
+            for asset in "${sealed_assets[@]}"; do
+              if [[ -z "${existing[$asset]:-}" ]]; then
+                gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/$asset"
+              fi
+            done
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/promotion.json"
+          fi
+          fetch_release "$release_json"
+          verify_complete_release "$release_json" "$RUNNER_TEMP/published-release-identity.json"
+          source_selection="$RUNNER_TEMP/publisher-source-selection.json"
+          quality_run="$RUNNER_TEMP/publisher-quality-run.json"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            [[ "$UPSTREAM_QUALITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$UPSTREAM_QUALITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_QUALITY_RUN_ID}" > "$quality_run"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
+              --argjson run "$UPSTREAM_QUALITY_RUN_ID" --argjson attempt "$UPSTREAM_QUALITY_RUN_ATTEMPT" '
+              .id == $run and .run_attempt == $attempt and
+              .path == ".github/workflows/quality.yml" and
+              .event == "push" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $source and
+              .head_repository.full_name == $repo
+            ' "$quality_run" >/dev/null
+            selection_kind=workflow_run
+            selection_resolution=qualified_workflow_run.head_sha
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ -n "$REQUESTED_REF" ]]
+            quality_runs="$RUNNER_TEMP/publisher-quality-runs.json"
+            gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
+              jq -s '
+                if all(.[]; type == "object" and (.workflow_runs | type == "array"))
+                then {workflow_runs: [.[].workflow_runs[]]}
+                else error("invalid paginated quality workflow runs response")
+                end
+              ' > "$quality_runs"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
+              [.workflow_runs[] | select(
+                .path == ".github/workflows/quality.yml" and
+                .event == "push" and .conclusion == "success" and
+                .head_branch == "main" and .head_sha == $source and
+                .head_repository.full_name == $repo and
+                (.id | type == "number" and . > 0) and
+                (.run_attempt | type == "number" and . > 0)
+              )] | sort_by(.id) | last // error("no exact successful Quality run")
+            ' "$quality_runs" > "$quality_run"
+            selection_kind=workflow_dispatch
+            selection_resolution='checkout(inputs.ref).git_rev_parse_head'
+          else
+            echo "Unsupported publisher event: $GITHUB_EVENT_NAME" >&2
             exit 1
           fi
-          release_dir="$RUNNER_TEMP/channel-release"
-          mkdir -p "$release_dir"
-          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$release_dir"
-          for asset in \
-            release.json ubitech-compose.yaml install.sh install.sh.sha256 \
-            ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256 \
-            ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256; do
-            test -f "$release_dir/$asset"
-          done
-          release_commit="${release_tag#container-}"
-          python3 - "$release_dir/release.json" "$release_commit" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import sys
+          jq -cS --arg kind "$selection_kind" --arg resolution "$selection_resolution" \
+            --arg requested_ref "$REQUESTED_REF" '
+            {
+              kind: $kind,
+              resolution: $resolution,
+              requested_ref: (if $kind == "workflow_run" then null else $requested_ref end),
+              qualification_run_id: .id,
+              qualification_run_attempt: .run_attempt,
+              qualification_workflow_path: .path,
+              qualification_event: .event,
+              qualification_conclusion: .conclusion,
+              qualification_head_branch: .head_branch,
+              qualification_head_sha: .head_sha,
+              qualification_head_repository: .head_repository.full_name
+            }
+          ' "$quality_run" > "$source_selection"
+          proof="$RUNNER_TEMP/publisher-provenance.json"
+          python3 .publisher-policy/scripts/release_promotion.py create-publisher-provenance \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-event "$GITHUB_EVENT_NAME" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --execution-head-sha "$EXECUTION_HEAD_SHA" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-selection "$source_selection" \
+            --release-identity "$RUNNER_TEMP/published-release-identity.json" \
+            --output "$proof"
+          echo "publisher_provenance=$proof" >> "$GITHUB_OUTPUT"
 
-          path = pathlib.Path(sys.argv[1])
-          expected_commit = sys.argv[2]
-          manifest = json.loads(path.read_text(encoding="utf-8"))
-          if manifest.get("channel") != "main" or manifest.get("source_commit") != expected_commit:
-              raise SystemExit("release channel/source identity mismatch")
-          root = path.parent
-          artifacts = {
-              "ubitech-compose.yaml": manifest["compose"]["sha256"],
-              "ubitech-manager-linux-amd64": manifest["manager"]["artifacts"]["amd64"]["sha256"],
-              "ubitech-manager-linux-arm64": manifest["manager"]["artifacts"]["arm64"]["sha256"],
-          }
-          for name, expected in artifacts.items():
-              actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
-              if actual != expected:
-                  raise SystemExit(f"release asset checksum mismatch: {name}")
-              if name.startswith("ubitech-manager-"):
-                  sidecar = (root / f"{name}.sha256").read_text(encoding="utf-8").split()
-                  if not sidecar or sidecar[0] != expected:
-                      raise SystemExit(f"release checksum sidecar mismatch: {name}")
-          installer_expected = (root / "install.sh.sha256").read_text(encoding="utf-8").split()
-          installer_actual = hashlib.sha256((root / "install.sh").read_bytes()).hexdigest()
-          if not installer_expected or installer_expected[0] != installer_actual:
-              raise SystemExit("release checksum sidecar mismatch: install.sh")
-          PY
-          (
-            cd "$release_dir"
-            bash -n install.sh
-          )
-          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
-          if [[ "$current_tag" == "$release_tag" ]]; then
-            exit 0
-          fi
-          # Every surviving serialized promotion recomputes the globally newest
-          # public release on main, so replacement of a pending job cannot
-          # strand a newer already-published generation.
-          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --latest
+      - name: Upload immutable release provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-promotion-provenance-${{ needs.prepare.outputs.source_commit }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.publish.outputs.publisher_provenance }}
+          if-no-files-found: error
+          retention-days: 90

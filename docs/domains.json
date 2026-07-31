@@ -83,7 +83,10 @@
       "id": "deployment",
       "documents": [
         "docs/operations/deployment.md",
-        "docs/operations/auto-update.md"
+        "docs/operations/auto-update.md",
+        "docs/contracts/release-transition.json",
+        "docs/contracts/release-transition-challenge.schema.json",
+        "docs/contracts/release-transition-receipt.schema.json"
       ],
       "code": [
         "manager/**",
@@ -245,6 +248,19 @@
     }
   ],
   "contracts": [
+    {
+      "id": "release-transition",
+      "source": "docs/contracts/release-transition.json",
+      "domains": [
+        "deployment"
+      ],
+      "targets": [
+        {
+          "path": "manager/internal/contract/release_transition_generated.go",
+          "format": "go-release-transition"
+        }
+      ]
+    },
     {
       "id": "container-platform",
       "source": "docs/contracts/container-platform.json",

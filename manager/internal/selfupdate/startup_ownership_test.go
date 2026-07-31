@@ -81,8 +81,9 @@ func newStartupOwnershipFixture(t *testing.T) *startupOwnershipFixture {
 		t.Fatal(err)
 	}
 	return &startupOwnershipFixture{
-		manager: &Manager{
-			Root: root, StatePath: statePath, InstallPath: stablePath,
+		manager: &Manager{Profile: testActiveProfile,
+			ConfigPath: filepath.Join(base, "config", "manager.toml"),
+			Root:       root, StatePath: statePath, InstallPath: stablePath,
 			SocketPath: filepath.Join(stateDir, "control", "manager.sock"), ControlTokenFile: tokenPath,
 			UnitName: "ubitech-agent-manager.service", RunningVersion: current.Version,
 		},
@@ -696,7 +697,7 @@ func TestStartupOwnershipTerminalJournalSurvivesLaterArtifactPruning(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := commitActivation(plan.PlanPath, plan); err != nil {
+	if err := commitActivation(testActiveProfile, plan.PlanPath, plan); err != nil {
 		t.Fatalf("commit recovery activation fixture: %v", err)
 	}
 	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
@@ -732,7 +733,7 @@ func TestStartupOwnershipRejectsTerminalSupersededPlanMissingIdentityWithoutMuta
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := commitActivation(recoveryPlan.PlanPath, recoveryPlan); err != nil {
+	if err := commitActivation(testActiveProfile, recoveryPlan.PlanPath, recoveryPlan); err != nil {
 		t.Fatalf("commit recovery activation fixture: %v", err)
 	}
 	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
@@ -885,7 +886,7 @@ func TestExternalRecoveryProbePromotesOnlyAfterAtomicCurrentRegistration(t *test
 
 func TestStartupOwnershipFreshInstallHasNoSyntheticOwner(t *testing.T) {
 	base := t.TempDir()
-	manager := &Manager{
+	manager := &Manager{Profile: testActiveProfile,
 		Root: filepath.Join(base, "manager-binaries"), StatePath: filepath.Join(base, "manager-binaries.json"),
 		InstallPath: filepath.Join(base, "bin", "ubitech-manager"), RunningVersion: strings.Repeat("a", 40),
 	}

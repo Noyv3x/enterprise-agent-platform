@@ -797,7 +797,7 @@ func (m *Manager) validateStartupSettledActivationPlan(state State) error {
 		return fmt.Errorf("settled Manager Current has nonterminal activation plan status %q", plan.Status)
 	}
 	unit := m.recoveryUnitName()
-	expectedPath := filepath.Join(m.Root, "versions", safeID(state.Current.Version+"-"+state.Current.SourceCommit[:12]), sourceManagerBinaryName())
+	expectedPath := filepath.Join(m.Root, "versions", safeID(state.Current.Version+"-"+state.Current.SourceCommit[:12]), m.managerBinaryName())
 	if plan.Mode != "" || plan.SchemaVersion != 1 || plan.PlanPath != planPath ||
 		plan.StatePath != m.StatePath || plan.InstallPath != m.InstallPath || plan.SocketPath != m.SocketPath ||
 		plan.ControlTokenFile != m.ControlTokenFile || plan.UnitName != unit ||
@@ -1081,7 +1081,7 @@ func (m *Manager) validateStartupVersionArtifact(version Version, label string) 
 		metadata.SHA256 != version.SHA256 || !verifiedMatches {
 		return fmt.Errorf("%s Manager metadata does not match state during startup", label)
 	}
-	if err := validateVersionDirectoryContents(directory); err != nil {
+	if err := validateVersionDirectoryContents(directory, m.managerBinaryName()); err != nil {
 		return fmt.Errorf("validate %s Manager version directory during startup: %w", label, err)
 	}
 	return nil
@@ -1170,7 +1170,7 @@ func (m *Manager) validateStartupOrdinaryRollbackHalf(state State, plan Plan) er
 		m.Root,
 		"versions",
 		safeID(candidate.Version+"-"+candidate.SourceCommit[:12]),
-		sourceManagerBinaryName(),
+		m.managerBinaryName(),
 	)
 	expectedPlanPath := filepath.Join(m.Root, "activations", safeID(candidate.SourceCommit)+".json")
 	if candidate.Path != expectedCandidatePath || plan.PlanPath != expectedPlanPath ||
@@ -1272,7 +1272,7 @@ func (m *Manager) readStartupHealthyRecoverySnapshot() (startupHealthyRecoverySn
 	if !validSourceCommit(m.RunningVersion) {
 		return snapshot, errors.New("running recovery Manager version is invalid")
 	}
-	recoveryPath := filepath.Join(m.Root, "versions", "recovery-"+stableSHA[:12], sourceManagerBinaryName())
+	recoveryPath := filepath.Join(m.Root, "versions", "recovery-"+stableSHA[:12], m.managerBinaryName())
 	recoveryBinary, _, err := readRecoveryRegularFile(recoveryPath, recoveryMaxBinaryBytes, false)
 	if err != nil || sha256Hex(recoveryBinary) != stableSHA {
 		return snapshot, errors.New("stable recovery Manager has no matching immutable recovery artifact")
@@ -1291,7 +1291,7 @@ func (m *Manager) readStartupHealthyRecoverySnapshot() (startupHealthyRecoverySn
 		(metadata.SourceCommit != "" && !validSourceCommit(metadata.SourceCommit)) {
 		return snapshot, errors.New("stable recovery Manager metadata does not match the running process")
 	}
-	if err := validateVersionDirectoryContents(filepath.Dir(recoveryPath)); err != nil {
+	if err := validateVersionDirectoryContents(filepath.Dir(recoveryPath), m.managerBinaryName()); err != nil {
 		return snapshot, fmt.Errorf("validate immutable recovery Manager directory: %w", err)
 	}
 	snapshot.recoverySHA = sha256Hex(recoveryBinary)

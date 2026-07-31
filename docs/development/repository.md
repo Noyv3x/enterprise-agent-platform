@@ -42,6 +42,7 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 - Python 需要 3.11+，四空格缩进，函数/模块使用 `snake_case`，类型提示用于说明接口。
 - Runtime 使用严格 TypeScript 和 Node 22.19+；模型、工具、审批、session、进程和委派逻辑归 `agent-runtime/src`。
 - Manager 使用 Go；公网 Gateway、Docker 编排、operation journal、release 校验和宿主执行归 `manager/`，业务容器不得复制这些职责。
+- `handoff-fs-helper` 使用同一静态 Manager 源构建为独立、digest-pinned 的最小镜像，只开放闭世界内部 worker 入口；它不是第二个 Manager、通用维护镜像或脚本容器。Docker 启动策略和 request/receipt 协议仍由 `manager/` 拥有，不能以 shell、`tar` 或 vendored 文件同步工具替代。
 - 前端使用 React + TypeScript；组件按 chat、shell、admin、preview、memory、skills 等领域组织。
 - Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
 - `enterprise_agent_platform/static/` 是生成资源，禁止手改。
@@ -67,7 +68,9 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。一个可交付变更集应同时包含规范、实现、测试和必要生成产物，避免文档与代码跨提交长期漂移。代码域允许多重匹配；修改跨域文件时必须同步每个声明域，并由评审补充路径映射无法识别的真实语义域。
 
-不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器及其校验文件和全部镜像 digest。重复发布同一 source commit 时必须逐项比较这些资产，main 通道提升前重新校验完整工件集合。安装器只能使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。
+不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器及其校验文件和全部镜像 digest。每个构建先保持 draft 并封印资产，只有持有 `container-channel-main` 全局锁的唯一 promotion evaluator 才能按直接前任关系公开它；其它 workflow 不得修改 release visibility 或 latest。普通 source-owner generation 通过质量门后可由 evaluator 自动提升，技术命名空间 bridge/cleanup generation 还必须分别通过唯一部署机的 Ed25519 签名回执门，具体契约只由[自动更新](../operations/auto-update.md)与 [`release-transition.json`](../contracts/release-transition.json)定义。
+
+`promotion.json` 是无环资产封印：它必须以排序后的闭世界目录绑定除自身外每个 release asset 的精确名称、SHA-256 和字节数，它自身则与其余资产一起由精确成功 `Publish atomic main release` run/attempt 的独立 Actions 出处证明绑定 GitHub release/asset ID、digest 和 size。证明生成器从 Container workflow 的 execution head 独立 checkout，不能依赖可能较旧且尚未包含当前证明协议的 built-source checkout；证明还分别绑定该 execution head、实际 source commit 以及经 API 重证的 Quality run/attempt，两种 head 不因 `workflow_run` 的 default-branch 语义而混为一谈。手工 dispatch 额外绑定输入 ref 和确定性 source 解析规则。重复发布同一 source commit 时必须逐项比较资产内容和 API identity，禁止 `--clobber`、重名、未知资产或封印后漂移。封印已上传但出处证明尚未上传的中断重试不改写 release，而是在完整复验后用新 run attempt 上传另一份精确证明。main 通道提升前必须从 release 重新下载并验证整个目录，验证上述出处证明，先证明或 create-only 建立指向 candidate commit 的同名 lightweight tag，以匿名 registry manifest 请求在可见性切换前后都重验 manifest 中全部受管镜像 digest，并复读 release ID、tag、target commit、draft/latest 和资产 ID/digest/size；任一公开前漂移都不得公开，公开后镜像后验失败则必须明确作为已可见事故报警。安装器只能使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。
 
 提交前检查：
 

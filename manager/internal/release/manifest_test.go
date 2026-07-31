@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -22,7 +23,7 @@ func validManifest(base string, compose []byte) Manifest {
 	artifact := Artifact{URL: base + "/compose", SHA256: hex.EncodeToString(sum[:])}
 	binary := sha256.Sum256([]byte("manager"))
 	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("a", 64)
 	}
 	return Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: time.Now().UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 1, Manager: ManagerRelease{Version: "v1", Artifacts: map[string]Artifact{runtime.GOARCH: {URL: base + "/manager", SHA256: hex.EncodeToString(binary[:])}}}, Compose: artifact, Images: images}
@@ -100,11 +101,11 @@ func manifestDocument(t *testing.T, manifest Manifest) map[string]any {
 	return document
 }
 
-func TestManifestAcceptsSafeOpaqueExtraImage(t *testing.T) {
+func TestManifestRejectsSafeOpaqueExtraImage(t *testing.T) {
 	manifest := validManifest("http://127.0.0.1", []byte("x"))
 	manifest.Images["future-service"] = manifest.Images["firecrawl-postgres"]
-	if err := manifest.Validate("main", runtime.GOOS, runtime.GOARCH); err != nil {
-		t.Fatalf("safe opaque image metadata was rejected: %v", err)
+	if err := manifest.Validate("main", runtime.GOOS, runtime.GOARCH); err == nil {
+		t.Fatal("opaque image outside the exact managed release set was accepted")
 	}
 }
 
@@ -148,6 +149,45 @@ func TestFetchValidatesManifestAndArtifactChecksum(t *testing.T) {
 	}
 	if string(data) != string(compose) {
 		t.Fatal("compose payload mismatch")
+	}
+}
+
+func TestDecodeManifestUsesFetchValidationForRetainedBytes(t *testing.T) {
+	manifest := validManifest("https://example.invalid", []byte("compose"))
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeManifest(data, manifest.Channel, runtime.GOOS, runtime.GOARCH)
+	if err != nil || decoded.ID() != manifest.ID() {
+		t.Fatalf("DecodeManifest = %q, %v", decoded.ID(), err)
+	}
+	tampered := append([]byte(`{"schema_version":1,"schema_version":1,`), data[1:]...)
+	if _, err := DecodeManifest(tampered, manifest.Channel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate retained manifest error = %v", err)
+	}
+}
+
+func TestDecodeRetainedHandoffPredecessorManifestAcceptsOnlyCanonicalP1Bytes(t *testing.T) {
+	path := "testdata/" + contract.SourceOwnerCompatGeneration + "-release.json"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := DecodeRetainedHandoffPredecessorManifest(data, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.ID() != contract.SourceOwnerCompatGeneration || len(manifest.Images) != len(contract.SourceOwnerCompatManagedImages) || manifest.NamespaceHandoff != nil {
+		t.Fatalf("unexpected canonical predecessor: %#v", manifest)
+	}
+	if _, err := DecodeManifest(data, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil {
+		t.Fatal("ordinary decoder accepted the old ten-image predecessor")
+	}
+	tampered := append([]byte(nil), data...)
+	tampered[len(tampered)-2] ^= 1
+	if _, err := DecodeRetainedHandoffPredecessorManifest(tampered, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "checksum") {
+		t.Fatalf("tampered predecessor error = %v", err)
 	}
 }
 

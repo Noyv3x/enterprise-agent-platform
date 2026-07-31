@@ -336,17 +336,19 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 	t.Cleanup(func() { _ = fixture.server.Close() })
 
 	fixture.runner = &activationTakeoverRunner{}
-	fixture.manager = &Manager{
-		Root:             managerRoot,
-		StatePath:        fixture.statePath,
-		InstallPath:      fixture.stablePath,
-		SocketPath:       socketPath,
-		ControlTokenFile: fixture.tokenPath,
-		UnitName:         "ubitech-agent-manager.service",
-		RunningVersion:   fixture.recoveryCommit,
-		Runner:           fixture.runner,
-		Now:              func() time.Time { return completedAt.Add(time.Second) },
-		BootID:           func() string { return fixture.originalPlan.BootID },
+	fixture.manager = &Manager{Profile: testActiveProfile,
+		ConfigPath:               filepath.Join(base, "config", "manager.toml"),
+		Root:                     managerRoot,
+		StatePath:                fixture.statePath,
+		InstallPath:              fixture.stablePath,
+		SocketPath:               socketPath,
+		ControlTokenFile:         fixture.tokenPath,
+		UnitName:                 "ubitech-agent-manager.service",
+		RunningVersion:           fixture.recoveryCommit,
+		Runner:                   fixture.runner,
+		Now:                      func() time.Time { return completedAt.Add(time.Second) },
+		BootID:                   func() string { return fixture.originalPlan.BootID },
+		recoveryExecutableReader: testRecoveryExecutableReader,
 	}
 	fixture.manager.RecoveryUnitActive = func(_ context.Context, unit string) (bool, error) {
 		fixture.mu.Lock()
@@ -378,7 +380,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		fixture.mu.Lock()
 		defer fixture.mu.Unlock()
 		fixture.watchdogChecks++
-		if unit != recoveryCurrentWatchdogUnitPrefix+fixture.recoverySHA[:12] ||
+		if unit != testTechnicalProfile.RecoveryWatchdogUnitPrefix+fixture.recoverySHA[:12] ||
 			immutablePath != filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.recoverySHA[:12], "ubitech-manager") ||
 			expectedSHA != fixture.recoverySHA || planPath != fixture.manager.currentRecoveryPlanPath(fixture.candidateCommit, fixture.recoverySHA) {
 			return errors.New("unexpected recovery watchdog process identity")
@@ -451,7 +453,7 @@ func (f *activationTakeoverFixture) runHook(name string, arguments []string) err
 			if err != nil {
 				return err
 			}
-			return commitActivation(plan.PlanPath, plan)
+			return commitActivation(testActiveProfile, plan.PlanPath, plan)
 		}
 	case "enable":
 		f.mu.Lock()
@@ -554,7 +556,7 @@ func TestRecoverCurrentTakesOverExactStuckActivationThroughWatchdogCommit(t *tes
 	if len(quiesceCalls) < 2 {
 		t.Fatalf("expected initial and journal-owner quiescence, got %#v", quiesceCalls)
 	}
-	wantUnits := recoveryActivationWatchdogUnits(*fixture.originalState.Candidate)
+	wantUnits := recoveryActivationWatchdogUnits(testTechnicalProfile.WatchdogUnitPrefix, *fixture.originalState.Candidate)
 	for _, call := range quiesceCalls {
 		gotUnits := append([]string(nil), call.exact...)
 		sort.Strings(gotUnits)
@@ -839,7 +841,7 @@ func TestRecoveryWatchdogCommitReplayDoesNotRotatePreviousTwice(t *testing.T) {
 	state.Candidate = nil
 	state.Activation = nil
 	activationTakeoverWriteJSON(t, fixture.statePath, state)
-	if err := commitActivation(planPath, plan); err != nil {
+	if err := commitActivation(testActiveProfile, planPath, plan); err != nil {
 		t.Fatalf("watchdog did not finish metadata-only replay: %v", err)
 	}
 	committed := activationTakeoverReadState(fixture.statePath)
@@ -848,7 +850,7 @@ func TestRecoveryWatchdogCommitReplayDoesNotRotatePreviousTwice(t *testing.T) {
 		committed.Previous.SHA256 == fixture.candidateSHA {
 		t.Fatalf("metadata replay rotated Current/Previous twice: %#v", committed)
 	}
-	if err := commitActivation(planPath, plan); err != nil {
+	if err := commitActivation(testActiveProfile, planPath, plan); err != nil {
 		t.Fatalf("terminal watchdog replay was not idempotent: %v", err)
 	}
 	afterSecondReplay := activationTakeoverReadState(fixture.statePath)
@@ -876,10 +878,10 @@ func TestSupersededOldWatchdogSnapshotCannotCommitOrRestore(t *testing.T) {
 		t.Fatalf("old ownership was not superseded: %#v err=%v", durableOldPlan, err)
 	}
 	before := fixture.keyFiles()
-	if err := commitActivation(fixture.oldPlanPath, oldPlanSnapshot); err == nil || !strings.Contains(err.Error(), "superseded") {
+	if err := commitActivation(testActiveProfile, fixture.oldPlanPath, oldPlanSnapshot); err == nil || !strings.Contains(err.Error(), "superseded") {
 		t.Fatalf("stale old watchdog commit was not rejected: %v", err)
 	}
-	if err := restorePrevious(oldPlanSnapshot, fixture.runner); err == nil || !strings.Contains(err.Error(), "superseded") {
+	if err := restorePrevious(testActiveProfile, oldPlanSnapshot, fixture.runner); err == nil || !strings.Contains(err.Error(), "superseded") {
 		t.Fatalf("stale old watchdog rollback was not rejected: %v", err)
 	}
 	activationTakeoverAssertFiles(t, before)
@@ -907,7 +909,7 @@ func TestRecoveryWatchdogRollbackRestoresCurrentCheckpointAndIsReplayable(t *tes
 		t.Fatal(err)
 	}
 	plan.Error = "injected recovery health deadline"
-	if err := restorePrevious(plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
+	if err := restorePrevious(testActiveProfile, plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
 		t.Fatalf("unexpected recovery watchdog rollback result: %v", err)
 	}
 	rolledBack := activationTakeoverReadState(fixture.statePath)
@@ -935,7 +937,7 @@ func TestRecoveryWatchdogRollbackRestoresCurrentCheckpointAndIsReplayable(t *tes
 	}
 
 	beforeReplay := fixture.keyFiles()
-	if err := restorePrevious(plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
+	if err := restorePrevious(testActiveProfile, plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
 		t.Fatalf("terminal rollback replay was not idempotent: %v", err)
 	}
 	activationTakeoverAssertFiles(t, beforeReplay)
@@ -1075,7 +1077,7 @@ func TestRecoveryPlanOwnershipRequiresEveryBindingField(t *testing.T) {
 			if err := validateRecoveryPlanOwnership(mutated, journal); err == nil {
 				t.Fatal("incomplete recovery plan retained transaction ownership")
 			}
-			if _, err := readRecoveryTakeoverOwnership(mutated); err == nil {
+			if _, err := readRecoveryTakeoverOwnership(testActiveProfile, mutated); err == nil {
 				t.Fatal("incomplete recovery plan was accepted by watchdog ownership read")
 			}
 		})
@@ -1592,7 +1594,7 @@ func TestRecoverCurrentConvergesRollbackAfterTerminalWriteBeforeServiceRestore(t
 		}
 		return originalHook(name, arguments)
 	}
-	if err := restorePrevious(plan, fixture.runner); err == nil || !strings.Contains(err.Error(), "enablement failed") {
+	if err := restorePrevious(testActiveProfile, plan, fixture.runner); err == nil || !strings.Contains(err.Error(), "enablement failed") {
 		t.Fatalf("unexpected interrupted rollback result: %v", err)
 	}
 	fixture.identity.set(false, "", "")
@@ -2006,8 +2008,8 @@ func TestRecoveryHostRebootRearmsWatcherFromRecoveryArtifact(t *testing.T) {
 			}
 			calls := fixture.runner.snapshot()
 			if fixture.runner.countCommand("systemd-run") != spawns+1 ||
-				!activationTakeoverHasWatchdogLaunch(calls, journal.RecoveryWatchdogUnit, journal.RecoveryPath, journal.RecoveryPlanPath) ||
-				activationTakeoverHasWatchdogLaunch(calls, journal.RecoveryWatchdogUnit, journal.OriginalCurrent.Path, journal.RecoveryPlanPath) {
+				!activationTakeoverHasWatchdogLaunch(calls, journal.RecoveryWatchdogUnit, journal.RecoveryPath, journal.RecoveryPlanPath, fixture.manager.ConfigPath) ||
+				activationTakeoverHasWatchdogLaunch(calls, journal.RecoveryWatchdogUnit, journal.OriginalCurrent.Path, journal.RecoveryPlanPath, fixture.manager.ConfigPath) {
 				t.Fatalf("reboot watchdog was not rebuilt exclusively from immutable R: %#v", calls)
 			}
 			latest, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
@@ -2020,7 +2022,7 @@ func TestRecoveryHostRebootRearmsWatcherFromRecoveryArtifact(t *testing.T) {
 			}
 			switch outcome {
 			case recoveryTakeoverCommitted:
-				if err := commitActivation(plan.PlanPath, plan); err != nil {
+				if err := commitActivation(testActiveProfile, plan.PlanPath, plan); err != nil {
 					t.Fatalf("new-boot recovery watchdog could not commit: %v", err)
 				}
 				committed := activationTakeoverReadState(fixture.statePath)
@@ -2030,7 +2032,7 @@ func TestRecoveryHostRebootRearmsWatcherFromRecoveryArtifact(t *testing.T) {
 				}
 			case recoveryTakeoverRolledBack:
 				plan.Error = "new-boot recovery health failure"
-				if err := restorePrevious(plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
+				if err := restorePrevious(testActiveProfile, plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
 					t.Fatalf("new-boot recovery watchdog could not roll back: %v", err)
 				}
 				rolledBack := activationTakeoverReadState(fixture.statePath)
@@ -2069,7 +2071,7 @@ func activationTakeoverImages() map[string]string {
 	names := []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis",
-		"firecrawl-rabbitmq",
+		"firecrawl-rabbitmq", "handoff-fs-helper",
 	}
 	images := make(map[string]string, len(names))
 	for index, name := range names {
@@ -2091,11 +2093,12 @@ func activationTakeoverJournalTransactionID(journal recoveryTakeoverJournal) str
 	return recoveryTakeoverTransactionID(journal)
 }
 
-func activationTakeoverHasWatchdogLaunch(calls [][]string, unit, executable, planPath string) bool {
+func activationTakeoverHasWatchdogLaunch(calls [][]string, unit, executable, planPath, configPath string) bool {
 	for _, call := range calls {
-		if len(call) == 11 && call[0] == "systemd-run" && call[1] == "--user" && call[2] == "--quiet" &&
+		if len(call) == 13 && call[0] == "systemd-run" && call[1] == "--user" && call[2] == "--quiet" &&
 			call[3] == "--collect" && call[4] == "--unit" && call[5] == unit && call[6] == "--property=Type=exec" &&
-			call[7] == executable && call[8] == "self-update-watchdog" && call[9] == "--plan" && call[10] == planPath {
+			call[7] == executable && call[8] == "self-update-watchdog" && call[9] == "--plan" && call[10] == planPath &&
+			call[11] == "--config" && call[12] == configPath {
 			return true
 		}
 	}

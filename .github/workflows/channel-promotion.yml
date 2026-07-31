@@ -1,0 +1,820 @@
+name: Main channel promotion
+
+on:
+  workflow_run:
+    workflows:
+      - Container release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Evaluate, issue a deployment challenge, or verify a receipt and promote
+        type: choice
+        required: true
+        default: evaluate
+        options:
+          - evaluate
+          - issue_challenge
+          - promote
+      candidate_generation:
+        description: Exact eligible draft generation for a challenge or receipt
+        required: false
+        type: string
+      challenge_run_id:
+        description: Trusted issue_challenge workflow run containing challenge.json
+        required: false
+        type: string
+      receipt_json_base64:
+        description: Base64-encoded closed deployment receipt JSON
+        required: false
+        type: string
+      receipt_signature_base64:
+        description: Base64 Ed25519 signature over RFC8785 receipt bytes
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: container-channel-main
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Evaluate the direct release successor
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.event == 'workflow_run' ||
+        github.event.workflow_run.event == 'workflow_dispatch') &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Prove the triggering release job actually published
+        id: upstream
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          run_json="$RUNNER_TEMP/upstream-release-run.json"
+          jobs_json="$RUNNER_TEMP/upstream-release-jobs.json"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}" > "$run_json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .path == ".github/workflows/container-release.yml" and
+            .conclusion == "success" and
+            (.event == "workflow_run" or .event == "workflow_dispatch") and
+            .head_branch == "main" and
+            .head_repository.full_name == $repo
+          ' "$run_json" >/dev/null
+          upstream_head="$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' "$run_json")"
+          upstream_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' "$run_json")"
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}/attempts/${upstream_attempt}/jobs?per_page=100" |
+            jq -s '
+              if all(.[]; type == "object" and (.jobs | type == "array"))
+              then {jobs: [.[].jobs[]]}
+              else error("invalid paginated workflow jobs response")
+              end
+            ' > "$jobs_json"
+          jq -e --arg head "$upstream_head" '
+            [.jobs[] | select(
+              .name == "Publish atomic main release" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_sha == $head
+            )] | length == 1
+          ' "$jobs_json" >/dev/null
+          echo "execution_head_sha=$upstream_head" >> "$GITHUB_OUTPUT"
+          echo "run_id=$UPSTREAM_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$upstream_attempt" >> "$GITHUB_OUTPUT"
+
+      - name: Check out canonical promotion policy
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize immutable promotion records
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_CANDIDATE: ${{ inputs.candidate_generation }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin main
+          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
+            echo "Current latest is not an immutable container generation: $current_tag" >&2
+            exit 1
+          fi
+          current="${BASH_REMATCH[1]}"
+          scan="$RUNNER_TEMP/promotion-scan"
+          candidates="$scan/candidates"
+          mkdir -p "$candidates"
+          gh api --paginate -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+            jq -s '
+              if all(.[]; type == "array")
+              then add
+              else error("invalid paginated releases response")
+              end
+            ' > "$scan/releases.json"
+          jq -c '.[] | select(.tag_name | test("^container-[0-9a-f]{40}$")) |
+            {tag_name, target_commitish, draft, assets: [.assets[].name]}' "$scan/releases.json" |
+          while IFS= read -r metadata; do
+            tag="$(jq -r .tag_name <<<"$metadata")"
+            generation="${tag#container-}"
+            if ! jq -e '.assets | index("promotion.json") != null' <<<"$metadata" >/dev/null; then
+              continue
+            fi
+            root="$candidates/$generation"
+            mkdir -p "$root"
+            jq '{tag_name, target_commitish, draft}' <<<"$metadata" > "$root/metadata.json"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$root" --pattern promotion.json
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$root" --pattern release.json
+            for contract in \
+              release-transition.json \
+              release-transition-challenge.schema.json \
+              release-transition-receipt.schema.json; do
+              git show "$generation:docs/contracts/$contract" > "$root/$contract"
+            done
+          done
+          current_root=""
+          if [[ -f "$candidates/$current/promotion.json" ]]; then
+            current_root="$candidates/$current"
+          fi
+          current_compat_root=""
+          compat_generation="$(jq -r '.source_owner_compat.generation // ""' docs/contracts/release-transition.json)"
+          if [[ -z "$current_root" && "$current" == "$compat_generation" ]]; then
+            legacy_assets=(
+              install.sh
+              install.sh.sha256
+              release.json
+              ubitech-compose.yaml
+              ubitech-manager-linux-amd64
+              ubitech-manager-linux-amd64.sha256
+              ubitech-manager-linux-arm64
+              ubitech-manager-linux-arm64.sha256
+            )
+            legacy_names="$(printf '%s\n' "${legacy_assets[@]}" | jq -R . | jq -sc 'sort')"
+            legacy_api="$scan/current-compat-api.json"
+            jq -e --arg tag "container-${current}" --arg target "$current" --argjson names "$legacy_names" '
+              [.[] | select(.tag_name == $tag)] as $matches |
+              ($matches | length) == 1 and
+              ($matches[0].target_commitish == $target) and
+              ($matches[0].draft == false) and ($matches[0].prerelease == false) and
+              ($matches[0].id | type == "number" and . > 0) and
+              ([ $matches[0].assets[].name ] | sort) == $names and
+              ([ $matches[0].assets[].name ] | length) == ([ $matches[0].assets[].name ] | unique | length) and
+              all($matches[0].assets[];
+                (.id | type == "number" and . > 0) and
+                (.size | type == "number" and . > 0) and
+                .state == "uploaded" and
+                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+              )
+            ' "$scan/releases.json" >/dev/null
+            jq -cS --arg tag "container-${current}" '
+              .[] | select(.tag_name == $tag) | {
+                release_id: .id, tag_name, target_commitish, draft, prerelease,
+                assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+              }
+            ' "$scan/releases.json" > "$legacy_api"
+            current_compat_root="$scan/current-compat"
+            mkdir -p "$current_compat_root"
+            gh release download "container-${current}" --repo "$GITHUB_REPOSITORY" \
+              --dir "$current_compat_root"
+            python3 - "$current_compat_root" "$legacy_api" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          identity = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          expected = identity["assets"]
+          if sorted(path.name for path in root.iterdir()) != [asset["name"] for asset in expected]:
+              raise SystemExit("canonical P1 release has an unexpected asset directory")
+          for asset in expected:
+              path = root / asset["name"]
+              observed = path.lstat()
+              if not stat.S_ISREG(observed.st_mode) or path.is_symlink() or observed.st_size != asset["size"]:
+                  raise SystemExit(f"canonical P1 release asset metadata mismatch: {asset['name']}")
+              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != asset["digest"]:
+                  raise SystemExit(f"canonical P1 release asset digest mismatch: {asset['name']}")
+          PY
+          fi
+          command=(
+            python3 scripts/release_promotion.py select-candidate
+            --current-generation "$current"
+            --candidates-root "$candidates"
+            --output "$scan/selection.json"
+          )
+          if [[ -n "$current_root" ]]; then
+            command+=(--current-root "$current_root")
+          fi
+          if [[ -n "$current_compat_root" ]]; then
+            command+=(--current-compat-root "$current_compat_root")
+          fi
+          "${command[@]}"
+          action="$(jq -r .action "$scan/selection.json")"
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "current_generation=$current" >> "$GITHUB_OUTPUT"
+          echo "scan_root=$scan" >> "$GITHUB_OUTPUT"
+          if [[ "$action" == none ]]; then
+            echo "No direct successor is eligible; latest remains $current"
+            exit 0
+          fi
+          candidate="$(jq -r .candidate.generation "$scan/selection.json")"
+          stage="$(jq -r .candidate.stage "$scan/selection.json")"
+          requested="$REQUESTED_CANDIDATE"
+          if [[ -n "$requested" && ! "$requested" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Requested generation must be a full lowercase commit" >&2
+            exit 1
+          fi
+          if [[ -n "$requested" && "$requested" != "$candidate" ]]; then
+            echo "Requested generation is not the unique direct successor" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$current" "$candidate"
+          git merge-base --is-ancestor "$candidate" origin/main
+          echo "candidate_generation=$candidate" >> "$GITHUB_OUTPUT"
+          echo "candidate_stage=$stage" >> "$GITHUB_OUTPUT"
+          echo "candidate_root=$candidates/$candidate" >> "$GITHUB_OUTPUT"
+          echo "current_root=$candidates/$current" >> "$GITHUB_OUTPUT"
+
+      - name: Validate all selected immutable release assets
+        id: assets
+        if: steps.select.outputs.action == 'promote'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE: ${{ steps.select.outputs.candidate_generation }}
+          CANDIDATE_ROOT: ${{ steps.select.outputs.candidate_root }}
+          REQUIRED_RUN_ID: ${{ steps.upstream.outputs.run_id }}
+          REQUIRED_RUN_ATTEMPT: ${{ steps.upstream.outputs.run_attempt }}
+          REQUIRED_EXECUTION_HEAD_SHA: ${{ steps.upstream.outputs.execution_head_sha }}
+        run: |
+          set -euo pipefail
+          assets=(
+            install.sh
+            install.sh.sha256
+            promotion.json
+            release.json
+            ubitech-compose.yaml
+            ubitech-manager-linux-amd64
+            ubitech-manager-linux-amd64.sha256
+            ubitech-manager-linux-arm64
+            ubitech-manager-linux-arm64.sha256
+          )
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc 'sort')"
+          tag="container-${CANDIDATE}"
+          api_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+          [[ "$api_url" == "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"* ]]
+          release_api="$RUNNER_TEMP/selected-release-api.json"
+          gh api -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' "$api_url" > "$release_api"
+          jq -e --arg tag "$tag" --arg target "$CANDIDATE" \
+            --argjson names "$expected_names" '
+            .tag_name == $tag and .target_commitish == $target and
+            .draft == true and .prerelease == false and
+            (.id | type == "number") and
+            ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
+            ([.assets[].name] | sort) == $names and
+            all(.assets[];
+              (.id | type == "number") and .state == "uploaded" and
+              (.size | type == "number" and . > 0) and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+            )
+          ' "$release_api" >/dev/null
+
+          release="$(mktemp -d "$RUNNER_TEMP/selected-release.XXXXXX")"
+          gh release download "container-${CANDIDATE}" --repo "$GITHUB_REPOSITORY" --dir "$release"
+          local_identity="$RUNNER_TEMP/selected-release-local-assets.json"
+          python3 - "$release" "$local_identity" "${assets[@]}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          expected = sorted(sys.argv[3:])
+          actual = sorted(path.name for path in root.iterdir())
+          if actual != expected:
+              raise SystemExit(f"downloaded release directory mismatch: {actual}")
+          assets = []
+          for name in expected:
+              path = root / name
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size <= 0:
+                  raise SystemExit(f"downloaded release asset is not a non-empty regular file: {name}")
+              assets.append({
+                  "name": name,
+                  "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": info.st_size,
+              })
+          output.write_text(
+              json.dumps(assets, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          jq -cS '[.assets[] | {name, digest, size}] | sort_by(.name)' \
+            "$release_api" > "$RUNNER_TEMP/selected-release-api-assets.json"
+          cmp "$local_identity" "$RUNNER_TEMP/selected-release-api-assets.json"
+          cmp "$release/promotion.json" "$CANDIDATE_ROOT/promotion.json"
+          cmp "$release/release.json" "$CANDIDATE_ROOT/release.json"
+          python3 scripts/release_promotion.py validate-promotion \
+            --contract "$CANDIDATE_ROOT/release-transition.json" \
+            --manifest "$release/release.json" \
+            --challenge-schema "$CANDIDATE_ROOT/release-transition-challenge.schema.json" \
+            --receipt-schema "$CANDIDATE_ROOT/release-transition-receipt.schema.json" \
+            --generation "$CANDIDATE" \
+            --assets-root "$release" \
+            --promotion "$release/promotion.json"
+          python3 - "$release" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          manifest = json.loads((root / "release.json").read_text(encoding="utf-8"))
+          artifacts = {
+              "ubitech-compose.yaml": manifest["compose"]["sha256"],
+              "ubitech-manager-linux-amd64": manifest["manager"]["artifacts"]["amd64"]["sha256"],
+              "ubitech-manager-linux-arm64": manifest["manager"]["artifacts"]["arm64"]["sha256"],
+          }
+          for name, expected in artifacts.items():
+              actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"release asset checksum mismatch: {name}")
+              if name.startswith("ubitech-manager-"):
+                  sidecar = (root / f"{name}.sha256").read_text(encoding="utf-8").split()
+                  if not sidecar or sidecar[0] != expected:
+                      raise SystemExit(f"release checksum sidecar mismatch: {name}")
+          expected = (root / "install.sh.sha256").read_text(encoding="utf-8").split()
+          actual = hashlib.sha256((root / "install.sh").read_bytes()).hexdigest()
+          if not expected or expected[0] != actual:
+              raise SystemExit("release checksum sidecar mismatch: install.sh")
+          PY
+          (cd "$release" && bash -n install.sh)
+
+          identity="$RUNNER_TEMP/selected-release-identity.json"
+          jq -cS '{
+            release_id: .id,
+            tag_name,
+            target_commitish,
+            draft,
+            prerelease,
+            assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+          }' "$release_api" > "$identity"
+          runs_json="$RUNNER_TEMP/candidate-publisher-runs.json"
+          if [[ -n "$REQUIRED_RUN_ID" ]]; then
+            [[ "$REQUIRED_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$REQUIRED_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            [[ "$REQUIRED_EXECUTION_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${REQUIRED_RUN_ID}" |
+              jq '{workflow_runs: [.]}' > "$runs_json"
+          else
+            gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/container-release.yml/runs?status=completed&per_page=100" |
+              jq -s '
+                if all(.[]; type == "object" and (.workflow_runs | type == "array"))
+                then {workflow_runs: [.[].workflow_runs[]]}
+                else error("invalid paginated publisher workflow runs response")
+                end
+              ' > "$runs_json"
+          fi
+          proofs=0
+          mapfile -t publisher_runs < <(jq -c --arg repo "$GITHUB_REPOSITORY" '
+            .workflow_runs[] | select(
+              .path == ".github/workflows/container-release.yml" and
+              .conclusion == "success" and
+              (.event == "workflow_run" or .event == "workflow_dispatch") and
+              .head_branch == "main" and
+              (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+              .head_repository.full_name == $repo and
+              (.id | type == "number" and . > 0) and
+              (.run_attempt | type == "number" and . > 0)
+            ) | {id, run_attempt, event, head_sha}
+          ' "$runs_json")
+          for publisher_run in "${publisher_runs[@]}"; do
+            run_id="$(jq -er '.id' <<<"$publisher_run")"
+            run_attempt="$(jq -er '.run_attempt' <<<"$publisher_run")"
+            workflow_event="$(jq -er '.event' <<<"$publisher_run")"
+            execution_head="$(jq -er '.head_sha' <<<"$publisher_run")"
+            if [[ -n "$REQUIRED_RUN_ID" && \
+                  ( "$run_id" != "$REQUIRED_RUN_ID" || \
+                    "$run_attempt" != "$REQUIRED_RUN_ATTEMPT" || \
+                    "$execution_head" != "$REQUIRED_EXECUTION_HEAD_SHA" ) ]]; then
+              continue
+            fi
+
+            jobs_json="$RUNNER_TEMP/publisher-jobs-${run_id}-${run_attempt}.json"
+            gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}/jobs?per_page=100" |
+              jq -s '
+                if all(.[]; type == "object" and (.jobs | type == "array"))
+                then {jobs: [.[].jobs[]]}
+                else error("invalid paginated publisher jobs response")
+                end
+              ' > "$jobs_json"
+            publish_jobs="$(jq --arg head "$execution_head" '
+              [.jobs[] | select(
+                .name == "Publish atomic main release" and
+                .status == "completed" and .conclusion == "success" and
+                .head_sha == $head
+              )] | length
+            ' "$jobs_json")"
+            if [[ "$publish_jobs" -ne 1 ]]; then
+              continue
+            fi
+
+            artifacts_json="$RUNNER_TEMP/publisher-artifacts-${run_id}-${run_attempt}.json"
+            artifact_name="release-promotion-provenance-${CANDIDATE}-attempt-${run_attempt}"
+            gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" |
+              jq -s '
+                if all(.[]; type == "object" and (.artifacts | type == "array"))
+                then {artifacts: [.[].artifacts[]]}
+                else error("invalid paginated publisher artifacts response")
+                end
+              ' > "$artifacts_json"
+            artifact_matches="$(jq --arg name "$artifact_name" '[.artifacts[] | select(.name == $name)] | length' "$artifacts_json")"
+            if [[ "$artifact_matches" -ne 1 ]]; then
+              if [[ -n "$REQUIRED_RUN_ID" ]]; then
+                echo "Triggering Container release run has no unique provenance artifact for $CANDIDATE" >&2
+                exit 1
+              fi
+              continue
+            fi
+            jq -e --arg name "$artifact_name" --arg head "$execution_head" --argjson run "$run_id" '
+              [.artifacts[] | select(.name == $name)] as $matches |
+              ($matches | length) == 1 and
+              ($matches[0].expired == false) and
+              ($matches[0].id | type == "number" and . > 0) and
+              ($matches[0].size_in_bytes | type == "number" and . > 0) and
+              ($matches[0].digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              $matches[0].workflow_run.id == $run and
+              $matches[0].workflow_run.head_sha == $head
+            ' "$artifacts_json" >/dev/null
+            artifact_id="$(jq -er --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .id' "$artifacts_json")"
+            artifact_digest="$(jq -er --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .digest' "$artifacts_json")"
+            proof_root="$(mktemp -d "$RUNNER_TEMP/publisher-proof.XXXXXX")"
+            proof_zip="$proof_root/provenance.zip"
+            gh api -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$proof_zip"
+            [[ "sha256:$(sha256sum "$proof_zip" | awk '{print $1}')" == "$artifact_digest" ]]
+            python3 - "$proof_zip" "$proof_root" <<'PY'
+          import pathlib
+          import stat
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          root = pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(archive) as value:
+              infos = value.infolist()
+              if len(infos) != 1 or infos[0].filename != "publisher-provenance.json":
+                  raise SystemExit("publisher provenance artifact must contain exactly publisher-provenance.json")
+              mode = infos[0].external_attr >> 16
+              if stat.S_ISLNK(mode) or infos[0].file_size <= 0 or infos[0].file_size > 1024 * 1024:
+                  raise SystemExit("publisher provenance artifact member is unsafe")
+              root.joinpath("publisher-provenance.json").write_bytes(value.read(infos[0]))
+          PY
+            proof_file="$proof_root/publisher-provenance.json"
+            selection_kind="$(jq -er '.source_selection.kind | select(. == "workflow_run" or . == "workflow_dispatch")' "$proof_file")"
+            [[ "$selection_kind" == "$workflow_event" ]]
+            qualification_run_id="$(jq -er '.source_selection.qualification_run_id | select(type == "number" and . > 0)' "$proof_file")"
+            qualification_attempt="$(jq -er '.source_selection.qualification_run_attempt | select(type == "number" and . > 0)' "$proof_file")"
+            [[ "$qualification_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$qualification_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+            quality_run="$proof_root/quality-run.json"
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${qualification_run_id}" > "$quality_run"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$CANDIDATE" \
+              --argjson run "$qualification_run_id" --argjson attempt "$qualification_attempt" '
+              .id == $run and .run_attempt == $attempt and
+              .path == ".github/workflows/quality.yml" and
+              .event == "push" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $source and
+              .head_repository.full_name == $repo
+            ' "$quality_run" >/dev/null
+            requested_ref="$(jq -er '
+              if .source_selection.kind == "workflow_run"
+              then (.source_selection.requested_ref | select(. == null) | "")
+              else (.source_selection.requested_ref | select(type == "string" and length > 0))
+              end
+            ' "$proof_file")"
+            if [[ "$selection_kind" == workflow_run ]]; then
+              selection_resolution=qualified_workflow_run.head_sha
+            else
+              selection_resolution='checkout(inputs.ref).git_rev_parse_head'
+            fi
+            source_selection="$proof_root/source-selection.json"
+            jq -cS --arg kind "$selection_kind" --arg resolution "$selection_resolution" \
+              --arg requested_ref "$requested_ref" '
+              {
+                kind: $kind,
+                resolution: $resolution,
+                requested_ref: (if $kind == "workflow_run" then null else $requested_ref end),
+                qualification_run_id: .id,
+                qualification_run_attempt: .run_attempt,
+                qualification_workflow_path: .path,
+                qualification_event: .event,
+                qualification_conclusion: .conclusion,
+                qualification_head_branch: .head_branch,
+                qualification_head_sha: .head_sha,
+                qualification_head_repository: .head_repository.full_name
+              }
+            ' "$quality_run" > "$source_selection"
+            python3 scripts/release_promotion.py validate-publisher-provenance \
+              --repository "$GITHUB_REPOSITORY" \
+              --workflow-event "$workflow_event" \
+              --workflow-run-id "$run_id" \
+              --run-attempt "$run_attempt" \
+              --execution-head-sha "$execution_head" \
+              --source-commit "$CANDIDATE" \
+              --source-selection "$source_selection" \
+              --release-identity "$identity" \
+              --provenance "$proof_file"
+            proofs=$((proofs + 1))
+            break
+          done
+          if [[ "$proofs" -lt 1 ]]; then
+            echo "No exact successful Container release attempt proves this draft identity" >&2
+            exit 1
+          fi
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "release_root=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Promote ordinary release
+        if: >-
+          steps.select.outputs.action == 'promote' &&
+          (steps.select.outputs.candidate_stage == 'source_owner' ||
+          steps.select.outputs.candidate_stage == 'target_baseline') &&
+          (github.event_name != 'workflow_dispatch' || inputs.action == 'evaluate')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE: ${{ steps.select.outputs.candidate_generation }}
+          CURRENT: ${{ steps.select.outputs.current_generation }}
+          SEALED_IDENTITY: ${{ steps.assets.outputs.identity }}
+          RELEASE_ROOT: ${{ steps.assets.outputs.release_root }}
+        run: |
+          set -euo pipefail
+          fetch_candidate_identity() {
+            local output="$1"
+            local api_url full
+            api_url="$(gh release view "container-${CANDIDATE}" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+            [[ "$api_url" == "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"* ]]
+            full="${output}.full"
+            gh api -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$api_url" > "$full"
+            jq -cS '{
+              release_id: .id,
+              tag_name,
+              target_commitish,
+              draft,
+              prerelease,
+              assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+            }' "$full" > "$output"
+          }
+          before="$RUNNER_TEMP/ordinary-release-before.json"
+          fetch_candidate_identity "$before"
+          cmp "$SEALED_IDENTITY" "$before"
+          jq -e '.draft == true and .prerelease == false' "$before" >/dev/null
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" |
+            jq -e --arg tag "container-${CURRENT}" '.tag_name == $tag' >/dev/null
+          scripts/verify-release-images-anonymous.sh "$RELEASE_ROOT/release.json"
+          scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$CANDIDATE"
+          gh release edit "container-${CANDIDATE}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          if ! scripts/verify-release-images-anonymous.sh "$RELEASE_ROOT/release.json"; then
+            echo "::error title=CRITICAL post-visibility registry failure::container-${CANDIDATE} is already visible and latest; anonymous access to all sealed image digests failed after publication. Visibility was not rolled back; treat this as a release incident."
+            exit 1
+          fi
+          after="$RUNNER_TEMP/ordinary-release-after.json"
+          fetch_candidate_identity "$after"
+          jq -e '.draft == false and .prerelease == false' "$after" >/dev/null
+          jq -cS 'del(.draft)' "$before" > "$RUNNER_TEMP/ordinary-before-stable.json"
+          jq -cS 'del(.draft)' "$after" > "$RUNNER_TEMP/ordinary-after-stable.json"
+          cmp "$RUNNER_TEMP/ordinary-before-stable.json" "$RUNNER_TEMP/ordinary-after-stable.json"
+          release_id="$(jq -er '.release_id | select(type == "number")' "$after")"
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" |
+            jq -e --arg tag "container-${CANDIDATE}" --argjson id "$release_id" \
+              '.id == $id and .tag_name == $tag and .draft == false' >/dev/null
+          gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/container-${CANDIDATE}" |
+            jq -e --arg generation "$CANDIDATE" \
+              '.object.type == "commit" and .object.sha == $generation' >/dev/null
+
+      - name: Leave gated transition release draft during ordinary evaluation
+        if: >-
+          steps.select.outputs.action == 'promote' &&
+          (steps.select.outputs.candidate_stage == 'bridge' ||
+          steps.select.outputs.candidate_stage == 'cleanup') &&
+          (github.event_name != 'workflow_dispatch' || inputs.action == 'evaluate')
+        run: echo "Transition release remains draft until its deployment receipt is verified."
+
+      - name: Issue one-time deployment challenge
+        id: challenge
+        if: >-
+          steps.select.outputs.action == 'promote' &&
+          (steps.select.outputs.candidate_stage == 'bridge' ||
+          steps.select.outputs.candidate_stage == 'cleanup') &&
+          github.event_name == 'workflow_dispatch' &&
+          inputs.action == 'issue_challenge'
+        shell: bash
+        env:
+          DEPLOYMENT_ID: ${{ secrets.RELEASE_TRANSITION_DEPLOYMENT_ID }}
+          KEY_ID: ${{ secrets.RELEASE_TRANSITION_KEY_ID }}
+          CANDIDATE: ${{ steps.select.outputs.candidate_generation }}
+          CURRENT: ${{ steps.select.outputs.current_generation }}
+          ROOT: ${{ steps.select.outputs.candidate_root }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DEPLOYMENT_ID" || -z "$KEY_ID" ]]; then
+            echo "Pinned deployment identity is not configured; release remains draft."
+            echo "issued=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          output="$RUNNER_TEMP/release-transition-challenge-${CANDIDATE}/challenge.json"
+          mkdir -p "$(dirname "$output")"
+          python3 scripts/release_promotion.py issue-challenge \
+            --contract "$ROOT/release-transition.json" \
+            --manifest "$ROOT/release.json" \
+            --challenge-schema "$ROOT/release-transition-challenge.schema.json" \
+            --receipt-schema "$ROOT/release-transition-receipt.schema.json" \
+            --promotion "$ROOT/promotion.json" \
+            --generation "$CANDIDATE" \
+            --current-generation "$CURRENT" \
+            --deployment-id "$DEPLOYMENT_ID" \
+            --key-id "$KEY_ID" \
+            --output "$output"
+          echo "issued=true" >> "$GITHUB_OUTPUT"
+          echo "artifact_path=$(dirname "$output")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload authenticated challenge artifact
+        if: steps.challenge.outputs.issued == 'true'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: release-transition-challenge-${{ steps.select.outputs.candidate_generation }}
+          path: ${{ steps.challenge.outputs.artifact_path }}/challenge.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify deployment receipt and promote transition release
+        if: >-
+          steps.select.outputs.action == 'promote' &&
+          (steps.select.outputs.candidate_stage == 'bridge' ||
+          steps.select.outputs.candidate_stage == 'cleanup') &&
+          github.event_name == 'workflow_dispatch' &&
+          inputs.action == 'promote'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYMENT_ID: ${{ secrets.RELEASE_TRANSITION_DEPLOYMENT_ID }}
+          KEY_ID: ${{ secrets.RELEASE_TRANSITION_KEY_ID }}
+          PUBLIC_KEY_PEM: ${{ secrets.RELEASE_TRANSITION_ED25519_PUBLIC_KEY_PEM }}
+          SECRET_RECEIPT: ${{ secrets.RELEASE_TRANSITION_RECEIPT_JSON_BASE64 }}
+          SECRET_SIGNATURE: ${{ secrets.RELEASE_TRANSITION_RECEIPT_SIGNATURE_BASE64 }}
+          INPUT_RECEIPT: ${{ inputs.receipt_json_base64 }}
+          INPUT_SIGNATURE: ${{ inputs.receipt_signature_base64 }}
+          CHALLENGE_RUN_ID: ${{ inputs.challenge_run_id }}
+          CANDIDATE: ${{ steps.select.outputs.candidate_generation }}
+          CURRENT: ${{ steps.select.outputs.current_generation }}
+          ROOT: ${{ steps.select.outputs.candidate_root }}
+          CURRENT_ROOT: ${{ steps.select.outputs.current_root }}
+          SEALED_IDENTITY: ${{ steps.assets.outputs.identity }}
+          RELEASE_ROOT: ${{ steps.assets.outputs.release_root }}
+        run: |
+          set -euo pipefail
+          receipt_b64="${SECRET_RECEIPT:-$INPUT_RECEIPT}"
+          signature_b64="${SECRET_SIGNATURE:-$INPUT_SIGNATURE}"
+          if [[ -z "$DEPLOYMENT_ID" || -z "$KEY_ID" || -z "$PUBLIC_KEY_PEM" || \
+                -z "$receipt_b64" || -z "$signature_b64" || -z "$CHALLENGE_RUN_ID" ]]; then
+            echo "Pinned key or receipt inputs are not configured; release remains draft."
+            exit 0
+          fi
+          if [[ ! "$CHALLENGE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+            echo "Challenge run id must be a positive decimal GitHub run id" >&2
+            exit 1
+          fi
+          run_json="$RUNNER_TEMP/challenge-run.json"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${CHALLENGE_RUN_ID}" > "$run_json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .name == "Main channel promotion" and
+            .path == ".github/workflows/channel-promotion.yml" and
+            .event == "workflow_dispatch" and
+            .conclusion == "success" and
+            .head_branch == "main" and
+            .head_repository.full_name == $repo
+          ' "$run_json" >/dev/null
+          challenge_dir="$RUNNER_TEMP/challenge"
+          mkdir -p "$challenge_dir"
+          gh run download "$CHALLENGE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "release-transition-challenge-${CANDIDATE}" --dir "$challenge_dir"
+          test -f "$challenge_dir/challenge.json"
+          evidence="$RUNNER_TEMP/receipt-evidence"
+          mkdir -m 0700 "$evidence"
+          printf '%s' "$PUBLIC_KEY_PEM" > "$evidence/public.pem"
+          chmod 0600 "$evidence/public.pem"
+          RECEIPT_B64="$receipt_b64" SIGNATURE_B64="$signature_b64" \
+            python3 - "$evidence" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          root.joinpath("receipt.json").write_bytes(
+              base64.b64decode(os.environ["RECEIPT_B64"], validate=True)
+          )
+          # The verifier consumes a strict-base64 text file and decodes the
+          # Ed25519 signature itself.
+          base64.b64decode(os.environ["SIGNATURE_B64"], validate=True)
+          root.joinpath("receipt.sig").write_text(
+              os.environ["SIGNATURE_B64"], encoding="ascii"
+          )
+          PY
+          chmod 0600 "$evidence/receipt.json" "$evidence/receipt.sig"
+          challenge_id="$(python3 scripts/release_promotion.py verify-receipt \
+            --contract "$ROOT/release-transition.json" \
+            --manifest "$ROOT/release.json" \
+            --challenge-schema "$ROOT/release-transition-challenge.schema.json" \
+            --receipt-schema "$ROOT/release-transition-receipt.schema.json" \
+            --promotion "$ROOT/promotion.json" \
+            --generation "$CANDIDATE" \
+            --current-generation "$CURRENT" \
+            --deployment-id "$DEPLOYMENT_ID" \
+            --key-id "$KEY_ID" \
+            --challenge "$challenge_dir/challenge.json" \
+            --receipt "$evidence/receipt.json" \
+            --signature "$evidence/receipt.sig" \
+            --public-key "$evidence/public.pem" \
+            --predecessor-manifest "$CURRENT_ROOT/release.json")"
+
+          fetch_candidate_identity() {
+            local output="$1"
+            local api_url full
+            api_url="$(gh release view "container-${CANDIDATE}" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+            [[ "$api_url" == "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"* ]]
+            full="${output}.full"
+            gh api -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$api_url" > "$full"
+            jq -cS '{
+              release_id: .id,
+              tag_name,
+              target_commitish,
+              draft,
+              prerelease,
+              assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+            }' "$full" > "$output"
+          }
+          before="$RUNNER_TEMP/transition-release-before.json"
+          fetch_candidate_identity "$before"
+          cmp "$SEALED_IDENTITY" "$before"
+          jq -e '.draft == true and .prerelease == false' "$before" >/dev/null
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" |
+            jq -e --arg tag "container-${CURRENT}" '.tag_name == $tag' >/dev/null
+          scripts/verify-release-images-anonymous.sh "$RELEASE_ROOT/release.json"
+          scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$CANDIDATE"
+
+          consumed_ref="release-transition-consumed-${challenge_id}"
+          if gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${consumed_ref}" >/dev/null 2>&1; then
+            echo "Challenge was already consumed" >&2
+            exit 1
+          fi
+          # The permanent Git ref is the replay ledger. Record consumption
+          # before visibility; a failed visibility mutation requires a fresh
+          # challenge and can never reuse this signature.
+          gh api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${consumed_ref}" -f "sha=${CANDIDATE}" >/dev/null
+          gh release edit "container-${CANDIDATE}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          if ! scripts/verify-release-images-anonymous.sh "$RELEASE_ROOT/release.json"; then
+            echo "::error title=CRITICAL post-visibility registry failure::container-${CANDIDATE} is already visible and latest; anonymous access to all sealed image digests failed after publication. Visibility was not rolled back; treat this as a release incident."
+            exit 1
+          fi
+          after="$RUNNER_TEMP/transition-release-after.json"
+          fetch_candidate_identity "$after"
+          jq -e '.draft == false and .prerelease == false' "$after" >/dev/null
+          jq -cS 'del(.draft)' "$before" > "$RUNNER_TEMP/transition-before-stable.json"
+          jq -cS 'del(.draft)' "$after" > "$RUNNER_TEMP/transition-after-stable.json"
+          cmp "$RUNNER_TEMP/transition-before-stable.json" "$RUNNER_TEMP/transition-after-stable.json"
+          release_id="$(jq -er '.release_id | select(type == "number")' "$after")"
+          gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" |
+            jq -e --arg tag "container-${CANDIDATE}" --argjson id "$release_id" \
+              '.id == $id and .tag_name == $tag and .draft == false' >/dev/null
+          gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/container-${CANDIDATE}" |
+            jq -e --arg generation "$CANDIDATE" \
+              '.object.type == "commit" and .object.sha == $generation' >/dev/null

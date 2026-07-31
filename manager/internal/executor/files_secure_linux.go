@@ -18,7 +18,6 @@ import (
 	"syscall"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
-	technicalidentity "github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
@@ -49,7 +48,7 @@ func (s FileService) sandboxPath(call Call, value string) (managedFilePath, erro
 	if !filepath.IsAbs(logical) {
 		logical = filepath.Join(contract.ContainerWorkspace, logical)
 	}
-	attachmentRoot := filepath.Join(contract.ContainerWorkspace, technicalidentity.SourceProfile().InternalWorkspaceDirectory, "attachments")
+	attachmentRoot := filepath.Join(contract.ContainerWorkspace, s.profile.InternalWorkspaceDirectory, "attachments")
 	type mapping struct {
 		logical  string
 		host     string
@@ -227,7 +226,7 @@ func managedOpenError(err error) error {
 	return fmt.Errorf("open managed path: %w", err)
 }
 
-func writeManagedFile(path managedFilePath, data []byte, mode os.FileMode) error {
+func writeManagedFile(path managedFilePath, data []byte, mode os.FileMode, temporaryPrefix string) error {
 	if err := path.rejectMutation(); err != nil {
 		return err
 	}
@@ -236,10 +235,10 @@ func writeManagedFile(path managedFilePath, data []byte, mode os.FileMode) error
 		return err
 	}
 	defer parent.Close()
-	return writeManagedFileAt(parent, leaf, data, mode)
+	return writeManagedFileAt(parent, leaf, data, mode, temporaryPrefix)
 }
 
-func writeManagedFileAt(parent *os.File, leaf string, data []byte, mode os.FileMode) error {
+func writeManagedFileAt(parent *os.File, leaf string, data []byte, mode os.FileMode, temporaryPrefix string) error {
 	if leaf == "." {
 		return errors.New("path is a directory")
 	}
@@ -247,7 +246,7 @@ func writeManagedFileAt(parent *os.File, leaf string, data []byte, mode os.FileM
 		return err
 	}
 
-	temporary, file, err := createTemporaryAt(parent)
+	temporary, file, err := createTemporaryAt(parent, temporaryPrefix)
 	if err != nil {
 		return err
 	}
@@ -299,13 +298,16 @@ func validateManagedWriteTarget(parent *os.File, leaf string) error {
 	return nil
 }
 
-func createTemporaryAt(parent *os.File) (string, *os.File, error) {
+func createTemporaryAt(parent *os.File, temporaryPrefix string) (string, *os.File, error) {
+	if temporaryPrefix == "" || strings.Contains(temporaryPrefix, string(filepath.Separator)) {
+		return "", nil, errors.New("managed temporary-file prefix is invalid")
+	}
 	for attempt := 0; attempt < 16; attempt++ {
 		random := make([]byte, 12)
 		if _, err := rand.Read(random); err != nil {
 			return "", nil, err
 		}
-		name := technicalidentity.SourceProfile().InternalWorkspaceDirectory + "-write-" + hex.EncodeToString(random)
+		name := temporaryPrefix + "-write-" + hex.EncodeToString(random)
 		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 		if errors.Is(err, syscall.EEXIST) {
 			continue

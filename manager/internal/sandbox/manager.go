@@ -21,6 +21,12 @@ type Record struct {
 	SandboxID           string     `json:"sandbox_id"`
 	SandboxHash         string     `json:"sandbox_hash"`
 	WorkspaceID         string     `json:"workspace_id"`
+	UID                 int        `json:"uid"`
+	GID                 int        `json:"gid"`
+	WorkspacePath       string     `json:"workspace_path"`
+	HomePath            string     `json:"home_path"`
+	EnvironmentPath     string     `json:"environment_path"`
+	AttachmentsPath     string     `json:"attachments_path"`
 	ContainerName       string     `json:"container_name"`
 	Image               string     `json:"image"`
 	LastActivityAt      time.Time  `json:"last_activity_at"`
@@ -30,8 +36,9 @@ type Record struct {
 }
 
 type registry struct {
-	SchemaVersion int               `json:"schema_version"`
-	Records       map[string]Record `json:"records"`
+	SchemaVersion    int               `json:"schema_version"`
+	TechnicalProfile string            `json:"technical_profile"`
+	Records          map[string]Record `json:"records"`
 }
 
 type Manager struct {
@@ -49,28 +56,57 @@ type Manager struct {
 	// ReclaimCapacity performs one controlled maintenance pass before a missing
 	// Sandbox image is retried. It is invoked before MaintenanceMu is acquired so
 	// cleanup cannot invert admission locks.
-	ReclaimCapacity func(context.Context) error
-	mu              sync.Mutex
-	registry        registry
-	ensureMu        sync.Mutex
-	ensureByID      map[string]*sync.Mutex
+	ReclaimCapacity        func(context.Context) error
+	mu                     sync.Mutex
+	registry               registry
+	ensureMu               sync.Mutex
+	ensureByID             map[string]*sync.Mutex
+	profile                identity.Profile
+	protected              []identity.Profile
+	registryUpgradePending bool
 }
 
-func Open(engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
-	manager := &Manager{Engine: engine, DataDir: dataDir, StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: 1, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}}
-	if err := atomicfile.ReadJSON(statePath, &manager.registry); err != nil && !os.IsNotExist(err) {
+func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
+	profile, err := active.Profile()
+	if err != nil {
+		return nil, fmt.Errorf("Sandbox technical profile: %w", err)
+	}
+	protected, err := active.ProtectedHostProfiles()
+	if err != nil {
+		return nil, fmt.Errorf("Sandbox protected technical profiles: %w", err)
+	}
+	manager := &Manager{Engine: engine, DataDir: filepath.Clean(dataDir), StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: sandboxRegistrySchemaVersion, TechnicalProfile: profile.ProfileID, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}, profile: profile, protected: protected}
+	upgraded, err := manager.loadRegistry()
+	if err != nil {
 		return nil, err
-	}
-	if manager.registry.SchemaVersion != 1 {
-		return nil, fmt.Errorf("unsupported sandbox registry schema %d", manager.registry.SchemaVersion)
-	}
-	if manager.registry.Records == nil {
-		manager.registry.Records = map[string]Record{}
 	}
 	if err := manager.validateRegistry(); err != nil {
 		return nil, err
 	}
+	if upgraded {
+		manager.registryUpgradePending = true
+	}
 	return manager, nil
+}
+
+// CommitRegistryUpgrade publishes a fully proven v1 -> v2 conversion. The
+// caller must invoke it only after a candidate Manager has been committed by
+// its watchdog (or when the running binary was already Current), so the prior
+// binary never has to read a schema it does not understand during rollback.
+func (m *Manager) CommitRegistryUpgrade() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.registryUpgradePending {
+		return nil
+	}
+	if err := m.validateRegistry(); err != nil {
+		return err
+	}
+	if err := atomicfile.WriteJSON(m.StatePath, m.registry, 0o600); err != nil {
+		return fmt.Errorf("persist upgraded sandbox registry: %w", err)
+	}
+	m.registryUpgradePending = false
+	return nil
 }
 
 func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now time.Time) (driver.SandboxSpec, error) {
@@ -119,8 +155,12 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 		return driver.SandboxSpec{}, err
 	}
 	hash := stableHash(sandboxID)
+	binding, err := m.expectedBinding(workspaceID, hash)
+	if err != nil {
+		return driver.SandboxSpec{}, err
+	}
 	envRoot := filepath.Join(m.DataDir, "agent-envs", hash)
-	spec := driver.SandboxSpec{ContainerName: identity.SourceProfile().SandboxContainerPrefix + hash[:16], AgentHash: hash, Image: image, Network: network, Workspace: workspacePath, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: uid, GID: gid}
+	spec := driver.SandboxSpec{ContainerName: m.profile.SandboxContainerPrefix + hash[:16], AgentHash: hash, Image: image, Network: network, Workspace: workspacePath, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: uid, GID: gid}
 	if attachmentPath, ok := m.attachmentPath(workspaceID); ok {
 		spec.Attachments = attachmentPath
 	}
@@ -172,6 +212,9 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	m.mu.Lock()
 	record := m.registry.Records[sandboxID]
 	record.SandboxID, record.SandboxHash, record.WorkspaceID, record.ContainerName, record.Image = sandboxID, hash, workspaceID, spec.ContainerName, spec.Image
+	record.UID, record.GID = binding.UID, binding.GID
+	record.WorkspacePath, record.HomePath = binding.WorkspacePath, binding.HomePath
+	record.EnvironmentPath, record.AttachmentsPath = binding.EnvironmentPath, binding.AttachmentsPath
 	record.LastActivityAt, record.StoppedAt = now.UTC(), nil
 	m.registry.Records[sandboxID] = record
 	persistErr := m.persistLocked()
@@ -211,6 +254,8 @@ func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
 	return m.persistLocked()
 }
 func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Time) error {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -230,6 +275,8 @@ func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Tim
 	return m.persistLocked()
 }
 func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -246,6 +293,8 @@ func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
 	return m.persistLocked()
 }
 func (m *Manager) Touch(sandboxID string, now time.Time) error {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -419,6 +468,8 @@ func (m *Manager) Records() []Record {
 // from the persisted managed-process records after a Manager restart. Unknown
 // or uninspectable sandbox processes are counted conservatively by the caller.
 func (m *Manager) ReconcileProcesses(background map[string]int, now time.Time) error {
+	unlockMaintenance := m.lockMaintenance()
+	defer unlockMaintenance()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, record := range m.registry.Records {
@@ -442,6 +493,15 @@ func (m *Manager) SetImage(image string) {
 }
 
 func (m *Manager) validateRegistry() error {
+	if m.registry.SchemaVersion != sandboxRegistrySchemaVersion {
+		return fmt.Errorf("unsupported sandbox registry schema %d", m.registry.SchemaVersion)
+	}
+	if m.registry.TechnicalProfile != m.profile.ProfileID {
+		return fmt.Errorf("sandbox registry technical profile %q does not match active profile %q", m.registry.TechnicalProfile, m.profile.ProfileID)
+	}
+	if m.registry.Records == nil {
+		return errors.New("sandbox registry records must be an object")
+	}
 	for key, record := range m.registry.Records {
 		if key == "" || record.SandboxID != key {
 			return fmt.Errorf("sandbox registry key %q does not match record identity %q", key, record.SandboxID)
@@ -450,11 +510,28 @@ func (m *Manager) validateRegistry() error {
 		if record.SandboxHash != hash {
 			return fmt.Errorf("sandbox registry %q has an invalid identity hash", key)
 		}
-		if record.ContainerName != identity.SourceProfile().SandboxContainerPrefix+hash[:16] {
+		if record.ContainerName != m.profile.SandboxContainerPrefix+hash[:16] {
 			return fmt.Errorf("sandbox registry %q has an invalid container name", key)
 		}
 		if _, err := m.workspacePath(record.WorkspaceID); err != nil {
 			return fmt.Errorf("sandbox registry %q has an invalid workspace binding: %w", key, err)
+		}
+		expected, err := m.expectedBinding(record.WorkspaceID, record.SandboxHash)
+		if err != nil {
+			return fmt.Errorf("sandbox registry %q has an invalid persistent binding: %w", key, err)
+		}
+		actual := bindingFromRecord(record)
+		if actual != expected {
+			return fmt.Errorf("sandbox registry %q persistent binding does not match the trusted data layout", key)
+		}
+		for _, relative := range expected.relativePaths() {
+			path, err := m.dataPath(relative)
+			if err != nil {
+				return fmt.Errorf("sandbox registry %q has an invalid persisted path: %w", key, err)
+			}
+			if err := validateOwnedDirectoryBelow(m.DataDir, path, record.UID, record.GID); err != nil {
+				return fmt.Errorf("sandbox registry %q persistent directory %q is invalid: %w", key, relative, err)
+			}
 		}
 	}
 	return nil
@@ -473,15 +550,26 @@ func (m *Manager) lockEnsure(sandboxID string) func() {
 }
 
 func (m *Manager) specForRecord(record Record) (driver.SandboxSpec, error) {
-	workspace, err := m.workspacePath(record.WorkspaceID)
+	if err := m.validateRecordBinding(record); err != nil {
+		return driver.SandboxSpec{}, err
+	}
+	workspace, err := m.dataPath(record.WorkspacePath)
 	if err != nil {
 		return driver.SandboxSpec{}, err
 	}
-	envRoot := filepath.Join(m.DataDir, "agent-envs", record.SandboxHash)
-	spec := driver.SandboxSpec{ContainerName: record.ContainerName, AgentHash: record.SandboxHash, Image: record.Image, Network: m.Network, Workspace: workspace, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: m.UID, GID: m.GID}
-	if path, ok := m.attachmentPath(record.WorkspaceID); ok {
-		spec.Attachments = path
+	home, err := m.dataPath(record.HomePath)
+	if err != nil {
+		return driver.SandboxSpec{}, err
 	}
+	environment, err := m.dataPath(record.EnvironmentPath)
+	if err != nil {
+		return driver.SandboxSpec{}, err
+	}
+	attachments, err := m.dataPath(record.AttachmentsPath)
+	if err != nil {
+		return driver.SandboxSpec{}, err
+	}
+	spec := driver.SandboxSpec{ContainerName: record.ContainerName, AgentHash: record.SandboxHash, Image: record.Image, Network: m.Network, Workspace: workspace, Home: home, Environment: environment, Attachments: attachments, UID: record.UID, GID: record.GID}
 	return spec, nil
 }
 
@@ -569,26 +657,11 @@ func (m *Manager) workspacePath(id string) (string, error) {
 	return filepath.Join(m.DataDir, "workspaces", clean), nil
 }
 func (m *Manager) attachmentPath(workspaceID string) (string, bool) {
-	clean := filepath.ToSlash(filepath.Clean(workspaceID))
-	if strings.HasPrefix(clean, "user-") {
-		id := strings.TrimPrefix(clean, "user-")
-		if id != "" && safeSegment(id) {
-			return filepath.Join(m.DataDir, "attachments", "private", id), true
-		}
+	relative, ok := attachmentRelativePath(workspaceID)
+	if !ok {
+		return "", false
 	}
-	if strings.HasPrefix(clean, "channels/channel-") {
-		id := strings.TrimPrefix(clean, "channels/channel-")
-		if id != "" && safeSegment(id) {
-			return filepath.Join(m.DataDir, "attachments", "channel", id), true
-		}
-	}
-	if strings.HasPrefix(clean, "channel-") {
-		id := strings.TrimPrefix(clean, "channel-")
-		if id != "" && safeSegment(id) {
-			return filepath.Join(m.DataDir, "attachments", "channel", id), true
-		}
-	}
-	return "", false
+	return filepath.Join(m.DataDir, filepath.FromSlash(relative)), true
 }
 func safeSegment(value string) bool {
 	for _, r := range value {
@@ -598,7 +671,12 @@ func safeSegment(value string) bool {
 	}
 	return value != ""
 }
-func (m *Manager) persistLocked() error { return atomicfile.WriteJSON(m.StatePath, m.registry, 0o600) }
+func (m *Manager) persistLocked() error {
+	if m.registryUpgradePending {
+		return errors.New("sandbox registry v2 cannot be persisted before Manager activation commits")
+	}
+	return atomicfile.WriteJSON(m.StatePath, m.registry, 0o600)
+}
 func stableHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

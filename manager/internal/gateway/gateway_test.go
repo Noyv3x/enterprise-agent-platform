@@ -9,8 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
+
+var testActiveProfile = identity.SourceActiveProfile()
 
 type stateStub struct{ value model.ManagerState }
 
@@ -22,7 +25,7 @@ func TestMaintenancePageContainsOnlyPublicState(t *testing.T) {
 	state.Phase = model.PhaseMigrating
 	state.ActiveOperationID = "op_public"
 	state.LastError = "/secret/host/path"
-	handler, err := NewHandler(stateStub{state}, "http://127.0.0.1:1")
+	handler, err := NewHandler(testActiveProfile, stateStub{state}, "http://127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,9 +49,33 @@ func TestMaintenancePageContainsOnlyPublicState(t *testing.T) {
 	}
 }
 
+func TestVerifiedTargetProfileOwnsOnlyNeutralGatewayPaths(t *testing.T) {
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := model.NewState(time.Now())
+	handler, err := NewHandler(active, stateStub{state}, "http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/__agent_platform/status", "/__agent_platform/health"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("target path %s returned %d", path, response.Code)
+		}
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/__ubitech/status", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("source path remained active under target profile: %d", response.Code)
+	}
+}
+
 func TestUnavailableFallbackUsesNeutralPublicCopy(t *testing.T) {
 	t.Parallel()
-	handler, err := NewHandler(stateStub{model.NewState(time.Now())}, "http://127.0.0.1:1")
+	handler, err := NewHandler(testActiveProfile, stateStub{model.NewState(time.Now())}, "http://127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +93,7 @@ func TestUnavailableFallbackUsesNeutralPublicCopy(t *testing.T) {
 func TestLANAccessUsesPeerAddressAndRejectsDisallowedSources(t *testing.T) {
 	t.Parallel()
 	state := model.NewState(time.Now())
-	handler, err := NewHandlerWithAccess(stateStub{state}, "http://127.0.0.1:1", AccessPolicy{
+	handler, err := NewHandlerWithAccess(testActiveProfile, stateStub{state}, "http://127.0.0.1:1", AccessPolicy{
 		AllowedRemotePrefixes: []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16")},
 	})
 	if err != nil {
@@ -113,7 +140,7 @@ func TestProxyRebuildsForwardingHeadersAcrossTrustBoundary(t *testing.T) {
 	}))
 	defer upstream.Close()
 	state := model.NewState(time.Now())
-	handler, err := NewHandlerWithAccess(stateStub{state}, upstream.URL, AccessPolicy{
+	handler, err := NewHandlerWithAccess(testActiveProfile, stateStub{state}, upstream.URL, AccessPolicy{
 		TrustedIngressPrefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
 	})
 	if err != nil {
@@ -161,7 +188,7 @@ func TestMaintenanceStatusUsesFinalizePendingOperation(t *testing.T) {
 	state.PublicState = model.StateUpdating
 	state.Maintenance = true
 	state.FinalizePendingOperationID = "op_finalize_pending"
-	handler, err := NewHandler(stateStub{state}, "http://127.0.0.1:1")
+	handler, err := NewHandler(testActiveProfile, stateStub{state}, "http://127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
 	}

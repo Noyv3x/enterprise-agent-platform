@@ -38,7 +38,7 @@ func TestRecordCurrentRecoveryFailurePersistsBoundedDiagnosticOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	audit := logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)
-	app := &application{state: store, audit: audit}
+	app := &application{state: store, audit: audit, handoffAdmission: openHandoffMutationAdmission{}}
 	before := store.State()
 	recoveryErr := errors.New(strings.Repeat("temporary recovery failure ", 5000))
 	wantDiagnostic := journal.BoundDiagnostic(recoveryErr.Error())
@@ -96,7 +96,7 @@ func TestRecordCurrentRecoveryFailureUsesActiveOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)
-	app := &application{state: store, audit: audit}
+	app := &application{state: store, audit: audit, handoffAdmission: openHandoffMutationAdmission{}}
 	app.recordCurrentRecoveryFailure(errors.New("operation journal unavailable"))
 	events, err := audit.Tail(1)
 	if err != nil {

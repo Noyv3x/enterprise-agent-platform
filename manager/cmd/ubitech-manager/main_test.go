@@ -21,6 +21,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/maintenance"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
@@ -29,6 +30,14 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/selfupdate"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/snapshot"
 )
+
+var testActiveProfile = identity.SourceActiveProfile()
+
+type openHandoffMutationAdmission struct{}
+
+func (openHandoffMutationAdmission) Acquire(context.Context) (func(), error) {
+	return func() {}, nil
+}
 
 type observedFixedStackLocker struct {
 	mu        sync.Mutex
@@ -393,7 +402,7 @@ func TestReconcileMaintenanceJointlyReclaimsSnapshotsReleasesImagesAndManagerVer
 	currentManifest, currentRelease := writeMaintenanceRelease(t, releasesRoot, currentID, now.Add(-2*time.Hour), "current")
 	obsoleteManifest, obsoleteRelease := writeMaintenanceRelease(t, releasesRoot, obsoleteID, now.Add(-2*time.Hour), "obsolete")
 
-	selfUpdater := &selfupdate.Manager{Root: filepath.Join(stateRoot, "manager-binaries"), StatePath: filepath.Join(stateRoot, "manager-binaries.json")}
+	selfUpdater := &selfupdate.Manager{Profile: testActiveProfile, Root: filepath.Join(stateRoot, "manager-binaries"), StatePath: filepath.Join(stateRoot, "manager-binaries.json")}
 	currentVersion := writeMaintenanceManagerVersion(t, selfUpdater.Root, "current", currentID, now.Add(-2*time.Hour))
 	obsoleteVersion := writeMaintenanceManagerVersion(t, selfUpdater.Root, "obsolete", obsoleteID, now.Add(-2*time.Hour))
 	writeTestJSON(t, selfUpdater.StatePath, selfupdate.State{SchemaVersion: 1, Current: &currentVersion, UpdatedAt: now})
@@ -408,16 +417,16 @@ func TestReconcileMaintenanceJointlyReclaimsSnapshotsReleasesImagesAndManagerVer
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sandboxes, err := sandbox.Open(nil, dataDir, filepath.Join(stateRoot, "sandboxes.json"), currentManifest.Images["agent-sandbox"], "test", time.Minute)
+	sandboxes, err := sandbox.Open(testActiveProfile, nil, dataDir, filepath.Join(stateRoot, "sandboxes.json"), currentManifest.Images["agent-sandbox"], "test", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runner := &maintenanceDockerRunner{}
-	docker := &driver.DockerCLI{Binary: "docker", Runner: runner}
+	docker := &driver.DockerCLI{Profile: testActiveProfile, Binary: "docker", Runner: runner}
 	cfg := config.Config{StateDir: stateRoot, ReleaseChannel: contract.ReleaseChannel}
-	app := &application{
+	app := &application{profile: testActiveProfile,
 		config: cfg, state: store, docker: docker, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots,
-		maintenanceMu: &maintenance.Admission{},
+		maintenanceMu: &maintenance.Admission{}, handoffAdmission: openHandoffMutationAdmission{},
 	}
 	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, operations: store, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
 
@@ -612,7 +621,7 @@ func TestReconciliationContextCancelsWhenMaintenanceBegins(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	app := &application{state: store}
+	app := &application{profile: testActiveProfile, state: store}
 	ctx, finish := app.reconciliationContext(context.Background(), generation, time.Minute)
 	defer finish()
 	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
@@ -646,15 +655,15 @@ func TestFirecrawlReconciliationCancellationYieldsToMaintenanceWithoutDiagnostic
 	}
 	root := t.TempDir()
 	runner := &blockingFirecrawlRunner{started: make(chan struct{})}
-	app := &application{
+	app := &application{profile: testActiveProfile,
 		state: store,
-		docker: &driver.DockerCLI{
+		docker: &driver.DockerCLI{Profile: testActiveProfile,
 			Runner: runner, Binary: "docker", ComposeProject: "test",
 			ComposeFile:   filepath.Join(root, "compose.yaml"),
 			GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data"),
 			StateDir: filepath.Join(root, "state"),
 		},
-		fixedStackMu: &sync.Mutex{},
+		fixedStackMu: &sync.Mutex{}, handoffAdmission: openHandoffMutationAdmission{},
 	}
 	result := make(chan error, 1)
 	go func() { result <- app.reconcileFirecrawl(context.Background()) }()
@@ -708,13 +717,13 @@ func TestFirecrawlReconciliationLocksBeforeReadingCurrentGeneration(t *testing.T
 	}()
 	calls := make(chan []string, 1)
 	root := t.TempDir()
-	app := &application{
+	app := &application{profile: testActiveProfile,
 		state: store,
-		docker: &driver.DockerCLI{
+		docker: &driver.DockerCLI{Profile: testActiveProfile,
 			Runner: firecrawlRunner{calls: calls}, ComposeProject: "test", ComposeFile: filepath.Join(root, "compose.yaml"),
 			GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data"), StateDir: filepath.Join(root, "state"),
 		},
-		fixedStackMu: locker,
+		fixedStackMu: locker, handoffAdmission: openHandoffMutationAdmission{},
 	}
 	done := make(chan struct{})
 	go func() {
@@ -799,6 +808,54 @@ func TestManagerCLIClientLoadsControlCapability(t *testing.T) {
 	}
 }
 
+func TestManagerCLIClientConsumesRetainedConfigAfterPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "manager.toml")
+	dataA := filepath.Join(root, "data-a")
+	dataB := filepath.Join(root, "data-b")
+	if err := os.WriteFile(configPath, []byte("data_root = \""+dataA+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadWithProfile(testActiveProfile, configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dataRoot, token := range map[string]string{
+		dataA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		dataB: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	} {
+		secrets := filepath.Join(dataRoot, "manager", "secrets")
+		if err := os.MkdirAll(secrets, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(secrets, "manager-token"), []byte(token+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Rename(configPath, configPath+".routed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("data_root = \""+dataB+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, retained, err := managerClientWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.DataRoot != dataA || client.SocketPath != filepath.Join(dataA, "manager", "control", "manager.sock") || client.Token != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("CLI reopened replacement config: cfg=%#v client=%#v", retained, client)
+	}
+}
+
+func TestRunRejectsUnknownCommandBeforeTechnicalIdentityRouting(t *testing.T) {
+	// Either value would make the identity router fail if it were reached.
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("XDG_BIN_HOME", "relative-bin-home")
+	if code := run([]string{"not-a-manager-command"}); code != 64 {
+		t.Fatalf("unknown command exit code = %d, want usage error 64", code)
+	}
+}
+
 func TestRecoverCurrentCommandRequiresExplicitSafetyInputs(t *testing.T) {
 	tests := []struct {
 		arguments []string
@@ -809,8 +866,9 @@ func TestRecoverCurrentCommandRequiresExplicitSafetyInputs(t *testing.T) {
 		{arguments: []string{"--yes", "--config", "/tmp/manager.toml"}, want: "--expected-sha256"},
 	}
 	for _, test := range tests {
-		if err := recoverCurrentCommand(test.arguments); err == nil || !strings.Contains(err.Error(), test.want) {
-			t.Fatalf("recoverCurrentCommand(%v) error = %v, want containing %q", test.arguments, err, test.want)
+		_, _, err := parseRecoverCurrentArguments(test.arguments)
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("parseRecoverCurrentArguments(%v) error = %v, want containing %q", test.arguments, err, test.want)
 		}
 	}
 }
@@ -893,6 +951,100 @@ func TestInstallUsesCurrentOperationAPIOnly(t *testing.T) {
 	}
 }
 
+func TestManualUpdateChecksOrdinaryManifestBeforeStartingOperation(t *testing.T) {
+	manifestURL := "https://releases.example/release.json"
+	var routes []string
+	configPath := startManagerCLIControlServer(t, manifestURL, func(response http.ResponseWriter, request *http.Request) {
+		routes = append(routes, request.Method+" "+request.URL.Path)
+		response.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/check":
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode check request: %v", err)
+			}
+			if body["manifest_url"] != manifestURL || body["idempotency_key"] == "" || len(body) != 2 {
+				t.Errorf("unexpected update check request: %#v", body)
+			}
+			_ = json.NewEncoder(response).Encode(releaseCheckResponse{Manifest: release.Manifest{}})
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/operations":
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode operation request: %v", err)
+			}
+			if body["operation"] != "update" || body["manifest_url"] != manifestURL || body["idempotency_key"] == "" || len(body) != 3 {
+				t.Errorf("unexpected update request: %#v", body)
+			}
+			response.WriteHeader(http.StatusAccepted)
+			_, _ = response.Write([]byte(`{"operation":{"id":"op_update","status":"running"}}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/operations/op_update":
+			_, _ = response.Write([]byte(`{"id":"op_update","status":"succeeded","finalized":true}`))
+		default:
+			http.NotFound(response, request)
+		}
+	})
+
+	if err := operationCommand("update", []string{"--config", configPath, "--release-manifest-url", manifestURL}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(routes, ","), "POST /v1/check,POST /v1/operations,GET /v1/operations/op_update"; got != want {
+		t.Fatalf("manual ordinary update routes = %s, want %s", got, want)
+	}
+}
+
+func TestManualUpdateStopsAfterNamespaceHandoffCheck(t *testing.T) {
+	manifestURL := "https://releases.example/bridge.json"
+	var routes []string
+	configPath := startManagerCLIControlServer(t, manifestURL, func(response http.ResponseWriter, request *http.Request) {
+		routes = append(routes, request.Method+" "+request.URL.Path)
+		response.Header().Set("Content-Type", "application/json")
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/check" {
+			t.Errorf("ordinary operation route was called after handoff check: %s %s", request.Method, request.URL.Path)
+			http.NotFound(response, request)
+			return
+		}
+		_ = json.NewEncoder(response).Encode(releaseCheckResponse{
+			Manifest: release.Manifest{NamespaceHandoff: &release.NamespaceHandoff{SchemaVersion: 1}},
+		})
+	})
+
+	if err := operationCommand("update", []string{"--config", configPath, "--release-manifest-url", manifestURL}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(routes, ","), "POST /v1/check"; got != want {
+		t.Fatalf("manual handoff update routes = %s, want %s", got, want)
+	}
+}
+
+func startManagerCLIControlServer(t *testing.T, manifestURL string, handler http.HandlerFunc) string {
+	t.Helper()
+	root := t.TempDir()
+	dataRoot := filepath.Join(root, "data")
+	configPath := filepath.Join(root, "manager.toml")
+	socketPath := filepath.Join(root, "manager.sock")
+	configBody := "data_root = \"" + dataRoot + "\"\n" +
+		"socket_path = \"" + socketPath + "\"\n" +
+		"release_manifest_url = \"" + manifestURL + "\"\n"
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(dataRoot, "manager", "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secrets, "manager-token"), []byte("control-token-0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: handler}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	return configPath
+}
+
 func TestAwaitOperationReturnsTerminalFailure(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "manager.sock")
 	listener, err := net.Listen("unix", socket)
@@ -943,7 +1095,7 @@ func TestGatewayControllerHotReconcilesIndependentLANListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Defaults()
+	cfg, err := config.Defaults(testActiveProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,7 +1110,7 @@ func TestGatewayControllerHotReconcilesIndependentLANListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	configs := config.NewManager(cfg)
-	controller := newGatewayController(&application{config: cfg, configs: configs, state: store})
+	controller := newGatewayController(&application{profile: testActiveProfile, config: cfg, configs: configs, state: store})
 	t.Cleanup(controller.Stop)
 	if err := controller.Start(); err != nil {
 		t.Fatal(err)
@@ -1017,28 +1169,41 @@ func newMaintenanceTestApplication(t *testing.T, cleanup maintenanceCleanup, rec
 		t.Fatal(err)
 	}
 	sandboxPath := filepath.Join(root, "manager", "sandboxes.json")
+	dataDir := filepath.Join(root, "data")
 	if len(records) > 0 {
 		registry := struct {
-			SchemaVersion int                       `json:"schema_version"`
-			Records       map[string]sandbox.Record `json:"records"`
-		}{SchemaVersion: 1, Records: map[string]sandbox.Record{}}
+			SchemaVersion    int                       `json:"schema_version"`
+			TechnicalProfile string                    `json:"technical_profile"`
+			Records          map[string]sandbox.Record `json:"records"`
+		}{SchemaVersion: 2, TechnicalProfile: identity.SourceProfile().ProfileID, Records: map[string]sandbox.Record{}}
 		for _, record := range records {
 			hash := sha256.Sum256([]byte(record.SandboxID))
 			record.SandboxHash = hex.EncodeToString(hash[:])
 			record.ContainerName = "ubitech-sandbox-" + record.SandboxHash[:16]
+			record.UID, record.GID = os.Getuid(), os.Getgid()
+			record.WorkspacePath = filepath.ToSlash(filepath.Join("workspaces", record.WorkspaceID))
+			record.HomePath = "agent-envs/" + record.SandboxHash + "/home"
+			record.EnvironmentPath = "agent-envs/" + record.SandboxHash + "/env"
+			record.AttachmentsPath = "attachments/private/1"
+			for _, relative := range []string{record.WorkspacePath, record.HomePath, record.EnvironmentPath, record.AttachmentsPath} {
+				if err := os.MkdirAll(filepath.Join(dataDir, filepath.FromSlash(relative)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
 			registry.Records[record.SandboxID] = record
 		}
 		writeTestJSON(t, sandboxPath, registry)
 	}
-	sandboxes, err := sandbox.Open(nil, filepath.Join(root, "data"), sandboxPath, maintenanceImage("default-sandbox"), "test", time.Minute)
+	sandboxes, err := sandbox.Open(testActiveProfile, nil, dataDir, sandboxPath, maintenanceImage("default-sandbox"), "test", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	selfUpdater := &selfupdate.Manager{Root: filepath.Join(root, "manager", "manager-binaries"), StatePath: filepath.Join(root, "manager", "manager-binaries.json")}
-	return &application{
+	selfUpdater := &selfupdate.Manager{Profile: testActiveProfile, Root: filepath.Join(root, "manager", "manager-binaries"), StatePath: filepath.Join(root, "manager", "manager-binaries.json")}
+	return &application{profile: testActiveProfile,
 		config: config.Config{StateDir: filepath.Join(root, "manager"), ReleaseChannel: contract.ReleaseChannel},
 		state:  store, sandboxes: sandboxes, selfUpdate: selfUpdater,
 		maintenanceMu: &maintenance.Admission{}, maintenanceJobs: cleanup,
+		handoffAdmission: openHandoffMutationAdmission{},
 	}, store
 }
 
@@ -1049,7 +1214,7 @@ func writeMaintenanceRelease(t *testing.T, root, id string, generatedAt time.Tim
 	images := map[string]string{}
 	for _, name := range []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq",
+		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 	} {
 		images[name] = maintenanceImage(seed + "-" + name)
 	}

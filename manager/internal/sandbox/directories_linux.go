@@ -16,6 +16,18 @@ import (
 // symlink, non-directory, or owned by an identity other than the Manager's
 // deployment UID/GID.
 func ensureOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
+	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, true)
+}
+
+// validateOwnedDirectoryBelow proves an existing persisted bind without
+// creating or repairing anything. It is used when upgrading the v1 Sandbox
+// registry: a missing directory is evidence that the old record is incomplete,
+// not permission to manufacture the fact needed to accept it.
+func validateOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
+	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, false)
+}
+
+func walkOwnedDirectoryBelow(dataDir, target string, uid, gid int, create bool) error {
 	base := filepath.Clean(dataDir)
 	target = filepath.Clean(target)
 	if !filepath.IsAbs(base) || !filepath.IsAbs(target) {
@@ -25,8 +37,10 @@ func ensureOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return errors.New("sandbox bind root must be below the configured data directory")
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return fmt.Errorf("create sandbox data directory: %w", err)
+	if create {
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return fmt.Errorf("create sandbox data directory: %w", err)
+		}
 	}
 	currentFD, err := syscall.Open(base, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
@@ -43,7 +57,7 @@ func ensureOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
 			return errors.New("sandbox bind root contains an invalid path segment")
 		}
 		nextFD, openErr := syscall.Openat(currentFD, part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		if errors.Is(openErr, syscall.ENOENT) {
+		if create && errors.Is(openErr, syscall.ENOENT) {
 			if mkdirErr := syscall.Mkdirat(currentFD, part, 0o700); mkdirErr != nil && !errors.Is(mkdirErr, syscall.EEXIST) {
 				return fmt.Errorf("create sandbox directory %q: %w", part, mkdirErr)
 			}

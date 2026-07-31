@@ -627,13 +627,45 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/internal/manager/health" and method == "GET":
             self._json(service.manager_internal_health())
             return
+        if path == "/internal/manager/handoff/evidence" and method == "GET":
+            self._json(service.manager_handoff_evidence())
+            return
+        if path == "/internal/manager/handoff/reservation" and method == "GET":
+            self._json(service.manager_handoff_reservation())
+            return
+        if path == "/internal/manager/handoff/commit-release" and method == "POST":
+            body = self._body_json_closed_world(
+                frozenset(
+                    {"operation_id", "target_generation", "binding_sha256"}
+                )
+            )
+            self._json(
+                service.manager_handoff_commit_release(
+                    body["operation_id"],
+                    body["target_generation"],
+                    body["binding_sha256"],
+                )
+            )
+            return
         if path == "/internal/manager/update/readiness" and method == "POST":
             body = self._body_json()
             self._json(service.manager_update_readiness(str(body.get("operation_id") or "")))
             return
-        if path == "/internal/manager/update/release" and method == "POST":
-            body = self._body_json()
-            self._json(service.manager_update_release(str(body.get("operation_id") or "")))
+        if path == "/internal/manager/update/commit-release" and method == "POST":
+            body = self._body_json_closed_world(frozenset({"operation_id"}))
+            self._json(
+                service.manager_update_commit_release(
+                    body["operation_id"]
+                )
+            )
+            return
+        if path == "/internal/manager/update/abort-release" and method == "POST":
+            body = self._body_json_closed_world(frozenset({"operation_id"}))
+            self._json(
+                service.manager_update_abort_release(
+                    body["operation_id"]
+                )
+            )
             return
         raise ServiceError(404, "manager endpoint not found")
 
@@ -1298,6 +1330,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(400, "invalid JSON body") from exc
         if not isinstance(data, dict):
             raise ServiceError(400, "JSON body must be an object")
+        return data
+
+    def _body_json_closed_world(
+        self, fields: frozenset[str], *, maximum_bytes: int = 16 * 1024
+    ) -> dict[str, Any]:
+        length = self._content_length()
+        if length > maximum_bytes:
+            raise ServiceError(413, "request body too large")
+        raw = self.rfile.read(length) if length else b"{}"
+
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(f"duplicate JSON field {key!r}")
+                value[key] = item
+            return value
+
+        try:
+            data = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=reject_duplicates
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ServiceError(400, "invalid JSON body") from exc
+        if not isinstance(data, dict) or set(data) != set(fields):
+            raise ServiceError(400, "JSON body fields do not match the endpoint schema")
         return data
 
     def _body_message(self) -> tuple[str, list[UploadedFile]]:

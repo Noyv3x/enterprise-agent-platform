@@ -11,12 +11,22 @@ import (
 	"strings"
 	"time"
 
+	technicalidentity "github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type FileService struct {
 	Sandboxes *sandbox.Manager
 	MaxBytes  int64
+	profile   technicalidentity.Profile
+}
+
+func NewFileService(active technicalidentity.ActiveProfile, sandboxes *sandbox.Manager, maxBytes int64) (FileService, error) {
+	profile, err := active.Profile()
+	if err != nil {
+		return FileService{}, fmt.Errorf("file executor technical profile: %w", err)
+	}
+	return FileService{Sandboxes: sandboxes, MaxBytes: maxBytes, profile: profile}, nil
 }
 
 func (s FileService) Execute(ctx context.Context, call Call) (string, map[string]any, error) {
@@ -91,7 +101,7 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 			if err != nil {
 				return "", nil, err
 			}
-			if err := writeManagedFile(path, []byte(args.Content), 0o600); err != nil {
+			if err := writeManagedFile(path, []byte(args.Content), 0o600, s.profile.InternalWorkspaceDirectory); err != nil {
 				return "", nil, err
 			}
 		} else {
@@ -99,7 +109,7 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 			if err != nil {
 				return "", nil, err
 			}
-			if err := writeManagedFile(path, []byte(args.Content), 0o600); err != nil {
+			if err := writeManagedFile(path, []byte(args.Content), 0o600, s.profile.InternalWorkspaceDirectory); err != nil {
 				return "", nil, err
 			}
 		}
@@ -150,7 +160,7 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 		if int64(len(updated)) > s.MaxBytes {
 			return "", nil, errors.New("patched file exceeds manager limit")
 		}
-		if err := writeManagedFileAt(parent, leaf, updated, 0o600); err != nil {
+		if err := writeManagedFileAt(parent, leaf, updated, 0o600, s.profile.InternalWorkspaceDirectory); err != nil {
 			return "", nil, err
 		}
 		return fmt.Sprintf("Patched %s (%d replacement%s)", args.Path, count, plural(count)), map[string]any{"path": args.Path, "replacements": count}, nil

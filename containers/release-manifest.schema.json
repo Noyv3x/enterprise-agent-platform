@@ -26,8 +26,8 @@
     "compose": { "$ref": "#/$defs/artifact" },
     "images": {
       "type": "object",
-      "minProperties": 10,
-      "maxProperties": 10,
+      "minProperties": 11,
+      "maxProperties": 11,
       "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
       "additionalProperties": { "$ref": "#/$defs/image" },
       "required": [
@@ -40,7 +40,8 @@
         "firecrawl-playwright",
         "firecrawl-postgres",
         "firecrawl-redis",
-        "firecrawl-rabbitmq"
+        "firecrawl-rabbitmq",
+        "handoff-fs-helper"
       ]
     },
     "namespace_handoff": { "$ref": "#/$defs/namespace_handoff" }

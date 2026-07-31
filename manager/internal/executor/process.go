@@ -27,9 +27,15 @@ import (
 )
 
 type ProcessManager struct {
-	Engine              driver.Engine
-	Sandboxes           *sandbox.Manager
-	MaxOutput           int64
+	Engine    driver.Engine
+	Sandboxes *sandbox.Manager
+	MaxOutput int64
+	// BackgroundAdmission is the deployment-wide handoff observation used by
+	// asynchronous process completion. Foreground process mutations remain
+	// inside the executor request's global -> runtime lease; background waiters
+	// must reacquire the global lease before changing their observable status,
+	// registry counters, process journal, or retained files.
+	BackgroundAdmission func(context.Context) (release func(), err error)
 	mu                  sync.Mutex
 	processes           map[string]*managedProcess
 	pendingByFamily     map[string]int
@@ -39,6 +45,7 @@ type ProcessManager struct {
 	maxCompletedRecords int
 	completedRecordTTL  time.Duration
 	previewID           string
+	profile             technicalidentity.Profile
 }
 type managedProcess struct {
 	mu             sync.Mutex
@@ -100,12 +107,16 @@ func (b *boundedBuffer) String() string {
 	return result
 }
 
-func NewProcessManager(engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64) *ProcessManager {
+func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64, backgroundAdmission func(context.Context) (func(), error)) (*ProcessManager, error) {
+	profile, err := active.Profile()
+	if err != nil {
+		return nil, fmt.Errorf("process executor technical profile: %w", err)
+	}
 	if maxOutput < 1024 {
 		maxOutput = 1 << 20
 	}
 	manager := &ProcessManager{
-		Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput,
+		Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput, BackgroundAdmission: backgroundAdmission,
 		processes:           map[string]*managedProcess{},
 		pendingByFamily:     map[string]int{},
 		maxRunningPerFamily: 16,
@@ -113,10 +124,11 @@ func NewProcessManager(engine driver.Engine, sandboxes *sandbox.Manager, maxOutp
 		maxCompletedRecords: 64,
 		completedRecordTTL:  time.Hour,
 		previewID:           newPreviewID(),
+		profile:             profile,
 	}
 	manager.recoverSandboxProcesses()
 	manager.pruneCompleted(time.Now())
-	return manager
+	return manager, nil
 }
 
 func newPreviewID() string {
@@ -269,7 +281,7 @@ if [ ! -r "$file" ]; then echo stopped; exit 0; fi
 read -r pid expected < "$file" || { echo unknown; exit 0; }
 case "$pid:$expected" in *[!0-9:]*) echo unknown; exit 0;; esac
 actual=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)
-if [ "$actual" = "$expected" ] && kill -0 "$pid" 2>/dev/null; then echo running; else rm -f "$file"; echo stopped; fi
+if [ "$actual" = "$expected" ] && kill -0 "$pid" 2>/dev/null; then echo running; else echo stopped; fi
 `
 
 func (m *ProcessManager) Run(requestContext context.Context, call Call, args terminalArguments) (ProcessSnapshot, error) {
@@ -351,7 +363,7 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 		}
 		cwd = resolved.Canonical
 		name = "/bin/sh"
-		commandArgs = []string{"-c", hostProcessWrapper, technicalidentity.SourceProfile().ManagerBinary, args.Command}
+		commandArgs = []string{"-c", hostProcessWrapper, m.profile.ManagerBinary, args.Command}
 	} else {
 		return ProcessSnapshot{}, errors.New("invalid target")
 	}
@@ -423,7 +435,22 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 }
 
 func (m *ProcessManager) wait(process *managedProcess) {
+	process.mu.Lock()
+	startedInBackground := process.snapshot.Background
+	process.mu.Unlock()
 	err := process.command.Wait()
+	releaseAdmission := func() {}
+	if startedInBackground {
+		var admissionErr error
+		releaseAdmission, admissionErr = m.acquireBackgroundAdmission(context.Background())
+		if admissionErr != nil {
+			// Keep the in-memory and durable process active. That conservative
+			// state continues to block handoff rather than publishing process
+			// control or completion outside the global observation boundary.
+			return
+		}
+	}
+	defer releaseAdmission()
 	contextErr := process.context.Err()
 	confirmed := true
 	if process.snapshot.Target == "sandbox" && err != nil {
@@ -628,6 +655,13 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		if err != nil || running {
 			continue
 		}
+		releaseAdmission, admissionErr := m.acquireBackgroundAdmission(context.Background())
+		if admissionErr != nil {
+			// A nonterminal handoff owns the deployment. Preserve the active
+			// durable record and let target/source startup reconciliation settle
+			// it under the selected namespace instead of writing across ownership.
+			return
+		}
 		now := time.Now().UTC()
 		process.mu.Lock()
 		if activeProcessStatus(process.snapshot.Status) {
@@ -636,15 +670,37 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 			process.snapshot.StopConfirmed = nil
 		}
 		process.mu.Unlock()
+		if process.hostPIDFile != "" {
+			_ = os.Remove(process.hostPIDFile)
+		}
 		_ = m.persistProcess(process)
 		_ = m.Sandboxes.ProcessExited(process.sandboxID, now)
 		m.pruneCompleted(now)
+		releaseAdmission()
 		return
 	}
 }
 
+func (m *ProcessManager) acquireBackgroundAdmission(ctx context.Context) (func(), error) {
+	if m == nil || m.BackgroundAdmission == nil {
+		return nil, errors.New("background process handoff admission is unavailable")
+	}
+	releaseAdmission, err := m.BackgroundAdmission(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if releaseAdmission == nil {
+		return nil, errors.New("background process handoff admission returned a nil release function")
+	}
+	if err := ctx.Err(); err != nil {
+		releaseAdmission()
+		return nil, err
+	}
+	return releaseAdmission, nil
+}
+
 func (m *ProcessManager) sandboxCommand(process *managedProcess, script string) (string, error) {
-	name, args := m.Engine.ExecArgs(process.spec, contract.ContainerAgentEnv, "/bin/sh", []string{"-c", script, technicalidentity.SourceProfile().ManagerBinary, process.pidFile})
+	name, args := m.Engine.ExecArgs(process.spec, contract.ContainerAgentEnv, "/bin/sh", []string{"-c", script, m.profile.ManagerBinary, process.pidFile})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()

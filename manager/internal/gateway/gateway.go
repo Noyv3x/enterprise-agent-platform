@@ -26,6 +26,7 @@ type StateProvider interface{ State() model.ManagerState }
 type Handler struct {
 	State    StateProvider
 	Proxy    *httputil.ReverseProxy
+	profile  identity.Profile
 	accessMu sync.RWMutex
 	access   AccessPolicy
 }
@@ -47,11 +48,15 @@ type forwardingMetadata struct {
 	host     string
 }
 
-func NewHandler(state StateProvider, platformURL string) (*Handler, error) {
-	return NewHandlerWithAccess(state, platformURL, AccessPolicy{})
+func NewHandler(active identity.ActiveProfile, state StateProvider, platformURL string) (*Handler, error) {
+	return NewHandlerWithAccess(active, state, platformURL, AccessPolicy{})
 }
 
-func NewHandlerWithAccess(state StateProvider, platformURL string, access AccessPolicy) (*Handler, error) {
+func NewHandlerWithAccess(active identity.ActiveProfile, state StateProvider, platformURL string, access AccessPolicy) (*Handler, error) {
+	profile, err := active.Profile()
+	if err != nil {
+		return nil, fmt.Errorf("Gateway technical profile: %w", err)
+	}
 	target, err := url.Parse(platformURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse platform URL: %w", err)
@@ -77,7 +82,7 @@ func NewHandlerWithAccess(state StateProvider, platformURL string, access Access
 		response.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = response.Write([]byte(fallbackPage))
 	}
-	return &Handler{State: state, Proxy: proxy, access: cloneAccessPolicy(access)}, nil
+	return &Handler{State: state, Proxy: proxy, profile: profile, access: cloneAccessPolicy(access)}, nil
 }
 
 func (h *Handler) SetAccessPolicy(access AccessPolicy) {
@@ -121,15 +126,14 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 	metadata := forwardingMetadataFor(access, request, peer)
 	request = request.WithContext(context.WithValue(request.Context(), forwardingContextKey{}, metadata))
 	state := h.State.State()
-	profile := identity.SourceProfile()
-	if request.URL.Path == profile.GatewayStatusPath {
+	if request.URL.Path == h.profile.GatewayStatusPath {
 		safeHeaders(response.Header())
 		response.Header().Set("Content-Type", "application/json")
 		response.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(response).Encode(publicState(state))
 		return
 	}
-	if request.URL.Path == profile.GatewayHealthPath {
+	if request.URL.Path == h.profile.GatewayHealthPath {
 		safeHeaders(response.Header())
 		response.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(response).Encode(map[string]any{"healthy": state.PublicState != model.StateFailed, "state": state.PublicState})

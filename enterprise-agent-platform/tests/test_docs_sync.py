@@ -96,7 +96,12 @@ class DocsSyncTests(unittest.TestCase):
                 },
                 {
                     "id": "deployment",
-                    "documents": ["docs/design/deployment.md"],
+                    "documents": [
+                        "docs/design/deployment.md",
+                        "docs/contracts/release-transition.json",
+                        "docs/contracts/release-transition-challenge.schema.json",
+                        "docs/contracts/release-transition-receipt.schema.json",
+                    ],
                     "code": ["manager/**"],
                     "tests": [],
                 },
@@ -233,6 +238,17 @@ class DocsSyncTests(unittest.TestCase):
         files: dict[str, str] = {
             "docs/domains.json": json.dumps(manifest or self.manifest(), indent=2) + "\n",
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
+            "docs/contracts/release-transition.json": (
+                REPOSITORY_ROOT / "docs/contracts/release-transition.json"
+            ).read_text(encoding="utf-8"),
+            "docs/contracts/release-transition-challenge.schema.json": (
+                REPOSITORY_ROOT
+                / "docs/contracts/release-transition-challenge.schema.json"
+            ).read_text(encoding="utf-8"),
+            "docs/contracts/release-transition-receipt.schema.json": (
+                REPOSITORY_ROOT
+                / "docs/contracts/release-transition-receipt.schema.json"
+            ).read_text(encoding="utf-8"),
             "docs/contracts/container-platform.json": json.dumps(
                 {
                     "schema_version": 1,
@@ -246,6 +262,34 @@ class DocsSyncTests(unittest.TestCase):
                         "agent_env": "/opt/agent-env",
                     },
                     "execution_targets": ["sandbox", "host"],
+                    "persistent_data_owners": {
+                        "cognee": [],
+                        "searxng": [],
+                        "firecrawl-redis": [
+                            {"uid": 999, "gid": 0},
+                            {"uid": 999, "gid": 1000},
+                        ],
+                        "firecrawl-rabbitmq": [
+                            {"uid": 999, "gid": 0},
+                            {"uid": 999, "gid": 999},
+                        ],
+                        "firecrawl-postgres": [
+                            {"uid": 999, "gid": 0},
+                            {"uid": 999, "gid": 999},
+                        ],
+                    },
+                    "agent_runtime_handoff": json.loads(
+                        (
+                            REPOSITORY_ROOT
+                            / "docs/contracts/container-platform.json"
+                        ).read_text(encoding="utf-8")
+                    )["agent_runtime_handoff"],
+                    "p1_source_handoff": json.loads(
+                        (
+                            REPOSITORY_ROOT
+                            / "docs/contracts/container-platform.json"
+                        ).read_text(encoding="utf-8")
+                    )["p1_source_handoff"],
                     "sandbox_idle_seconds": 1800,
                     "migration_backup_retention_seconds": 604800,
                     "obsolete_artifact_retention_seconds": 3600,
@@ -292,6 +336,10 @@ class DocsSyncTests(unittest.TestCase):
                         "firecrawl-rabbitmq": {
                             "compressed_bytes": 1073741824,
                             "unpacked_bytes": 2147483648,
+                        },
+                        "handoff-fs-helper": {
+                            "compressed_bytes": 536870912,
+                            "unpacked_bytes": 1073741824,
                         },
                     },
                     "public_update_states": [
@@ -456,6 +504,42 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("sync", expect=1)
         self.assertIn("0 <= minimum <= default <= maximum", result.stderr)
 
+    def test_release_transition_contract_and_receipt_schemas_fail_closed(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        transition_path = self.root / "docs/contracts/release-transition.json"
+        transition = json.loads(transition_path.read_text(encoding="utf-8"))
+        transition["promotion"]["require_direct_predecessor"] = False
+        transition_path.write_text(json.dumps(transition), encoding="utf-8")
+        policy = self.run_command("sync", expect=1)
+        self.assertIn("direct-predecessor draft gates", policy.stderr)
+
+        self.write_fixture()
+        schema_path = (
+            self.root
+            / "docs/contracts/release-transition-receipt.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema["additionalProperties"] = True
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        schema_result = self.run_command("sync", expect=1)
+        self.assertIn("schema must describe a closed object", schema_result.stderr)
+
+    def test_release_transition_accepts_target_baseline_without_draft_gate(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        transition_path = self.root / "docs/contracts/release-transition.json"
+        transition = json.loads(transition_path.read_text(encoding="utf-8"))
+        transition["stage"] = "target_baseline"
+        transition.pop("source_owner_compat")
+        transition_path.write_text(json.dumps(transition), encoding="utf-8")
+        self.run_command("sync", expect=0)
+
+        transition["promotion"]["draft_stages"].append("target_baseline")
+        transition_path.write_text(json.dumps(transition), encoding="utf-8")
+        policy = self.run_command("sync", expect=1)
+        self.assertIn("direct-predecessor draft gates", policy.stderr)
+
     def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:
         self.initialize_git()
         self.write_fixture()
@@ -470,6 +554,95 @@ class DocsSyncTests(unittest.TestCase):
             "must contain exactly compressed_bytes and unpacked_bytes",
             result.stderr,
         )
+
+    def test_container_contract_rejects_runtime_retired_root_drift(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/container-platform.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["agent_runtime_handoff"]["p1_retired_roots"]["app"][  # type: ignore[index]
+            "allowed_symlinks"
+        ]["node_modules/.bin/extra"] = "../extra/bin.js"
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        result = self.run_command("sync", expect=1)
+        self.assertIn("P1 app symlink set is invalid", result.stderr)
+
+    def test_container_contract_rejects_invalid_runtime_validation_limits(self) -> None:
+        self.initialize_git()
+        path = self.root / "docs/contracts/container-platform.json"
+        for invalid in (True, 0):
+            with self.subTest(invalid=invalid):
+                self.write_fixture()
+                contract = json.loads(path.read_text(encoding="utf-8"))
+                contract["agent_runtime_handoff"]["validation_limits"][  # type: ignore[index]
+                    "maximum_jsonl_records"
+                ] = invalid
+                path.write_text(
+                    json.dumps(contract, indent=2) + "\n", encoding="utf-8"
+                )
+                result = self.run_command("sync", expect=1)
+                self.assertIn(
+                    "validation_limits.maximum_jsonl_records must be a positive JavaScript-safe integer",
+                    result.stderr,
+                )
+
+    def test_container_contract_runtime_limit_change_drives_all_generated_targets(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/container-platform.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["agent_runtime_handoff"]["validation_limits"][  # type: ignore[index]
+            "maximum_jsonl_records"
+        ] = 123_457
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+
+        self.run_command("sync", expect=0)
+        self.run_command("check", expect=0)
+        generated = {
+            "python": self.root
+            / "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py",
+            "runtime": self.root
+            / "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts",
+            "frontend": self.root
+            / "enterprise-agent-platform/frontend/src/container-contract.generated.ts",
+            "go": self.root / "manager/internal/contract/generated.go",
+        }
+        self.assertIn(
+            "'maximum_jsonl_records': 123457",
+            generated["python"].read_text(encoding="utf-8"),
+        )
+        for name in ("runtime", "frontend"):
+            self.assertIn(
+                '"maximum_jsonl_records": 123457',
+                generated[name].read_text(encoding="utf-8"),
+            )
+        self.assertTrue(
+            any(
+                line.split() == ["AgentRuntimeMaximumJSONLRecords", "=", "123457"]
+                for line in generated["go"].read_text(encoding="utf-8").splitlines()
+            )
+        )
+
+    def test_container_contract_rejects_p1_source_layout_and_digest_drift(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/container-platform.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["p1_source_handoff"]["layouts"]["manager"]["entries"][  # type: ignore[index]
+            "migration.json"
+        ]["disposition"] = "ignored"
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        layout = self.run_command("sync", expect=1)
+        self.assertIn("invalid type or disposition", layout.stderr)
+
+        self.write_fixture()
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["p1_source_handoff"]["fixed_sha256"][  # type: ignore[index]
+            "data/runtimes/cognee/python-install.json"
+        ] = "not-a-digest"
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        digest = self.run_command("sync", expect=1)
+        self.assertIn("fixed_sha256 is invalid", digest.stderr)
 
     def test_check_change_requires_documentation_for_code(self) -> None:
         base = self.ready_repository()

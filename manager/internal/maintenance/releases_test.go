@@ -24,6 +24,11 @@ type recordingImagePruner struct {
 	disposition map[string]bool
 }
 
+const (
+	retainedHandoffPredecessorID     = "983f79b4900502f35fac6de8154eb344fc9f143b"
+	retainedHandoffPredecessorSHA256 = "8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1"
+)
+
 func (p *recordingImagePruner) PruneManagedImages(_ context.Context, candidates []string, protected map[string]struct{}, _ RemovalGuard) (map[string]bool, error) {
 	p.candidates = append([]string(nil), candidates...)
 	p.protected = cloneStringSet(protected)
@@ -72,6 +77,49 @@ func TestPruneReleasesRemovesOnlyExpiredVerifiedUnprotectedGeneration(t *testing
 	}
 	if len(pruner.candidates) == 0 || !sort.StringsAreSorted(pruner.candidates) {
 		t.Fatalf("image cleanup candidates are missing or unstable: %#v", pruner.candidates)
+	}
+}
+
+func TestPruneReleasesDoesNotParseStateProtectedRetainedHandoffPredecessor(t *testing.T) {
+	root := t.TempDir()
+	path := writeRetainedHandoffPredecessor(t, root)
+	pruner := &recordingImagePruner{}
+	now := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+
+	removed, err := PruneReleases(context.Background(), now, ReleasePolicy{
+		Root: root, Channel: "main", Retention: time.Hour,
+		ProtectedIDs: map[string]struct{}{retainedHandoffPredecessorID: {}},
+		Images:       pruner, RemovalGuard: acceptingRemovalGuard(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 || len(pruner.candidates) != 0 {
+		t.Fatalf("state-protected P1 crossed ordinary maintenance: removed=%d images=%#v", removed, pruner.candidates)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("state-protected P1 release was changed: %v", err)
+	}
+}
+
+func TestPruneReleasesDoesNotUseLegacyDecoderForUnboundRetainedHandoffPredecessor(t *testing.T) {
+	root := t.TempDir()
+	path := writeRetainedHandoffPredecessor(t, root)
+	pruner := &recordingImagePruner{}
+	now := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+
+	removed, err := PruneReleases(context.Background(), now, ReleasePolicy{
+		Root: root, Channel: "main", Retention: time.Hour,
+		Images: pruner, RemovalGuard: acceptingRemovalGuard(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 || len(pruner.candidates) != 0 {
+		t.Fatalf("unbound P1 entered ordinary maintenance through a legacy decoder: removed=%d images=%#v", removed, pruner.candidates)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("unbound P1 evidence was not retained fail-closed: %v", err)
 	}
 }
 
@@ -508,7 +556,7 @@ func writeRelease(t *testing.T, root, id string, generatedAt time.Time, digestDi
 	for _, name := range []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq",
+		"firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 	} {
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(digestDigit, 64)
 	}
@@ -537,6 +585,36 @@ func writeRelease(t *testing.T, root, id string, generatedAt time.Time, digestDi
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), compose, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeRetainedHandoffPredecessor(t *testing.T, root string) string {
+	t.Helper()
+	fixture := filepath.Join("..", "release", "testdata", retainedHandoffPredecessorID+"-release.json")
+	raw, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	if got := hex.EncodeToString(digest[:]); got != retainedHandoffPredecessorSHA256 {
+		t.Fatalf("retained handoff predecessor fixture SHA-256 = %s", got)
+	}
+	path := filepath.Join(root, retainedHandoffPredecessorID)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "manifest.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Ordinary maintenance must reject the legacy exact-10 image shape before
+	// reading Compose. The real Compose remains a release asset used only by the
+	// narrowly bound handoff predecessor decoder/participant path.
+	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {

@@ -292,7 +292,7 @@ func newStartupTempCleanupManager(t *testing.T) (*Manager, string, time.Time) {
 		}
 	}
 	now := time.Unix(2_000_000_000, 0).UTC()
-	manager := &Manager{
+	manager := &Manager{Profile: testActiveProfile,
 		Root:             root,
 		StatePath:        filepath.Join(stateDirectory, "manager-binaries.json"),
 		InstallPath:      filepath.Join(stateDirectory, "bin", "ubitech-manager"),

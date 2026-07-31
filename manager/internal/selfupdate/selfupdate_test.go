@@ -1,6 +1,7 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,9 +23,41 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
+
+var (
+	testActiveProfile    = identity.SourceActiveProfile()
+	testTechnicalProfile = identity.SourceProfile()
+)
+
+func runTestWatchdog(ctx context.Context, active identity.ActiveProfile, planPath string, runner Runner) error {
+	return runTestWatchdogWithTransfer(ctx, active, planPath, runner, func() error { return nil })
+}
+
+func runTestWatchdogWithTransfer(ctx context.Context, active identity.ActiveProfile, planPath string, runner Runner, transfer func() error) error {
+	_, plan, err := readRecoveryActivationPlan(planPath)
+	if err != nil {
+		return err
+	}
+	binding := testWatchdogBinding(active, plan)
+	return RunWatchdog(ctx, binding, planPath, runner, transfer)
+}
+
+func testWatchdogBinding(active identity.ActiveProfile, plan Plan) WatchdogBinding {
+	root := filepath.Dir(filepath.Dir(plan.PlanPath))
+	return WatchdogBinding{
+		active: active, configPath: filepath.Join(filepath.Dir(root), "test-manager.toml"),
+		root: root, statePath: plan.StatePath, activationRoot: filepath.Dir(plan.PlanPath),
+		installPath: plan.InstallPath, socketPath: plan.SocketPath,
+		controlTokenFile: plan.ControlTokenFile, unitName: plan.UnitName,
+		bindingValidator: func(WatchdogBinding) error { return nil },
+		processVerifier:  func(context.Context, WatchdogBinding, Plan, string, string, bool) error { return nil },
+	}
+}
 
 type fakeRunner struct {
 	calls       [][]string
@@ -60,7 +93,7 @@ func TestStartupIdentityTracksRunningInodeAfterPathReplacement(t *testing.T) {
 		if err := atomicfile.WriteJSON(statePath, state, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		manager := &Manager{StatePath: statePath}
+		manager := &Manager{Profile: testActiveProfile, StatePath: statePath}
 		if err := manager.AcknowledgeStartup(); err == nil || !strings.Contains(err.Error(), "not the registered Current") {
 			t.Fatalf("startup acknowledgement followed replaced path instead of running inode: %v", err)
 		}
@@ -144,7 +177,7 @@ func newPreparedManager(t *testing.T) (*Manager, release.Manifest, []byte, *fake
 	if err := atomicfile.WriteFile(tokenFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{Root: filepath.Join(root, "state", "binaries"), StatePath: filepath.Join(root, "state", "manager-binaries.json"), InstallPath: install, SocketPath: filepath.Join(root, "manager.sock"), ControlTokenFile: tokenFile, UnitName: "ubitech-agent-manager.service", RunningVersion: "current", Client: release.Client{HTTP: server.Client()}, Runner: runner, Now: func() time.Time { return time.Unix(10, 0) }, BootID: func() string { return "boot-a" }}
+	manager := &Manager{Profile: testActiveProfile, ConfigPath: filepath.Join(root, "config", "manager.toml"), Root: filepath.Join(root, "state", "binaries"), StatePath: filepath.Join(root, "state", "manager-binaries.json"), InstallPath: install, SocketPath: filepath.Join(root, "manager.sock"), ControlTokenFile: tokenFile, UnitName: "ubitech-agent-manager.service", RunningVersion: "current", Client: release.Client{HTTP: server.Client()}, Runner: runner, Now: func() time.Time { return time.Unix(10, 0) }, BootID: func() string { return "boot-a" }}
 	manager.RecoveryUnitActive = func(_ context.Context, unit string) (bool, error) {
 		return runner.activeUnits[unit], nil
 	}
@@ -173,7 +206,7 @@ func ordinaryTestPlan(manager *Manager, manifest release.Manifest, state State, 
 
 func TestProbeTransientUnitUsesWaitedCollectibleOneshot(t *testing.T) {
 	runner := &fakeRunner{}
-	manager := &Manager{Runner: runner}
+	manager := &Manager{Profile: testActiveProfile, Runner: runner}
 	if err := manager.ProbeTransientUnit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +218,7 @@ func TestProbeTransientUnitUsesWaitedCollectibleOneshot(t *testing.T) {
 
 func TestProbeTransientUnitFailsClosed(t *testing.T) {
 	runner := &fakeRunner{fail: "systemd-run"}
-	manager := &Manager{Runner: runner}
+	manager := &Manager{Profile: testActiveProfile, Runner: runner}
 	if err := manager.ProbeTransientUnit(context.Background()); err == nil || !strings.Contains(err.Error(), "probe user-systemd transient unit") {
 		t.Fatalf("expected a fail-closed transient probe, got %v", err)
 	}
@@ -273,7 +306,7 @@ func TestDiscardPreparedRejectsCommittedActivatedOrMismatchedCandidate(t *testin
 }
 
 func TestActivateCreatesOwnerOnlyActivationDirectoryOnFreshRoot(t *testing.T) {
-	manager, manifest, _, _ := newPreparedManager(t)
+	manager, manifest, _, runner := newPreparedManager(t)
 	activationsRoot := filepath.Join(manager.Root, "activations")
 	if _, err := os.Lstat(activationsRoot); !os.IsNotExist(err) {
 		t.Fatalf("fresh Manager unexpectedly has activation directory: %v", err)
@@ -288,6 +321,55 @@ func TestActivateCreatesOwnerOnlyActivationDirectoryOnFreshRoot(t *testing.T) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
 		t.Fatalf("activation directory is not an owner-only real directory: mode=%v err=%v", info, err)
 	}
+	found := false
+	for _, call := range runner.calls {
+		if len(call) >= 4 && call[0] == "systemd-run" && call[len(call)-2] == "--config" && call[len(call)-1] == manager.ConfigPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("new-baseline watchdog omitted the Manager config binding: %#v", runner.calls)
+	}
+}
+
+func TestOrdinaryWatchdogOmitsConfigOnlyForExactP1RetainedCurrent(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{activeUnits: map[string]bool{}}
+	manager := &Manager{
+		Profile: testActiveProfile, ConfigPath: "relative-must-not-be-used", Runner: runner,
+		RecoveryUnitActive:       func(_ context.Context, unit string) (bool, error) { return runner.activeUnits[unit], nil },
+		OrdinaryWatchdogVerifier: func(context.Context, string, string, string, string) error { return nil },
+	}
+	plan := Plan{PlatformCommit: strings.Repeat("b", 40), PlanPath: filepath.Join(root, "plan.json")}
+	previous := Version{
+		SourceCommit: contract.SourceOwnerCompatGeneration, Path: filepath.Join(root, "p1", "ubitech-manager"),
+		SHA256: strings.Repeat("a", 64),
+	}
+	if err := manager.ensureOrdinaryWatchdog(context.Background(), plan, previous); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 || slicesContain(runner.calls[0], "--config") {
+		t.Fatalf("exact P1 watchdog unexpectedly required a new argv binding: %#v", runner.calls)
+	}
+
+	runner.calls = nil
+	runner.activeUnits = map[string]bool{}
+	previous.SourceCommit = strings.Repeat("c", 40)
+	if err := manager.ensureOrdinaryWatchdog(context.Background(), plan, previous); err == nil || !strings.Contains(err.Error(), "config binding") {
+		t.Fatalf("non-P1 watchdog accepted the legacy argv exception: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("invalid non-P1 watchdog spawned before config validation: %#v", runner.calls)
+	}
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestActivationRollbackQueryLeavesFreshRootUntouchedBeforeFirstActivate(t *testing.T) {
@@ -464,7 +546,7 @@ func TestActivateResumesPreparedPlanWithoutClobberingOrDuplicatingWatchdog(t *te
 	if err := persistActivationPlan(plan.PlanPath, plan); err != nil {
 		t.Fatal(err)
 	}
-	watchdogUnit := recoveryWatchdogUnitPrefix + manifest.SourceCommit[:12]
+	watchdogUnit := testTechnicalProfile.WatchdogUnitPrefix + manifest.SourceCommit[:12]
 	runner.activeUnits[watchdogUnit] = true
 	spawnsBefore := countFakeRunnerCommands(runner, "systemd-run")
 
@@ -592,7 +674,7 @@ func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 	if !managerHealthy(context.Background(), manager.SocketPath, manager.ControlTokenFile, plan.CandidateVersion, plan.CandidateSHA) {
 		t.Fatal("candidate identity fixture is not healthy")
 	}
-	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err != nil {
 		t.Fatal(err)
 	}
 	state, _ = manager.State()
@@ -601,6 +683,94 @@ func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 	}
 	if committed, err := manager.ActivationCommitted(manifest); err != nil || !committed {
 		t.Fatalf("watchdog commit was not visible to cleanup barrier: committed=%v err=%v", committed, err)
+	}
+}
+
+func TestWatchdogAuthorityTransferFailurePrecedesEveryMutation(t *testing.T) {
+	manager, manifest, _, runner := newPreparedManager(t)
+	if err := manager.MarkPlatformCommitted(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Activate(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.State()
+	if err != nil || state.Activation == nil {
+		t.Fatalf("activation fixture is incomplete: %#v %v", state, err)
+	}
+	stateBefore, err := os.ReadFile(manager.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBefore, err := os.ReadFile(state.Activation.PlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerCalls := len(runner.calls)
+	want := errors.New("handoff authority changed")
+	called := false
+	err = runTestWatchdogWithTransfer(context.Background(), testActiveProfile, state.Activation.PlanPath, runner, func() error {
+		called = true
+		return want
+	})
+	if !called || !errors.Is(err, want) {
+		t.Fatalf("watchdog authority transfer result = %v called=%v", err, called)
+	}
+	stateAfter, stateErr := os.ReadFile(manager.StatePath)
+	planAfter, planErr := os.ReadFile(state.Activation.PlanPath)
+	if stateErr != nil || planErr != nil || !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(planBefore, planAfter) {
+		t.Fatalf("failed watchdog authority transfer mutated durable state: state_err=%v plan_err=%v", stateErr, planErr)
+	}
+	if len(runner.calls) != runnerCalls {
+		t.Fatalf("failed watchdog authority transfer invoked a service mutation: %#v", runner.calls[runnerCalls:])
+	}
+}
+
+func TestWatchdogAcceptsLegacyArgvShapeOnlyForExactSourceOwnerPredecessor(t *testing.T) {
+	manager, manifest, _, runner := newPreparedManager(t)
+	if err := manager.MarkPlatformCommitted(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Activate(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.State()
+	if err != nil || state.Current == nil || state.Activation == nil {
+		t.Fatalf("activation fixture is incomplete: %#v %v", state, err)
+	}
+	_, plan, err := readRecoveryActivationPlan(state.Activation.PlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("stop after process proof")
+	for _, test := range []struct {
+		name       string
+		commit     string
+		wantCompat bool
+	}{
+		{name: "exact predecessor", commit: contract.SourceOwnerCompatGeneration, wantCompat: true},
+		{name: "ordinary current", commit: strings.Repeat("d", 40), wantCompat: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			latest, readErr := manager.State()
+			if readErr != nil || latest.Current == nil {
+				t.Fatalf("read Current: %#v %v", latest, readErr)
+			}
+			latest.Current.SourceCommit = test.commit
+			if writeErr := atomicfile.WriteJSON(manager.StatePath, latest, 0o600); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			binding := testWatchdogBinding(testActiveProfile, plan)
+			observed := false
+			binding.processVerifier = func(_ context.Context, _ WatchdogBinding, _ Plan, _, _ string, allowCompat bool) error {
+				observed = allowCompat
+				return nil
+			}
+			err := RunWatchdog(context.Background(), binding, plan.PlanPath, runner, func() error { return want })
+			if !errors.Is(err, want) || observed != test.wantCompat {
+				t.Fatalf("compat process proof = %v err=%v, want %v", observed, err, test.wantCompat)
+			}
+		})
 	}
 }
 
@@ -772,7 +942,7 @@ func TestOrdinaryWatchdogRecreatesCommittedPlanAfterStatePromotion(t *testing.T)
 			})}
 			go func() { _ = server.Serve(listener) }()
 			t.Cleanup(func() { _ = server.Close() })
-			if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
+			if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err != nil {
 				t.Fatalf("watchdog did not reconstruct committed plan: %v", err)
 			}
 			if checkpointErr != nil {
@@ -841,7 +1011,7 @@ func TestOrdinaryWatchdogSubmitsExternalRestartOnceAndLateReplayIsNoOp(t *testin
 		acknowledged.UpdatedAt = time.Now().UTC()
 		callbackErr = persistActivationPlan(plan.PlanPath, acknowledged)
 	}
-	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err != nil {
 		t.Fatal(err)
 	}
 	if callbackErr != nil {
@@ -855,7 +1025,7 @@ func TestOrdinaryWatchdogSubmitsExternalRestartOnceAndLateReplayIsNoOp(t *testin
 		t.Fatalf("watchdog did not commit Candidate: %#v %v", state, err)
 	}
 	callsBeforeReplay := len(runner.calls)
-	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err != nil {
 		t.Fatalf("late committed watchdog replay failed: %v", err)
 	}
 	if len(runner.calls) != callsBeforeReplay {
@@ -886,12 +1056,12 @@ func TestStaleOrdinaryWatchdogCannotRollbackCommittedCandidate(t *testing.T) {
 	if err := persistActivationPlan(committed.PlanPath, committed); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitActivation(committed.PlanPath, committed); err != nil {
+	if err := commitActivation(testActiveProfile, committed.PlanPath, committed); err != nil {
 		t.Fatal(err)
 	}
 	callsBefore := len(runner.calls)
 	stale.Error = "stale watchdog timeout"
-	if err := restorePrevious(stale, runner); err != nil {
+	if err := restorePrevious(testActiveProfile, stale, runner); err != nil {
 		t.Fatalf("stale watchdog did not observe committed terminal state: %v", err)
 	}
 	if len(runner.calls) != callsBefore {
@@ -936,7 +1106,7 @@ func TestOrdinaryCommitRejectsRollbackCrashAfterStableWasRestored(t *testing.T) 
 	if err := atomicfile.WriteFile(manager.InstallPath, oldBinary, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitActivation(planPath, plan); err == nil || !strings.Contains(err.Error(), "stable Manager does not match Candidate") {
+	if err := commitActivation(testActiveProfile, planPath, plan); err == nil || !strings.Contains(err.Error(), "stable Manager does not match Candidate") {
 		t.Fatalf("ordinary commit accepted a rollback crash checkpoint: %v", err)
 	}
 	state, err = manager.State()
@@ -985,7 +1155,7 @@ func TestFreshOrdinaryWatchdogCompletesPlanAfterStateCommitCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := RunWatchdog(context.Background(), planPath, runner); err != nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, planPath, runner); err != nil {
 		t.Fatalf("fresh watchdog did not reconcile state-first commit: %v", err)
 	}
 	committed, err := manager.State()
@@ -1000,7 +1170,7 @@ func TestFreshOrdinaryWatchdogCompletesPlanAfterStateCommitCrash(t *testing.T) {
 	}
 	stale := plan
 	stale.Error = "stale watchdog rollback after state commit"
-	if err := restorePrevious(stale, runner); err != nil {
+	if err := restorePrevious(testActiveProfile, stale, runner); err != nil {
 		t.Fatalf("stale rollback did not observe committed terminal plan: %v", err)
 	}
 	after, err := manager.State()
@@ -1055,7 +1225,7 @@ func TestOrdinaryWatchdogRetriesExternalRestartSubmission(t *testing.T) {
 		acknowledged.UpdatedAt = time.Now().UTC()
 		return persistActivationPlan(plan.PlanPath, acknowledged)
 	})
-	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err != nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err != nil {
 		t.Fatal(err)
 	}
 	if restartAttempts != 2 {
@@ -1085,7 +1255,7 @@ func TestOrdinaryWatchdogRestoresCurrentWhenOwnedPlanDisappears(t *testing.T) {
 		runner.onRun = nil
 		_ = os.WriteFile(planPath, []byte("{corrupt"), 0o600)
 	}
-	err = RunWatchdog(context.Background(), planPath, runner)
+	err = runTestWatchdog(context.Background(), testActiveProfile, planPath, runner)
 	if err == nil || !strings.Contains(err.Error(), "read Manager activation plan while watching candidate") {
 		t.Fatalf("lost activation plan did not produce a bounded rollback error: %v", err)
 	}
@@ -1104,11 +1274,29 @@ func TestOrdinaryWatchdogRestoresCurrentWhenOwnedPlanDisappears(t *testing.T) {
 }
 
 func TestRecoveryWatchdogRejectsUnownedPlanWithoutOrdinaryManagerRestart(t *testing.T) {
-	root := t.TempDir()
-	planPath := filepath.Join(root, "recovery-plan.json")
+	base := t.TempDir()
+	root := filepath.Join(base, "manager-binaries")
+	activations := filepath.Join(root, "activations")
+	versions := filepath.Join(root, "versions")
+	for _, directory := range []string{root, activations, versions} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	planPath := filepath.Join(activations, "recovery-plan.json")
 	plan := Plan{
 		SchemaVersion: 1, Mode: recoveryActivationMode, PlanPath: planPath, Status: "activated",
-		Activated: true, UnitName: "ubitech-agent-manager.service", HealthTimeoutMS: 5_000,
+		Activated: true, UnitName: testTechnicalProfile.ManagerUnit, HealthTimeoutMS: 5_000,
+		StatePath:        filepath.Join(base, "manager-binaries.json"),
+		InstallPath:      filepath.Join(base, "bin", testTechnicalProfile.ManagerBinary),
+		SocketPath:       filepath.Join(base, "control", "manager.sock"),
+		ControlTokenFile: filepath.Join(base, "secrets", "manager-token"),
+		CandidatePath:    filepath.Join(versions, "candidate", testTechnicalProfile.ManagerBinary),
+		PreviousPath:     filepath.Join(versions, "previous", testTechnicalProfile.ManagerBinary),
+		PlatformCommit:   strings.Repeat("a", 40),
 	}
 	if err := persistActivationPlan(planPath, plan); err != nil {
 		t.Fatal(err)
@@ -1116,7 +1304,7 @@ func TestRecoveryWatchdogRejectsUnownedPlanWithoutOrdinaryManagerRestart(t *test
 	runner := &fakeRunner{}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := RunWatchdog(ctx, planPath, runner); err == nil || !strings.Contains(err.Error(), "activation plan has no current recovery ownership") {
+	if err := runTestWatchdog(ctx, testActiveProfile, planPath, runner); err == nil || !strings.Contains(err.Error(), "activation plan has no current recovery ownership") {
 		t.Fatalf("unowned recovery watchdog result = %v, want fail-closed ownership error", err)
 	}
 	if countFakeRunnerCommands(runner, "systemctl") != 0 {
@@ -1141,7 +1329,7 @@ func TestWatchdogRestoresPreviousBinaryWhenCandidateDoesNotStart(t *testing.T) {
 	if err := atomicfile.WriteJSON(plan.PlanPath, plan, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := RunWatchdog(context.Background(), plan.PlanPath, runner); err == nil {
+	if err := runTestWatchdog(context.Background(), testActiveProfile, plan.PlanPath, runner); err == nil {
 		t.Fatal("expected watchdog rollback result")
 	}
 	installed, err := os.ReadFile(manager.InstallPath)
@@ -1432,7 +1620,7 @@ func TestActivateCannotOverwriteWatchdogRollbackWhileSystemdProofIsInFlight(t *t
 		}
 	}
 	plan.Error = "watchdog deadline won before stable replacement"
-	if err := restorePrevious(plan, runner); err == nil || !strings.Contains(err.Error(), "watchdog deadline") {
+	if err := restorePrevious(testActiveProfile, plan, runner); err == nil || !strings.Contains(err.Error(), "watchdog deadline") {
 		t.Fatalf("watchdog rollback result = %v", err)
 	}
 	close(releaseProof)
@@ -1492,7 +1680,7 @@ func TestCandidateAcknowledgementCannotOverwriteConcurrentWatchdogRollback(t *te
 		}
 	}
 	plan.Error = "watchdog rollback won acknowledgement race"
-	if err := restorePrevious(plan, runner); err == nil || !strings.Contains(err.Error(), "acknowledgement race") {
+	if err := restorePrevious(testActiveProfile, plan, runner); err == nil || !strings.Contains(err.Error(), "acknowledgement race") {
 		t.Fatalf("watchdog rollback result = %v", err)
 	}
 	close(releaseProof)
@@ -1534,7 +1722,7 @@ func TestStartupCompletesIntentAfterCrashBetweenBinaryReplaceAndPlanUpdate(t *te
 	if err := atomicfile.WriteJSON(plan.PlanPath, plan, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	watchdogUnit := recoveryWatchdogUnitPrefix + manifest.SourceCommit[:12]
+	watchdogUnit := testTechnicalProfile.WatchdogUnitPrefix + manifest.SourceCommit[:12]
 	runner.activeUnits[watchdogUnit] = false
 	spawnsBefore := countFakeRunnerCommands(runner, "systemd-run")
 	if err := manager.acknowledgeExecutable(manager.InstallPath); err != nil {
@@ -1571,7 +1759,7 @@ func TestActivationPlanBoundsExternalWatchdogFailure(t *testing.T) {
 	if err := atomicfile.WriteJSON(plan.PlanPath, plan, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner.activeUnits[recoveryWatchdogUnitPrefix+manifest.SourceCommit[:12]] = false
+	runner.activeUnits[testTechnicalProfile.WatchdogUnitPrefix+manifest.SourceCommit[:12]] = false
 	runner.fail = "systemd-run"
 	externalFailure := "watchdog-external-head\n" + strings.Repeat("y", journal.MaxDiagnosticBytes*3) + "\nwatchdog-external-tail"
 	runner.failure = errors.New(externalFailure)

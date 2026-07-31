@@ -11,8 +11,10 @@ between two Git revisions.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
+import posixpath
 import re
 import stat
 import subprocess
@@ -64,6 +66,20 @@ REQUIRED_CONTAINER_PLATFORM_TARGETS = {
     "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts": "typescript-container-platform",
     "enterprise-agent-platform/frontend/src/container-contract.generated.ts": "typescript-container-platform",
 }
+REQUIRED_RELEASE_TRANSITION_SOURCE = "docs/contracts/release-transition.json"
+REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA = (
+    "docs/contracts/release-transition-challenge.schema.json"
+)
+REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA = (
+    "docs/contracts/release-transition-receipt.schema.json"
+)
+REQUIRED_RELEASE_TRANSITION_DOCUMENTS = frozenset(
+    {
+        REQUIRED_RELEASE_TRANSITION_SOURCE,
+        REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA,
+        REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA,
+    }
+)
 REQUIRED_OWNED_CODE_PROBES = {
     ".gitignore": frozenset({"repository-development"}),
     ".github/workflows/quality.yml": frozenset({"repository-development"}),
@@ -209,6 +225,224 @@ def _read_json(path: Path, label: str) -> Any:
         raise DocsSyncError(
             f"{label} is not valid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
         ) from exc
+
+
+def read_strict_json(path: Path, label: str) -> Any:
+    """Read JSON while rejecting duplicate object members.
+
+    Release-transition inputs are signed or drive release visibility, so the
+    ordinary last-member-wins behavior of ``json.loads`` is not acceptable.
+    """
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DocsSyncError(f"{label} contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite number {value}")
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise DocsSyncError(f"{label} is missing: {path}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise DocsSyncError(f"{label} is not strict JSON: {exc}") from exc
+
+
+def _parse_rfc3339(value: str, label: str) -> dt.datetime:
+    if not value.endswith("Z"):
+        raise DocsSyncError(f"{label} must be an RFC3339 UTC timestamp ending in Z")
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise DocsSyncError(f"{label} must be a valid RFC3339 date-time") from exc
+    if parsed.tzinfo != dt.timezone.utc:
+        raise DocsSyncError(f"{label} must use UTC")
+    return parsed
+
+
+def validate_closed_json_schema_instance(
+    value: Any,
+    schema: Any,
+    label: str,
+) -> dict[str, Any]:
+    """Validate the closed Draft-2020-12 subset used by receipt contracts.
+
+    The field list and constraints remain in the canonical schema documents;
+    this interpreter intentionally supports only their fail-closed subset.
+    """
+
+    schema_object = _expect_object(schema, f"{label} schema")
+    if schema_object.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+        raise DocsSyncError(f"{label} schema must use JSON Schema draft 2020-12")
+    if schema_object.get("type") != "object" or schema_object.get("additionalProperties") is not False:
+        raise DocsSyncError(f"{label} schema must describe a closed object")
+    properties = _expect_object(schema_object.get("properties"), f"{label} schema.properties")
+    required = _expect_string_list(schema_object.get("required"), f"{label} schema.required")
+    if set(required) != set(properties):
+        raise DocsSyncError(f"{label} schema must require every declared property")
+    instance = _expect_object(value, label)
+    _reject_unknown_keys(instance, set(properties), label)
+    missing = sorted(set(required) - set(instance))
+    if missing:
+        raise DocsSyncError(f"{label} is missing required keys: {', '.join(missing)}")
+    for name, rule_value in properties.items():
+        rule = _expect_object(rule_value, f"{label} schema property {name}")
+        _reject_unknown_keys(rule, {"const", "enum", "type", "pattern", "format"}, f"{label} schema property {name}")
+        item = instance[name]
+        if "const" in rule and (
+            type(item) is not type(rule["const"]) or item != rule["const"]
+        ):
+            raise DocsSyncError(f"{label}.{name} must equal {rule['const']!r}")
+        if "enum" in rule:
+            enum = rule["enum"]
+            if not isinstance(enum, list) or not enum or len({json.dumps(entry, sort_keys=True) for entry in enum}) != len(enum):
+                raise DocsSyncError(f"{label} schema property {name}.enum must be a unique non-empty array")
+            if not any(type(item) is type(entry) and item == entry for entry in enum):
+                raise DocsSyncError(f"{label}.{name} is not an allowed value")
+        expected_type = rule.get("type")
+        if expected_type == "string" and not isinstance(item, str):
+            raise DocsSyncError(f"{label}.{name} must be a string")
+        if expected_type is not None and expected_type != "string":
+            raise DocsSyncError(f"{label} schema property {name} uses unsupported type {expected_type!r}")
+        pattern = rule.get("pattern")
+        if pattern is not None:
+            if not isinstance(pattern, str):
+                raise DocsSyncError(f"{label} schema property {name}.pattern must be a string")
+            try:
+                matched = re.fullmatch(pattern, item)
+            except (re.error, TypeError) as exc:
+                raise DocsSyncError(f"{label} schema property {name} has an invalid pattern") from exc
+            if matched is None:
+                raise DocsSyncError(f"{label}.{name} does not match its canonical pattern")
+        value_format = rule.get("format")
+        if value_format is not None:
+            if value_format != "date-time" or not isinstance(item, str):
+                raise DocsSyncError(f"{label} schema property {name} uses an unsupported format")
+            _parse_rfc3339(item, f"{label}.{name}")
+    return instance
+
+
+def validate_release_transition_contract(value: Any, label: str) -> dict[str, Any]:
+    contract = _expect_object(value, label)
+    _reject_unknown_keys(
+        contract,
+        {
+            "schema_version",
+            "transition_id",
+            "stage",
+            "predecessor_generation",
+            "source_owner_compat",
+            "source_profile_id",
+            "target_profile_id",
+            "manifest_protocol",
+            "promotion",
+            "deployment_receipt",
+        },
+        label,
+    )
+    required_keys = {
+        "schema_version", "transition_id", "stage", "predecessor_generation",
+        "source_profile_id", "target_profile_id", "manifest_protocol",
+        "promotion", "deployment_receipt",
+    }
+    if set(contract) not in {frozenset(required_keys), frozenset(required_keys | {"source_owner_compat"})}:
+        raise DocsSyncError(f"{label} must contain the complete closed transition contract")
+    if (
+        type(contract["schema_version"]) is not int
+        or contract["schema_version"] != 1
+        or contract["transition_id"] != "technical-namespace-v1"
+    ):
+        raise DocsSyncError(f"{label} has an unsupported schema or transition id")
+    if contract["stage"] not in {"source_owner", "bridge", "cleanup", "target_baseline"}:
+        raise DocsSyncError(
+            f"{label}.stage must be source_owner, bridge, cleanup, or target_baseline"
+        )
+    if not isinstance(contract["predecessor_generation"], str) or re.fullmatch(r"[0-9a-f]{40}", contract["predecessor_generation"]) is None:
+        raise DocsSyncError(f"{label}.predecessor_generation must be a lowercase 40-character commit")
+    compat = contract.get("source_owner_compat")
+    if contract["stage"] == "source_owner":
+        compat = _expect_object(compat, f"{label}.source_owner_compat")
+        _reject_unknown_keys(
+            compat,
+            {"generation", "manifest_sha256", "compose_sha256", "managed_images"},
+            f"{label}.source_owner_compat",
+        )
+        if set(compat) != {"generation", "manifest_sha256", "compose_sha256", "managed_images"}:
+            raise DocsSyncError(f"{label}.source_owner_compat must be complete")
+        if compat["generation"] != contract["predecessor_generation"]:
+            raise DocsSyncError(f"{label}.source_owner_compat.generation must equal predecessor_generation")
+        canonical_p1 = {
+            "generation": "983f79b4900502f35fac6de8154eb344fc9f143b",
+            "manifest_sha256": "8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1",
+            "compose_sha256": "ebe1ce922cd33c9acb816bf9af175fc7e3838835cb413ab3ee91b91808698954",
+        }
+        if any(compat.get(name) != value for name, value in canonical_p1.items()):
+            raise DocsSyncError(
+                f"{label}.source_owner_compat is limited to the canonical P1 generation and bytes"
+            )
+        for name in ("manifest_sha256", "compose_sha256"):
+            if not isinstance(compat[name], str) or re.fullmatch(r"[0-9a-f]{64}", compat[name]) is None:
+                raise DocsSyncError(f"{label}.source_owner_compat.{name} must be a lowercase SHA-256")
+        expected_compat_images = [
+            "agent-runtime", "agent-sandbox", "camofox", "firecrawl-api",
+            "firecrawl-playwright", "firecrawl-postgres", "firecrawl-rabbitmq",
+            "firecrawl-redis", "platform", "searxng",
+        ]
+        if compat["managed_images"] != expected_compat_images:
+            raise DocsSyncError(f"{label}.source_owner_compat.managed_images must preserve the exact P1 closed set")
+    elif compat is not None:
+        raise DocsSyncError(f"{label}.source_owner_compat is permitted only for source_owner")
+    if contract["source_profile_id"] != "ubitech-agent-v1" or contract["target_profile_id"] != "agent-platform-v1":
+        raise DocsSyncError(f"{label} must bind the canonical source and target profiles")
+    protocol = _expect_object(contract["manifest_protocol"], f"{label}.manifest_protocol")
+    _reject_unknown_keys(protocol, {"ordinary_schema_version", "bridge_schema_version", "cleanup_schema_version"}, f"{label}.manifest_protocol")
+    expected_protocol = {
+        "ordinary_schema_version": 1,
+        "bridge_schema_version": 1,
+        "cleanup_schema_version": 2,
+    }
+    if json.dumps(protocol, sort_keys=True) != json.dumps(expected_protocol, sort_keys=True):
+        raise DocsSyncError(f"{label}.manifest_protocol must preserve the v1 ordinary/bridge and v2 cleanup barrier")
+    promotion = _expect_object(contract["promotion"], f"{label}.promotion")
+    _reject_unknown_keys(promotion, {"draft_stages", "require_direct_predecessor", "concurrency_group"}, f"{label}.promotion")
+    expected_promotion = {
+        "draft_stages": ["bridge", "cleanup"],
+        "require_direct_predecessor": True,
+        "concurrency_group": "container-channel-main",
+    }
+    if json.dumps(promotion, sort_keys=True) != json.dumps(expected_promotion, sort_keys=True):
+        raise DocsSyncError(f"{label}.promotion must preserve serialized direct-predecessor draft gates")
+    receipt = _expect_object(contract["deployment_receipt"], f"{label}.deployment_receipt")
+    _reject_unknown_keys(
+        receipt,
+        {
+            "schema_version", "algorithm", "canonicalization", "state_root",
+            "challenge_ttl_seconds", "receipt_ttl_seconds",
+            "source_owner_receipt_type", "target_commit_receipt_type",
+        },
+        f"{label}.deployment_receipt",
+    )
+    expected_receipt = {
+        "schema_version": 1,
+        "algorithm": "Ed25519",
+        "canonicalization": "RFC8785",
+        "state_root": "$XDG_STATE_HOME/agent-platform/release-transition",
+        "challenge_ttl_seconds": 300,
+        "receipt_ttl_seconds": 300,
+        "source_owner_receipt_type": "source_owner_ready",
+        "target_commit_receipt_type": "target_handoff_committed",
+    }
+    if json.dumps(receipt, sort_keys=True) != json.dumps(expected_receipt, sort_keys=True):
+        raise DocsSyncError(f"{label}.deployment_receipt does not match the one-time Ed25519 receipt policy")
+    return contract
 
 
 def _expect_object(value: Any, label: str) -> dict[str, Any]:
@@ -358,6 +592,94 @@ def load_manifest(root: Path) -> Manifest:
             )
         )
 
+    deployment_domains = [domain for domain in domains if domain.identifier == "deployment"]
+    if len(deployment_domains) != 1:
+        raise DocsSyncError("manifest must define exactly one deployment domain")
+    missing_transition_documents = sorted(
+        REQUIRED_RELEASE_TRANSITION_DOCUMENTS
+        - set(deployment_domains[0].documents)
+    )
+    if missing_transition_documents:
+        raise DocsSyncError(
+            "deployment domain must own all release-transition contracts: "
+            + ", ".join(missing_transition_documents)
+        )
+    transition_path = _reject_symlink_chain(
+        root,
+        REQUIRED_RELEASE_TRANSITION_SOURCE,
+        "release-transition contract",
+    )
+    challenge_schema_path = _reject_symlink_chain(
+        root,
+        REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA,
+        "release-transition challenge schema",
+    )
+    receipt_schema_path = _reject_symlink_chain(
+        root,
+        REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA,
+        "release-transition receipt schema",
+    )
+    for path, label, relative in (
+        (transition_path, "release-transition contract", REQUIRED_RELEASE_TRANSITION_SOURCE),
+        (challenge_schema_path, "release-transition challenge schema", REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA),
+        (receipt_schema_path, "release-transition receipt schema", REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA),
+    ):
+        _require_regular_file(path, label, relative)
+    transition_contract = validate_release_transition_contract(
+        read_strict_json(transition_path, "release-transition contract"),
+        "release-transition contract",
+    )
+    challenge_schema = read_strict_json(
+        challenge_schema_path,
+        "release-transition challenge schema",
+    )
+    receipt_schema = read_strict_json(
+        receipt_schema_path,
+        "release-transition receipt schema",
+    )
+    # Validate the schemas themselves through representative values derived
+    # from the transition contract. Runtime/CI consumers read these same files.
+    source_receipt_type = transition_contract["deployment_receipt"]["source_owner_receipt_type"]
+    sample_challenge = {
+        "schema_version": 1,
+        "transition_id": transition_contract["transition_id"],
+        "challenge_id": "challenge_" + "0" * 32,
+        "nonce": "A" * 43,
+        "receipt_type": source_receipt_type,
+        "deployment_id": "deployment",
+        "key_id": "primary",
+        "predecessor_generation": "0" * 40,
+        "candidate_generation": "1" * 40,
+        "expected_observed_generation": "0" * 40,
+        "expected_profile_id": transition_contract["source_profile_id"],
+        "expected_capability": "source_owner",
+        "expected_status": "idle",
+        "issued_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-01-01T00:05:00Z",
+    }
+    validate_closed_json_schema_instance(sample_challenge, challenge_schema, "release-transition challenge")
+    sample_receipt = {
+        "schema_version": 1,
+        "transition_id": transition_contract["transition_id"],
+        "challenge_id": sample_challenge["challenge_id"],
+        "nonce": sample_challenge["nonce"],
+        "receipt_type": source_receipt_type,
+        "deployment_id": sample_challenge["deployment_id"],
+        "key_id": sample_challenge["key_id"],
+        "predecessor_generation": sample_challenge["predecessor_generation"],
+        "candidate_generation": sample_challenge["candidate_generation"],
+        "observed_generation": sample_challenge["expected_observed_generation"],
+        "profile_id": sample_challenge["expected_profile_id"],
+        "capability": sample_challenge["expected_capability"],
+        "status": sample_challenge["expected_status"],
+        "architecture": "amd64",
+        "manager_sha256": "2" * 64,
+        "evidence_sha256": "3" * 64,
+        "issued_at": sample_challenge["issued_at"],
+        "expires_at": sample_challenge["expires_at"],
+    }
+    validate_closed_json_schema_instance(sample_receipt, receipt_schema, "release-transition receipt")
+
     contracts_raw = raw.get("contracts")
     if not isinstance(contracts_raw, list) or not contracts_raw:
         raise DocsSyncError("contracts must be a non-empty JSON array")
@@ -401,6 +723,7 @@ def load_manifest(root: Path) -> Manifest:
                 "python-container-platform",
                 "typescript-container-platform",
                 "go-container-platform",
+                "go-release-transition",
             }:
                 raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
             _reject_symlink_chain(root, target_path, f"{target_label}.path")
@@ -1080,6 +1403,9 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
             "database_schema_version",
             "container_paths",
             "execution_targets",
+            "persistent_data_owners",
+            "agent_runtime_handoff",
+            "p1_source_handoff",
             "sandbox_idle_seconds",
             "migration_backup_retention_seconds",
             "obsolete_artifact_retention_seconds",
@@ -1141,6 +1467,379 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
                 f"{label}.{field} must exactly match the documented ordered values"
             )
 
+    persistent_owners = _expect_object(
+        contract.get("persistent_data_owners"),
+        f"{label}.persistent_data_owners",
+    )
+    expected_owner_sets = {
+        "cognee",
+        "searxng",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+        "firecrawl-postgres",
+    }
+    if set(persistent_owners) != expected_owner_sets:
+        raise DocsSyncError(
+            f"{label}.persistent_data_owners must contain exactly the current persistent service set"
+        )
+    for service, raw_owners in persistent_owners.items():
+        if not isinstance(raw_owners, list):
+            raise DocsSyncError(
+                f"{label}.persistent_data_owners.{service} must be an array"
+            )
+        seen_owners: set[tuple[int, int]] = set()
+        for index, raw_owner in enumerate(raw_owners):
+            owner = _expect_object(
+                raw_owner,
+                f"{label}.persistent_data_owners.{service}[{index}]",
+            )
+            if set(owner) != {"uid", "gid"}:
+                raise DocsSyncError(
+                    f"{label}.persistent_data_owners.{service}[{index}] must contain exactly uid and gid"
+                )
+            uid, gid = owner["uid"], owner["gid"]
+            if (
+                isinstance(uid, bool)
+                or isinstance(gid, bool)
+                or not isinstance(uid, int)
+                or not isinstance(gid, int)
+                or uid < 0
+                or gid < 0
+                or uid > 0xFFFFFFFF
+                or gid > 0xFFFFFFFF
+            ):
+                raise DocsSyncError(
+                    f"{label}.persistent_data_owners.{service}[{index}] has an invalid uid/gid"
+                )
+            identity = (uid, gid)
+            if identity in seen_owners:
+                raise DocsSyncError(
+                    f"{label}.persistent_data_owners.{service} contains a duplicate uid/gid"
+                )
+            seen_owners.add(identity)
+
+    runtime_handoff = _expect_object(
+        contract.get("agent_runtime_handoff"),
+        f"{label}.agent_runtime_handoff",
+    )
+    _reject_unknown_keys(
+        runtime_handoff,
+        {
+            "validation_limits",
+            "current_roots",
+            "ephemeral_roots",
+            "p1_retired_roots",
+        },
+        f"{label}.agent_runtime_handoff",
+    )
+    if set(runtime_handoff) != {
+        "validation_limits",
+        "current_roots",
+        "ephemeral_roots",
+        "p1_retired_roots",
+    }:
+        raise DocsSyncError(f"{label}.agent_runtime_handoff must be complete")
+    validation_limits = _expect_object(
+        runtime_handoff["validation_limits"],
+        f"{label}.agent_runtime_handoff.validation_limits",
+    )
+    expected_validation_limits = {
+        "maximum_identity_records",
+        "maximum_jsonl_bytes",
+        "maximum_jsonl_records",
+        "maximum_directory_entries",
+    }
+    _reject_unknown_keys(
+        validation_limits,
+        expected_validation_limits,
+        f"{label}.agent_runtime_handoff.validation_limits",
+    )
+    if set(validation_limits) != expected_validation_limits:
+        raise DocsSyncError(
+            f"{label}.agent_runtime_handoff.validation_limits must be complete"
+        )
+    for field in sorted(expected_validation_limits):
+        value = validation_limits[field]
+        if (
+            type(value) is not int
+            or value <= 0
+            or value > JAVASCRIPT_MAX_SAFE_INTEGER
+        ):
+            raise DocsSyncError(
+                f"{label}.agent_runtime_handoff.validation_limits.{field} "
+                "must be a positive JavaScript-safe integer"
+            )
+    if _expect_string_list(
+        runtime_handoff["current_roots"],
+        f"{label}.agent_runtime_handoff.current_roots",
+    ) != ("sessions", "approvals", "idempotency"):
+        raise DocsSyncError(
+            f"{label}.agent_runtime_handoff.current_roots must match the current Runtime schema"
+        )
+    if _expect_string_list(
+        runtime_handoff["ephemeral_roots"],
+        f"{label}.agent_runtime_handoff.ephemeral_roots",
+    ) != ("logs",):
+        raise DocsSyncError(
+            f"{label}.agent_runtime_handoff.ephemeral_roots must contain only logs"
+        )
+    retired = _expect_object(
+        runtime_handoff["p1_retired_roots"],
+        f"{label}.agent_runtime_handoff.p1_retired_roots",
+    )
+    if set(retired) != {"app", "home", "memory", "migration"}:
+        raise DocsSyncError(
+            f"{label}.agent_runtime_handoff.p1_retired_roots must contain exactly app, home, memory and migration"
+        )
+    app = _expect_object(retired["app"], f"{label}.agent_runtime_handoff.p1_retired_roots.app")
+    app_keys = {
+        "mode", "top_level_entries", "inventory_algorithm", "inventory_sha256",
+        "inventory_entries", "inventory_regular_bytes", "install_source_signature",
+        "package_name", "package_version", "allowed_symlinks",
+    }
+    _reject_unknown_keys(app, app_keys, f"{label}.agent_runtime_handoff.p1_retired_roots.app")
+    if set(app) != app_keys or app.get("mode") != 0o755:
+        raise DocsSyncError(f"{label}.agent_runtime_handoff.p1_retired_roots.app is incomplete")
+    expected_top = (
+        ".gitignore", "README.md", "dist", "install.json", "node_modules",
+        "package-lock.json", "package.json", "src", "test", "tsconfig.json",
+    )
+    if _expect_string_list(app["top_level_entries"], f"{label}.agent_runtime_handoff.p1_retired_roots.app.top_level_entries") != expected_top:
+        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app top-level inventory is invalid")
+    if app.get("inventory_algorithm") != "runtime-retired-tree-v1":
+        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app inventory algorithm is invalid")
+    for field in ("inventory_sha256", "install_source_signature"):
+        value = app.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app {field} must be a SHA-256")
+    for field in ("inventory_entries", "inventory_regular_bytes"):
+        value = app.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > JAVASCRIPT_MAX_SAFE_INTEGER:
+            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app {field} must be positive")
+    if app.get("package_name") != "@ubitech/agent-runtime" or app.get("package_version") != "0.1.0":
+        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app package identity is invalid")
+    symlinks = _expect_object(app["allowed_symlinks"], f"{label}.agent_runtime_handoff.p1_retired_roots.app.allowed_symlinks")
+    expected_symlinks = {
+        "node_modules/.bin/anthropic-ai-sdk": "../@anthropic-ai/sdk/bin/cli",
+        "node_modules/.bin/openai": "../openai/bin/cli",
+        "node_modules/.bin/pi-ai": "../@earendil-works/pi-ai/dist/cli.js",
+        "node_modules/.bin/yaml": "../yaml/bin.mjs",
+    }
+    if symlinks != expected_symlinks:
+        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app symlink set is invalid")
+    for path_value, target_value in symlinks.items():
+        resolved = posixpath.normpath(
+            posixpath.join(posixpath.dirname(path_value), target_value)
+        )
+        if (
+            path_value.startswith("/")
+            or target_value.startswith("/")
+            or resolved in {"", ".", ".."}
+            or resolved.startswith("../")
+        ):
+            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app symlink escapes its root")
+
+    for root_name, expected_mode in (("home", 0o755), ("memory", 0o700)):
+        empty_root = _expect_object(retired[root_name], f"{label}.agent_runtime_handoff.p1_retired_roots.{root_name}")
+        if empty_root != {"mode": expected_mode, "empty": True}:
+            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 {root_name} must be an exact empty directory")
+    migration = _expect_object(retired["migration"], f"{label}.agent_runtime_handoff.p1_retired_roots.migration")
+    migration_keys = {"mode", "file_name", "file_mode", "schema_version", "phase", "fields"}
+    _reject_unknown_keys(migration, migration_keys, f"{label}.agent_runtime_handoff.p1_retired_roots.migration")
+    expected_migration_fields = (
+        "attachments_skipped", "attachments_verified", "imported", "memories_imported",
+        "memories_skipped", "oauth_cleared", "oauth_imported", "oauth_skipped",
+        "phase", "session_manifests", "session_messages", "skipped", "updated_at",
+        "version", "workspaces_skipped", "workspaces_verified",
+    )
+    if (
+        set(migration) != migration_keys
+        or migration.get("mode") != 0o700
+        or migration.get("file_name") != "hermes-cutover.json"
+        or migration.get("file_mode") != 0o600
+        or migration.get("schema_version") != 1
+        or migration.get("phase") != "finalized"
+        or _expect_string_list(migration.get("fields"), f"{label}.agent_runtime_handoff.p1_retired_roots.migration.fields") != expected_migration_fields
+    ):
+        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 migration marker contract is invalid")
+
+    p1_source = _expect_object(
+        contract.get("p1_source_handoff"),
+        f"{label}.p1_source_handoff",
+    )
+    p1_keys = {
+        "layouts", "empty_files", "empty_directories", "fixed_sha256",
+        "secret_files", "secret_line_pattern", "manager_secret_names",
+        "workspace_namespace", "camofox_home", "manager_migration",
+        "firecrawl_environment",
+    }
+    _reject_unknown_keys(p1_source, p1_keys, f"{label}.p1_source_handoff")
+    if set(p1_source) != p1_keys:
+        raise DocsSyncError(f"{label}.p1_source_handoff must be complete")
+    layouts = _expect_object(p1_source["layouts"], f"{label}.p1_source_handoff.layouts")
+    expected_layout_roots = {
+        ".", "data", "data/runtimes", "data/runtimes/camofox",
+        "data/runtimes/cognee", "data/runtimes/firecrawl",
+        "data/runtimes/searxng", "manager",
+    }
+    if set(layouts) != expected_layout_roots:
+        raise DocsSyncError(f"{label}.p1_source_handoff.layouts has an invalid closed root set")
+    layout_entries: dict[str, dict[str, Any]] = {}
+    dispositions = {"retained", "copied", "generated", "retired", "ephemeral"}
+    for relative, raw_layout in layouts.items():
+        layout = _expect_object(raw_layout, f"{label}.p1_source_handoff.layouts.{relative}")
+        if set(layout) != {"mode", "entries"} or layout["mode"] != 0o700:
+            raise DocsSyncError(f"{label}.p1_source_handoff.layouts.{relative} must be an owner-only directory")
+        entries = _expect_object(layout["entries"], f"{label}.p1_source_handoff.layouts.{relative}.entries")
+        if not entries:
+            raise DocsSyncError(f"{label}.p1_source_handoff.layouts.{relative}.entries cannot be empty")
+        layout_entries[relative] = entries
+        for name, raw_entry in entries.items():
+            if (
+                not isinstance(name, str) or name in {"", ".", ".."}
+                or "/" in name or "\\" in name or "\x00" in name
+            ):
+                raise DocsSyncError(f"{label}.p1_source_handoff contains an unsafe entry name")
+            entry = _expect_object(raw_entry, f"{label}.p1_source_handoff.layouts.{relative}.entries.{name}")
+            if set(entry) != {"type", "disposition", "mode", "required"}:
+                raise DocsSyncError(f"{label}.p1_source_handoff entry must contain type, disposition, mode and required")
+            if entry["type"] not in {"directory", "file"} or entry["disposition"] not in dispositions:
+                raise DocsSyncError(f"{label}.p1_source_handoff entry has an invalid type or disposition")
+            if entry["mode"] not in {0o600, 0o644, 0o700, 0o755} or not isinstance(entry["required"], bool):
+                raise DocsSyncError(f"{label}.p1_source_handoff entry has an invalid mode or required flag")
+    for relative in expected_layout_roots - {"."}:
+        parent, name = posixpath.split(relative)
+        parent = parent or "."
+        parent_entry = layout_entries.get(parent, {}).get(name)
+        if not isinstance(parent_entry, dict) or parent_entry.get("type") != "directory" or not parent_entry.get("required"):
+            raise DocsSyncError(f"{label}.p1_source_handoff layout root {relative} is not required by its parent")
+
+    def p1_path_list(field: str, expected_disposition: str | None = None) -> tuple[str, ...]:
+        values = _expect_string_list(p1_source[field], f"{label}.p1_source_handoff.{field}")
+        if tuple(sorted(values)) != values or len(set(values)) != len(values):
+            raise DocsSyncError(f"{label}.p1_source_handoff.{field} must be sorted and unique")
+        for value in values:
+            parent, name = posixpath.split(value)
+            parent = parent or "."
+            entry = layout_entries.get(parent, {}).get(name)
+            if not isinstance(entry, dict) or not entry.get("required"):
+                raise DocsSyncError(f"{label}.p1_source_handoff.{field} references an unknown optional object")
+            if expected_disposition is not None and entry.get("disposition") != expected_disposition:
+                raise DocsSyncError(f"{label}.p1_source_handoff.{field} has the wrong disposition")
+        return values
+
+    empty_files = p1_path_list("empty_files", "ephemeral")
+    empty_directories = p1_path_list("empty_directories")
+    secret_files = p1_path_list("secret_files", "retired")
+    for value in empty_files + secret_files:
+        parent, name = posixpath.split(value)
+        if layout_entries[parent or "."][name]["type"] != "file":
+            raise DocsSyncError(f"{label}.p1_source_handoff expected a file at {value}")
+    for value in empty_directories:
+        parent, name = posixpath.split(value)
+        if layout_entries[parent or "."][name]["type"] != "directory":
+            raise DocsSyncError(f"{label}.p1_source_handoff expected a directory at {value}")
+    if p1_source["secret_line_pattern"] != r"^[A-Za-z0-9_-]{64}\n$":
+        raise DocsSyncError(f"{label}.p1_source_handoff.secret_line_pattern is invalid")
+    manager_secret_names = _expect_string_list(
+        p1_source["manager_secret_names"],
+        f"{label}.p1_source_handoff.manager_secret_names",
+    )
+    expected_manager_secret_names = (
+        "agent-runtime-token",
+        "agent-tool-token",
+        "camofox-access-key",
+        "firecrawl-bull-auth-key",
+        "firecrawl-postgres-password",
+        "manager-executor-token",
+        "manager-token",
+        "session-secret",
+    )
+    if manager_secret_names != expected_manager_secret_names:
+        raise DocsSyncError(
+            f"{label}.p1_source_handoff.manager_secret_names must match the audited P1 closed set"
+        )
+    workspace_namespace = _expect_object(
+        p1_source["workspace_namespace"],
+        f"{label}.p1_source_handoff.workspace_namespace",
+    )
+    workspace_namespace_keys = {
+        "source_directory", "target_directory", "required", "mode",
+        "root_owned_empty_mount",
+    }
+    if set(workspace_namespace) != workspace_namespace_keys:
+        raise DocsSyncError(
+            f"{label}.p1_source_handoff.workspace_namespace must be complete"
+        )
+    root_owned_mount = _expect_object(
+        workspace_namespace["root_owned_empty_mount"],
+        f"{label}.p1_source_handoff.workspace_namespace.root_owned_empty_mount",
+    )
+    if (
+        workspace_namespace["source_directory"] != ".ubitech"
+        or workspace_namespace["target_directory"] != ".agent-platform"
+        or workspace_namespace["required"] is not True
+        or workspace_namespace["mode"] != 0o755
+        or root_owned_mount != {
+            "relative_path": "attachments",
+            "mode": 0o755,
+            "uid": 0,
+            "gid": 0,
+        }
+    ):
+        raise DocsSyncError(
+            f"{label}.p1_source_handoff.workspace_namespace is not the audited P1 mapping"
+        )
+    fixed = _expect_object(p1_source["fixed_sha256"], f"{label}.p1_source_handoff.fixed_sha256")
+    expected_fixed = {
+        "data/runtimes/cognee/python-install.json",
+        "data/runtimes/firecrawl/docker-compose.enterprise.yaml",
+        "data/runtimes/firecrawl/docker-compose.ubitech.yaml",
+        "data/runtimes/searxng/docker-compose.ubitech.yaml",
+    }
+    if set(fixed) != expected_fixed or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in fixed.values()):
+        raise DocsSyncError(f"{label}.p1_source_handoff.fixed_sha256 is invalid")
+
+    camofox_home = _expect_object(p1_source["camofox_home"], f"{label}.p1_source_handoff.camofox_home")
+    if set(camofox_home) != {"path", "mode", "top_level_entries", "allowed_symlinks"} or camofox_home["path"] != "data/runtimes/camofox/home" or camofox_home["mode"] != 0o755:
+        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home identity is invalid")
+    if _expect_string_list(camofox_home["top_level_entries"], f"{label}.p1_source_handoff.camofox_home.top_level_entries") != (".cache", ".camoufox", "Downloads", "camoufox"):
+        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home top-level set is invalid")
+    expected_camofox_symlinks = {
+        ".cache/camoufox/camofox-bin": "/opt/camofox/browser/camoufox",
+        ".cache/camoufox/fontconfig": "/opt/camofox/browser/fontconfig",
+        ".cache/camoufox/properties.json": "/opt/camofox/browser/properties.json",
+    }
+    if _expect_object(camofox_home["allowed_symlinks"], f"{label}.p1_source_handoff.camofox_home.allowed_symlinks") != expected_camofox_symlinks:
+        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home symlink set is invalid")
+
+    manager_migration = _expect_object(p1_source["manager_migration"], f"{label}.p1_source_handoff.manager_migration")
+    migration_source_keys = {
+        "path", "mode", "schema_version", "status", "legacy_id_pattern",
+        "operation_id_pattern", "commit_pattern", "campaign_pattern",
+        "fields", "retirement_status", "retirement_fields",
+    }
+    if set(manager_migration) != migration_source_keys or manager_migration["path"] != "manager/migration.json" or manager_migration["mode"] != 0o600 or manager_migration["schema_version"] != 1 or manager_migration["status"] != "purged" or manager_migration["retirement_status"] != "completed":
+        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration identity is invalid")
+    expected_migration_patterns = {
+        "legacy_id_pattern": r"^legacy-[0-9a-f]{16}$",
+        "operation_id_pattern": r"^op_[0-9a-f]{32}$",
+        "commit_pattern": r"^[0-9a-f]{40}$",
+        "campaign_pattern": r"^source-v1-retirement-[0-9]{4}-[0-9]{2}$",
+    }
+    if any(manager_migration[name] != value for name, value in expected_migration_patterns.items()):
+        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration patterns are invalid")
+    expected_manager_fields = ("created_at", "expected_source_commit", "id", "operation_id", "retirement", "schema_version", "status", "updated_at")
+    expected_retirement_fields = ("campaign_id", "completed_at", "docker_removed", "generation_id", "recovery_removed", "source_state_removed", "started_at", "status", "systemd_removed")
+    if _expect_string_list(manager_migration["fields"], f"{label}.p1_source_handoff.manager_migration.fields") != expected_manager_fields or _expect_string_list(manager_migration["retirement_fields"], f"{label}.p1_source_handoff.manager_migration.retirement_fields") != expected_retirement_fields:
+        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration fields are invalid")
+
+    firecrawl_environment = _expect_object(p1_source["firecrawl_environment"], f"{label}.p1_source_handoff.firecrawl_environment")
+    if set(firecrawl_environment) != {"path", "mode", "keys", "bull_auth_pattern", "literal_values"} or firecrawl_environment["path"] != "data/runtimes/firecrawl/.env" or firecrawl_environment["mode"] != 0o600 or firecrawl_environment["bull_auth_pattern"] != r"^[A-Za-z0-9_-]{32}$":
+        raise DocsSyncError(f"{label}.p1_source_handoff.firecrawl_environment identity is invalid")
+    if _expect_string_list(firecrawl_environment["keys"], f"{label}.p1_source_handoff.firecrawl_environment.keys") != ("BULL_AUTH_KEY", "HOST", "PORT", "USE_DB_AUTHENTICATION") or _expect_object(firecrawl_environment["literal_values"], f"{label}.p1_source_handoff.firecrawl_environment.literal_values") != {"HOST": '"0.0.0.0"', "PORT": '"127.0.0.1:3002"', "USE_DB_AUTHENTICATION": '"false"'}:
+        raise DocsSyncError(f"{label}.p1_source_handoff.firecrawl_environment values are invalid")
+
     for field in (
         "database_schema_version",
         "sandbox_idle_seconds",
@@ -1171,6 +1870,7 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         "firecrawl-postgres",
         "firecrawl-redis",
         "firecrawl-rabbitmq",
+        "handoff-fs-helper",
     }
     if set(estimates) != managed_images:
         raise DocsSyncError(
@@ -1203,6 +1903,9 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
 def _render_python_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
     estimates = contract["managed_image_capacity_estimates"]
+    persistent_owners = contract["persistent_data_owners"]
+    runtime_handoff = contract["agent_runtime_handoff"]
+    p1_source_handoff = contract["p1_source_handoff"]
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -1211,6 +1914,9 @@ RELEASE_CHANNEL = {contract["release_channel"]!r}
 DATABASE_SCHEMA_VERSION = {contract["database_schema_version"]}
 CONTAINER_PATHS = {paths!r}
 EXECUTION_TARGETS = {tuple(contract["execution_targets"])!r}
+PERSISTENT_DATA_OWNERS = {persistent_owners!r}
+AGENT_RUNTIME_HANDOFF = {runtime_handoff!r}
+P1_SOURCE_HANDOFF = {p1_source_handoff!r}
 SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]}
 MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]}
 OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]}
@@ -1231,6 +1937,9 @@ def _render_typescript_container_platform(contract: dict[str, Any], source: str)
     operations = json.dumps(contract["operations"], ensure_ascii=False)
     phases = json.dumps(contract["operation_phases"], ensure_ascii=False)
     estimates = json.dumps(contract["managed_image_capacity_estimates"], ensure_ascii=False, indent=2)
+    persistent_owners = json.dumps(contract["persistent_data_owners"], ensure_ascii=False, indent=2)
+    runtime_handoff = json.dumps(contract["agent_runtime_handoff"], ensure_ascii=False, indent=2)
+    p1_source_handoff = json.dumps(contract["p1_source_handoff"], ensure_ascii=False, indent=2)
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]} as const;
 export const RELEASE_CHANNEL = {_typescript_string(contract["release_channel"])} as const;
@@ -1238,6 +1947,9 @@ export const DATABASE_SCHEMA_VERSION = {contract["database_schema_version"]} as 
 export const CONTAINER_PATHS = {paths} as const;
 export const EXECUTION_TARGETS = {targets} as const;
 export type ExecutionTarget = (typeof EXECUTION_TARGETS)[number];
+export const PERSISTENT_DATA_OWNERS = {persistent_owners} as const;
+export const AGENT_RUNTIME_HANDOFF = {runtime_handoff} as const;
+export const P1_SOURCE_HANDOFF = {p1_source_handoff} as const;
 export const SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]} as const;
 export const MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]} as const;
 export const OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]} as const;
@@ -1260,6 +1972,7 @@ def _go_string(value: str) -> str:
 
 def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
+    runtime_limits = contract["agent_runtime_handoff"]["validation_limits"]
 
     def strings(values: Sequence[str]) -> str:
         return ", ".join(_go_string(value) for value in values)
@@ -1290,6 +2003,22 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
             str(contract["update_pre_cutover_min_free_bytes"]),
         ),
         ("UpdateMinFreeInodes", str(contract["update_min_free_inodes"])),
+        (
+            "AgentRuntimeMaximumIdentityRecords",
+            str(runtime_limits["maximum_identity_records"]),
+        ),
+        (
+            "AgentRuntimeMaximumJSONLBytes",
+            str(runtime_limits["maximum_jsonl_bytes"]),
+        ),
+        (
+            "AgentRuntimeMaximumJSONLRecords",
+            str(runtime_limits["maximum_jsonl_records"]),
+        ),
+        (
+            "AgentRuntimeMaximumDirectoryEntries",
+            str(runtime_limits["maximum_directory_entries"]),
+        ),
     )
     name_width = max(len(name) for name, _ in constants)
     constant_lines = "\n".join(
@@ -1304,6 +2033,87 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
         + str(value["unpacked_bytes"])
         + ",\n\t},"
         for name, value in sorted(contract["managed_image_capacity_estimates"].items())
+    )
+    owner_names = [_go_string(name) for name in contract["persistent_data_owners"]]
+    owner_name_width = max(len(name) for name in owner_names)
+    owner_lines = "\n".join(
+        "\t"
+        + _go_string(name)
+        + ":"
+        + " " * (owner_name_width - len(_go_string(name)) + 1)
+        + "{"
+        + ", ".join(
+            "{UID: " + str(owner["uid"]) + ", GID: " + str(owner["gid"]) + "}"
+            for owner in owners
+        )
+        + "},"
+        for name, owners in sorted(contract["persistent_data_owners"].items())
+    )
+    runtime_handoff = contract["agent_runtime_handoff"]
+    retired = runtime_handoff["p1_retired_roots"]
+    app = retired["app"]
+    migration = retired["migration"]
+    symlink_items = [
+        (_go_string(path), _go_string(target))
+        for path, target in sorted(app["allowed_symlinks"].items())
+    ]
+    symlink_key_width = max(len(path) for path, _ in symlink_items)
+    symlink_lines = "\n".join(
+        f"\t{path}:{' ' * (symlink_key_width - len(path) + 1)}{target},"
+        for path, target in symlink_items
+    )
+    p1_source = contract["p1_source_handoff"]
+    p1_layout_lines: list[str] = []
+    for relative, layout in sorted(p1_source["layouts"].items()):
+        rendered_names = [_go_string(name) for name in layout["entries"]]
+        rendered_name_width = max(len(name) for name in rendered_names)
+        entry_lines = "\n".join(
+            "\t\t"
+            + _go_string(name)
+            + ":"
+            + " " * (rendered_name_width - len(_go_string(name)) + 1)
+            + "{Type: "
+            + _go_string(value["type"])
+            + ", Disposition: "
+            + _go_string(value["disposition"])
+            + ", Mode: "
+            + str(value["mode"])
+            + ", Required: "
+            + str(value["required"]).lower()
+            + "},"
+            for name, value in sorted(layout["entries"].items())
+        )
+        p1_layout_lines.append(
+            "\t"
+            + _go_string(relative)
+            + ": {Mode: "
+            + str(layout["mode"])
+            + ", Entries: map[string]P1SourceObject{\n"
+            + entry_lines
+            + "\n\t}},"
+        )
+    p1_fixed_names = [_go_string(path) for path in p1_source["fixed_sha256"]]
+    p1_fixed_width = max(len(name) for name in p1_fixed_names)
+    p1_fixed_lines = "\n".join(
+        f"\t{_go_string(path)}:{' ' * (p1_fixed_width - len(_go_string(path)) + 1)}{_go_string(value)},"
+        for path, value in sorted(p1_source["fixed_sha256"].items())
+    )
+    p1_camofox = p1_source["camofox_home"]
+    p1_camofox_symlink_names = [_go_string(path) for path in p1_camofox["allowed_symlinks"]]
+    p1_camofox_symlink_width = max(len(name) for name in p1_camofox_symlink_names)
+    p1_camofox_symlink_lines = "\n".join(
+        f"\t{_go_string(path)}:{' ' * (p1_camofox_symlink_width - len(_go_string(path)) + 1)}{_go_string(value)},"
+        for path, value in sorted(p1_camofox["allowed_symlinks"].items())
+    )
+    p1_migration = p1_source["manager_migration"]
+    p1_firecrawl = p1_source["firecrawl_environment"]
+    p1_workspace = p1_source["workspace_namespace"]
+    p1_workspace_mount = p1_workspace["root_owned_empty_mount"]
+    p1_firecrawl_literal_names = [_go_string(name) for name in p1_firecrawl["literal_values"]]
+    p1_firecrawl_literal_width = max(len(name) for name in p1_firecrawl_literal_names)
+    p1_firecrawl_literal_lines = "\n".join(
+        f"\t{_go_string(name)}:{' ' * (p1_firecrawl_literal_width - len(_go_string(name)) + 1)}{_go_string(value)},"
+        for name, value in sorted(p1_firecrawl["literal_values"].items())
     )
 
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
@@ -1322,10 +2132,124 @@ var ManagedImageCapacityEstimates = map[string]ImageCapacityEstimate{{
 {estimate_lines}
 }}
 
+type PersistentDataOwner struct {{
+\tUID uint32
+\tGID uint32
+}}
+
+var PersistentDataOwners = map[string][]PersistentDataOwner{{
+{owner_lines}
+}}
+
+const (
+\tAgentRuntimeP1AppMode             = {app["mode"]}
+\tAgentRuntimeP1AppInventorySHA256  = {_go_string(app["inventory_sha256"])}
+\tAgentRuntimeP1AppInventoryEntries = {app["inventory_entries"]}
+\tAgentRuntimeP1AppRegularBytes     = {app["inventory_regular_bytes"]}
+\tAgentRuntimeP1InstallSignature    = {_go_string(app["install_source_signature"])}
+\tAgentRuntimeP1PackageName         = {_go_string(app["package_name"])}
+\tAgentRuntimeP1PackageVersion      = {_go_string(app["package_version"])}
+\tAgentRuntimeP1HomeMode            = {retired["home"]["mode"]}
+\tAgentRuntimeP1MemoryMode          = {retired["memory"]["mode"]}
+\tAgentRuntimeP1MigrationMode       = {migration["mode"]}
+\tAgentRuntimeP1MigrationFile       = {_go_string(migration["file_name"])}
+\tAgentRuntimeP1MigrationFileMode   = {migration["file_mode"]}
+\tAgentRuntimeP1MigrationSchema     = {migration["schema_version"]}
+\tAgentRuntimeP1MigrationPhase      = {_go_string(migration["phase"])}
+)
+
+var AgentRuntimeCurrentRoots = []string{{{strings(runtime_handoff["current_roots"])}}}
+var AgentRuntimeEphemeralRoots = []string{{{strings(runtime_handoff["ephemeral_roots"])}}}
+var AgentRuntimeP1RetiredRoots = []string{{{strings(retired.keys())}}}
+var AgentRuntimeP1AppTopLevelEntries = []string{{{strings(app["top_level_entries"])}}}
+var AgentRuntimeP1AppAllowedSymlinks = map[string]string{{
+{symlink_lines}
+}}
+var AgentRuntimeP1MigrationFields = []string{{{strings(migration["fields"])}}}
+
+type P1SourceObject struct {{
+	Type        string
+	Disposition string
+	Mode        uint32
+	Required    bool
+}}
+
+type P1SourceDirectory struct {{
+	Mode    uint32
+	Entries map[string]P1SourceObject
+}}
+
+var P1SourceLayouts = map[string]P1SourceDirectory{{
+{chr(10).join(p1_layout_lines)}
+}}
+
+var P1SourceEmptyFiles = []string{{{strings(p1_source["empty_files"])}}}
+var P1SourceEmptyDirectories = []string{{{strings(p1_source["empty_directories"])}}}
+var P1SourceSecretFiles = []string{{{strings(p1_source["secret_files"])}}}
+var P1ManagerSecretNames = []string{{{strings(p1_source["manager_secret_names"])}}}
+var P1SourceFixedSHA256 = map[string]string{{
+{p1_fixed_lines}
+}}
+
+const P1SourceSecretLinePattern = {_go_string(p1_source["secret_line_pattern"])}
+const P1WorkspaceSourceDirectory = {_go_string(p1_workspace["source_directory"])}
+const P1WorkspaceTargetDirectory = {_go_string(p1_workspace["target_directory"])}
+const P1WorkspaceNamespaceRequired = {str(p1_workspace["required"]).lower()}
+const P1WorkspaceNamespaceMode = {p1_workspace["mode"]}
+const P1WorkspaceRootOwnedMountPath = {_go_string(p1_workspace_mount["relative_path"])}
+const P1WorkspaceRootOwnedMountMode = {p1_workspace_mount["mode"]}
+const P1WorkspaceRootOwnedUID = {p1_workspace_mount["uid"]}
+const P1WorkspaceRootOwnedGID = {p1_workspace_mount["gid"]}
+const P1CamofoxHomePath = {_go_string(p1_camofox["path"])}
+const P1CamofoxHomeMode = {p1_camofox["mode"]}
+const P1ManagerMigrationPath = {_go_string(p1_migration["path"])}
+const P1ManagerMigrationMode = {p1_migration["mode"]}
+const P1ManagerMigrationSchema = {p1_migration["schema_version"]}
+const P1ManagerMigrationStatus = {_go_string(p1_migration["status"])}
+const P1ManagerRetirementStatus = {_go_string(p1_migration["retirement_status"])}
+const P1ManagerLegacyIDPattern = {_go_string(p1_migration["legacy_id_pattern"])}
+const P1ManagerOperationIDPattern = {_go_string(p1_migration["operation_id_pattern"])}
+const P1ManagerCommitPattern = {_go_string(p1_migration["commit_pattern"])}
+const P1ManagerCampaignPattern = {_go_string(p1_migration["campaign_pattern"])}
+const P1FirecrawlEnvironmentPath = {_go_string(p1_firecrawl["path"])}
+const P1FirecrawlEnvironmentMode = {p1_firecrawl["mode"]}
+const P1FirecrawlBullAuthPattern = {_go_string(p1_firecrawl["bull_auth_pattern"])}
+
+var P1CamofoxHomeTopLevelEntries = []string{{{strings(p1_camofox["top_level_entries"])}}}
+var P1CamofoxHomeAllowedSymlinks = map[string]string{{
+{p1_camofox_symlink_lines}
+}}
+var P1ManagerMigrationFields = []string{{{strings(p1_migration["fields"])}}}
+var P1ManagerRetirementFields = []string{{{strings(p1_migration["retirement_fields"])}}}
+var P1FirecrawlEnvironmentKeys = []string{{{strings(p1_firecrawl["keys"])}}}
+var P1FirecrawlEnvironmentLiteralValues = map[string]string{{
+{p1_firecrawl_literal_lines}
+}}
+
 var ExecutionTargets = []string{{{strings(contract["execution_targets"])}}}
 var PublicUpdateStates = []string{{{strings(contract["public_update_states"])}}}
 var Operations = []string{{{strings(contract["operations"])}}}
 var OperationPhases = []string{{{strings(contract["operation_phases"])}}}
+'''
+
+
+def _render_go_release_transition(contract: dict[str, Any], source: str) -> str:
+    compat = contract.get("source_owner_compat")
+    if compat is None:
+        return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
+package contract
+'''
+    images = ", ".join(_go_string(value) for value in compat["managed_images"])
+    return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
+package contract
+
+const (
+\tSourceOwnerCompatGeneration     = {_go_string(compat["generation"])}
+\tSourceOwnerCompatManifestSHA256 = {_go_string(compat["manifest_sha256"])}
+\tSourceOwnerCompatComposeSHA256  = {_go_string(compat["compose_sha256"])}
+)
+
+var SourceOwnerCompatManagedImages = []string{{{images}}}
 '''
 
 
@@ -1416,6 +2340,8 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
         parsed = _validate_upstream_sources_contract(
             raw, f"contract {contract.identifier}"
         )
+    elif contract.identifier == "release-transition":
+        parsed = validate_release_transition_contract(raw, f"contract {contract.identifier}")
     else:
         raise DocsSyncError(f"unsupported contract id: {contract.identifier}")
     rendered: dict[str, str] = {}
@@ -1430,6 +2356,8 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_typescript_container_platform(parsed, contract.source)
         elif target.format == "go-container-platform":
             content = _render_go_container_platform(parsed, contract.source)
+        elif target.format == "go-release-transition":
+            content = _render_go_release_transition(parsed, contract.source)
         else:  # Protected by manifest validation; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content

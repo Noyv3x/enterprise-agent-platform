@@ -24,14 +24,31 @@ const recoverySystemdIntegrationEnvironment = "UBITECH_SYSTEMD_INTEGRATION"
 const recoverySystemdIntegrationHelperEnvironment = "UBITECH_SYSTEMD_INTEGRATION_HELPER"
 const ordinarySystemdIntegrationMainEnvironment = "UBITECH_SYSTEMD_ACTIVATION_MAIN_HELPER"
 const ordinarySystemdIntegrationWatchdogEnvironment = "UBITECH_SYSTEMD_ACTIVATION_WATCHDOG_HELPER"
+const ordinarySystemdIntegrationConfigEnvironment = "UBITECH_SYSTEMD_ACTIVATION_CONFIG"
 
 func init() {
 	if os.Getenv(ordinarySystemdIntegrationWatchdogEnvironment) == "1" {
-		if len(os.Args) != 4 || os.Args[1] != "self-update-watchdog" || os.Args[2] != "--plan" || !filepath.IsAbs(os.Args[3]) {
+		if len(os.Args) != 6 || os.Args[1] != "self-update-watchdog" || os.Args[2] != "--plan" || !filepath.IsAbs(os.Args[3]) ||
+			os.Args[4] != "--config" || !filepath.IsAbs(os.Args[5]) {
 			_, _ = fmt.Fprintf(os.Stderr, "invalid ordinary integration watchdog argv: %q\n", os.Args)
 			os.Exit(2)
 		}
-		if err := RunWatchdog(context.Background(), os.Args[3], nil); err != nil {
+		_, plan, err := readRecoveryActivationPlan(os.Args[3])
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "read ordinary integration watchdog plan: %v\n", err)
+			os.Exit(2)
+		}
+		manager := &Manager{
+			Profile: testActiveProfile, ConfigPath: os.Args[5],
+			Root: filepath.Dir(filepath.Dir(plan.PlanPath)), StatePath: plan.StatePath,
+			InstallPath: plan.InstallPath, SocketPath: plan.SocketPath,
+			ControlTokenFile: plan.ControlTokenFile, UnitName: plan.UnitName,
+		}
+		binding, err := manager.WatchdogBinding()
+		if err == nil {
+			err = RunWatchdog(context.Background(), binding, os.Args[3], nil, func() error { return nil })
+		}
+		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "ordinary integration watchdog failed: %v\n", err)
 			os.Exit(2)
 		}
@@ -63,8 +80,9 @@ func init() {
 func runOrdinarySystemdIntegrationMain() error {
 	planPath := os.Getenv("UBITECH_SYSTEMD_ACTIVATION_PLAN")
 	markerPath := os.Getenv("UBITECH_SYSTEMD_ACTIVATION_MARKER")
-	if !filepath.IsAbs(planPath) || !filepath.IsAbs(markerPath) {
-		return fmt.Errorf("ordinary integration paths must be absolute: plan=%q marker=%q", planPath, markerPath)
+	configPath := os.Getenv(ordinarySystemdIntegrationConfigEnvironment)
+	if !filepath.IsAbs(planPath) || !filepath.IsAbs(markerPath) || !filepath.IsAbs(configPath) {
+		return fmt.Errorf("ordinary integration paths must be absolute: plan=%q marker=%q config=%q", planPath, markerPath, configPath)
 	}
 	var plan Plan
 	if err := atomicfile.ReadJSON(planPath, &plan); err != nil {
@@ -137,7 +155,7 @@ func runOrdinarySystemdIntegrationMain() error {
 		// the independent watchdog remains alive. The integration assertion uses
 		// this interval to prove cgroup separation, not merely eventual success.
 		time.Sleep(1500 * time.Millisecond)
-		manager := &Manager{
+		manager := &Manager{Profile: testActiveProfile, ConfigPath: configPath,
 			Root: filepath.Dir(filepath.Dir(plan.PlanPath)), StatePath: plan.StatePath,
 			InstallPath: plan.InstallPath, SocketPath: plan.SocketPath,
 			ControlTokenFile: plan.ControlTokenFile, UnitName: plan.UnitName,
@@ -180,7 +198,7 @@ func TestRecoverySystemdQuiescenceIntegration(t *testing.T) {
 	}
 
 	suffix := recoverySystemdIntegrationSuffix(t)
-	unitBase := recoveryWatchdogUnitPrefix + "integration-" + suffix
+	unitBase := testTechnicalProfile.WatchdogUnitPrefix + "integration-" + suffix
 	unit := unitBase + ".service"
 	mainUnit := "ubitech-agent-manager-integration-main-" + suffix + ".service"
 	if loadState, err := recoverySystemdProperty(ctx, unit, "LoadState"); err != nil {
@@ -254,7 +272,7 @@ func TestRecoverySystemdQuiescenceIntegration(t *testing.T) {
 		return found && processPID == mainPID, nil
 	})
 
-	manager := &Manager{}
+	manager := &Manager{Profile: testActiveProfile}
 	if err := manager.quiesceRecoveryUnits(ctx, mainUnit, []string{unitBase}, planPath); err != nil {
 		t.Fatalf("quiesce exact integration watchdog: %v", err)
 	}
@@ -309,10 +327,10 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 
 	suffix := recoverySystemdIntegrationSuffix(t)
 	platformCommit := sha256Hex([]byte("ordinary-systemd-integration-" + suffix))[:40]
-	watchdogBase := recoveryWatchdogUnitPrefix + platformCommit[:12]
+	watchdogBase := testTechnicalProfile.WatchdogUnitPrefix + platformCommit[:12]
 	watchdogUnit := watchdogBase + ".service"
-	mainBase := "ubitech-agent-manager-integration-main-" + suffix
-	mainUnit := mainBase + ".service"
+	mainUnit := testTechnicalProfile.ManagerUnit
+	mainBase := strings.TrimSuffix(mainUnit, ".service")
 	for _, unit := range []string{watchdogUnit, mainUnit} {
 		load, err := recoverySystemdProperty(ctx, unit, "LoadState")
 		if err != nil {
@@ -322,7 +340,15 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 			t.Fatalf("collision-resistant integration unit already exists: %s load=%s", unit, load)
 		}
 	}
-	root := t.TempDir()
+	base := t.TempDir()
+	// testing.T.TempDir may place the per-test directory below a harness-owned
+	// parent whose default mode is broader than recovery credentials permit.
+	// The ordinary Manager helper reads its control token through the production
+	// private-path validator, so make the exact credential directory private.
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatalf("protect ordinary integration root: %v", err)
+	}
+	root := filepath.Join(base, "manager-binaries")
 	// Register unit cleanup after t.TempDir so LIFO cleanup stops every process
 	// before the temporary executable and state tree are removed.
 	t.Cleanup(func() {
@@ -331,12 +357,12 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 		_ = exec.CommandContext(cleanupCtx, "systemctl", "--user", "stop", watchdogUnit).Run()
 		_ = exec.CommandContext(cleanupCtx, "systemctl", "--user", "stop", mainUnit).Run()
 	})
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	versionsRoot := filepath.Join(root, "versions")
 	activationsRoot := filepath.Join(root, "activations")
-	controlRoot := filepath.Join(root, "control")
+	controlRoot := filepath.Join(base, "control")
 	for _, directory := range []string{versionsRoot, activationsRoot, controlRoot} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
@@ -352,7 +378,11 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 	}
 	currentPath := filepath.Join(versionsRoot, "current-manager")
 	candidatePath := filepath.Join(versionsRoot, "candidate-manager")
-	installPath := filepath.Join(root, "ubitech-manager")
+	installRoot := filepath.Join(base, "bin")
+	if err := os.MkdirAll(installRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installPath := filepath.Join(installRoot, testTechnicalProfile.ManagerBinary)
 	if err := atomicfile.WriteFile(currentPath, executableData, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -370,14 +400,18 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 	}
 	currentVersion := strings.Repeat("1", 40)
 	controlToken := strings.Repeat("integration-token-", 4)
-	tokenPath := filepath.Join(root, "manager-token")
+	tokenPath := filepath.Join(base, "manager-token")
 	if err := os.WriteFile(tokenPath, []byte(controlToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	statePath := filepath.Join(root, "manager-binaries.json")
+	statePath := filepath.Join(base, "manager-binaries.json")
 	planPath := filepath.Join(activationsRoot, platformCommit+".json")
 	socketPath := filepath.Join(controlRoot, "manager.sock")
-	markerPath := filepath.Join(root, "manager-starts.log")
+	markerPath := filepath.Join(base, "manager-starts.log")
+	configPath := filepath.Join(base, "manager.toml")
+	if err := os.WriteFile(configPath, []byte("# systemd integration startup binding\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	state := State{
 		SchemaVersion: 1,
@@ -415,6 +449,7 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 		"--setenv="+ordinarySystemdIntegrationMainEnvironment+"=1",
 		"--setenv=UBITECH_SYSTEMD_ACTIVATION_PLAN="+planPath,
 		"--setenv=UBITECH_SYSTEMD_ACTIVATION_MARKER="+markerPath,
+		"--setenv="+ordinarySystemdIntegrationConfigEnvironment+"="+configPath,
 		installPath,
 	)
 	if output, err := mainStart.CombinedOutput(); err != nil {
@@ -446,18 +481,18 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 		"systemd-run", "--user", "--quiet", "--collect", "--unit", watchdogBase,
 		"--property=Type=exec",
 		"--setenv="+ordinarySystemdIntegrationWatchdogEnvironment+"=1",
-		currentPath, "self-update-watchdog", "--plan", planPath,
+		currentPath, "self-update-watchdog", "--plan", planPath, "--config", configPath,
 	)
 	if output, err := watchdogStart.CombinedOutput(); err != nil {
 		t.Fatalf("start ordinary integration watchdog: %v: %s", err, strings.TrimSpace(string(output)))
 	}
-	manager := &Manager{}
+	manager := &Manager{Profile: testActiveProfile, ConfigPath: configPath}
 	recoverySystemdIntegrationEventually(t, ctx, "ordinary integration watchdog ownership", func() (bool, error) {
 		active, err := recoverySystemdProperty(ctx, watchdogUnit, "ActiveState")
 		if err != nil || active != "active" {
 			return false, err
 		}
-		if err := manager.verifyOrdinaryWatchdogProcess(ctx, watchdogBase, currentPath, currentSHA, planPath); err != nil {
+		if err := manager.verifyOrdinaryWatchdogProcess(ctx, watchdogBase, currentPath, currentSHA, planPath, false); err != nil {
 			return false, nil
 		}
 		return true, nil
@@ -572,7 +607,7 @@ func recoverySystemdIntegrationWatchdogUnits(ctx context.Context) ([]string, err
 	output, err := exec.CommandContext(
 		ctx,
 		"systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--full",
-		recoveryWatchdogUnitPrefix+"*",
+		testTechnicalProfile.WatchdogUnitPrefix+"*",
 	).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("list user-systemd Manager watchdog units: %w: %s", err, strings.TrimSpace(string(output)))

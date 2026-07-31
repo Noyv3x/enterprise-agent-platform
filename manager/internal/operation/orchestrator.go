@@ -3,6 +3,7 @@ package operation
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
@@ -42,6 +44,8 @@ type Orchestrator struct {
 	Gate                 Gate
 	Snapshots            Snapshotter
 	SelfUpdate           SelfUpdater
+	TechnicalProfile     identity.ActiveProfile
+	DataRoot             string
 	ReleasesDir          string
 	ManifestURL          string
 	Channel              string
@@ -56,11 +60,22 @@ type Orchestrator struct {
 	LocalActiveProcesses func() int
 	FixedStackMu         sync.Locker
 	MaintenanceMu        sync.Locker
-	ReclaimCapacity      func(context.Context, string, release.Manifest) error
-	mu                   sync.Mutex
-	finalizeMu           sync.Mutex
-	rollbackMu           sync.Mutex
-	running              map[string]context.CancelFunc
+	// HandoffAdmission is acquired before MaintenanceMu for every ordinary
+	// operation publication boundary. A source-owner Manager uses it to retain
+	// the deployment-wide handoff observation lock and reject a nonterminal
+	// namespace transaction. The returned release function must be idempotent.
+	HandoffAdmission func(context.Context) (release func(), err error)
+	// NamespaceHandoffCheck is installed only by the complete source-owner
+	// application. It receives the already validated and immutably retained
+	// bridge manifest identity after the ordinary observation lease is released,
+	// and must route it to the handoff coordinator. Ordinary update execution
+	// still rejects the descriptor; the coordinator is its only mutation owner.
+	NamespaceHandoffCheck func(context.Context, release.Manifest, string, string) error
+	ReclaimCapacity       func(context.Context, string, release.Manifest) error
+	mu                    sync.Mutex
+	finalizeMu            sync.Mutex
+	rollbackMu            sync.Mutex
+	running               map[string]context.CancelFunc
 }
 
 const reservationReleaseTimeout = 10 * time.Second
@@ -70,6 +85,21 @@ type reservationReleaseUncertainError struct{ cause error }
 
 func (e *reservationReleaseUncertainError) Error() string { return e.cause.Error() }
 func (e *reservationReleaseUncertainError) Unwrap() error { return e.cause }
+
+type retainedGenerationSlot string
+
+const (
+	retainedGenerationCurrent  retainedGenerationSlot = "current"
+	retainedGenerationPrevious retainedGenerationSlot = "previous"
+)
+
+// retainedSourceAbortGate is deliberately narrower than Gate. Only the source
+// profile's exact, locally retained public predecessor may opt into the one
+// legacy endpoint needed to abort its reservation. Ordinary fakes, target
+// Managers, remote manifests and future generations never acquire this method.
+type retainedSourceAbortGate interface {
+	releaseRetainedSourcePredecessor(context.Context, string, string) error
+}
 
 func (o *Orchestrator) Preflight(ctx context.Context) error {
 	if err := o.Engine.Preflight(ctx); err != nil {
@@ -90,10 +120,46 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	if err != nil {
 		return release.Manifest{}, err
 	}
-	if err := rejectUnownedNamespaceHandoff(manifest); err != nil {
+	if manifest.NamespaceHandoff != nil && o.NamespaceHandoffCheck == nil {
+		return release.Manifest{}, errors.New("namespace handoff requires the complete handoff owner and cannot run as an ordinary update")
+	}
+	if manifest.NamespaceHandoff == nil {
+		if err := rejectUnownedNamespaceHandoff(manifest); err != nil {
+			return release.Manifest{}, err
+		}
+	}
+	if manifest.NamespaceHandoff != nil {
+		// Retain bytes and clear any old check-only Candidate while following the
+		// ordinary global->runtime lock order. Release that observation before
+		// entering Coordinator.Begin, which takes the same global lock and then
+		// acquires its stronger runtime freeze. Re-entering while held deadlocks;
+		// publishing a Candidate would let runUpdate misinterpret the bridge.
+		unlockMaintenance, lockErr := o.lockMaintenanceAdmission(ctx)
+		if lockErr != nil {
+			return release.Manifest{}, lockErr
+		}
+		path, saveErr := o.saveManifest(ctx, manifest, data)
+		if saveErr == nil {
+			_, saveErr = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+				state.Candidate = nil
+				state.LastError = ""
+				return nil
+			})
+		}
+		unlockMaintenance()
+		if saveErr != nil {
+			return release.Manifest{}, saveErr
+		}
+		digest := sha256.Sum256(data)
+		if err := o.NamespaceHandoffCheck(ctx, manifest, path, fmt.Sprintf("%x", digest[:])); err != nil {
+			return release.Manifest{}, err
+		}
+		return manifest, nil
+	}
+	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
+	if err != nil {
 		return release.Manifest{}, err
 	}
-	unlockMaintenance := o.lockMaintenanceAdmission()
 	defer unlockMaintenance()
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
@@ -111,7 +177,10 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	return manifest, err
 }
 func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, bool, error) {
-	unlockMaintenance := o.lockMaintenanceAdmission()
+	unlockMaintenance, err := o.lockMaintenanceAdmission(context.Background())
+	if err != nil {
+		return model.Operation{}, false, err
+	}
 	defer unlockMaintenance()
 	o.mu.Lock()
 	op, reused, err := o.Store.Begin(request, o.now())
@@ -158,23 +227,43 @@ func (o *Orchestrator) Await(ctx context.Context, id string) (model.Operation, e
 // are deliberately withheld until the watchdog has committed the candidate
 // binary.
 func (o *Orchestrator) RecoverBeforeActivation(ctx context.Context) error {
-	unlockMaintenance := o.lockMaintenanceAdmission()
+	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
+	if err != nil {
+		return err
+	}
 	defer unlockMaintenance()
 	return o.recover(ctx, false, true)
 }
 
 func (o *Orchestrator) Recover(ctx context.Context) error {
-	unlockMaintenance := o.lockMaintenanceAdmission()
+	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
+	if err != nil {
+		return err
+	}
 	defer unlockMaintenance()
 	return o.recover(ctx, true, false)
 }
 
-func (o *Orchestrator) lockMaintenanceAdmission() func() {
+func (o *Orchestrator) lockMaintenanceAdmission(ctx context.Context) (func(), error) {
+	releaseHandoff := func() {}
+	if o.HandoffAdmission != nil {
+		var err error
+		releaseHandoff, err = o.HandoffAdmission(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if releaseHandoff == nil {
+			return nil, errors.New("handoff admission returned a nil release function")
+		}
+	}
 	if o.MaintenanceMu == nil {
-		return func() {}
+		return releaseHandoff, nil
 	}
 	o.MaintenanceMu.Lock()
-	return o.MaintenanceMu.Unlock
+	return func() {
+		o.MaintenanceMu.Unlock()
+		releaseHandoff()
+	}, nil
 }
 
 func (o *Orchestrator) RecoveryPending() bool {
@@ -302,7 +391,7 @@ func (o *Orchestrator) recoverFinalize(ctx context.Context, state model.ManagerS
 	if state.Current == nil || state.Current.ManifestPath == "" || op.TargetGeneration != state.Current.ID {
 		return errors.New("pending finalize generation does not match current generation")
 	}
-	manifest, err := o.loadManifest(state.Current.ManifestPath)
+	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
 	if err != nil {
 		return err
 	}
@@ -617,6 +706,7 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	if stateBefore.FinalizePendingOperationID != op.ID {
 		return errors.New("pending finalize operation changed")
 	}
+	watchdogCommitted := false
 	if !op.Finalized {
 		isGenerationChange := op.Kind == model.OperationInstall || op.Kind == model.OperationUpdate
 		if isGenerationChange && o.SelfUpdate != nil {
@@ -643,6 +733,7 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 				// watchdog has observed and committed a healthy new Manager.
 				return o.finalizeFailure("manager activation acknowledgement is pending", errors.New("watchdog has not committed the candidate Manager"))
 			}
+			watchdogCommitted = true
 		}
 		if (isGenerationChange || op.Kind == model.OperationRollback) && o.OnCommit != nil {
 			o.OnCommit(manifest)
@@ -656,9 +747,17 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 		return o.finalizeFailure("final committed generation readiness is pending", err)
 	}
 	if !op.Finalized {
-		// Admission release is the final externally visible hook.
-		if err := o.Gate.Release(ctx, op.ID); err != nil {
-			return o.finalizeFailure("update reservation release is pending", err)
+		// Admission release is the final externally visible hook. Only the
+		// generation-change path with durable watchdog evidence receives the
+		// Platform capability that commits workspace/Camoufox machine schemas.
+		var releaseErr error
+		if watchdogCommitted {
+			releaseErr = o.Gate.Commit(ctx, op.ID)
+		} else {
+			releaseErr = o.releaseGate(ctx, o.Gate, op.ID)
+		}
+		if releaseErr != nil {
+			return o.finalizeFailure("update reservation release is pending", releaseErr)
 		}
 		o.event(op.ID, "operation.committed", manifest.ID(), nil)
 		if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
@@ -812,7 +911,7 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("there is no current generation"))
 		return
 	}
-	manifest, err := o.loadManifest(state.Current.ManifestPath)
+	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
 	if err != nil {
 		o.failBeforeMaintenance(op, err)
 		return
@@ -881,7 +980,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("there is no previous generation"))
 		return
 	}
-	manifest, err := o.loadManifest(state.Previous.ManifestPath)
+	manifest, err := o.loadStateManifest(state.Previous, retainedGenerationPrevious)
 	if err != nil {
 		o.failBeforeMaintenance(op, err)
 		return
@@ -993,7 +1092,7 @@ func (o *Orchestrator) runRepair(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("no current generation is available for repair"))
 		return
 	}
-	manifest, err := o.loadManifest(state.Current.ManifestPath)
+	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
 	if err == nil {
 		_, err = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 			value.TargetGeneration = state.Current.ID
@@ -1193,7 +1292,7 @@ func (o *Orchestrator) releaseReservation(gate Gate, id string, cause error) err
 	}
 	releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
 	defer cancel()
-	if err := gate.Release(releaseCtx, id); err != nil {
+	if err := o.releaseGate(releaseCtx, gate, id); err != nil {
 		return &reservationReleaseUncertainError{cause: errors.Join(cause, fmt.Errorf("confirm reservation release: %w", err))}
 	}
 	return nil
@@ -1257,7 +1356,7 @@ func (o *Orchestrator) recoverUnconfirmedReservation(_ context.Context, op model
 	if gate == nil {
 		return o.holdUnconfirmedReservation(op, errors.New(reservationRetryDiagnostic(op.Error, "platform admission gate is not configured for reservation recovery")))
 	}
-	if err := gate.Release(releaseCtx, op.ID); err != nil {
+	if err := o.releaseGate(releaseCtx, gate, op.ID); err != nil {
 		return o.holdUnconfirmedReservation(op, errors.New(reservationRetryDiagnostic(op.Error, fmt.Sprintf("retry reservation release: %v", err))))
 	}
 	message := journal.BoundDiagnostic(op.Error)
@@ -1629,7 +1728,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 	state := o.Store.State()
 	if readErr == nil && state.Current != nil {
 		var previous release.Manifest
-		previous, readErr = o.loadManifest(state.Current.ManifestPath)
+		previous, readErr = o.loadStateManifest(state.Current, retainedGenerationCurrent)
 		if readErr == nil {
 			_ = o.Engine.StopFixed(ctx)
 			readErr = o.Engine.StartFixed(ctx, previous)
@@ -1645,7 +1744,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 		}
 		if readErr == nil {
 			releaseCtx, cancel := context.WithTimeout(context.Background(), reservationReleaseTimeout)
-			releaseErr := gate.Release(releaseCtx, op.ID)
+			releaseErr := o.releaseGate(releaseCtx, gate, op.ID)
 			cancel()
 			if releaseErr != nil {
 				readErr = fmt.Errorf("release update reservation: %w", releaseErr)
@@ -1849,6 +1948,49 @@ func (o *Orchestrator) loadManifest(path string) (release.Manifest, error) {
 		return value, err
 	}
 	return value, nil
+}
+
+// loadStateManifest keeps the current parser strict for every normal retained
+// generation. The compatibility reader is reached only after strict validation
+// fails and independently proves the exact source-profile Current/Previous P1
+// bytes and path fixed by the release-transition contract.
+func (o *Orchestrator) loadStateManifest(generation *model.Generation, slot retainedGenerationSlot) (release.Manifest, error) {
+	if generation == nil {
+		return release.Manifest{}, errors.New("retained generation is absent")
+	}
+	manifest, strictErr := o.loadManifest(generation.ManifestPath)
+	if strictErr == nil {
+		return manifest, nil
+	}
+	manifest, compatibilityErr := o.loadRetainedSourceCompatibility(generation, slot)
+	if compatibilityErr == nil {
+		return manifest, nil
+	}
+	return release.Manifest{}, errors.Join(
+		strictErr,
+		fmt.Errorf("retained source predecessor compatibility rejected: %w", compatibilityErr),
+	)
+}
+
+// releaseGate performs the normal abort first in all cases. HTTPGate is allowed
+// to try the historical endpoint only when this process can still prove that
+// the authoritative Current is the exact canonical source predecessor.
+func (o *Orchestrator) releaseGate(ctx context.Context, gate Gate, operationID string) error {
+	if gate == nil {
+		return errors.New("platform admission gate is not configured for release")
+	}
+	if o.Store == nil {
+		return gate.Release(ctx, operationID)
+	}
+	state := o.Store.State()
+	if state.Current != nil {
+		if _, err := o.loadRetainedSourceCompatibility(state.Current, retainedGenerationCurrent); err == nil {
+			if compatibilityGate, ok := gate.(retainedSourceAbortGate); ok {
+				return compatibilityGate.releaseRetainedSourcePredecessor(ctx, operationID, state.Current.ID)
+			}
+		}
+	}
+	return gate.Release(ctx, operationID)
 }
 func (o *Orchestrator) now() time.Time {
 	if o.Now != nil {

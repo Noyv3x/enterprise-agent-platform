@@ -41,9 +41,10 @@ from PIL import Image, UnidentifiedImageError
 from .auth import TokenSigner, hash_password, verify_password
 from .agent_inputs import AgentRunInput, AgentRunInputStore
 from .agent_scopes import AgentExecutionScope, AgentScopeManager
+from .camofox_state import ensure_camofox_runtime_sidecar
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
-from .container_contract_generated import CONTAINER_PATHS
+from .container_contract_generated import CONTAINER_PATHS, DATABASE_SCHEMA_VERSION
 from .db import Database, decode_json, encode_json, now_ts
 from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
@@ -61,6 +62,7 @@ from .internal_config import (
     read_cognee_internal_config,
     update_env_file,
 )
+from .handoff_evidence import collect_platform_handoff_evidence
 from .jobs import DurableJob, DurableJobStore
 from .learning import (
     LEARNING_REVIEW_JOB_KIND,
@@ -365,6 +367,25 @@ MAX_BRAND_LOGO_BYTES = 256 * 1024
 MAX_BRAND_LOGO_DIMENSION = 4096
 MAX_BRAND_LOGO_PIXELS = 16 * 1024 * 1024
 BRAND_LOGO_MIME_TYPES = frozenset({"image/png", "image/webp"})
+MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING = (
+    "manager_namespace_handoff_commit_receipt_v1"
+)
+MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION = 1
+MANAGER_HANDOFF_OPERATION_RE = re.compile(r"^handoff_[0-9a-f]{32}$")
+MANAGER_HANDOFF_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
+MANAGER_HANDOFF_BINDING_RE = re.compile(r"^[0-9a-f]{64}$")
+MANAGER_HANDOFF_RECEIPT_RE = re.compile(r"^[0-9a-f]{64}$")
+MANAGER_HANDOFF_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "operation_id",
+        "target_generation",
+        "binding_sha256",
+        "database_schema_version",
+        "committed_at",
+        "receipt_sha256",
+    }
+)
 TELEGRAM_SETTING_ENABLED = "telegram_enabled"
 TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
 TELEGRAM_SETTING_POLLING = "telegram_polling"
@@ -374,6 +395,108 @@ OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
 }
+
+
+def _manager_handoff_object_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate handoff receipt field {key!r}")
+        result[key] = value
+    return result
+
+
+def _manager_handoff_receipt_material(receipt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "binding_sha256": receipt["binding_sha256"],
+        "committed_at": receipt["committed_at"],
+        "database_schema_version": receipt["database_schema_version"],
+        "operation_id": receipt["operation_id"],
+        "schema_version": receipt["schema_version"],
+        "target_generation": receipt["target_generation"],
+    }
+
+
+def _manager_handoff_receipt_digest(receipt: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        _manager_handoff_receipt_material(receipt),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_manager_handoff_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != MANAGER_HANDOFF_RECEIPT_FIELDS:
+        raise ValueError("handoff commit receipt fields do not match schema 1")
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION
+    ):
+        raise ValueError("handoff commit receipt schema is unsupported")
+    operation_id = value.get("operation_id")
+    target_generation = value.get("target_generation")
+    binding_sha256 = value.get("binding_sha256")
+    database_schema_version = value.get("database_schema_version")
+    committed_at = value.get("committed_at")
+    receipt_sha256 = value.get("receipt_sha256")
+    if not isinstance(operation_id, str) or not MANAGER_HANDOFF_OPERATION_RE.fullmatch(
+        operation_id
+    ):
+        raise ValueError("handoff commit receipt operation id is invalid")
+    if not isinstance(
+        target_generation, str
+    ) or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation):
+        raise ValueError("handoff commit receipt target generation is invalid")
+    if not isinstance(binding_sha256, str) or not MANAGER_HANDOFF_BINDING_RE.fullmatch(
+        binding_sha256
+    ):
+        raise ValueError("handoff commit receipt binding is invalid")
+    if type(database_schema_version) is not int or database_schema_version <= 0:
+        raise ValueError("handoff commit receipt database schema is invalid")
+    if not isinstance(committed_at, str) or not committed_at.endswith("Z"):
+        raise ValueError("handoff commit receipt timestamp is invalid")
+    try:
+        parsed_at = datetime.fromisoformat(committed_at[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("handoff commit receipt timestamp is invalid") from exc
+    if parsed_at.tzinfo is None or parsed_at.utcoffset() != timezone.utc.utcoffset(parsed_at):
+        raise ValueError("handoff commit receipt timestamp is not UTC")
+    if not isinstance(receipt_sha256, str) or not MANAGER_HANDOFF_RECEIPT_RE.fullmatch(
+        receipt_sha256
+    ):
+        raise ValueError("handoff commit receipt digest is invalid")
+    normalized = dict(value)
+    if not secrets.compare_digest(
+        receipt_sha256, _manager_handoff_receipt_digest(normalized)
+    ):
+        raise ValueError("handoff commit receipt digest does not match its fields")
+    return normalized
+
+
+def _validate_manager_handoff_commit_identity(
+    operation_id: str,
+    target_generation: str,
+    binding_sha256: str,
+) -> tuple[str, str, str]:
+    if not all(
+        isinstance(value, str)
+        for value in (operation_id, target_generation, binding_sha256)
+    ):
+        raise ServiceError(400, "handoff commit identity fields must be strings")
+    clean_operation_id = operation_id.strip()
+    clean_target_generation = target_generation.strip()
+    clean_binding_sha256 = binding_sha256.strip()
+    if not MANAGER_HANDOFF_OPERATION_RE.fullmatch(clean_operation_id):
+        raise ServiceError(400, "handoff operation_id is invalid")
+    if not MANAGER_HANDOFF_GENERATION_RE.fullmatch(clean_target_generation):
+        raise ServiceError(400, "handoff target_generation is invalid")
+    if not MANAGER_HANDOFF_BINDING_RE.fullmatch(clean_binding_sha256):
+        raise ServiceError(400, "handoff binding_sha256 is invalid")
+    return clean_operation_id, clean_target_generation, clean_binding_sha256
 
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     "admin": {
@@ -448,6 +571,10 @@ class EnterpriseService:
         self._instance_lock_fd: int | None = None
         self._instance_lock_finalizer: weakref.finalize | None = None
         self._acquire_instance_lock()
+        self._camofox_sidecar = ensure_camofox_runtime_sidecar(
+            self.config.data_dir,
+            commit_schema_upgrade=not bool(startup_reservation_id),
+        )
         self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
         self.learning_reviews = LearningReviewStore(self.db)
@@ -482,7 +609,11 @@ class EnterpriseService:
             setting_provider=self.get_setting,
         )
         self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
-        self.agent_scopes = AgentScopeManager(config, self.db)
+        self.agent_scopes = AgentScopeManager(
+            config,
+            self.db,
+            commit_schema_upgrade=not bool(startup_reservation_id),
+        )
         self.skills = SkillStore(config.data_dir)
         if not self.get_setting("agent_tool_token"):
             self.set_setting(
@@ -546,6 +677,7 @@ class EnterpriseService:
         self._auto_update_reservation_id = startup_reservation_id
         self._auto_update_reservation_owner = startup_reservation_owner
         self._auto_update_last_released_id = ""
+        self._auto_update_last_committed_id = ""
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
@@ -4009,7 +4141,7 @@ class EnterpriseService:
         except ValueError as exc:
             raise ServiceError(400, str(exc)) from exc
 
-    def manager_update_release(self, operation_id: str) -> dict[str, Any]:
+    def manager_update_abort_release(self, operation_id: str) -> dict[str, Any]:
         if self.manager_client is None:
             raise ServiceError(404, "manager integration is not active")
         released = self.release_auto_update_reservation(
@@ -4022,6 +4154,210 @@ class EnterpriseService:
             )
         return {"released": True}
 
+    def manager_update_commit_release(self, operation_id: str) -> dict[str, Any]:
+        """Commit machine schemas, then release one exact Manager reservation."""
+
+        if self.manager_client is None:
+            raise ServiceError(404, "manager integration is not active")
+        clean_operation_id = str(operation_id or "").strip()
+        with self._conversation_lock:
+            if (
+                not self._auto_update_reserved
+                and clean_operation_id
+                and self._auto_update_last_committed_id == clean_operation_id
+            ):
+                return {"released": True}
+            if (
+                not clean_operation_id
+                or not self._auto_update_reserved
+                or self._auto_update_reservation_owner != "manager"
+                or self._auto_update_reservation_id != clean_operation_id
+            ):
+                raise ServiceError(
+                    409, "maintenance reservation does not match the Manager operation"
+                )
+
+            # These transitions may make the data unreadable to the previous
+            # binary, so they run only through the watchdog-proven capability
+            # and while admission remains frozen. A failure deliberately leaves
+            # the reservation held for an idempotent retry or controlled repair.
+            self.agent_scopes.commit_schema_upgrade()
+            self._camofox_sidecar = ensure_camofox_runtime_sidecar(
+                self.config.data_dir,
+                commit_schema_upgrade=True,
+            )
+            self._auto_update_last_committed_id = clean_operation_id
+            released = self.release_auto_update_reservation(
+                clean_operation_id,
+                expected_owner="manager",
+            )
+            if not released:  # The re-entrant lock makes this an invariant check.
+                self._auto_update_last_committed_id = ""
+                raise ServiceError(
+                    409, "maintenance reservation does not match the Manager operation"
+                )
+        return {"released": True}
+
+    def _load_manager_handoff_commit_receipt(self) -> dict[str, Any] | None:
+        raw = self.get_setting(MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING)
+        if raw is None:
+            return None
+        if len(raw.encode("utf-8")) > 16 * 1024:
+            raise ServiceError(500, "persisted handoff commit receipt is invalid")
+        try:
+            value = json.loads(raw, object_pairs_hook=_manager_handoff_object_pairs)
+            return _validate_manager_handoff_receipt(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ServiceError(
+                500, "persisted handoff commit receipt is invalid"
+            ) from exc
+
+    def _persist_manager_handoff_commit_receipt(
+        self,
+        operation_id: str,
+        target_generation: str,
+        binding_sha256: str,
+    ) -> dict[str, Any]:
+        database_schema_version = int(
+            self.db.scalar(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+            )
+            or 0
+        )
+        if database_schema_version != DATABASE_SCHEMA_VERSION:
+            raise ServiceError(
+                409, "Platform database schema is not at the target generation"
+            )
+        receipt: dict[str, Any] = {
+            "schema_version": MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION,
+            "operation_id": operation_id,
+            "target_generation": target_generation,
+            "binding_sha256": binding_sha256,
+            "database_schema_version": database_schema_version,
+            "committed_at": datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+        receipt["receipt_sha256"] = _manager_handoff_receipt_digest(receipt)
+        receipt = _validate_manager_handoff_receipt(receipt)
+        self.set_setting(
+            MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING,
+            json.dumps(
+                receipt,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        observed = self._load_manager_handoff_commit_receipt()
+        if observed != receipt:
+            raise ServiceError(500, "handoff commit receipt was not durable")
+        return receipt
+
+    @staticmethod
+    def _handoff_receipt_matches(
+        receipt: dict[str, Any],
+        operation_id: str,
+        target_generation: str,
+        binding_sha256: str,
+    ) -> bool:
+        return bool(
+            receipt.get("operation_id") == operation_id
+            and receipt.get("target_generation") == target_generation
+            and receipt.get("binding_sha256") == binding_sha256
+        )
+
+    def manager_handoff_commit_release(
+        self,
+        operation_id: str,
+        target_generation: str,
+        binding_sha256: str,
+    ) -> dict[str, Any]:
+        """Commit one journal-bound target handoff and release its reservation."""
+
+        if self.manager_client is None:
+            raise ServiceError(404, "manager integration is not active")
+        (
+            clean_operation_id,
+            clean_target_generation,
+            clean_binding_sha256,
+        ) = _validate_manager_handoff_commit_identity(
+            operation_id, target_generation, binding_sha256
+        )
+        with self._conversation_lock:
+            receipt = self._load_manager_handoff_commit_receipt()
+            if receipt is not None and not self._handoff_receipt_matches(
+                receipt,
+                clean_operation_id,
+                clean_target_generation,
+                clean_binding_sha256,
+            ):
+                raise ServiceError(
+                    409, "persisted handoff commit receipt has another identity"
+                )
+
+            if self._auto_update_reserved and (
+                self._auto_update_reservation_owner != "manager"
+                or self._auto_update_reservation_id != clean_operation_id
+            ):
+                raise ServiceError(
+                    409, "maintenance reservation does not match the handoff operation"
+                )
+            if receipt is None:
+                if not self._auto_update_reserved:
+                    raise ServiceError(
+                        409,
+                        "maintenance reservation does not match the handoff operation",
+                    )
+                # Both schema transitions are idempotent. A crash between either
+                # effect and the durable receipt re-enters here under the same
+                # frozen reservation and converges the missing effect.
+                self.agent_scopes.commit_schema_upgrade()
+                self._camofox_sidecar = ensure_camofox_runtime_sidecar(
+                    self.config.data_dir,
+                    commit_schema_upgrade=True,
+                )
+                receipt = self._persist_manager_handoff_commit_receipt(
+                    clean_operation_id,
+                    clean_target_generation,
+                    clean_binding_sha256,
+                )
+
+            # The receipt is already durable before admission is reopened. If
+            # the process or response fails here, target startup restores the
+            # same reservation and a retry releases it without repeating schema
+            # effects.
+            if self._auto_update_reserved:
+                released = self.release_auto_update_reservation(
+                    clean_operation_id,
+                    expected_owner="manager",
+                )
+                if not released:
+                    raise ServiceError(
+                        409,
+                        "maintenance reservation does not match the handoff operation",
+                    )
+            self._auto_update_last_committed_id = clean_operation_id
+            return {"released": True, "receipt": dict(receipt)}
+
+    def manager_handoff_reservation(self) -> dict[str, Any]:
+        """Return the exact read-only handoff reservation reconciliation view."""
+
+        if self.manager_client is None:
+            raise ServiceError(404, "manager integration is not active")
+        with self._conversation_lock:
+            return {
+                "schema_version": 1,
+                "reserved": bool(self._auto_update_reserved),
+                "reservation_id": self._auto_update_reservation_id
+                if self._auto_update_reserved
+                else "",
+                "reservation_owner": self._auto_update_reservation_owner
+                if self._auto_update_reserved
+                else "",
+                "receipt": self._load_manager_handoff_commit_receipt(),
+            }
+
     def manager_internal_health(self) -> dict[str, Any]:
         with self._conversation_lock:
             blockers = self._auto_update_agent_blockers_locked()
@@ -4033,6 +4369,22 @@ class EnterpriseService:
             "update_reserved": self._auto_update_reserved,
             **blockers,
         }
+
+    def manager_handoff_evidence(self) -> dict[str, Any]:
+        """Observe the source Platform boundary without reserving or repairing it."""
+
+        with self._conversation_lock:
+            if self._closed:
+                raise ServiceError(409, "Platform is shutting down")
+            blockers = self._auto_update_agent_blockers_locked()
+            blockers["reserved"] = bool(self._auto_update_reserved)
+            workspace_identity = self.agent_scopes.handoff_workspace_identity()
+            return collect_platform_handoff_evidence(
+                self.db,
+                self.config.data_dir,
+                workspace_identity,
+                blockers,
+            )
 
     def auto_update_public_status(self) -> dict[str, Any]:
         if self.manager_client is None:
@@ -4086,6 +4438,7 @@ class EnterpriseService:
             self._auto_update_reserved = True
             self._auto_update_reservation_id = clean_update_id
             self._auto_update_reservation_owner = "manager"
+            self._auto_update_last_committed_id = ""
             result["reserved"] = True
             return result
 

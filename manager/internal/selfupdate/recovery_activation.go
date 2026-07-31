@@ -318,7 +318,7 @@ func (m *Manager) readRecoveryTakeover(stateData []byte, state State, evidence r
 		plan:      plan,
 		stableSHA: stableSHA,
 		candidate: candidate,
-		watchdogs: recoveryActivationWatchdogUnits(candidate),
+		watchdogs: recoveryActivationWatchdogUnits(m.watchdogUnitPrefix(), candidate),
 	}, nil
 }
 
@@ -394,10 +394,10 @@ func (m *Manager) validateRecoveryPlanBinding(plan Plan, state State, candidate 
 	return nil
 }
 
-func recoveryActivationWatchdogUnits(candidate Version) []string {
+func recoveryActivationWatchdogUnits(prefix string, candidate Version) []string {
 	return []string{
-		recoveryWatchdogUnitPrefix + safeID(candidate.SourceCommit[:12]),
-		recoveryWatchdogUnitPrefix + "recovery-" + safeID(candidate.SHA256[:12]),
+		prefix + safeID(candidate.SourceCommit[:12]),
+		prefix + "recovery-" + safeID(candidate.SHA256[:12]),
 	}
 }
 
@@ -410,7 +410,7 @@ func (m *Manager) quiesceRecoveryUnits(ctx context.Context, mainUnit string, exa
 		allowed[unit] = struct{}{}
 		allowed[unit+".service"] = struct{}{}
 	}
-	output, err := exec.CommandContext(ctx, "systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--full", recoveryWatchdogUnitPrefix+"*").CombinedOutput()
+	output, err := exec.CommandContext(ctx, "systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--full", m.watchdogUnitPrefix()+"*").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("enumerate Manager watchdog units: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -519,7 +519,7 @@ func recoveryWatchdogProcess(planPath string) (int, bool, error) {
 	if err != nil || !found {
 		return pid, found, err
 	}
-	if len(arguments) == 4 && arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath {
+	if watchdogArgumentsOwnPlan(arguments, planPath) {
 		return pid, true, nil
 	}
 	// The first watchdog may be unrelated to planPath; search all processes so
@@ -566,7 +566,7 @@ func scanRecoveryWatchdogProcesses(planPath string) (int, []string, bool, error)
 		if !watchdog {
 			continue
 		}
-		if planPath == "" || len(arguments) == 4 && arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath {
+		if planPath == "" || watchdogArgumentsOwnPlan(arguments, planPath) {
 			return pid, arguments, true, nil
 		}
 	}
@@ -577,8 +577,8 @@ func (m *Manager) verifyRecoveryWatchdogProcess(ctx context.Context, unit, execu
 	if m.RecoveryWatchdogVerifier != nil {
 		return m.RecoveryWatchdogVerifier(ctx, unit, executablePath, expectedSHA, planPath)
 	}
-	if !strings.HasPrefix(unit, recoveryCurrentWatchdogUnitPrefix) || !validSHA256(expectedSHA) ||
-		unit != recoveryCurrentWatchdogUnitPrefix+safeID(expectedSHA[:12]) {
+	if !strings.HasPrefix(unit, m.recoveryWatchdogUnitPrefix()) || !validSHA256(expectedSHA) ||
+		unit != m.recoveryWatchdogUnitPrefix()+safeID(expectedSHA[:12]) {
 		return errors.New("current recovery watchdog unit identity is invalid")
 	}
 	mainPIDText, err := recoverySystemdProperty(ctx, unit, "MainPID")
@@ -616,7 +616,8 @@ func (m *Manager) verifyRecoveryWatchdogProcess(ctx context.Context, unit, execu
 		return fmt.Errorf("read current recovery watchdog command line: %w", err)
 	}
 	arguments := strings.Split(strings.TrimRight(string(commandData), "\x00"), "\x00")
-	if len(arguments) != 4 || arguments[1] != "self-update-watchdog" || arguments[2] != "--plan" || arguments[3] != planPath {
+	want := []string{arguments[0], "self-update-watchdog", "--plan", planPath, "--config", m.ConfigPath}
+	if !validManagerConfigPath(m.ConfigPath) || !reflect.DeepEqual(arguments, want) {
 		return errors.New("current recovery watchdog command line does not exactly own the recovery plan")
 	}
 	cgroupData, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(mainPID), "cgroup"))
@@ -624,6 +625,14 @@ func (m *Manager) verifyRecoveryWatchdogProcess(ctx context.Context, unit, execu
 		return errors.New("current recovery watchdog process is outside its systemd control group")
 	}
 	return nil
+}
+
+func watchdogArgumentsOwnPlan(arguments []string, planPath string) bool {
+	if len(arguments) == 4 {
+		return arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath
+	}
+	return len(arguments) == 6 && arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath &&
+		arguments[4] == "--config" && validManagerConfigPath(arguments[5])
 }
 
 func recoveryProcessInExactControlGroup(data []byte, controlGroup string) bool {

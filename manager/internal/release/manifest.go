@@ -51,6 +51,7 @@ var managedImageNames = []string{
 	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
 	"firecrawl-redis", "firecrawl-rabbitmq",
+	"handoff-fs-helper",
 }
 
 var managedImageNameSet = func() map[string]struct{} {
@@ -61,10 +62,9 @@ var managedImageNameSet = func() map[string]struct{} {
 	return result
 }()
 
-// IsManagedImageName identifies image entries that the current product may
-// pull, expose to Compose, or project through its status API. Manifest parsing
-// accepts safe opaque extension entries for forward compatibility, but those
-// entries must never cross this execution boundary.
+// IsManagedImageName identifies the exact closed set admitted by the current
+// release protocol. A manifest with an unknown or missing image key is invalid;
+// compatibility is introduced only by a versioned schema change.
 func IsManagedImageName(name string) bool {
 	_, ok := managedImageNameSet[name]
 	return ok
@@ -142,6 +142,9 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
+	if len(m.Images) != len(managedImageNames) {
+		return fmt.Errorf("manifest images must contain exactly %d managed entries", len(managedImageNames))
+	}
 	for _, name := range managedImageNames {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
@@ -149,6 +152,9 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 		}
 	}
 	for name, digest := range m.Images {
+		if !IsManagedImageName(name) {
+			return fmt.Errorf("image %q is outside the current managed release set", name)
+		}
 		if !imageNamePattern.MatchString(name) {
 			return fmt.Errorf("image name %q must use lowercase kebab-case", name)
 		}
@@ -323,34 +329,110 @@ func (c Client) Fetch(ctx context.Context, url, channel string) (Manifest, []byt
 	if err != nil {
 		return Manifest{}, nil, err
 	}
+	manifest, err := DecodeManifest(data, channel, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	return manifest, data, nil
+}
+
+// DecodeManifest applies the same closed-world parser and cross-field
+// validation as Client.Fetch to already retained immutable bytes. The handoff
+// helper uses it after the source Manager has stopped; it must never reinterpret
+// a journal-bound manifest through a weaker decoder.
+func DecodeManifest(data []byte, channel, goos, goarch string) (Manifest, error) {
+	manifest, err := decodeManifestDocument(data)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := manifest.Validate(channel, goos, goarch); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+// DecodeRetainedHandoffPredecessorManifest is the only compatibility parser
+// for the source-owner A2 handoff. It accepts the exact, immutable P1 bytes
+// named by the canonical transition contract and no other old manifest. The
+// caller must additionally prove that these bytes came from the canonical
+// source-profile retained Current/Previous generation path; remote releases,
+// candidates and bridge manifests must continue to use DecodeManifest.
+func DecodeRetainedHandoffPredecessorManifest(data []byte, channel, goos, goarch string) (Manifest, error) {
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != contract.SourceOwnerCompatManifestSHA256 {
+		return Manifest{}, errors.New("retained handoff predecessor manifest checksum is not canonical")
+	}
+	manifest, err := decodeManifestDocument(data)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.SourceCommit != contract.SourceOwnerCompatGeneration ||
+		manifest.Manager.Version != contract.SourceOwnerCompatGeneration || manifest.NamespaceHandoff != nil {
+		return Manifest{}, errors.New("retained handoff predecessor identity is not canonical")
+	}
+	if len(manifest.Images) != len(contract.SourceOwnerCompatManagedImages) {
+		return Manifest{}, errors.New("retained handoff predecessor image set is not canonical")
+	}
+	for _, name := range contract.SourceOwnerCompatManagedImages {
+		if image, ok := manifest.Images[name]; !ok || !digestPattern.MatchString(image) {
+			return Manifest{}, fmt.Errorf("retained handoff predecessor image %q is not canonical", name)
+		}
+	}
+	for name := range manifest.Images {
+		found := false
+		for _, expected := range contract.SourceOwnerCompatManagedImages {
+			if name == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return Manifest{}, fmt.Errorf("retained handoff predecessor image %q is outside the canonical set", name)
+		}
+	}
+	// Reuse every current cross-field validation other than the deliberate P1
+	// image-set difference. The synthetic entry is never returned or executed.
+	validated := manifest
+	validated.Images = make(map[string]string, len(manifest.Images)+1)
+	for name, image := range manifest.Images {
+		validated.Images[name] = image
+	}
+	validated.Images["handoff-fs-helper"] = manifest.Images["platform"]
+	if err := validated.Validate(channel, goos, goarch); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+func decodeManifestDocument(data []byte) (Manifest, error) {
+	if len(data) == 0 || len(data) > maxManifestBytes {
+		return Manifest{}, errors.New("release manifest has an invalid size")
+	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
-		return Manifest{}, nil, fmt.Errorf("decode release manifest: %w", err)
+		return Manifest{}, fmt.Errorf("decode release manifest: %w", err)
 	}
 	var manifest Manifest
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
-		return Manifest{}, nil, fmt.Errorf("decode release manifest: %w", err)
+		return Manifest{}, fmt.Errorf("decode release manifest: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return Manifest{}, nil, errors.New("decode release manifest: trailing JSON value")
+			return Manifest{}, errors.New("decode release manifest: trailing JSON value")
 		}
-		return Manifest{}, nil, fmt.Errorf("decode release manifest: %w", err)
+		return Manifest{}, fmt.Errorf("decode release manifest: %w", err)
 	}
 	var envelope struct {
 		NamespaceHandoff json.RawMessage `json:"namespace_handoff"`
 	}
 	if err := json.Unmarshal(data, &envelope); err == nil {
 		if envelope.NamespaceHandoff != nil && strings.TrimSpace(string(envelope.NamespaceHandoff)) == "null" {
-			return Manifest{}, nil, errors.New("decode release manifest: namespace_handoff must not be null")
+			return Manifest{}, errors.New("decode release manifest: namespace_handoff must not be null")
 		}
 	}
-	if err := manifest.Validate(channel, runtime.GOOS, runtime.GOARCH); err != nil {
-		return Manifest{}, nil, err
-	}
-	return manifest, data, nil
+	return manifest, nil
 }
 
 func rejectDuplicateJSONKeys(data []byte) error {

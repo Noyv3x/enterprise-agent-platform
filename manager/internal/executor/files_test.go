@@ -232,7 +232,7 @@ func TestManagedPatchKeepsTheVerifiedParentDirectoryPinned(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "file.txt"), []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManagedFileAt(parent, leaf, []byte("patched"), 0o600); err != nil {
+	if err := writeManagedFileAt(parent, leaf, []byte("patched"), 0o600, ".ubitech"); err != nil {
 		t.Fatal(err)
 	}
 	if content, err := os.ReadFile(filepath.Join(pinned, "file.txt")); err != nil || string(content) != "patched" {

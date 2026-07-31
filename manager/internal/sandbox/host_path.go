@@ -30,6 +30,7 @@ type HostPath struct {
 
 	access    HostPathAccess
 	stateRoot string
+	protected []identity.Profile
 }
 
 // Allows reports whether a descendant reached while walking this path remains
@@ -40,7 +41,7 @@ func (p HostPath) Allows(candidate string) bool {
 	if !isAtOrBelow(clean, p.Canonical) {
 		return false
 	}
-	return hostPathAllowed(p.access, clean, p.stateRoot)
+	return hostPathAllowed(p.access, clean, p.stateRoot, p.protected)
 }
 
 // ResolveHostPath performs the only supported logical-to-host mapping. The
@@ -97,10 +98,10 @@ func (m *Manager) ResolveHostPath(sandboxID, value string, access HostPathAccess
 		canonical = filepath.Join(canonical, relative)
 	}
 	stateRoot := filepath.Clean(filepath.Dir(m.StatePath))
-	if !hostPathAllowed(access, canonical, stateRoot) {
+	if !hostPathAllowed(access, canonical, stateRoot, m.protected) {
 		return HostPath{}, errors.New("host path is protected by the Manager")
 	}
-	return HostPath{Root: filepath.Clean(root), Relative: relative, Canonical: canonical, access: access, stateRoot: stateRoot}, nil
+	return HostPath{Root: filepath.Clean(root), Relative: relative, Canonical: canonical, access: access, stateRoot: stateRoot, protected: append([]identity.Profile(nil), m.protected...)}, nil
 }
 
 func relativeHostPath(root, path string) (string, bool) {
@@ -130,8 +131,8 @@ func cleanHostRelative(value string) (string, error) {
 	return clean, nil
 }
 
-func hostPathAllowed(access HostPathAccess, path, stateRoot string) bool {
-	if protectedManagerHostPath(path, stateRoot) || isDockerSocket(path) {
+func hostPathAllowed(access HostPathAccess, path, stateRoot string, profiles []identity.Profile) bool {
+	if protectedManagerHostPath(path, stateRoot, profiles) || isDockerSocket(path) {
 		return false
 	}
 	switch access {
@@ -146,19 +147,20 @@ func hostPathAllowed(access HostPathAccess, path, stateRoot string) bool {
 	}
 }
 
-func protectedManagerHostPath(path, stateRoot string) bool {
+func protectedManagerHostPath(path, stateRoot string, profiles []identity.Profile) bool {
 	clean := filepath.Clean(path)
 	if filepath.IsAbs(stateRoot) && isAtOrBelow(clean, stateRoot) {
 		return true
 	}
-	profile := identity.SourceProfile()
-	for _, root := range []string{
-		filepath.Join("/run", profile.DataDirectory),
-		filepath.Join("/var/run", profile.DataDirectory),
-		filepath.Join(profile.ContainerDataRoot, profile.ManagerStateDirectory),
-	} {
-		if isAtOrBelow(clean, root) {
-			return true
+	for _, profile := range profiles {
+		for _, root := range []string{
+			filepath.Join("/run", profile.DataDirectory),
+			filepath.Join("/var/run", profile.DataDirectory),
+			filepath.Join(profile.ContainerDataRoot, profile.ManagerStateDirectory),
+		} {
+			if isAtOrBelow(clean, root) {
+				return true
+			}
 		}
 	}
 	parts := strings.Split(strings.TrimPrefix(filepath.ToSlash(clean), "/"), "/")
@@ -170,9 +172,22 @@ func protectedManagerHostPath(path, stateRoot string) bool {
 	}
 	if homeOffset >= 0 {
 		rest := parts[homeOffset:]
-		if hasPathPrefix(rest, []string{".config", profile.ConfigDirectory}) ||
-			hasPathPrefix(rest, []string{".local", "share", profile.DataDirectory, profile.ManagerStateDirectory}) {
-			return true
+		for _, profile := range profiles {
+			if hasPathPrefix(rest, []string{".config", profile.ConfigDirectory}) ||
+				hasPathPrefix(rest, []string{".local", "share", profile.DataDirectory, profile.ManagerStateDirectory}) {
+				return true
+			}
+		}
+	}
+	if len(parts) >= 4 && parts[0] == "run" && parts[1] == "user" && decimalPathPart(parts[2]) {
+		for _, profile := range profiles {
+			if profile.RuntimeSocketPath == "" {
+				continue
+			}
+			runtimeParts := strings.Split(filepath.ToSlash(profile.RuntimeSocketPath), "/")
+			if len(runtimeParts) > 1 && hasPathPrefix(parts[3:], runtimeParts[:len(runtimeParts)-1]) {
+				return true
+			}
 		}
 	}
 	return false

@@ -9,6 +9,8 @@ fail() {
   exit 1
 }
 
+python3 -m unittest discover -s scripts/tests -v
+
 for path in \
   containers/platform.Dockerfile \
   containers/agent-runtime.Dockerfile \
@@ -194,18 +196,47 @@ grep -Fq 'cp install.sh "$stage/install.sh"' .github/workflows/container-release
   || fail "release assembly does not include install.sh"
 grep -Fq 'sha256sum install.sh > install.sh.sha256' .github/workflows/container-release.yml \
   || fail "release assembly does not checksum install.sh"
-grep -Fq '"$STAGE/install.sh"' .github/workflows/container-release.yml \
-  || fail "release publication does not upload install.sh"
-grep -Fq '"$STAGE/install.sh.sha256"' .github/workflows/container-release.yml \
-  || fail "release publication does not upload the install.sh checksum"
-grep -Fq -- '--latest=false' .github/workflows/container-release.yml \
-  || fail "stale qualified releases are not prevented from replacing the main channel"
+grep -Eq '^[[:space:]]+install\.sh$' .github/workflows/container-release.yml \
+  || fail "release publication does not include install.sh"
+grep -Eq '^[[:space:]]+install\.sh\.sha256$' .github/workflows/container-release.yml \
+  || fail "release publication does not include the install.sh checksum"
+grep -Fq 'gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/$asset"' .github/workflows/container-release.yml \
+  || fail "release publication does not upload each immutable asset"
+grep -Fq 'scripts/release_promotion.py create-promotion' .github/workflows/container-release.yml \
+  || fail "container release does not create the immutable promotion contract"
+grep -Fq 'scripts/release_promotion.py create-publisher-provenance' .github/workflows/container-release.yml \
+  || fail "container release does not publish an exact Actions provenance record"
+grep -Fq 'Upload immutable release provenance' .github/workflows/container-release.yml \
+  || fail "container release does not retain its publisher provenance as an Actions artifact"
+grep -Fq '"$STAGE/promotion.json"' .github/workflows/container-release.yml \
+  || fail "container release does not upload promotion.json last"
+if grep -Eq -- '--draft=false|--latest|--clobber' .github/workflows/container-release.yml; then
+  fail "container build workflow can mutate visibility or replace immutable assets"
+fi
 grep -Fq "group: container-release-\${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}" .github/workflows/container-release.yml \
   || fail "container releases are not isolated per source commit"
-grep -Fq 'group: container-channel-main' .github/workflows/container-release.yml \
+grep -Fq 'group: container-channel-main' .github/workflows/channel-promotion.yml \
   || fail "main-channel release promotion is not serialized"
-grep -Fq 'done < <(git rev-list origin/main)' .github/workflows/container-release.yml \
-  || fail "main-channel release promotion does not choose the newest qualified main commit"
+grep -Fq 'scripts/release_promotion.py select-candidate' .github/workflows/channel-promotion.yml \
+  || fail "main-channel release promotion does not enforce a direct predecessor"
+grep -Fq 'scripts/release_promotion.py validate-publisher-provenance' .github/workflows/channel-promotion.yml \
+  || fail "main-channel release promotion does not verify exact publisher provenance"
+grep -Fq -- '--current-compat-root "$current_compat_root"' .github/workflows/channel-promotion.yml \
+  || fail "first promotion does not pass the exact P1 release into the evaluator"
+grep -Fq 'source_owner_compat.generation' .github/workflows/channel-promotion.yml \
+  || fail "first promotion is not restricted to the contract-pinned P1 generation"
+[[ "$(grep -Fc 'scripts/verify-release-images-anonymous.sh' .github/workflows/channel-promotion.yml)" -eq 4 ]] \
+  || fail "main-channel promotion must verify all public image digests before and after both visibility paths"
+[[ "$(grep -Fc 'CRITICAL post-visibility registry failure' .github/workflows/channel-promotion.yml)" -eq 2 ]] \
+  || fail "post-visibility registry failures are not classified as release incidents"
+[[ "$(grep -Fc 'scripts/ensure-release-candidate-tag.sh' .github/workflows/channel-promotion.yml)" -eq 2 ]] \
+  || fail "both visibility paths do not establish the exact candidate tag first"
+[[ -x scripts/verify-release-images-anonymous.sh ]] \
+  || fail "anonymous release-image verifier is missing or not executable"
+[[ -x scripts/ensure-release-candidate-tag.sh ]] \
+  || fail "create-only release candidate tag verifier is missing or not executable"
+grep -Fq 'release-transition-consumed-${challenge_id}' .github/workflows/channel-promotion.yml \
+  || fail "main-channel release promotion has no durable replay ledger"
 grep -Fq 'public-images:' .github/workflows/container-release.yml \
   || fail "container release has no public-image publication gate"
 grep -Fq 'GitHub exposes no supported package-visibility mutation API' .github/workflows/container-release.yml \
@@ -231,7 +262,7 @@ if rg -q '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/containe
 fi
 grep -Fq "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)" .github/workflows/container-release.yml \
   || fail "release image verification is not driven by the canonical managed-image directory"
-grep -Fq '[[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]' .github/workflows/container-release.yml \
+grep -Fq '[[ "${#components[@]}" -eq 11 && "${#images[@]}" -eq "${#components[@]}" ]]' .github/workflows/container-release.yml \
   || fail "release does not fail closed when the managed-image catalog is incomplete"
 if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then
   fail "container release still publishes a retired FoundationDB image key"
@@ -258,6 +289,18 @@ def job(name: str) -> str:
     return match.group(0)
 
 public_images = job("public-images")
+helper_matrix = """          - component: handoff-fs-helper
+            dockerfile: containers/handoff-fs-helper.Dockerfile
+            # Keep this one-shot capability in an already-public package while
+            # preserving a separate immutable image/digest and scratch rootfs.
+            image: platform
+            tag_suffix: '-handoff-fs-helper'"""
+if helper_matrix not in workflow:
+    raise SystemExit("handoff helper is not published as a distinct digest in the existing public Platform package")
+if workflow.count("package_component=platform") != 2:
+    raise SystemExit("handoff helper package mapping is not enforced in both public-image gates")
+if "${{ needs.prepare.outputs.source_commit }}${{ matrix.tag_suffix }}" not in workflow:
+    raise SystemExit("container image publication does not preserve the helper's distinct tag")
 if "packages: read" not in public_images:
     raise SystemExit("public-image gate lacks package metadata read permission")
 if "    timeout-minutes: 120\n" not in public_images:
@@ -270,7 +313,7 @@ for dependent in ("compose-smoke", "publish"):
 managed_components = (
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq",
+    "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 )
 for component in managed_components:
     if component not in public_images:
@@ -279,7 +322,7 @@ for component in managed_components:
         raise SystemExit(f"public-image capacity catalog omits {component}")
 for fragment in (
     "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)",
-    '[[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]',
+    '[[ "${#components[@]}" -eq 11 && "${#images[@]}" -eq "${#components[@]}" ]]',
     'for component in "${components[@]}"; do',
     'for architecture in amd64 arm64; do',
     'docker buildx imagetools inspect "$image" --raw',
@@ -357,7 +400,17 @@ for fragment in (
     'UBITECH_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er',
     'sandbox_image="$UBITECH_AGENT_SANDBOX_IMAGE"',
     'docker compose -f containers/compose.yaml config --format json',
-    '} == ($expected[0] | del(."agent-sandbox"))',
+    '} == ($expected[0] | del(."agent-sandbox", ."handoff-fs-helper"))',
+    'handoff_helper_image="$(jq -er',
+    'docker pull "$handoff_helper_image"',
+    '"$handoff_helper_image" --request /control/request.json --receipt /control/receipt.json',
+    'sudo -n chown -R 42424:42424 "$handoff_helper_root/source/data"',
+    '--env "HANDOFF_FS_IMAGE_DIGEST=$handoff_helper_image"',
+    'src=$handoff_helper_root/source/data,dst=/source,readonly',
+    'target/copied/payload.txt',
+    '"$UBITECH_FIRECRAWL_REDIS_IMAGE" -c',
+    '"$UBITECH_FIRECRAWL_RABBITMQ_IMAGE" -c',
+    '"$UBITECH_FIRECRAWL_POSTGRES_IMAGE" -c',
     'browser_fixture_container="${UBITECH_COMPOSE_PROJECT}-browser-fixture"',
     'scripts/fixtures/browser-control.html',
     '--entrypoint python',
@@ -457,7 +510,7 @@ if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
 expected_images = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq",
+    "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 }
 if required_images != expected_images:
     raise SystemExit(f"unexpected required release images: {sorted(required_images)}")
@@ -477,6 +530,13 @@ for dockerfile in containers/*.Dockerfile; do
   if [[ "$dockerfile" == containers/agent-sandbox.Dockerfile ]]; then
     grep -Fq 'ENTRYPOINT ["/usr/local/bin/ubitech-agent-sandbox-entrypoint"]' "$dockerfile" \
       || fail "Agent Sandbox does not use the UID/GID mapping entrypoint"
+  elif [[ "$dockerfile" == containers/handoff-fs-helper.Dockerfile ]]; then
+    grep -Fq 'FROM scratch' "$dockerfile" \
+      || fail "handoff filesystem helper must use a shell-free scratch image"
+    grep -Fq 'USER 0:0' "$dockerfile" \
+      || fail "handoff filesystem helper must declare its narrow privileged identity"
+    grep -Fq 'ENTRYPOINT ["/handoff-fs-helper"]' "$dockerfile" \
+      || fail "handoff filesystem helper has an unexpected entrypoint"
   else
     grep -q '^USER ' "$dockerfile" || fail "$dockerfile has no explicit USER"
     grep -q '^HEALTHCHECK ' "$dockerfile" || fail "$dockerfile has no image healthcheck"

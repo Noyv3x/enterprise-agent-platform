@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
 const (
@@ -86,7 +87,7 @@ func (m *Manager) newRecoveryTakeoverJournal(
 	}
 	path := m.recoveryTakeoverJournalPath(request.platformCommit, request.newSHA)
 	recoveryPlanPath := m.currentRecoveryPlanPath(request.platformCommit, request.newSHA)
-	watchdogUnit := recoveryCurrentWatchdogUnitPrefix + safeID(request.newSHA[:12])
+	watchdogUnit := m.recoveryWatchdogUnitPrefix() + safeID(request.newSHA[:12])
 	now := m.now()
 	journal := recoveryTakeoverJournal{
 		SchemaVersion:           1,
@@ -270,7 +271,7 @@ func validateRecoveryTakeoverJournal(journal recoveryTakeoverJournal, manager *M
 	}
 	if journal.Path != manager.recoveryTakeoverJournalPath(journal.PlatformCommit, journal.RecoverySHA256) ||
 		journal.RecoveryPlanPath != manager.currentRecoveryPlanPath(journal.PlatformCommit, journal.RecoverySHA256) ||
-		journal.RecoveryWatchdogUnit != recoveryCurrentWatchdogUnitPrefix+safeID(journal.RecoverySHA256[:12]) ||
+		journal.RecoveryWatchdogUnit != manager.recoveryWatchdogUnitPrefix()+safeID(journal.RecoverySHA256[:12]) ||
 		journal.PlatformStatePath != filepath.Join(filepath.Dir(manager.StatePath), "state.json") ||
 		journal.OperationPath != filepath.Join(filepath.Dir(manager.StatePath), "operations", journal.OperationID+".json") ||
 		journal.ManifestPath != filepath.Join(filepath.Dir(manager.StatePath), "releases", journal.PlatformCommit, "manifest.json") ||
@@ -296,7 +297,7 @@ func validateRecoveryTakeoverJournal(journal recoveryTakeoverJournal, manager *M
 		!pathWithin(filepath.Join(manager.Root, "activations"), journal.RecoveryPlanPath) {
 		return errors.New("current recovery takeover journal references an unmanaged Manager path")
 	}
-	if journal.RecoveryPath != filepath.Join(manager.Root, "versions", "recovery-"+journal.RecoverySHA256[:12], sourceManagerBinaryName()) {
+	if journal.RecoveryPath != filepath.Join(manager.Root, "versions", "recovery-"+journal.RecoverySHA256[:12], manager.managerBinaryName()) {
 		return errors.New("current recovery takeover journal recovery artifact path is inconsistent")
 	}
 	if !validRecoveryOperationID(journal.OperationID) ||
@@ -412,7 +413,7 @@ func validRecoveryTakeoverTransition(from, to string) bool {
 	}
 }
 
-func readRecoveryTakeoverOwnership(plan Plan) (recoveryTakeoverJournal, error) {
+func readRecoveryTakeoverOwnership(active identity.ActiveProfile, plan Plan) (recoveryTakeoverJournal, error) {
 	var journal recoveryTakeoverJournal
 	if plan.Mode != recoveryActivationMode || plan.RecoveryJournalPath == "" || plan.RecoveryTransactionID == "" {
 		return journal, errors.New("activation plan has no current recovery ownership")
@@ -429,6 +430,7 @@ func readRecoveryTakeoverOwnership(plan Plan) (recoveryTakeoverJournal, error) {
 	}
 	root := filepath.Dir(filepath.Dir(plan.RecoveryJournalPath))
 	manager := &Manager{
+		Profile:          active,
 		Root:             root,
 		StatePath:        filepath.Join(filepath.Dir(root), "manager-binaries.json"),
 		InstallPath:      journal.InstallPath,
