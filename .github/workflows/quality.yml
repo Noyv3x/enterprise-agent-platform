@@ -165,6 +165,11 @@ jobs:
       - name: Run runtime tests
         run: npm test
 
+      - name: Stress runtime inactivity lifecycle
+        run: |
+          seq 1 12 | xargs -P 4 -n 1 sh -c \
+            'node --test --test-concurrency=4 --test-name-pattern="active foreground terminal work|uncooperative provider" dist/test/run-timeout.test.js >/dev/null'
+
       - name: Build runtime
         run: npm run build
 

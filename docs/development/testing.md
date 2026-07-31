@@ -69,7 +69,7 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
-涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。
 
 ## 前端
 
