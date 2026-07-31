@@ -318,6 +318,28 @@ export class SessionStore {
     await rm(target, { recursive: true, force: true });
   }
 
+  /** Delete exactly one transient session while preserving lifecycle approvals and siblings. */
+  async deleteSession(identity: SessionIdentity): Promise<void> {
+    const file = this.path(identity);
+    const archive = this.archivePath(identity);
+    const manifest = file.replace(/\.jsonl$/, ".manifest.json");
+    const directory = dirname(file);
+    await this.withQueue(this.mutationQueues, file, async () => {
+      await this.withQueue(this.archiveQueues, archive, async () => {
+        await Promise.all([
+          rm(file, { force: true }),
+          rm(archive, { force: true }),
+          rm(manifest, { force: true }),
+        ]);
+        try {
+          await this.syncDirectory(directory);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      });
+    });
+  }
+
   async deleteScopeFamily(scopeKey: string, lifecycleId?: string): Promise<void> {
     const directories = await readdir(this.sessionsRoot, { withFileTypes: true }).then(
       (entries) => entries.filter((entry) => entry.isDirectory()).map((entry) => join(this.sessionsRoot, entry.name)),

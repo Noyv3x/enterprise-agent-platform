@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -320,6 +321,54 @@ class DatabaseTransactionTests(unittest.TestCase):
                     for row in db.query("SELECT title FROM knowledge_documents")
                 }
                 self.assertEqual(titles, {"Committed", "AlsoCommitted"})
+            finally:
+                db.close()
+
+    def test_commit_failure_rolls_back_and_connection_remains_reusable(self):
+        class FailFirstCommit:
+            def __init__(self, connection):
+                self.connection = connection
+                self.failed = False
+                self.rollbacks = 0
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def commit(self):
+                if not self.failed:
+                    self.failed = True
+                    raise sqlite3.OperationalError("simulated disk full during commit")
+                return self.connection.commit()
+
+            def rollback(self):
+                self.rollbacks += 1
+                return self.connection.rollback()
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "kb.db")
+            try:
+                holder = db._local.holder
+                proxy = FailFirstCommit(holder.conn)
+                holder.conn = proxy
+                with self.assertRaises(sqlite3.OperationalError):
+                    with db.transaction() as conn:
+                        conn.execute(
+                            "INSERT INTO knowledge_documents"
+                            "(title, summary, content, source, created_at, updated_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            ("NotCommitted", "", "body", "", 1, 1),
+                        )
+                self.assertEqual(proxy.rollbacks, 1)
+                self.assertEqual(self._count(db), 0)
+
+                with db.transaction() as conn:
+                    conn.execute(
+                        "INSERT INTO knowledge_documents"
+                        "(title, summary, content, source, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        ("Recovered", "", "body", "", 1, 1),
+                    )
+                self.assertEqual(self._count(db), 1)
             finally:
                 db.close()
 

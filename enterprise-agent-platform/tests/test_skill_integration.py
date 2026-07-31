@@ -500,6 +500,53 @@ class SkillIntegrationTests(unittest.TestCase):
         self.assertEqual(detail, "create")
         self.assertNotIn(secret_instructions, detail)
 
+        loaded = agent_tool_detail(
+            {
+                "tool_name": "skill",
+                "arguments": {
+                    "action": "load",
+                    "arguments": {
+                        "id": "code-review",
+                        "instructions": secret_instructions,
+                    },
+                },
+            }
+        )
+        self.assertEqual(loaded, "load · code-review")
+        self.assertNotIn(secret_instructions, loaded)
+
+        read = agent_tool_detail(
+            {
+                "tool_name": "skill",
+                "arguments": {
+                    "action": "read",
+                    "arguments": {
+                        "id": "code-review",
+                        "file_path": "references/checklist.md",
+                        "content": secret_instructions,
+                    },
+                },
+            }
+        )
+        self.assertEqual(read, "read · code-review · references/checklist.md")
+        self.assertNotIn(secret_instructions, read)
+
+        self.assertEqual(
+            agent_tool_detail(
+                {
+                    "tool_name": "skill",
+                    "arguments": {
+                        "action": "read",
+                        "arguments": {
+                            "id": "../../unsafe",
+                            "file_path": "references/../../secret.md",
+                        },
+                    },
+                }
+            ),
+            "read",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -192,6 +192,39 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
                 scope = service.agent_scopes.ensure_private_scope(int(admin["id"]))
+                source_message_id = service.db.insert(
+                    """
+                    INSERT INTO messages(
+                        scope_type, scope_id, author_type, user_id, username,
+                        content, metadata_json, created_at
+                    ) VALUES ('private', ?, 'user', ?, ?, ?, '{}', ?)
+                    """,
+                    (
+                        str(admin["id"]),
+                        int(admin["id"]),
+                        str(admin["username"]),
+                        "concurrent automatic memory source",
+                        now_ts(),
+                    ),
+                )
+                parent_job, _ = service.jobs.enqueue(
+                    kind="agent",
+                    dedupe_key="concurrent-automatic-memory-parent",
+                    payload={"source_message_id": source_message_id},
+                    scope_type="private",
+                    scope_id=str(admin["id"]),
+                )
+                self.assertIsNotNone(
+                    service.jobs.mark_running(parent_job.id, lease_seconds=60)
+                )
+                service.agent_inputs.start_root(
+                    message_id=source_message_id,
+                    job_id=parent_job.id,
+                    input_group_id="concurrent-automatic-memory",
+                )
+                service.agent_inputs.set_runtime_run(
+                    "concurrent-automatic-memory", "run-concurrent"
+                )
                 results: list[dict] = []
                 errors: list[BaseException] = []
                 barrier = threading.Barrier(2)
@@ -210,7 +243,7 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                                     "source_type": "automatic",
                                     "source_run_id": "run-concurrent",
                                     "run_id": "run-concurrent",
-                                    "source_message_id": "42",
+                                    "source_message_id": source_message_id,
                                     "delegation_depth": 0,
                                     "unattended": False,
                                 }
@@ -239,7 +272,9 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
                 )
                 self.assertEqual(stored["source_type"], "automatic")
                 self.assertEqual(stored["source_run_id"], "run-concurrent")
-                self.assertEqual(stored["source_message_id"], "42")
+                self.assertEqual(
+                    stored["source_message_id"], str(source_message_id)
+                )
             finally:
                 service.close()
 

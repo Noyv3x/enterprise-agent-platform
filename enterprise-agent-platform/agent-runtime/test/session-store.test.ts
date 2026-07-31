@@ -25,6 +25,43 @@ test("SessionStore seeds once and isolates sessions", async () => {
   }
 });
 
+test("SessionStore deletes exactly one transient session and preserves lifecycle approvals", async () => {
+  const home = await temporaryDirectory("agent-session-delete-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "review" };
+    const sibling = { ...identity, session_id: "ordinary" };
+    const message: UserMessage = { role: "user", content: "temporary", timestamp: 1 };
+    await store.initialize(identity, [message]);
+    await store.initialize(sibling, [{ ...message, content: "preserved" }]);
+    await store.appendSessionApproval(identity, "v2:test:key", "skill");
+    await writeFile(store.archivePath(identity), `${JSON.stringify({
+      id: "archive-entry",
+      type: "message",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      ...identity,
+      payload: message,
+    })}\n`, { mode: 0o600 });
+
+    await store.deleteSession(identity);
+    await store.deleteSession(identity);
+
+    for (const path of [
+      store.path(identity),
+      store.archivePath(identity),
+      store.path(identity).replace(/\.jsonl$/, ".manifest.json"),
+    ]) {
+      await assert.rejects(stat(path), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    }
+    const [preserved] = await store.load(sibling);
+    assert.equal(preserved?.role, "user");
+    assert.equal(preserved?.role === "user" ? preserved.content : undefined, "preserved");
+    assert.equal(await store.hasSessionApproval(identity, "v2:test:key"), true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore ignores an incomplete final JSONL record", async () => {
   const home = await temporaryDirectory("agent-session-tail-");
   try {

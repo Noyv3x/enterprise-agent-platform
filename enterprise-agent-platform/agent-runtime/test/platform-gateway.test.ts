@@ -249,6 +249,106 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
   }
 });
 
+test("PlatformGateway forwards trusted learning-review context and normalizes reconcile operations", async () => {
+  const bodies: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    bodies.push({
+      path: request.url || "",
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, unknown>,
+    });
+    response.setHeader("content-type", "application/json");
+    response.end("{}");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const gateway = new PlatformGateway(`http://127.0.0.1:${address.port}`, "token");
+    const request: RunRequest = {
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "learning-review-7",
+      workspace: "/workspace",
+      system_prompt: "system",
+      input: "review",
+      model: { provider: "openai-codex", id: "gpt-5" },
+      metadata: {
+        actor: { id: 42 },
+        source_message_id: 88,
+        trigger: "learning_review",
+        review_mode: "memory_skill",
+        review_job_id: 7,
+        idempotency_key: "agent-learning-review:7",
+        unattended: true,
+        delegation_depth: 0,
+      },
+    };
+    await gateway.invoke(request, "review-run", "memory", "reconcile", {
+      review_job_id: 999,
+      operations: [
+        { action: "store", target: "memory", content: "Stable fact" },
+        { action: "forget", target: "memory", id: 3 },
+      ],
+    });
+    await gateway.invoke(request, "review-run", "memory", "search", { query: "stable" });
+    await gateway.invoke(request, "review-run", "memory", "read", { id: 3 });
+    await gateway.invoke(request, "review-run", "memory", "list", {});
+    await gateway.invoke(request, "review-run", "skill", "patch", {
+      id: "review-code",
+      old_string: "old",
+      new_string: "new",
+    });
+
+    assert.equal(bodies[0]?.path, "/api/agent/tools/memory");
+    assert.equal(bodies[0]?.body.action, "reconcile");
+    assert.equal(bodies[0]?.body.review_mode, "memory_skill");
+    assert.equal(bodies[0]?.body.review_job_id, 7);
+    assert.equal(bodies[0]?.body.source_message_id, 88);
+    assert.deepEqual(bodies[0]?.body.operations, [
+      {
+        action: "add",
+        target: "memory",
+        content: "Stable fact",
+        owner_user_id: 42,
+        source_run_id: "review-run",
+        source_message_id: 88,
+        source_type: "automatic",
+      },
+      {
+        action: "remove",
+        target: "memory",
+        id: 3,
+        owner_user_id: 42,
+        source_run_id: "review-run",
+        source_message_id: 88,
+        source_type: "automatic",
+      },
+    ]);
+    for (const [index, action] of ["search", "read", "list"].entries()) {
+      const read = bodies[index + 1];
+      assert.equal(read?.path, "/api/agent/tools/memory/search");
+      assert.equal(read?.body.action, action);
+      assert.equal(read?.body.review_mode, "memory_skill");
+      assert.equal(read?.body.review_job_id, 7);
+      assert.equal(read?.body.parent_run_id, "");
+      assert.equal(read?.body.delegation_depth, 0);
+      assert.equal(read?.body.trigger, "learning_review");
+      assert.equal(read?.body.unattended, true);
+      assert.equal(read?.body.source_message_id, 88);
+    }
+    const skillContext = bodies[4]?.body.context as Record<string, unknown>;
+    assert.equal(skillContext.review_mode, "memory_skill");
+    assert.equal(skillContext.review_job_id, 7);
+    assert.equal(skillContext.trigger, "learning_review");
+    assert.equal(skillContext.unattended, true);
+    assert.equal(skillContext.source_message_id, 88);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("PlatformGateway forwards typed platform session-search actions within the trusted scope", async () => {
   let body: Record<string, unknown> = {};
   const server = createServer(async (request, response) => {

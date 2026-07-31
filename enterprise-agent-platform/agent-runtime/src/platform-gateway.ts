@@ -49,6 +49,14 @@ export class PlatformGateway {
         ...(request.metadata?.unattended === undefined
           ? {}
           : { unattended: request.metadata.unattended === true }),
+        ...(typeof request.metadata?.review_mode === "string"
+          ? { review_mode: request.metadata.review_mode }
+          : {}),
+        ...(typeof request.metadata?.review_job_id === "number"
+          && Number.isSafeInteger(request.metadata.review_job_id)
+          && request.metadata.review_job_id > 0
+          ? { review_job_id: request.metadata.review_job_id }
+          : {}),
       },
     };
     const target = gatewayTarget(baseUrl, body);
@@ -125,9 +133,26 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     lifecycle_id: request.context.lifecycle_id,
     session_id: request.context.session_id,
     run_id: request.context.run_id,
+    ...(request.context.review_mode === undefined || request.context.source_message_id === undefined
+      ? {}
+      : { source_message_id: request.context.source_message_id }),
+    ...(request.context.review_mode === undefined
+      ? {}
+      : { review_mode: request.context.review_mode }),
+    ...(request.context.review_job_id === undefined
+      ? {}
+      : { review_job_id: request.context.review_job_id }),
+    ...(request.context.review_mode === undefined
+      ? {}
+      : {
+          parent_run_id: request.context.parent_run_id ?? "",
+          delegation_depth: request.context.delegation_depth,
+          trigger: request.context.trigger,
+          unattended: request.context.unattended,
+        }),
   };
   if (request.tool === "memory") {
-    if (!["search", "read", "list", "store", "replace", "forget", "clear"].includes(request.action)) {
+    if (!["search", "read", "list", "store", "replace", "forget", "reconcile", "clear"].includes(request.action)) {
       throw new Error("memory action is not supported");
     }
     if (["search", "read", "list"].includes(request.action)) {
@@ -148,6 +173,8 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
         delegation_depth: request.context.delegation_depth,
         trigger: request.context.trigger,
         unattended: request.context.unattended,
+        review_mode: request.context.review_mode,
+        review_job_id: request.context.review_job_id,
       },
     };
   }
@@ -218,6 +245,8 @@ function authoritativeMemoryArguments(request: GatewayToolRequest): JsonObject {
           normalized.source_message_id = request.context.source_message_id;
         }
       }
+      if (operationAction === "store") normalized.action = "add";
+      if (operationAction === "forget") normalized.action = "remove";
       return normalized;
     });
   }

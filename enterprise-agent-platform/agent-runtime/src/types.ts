@@ -67,10 +67,54 @@ export interface RunMetadata extends JsonObject {
   approval_session_id?: string;
   trigger?: string;
   unattended?: boolean;
+  review_mode?: string;
+  review_job_id?: number;
   schedule_id?: string;
   schedule_run_id?: string;
   scheduled_for?: string;
   available_skills?: unknown;
+}
+
+export const LEARNING_REVIEW_MODE = "memory_skill";
+export const LEARNING_REVIEW_TRIGGER = "learning_review";
+
+/**
+ * Return true only for the complete, Platform-issued learning-review context.
+ * Individual metadata fields are not capability switches: callers must
+ * provide the whole root private-run identity before Runtime narrows the tool
+ * set or grants the review-specific mutation policy.
+ */
+export function isLearningReviewRun(request: Pick<RunRequest, "scope_key" | "session_id" | "metadata">): boolean {
+  const metadata = request.metadata;
+  if (!metadata || !/^private:[1-9][0-9]*$/.test(request.scope_key)) return false;
+  const reviewJobId = metadata.review_job_id;
+  return metadata.review_mode === LEARNING_REVIEW_MODE
+    && metadata.trigger === LEARNING_REVIEW_TRIGGER
+    && metadata.unattended === true
+    && typeof reviewJobId === "number"
+    && Number.isSafeInteger(reviewJobId)
+    && reviewJobId > 0
+    && request.session_id === `learning-review-${reviewJobId}`
+    && metadata.idempotency_key === `agent-learning-review:${reviewJobId}`
+    && typeof metadata.source_message_id === "number"
+    && Number.isSafeInteger(metadata.source_message_id)
+    && metadata.source_message_id > 0
+    && (metadata.parent_run_id === undefined || metadata.parent_run_id === "")
+    && (metadata.delegation_depth === undefined || metadata.delegation_depth === 0);
+}
+
+export function hasLearningReviewMetadata(
+  request: Pick<RunRequest, "metadata">,
+): boolean {
+  const metadata = request.metadata;
+  return Boolean(
+    metadata
+    && (
+      metadata.review_mode !== undefined
+      || metadata.review_job_id !== undefined
+      || metadata.trigger === LEARNING_REVIEW_TRIGGER
+    )
+  );
 }
 
 export type UserInput = string | Array<TextContent | ImageContent>;
@@ -201,6 +245,8 @@ export interface GatewayToolRequest {
     delegation_depth?: number;
     trigger?: string;
     unattended?: boolean;
+    review_mode?: string;
+    review_job_id?: number;
   };
 }
 

@@ -55,7 +55,7 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 }
 ```
 
-`execution_context` 由 Platform 从数据库 scope 派生，不能接受模型值；委派请求继承父值。可选字段包括 `history`、`attachments`、`thinking_level`、内部 Gateway 信息和 metadata。图片附件由 Platform 读取受限字节后放入 `input` image block；附件列表只携带 `/workspace/.ubitech/attachments/...` 容器逻辑路径和安全 metadata，Runtime 不直接读取 Platform 文件系统。metadata 可携带 parent/delegation、idempotency、source message、触发来源、计划任务和可用技能索引；OAuth token、宿主路径、Docker 身份和可覆盖 provider endpoint 的值不得出现。
+`execution_context` 由 Platform 从数据库 scope 派生，不能接受模型值；委派请求继承父值。可选字段包括 `history`、`attachments`、`thinking_level`、内部 Gateway 信息和 metadata。图片附件由 Platform 读取受限字节后放入 `input` image block；附件列表只携带 `/workspace/.ubitech/attachments/...` 容器逻辑路径和安全 metadata，Runtime 不直接读取 Platform 文件系统。metadata 可携带 parent/delegation、idempotency、source message、触发来源、计划任务和可用技能索引；OAuth token、宿主路径、Docker 身份和可覆盖 provider endpoint 的值不得出现。Platform 内部学习复盘还同时携带 `review_mode=memory_skill`、`trigger=learning_review`、`unattended=true` 和正整数 `review_job_id`，并把 session 与幂等身份固定为 `session_id=learning-review-<review_job_id>`、`metadata.idempotency_key=agent-learning-review:<review_job_id>`。Runtime 只有在 canonical private 顶层 scope、当前 source message、无 parent/delegation 且这两个派生身份精确匹配的完整组合下才启用受限能力；对应 session/idempotency 命名空间为内部保留，普通 Run 也不能预占。这些字段不是公共提权开关。
 
 成功创建返回 HTTP 202：
 
@@ -114,7 +114,7 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 
 审批 body 只接受 `approval_id` 和 `decision`。decision 是 `once`、`session`、`always` 或 `deny`。省略 `approval_id` 时处理该 Run 最新待决审批；未知字段或无效 decision 返回 400。
 
-审批用于 host terminal、Skill、计划修改和其它明确需要用户决定的业务动作。自动记忆不使用审批。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
+审批用于 host terminal、普通前台 Skill 修改、计划修改和其它明确需要用户决定的业务动作。自动记忆不使用审批；经过完整校验的内部学习复盘可以免批执行受限的 memory 与 agent-owned Skill create/patch，其它 Skill 动作仍失败关闭。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
 
 terminal、process 和文件工具必须带 `target=sandbox|host`，省略时为 sandbox。Sandbox 不使用人工审批；host terminal 在调用 Manager 之前逐次请求审批，choices 固定为 `once|deny`，不支持 session/always 复用，也不能成为 Run 默认。批准后 Runtime 写入 `execution.audit`，数据包含 target、完整安全展示参数、canonical cwd/路径、前后台方式和有效 timeout。Manager 响应回显不可伪造的 executor id、实际 target 和审计 id，Runtime 才能发出 `tool.started`。
 
@@ -135,6 +135,8 @@ Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`f
 Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
 Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill 和 mail；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+
+memory 额外支持原子 `reconcile`，其 `operations` 至多二十项且只含 `store|replace|forget`。skill 额外支持精确 `patch`：参数包含 id、可选 support `file_path`、`old_string`、`new_string` 与 `expected_replacements`。复盘 Gateway context 在 memory 的 `search|read|list` 与变更请求中都必须携带 `parent_run_id`、`delegation_depth`、`trigger`、`unattended`、`review_mode` 和 `review_job_id`，并结合已有 run/scope/lifecycle/owner/source message 构成完整主体。Python 在执行任何复盘记忆查询或写入前必须反查 running job、当前 lifecycle、激活账号与权限；过期或不完整主体返回 403，不读取记忆。复盘 Skill 不能 delete、enable/disable、完整 update 或 remove/write support，支持文件修改同样走精确 patch。
 
 Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
 

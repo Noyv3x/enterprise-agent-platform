@@ -503,6 +503,186 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
   }
 });
 
+test("RunCoordinator isolates learning review tools, approvals, prompt, and terminal session state", async () => {
+  const home = await temporaryDirectory("agent-learning-review-");
+  const workspace = await temporaryDirectory("agent-learning-review-workspace-");
+  const faux = fauxProvider();
+  const observedTools: string[][] = [];
+  const observedPrompts: string[] = [];
+  faux.setResponses([
+    (context) => {
+      observedTools.push(context.tools?.map((tool) => tool.name) ?? []);
+      observedPrompts.push(context.systemPrompt || "");
+      return fauxAssistantMessage(fauxToolCall("skill", {
+        action: "load",
+        arguments: { id: "code-review" },
+      }), { stopReason: "toolUse" });
+    },
+    (context) => {
+      observedTools.push(context.tools?.map((tool) => tool.name) ?? []);
+      return fauxAssistantMessage(fauxToolCall("skill", {
+        action: "patch",
+        arguments: {
+          id: "code-review",
+          old_string: "old",
+          new_string: "new",
+          expected_replacements: 1,
+        },
+      }), { stopReason: "toolUse" });
+    },
+    fauxAssistantMessage("Learning review complete."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const gatewayActions: string[] = [];
+  coordinator.gateway.invoke = async (_request, _runId, tool, action) => {
+    gatewayActions.push(`${tool}.${action}`);
+    return action === "load"
+      ? { data: { skill: { id: "code-review", instructions: "Review code carefully." } } }
+      : { data: { updated: true } };
+  };
+  const request = {
+    scope_key: "private:1",
+    lifecycle_id: "life",
+    session_id: "learning-review-7",
+    workspace,
+    system_prompt: "You are ubitech agent.",
+    input: "Extract durable learning only.",
+    model: { provider: "openai-codex", id: "gpt-5.5" },
+    metadata: {
+      trigger: "learning_review",
+      review_mode: "memory_skill",
+      review_job_id: 7,
+      source_message_id: 88,
+      idempotency_key: "agent-learning-review:7",
+      unattended: true,
+      delegation_depth: 0,
+      available_skills: [{ id: "code-review", name: "Code review" }],
+    },
+  } as const;
+  try {
+    const run = coordinator.createRun(request);
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.deepEqual(observedTools, [["memory", "skill"], ["memory", "skill"]]);
+    assert.match(observedPrompts[0] || "", /<learning_review_policy>/);
+    assert.match(observedPrompts[0] || "", /isolated learning review/);
+    assert.match(observedPrompts[0] || "", /class-level umbrella Skill/);
+    assert.match(observedPrompts[0] || "", /recovered transient failure/);
+    assert.match(observedPrompts[0] || "", /persistent shared budget of 20 mutation units across all calls/);
+    assert.match(observedPrompts[0] || "", /each reconcile child operation costs 1 unit/);
+    assert.match(observedPrompts[0] || "", /each Skill create or patch costs 1 unit/);
+    assert.match(observedPrompts[0] || "", /reads cost 0 units/);
+    assert.match(observedPrompts[0] || "", /Platform rejects any mutation that would exceed the remaining budget/);
+    assert.doesNotMatch(observedPrompts[0] || "", /<execution_discipline>/);
+    assert.deepEqual(gatewayActions, ["skill.load", "skill.patch"]);
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.equal(events.filter((event) => event.type === "tool.started").length, 2);
+
+    const identity = {
+      scope_key: request.scope_key,
+      lifecycle_id: request.lifecycle_id,
+      session_id: request.session_id,
+    };
+    assert.deepEqual(await coordinator.sessions.load(identity), []);
+    await assert.rejects(
+      readFile(coordinator.sessions.path(identity), "utf8"),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator rejects partial, delegated, or mismatched learning-review identities", async () => {
+  const home = await temporaryDirectory("agent-learning-review-validation-");
+  const coordinator = new RunCoordinator({ config: testConfig(home) });
+  const ordinaryIdentity = {
+    scope_key: "private:1",
+    lifecycle_id: "life",
+    session_id: "ordinary-session",
+  };
+  const base = {
+    ...ordinaryIdentity,
+    workspace: "/tmp",
+    system_prompt: "system",
+    input: "review",
+    model: { provider: "openai-codex", id: "gpt-5.5" },
+  };
+  try {
+    await coordinator.sessions.initialize(ordinaryIdentity, [
+      { role: "user", content: "keep this ordinary session", timestamp: 1 },
+    ]);
+    for (const metadata of [
+      { review_mode: "memory_skill" },
+      {
+        trigger: "learning_review",
+        review_mode: "memory_skill",
+        review_job_id: 7,
+        source_message_id: 8,
+        unattended: true,
+        parent_run_id: "parent",
+        delegation_depth: 1,
+      },
+      {
+        trigger: "learning_review",
+        review_mode: "memory_skill",
+        review_job_id: 0,
+        source_message_id: 8,
+        unattended: true,
+      },
+    ]) {
+      assert.throws(
+        () => coordinator.createRun({ ...base, metadata } as never),
+        (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
+      );
+    }
+    const completeMetadata = {
+      trigger: "learning_review",
+      review_mode: "memory_skill",
+      review_job_id: 7,
+      source_message_id: 8,
+      idempotency_key: "agent-learning-review:7",
+      unattended: true,
+      delegation_depth: 0,
+    } as const;
+    assert.throws(
+      () => coordinator.createRun({ ...base, metadata: completeMetadata } as never),
+      (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
+    );
+    assert.throws(
+      () => coordinator.createRun({
+        ...base,
+        session_id: "learning-review-7",
+      } as never),
+      (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
+    );
+    assert.throws(
+      () => coordinator.createRun({
+        ...base,
+        metadata: { idempotency_key: "agent-learning-review:7" },
+      } as never),
+      (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
+    );
+    assert.throws(
+      () => coordinator.createRun({
+        ...base,
+        session_id: "learning-review-7",
+        metadata: { ...completeMetadata, idempotency_key: "agent-learning-review:8" },
+      } as never),
+      (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
+    );
+    assert.deepEqual(await coordinator.sessions.load(ordinaryIdentity), [
+      { role: "user", content: "keep this ordinary session", timestamp: 1 },
+    ]);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("unattended scheduled skill mutations require existing persistent authorization", async () => {
   const home = await temporaryDirectory("agent-scheduled-skill-");
   const workspace = await temporaryDirectory("agent-scheduled-skill-workspace-");

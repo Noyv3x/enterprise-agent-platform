@@ -43,7 +43,7 @@ Python Platform 容器拥有产品业务状态：
 - 登录、会话签名、账号和服务端权限；
 - 频道、私人消息、附件、审计和 token 用量；
 - Agent scope、消息准入、持久任务、短消息合并和计划任务；
-- 自动记忆、知识库、技能、跨会话搜索和邮箱账户；
+- 自动记忆、知识库、技能、跨会话搜索、后台学习复盘和邮箱账户；
 - OAuth 流程、凭据刷新和可见模型目录；
 - Telegram 与面向 Runtime 的内部业务工具 Gateway。
 
@@ -73,6 +73,12 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 4. Runtime 将产品工具回调 Platform；terminal、process 与文件工具按主 Agent identity 调用管理器，默认进入对应 Sandbox。
 5. Sandbox 执行在硬阻断和审计后直接运行；宿主命令必须先获得本次用户审批，管理器再产生带完整安全展示参数的审计事件，并记录 target、部署用户和 sudo 使用情况。
 6. 最终回复和用量先持久化，再将任务账本转为成功。
+
+### 后台学习复盘
+
+只有规范私人、顶层、交互式任务在最终回复与主任务成功后才累计学习节奏。Platform 分别累计成功用户回合和已完成工具调用；任一计数达到十次时，以来源消息和 lifecycle 为幂等边界写入低优先级 `agent_learning_review` 持久任务。频道、计划、邮件唤醒、委派、失败、中断和复盘任务本身不累计也不触发复盘。
+
+学习 worker 在业务回复之外串行领取任务，重新校验账号、scope、lifecycle 和来源消息，只向 Runtime 提交有界的近期私人会话。账号激活状态和私人 Agent 权限不只在领取时检查；复盘 memory 读操作在 lifecycle 门和同一 SQLite 快照中完成授权复验与查询，memory 写操作在同一个 `BEGIN IMMEDIATE` 事务内完成复验、持久预算扣减、变更和返回快照。普通交互 Run 的 automatic memory 写入也在 lifecycle 门与单一写事务中通过来源消息、runtime Run 到 running 父任务映射复验。Skill 写入横跨 DB/文件系统，故在持有 lifecycle 门时先持久预扣预算，再重新复验并提交文件；失败可消耗预算，不能出现文件成功而计费回滚。每个 review durable job 的 payload 持久保存二十单位总预算用量，memory 子动作与 Skill create/patch 共享，进程重启、任务重排或 Runtime 重试不会刷新。该 Run 使用独立临时 session，不产生产品消息、工作记录或通知；Runtime 只暴露 memory 与 skill，并在终态后删除临时 session。复盘失败不改变已经交付的回复，安全重试依靠持久任务的幂等键；领取、重排或终态落盘遇到短暂存储错误时，worker 使用有上限的退避持续恢复，不得因单次异常静默永久退出；已领取任务在无法确认终态时保持为更新阻塞项，关闭则留给启动恢复。更新预约建立后不领取新复盘，正在运行的复盘是更新阻塞项，完成或受控取消并重排后才切换版本。
 
 ### 运行中追加输入
 

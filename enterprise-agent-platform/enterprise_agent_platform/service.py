@@ -54,6 +54,13 @@ from .internal_config import (
     update_env_file,
 )
 from .jobs import DurableJob, DurableJobStore
+from .learning import (
+    LEARNING_REVIEW_JOB_KIND,
+    LEARNING_REVIEW_LEASE_SECONDS,
+    LEARNING_REVIEW_MAX_ATTEMPTS,
+    LearningReviewBudgetExceeded,
+    LearningReviewStore,
+)
 from .knowledge import KnowledgeBase
 from .loopback_http import (
     open_loopback_url,
@@ -424,6 +431,7 @@ class EnterpriseService:
         self._acquire_instance_lock()
         self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
+        self.learning_reviews = LearningReviewStore(self.db)
         self.agent_inputs = AgentRunInputStore(self.db)
         self.schedules = AgentScheduleStore(self.db)
         self.mail_accounts = MailAccountStore(self.db)
@@ -505,6 +513,11 @@ class EnterpriseService:
         self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_active_tasks: dict[str, dict[str, Any]] = {}
+        self._learning_wakeup = threading.Event()
+        self._learning_thread: threading.Thread | None = None
+        self._learning_active_jobs: dict[int, str] = {}
+        self._learning_skill_reads_lock = threading.RLock()
+        self._learning_skill_reads: dict[tuple[int, str], set[str]] = {}
         # Admissions cover the short message-persist -> durable-job-enqueue
         # boundary. Manager reserves an idle platform under the same
         # lock, so a request either becomes durable work first or receives the
@@ -576,6 +589,7 @@ class EnterpriseService:
         self._cleanup_incomplete_attachment_messages()
         self._cleanup_orphan_attachment_files()
         self._recover_durable_work()
+        self._start_learning_worker()
         self._start_schedule_worker()
         self._start_mail_worker()
         self._start_telegram_gateway()
@@ -668,6 +682,10 @@ class EnterpriseService:
             with self._conversation_lock:
                 self._closed = True
                 workers = list(self._agent_workers.values())
+                learning_worker = self._learning_thread
+                learning_run_ids = [
+                    run_id for run_id in self._learning_active_jobs.values() if run_id
+                ]
             self.unregister_telegram_delivery_handler()
             if self._telegram_gateway is not None:
                 self._telegram_gateway.stop()
@@ -675,6 +693,15 @@ class EnterpriseService:
             self._telegram_delivery_wakeup.set()
             self._schedule_wakeup.set()
             self._mail_wakeup.set()
+            self._learning_wakeup.set()
+
+            cancel_run = getattr(self.agent_client, "cancel_run", None)
+            if callable(cancel_run):
+                for run_id in learning_run_ids:
+                    try:
+                        cancel_run(run_id)
+                    except Exception:
+                        pass
 
             # First close scope-owned processes, the Agent client and runtime
             # status adapters. The database deliberately stays open until every
@@ -698,6 +725,7 @@ class EnterpriseService:
                 telegram_delivery,
                 schedule_worker,
                 mail_worker,
+                learning_worker,
                 *workers,
             ]:
                 if worker is None or worker is threading.current_thread():
@@ -711,6 +739,7 @@ class EnterpriseService:
                     telegram_delivery,
                     schedule_worker,
                     mail_worker,
+                    learning_worker,
                     *workers,
                 ]
                 if worker is not None and worker is not threading.current_thread() and worker.is_alive()
@@ -887,6 +916,56 @@ class EnterpriseService:
             start_lock.acquire()
             try:
                 self._ensure_agent_task_can_run(task)
+            except BaseException:
+                start_lock.release()
+                raise
+
+        guard = threading.Lock()
+        released = False
+
+        def release(_run_id: str = "") -> None:
+            nonlocal released
+            with guard:
+                if released:
+                    return
+                released = True
+                start_lock.release()
+
+        try:
+            signature = inspect.signature(self.agent_client.generate)
+            parameters = signature.parameters
+            supports_callback = "run_started_callback" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_callback = False
+        return release, supports_callback
+
+    def _learning_review_submission_barrier(
+        self,
+        job: DurableJob,
+        *,
+        scope_key: str,
+        lifecycle_id: str,
+        owner_user_id: int,
+        source_message_id: int,
+        response_message_id: int,
+    ) -> tuple[Callable[[str], None], bool]:
+        """Close review validation -> Runtime acceptance against lifecycle cleanup."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+            try:
+                self._validate_learning_review_execution_context(
+                    job,
+                    scope_key=scope_key,
+                    lifecycle_id=lifecycle_id,
+                    owner_user_id=owner_user_id,
+                    source_message_id=source_message_id,
+                    response_message_id=response_message_id,
+                )
             except BaseException:
                 start_lock.release()
                 raise
@@ -1148,6 +1227,26 @@ class EnterpriseService:
                     (str(reason)[:2000], timestamp, timestamp, *cancellable_job_ids),
                 )
             if scope_type == "private":
+                # Learning reviews are lifecycle-owned work just like the
+                # foreground Agent job that produced them. Closing a private
+                # lifecycle terminally invalidates both queued reviews and a
+                # review whose Runtime acceptance was ordered immediately
+                # before this cleanup barrier. The worker's settlement CAS
+                # cannot resurrect either row.
+                conn.execute(
+                    """
+                    UPDATE durable_jobs
+                    SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
+                    WHERE kind = ? AND scope_type = 'private' AND scope_id = ?
+                      AND status IN ('queued', 'running')
+                    """,
+                    (
+                        str(reason)[:2000],
+                        timestamp,
+                        LEARNING_REVIEW_JOB_KIND,
+                        scope_id,
+                    ),
+                )
                 conn.execute(
                     """
                     UPDATE agent_run_inputs
@@ -3711,6 +3810,7 @@ class EnterpriseService:
         return {
             "reserved": False,
             "active_agent_tasks": len(self._agent_active_tasks),
+            "active_learning_reviews": len(self._learning_active_jobs),
             "queued_agent_jobs": counts.get("queued", 0),
             "running_agent_jobs": counts.get("running", 0),
             "admissions_in_progress": self._agent_update_admissions,
@@ -3723,6 +3823,7 @@ class EnterpriseService:
             int(result.get(field) or 0) > 0
             for field in (
                 "active_agent_tasks",
+                "active_learning_reviews",
                 "queued_agent_jobs",
                 "running_agent_jobs",
                 "admissions_in_progress",
@@ -3782,6 +3883,372 @@ class EnterpriseService:
         self._mail_wakeup.set()
         self._start_telegram_gateway()
         self._telegram_delivery_wakeup.set()
+        self._start_learning_worker()
+        self._learning_wakeup.set()
+
+    def _start_learning_worker(self) -> None:
+        with self._conversation_lock:
+            if self._closed:
+                return
+            worker = self._learning_thread
+            if worker is not None and worker.is_alive():
+                self._learning_wakeup.set()
+                return
+            worker = threading.Thread(
+                target=self._learning_worker,
+                name="agent-learning-review",
+                daemon=True,
+            )
+            self._learning_thread = worker
+            worker.start()
+
+    def _claim_learning_review(self) -> DurableJob | None:
+        """Claim one review without racing a Manager maintenance reservation."""
+
+        ready = self.jobs.ready(LEARNING_REVIEW_JOB_KIND, limit=1)
+        if not ready:
+            return None
+        with self._conversation_lock:
+            if self._closed or self._auto_update_reserved:
+                return None
+            self._agent_update_admissions += 1
+        claimed: DurableJob | None = None
+        try:
+            claimed = self.jobs.mark_running(
+                ready[0].id,
+                lease_seconds=LEARNING_REVIEW_LEASE_SECONDS,
+            )
+            with self._conversation_lock:
+                if claimed is not None:
+                    self._learning_active_jobs[claimed.id] = ""
+        finally:
+            with self._conversation_lock:
+                self._agent_update_admissions = max(
+                    0, self._agent_update_admissions - 1
+                )
+        return claimed
+
+    def _learning_worker(self) -> None:
+        claim_backoff_seconds = 0.25
+        try:
+            while True:
+                with self._conversation_lock:
+                    if self._closed:
+                        return
+                    reserved = self._auto_update_reserved
+                if reserved:
+                    self._learning_wakeup.wait(timeout=1.0)
+                    self._learning_wakeup.clear()
+                    continue
+                try:
+                    job = self._claim_learning_review()
+                except Exception as exc:
+                    # A transient SQLite/filesystem failure must not permanently
+                    # kill the only review worker. No job was returned to this
+                    # loop, so retry discovery with capped backoff; an ambiguous
+                    # running claim remains durable and startup recovery can
+                    # reclaim it if this process is shut down meanwhile.
+                    print(
+                        f"Could not claim Agent learning review: {exc}",
+                        file=sys.stderr,
+                    )
+                    self._wait_for_learning_retry(claim_backoff_seconds)
+                    claim_backoff_seconds = min(5.0, claim_backoff_seconds * 2)
+                    continue
+                claim_backoff_seconds = 0.25
+                if job is None:
+                    self._learning_wakeup.wait(timeout=1.0)
+                    self._learning_wakeup.clear()
+                    continue
+                settlement: str | None = None
+                settlement_error = ""
+                settlement_delay = 0
+                try:
+                    self._execute_learning_review(job)
+                except AgentRuntimeRunError as exc:
+                    # A terminal needs_review/cancelled result can already have
+                    # durable effects. Never submit it under a new identity.
+                    settlement = "failed"
+                    settlement_error = str(exc)
+                    print(f"Agent learning review {job.id} failed: {exc}", file=sys.stderr)
+                except Exception as exc:
+                    settlement_error = str(exc)
+                    if job.attempts < LEARNING_REVIEW_MAX_ATTEMPTS:
+                        settlement = "queued"
+                        settlement_delay = min(
+                            300, 15 * (2 ** max(0, job.attempts - 1))
+                        )
+                    else:
+                        settlement = "failed"
+                    print(f"Agent learning review {job.id} failed: {exc}", file=sys.stderr)
+                else:
+                    settlement = "succeeded"
+                finally:
+                    try:
+                        if settlement is not None:
+                            self._settle_learning_review_job(
+                                job,
+                                status=settlement,
+                                error=settlement_error,
+                                delay_seconds=settlement_delay,
+                            )
+                    finally:
+                        with self._conversation_lock:
+                            self._learning_active_jobs.pop(job.id, None)
+                        with self._learning_skill_reads_lock:
+                            for key in [
+                                key for key in self._learning_skill_reads if key[0] == job.id
+                            ]:
+                                self._learning_skill_reads.pop(key, None)
+        finally:
+            with self._conversation_lock:
+                if self._learning_thread is threading.current_thread():
+                    self._learning_thread = None
+
+    def _wait_for_learning_retry(self, timeout: float) -> None:
+        self._learning_wakeup.wait(timeout=max(0.01, min(float(timeout), 5.0)))
+        self._learning_wakeup.clear()
+
+    def _settle_learning_review_job(
+        self,
+        job: DurableJob,
+        *,
+        status: str,
+        error: str,
+        delay_seconds: int,
+    ) -> bool:
+        """Persist one claimed review outcome without abandoning the worker.
+
+        Keep the job in the in-memory active set while its durable outcome is
+        uncertain. This makes Manager readiness fail closed. On process shutdown
+        the running row is deliberately left for normal startup recovery.
+        """
+
+        if status not in {"succeeded", "failed", "queued"}:
+            raise ValueError("learning review settlement status is invalid")
+        backoff_seconds = 0.25
+        while True:
+            with self._conversation_lock:
+                if self._closed:
+                    return False
+            try:
+                if status == "succeeded":
+                    transitioned = self.jobs.mark_succeeded(job.id)
+                elif status == "queued":
+                    transitioned = self.jobs.requeue(
+                        job.id,
+                        delay_seconds=delay_seconds,
+                        error=error,
+                    )
+                else:
+                    transitioned = self.jobs.mark_failed(job.id, error)
+                if transitioned:
+                    return True
+                current = self.jobs.get(job.id)
+                if current is None or current.status != "running":
+                    # Another lifecycle/admin path already made the job
+                    # terminal or recoverable; never resurrect it here.
+                    return True
+                settlement_error = "running job rejected its settlement CAS"
+            except Exception as exc:
+                settlement_error = str(exc)
+            print(
+                f"Could not persist Agent learning review {job.id} outcome: "
+                f"{settlement_error}",
+                file=sys.stderr,
+            )
+            self._wait_for_learning_retry(backoff_seconds)
+            backoff_seconds = min(5.0, backoff_seconds * 2)
+
+    def _validate_learning_review_execution_context(
+        self,
+        job: DurableJob,
+        *,
+        scope_key: str,
+        lifecycle_id: str,
+        owner_user_id: int,
+        source_message_id: int,
+        response_message_id: int,
+    ) -> tuple[AgentExecutionScope, dict[str, Any]]:
+        """Return current review principals or fail closed before submission."""
+
+        payload = job.payload
+        scope = self.agent_scopes.get_scope(scope_key)
+        actor = self.get_user(owner_user_id)
+        if (
+            payload.get("schema_version") != 1
+            or scope is None
+            or scope.scope_type != "private"
+            or scope.scope_key != scope_key
+            or str(scope.scope_id) != str(owner_user_id)
+            or scope.lifecycle_id != lifecycle_id
+            or actor is None
+            or not actor.get("active")
+            or PERMISSION_PRIVATE_AGENT not in set(actor.get("permissions") or [])
+        ):
+            raise ValueError("learning review scope, lifecycle, or owner is stale")
+        source = self.db.query_one(
+            """
+            SELECT id FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+              AND author_type = 'user' AND user_id = ?
+            """,
+            (source_message_id, str(owner_user_id), owner_user_id),
+        )
+        response = self.db.query_one(
+            """
+            SELECT id FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+              AND author_type = 'agent'
+            """,
+            (response_message_id, str(owner_user_id)),
+        )
+        if source is None or response is None or source_message_id >= response_message_id:
+            raise ValueError("learning review source messages are unavailable")
+        current = self.jobs.get(job.id)
+        if not self.learning_reviews.context_matches(
+            current,
+            scope_key=scope_key,
+            lifecycle_id=lifecycle_id,
+            owner_user_id=owner_user_id,
+            source_message_id=source_message_id,
+        ):
+            raise ValueError("learning review job is no longer active")
+        return scope, actor
+
+    def _execute_learning_review(self, job: DurableJob) -> None:
+        payload = job.payload
+        try:
+            owner_user_id = int(payload.get("owner_user_id"))
+            source_message_id = int(payload.get("source_message_id"))
+            response_message_id = int(payload.get("response_message_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("learning review payload has invalid identifiers") from exc
+        scope_key = str(payload.get("scope_key") or "").strip()
+        lifecycle_id = str(payload.get("lifecycle_id") or "").strip()
+        scope, actor = self._validate_learning_review_execution_context(
+            job,
+            scope_key=scope_key,
+            lifecycle_id=lifecycle_id,
+            owner_user_id=owner_user_id,
+            source_message_id=source_message_id,
+            response_message_id=response_message_id,
+        )
+
+        generation = self.account_generation_config(actor)
+        execution = self._agent_execution_metadata(scope)
+        session_id = f"learning-review-{job.id}"
+        history = self._agent_session_seed_history(
+            "private", str(owner_user_id), response_message_id + 1
+        )
+        tool_trace = [
+            {
+                "tool": str(item.get("tool") or "")[:64],
+                "detail": str(item.get("detail") or "")[:500],
+            }
+            for item in list(payload.get("tool_trace") or [])[:20]
+            if isinstance(item, dict) and str(item.get("tool") or "").strip()
+        ]
+        review_input = (
+            "Review the preceding completed interaction for durable learning. "
+            "Use only the memory and skill tools. Make no conversational reply; "
+            "if there is nothing durable and reusable to change, use no mutation. "
+            "When finished, return only REVIEW_COMPLETE."
+        )
+        if tool_trace:
+            review_input += "\n" + format_untrusted_context_data(
+                "recent_tool_activity", tool_trace
+            )
+
+        release_submission, supports_callback = self._learning_review_submission_barrier(
+            job,
+            scope_key=scope_key,
+            lifecycle_id=lifecycle_id,
+            owner_user_id=owner_user_id,
+            source_message_id=source_message_id,
+            response_message_id=response_message_id,
+        )
+
+        def run_started(run_id: str) -> None:
+            # Match the normal Run lock ordering: release the lifecycle gate
+            # before consulting conversation state. A concurrent reset that was
+            # waiting on the gate can now terminally cancel this accepted job
+            # and clean the whole old lifecycle.
+            release_submission(run_id)
+            should_cancel = False
+            stale_context = False
+            with self._conversation_lock:
+                try:
+                    self._validate_learning_review_execution_context(
+                        job,
+                        scope_key=scope_key,
+                        lifecycle_id=lifecycle_id,
+                        owner_user_id=owner_user_id,
+                        source_message_id=source_message_id,
+                        response_message_id=response_message_id,
+                    )
+                except Exception:
+                    stale_context = True
+                    should_cancel = True
+                else:
+                    if job.id in self._learning_active_jobs:
+                        self._learning_active_jobs[job.id] = str(run_id)
+                should_cancel = should_cancel or self._closed
+            if stale_context:
+                try:
+                    self.jobs.mark_failed(
+                        job.id,
+                        "Agent learning review was cancelled because its lifecycle changed",
+                    )
+                except Exception:
+                    # This callback is an acceptance boundary. Runtime cleanup
+                    # below remains mandatory even if durable settlement is
+                    # temporarily unavailable; startup recovery handles a row
+                    # left running.
+                    pass
+            if should_cancel:
+                cancel_run = getattr(self.agent_client, "cancel_run", None)
+                if callable(cancel_run):
+                    try:
+                        cancel_run(str(run_id))
+                    except Exception:
+                        pass
+
+        generate_kwargs: dict[str, Any] = dict(
+            system_prompt=self._private_system_prompt(actor, scope, []),
+            user_message=review_input,
+            history=history,
+            session_id=session_id,
+            session_key=scope_key,
+            metadata={
+                "idempotency_key": f"agent-learning-review:{job.id}",
+                "source_message_id": source_message_id,
+                "review_job_id": job.id,
+                "review_mode": "memory_skill",
+                "trigger": "learning_review",
+                "unattended": True,
+                "actor": self._agent_actor_metadata(actor),
+                "available_skills": self._available_skill_index(scope_key),
+                "execution": execution,
+                "workspace": {
+                    "path": self._agent_runtime_workspace(scope),
+                    "scope": "private",
+                    "user_id": owner_user_id,
+                },
+            },
+            attachments=[],
+            model=generation["model"],
+            thinking_depth=generation["thinking_depth"],
+            reasoning_config=generation["reasoning_config"],
+        )
+        if supports_callback:
+            generate_kwargs["run_started_callback"] = run_started
+        try:
+            # Adapters without the acceptance callback remain behind the gate
+            # for the whole call; this is conservative and preserves ordering.
+            self.agent_client.generate(**generate_kwargs)
+        finally:
+            release_submission()
 
     def _begin_agent_update_admission(self) -> None:
         with self._conversation_lock:
@@ -5149,6 +5616,15 @@ class EnterpriseService:
                 attachment_source="agent_generated",
                 attachment_uploader_user_id=int(task["actor"]["id"]),
             )
+            task["_learning_candidate"] = {
+                "scope_key": agent_scope.scope_key,
+                "lifecycle_id": agent_scope.lifecycle_id,
+                "owner_user_id": int(actor["id"]),
+                "source_message_id": int(user_msg["id"]),
+                "response_message_id": int(message["id"]),
+                "tool_calls": len(task.get("_learning_tool_call_ids") or ()),
+                "tool_trace": list(task.get("_learning_tool_trace") or ()),
+            }
         self._telegram_delivery_wakeup.set()
         self._record_token_usage_event(
             task,
@@ -7555,6 +8031,25 @@ class EnterpriseService:
 
     def agent_memory_search(self, body: dict[str, Any]) -> dict[str, Any]:
         scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
+        if str(body.get("review_mode") or "").strip():
+            with self._learning_review_memory_read_boundary(
+                body, scope_key
+            ) as conn:
+                return self._agent_memory_search_in_transaction(
+                    conn, body, scope_key
+                )
+        with self.db.transaction() as conn:
+            conn.execute("BEGIN")
+            return self._agent_memory_search_in_transaction(conn, body, scope_key)
+
+    def _agent_memory_search_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        body: dict[str, Any],
+        scope_key: str,
+    ) -> dict[str, Any]:
+        """Query memory on the caller's authorization transaction snapshot."""
+
         target = str(body.get("target") or "memory").strip().lower()
         if target not in {"memory", "user", "all"}:
             raise ServiceError(400, "memory target must be memory, user or all")
@@ -7578,13 +8073,14 @@ class EnterpriseService:
                 parsed_id = int(memory_id)
             except (TypeError, ValueError) as exc:
                 raise ServiceError(400, "memory id is invalid") from exc
-            row = self.db.query_one(
+            raw_row = conn.execute(
                 f"""
                 SELECT * FROM agent_memories
                 WHERE id = ? AND scope_key = ? AND {target_clause}
                 """,
                 [parsed_id, scope_key, *target_params],
-            )
+            ).fetchone()
+            row = dict(raw_row) if raw_row is not None else None
             blocked = bool(row and self._memory_row_injection_reasons(row))
             memory = None if row is None or blocked else self._public_agent_memory(row)
             return {
@@ -7598,7 +8094,9 @@ class EnterpriseService:
         if terms and getattr(self.db, "fts_available", False):
             match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:16])
             try:
-                rows = self.db.query(
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
                     f"""
                     SELECT m.*, bm25(agent_memory_fts) AS rank
                     FROM agent_memory_fts
@@ -7608,7 +8106,8 @@ class EnterpriseService:
                     ORDER BY rank, m.updated_at DESC LIMIT ?
                     """,
                     [match, scope_key, *target_params, 200],
-                )
+                    ).fetchall()
+                ]
             except Exception:
                 rows = []
         else:
@@ -7619,14 +8118,17 @@ class EnterpriseService:
             if query:
                 like_clause = " AND (content LIKE ? OR tags_json LIKE ?)"
                 fallback_params.extend([f"%{query}%", f"%{query}%"])
-            rows = self.db.query(
+            rows = [
+                dict(row)
+                for row in conn.execute(
                 f"""
                 SELECT * FROM agent_memories
                 WHERE scope_key = ? AND {target_clause}{like_clause}
                 ORDER BY updated_at DESC LIMIT ?
                 """,
                 [scope_key, *target_params, *fallback_params, 200],
-            )
+                ).fetchall()
+            ]
         memories: list[dict[str, Any]] = []
         blocked_count = 0
         seen_hashes: set[str] = set()
@@ -7664,15 +8166,46 @@ class EnterpriseService:
             for raw in operations
             if isinstance(raw, dict)
         }
+        review_job: DurableJob | None = None
         if outer_source == "automatic" or "automatic" in requested_sources:
             if requested_sources != {"automatic"}:
                 raise ServiceError(400, "automatic memory operations cannot mix source types")
-            self._validate_automatic_memory_write_context(body, scope_key)
+            review_job = self._validate_automatic_memory_write_context(
+                body, scope_key
+            )
+        if review_job is not None:
+            if len(operations) > 20:
+                raise ServiceError(
+                    400, "learning review memory operations may contain at most 20 items"
+                )
+            review_actions = {
+                str(raw.get("action") or "add").strip().lower()
+                for raw in operations
+                if isinstance(raw, dict)
+            }
+            if not review_actions.issubset({"add", "replace", "remove"}):
+                raise ServiceError(
+                    403,
+                    "learning reviews may only add, replace, or remove individual memories",
+                )
         changed: list[dict[str, Any]] = []
         affected: set[tuple[str, int | None]] = set()
         baselines: dict[tuple[str, int | None], tuple[int, int]] = {}
         outer_owner = body.get("owner_user_id")
-        with self.db.transaction(immediate=True) as conn:
+        automatic_write = outer_source == "automatic" or "automatic" in requested_sources
+        if review_job is not None:
+            mutation_boundary = self._learning_review_memory_mutation_boundary(
+                body,
+                scope_key,
+                mutation_units=len(operations),
+            )
+        elif automatic_write:
+            mutation_boundary = self._interactive_memory_mutation_boundary(
+                body, scope_key
+            )
+        else:
+            mutation_boundary = self.db.transaction(immediate=True)
+        with mutation_boundary as conn:
             for raw in operations:
                 if not isinstance(raw, dict):
                     raise ServiceError(400, "memory operation must be an object")
@@ -7703,13 +8236,24 @@ class EnterpriseService:
                         raw.get("source_type") or body.get("source_type") or "manual"
                     )
                     source_run_id = str(
-                        raw.get("source_run_id") or body.get("source_run_id") or ""
+                        (
+                            body.get("source_run_id")
+                            if source_type == "automatic"
+                            else raw.get("source_run_id")
+                            or body.get("source_run_id")
+                        )
+                        or ""
                     )[:512]
                     source_message_id = str(
-                        raw.get("source_message_id")
-                        or raw.get("source_message_key")
-                        or body.get("source_message_id")
-                        or body.get("source_message_key")
+                        (
+                            body.get("source_message_id")
+                            or body.get("source_message_key")
+                            if source_type == "automatic"
+                            else raw.get("source_message_id")
+                            or raw.get("source_message_key")
+                            or body.get("source_message_id")
+                            or body.get("source_message_key")
+                        )
                         or ""
                     )[:512]
                     source_message_id = self._normalize_source_message_id(
@@ -7828,8 +8372,7 @@ class EnterpriseService:
                         ""
                         if source_type == "manual"
                         else str(
-                            raw.get("source_run_id")
-                            or body.get("source_run_id")
+                            body.get("source_run_id")
                             or row["source_run_id"]
                             or ""
                         )[:512]
@@ -7838,9 +8381,7 @@ class EnterpriseService:
                         ""
                         if source_type == "manual"
                         else self._normalize_source_message_id(
-                            raw.get("source_message_id")
-                            or raw.get("source_message_key")
-                            or body.get("source_message_id")
+                            body.get("source_message_id")
                             or body.get("source_message_key")
                             or row["source_message_id"]
                             or ""
@@ -7876,12 +8417,22 @@ class EnterpriseService:
                     owner_user_id,
                     baseline=baselines[(target, owner_user_id)],
                 )
-        return {"changed": changed, **self.agent_memory_search({
-            "scope_key": scope_key,
-            "target": body.get("target") or "memory",
-            "owner_user_id": outer_owner,
-            "limit": 20,
-        })}
+            # Keep the complete review identity and the mutation's SQLite
+            # snapshot through the write-after-read response. Re-entering the
+            # public endpoint with a reduced body would either lose authority
+            # or reopen a revoke/reset time-of-check/time-of-use window.
+            snapshot = self._agent_memory_search_in_transaction(
+                conn,
+                {
+                    **body,
+                    "scope_key": scope_key,
+                    "target": body.get("target") or "memory",
+                    "owner_user_id": outer_owner,
+                    "limit": 20,
+                },
+                scope_key,
+            )
+        return {"changed": changed, **snapshot}
 
     def agent_session_search(self, body: dict[str, Any]) -> dict[str, Any]:
         scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
@@ -8435,6 +8986,9 @@ class EnterpriseService:
             "scope_id",
             "scope_key",
             "lifecycle_id",
+            "created_by",
+            "pinned",
+            "state",
         }
         if forbidden.intersection(arguments):
             raise ServiceError(
@@ -8462,8 +9016,19 @@ class EnterpriseService:
                     403, "skill owner does not match private Agent scope"
                 )
 
+        review_job: DurableJob | None = None
+        if str(context.get("review_mode") or "").strip():
+            review_job = self._validate_learning_review_context(
+                context, raw_scope_key
+            )
+            if action not in {"list", "load", "read", "create", "patch"}:
+                raise ServiceError(
+                    403, "learning reviews may only read, create, or patch skills"
+                )
+
         mutations = {
             "create",
+            "patch",
             "update",
             "delete",
             "enable",
@@ -8499,12 +9064,20 @@ class EnterpriseService:
                     )
                 except (TypeError, ValueError) as exc:
                     raise ServiceError(400, "skill limit is invalid") from exc
-                skills = self.skills.list(
-                    scope.scope_key,
-                    query=str(arguments.get("query") or "").strip(),
-                    category=str(arguments.get("category") or "").strip(),
-                    limit=MAX_SKILL_LIST_RESULTS,
-                )
+                list_arguments = {
+                    "query": str(arguments.get("query") or "").strip(),
+                    "category": str(arguments.get("category") or "").strip(),
+                    "limit": MAX_SKILL_LIST_RESULTS,
+                }
+                if review_job is not None:
+                    with self._learning_review_skill_read_boundary(
+                        context, raw_scope_key
+                    ):
+                        skills = self.skills.list(
+                            scope.scope_key, **list_arguments
+                        )
+                else:
+                    skills = self.skills.list(scope.scope_key, **list_arguments)
                 skills = [
                     skill
                     for skill in skills
@@ -8512,31 +9085,132 @@ class EnterpriseService:
                 ][:limit]
                 return {"skills": skills, "count": len(skills)}
             if action == "load":
-                skill = self.skills.load(scope.scope_key, skill_id)
-                if skill.get("enabled") is not True:
-                    raise ServiceError(409, "Agent skill is disabled")
+                if review_job is not None:
+                    with self._learning_review_skill_read_boundary(
+                        context, raw_scope_key
+                    ):
+                        skill = self.skills.load(scope.scope_key, skill_id)
+                        if skill.get("enabled") is not True:
+                            raise ServiceError(409, "Agent skill is disabled")
+                        read_key = (
+                            review_job.id,
+                            str(context.get("run_id") or ""),
+                        )
+                        with self._learning_skill_reads_lock:
+                            self._learning_skill_reads.setdefault(
+                                read_key, set()
+                            ).add(skill_id)
+                else:
+                    skill = self.skills.load(scope.scope_key, skill_id)
+                    if skill.get("enabled") is not True:
+                        raise ServiceError(409, "Agent skill is disabled")
                 return {"skill": skill}
             if action == "read":
-                skill = self.skills.get(scope.scope_key, skill_id)
-                if skill.get("enabled") is not True:
-                    raise ServiceError(409, "Agent skill is disabled")
-                support = self.skills.read_support(
-                    scope.scope_key,
-                    skill_id,
-                    str(arguments.get("file_path") or ""),
-                )
+                if review_job is not None:
+                    with self._learning_review_skill_read_boundary(
+                        context, raw_scope_key
+                    ):
+                        skill = self.skills.get(scope.scope_key, skill_id)
+                        if skill.get("enabled") is not True:
+                            raise ServiceError(409, "Agent skill is disabled")
+                        support = self.skills.read_support(
+                            scope.scope_key,
+                            skill_id,
+                            str(arguments.get("file_path") or ""),
+                        )
+                        read_key = (
+                            review_job.id,
+                            str(context.get("run_id") or ""),
+                        )
+                        with self._learning_skill_reads_lock:
+                            self._learning_skill_reads.setdefault(
+                                read_key, set()
+                            ).add(skill_id)
+                else:
+                    skill = self.skills.get(scope.scope_key, skill_id)
+                    if skill.get("enabled") is not True:
+                        raise ServiceError(409, "Agent skill is disabled")
+                    support = self.skills.read_support(
+                        scope.scope_key,
+                        skill_id,
+                        str(arguments.get("file_path") or ""),
+                    )
                 return {"id": skill_id, **support}
             if action == "create":
+                create_arguments = {
+                    "name": arguments.get("name"),
+                    "description": arguments.get("description"),
+                    "instructions": arguments.get("instructions"),
+                    "category": arguments.get("category"),
+                    "version": arguments.get("version"),
+                    "tags": arguments.get("tags"),
+                    "enabled": True,
+                }
+                if review_job is not None:
+                    with self._learning_review_skill_mutation_boundary(
+                        context, raw_scope_key
+                    ):
+                        skill = self.skills.create(
+                            scope.scope_key,
+                            **create_arguments,
+                            created_by="agent",
+                        )
+                    return {"skill": skill}
                 return {
                     "skill": self.skills.create(
                         scope.scope_key,
-                        name=arguments.get("name"),
-                        description=arguments.get("description"),
-                        instructions=arguments.get("instructions"),
-                        category=arguments.get("category"),
-                        version=arguments.get("version"),
-                        tags=arguments.get("tags"),
-                        enabled=True,
+                        **create_arguments,
+                        created_by="user",
+                    )
+                }
+            if action == "patch":
+                patch_arguments = {
+                    "file_path": (
+                        str(arguments.get("file_path"))
+                        if arguments.get("file_path") is not None
+                        else None
+                    ),
+                    "expected_replacements": (
+                        1
+                        if arguments.get("expected_replacements") is None
+                        else arguments.get("expected_replacements")
+                    ),
+                }
+                if review_job is not None:
+                    read_key = (review_job.id, str(context.get("run_id") or ""))
+                    with self._learning_review_skill_mutation_boundary(
+                        context, raw_scope_key
+                    ):
+                        with self._learning_skill_reads_lock:
+                            # The ledger entry is a same-process grant, while
+                            # the surrounding boundary rechecks every durable
+                            # principal and keeps lifecycle/job mutation out.
+                            was_read = skill_id in self._learning_skill_reads.get(
+                                read_key, set()
+                            )
+                        if not was_read:
+                            raise ServiceError(
+                                403,
+                                "learning review must load or read a skill before patching it",
+                            )
+                        # The store holds its scope lock across both provenance
+                        # validation and replacement, so delete/recreate cannot
+                        # cross this final authorization-to-write boundary.
+                        skill = self.skills.patch_automatic(
+                            scope.scope_key,
+                            skill_id,
+                            str(arguments.get("old_string") or ""),
+                            str(arguments.get("new_string") or ""),
+                            **patch_arguments,
+                        )
+                    return {"skill": skill}
+                return {
+                    "skill": self.skills.patch(
+                        scope.scope_key,
+                        skill_id,
+                        str(arguments.get("old_string") or ""),
+                        str(arguments.get("new_string") or ""),
+                        **patch_arguments,
                     )
                 }
             if action == "update":
@@ -8588,7 +9262,7 @@ class EnterpriseService:
         raise ServiceError(
             400,
             "skill action must be list, load, read, create, update, delete, "
-            "enable, disable, write_file or remove_file",
+            "patch, enable, disable, write_file or remove_file",
         )
 
     def _agent_schedule_tool(
@@ -10349,8 +11023,11 @@ class EnterpriseService:
 
     def _validate_automatic_memory_write_context(
         self, body: dict[str, Any], scope_key: str
-    ) -> None:
+    ) -> DurableJob | None:
         """Fail closed unless this is the owner's current interactive private run."""
+
+        if str(body.get("review_mode") or "").strip():
+            return self._validate_learning_review_context(body, scope_key)
 
         scope = self.agent_scopes.get_scope(scope_key)
         if (
@@ -10392,6 +11069,381 @@ class EnterpriseService:
                 403,
                 "automatic memory writes require a top-level interactive private Agent run",
             )
+        return None
+
+    def _validate_learning_review_context(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+    ) -> DurableJob:
+        """Validate every trusted field before granting review-only writes."""
+
+        scope = self.agent_scopes.get_scope(scope_key)
+        try:
+            review_job_id = int(context.get("review_job_id"))
+            owner_user_id = int(context.get("owner_user_id"))
+            source_message_id = int(
+                context.get("source_message_id") or context.get("source_message_key")
+            )
+            delegation_depth = int(context.get("delegation_depth") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(403, "learning review context is invalid") from exc
+        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
+        run_id = str(context.get("run_id") or "").strip()
+        parent_run_id = str(context.get("parent_run_id") or "").strip()
+        actor = self.get_user(owner_user_id)
+        if (
+            scope is None
+            or scope.scope_type != "private"
+            or scope.scope_key != scope_key
+            or str(scope.scope_id) != str(owner_user_id)
+            or lifecycle_id != scope.lifecycle_id
+            or actor is None
+            or not actor.get("active")
+            or PERMISSION_PRIVATE_AGENT not in set(actor.get("permissions") or [])
+            or str(context.get("review_mode") or "").strip() != "memory_skill"
+            or str(context.get("trigger") or "").strip() != "learning_review"
+            or context.get("unattended") is not True
+            or review_job_id <= 0
+            or source_message_id <= 0
+            or delegation_depth != 0
+            or parent_run_id
+            or not run_id
+        ):
+            raise ServiceError(403, "learning review context is not authorized")
+        job = self.jobs.get(review_job_id)
+        if not self.learning_reviews.context_matches(
+            job,
+            scope_key=scope_key,
+            lifecycle_id=lifecycle_id,
+            owner_user_id=owner_user_id,
+            source_message_id=source_message_id,
+        ):
+            raise ServiceError(403, "learning review job is not active")
+        return job
+
+    def _revalidate_learning_review_mutation_context(
+        self,
+        conn: sqlite3.Connection,
+        context: dict[str, Any],
+        scope_key: str,
+    ) -> None:
+        """Authorize a review write in the transaction that performs it."""
+
+        try:
+            review_job_id = int(context.get("review_job_id"))
+            owner_user_id = int(context.get("owner_user_id"))
+            source_message_id = int(
+                context.get("source_message_id")
+                or context.get("source_message_key")
+            )
+            delegation_depth = int(context.get("delegation_depth") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(403, "learning review context is invalid") from exc
+        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
+        run_id = str(context.get("run_id") or "").strip()
+        parent_run_id = str(context.get("parent_run_id") or "").strip()
+        if (
+            str(context.get("review_mode") or "").strip() != "memory_skill"
+            or str(context.get("trigger") or "").strip() != "learning_review"
+            or context.get("unattended") is not True
+            or review_job_id <= 0
+            or owner_user_id <= 0
+            or source_message_id <= 0
+            or delegation_depth != 0
+            or parent_run_id
+            or not run_id
+        ):
+            raise ServiceError(403, "learning review context is not authorized")
+
+        scope_row = conn.execute(
+            """
+            SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
+                   runtime.lifecycle_id
+            FROM agent_scopes AS scopes
+            JOIN agent_runtime_scopes AS runtime
+              ON runtime.scope_key = scopes.scope_key
+            WHERE scopes.scope_key = ?
+            """,
+            (scope_key,),
+        ).fetchone()
+        actor_row = conn.execute(
+            "SELECT id, active, permission_group, role FROM users WHERE id = ?",
+            (owner_user_id,),
+        ).fetchone()
+        source_row = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+              AND author_type = 'user' AND user_id = ?
+            """,
+            (source_message_id, str(owner_user_id), owner_user_id),
+        ).fetchone()
+        actor_group = (
+            public_permission_group(dict(actor_row)) if actor_row is not None else ""
+        )
+        if (
+            scope_row is None
+            or str(scope_row["scope_type"]) != "private"
+            or str(scope_row["scope_key"]) != scope_key
+            or str(scope_row["scope_id"]) != str(owner_user_id)
+            or str(scope_row["lifecycle_id"]) != lifecycle_id
+            or actor_row is None
+            or int(actor_row["active"] or 0) != 1
+            or actor_group not in PERMISSION_GROUPS
+            or PERMISSION_PRIVATE_AGENT
+            not in PERMISSION_GROUPS[actor_group]["permissions"]
+            or source_row is None
+            or not self.learning_reviews.context_matches_in_transaction(
+                conn,
+                review_job_id,
+                scope_key=scope_key,
+                lifecycle_id=lifecycle_id,
+                owner_user_id=owner_user_id,
+                source_message_id=source_message_id,
+            )
+        ):
+            raise ServiceError(403, "learning review context is not authorized")
+
+    def _revalidate_interactive_memory_mutation_context(
+        self,
+        conn: sqlite3.Connection,
+        context: dict[str, Any],
+        scope_key: str,
+    ) -> None:
+        """Authorize an ordinary automatic memory write at its commit edge."""
+
+        try:
+            owner_user_id = int(context.get("owner_user_id"))
+            delegation_depth = int(context.get("delegation_depth") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(403, "automatic memory write context is invalid") from exc
+        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
+        run_id = str(context.get("run_id") or "").strip()
+        source_run_id = str(context.get("source_run_id") or "").strip()
+        parent_run_id = str(context.get("parent_run_id") or "").strip()
+        trigger = str(context.get("trigger") or "").strip().lower()
+        source_message_id = self._normalize_source_message_id(
+            context.get("source_message_id")
+            or context.get("source_message_key")
+        )
+        if (
+            owner_user_id <= 0
+            or delegation_depth != 0
+            or parent_run_id
+            or trigger not in {"", "interactive"}
+            or (
+                context.get("unattended") is not None
+                and context.get("unattended") is not False
+            )
+            or not lifecycle_id
+            or not run_id
+            or source_run_id != run_id
+            or not source_message_id
+        ):
+            raise ServiceError(
+                403,
+                "automatic memory writes require a running top-level interactive private Agent run",
+            )
+
+        scope_row = conn.execute(
+            """
+            SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
+                   runtime.lifecycle_id
+            FROM agent_scopes AS scopes
+            JOIN agent_runtime_scopes AS runtime
+              ON runtime.scope_key = scopes.scope_key
+            WHERE scopes.scope_key = ?
+            """,
+            (scope_key,),
+        ).fetchone()
+        actor_row = conn.execute(
+            "SELECT id, active, permission_group, role FROM users WHERE id = ?",
+            (owner_user_id,),
+        ).fetchone()
+        source_row = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+              AND author_type = 'user' AND user_id = ?
+            """,
+            (source_message_id, str(owner_user_id), owner_user_id),
+        ).fetchone()
+        run_row = conn.execute(
+            """
+            SELECT inputs.message_id
+            FROM agent_run_inputs AS inputs
+            JOIN durable_jobs AS parent ON parent.id = inputs.parent_job_id
+            WHERE inputs.message_id = ?
+              AND inputs.runtime_run_id = ?
+              AND parent.kind = 'agent'
+              AND parent.status = 'running'
+              AND parent.scope_type = 'private'
+              AND parent.scope_id = ?
+            """,
+            (source_message_id, run_id, str(owner_user_id)),
+        ).fetchone()
+        actor_group = (
+            public_permission_group(dict(actor_row)) if actor_row is not None else ""
+        )
+        if (
+            scope_row is None
+            or str(scope_row["scope_type"]) != "private"
+            or str(scope_row["scope_key"]) != scope_key
+            or str(scope_row["scope_id"]) != str(owner_user_id)
+            or str(scope_row["lifecycle_id"]) != lifecycle_id
+            or actor_row is None
+            or int(actor_row["active"] or 0) != 1
+            or actor_group not in PERMISSION_GROUPS
+            or PERMISSION_PRIVATE_AGENT
+            not in PERMISSION_GROUPS[actor_group]["permissions"]
+            or source_row is None
+            or run_row is None
+        ):
+            raise ServiceError(
+                403,
+                "automatic memory write context is no longer authorized",
+            )
+
+    def _consume_learning_review_mutation_budget(
+        self,
+        conn: sqlite3.Connection,
+        context: dict[str, Any],
+        units: int,
+    ) -> None:
+        try:
+            self.learning_reviews.consume_mutation_budget_in_transaction(
+                conn,
+                int(context.get("review_job_id")),
+                units,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(403, "learning review context is invalid") from exc
+        except LearningReviewBudgetExceeded as exc:
+            raise ServiceError(409, str(exc)) from exc
+
+    @contextmanager
+    def _learning_review_memory_read_boundary(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+    ):
+        """Observe review authorization and memory rows on one DB snapshot."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            # BEGIN IMMEDIATE gives the review query a deterministic
+            # linearization point against revoke/reset/job settlement writers.
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_learning_review_mutation_context(
+                    conn, context, scope_key
+                )
+                yield conn
+        finally:
+            start_lock.release()
+
+    @contextmanager
+    def _learning_review_skill_read_boundary(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+    ):
+        """Linearize review authorization with Skill reads and read-ledger writes."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            # Keep this write-serialized snapshot open across the bounded Skill
+            # filesystem read and read-ledger registration. Revocation, reset,
+            # and job settlement therefore occur wholly before or after it.
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_learning_review_mutation_context(
+                    conn, context, scope_key
+                )
+                yield
+        finally:
+            start_lock.release()
+
+    @contextmanager
+    def _interactive_memory_mutation_boundary(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+    ):
+        """Linearize ordinary automatic memory writes with Run lifecycle."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_interactive_memory_mutation_context(
+                    conn, context, scope_key
+                )
+                yield conn
+        finally:
+            start_lock.release()
+
+    @contextmanager
+    def _learning_review_memory_mutation_boundary(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+        *,
+        mutation_units: int,
+    ):
+        """Linearize review authorization, mutation and lifecycle cleanup."""
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_learning_review_mutation_context(
+                    conn, context, scope_key
+                )
+                self._consume_learning_review_mutation_budget(
+                    conn, context, mutation_units
+                )
+                yield conn
+        finally:
+            start_lock.release()
+
+    @contextmanager
+    def _learning_review_skill_mutation_boundary(
+        self,
+        context: dict[str, Any],
+        scope_key: str,
+    ):
+        """Precharge and authorize one filesystem Skill mutation fail-closed.
+
+        SQLite cannot atomically commit the Skill file. Persist one budget unit
+        before touching the filesystem, then revalidate in a second immediate
+        transaction held through the file commit. A failed Skill write may
+        consume its unit, but a successful file commit can never escape billing.
+        """
+
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_learning_review_mutation_context(
+                    conn, context, scope_key
+                )
+                self._consume_learning_review_mutation_budget(
+                    conn, context, 1
+                )
+            with self.db.transaction(immediate=True) as conn:
+                self._revalidate_learning_review_mutation_context(
+                    conn, context, scope_key
+                )
+                yield
+        finally:
+            start_lock.release()
 
     def _validate_memory_owner_for_scope(
         self, scope_key: str, owner_user_id: int | None
@@ -12858,7 +13910,47 @@ class EnterpriseService:
                     # shutdown that begins after a committed reply must not
                     # quarantine already-successful work merely because the
                     # in-memory epoch changed between commit and this update.
-                    ledger_succeeded = self.jobs.mark_succeeded(job_id) if job_id else True
+                    learning_candidate = task.get("_learning_candidate")
+                    runtime_metadata = (
+                        task.get("runtime_metadata")
+                        if isinstance(task.get("runtime_metadata"), dict)
+                        else {}
+                    )
+                    eligible_learning = (
+                        bool(job_id)
+                        and str(task.get("scope_type")) == "private"
+                        and not task.get("schedule_run_id")
+                        and str(runtime_metadata.get("trigger") or "").strip().lower()
+                        in {"", "interactive"}
+                        and runtime_metadata.get("unattended") is not True
+                        and isinstance(learning_candidate, dict)
+                    )
+                    if eligible_learning:
+                        try:
+                            completion = self.learning_reviews.complete_foreground_job(
+                                job_id,
+                                scope_key=str(learning_candidate["scope_key"]),
+                                lifecycle_id=str(learning_candidate["lifecycle_id"]),
+                                owner_user_id=int(learning_candidate["owner_user_id"]),
+                                source_message_id=int(learning_candidate["source_message_id"]),
+                                response_message_id=int(learning_candidate["response_message_id"]),
+                                tool_calls=int(learning_candidate.get("tool_calls") or 0),
+                                tool_trace=list(learning_candidate.get("tool_trace") or ()),
+                            )
+                            ledger_succeeded = completion.succeeded
+                            if completion.review_job_id is not None:
+                                self._learning_wakeup.set()
+                        except Exception as learning_exc:
+                            # Learning is best effort. A damaged cadence record
+                            # must not turn a committed reply into a foreground
+                            # failure.
+                            print(
+                                f"Could not schedule Agent learning review: {learning_exc}",
+                                file=sys.stderr,
+                            )
+                            ledger_succeeded = self.jobs.mark_succeeded(job_id)
+                    else:
+                        ledger_succeeded = self.jobs.mark_succeeded(job_id) if job_id else True
                     if ledger_succeeded:
                         self._mark_input_group_succeeded(task)
                         self._update_schedule_run_for_task(
@@ -13391,6 +14483,37 @@ class EnterpriseService:
             or event.get("type")
             or ""
         ).strip().lower()
+        if event_type == "tool.started" and event.get("execution_started") is not False:
+            tool_call_id = str(
+                event.get("tool_call_id")
+                or event.get("toolCallId")
+                or event.get("id")
+                or ""
+            ).strip()
+            seen = task.setdefault("_learning_tool_trace_ids", set())
+            trace = task.setdefault("_learning_tool_trace", [])
+            if tool_call_id and tool_call_id not in seen and len(trace) < 20:
+                seen.add(tool_call_id)
+                trace.append(
+                    {
+                        "tool": str(
+                            event.get("tool") or event.get("tool_name") or ""
+                        )[:64],
+                        "detail": agent_tool_detail(event)[:500],
+                    }
+                )
+        if (
+            event_type in {"tool.completed", "tool.failed"}
+            and event.get("execution_started") is not False
+        ):
+            tool_call_id = str(
+                event.get("tool_call_id")
+                or event.get("toolCallId")
+                or event.get("id")
+                or ""
+            ).strip()
+            if tool_call_id:
+                task.setdefault("_learning_tool_call_ids", set()).add(tool_call_id)
         if event_type in {"input.accepted", "input.injected", "input.unconsumed"}:
             self._record_joined_input_progress(task, event_type, event)
         if task.get("schedule_run_id"):
@@ -15264,6 +16387,16 @@ def agent_tool_detail(event: dict[str, Any]) -> str:
     action = _safe_tool_summary_text(arguments.get("action"), limit=40)
     nested = arguments.get("arguments")
     nested = nested if isinstance(nested, dict) else {}
+    if tool == "skill" and action in {"load", "read"}:
+        skill_id = _safe_skill_trace_id(nested.get("id"))
+        if not skill_id:
+            return action
+        parts = [action, skill_id]
+        if action == "read":
+            file_path = _safe_skill_trace_file_path(nested.get("file_path"))
+            if file_path:
+                parts.append(file_path)
+        return " · ".join(parts)
     if tool in {"web", "knowledge", "memory", "session", "session_search"}:
         query = _safe_tool_summary_text(nested.get("query") or nested.get("q"))
         url = _safe_tool_url(nested.get("url"))
@@ -15276,6 +16409,43 @@ def agent_tool_detail(event: dict[str, Any]) -> str:
         parts = [action, url]
         return " · ".join(part for part in parts if part)[:160]
     return action
+
+
+_SKILL_TRACE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+_SKILL_TRACE_FILE_ROOTS = frozenset({"references", "templates", "scripts", "assets"})
+
+
+def _safe_skill_trace_id(value: Any) -> str:
+    """Return only a canonical Skill package id for a learning trace."""
+
+    raw = str(value or "").strip()
+    return raw if _SKILL_TRACE_ID_RE.fullmatch(raw) else ""
+
+
+def _safe_skill_trace_file_path(value: Any) -> str:
+    """Return a bounded relative Skill support path with secrets redacted."""
+
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or len(raw) > 240
+        or raw.startswith("/")
+        or "\\" in raw
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        return ""
+    parts = raw.split("/")
+    if (
+        parts[0] not in _SKILL_TRACE_FILE_ROOTS
+        or any(
+            not part
+            or part in {".", ".."}
+            or len(part.encode("utf-8")) > 255
+            for part in parts
+        )
+    ):
+        return ""
+    return _safe_tool_summary_text(raw, limit=240, redact_paths=False)
 
 
 def _safe_tool_path(value: Any) -> str:

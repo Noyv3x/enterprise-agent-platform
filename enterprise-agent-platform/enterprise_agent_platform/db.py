@@ -1221,18 +1221,45 @@ class Database:
                 pass
             raise
         else:
+            self._commit_or_rollback(conn)
+
+    @staticmethod
+    def _commit_or_rollback(conn: sqlite3.Connection) -> None:
+        """Commit one write, restoring a reusable connection on failure."""
+
+        try:
             conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         conn = self._conn
-        cur = conn.execute(sql, tuple(params))
-        conn.commit()
+        try:
+            cur = conn.execute(sql, tuple(params))
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        self._commit_or_rollback(conn)
         return cur
 
     def executemany(self, sql: str, seq: Iterable[Iterable[Any]]) -> None:
         conn = self._conn
-        conn.executemany(sql, seq)
-        conn.commit()
+        try:
+            conn.executemany(sql, seq)
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        self._commit_or_rollback(conn)
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         rows = self._conn.execute(sql, tuple(params)).fetchall()

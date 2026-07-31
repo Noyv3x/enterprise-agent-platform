@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
@@ -31,6 +33,7 @@ MAX_SUPPORT_TOTAL_BYTES = 5 * 1024 * 1024
 DEFAULT_PROMPT_INDEX_CHARS = 32 * 1024
 PROMPT_DESCRIPTION_CHARS = 240
 MAX_SKILL_QUERY_CHARS = 4000
+MAX_PATCH_REPLACEMENTS = 10_000
 
 SUPPORT_DIRECTORIES = frozenset({"references", "templates", "scripts", "assets"})
 BUNDLED_METADATA_FILES = frozenset(
@@ -53,6 +56,9 @@ _SCOPE_DELETE_ORPHAN_RE = re.compile(
 _SCOPE_SUPPORT_DELETE_ORPHAN_RE = re.compile(
     r"^\.support-delete-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-[0-9a-f]{16}$"
 )
+_SCOPE_USAGE_WRITE_ORPHAN_RE = re.compile(
+    r"^\.\.skill-usage\.json\.[0-9a-f]{16}\.tmp$"
+)
 _SUPPORT_WRITE_ORPHAN_RE = re.compile(r"^\..+\.[0-9a-f]{16}\.tmp$")
 _SKILL_ROOT_WRITE_ORPHAN_RES = (
     re.compile(r"^\.SKILL\.md\.[0-9a-f]{16}\.tmp$"),
@@ -61,6 +67,31 @@ _SKILL_ROOT_WRITE_ORPHAN_RES = (
 _FRONTMATTER_KEYS = ("name", "description", "version", "category", "tags")
 _MAX_SKILL_DOCUMENT_BYTES = MAX_INSTRUCTIONS_BYTES + 16 * 1024
 _MAX_SIDECAR_BYTES = 16 * 1024
+_MAX_USAGE_STATE_BYTES = 128 * 1024
+_USAGE_STATE_FILE = ".skill-usage.json"
+_USAGE_CREATED_BY = frozenset({"user", "agent"})
+_USAGE_STATES = frozenset({"active", "stale", "archived"})
+_PREFIXED_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-proj-[A-Za-z0-9_-]{16,512}|"
+    r"github_pat_[A-Za-z0-9_]{20,512}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,255}|"
+    r"glpat-[A-Za-z0-9_-]{20,255}"
+    r")(?![A-Za-z0-9_-])"
+)
+_PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"-----BEGIN (?P<label>(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----"
+    r"(?P<body>[A-Za-z0-9+/=\r\n\t ]{64,32768}?)"
+    r"-----END (?P=label)-----"
+)
+_BEARER_CREDENTIAL_RE = re.compile(
+    r"\bbearer[ \t]+(?P<value>[A-Za-z0-9][A-Za-z0-9._~+/=-]{19,2047})",
+    re.IGNORECASE,
+)
+_BEARER_PLACEHOLDER_RE = re.compile(
+    r"^(?:your|example|sample|placeholder|redacted|replace|token|access[_-]?token)",
+    re.IGNORECASE,
+)
 
 
 class SkillStoreError(RuntimeError):
@@ -248,7 +279,9 @@ class SkillStore:
         with self._locked_scope(scope_key) as scope_dir:
             skill_dir = self._find_skill_dir(scope_dir, normalized_id)
             if skill_dir is not None:
-                return self._read_record(skill_dir, include_instructions=True)
+                record = self._read_record(skill_dir, include_instructions=True)
+                self._bump_usage(scope_dir, normalized_id, event="use")
+                return record
             if self._visible_bundled_record(scope_dir, normalized_id) is not None:
                 return self._read_bundled_record(
                     self._bundled_skill_dirs[normalized_id],
@@ -271,6 +304,7 @@ class SkillStore:
         category: str | None = "general",
         tags: Sequence[str] | None = None,
         enabled: bool = True,
+        created_by: str = "user",
     ) -> dict[str, Any]:
         """Atomically create a new Skill package."""
 
@@ -288,8 +322,10 @@ class SkillStore:
                 "enabled must be a boolean",
                 code="invalid_skill",
             )
+        normalized_created_by = _validate_created_by(created_by)
 
         with self._locked_scope(scope_key) as scope_dir:
+            usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
             existing_dirs = list(self._iter_skill_dirs(scope_dir))
             if len(existing_dirs) >= MAX_SKILLS_PER_SCOPE:
                 raise SkillStoreError(
@@ -302,6 +338,11 @@ class SkillStore:
                 str(document["name"]),
             )
             skill_id = self._new_skill_id(scope_dir, str(document["name"]))
+            if normalized_created_by == "agent":
+                self._reject_agent_bundled_conflict(
+                    skill_id=skill_id,
+                    name=str(document["name"]),
+                )
             now = _utc_now()
             sidecar = {
                 "schema_version": 1,
@@ -312,6 +353,7 @@ class SkillStore:
             }
             target = scope_dir / skill_id
             staging = scope_dir / f".create-{skill_id}-{secrets.token_hex(6)}"
+            target_created = False
             try:
                 staging.mkdir(mode=0o700)
                 staging.chmod(0o700)
@@ -324,12 +366,31 @@ class SkillStore:
                     _render_sidecar(sidecar),
                 )
                 os.replace(staging, target)
+                target_created = True
                 _fsync_directory(scope_dir)
+                usage_state["skills"][skill_id] = _default_usage_record(
+                    created_by=normalized_created_by
+                )
+                self._write_usage_state(scope_dir, usage_state)
             except SkillStoreError:
                 _remove_tree_quietly(staging)
+                if target_created:
+                    _remove_tree_quietly(target)
+                    self._restore_usage_state(
+                        scope_dir,
+                        old_usage_bytes,
+                    )
+                    _fsync_directory(scope_dir)
                 raise
             except OSError as exc:
                 _remove_tree_quietly(staging)
+                if target_created:
+                    _remove_tree_quietly(target)
+                    self._restore_usage_state(
+                        scope_dir,
+                        old_usage_bytes,
+                    )
+                    _fsync_directory(scope_dir)
                 raise SkillStoreError(
                     500,
                     f"cannot create Skill: {exc}",
@@ -337,6 +398,13 @@ class SkillStore:
                 ) from exc
             except BaseException:
                 _remove_tree_quietly(staging)
+                if target_created:
+                    _remove_tree_quietly(target)
+                    self._restore_usage_state(
+                        scope_dir,
+                        old_usage_bytes,
+                    )
+                    _fsync_directory(scope_dir)
                 raise
             return self._read_record(target, include_instructions=False)
 
@@ -417,7 +485,9 @@ class SkillStore:
 
         with self._locked_scope(scope_key) as scope_dir:
             skill_dir = self._require_skill_dir(scope_dir, skill_id)
+            normalized_id = skill_dir.name
             record = self._read_record(skill_dir, include_instructions=False)
+            usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
             self._validate_package_tree(skill_dir)
             resolved_scope = scope_dir.resolve(strict=True)
             resolved_skill = skill_dir.resolve(strict=True)
@@ -431,12 +501,39 @@ class SkillStore:
             try:
                 os.replace(skill_dir, tombstone)
                 _fsync_directory(scope_dir)
+                usage_state["skills"].pop(normalized_id, None)
+                self._write_usage_state(scope_dir, usage_state)
             except OSError as exc:
+                if tombstone.exists() and not skill_dir.exists():
+                    try:
+                        os.replace(tombstone, skill_dir)
+                        self._restore_usage_state(scope_dir, old_usage_bytes)
+                        _fsync_directory(scope_dir)
+                    except (OSError, SkillStoreError):
+                        pass
                 raise SkillStoreError(
                     500,
                     f"cannot delete Skill: {exc}",
                     code="skill_write_failed",
                 ) from exc
+            except SkillStoreError:
+                if tombstone.exists() and not skill_dir.exists():
+                    try:
+                        os.replace(tombstone, skill_dir)
+                        self._restore_usage_state(scope_dir, old_usage_bytes)
+                        _fsync_directory(scope_dir)
+                    except (OSError, SkillStoreError):
+                        pass
+                raise
+            except BaseException:
+                if tombstone.exists() and not skill_dir.exists():
+                    try:
+                        os.replace(tombstone, skill_dir)
+                        self._restore_usage_state(scope_dir, old_usage_bytes)
+                        _fsync_directory(scope_dir)
+                    except (OSError, SkillStoreError):
+                        pass
+                raise
             try:
                 shutil.rmtree(tombstone)
             except OSError:
@@ -444,6 +541,98 @@ class SkillStore:
                 # safe to clean on maintenance and must not resurrect the Skill.
                 pass
             return record
+
+    def patch(
+        self,
+        scope_key: str,
+        skill_id: str,
+        old_string: str,
+        new_string: str,
+        *,
+        file_path: str | None = None,
+        expected_replacements: int = 1,
+    ) -> dict[str, Any]:
+        """Apply an exact, counted replacement to SKILL.md or one support file."""
+
+        normalized_id = _validate_skill_id(skill_id)
+        _validate_patch_arguments(
+            old_string,
+            new_string,
+            expected_replacements,
+        )
+        relative = None if file_path is None else _validate_support_path(file_path)
+
+        with self._locked_scope(scope_key) as scope_dir:
+            return self._patch_locked(
+                scope_dir,
+                normalized_id,
+                old_string,
+                new_string,
+                relative=relative,
+                expected_replacements=expected_replacements,
+                require_automatic_eligibility=False,
+            )
+
+    def patch_automatic(
+        self,
+        scope_key: str,
+        skill_id: str,
+        old_string: str,
+        new_string: str,
+        *,
+        file_path: str | None = None,
+        expected_replacements: int = 1,
+    ) -> dict[str, Any]:
+        """Patch one review-owned Skill after an in-lock eligibility check.
+
+        This is the only write entry point for unattended learning.  The
+        package and its usage provenance are reread under the same scope lock
+        that protects the exact replacement, so a delete/recreate cannot reuse
+        an earlier eligibility decision.
+        """
+
+        normalized_id = _validate_skill_id(skill_id)
+        _validate_patch_arguments(
+            old_string,
+            new_string,
+            expected_replacements,
+        )
+        relative = None if file_path is None else _validate_support_path(file_path)
+
+        with self._locked_scope(scope_key) as scope_dir:
+            return self._patch_locked(
+                scope_dir,
+                normalized_id,
+                old_string,
+                new_string,
+                relative=relative,
+                expected_replacements=expected_replacements,
+                require_automatic_eligibility=True,
+            )
+
+    def automatic_patch_allowed(self, scope_key: str, skill_id: str) -> bool:
+        """Report current review eligibility without granting a write."""
+
+        normalized_id = _validate_skill_id(skill_id)
+        with self._locked_scope(scope_key) as scope_dir:
+            skill_dir = self._find_skill_dir(scope_dir, normalized_id)
+            if skill_dir is None:
+                return False
+            current = self._read_record(skill_dir, include_instructions=False)
+            usage_state = self._read_usage_state(scope_dir)
+            usage_record = self._usage_record(usage_state, normalized_id)
+            if not self._automatic_patch_eligible(usage_record):
+                return False
+            try:
+                self._reject_agent_bundled_conflict(
+                    skill_id=normalized_id,
+                    name=str(current["name"]),
+                )
+            except SkillStoreError as exc:
+                if exc.code == "bundled_skill_conflict":
+                    return False
+                raise
+            return True
 
     def set_enabled(
         self,
@@ -753,7 +942,8 @@ class SkillStore:
             support_orphan = bool(
                 _SCOPE_SUPPORT_DELETE_ORPHAN_RE.fullmatch(name)
             )
-            if not directory_orphan and not support_orphan:
+            usage_orphan = bool(_SCOPE_USAGE_WRITE_ORPHAN_RE.fullmatch(name))
+            if not directory_orphan and not support_orphan and not usage_orphan:
                 continue
             self._require_direct_child(scope_dir, entry, label="transaction artifact")
             if directory_orphan:
@@ -769,9 +959,17 @@ class SkillStore:
             else:
                 _inspect_private_file_size(
                     entry,
-                    max_bytes=MAX_SUPPORT_FILE_BYTES,
+                    max_bytes=(
+                        _MAX_USAGE_STATE_BYTES
+                        if usage_orphan
+                        else MAX_SUPPORT_FILE_BYTES
+                    ),
                     missing_status=500,
-                    label="support deletion artifact",
+                    label=(
+                        "Skill usage write artifact"
+                        if usage_orphan
+                        else "support deletion artifact"
+                    ),
                 )
                 try:
                     entry.unlink()
@@ -1118,6 +1316,328 @@ class SkillStore:
             record["skill_dir"] = str(skill_dir.resolve(strict=True))
         return record
 
+    def _read_usage_state(self, scope_dir: Path) -> dict[str, Any]:
+        state, _ = self._read_usage_state_snapshot(scope_dir)
+        return state
+
+    def _read_usage_state_snapshot(
+        self,
+        scope_dir: Path,
+    ) -> tuple[dict[str, Any], bytes | None]:
+        path = scope_dir / _USAGE_STATE_FILE
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return _empty_usage_state(), None
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot inspect Skill usage state: {exc}",
+                code="skill_usage_read_failed",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SkillStoreError(
+                409,
+                "Skill usage state must be a regular non-symlink file",
+                code="unsafe_skill_path",
+            )
+        raw = _read_private_bytes(
+            path,
+            max_bytes=_MAX_USAGE_STATE_BYTES,
+            missing_status=500,
+            label=_USAGE_STATE_FILE,
+            require_owner_only=True,
+            require_single_link=True,
+        )
+        return _parse_usage_state(raw), raw
+
+    def _write_usage_state(
+        self,
+        scope_dir: Path,
+        state: dict[str, Any],
+    ) -> None:
+        validated = _validated_usage_state(state)
+        rendered = _render_usage_state(validated)
+        if len(rendered) > _MAX_USAGE_STATE_BYTES:
+            raise SkillStoreError(
+                500,
+                "Skill usage state exceeds its size limit",
+                code="corrupt_skill_usage",
+            )
+        try:
+            _atomic_write_bytes(
+                scope_dir / _USAGE_STATE_FILE,
+                rendered,
+            )
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot write Skill usage state: {exc}",
+                code="skill_write_failed",
+            ) from exc
+
+    def _restore_usage_state(
+        self,
+        scope_dir: Path,
+        old_bytes: bytes | None,
+    ) -> None:
+        """Best-effort transaction rollback for a usage-state replacement."""
+
+        path = scope_dir / _USAGE_STATE_FILE
+        try:
+            if old_bytes is None:
+                path.unlink(missing_ok=True)
+                _fsync_directory(scope_dir)
+            else:
+                _atomic_write_bytes(path, old_bytes)
+        except (OSError, SkillStoreError):
+            pass
+
+    @staticmethod
+    def _usage_record(
+        state: dict[str, Any],
+        skill_id: str,
+    ) -> dict[str, Any]:
+        record = state["skills"].get(skill_id)
+        if record is None:
+            return _default_usage_record(created_by="user")
+        return dict(record)
+
+    def _bump_usage(
+        self,
+        scope_dir: Path,
+        skill_id: str,
+        *,
+        event: str,
+    ) -> None:
+        state = self._read_usage_state(scope_dir)
+        record = self._usage_record(state, skill_id)
+        _bump_usage_record(record, event=event, timestamp=_utc_now())
+        state["skills"][skill_id] = record
+        self._write_usage_state(scope_dir, state)
+
+    @staticmethod
+    def _automatic_patch_eligible(usage_record: dict[str, Any]) -> bool:
+        return bool(
+            usage_record["created_by"] == "agent"
+            and usage_record["state"] == "active"
+            and not usage_record["pinned"]
+        )
+
+    def _patch_locked(
+        self,
+        scope_dir: Path,
+        skill_id: str,
+        old_string: str,
+        new_string: str,
+        *,
+        relative: str | None,
+        expected_replacements: int,
+        require_automatic_eligibility: bool,
+    ) -> dict[str, Any]:
+        """Apply one exact patch while the caller holds the scope lock."""
+
+        skill_dir = self._require_skill_dir(scope_dir, skill_id)
+        current = self._read_record(skill_dir, include_instructions=False)
+        usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
+        usage_record = self._usage_record(usage_state, skill_id)
+        if require_automatic_eligibility:
+            if not self._automatic_patch_eligible(usage_record):
+                raise SkillStoreError(
+                    403,
+                    "background learning cannot patch this Skill",
+                    code="automatic_skill_patch_forbidden",
+                )
+            # A human may have renamed an agent-owned package since the review
+            # read it.  Recheck both immutable package id and current name here
+            # so the unattended path cannot maintain a bundled shadow.
+            self._reject_agent_bundled_conflict(
+                skill_id=skill_id,
+                name=str(current["name"]),
+            )
+
+        if relative is None:
+            self._patch_document(
+                scope_dir,
+                skill_dir,
+                skill_id,
+                old_string,
+                new_string,
+                expected_replacements,
+                usage_state,
+                usage_record,
+                old_usage_bytes,
+                reject_bundled_conflict=require_automatic_eligibility,
+            )
+        else:
+            self._patch_support(
+                scope_dir,
+                skill_dir,
+                skill_id,
+                relative,
+                old_string,
+                new_string,
+                expected_replacements,
+                usage_state,
+                usage_record,
+                old_usage_bytes,
+            )
+        return self._read_record(skill_dir, include_instructions=False)
+
+    def _patch_document(
+        self,
+        scope_dir: Path,
+        skill_dir: Path,
+        skill_id: str,
+        old_string: str,
+        new_string: str,
+        expected_replacements: int,
+        usage_state: dict[str, Any],
+        usage_record: dict[str, Any],
+        old_usage_bytes: bytes | None,
+        *,
+        reject_bundled_conflict: bool = False,
+    ) -> None:
+        document_path = skill_dir / "SKILL.md"
+        sidecar_path = skill_dir / ".skill.json"
+        old_document = _read_private_bytes(
+            document_path,
+            max_bytes=_MAX_SKILL_DOCUMENT_BYTES,
+            missing_status=500,
+            label="SKILL.md",
+        )
+        try:
+            current_text = old_document.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkillStoreError(
+                500,
+                "SKILL.md must be UTF-8 text",
+                code="corrupt_skill",
+            ) from exc
+        replacement_count = current_text.count(old_string)
+        _require_patch_count(replacement_count, expected_replacements)
+        updated_text = current_text.replace(old_string, new_string)
+        updated_document = _validated_document(
+            **_parse_skill_document(updated_text)
+        )
+        self._ensure_unique_name(
+            list(self._iter_skill_dirs(scope_dir)),
+            str(updated_document["name"]),
+            exclude_id=skill_id,
+        )
+        if reject_bundled_conflict:
+            self._reject_agent_bundled_conflict(
+                skill_id=skill_id,
+                name=str(updated_document["name"]),
+            )
+        updated_bytes = _render_skill_document(updated_document).encode("utf-8")
+        if len(updated_bytes) > _MAX_SKILL_DOCUMENT_BYTES:
+            raise SkillStoreError(
+                413,
+                "patched SKILL.md exceeds its size limit",
+                code="skill_size_exceeded",
+            )
+
+        sidecar = self._read_sidecar(skill_dir, expected_id=skill_id)
+        old_sidecar = _read_private_bytes(
+            sidecar_path,
+            max_bytes=_MAX_SIDECAR_BYTES,
+            missing_status=500,
+            label=".skill.json",
+        )
+        timestamp = _utc_now()
+        sidecar["updated_at"] = timestamp
+        _bump_usage_record(usage_record, event="patch", timestamp=timestamp)
+        usage_state["skills"][skill_id] = usage_record
+
+        try:
+            _atomic_write_bytes(document_path, updated_bytes)
+            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+            self._write_usage_state(scope_dir, usage_state)
+        except BaseException as exc:
+            _restore_private_file(document_path, old_document)
+            _restore_private_file(sidecar_path, old_sidecar)
+            self._restore_usage_state(scope_dir, old_usage_bytes)
+            if isinstance(exc, SkillStoreError):
+                raise
+            if isinstance(exc, OSError):
+                raise SkillStoreError(
+                    500,
+                    f"cannot patch Skill: {exc}",
+                    code="skill_write_failed",
+                ) from exc
+            raise
+
+    def _patch_support(
+        self,
+        scope_dir: Path,
+        skill_dir: Path,
+        skill_id: str,
+        relative: str,
+        old_string: str,
+        new_string: str,
+        expected_replacements: int,
+        usage_state: dict[str, Any],
+        usage_record: dict[str, Any],
+        old_usage_bytes: bytes | None,
+    ) -> None:
+        linked = self._scan_linked_files(skill_dir)
+        existing_sizes = {path: size for path, size in linked}
+        target = self._support_target(skill_dir, relative, must_exist=True)
+        current_text, current_size = _read_private_text(
+            target,
+            max_bytes=MAX_SUPPORT_FILE_BYTES,
+            missing_status=404,
+            label="supporting file",
+        )
+        replacement_count = current_text.count(old_string)
+        _require_patch_count(replacement_count, expected_replacements)
+        updated_bytes = _validate_support_content(
+            current_text.replace(old_string, new_string)
+        )
+        new_total = sum(existing_sizes.values()) - current_size + len(updated_bytes)
+        if new_total > MAX_SUPPORT_TOTAL_BYTES:
+            raise SkillStoreError(
+                413,
+                (
+                    "supporting files may contain at most "
+                    f"{MAX_SUPPORT_TOTAL_BYTES} bytes in total"
+                ),
+                code="support_size_exceeded",
+            )
+
+        sidecar_path = skill_dir / ".skill.json"
+        sidecar = self._read_sidecar(skill_dir, expected_id=skill_id)
+        old_sidecar = _read_private_bytes(
+            sidecar_path,
+            max_bytes=_MAX_SIDECAR_BYTES,
+            missing_status=500,
+            label=".skill.json",
+        )
+        old_target = current_text.encode("utf-8")
+        timestamp = _utc_now()
+        sidecar["updated_at"] = timestamp
+        _bump_usage_record(usage_record, event="patch", timestamp=timestamp)
+        usage_state["skills"][skill_id] = usage_record
+
+        try:
+            _atomic_write_bytes(target, updated_bytes)
+            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+            self._write_usage_state(scope_dir, usage_state)
+        except BaseException as exc:
+            _restore_private_file(target, old_target)
+            _restore_private_file(sidecar_path, old_sidecar)
+            self._restore_usage_state(scope_dir, old_usage_bytes)
+            if isinstance(exc, SkillStoreError):
+                raise
+            if isinstance(exc, OSError):
+                raise SkillStoreError(
+                    500,
+                    f"cannot patch supporting file: {exc}",
+                    code="skill_write_failed",
+                ) from exc
+            raise
+
     def _load_bundled_catalog(self, requested_root: Path) -> None:
         try:
             info = requested_root.lstat()
@@ -1313,6 +1833,7 @@ class SkillStore:
             return _validated_document(
                 **parsed,
                 check_instruction_threats=check_instruction_threats,
+                check_sensitive_material=check_instruction_threats,
             )
         except SkillStoreError as exc:
             if exc.status >= 500:
@@ -1538,6 +2059,20 @@ class SkillStore:
             code="skill_id_allocation_failed",
         )
 
+    def _reject_agent_bundled_conflict(self, *, skill_id: str, name: str) -> None:
+        """Keep unattended learning from silently shadowing release Skills."""
+
+        desired_name = name.casefold()
+        if skill_id in self._bundled_records or any(
+            str(record["name"]).casefold() == desired_name
+            for record in self._bundled_records.values()
+        ):
+            raise SkillStoreError(
+                409,
+                "background learning cannot shadow a bundled Skill",
+                code="bundled_skill_conflict",
+            )
+
     def _replace_document_and_sidecar(
         self,
         skill_dir: Path,
@@ -1704,6 +2239,71 @@ def _validate_scope_key(scope_key: str) -> str:
     return scope_key
 
 
+def _validate_created_by(created_by: Any) -> str:
+    if not isinstance(created_by, str) or created_by not in _USAGE_CREATED_BY:
+        raise SkillStoreError(
+            400,
+            "created_by must be user or agent",
+            code="invalid_skill_provenance",
+        )
+    return created_by
+
+
+def _validate_patch_arguments(
+    old_string: Any,
+    new_string: Any,
+    expected_replacements: Any,
+) -> None:
+    if not isinstance(old_string, str) or not old_string:
+        raise SkillStoreError(
+            400,
+            "old_string must be a non-empty string",
+            code="invalid_skill_patch",
+        )
+    if not isinstance(new_string, str):
+        raise SkillStoreError(
+            400,
+            "new_string must be a string",
+            code="invalid_skill_patch",
+        )
+    for field, value in (("old_string", old_string), ("new_string", new_string)):
+        if "\x00" in value:
+            raise SkillStoreError(
+                400,
+                f"{field} must not contain NUL",
+                code="invalid_skill_patch",
+            )
+        _reject_surrogates(value, field, code="invalid_skill_patch")
+        if len(value.encode("utf-8")) > MAX_SUPPORT_FILE_BYTES:
+            raise SkillStoreError(
+                413,
+                f"{field} exceeds the patch text size limit",
+                code="skill_size_exceeded",
+            )
+    if (
+        isinstance(expected_replacements, bool)
+        or not isinstance(expected_replacements, int)
+        or not 1 <= expected_replacements <= MAX_PATCH_REPLACEMENTS
+    ):
+        raise SkillStoreError(
+            400,
+            (
+                "expected_replacements must be between 1 and "
+                f"{MAX_PATCH_REPLACEMENTS}"
+            ),
+            code="invalid_skill_patch",
+        )
+
+
+def _require_patch_count(actual: int, expected: int) -> None:
+    if actual != expected:
+        raise SkillStoreError(
+            409,
+            f"expected {expected} replacements, found {actual}",
+            code="skill_patch_mismatch",
+        )
+
+
 def _validate_skill_id(skill_id: str) -> str:
     if not isinstance(skill_id, str) or not _SKILL_ID_RE.fullmatch(skill_id):
         raise SkillStoreError(
@@ -1786,6 +2386,7 @@ def _validated_document(
     category: Any,
     tags: Sequence[str] | None,
     check_instruction_threats: bool = True,
+    check_sensitive_material: bool = True,
 ) -> dict[str, Any]:
     normalized_name = _validate_scalar(name, "name", max_chars=MAX_NAME_CHARS)
     normalized_description = _validate_scalar(
@@ -1836,12 +2437,30 @@ def _validated_document(
             "instructions resemble prompt-injection or credential-exfiltration commands",
             code="unsafe_skill_instructions",
         )
+    normalized_tags = _validate_tags(tags)
+    if check_sensitive_material and _credential_material_reasons(
+        "\n".join(
+            (
+                normalized_name,
+                normalized_description,
+                normalized_version,
+                normalized_category,
+                *normalized_tags,
+                instructions,
+            )
+        )
+    ):
+        raise SkillStoreError(
+            400,
+            "Skill content contains apparent plaintext credential material",
+            code="sensitive_skill_content",
+        )
     return {
         "name": normalized_name,
         "description": normalized_description,
         "version": normalized_version,
         "category": normalized_category,
-        "tags": _validate_tags(tags),
+        "tags": normalized_tags,
         "instructions": instructions,
     }
 
@@ -1923,6 +2542,158 @@ def _render_sidecar(sidecar: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _empty_usage_state() -> dict[str, Any]:
+    return {"schema_version": 1, "skills": {}}
+
+
+def _default_usage_record(*, created_by: str) -> dict[str, Any]:
+    return {
+        "created_by": _validate_created_by(created_by),
+        "use_count": 0,
+        "last_used_at": None,
+        "patch_count": 0,
+        "last_patched_at": None,
+        "state": "active",
+        "pinned": False,
+        "archived_at": None,
+    }
+
+
+def _validated_usage_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"schema_version", "skills"}:
+        raise SkillStoreError(
+            500,
+            "invalid Skill usage state fields",
+            code="corrupt_skill_usage",
+        )
+    if value.get("schema_version") != 1 or not isinstance(value.get("skills"), dict):
+        raise SkillStoreError(
+            500,
+            "invalid Skill usage state schema",
+            code="corrupt_skill_usage",
+        )
+    if len(value["skills"]) > MAX_SKILLS_PER_SCOPE:
+        raise SkillStoreError(
+            500,
+            "Skill usage state exceeds the per-scope Skill limit",
+            code="corrupt_skill_usage",
+        )
+
+    required_record_fields = {
+        "created_by",
+        "use_count",
+        "last_used_at",
+        "patch_count",
+        "last_patched_at",
+        "state",
+        "pinned",
+        "archived_at",
+    }
+    skills: dict[str, dict[str, Any]] = {}
+    for raw_id, raw_record in value["skills"].items():
+        if not isinstance(raw_id, str) or not _SKILL_ID_RE.fullmatch(raw_id):
+            raise SkillStoreError(
+                500,
+                "Skill usage state contains an invalid Skill id",
+                code="corrupt_skill_usage",
+            )
+        if (
+            not isinstance(raw_record, dict)
+            or set(raw_record) != required_record_fields
+        ):
+            raise SkillStoreError(
+                500,
+                f"invalid Skill usage record fields for {raw_id}",
+                code="corrupt_skill_usage",
+            )
+        created_by = raw_record.get("created_by")
+        state = raw_record.get("state")
+        if created_by not in _USAGE_CREATED_BY or state not in _USAGE_STATES:
+            raise SkillStoreError(
+                500,
+                f"invalid Skill usage record state for {raw_id}",
+                code="corrupt_skill_usage",
+            )
+        for count_field in ("use_count", "patch_count"):
+            count = raw_record.get(count_field)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise SkillStoreError(
+                    500,
+                    f"invalid {count_field} for {raw_id}",
+                    code="corrupt_skill_usage",
+                )
+        if not isinstance(raw_record.get("pinned"), bool):
+            raise SkillStoreError(
+                500,
+                f"invalid pinned state for {raw_id}",
+                code="corrupt_skill_usage",
+            )
+        for timestamp_field in (
+            "last_used_at",
+            "last_patched_at",
+            "archived_at",
+        ):
+            timestamp = raw_record.get(timestamp_field)
+            if timestamp is not None and (
+                not isinstance(timestamp, str) or not timestamp
+            ):
+                raise SkillStoreError(
+                    500,
+                    f"invalid {timestamp_field} for {raw_id}",
+                    code="corrupt_skill_usage",
+                )
+        archived_at = raw_record.get("archived_at")
+        if (state == "archived") != (archived_at is not None):
+            raise SkillStoreError(
+                500,
+                f"inconsistent archived state for {raw_id}",
+                code="corrupt_skill_usage",
+            )
+        skills[raw_id] = dict(raw_record)
+    return {"schema_version": 1, "skills": skills}
+
+
+def _parse_usage_state(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SkillStoreError(
+            500,
+            "invalid Skill usage state",
+            code="corrupt_skill_usage",
+        ) from exc
+    return _validated_usage_state(value)
+
+
+def _render_usage_state(state: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _bump_usage_record(
+    record: dict[str, Any],
+    *,
+    event: str,
+    timestamp: str,
+) -> None:
+    if event == "use":
+        record["use_count"] = int(record["use_count"]) + 1
+        record["last_used_at"] = timestamp
+        return
+    if event == "patch":
+        record["patch_count"] = int(record["patch_count"]) + 1
+        record["last_patched_at"] = timestamp
+        return
+    raise ValueError(f"unknown Skill usage event: {event}")
+
+
 def _validate_support_path(file_path: str) -> str:
     if not isinstance(file_path, str) or not file_path:
         raise SkillStoreError(
@@ -1988,6 +2759,12 @@ def _validate_support_content(content: Any) -> bytes:
             "supporting file content must not contain NUL",
             code="invalid_support_content",
         )
+    if _credential_material_reasons(content):
+        raise SkillStoreError(
+            400,
+            "supporting file contains apparent plaintext credential material",
+            code="sensitive_skill_content",
+        )
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_SUPPORT_FILE_BYTES:
         raise SkillStoreError(
@@ -1999,6 +2776,55 @@ def _validate_support_content(content: Any) -> bytes:
             code="support_size_exceeded",
         )
     return encoded
+
+
+def _credential_material_reasons(content: str) -> list[str]:
+    """Return high-confidence literal credential classes without flagging prose.
+
+    Credential-related terms and placeholders are intentionally allowed. This
+    boundary targets values that are directly reusable as secrets.
+    """
+
+    reasons: list[str] = []
+    if _PREFIXED_CREDENTIAL_RE.search(content):
+        reasons.append("prefixed_token")
+    if any(_looks_like_private_key_block(match) for match in _PRIVATE_KEY_BLOCK_RE.finditer(content)):
+        reasons.append("private_key")
+    for match in _BEARER_CREDENTIAL_RE.finditer(content):
+        value = match.group("value")
+        if _BEARER_PLACEHOLDER_RE.match(value):
+            continue
+        if any(character.isdigit() for character in value) or any(
+            character in "._~+/=" for character in value
+        ):
+            reasons.append("bearer_token")
+            break
+    return reasons
+
+
+def _looks_like_private_key_block(match: re.Match[str]) -> bool:
+    compact = "".join(match.group("body").split())
+    if len(compact) < 64 or len(compact) % 4:
+        return False
+    try:
+        decoded = base64.b64decode(compact.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        return False
+    if match.group("label") == "OPENSSH PRIVATE KEY":
+        return decoded.startswith(b"openssh-key-v1\x00")
+    if len(decoded) < 32 or decoded[0] != 0x30 or len(decoded) < 2:
+        return False
+    first_length = decoded[1]
+    if first_length < 0x80:
+        header_length = 2
+        payload_length = first_length
+    else:
+        length_bytes = first_length & 0x7F
+        if not 1 <= length_bytes <= 4 or len(decoded) < 2 + length_bytes:
+            return False
+        header_length = 2 + length_bytes
+        payload_length = int.from_bytes(decoded[2:header_length], "big")
+    return header_length + payload_length == len(decoded)
 
 
 def _reject_surrogates(value: str, field: str, *, code: str) -> None:
@@ -2039,6 +2865,8 @@ def _read_private_bytes(
     max_bytes: int,
     missing_status: int,
     label: str,
+    require_owner_only: bool = False,
+    require_single_link: bool = False,
 ) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
@@ -2065,6 +2893,20 @@ def _read_private_bytes(
             raise SkillStoreError(
                 409,
                 f"{label} must be a regular non-symlink file",
+                code="unsafe_skill_path",
+            )
+        if require_single_link and info.st_nlink != 1:
+            raise SkillStoreError(
+                409,
+                f"{label} must not be hard-linked",
+                code="unsafe_skill_path",
+            )
+        if require_owner_only and (
+            info.st_uid != os.geteuid() or info.st_mode & 0o077
+        ):
+            raise SkillStoreError(
+                409,
+                f"{label} must be owned by the current user and owner-only",
                 code="unsafe_skill_path",
             )
         if info.st_size > max_bytes:
@@ -2198,6 +3040,15 @@ def _remove_tree_quietly(path: Path) -> None:
     except FileNotFoundError:
         pass
     except OSError:
+        pass
+
+
+def _restore_private_file(path: Path, old_bytes: bytes) -> None:
+    """Best-effort rollback for a file replaced within a larger transaction."""
+
+    try:
+        _atomic_write_bytes(path, old_bytes)
+    except (OSError, SkillStoreError):
         pass
 
 

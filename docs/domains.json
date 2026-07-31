@@ -109,6 +109,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
         "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",
         "enterprise-agent-platform/enterprise_agent_platform/memory_security.py",
+        "enterprise-agent-platform/enterprise_agent_platform/learning.py",
         "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
@@ -117,6 +118,7 @@
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_memory_session_search.py",
+        "enterprise-agent-platform/tests/test_learning_review.py",
         "enterprise-agent-platform/tests/test_knowledge_db.py",
         "enterprise-agent-platform/agent-runtime/test/session-*.test.ts",
         "enterprise-agent-platform/tests/test_container_data_layout.py"

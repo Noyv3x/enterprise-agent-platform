@@ -65,6 +65,14 @@ terminal 的前台进程保持 Run 活动并有独立工具 deadline；后台进
 
 每个主 Agent 的系统提示同时说明 Sandbox 逻辑工作区 `/workspace` 和由可信部署配置派生的当前宿主映射。Agent 默认在工作区创建并保存交付物，保持目录有序，并在确认无用后清理自己产生的临时中间文件；不得以“整理”为由删除上传附件、用户文件或含义不明的内容。宿主映射只用于帮助理解路径关系，不改变 Sandbox 默认执行目标，也不进入公共状态、数据库或普通工具 metadata。
 
+## 学习复盘 Run
+
+Platform 可创建 `metadata.review_mode=memory_skill`、`trigger=learning_review`、`unattended=true` 的内部 Run。Runtime 只在规范私人顶层 scope、无 parent/delegation、带正整数 `review_job_id` 和来源消息，且 `session_id=learning-review-<review_job_id>`、`metadata.idempotency_key=agent-learning-review:<review_job_id>` 时接受该组合。`learning-review-<正整数>` session 和 `agent-learning-review:<正整数>` 幂等命名空间只保留给完整复盘身份；普通 Run 即使不声明 review metadata 也不能占用。校验发生在排队和 session 初始化前；普通请求不能通过单独设置字段或借用普通 session 取得复盘权限。Platform 提交复盘时必须进入与普通 Run 相同的每 scope lifecycle start barrier，在持有门闩时立即重验账号、权限、lifecycle、来源消息和 running job，并把门闩保持到 Runtime 明确接受 Run。停用、撤权或显式 lifecycle reset 必须终结该 scope 的 queued/running 复盘任务，并在同一 lifecycle 门闩下清理先于 reset 被接受的 Run。接受回调再次发现 job 或 lifecycle 已失效时还必须终结 job 并取消该 Run，使旧 lifecycle 的复盘不可在清理完成后留存。
+
+复盘沿用 Hermes 的“先交付回复，再独立审查”原则，但使用平台持久任务而不是进程内 daemon。它使用独立 session 和有界近期历史，不接受追加输入，不委派，不显示流式内容，也不写父 session；终态后 Runtime 精确删除该临时 session。复盘每次最多发起 `16` 个模型 turn；若全局 `maxTurnsPerRun` 更小则取较小值，不得通过调高普通 Run 上限扩大这条免审批自动写路径。每个 review job 另有由 Platform 权威执行且跨重启保留的二十单位总变更预算：memory 单动作、reconcile 子动作和 Skill create/patch 共享计费，读取免费；工具说明与复盘系统提示必须明确该限制，Runtime 自身不能把一次 reconcile 错算成一次。前台工具轨迹只保存有界、安全摘要；`skill.load` 与 `skill.read` 必须保留严格校验后的 Skill id，使复盘能优先检查本轮实际使用的 Skill，`skill.read` 可附安全相对文件路径，但 Skill 正文、patch 内容和工具结果不得进入轨迹。工具集合硬限制为 memory 与 skill：memory 可读并可 `store|replace|forget|reconcile`，不能 clear；skill 可 `list|load|read|create|patch`，现有 Skill 必须先在同一 Run load/read。terminal、process、文件、web、browser、mail、schedule、knowledge、session 和 delegate 都不存在于模型工具表。
+
+复盘中的 memory/skill 允许动作不弹用户审批，但 Runtime Gateway 必须在 memory 读写和全部 Skill 请求中透传完整的可信复盘主体：parent/delegation、trigger、unattended、review mode/job、owner、source message、scope 和 lifecycle。Python Gateway 在任何记忆查询、Skill 读取或写入之前都必须反查对应 `agent_learning_review` durable job 仍在 running，并重新校验账号激活与权限、owner、canonical scope、lifecycle 与 source message；旧 lifecycle、终态 job 或已撤权账号发出的延迟读请求必须在访问数据前以 403 失败关闭。复盘 Skill `list/load/read` 的最终复验、文件读取和 read-ledger 登记处于同一个 lifecycle gate 与 `BEGIN IMMEDIATE` 边界内，但不扣变更预算。Skill 创建来源由 Gateway 标为 agent；patch 只能作用于未 pin、active 且 agent-owned 的包。任何校验失败、模型失败或临时 session 清理失败都不能撤回或改写前台回复，也不能递归触发另一轮学习。
+
 ## 委派
 
 委派深度和每 Run 子任务数量受策略限制。子 Agent 使用派生 scope 和独立 session，但继承父主 Agent 的 Sandbox、workspace、HOME 与 env；临时记忆和浏览器身份仍按子 scope 隔离。子 Run 的模型输出、工具活动和等待要向父 Run 传播活动，避免父 Run 被误判无进展。

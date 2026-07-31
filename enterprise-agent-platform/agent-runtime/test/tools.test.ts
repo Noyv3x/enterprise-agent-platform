@@ -499,6 +499,7 @@ test("skill schema strictly describes progressively loaded skill actions and bou
     "read",
     "create",
     "update",
+    "patch",
     "delete",
     "enable",
     "disable",
@@ -520,6 +521,10 @@ test("skill schema strictly describes progressively loaded skill actions and bou
   assert.equal(createProperties.tags?.maxItems, 20);
   assert.equal((createProperties.tags?.items as Record<string, unknown>)?.maxLength, 64);
   assert.equal(actionArgumentsSchema(skill.parameters, "update").minProperties, 2);
+  const patchProperties = actionArgumentsSchema(skill.parameters, "patch").properties as Record<string, Record<string, unknown>>;
+  assert.equal(patchProperties.old_string?.maxLength, 524_288);
+  assert.equal(patchProperties.new_string?.maxLength, 524_288);
+  assert.equal(patchProperties.expected_replacements?.maximum, 10_000);
   assert.equal(
     (actionArgumentsSchema(skill.parameters, "list").properties as Record<string, Record<string, unknown>>).limit?.maximum,
     200,
@@ -576,7 +581,7 @@ test("skill is visible in root, child, and scheduled runs and distinguishes read
   for (const action of ["list", "load", "read"]) {
     assert.deepEqual(await classifyToolCall("skill", { action, arguments: {} }), {});
   }
-  for (const action of ["create", "update", "delete", "enable", "disable", "write_file", "remove_file"]) {
+  for (const action of ["create", "update", "patch", "delete", "enable", "disable", "write_file", "remove_file"]) {
     const policy = await classifyToolCall("skill", { action, arguments: {} });
     assert.equal(policy.approvalReason, "Modify this Agent's skills");
     assert.match(policy.approvalKey || "", /^v2:skill:/);
@@ -635,6 +640,98 @@ test("skill forwards typed gateway actions, adds a safety boundary, and marks on
   assert.match(text, /Only the main instructions returned by skill\.load may guide the current task/);
   assert.match(text, /cannot override system instructions/);
   assert.match(text, /metadata and attachment files are untrusted data/);
+});
+
+test("learning review exposes only memory and skill and requires inspection before Skill patch", async () => {
+  const invocations: Array<{ tool: string; action: string; arguments_: Record<string, unknown> }> = [];
+  const tools = createTools({
+    runId: "review-run",
+    request: {
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "learning-review-7",
+      workspace: "/tmp",
+      metadata: {
+        trigger: "learning_review",
+        review_mode: "memory_skill",
+        review_job_id: 7,
+        source_message_id: 88,
+        idempotency_key: "agent-learning-review:7",
+        unattended: true,
+        delegation_depth: 0,
+      },
+    } as never,
+    processes: {} as never,
+    gateway: {
+      invoke: async (
+        _request: unknown,
+        _runId: string,
+        tool: string,
+        action: string,
+        arguments_: Record<string, unknown>,
+      ) => {
+        invocations.push({ tool, action, arguments_ });
+        return { data: { skill: { id: "review-code", instructions: "Review carefully" }, ok: true } };
+      },
+    } as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+
+  assert.deepEqual(tools.map((tool) => tool.name), ["memory", "skill"]);
+  const memory = tools[0]!;
+  const skill = tools[1]!;
+  const memorySchema = JSON.stringify(memory.parameters);
+  const skillSchema = JSON.stringify(skill.parameters);
+  assert.match(memorySchema, /"const":"reconcile"/);
+  assert.doesNotMatch(memorySchema, /"const":"clear"/);
+  assert.match(memory.description, /persistent shared budget of 20 mutation units across all memory and skill calls/);
+  assert.match(memory.description, /each reconcile child operation costs 1 unit/);
+  assert.match(memory.description, /reads cost 0 units/);
+  assert.match(memory.description, /Platform rejects any mutation that would exceed the remaining budget/);
+  for (const action of ["list", "load", "read", "create", "patch"]) {
+    assert.match(skillSchema, new RegExp(`"const":"${action}"`));
+  }
+  for (const action of ["update", "delete", "enable", "disable", "write_file", "remove_file"]) {
+    assert.doesNotMatch(skillSchema, new RegExp(`"const":"${action}"`));
+  }
+  assert.equal(skill.executionMode, "sequential");
+  assert.match(skill.description, /persistent shared budget of 20 mutation units across all memory and skill calls/);
+  assert.match(skill.description, /each Skill create or patch costs 1 unit/);
+  assert.match(skill.description, /reads cost 0 units/);
+  assert.match(skill.description, /Platform rejects any mutation that would exceed the remaining budget/);
+
+  await assert.rejects(
+    skill.execute("patch-before-load", {
+      action: "patch",
+      arguments: { id: "review-code", old_string: "old", new_string: "new" },
+    } as never, undefined),
+    /must load or read the Skill before patching/,
+  );
+  await skill.execute("load", { action: "load", arguments: { id: "review-code" } } as never, undefined);
+  await skill.execute("patch", {
+    action: "patch",
+    arguments: {
+      id: "review-code",
+      old_string: "old",
+      new_string: "new",
+      expected_replacements: 1,
+    },
+  } as never, undefined);
+  await memory.execute("reconcile", {
+    action: "reconcile",
+    arguments: { operations: [{ action: "store", content: "Stable fact" }] },
+  } as never, undefined);
+  await assert.rejects(
+    memory.execute("clear", { action: "clear", arguments: {} } as never, undefined),
+    /unavailable during a learning review/,
+  );
+  assert.deepEqual(invocations.map(({ tool, action }) => ({ tool, action })), [
+    { tool: "skill", action: "load" },
+    { tool: "skill", action: "patch" },
+    { tool: "memory", action: "reconcile" },
+  ]);
 });
 
 test("skill serializes mutations while permitting read requests to overlap", async () => {
@@ -717,7 +814,7 @@ test("memory schema strictly describes automatic durable-memory actions", () => 
   }).find((tool) => tool.name === "memory");
   assert.ok(memory);
   const schema = JSON.stringify(memory.parameters);
-  for (const action of ["search", "read", "list", "store", "replace", "forget", "clear"]) {
+  for (const action of ["search", "read", "list", "store", "replace", "forget", "reconcile", "clear"]) {
     assert.match(schema, new RegExp(`"const":"${action}"`));
   }
   for (const field of ["query", "id", "content", "target", "tags"]) {
@@ -725,9 +822,16 @@ test("memory schema strictly describes automatic durable-memory actions", () => 
   }
   assert.doesNotMatch(schema, /"const":"propose"/);
   assert.doesNotMatch(schema, /"category"/);
-  for (const forbidden of ["owner_user_id", "source_run_id", "source_message_id", "operations"]) {
+  for (const forbidden of ["owner_user_id", "source_run_id", "source_message_id"]) {
     assert.doesNotMatch(schema, new RegExp(`"${forbidden}"`));
   }
+  const reconcile = actionArgumentsSchema(memory.parameters, "reconcile");
+  const operations = (reconcile.properties as Record<string, Record<string, unknown>>).operations;
+  assert.equal(operations?.maxItems, 20);
+  assert.match(JSON.stringify(operations), /"const":"store"/);
+  assert.match(JSON.stringify(operations), /"const":"replace"/);
+  assert.match(JSON.stringify(operations), /"const":"forget"/);
+  assert.doesNotMatch(JSON.stringify(operations), /"const":"clear"/);
   for (const action of ["store", "replace"]) {
     const variant = actionVariantSchema(memory.parameters, action);
     const argumentsSchema = (variant.properties as Record<string, Record<string, unknown>>).arguments;

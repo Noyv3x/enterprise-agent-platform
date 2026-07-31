@@ -49,7 +49,9 @@ python3 -m compileall enterprise_agent_platform tests
 
 Python 测试位于 `tests/test_*.py`。新增路由、配置、数据库迁移、权限、任务恢复、自动更新或托管服务行为时，应测试成功、拒绝、重启恢复和竞态边界。
 
-SQLite 测试使用临时数据目录，不共享开发数据库。OAuth、Telegram、Cognee、Firecrawl、SearXNG、Camoufox 和 Git 操作优先使用确定性 fake；没有显式凭据和服务时，不把真实网络集成作为单元测试前提。
+学习闭环测试必须覆盖十回合/十工具节奏、重启恢复、来源幂等、lifecycle 轮换和所有非私人/非交互排除项；复盘失败不得影响已持久回复，更新预约期间不得领取新任务。还必须注入领取和终态落盘的短暂数据库错误，证明 worker 会有界退避并继续处理，已领取任务在未落盘时仍阻塞更新。前台 `skill.load/read` 的工具轨迹测试必须证明安全 Skill id（以及 read 的安全相对路径）进入复盘 payload，同时正文、patch 内容和工具结果不进入轨迹。Gateway 测试必须用确定性并发覆盖复盘 memory 查询的“授权复验与查询同一 SQLite 快照”、复盘写入返回快照不丢失 review identity，以及普通 automatic memory 写入与账号撤权、lifecycle reset、父任务终结的线性化；延迟到达的旧请求必须失败关闭。复盘 Skill `list/load/read` 还必须覆盖“终态或撤权先发生则不触碰文件”和“读取先线性化则撤权等待”的两种顺序，并证明 ledger 独立锁不会形成 conversation→DB / DB→conversation 反向死锁。每个复盘 durable job 的二十单位共享变更预算必须覆盖 reconcile 按子动作计费、memory 失败回滚、Skill 写入持久预扣且失败可计费、memory 与 Skill 跨调用累计、任务重排/进程重启不重置和耗尽拒绝。Skill 测试必须覆盖可信 created_by、既有状态默认 user-owned、精确 patch 次数、读前写、bundled/user/pinned/archived 拒绝、agent-created bundled id/名称冲突、注入扫描、高置信凭据拒绝与认证文档/占位符放行，以及原子状态文件损坏。Runtime 测试还要证明复盘工具白名单、免批仅限完整 review context、父 session 不被写入且临时 session 终态删除，并要证明复盘的第 `17` 个模型请求在发送前被独立硬上限拒绝、工具说明与提示词都公开二十单位计费，而普通 Run 仍遵循全局模型轮次上限。
+
+SQLite 测试使用临时数据目录，不共享开发数据库；事务测试必须覆盖正文异常与 `commit` 异常都执行 rollback，并证明同一线程连接随后仍可安全写入。OAuth、Telegram、Cognee、Firecrawl、SearXNG、Camoufox 和 Git 操作优先使用确定性 fake；没有显式凭据和服务时，不把真实网络集成作为单元测试前提。
 
 ## Agent Runtime
 

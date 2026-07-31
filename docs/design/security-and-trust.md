@@ -112,6 +112,10 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 需要进入长期指令上下文的记忆、Skill 主指令和计划 prompt 在写入与加载/执行两个边界经过共享高置信威胁扫描。扫描有输入上限和有界模式，覆盖 NFKC 兼容字符、不可见/双向 Unicode、明确的指令覆盖、角色劫持、系统提示泄露和凭据外传；它是纵深防护，不能宣称识别所有注入。
 
+后台学习复盘是唯一可跳过 Skill 用户审批的内部路径。它必须同时具有 Platform 生成的 `review_mode`、trigger、unattended、review job、owner、source message、canonical scope 和当前 lifecycle；临时 `session_id` 与幂等 key 必须分别精确等于 `learning-review-<review_job_id>` 和 `agent-learning-review:<review_job_id>`，Runtime 在排队或写入 session 前拒绝任何错配，不能让伪造复盘身份删除普通会话。Runtime 必须将这个完整主体透传到每次复盘 memory 读写和 Skill 请求；Gateway 在任何记忆查询、Skill 读取或副作用前都从 SQLite 反查 running job、当前 lifecycle、激活账号与权限，不能只信 Runtime metadata。复盘 memory `search|read|list` 必须在 lifecycle/review 串行门内，用同一个 SQLite 事务快照完成授权复验和查询；写入则在同一个 `BEGIN IMMEDIATE` 事务内完成复验、预算扣减、变更和返回快照，使 reset、撤权或 job 终结与读写具有明确线性化边界。复盘 Skill `list/load/read` 同样必须把最终复验、文件系统读取与 read-ledger 登记纳入一个保持到读取结束的 lifecycle gate 和 `BEGIN IMMEDIATE` 边界，防止旧 lifecycle 或撤权请求读取当前 Skill。普通私人交互 Run 的 automatic memory 写入同样必须在 lifecycle 门和单一 `BEGIN IMMEDIATE` 事务内，依据当前 scope/lifecycle、账号权限、来源用户消息和 `agent_run_inputs.runtime_run_id` 到 running 父 Agent job 的权威映射复验，不能把早先预检当作持久授权。Runtime 工具白名单和 Platform 动作白名单形成双重边界。复盘不能访问 Sandbox、终端、文件、网络、浏览器、邮件、计划、委派或凭据；Skill create 和 patch 都必须在 lifecycle/review 串行门内重验 scope、账号、权限、来源消息与 running job。Skill 更新还要求同一 Run 先读，再在同一 scope lock 内完成目标包身份重读、`agent-owned + active + unpinned` 资格复核和精确 patch，不接受一个锁外先检查结果作为持久授权。自动 patch 前后都要以 package id 和重新解析的 frontmatter name 拒绝 bundled 遮蔽，并继续执行注入与高置信明文凭据扫描。该扫描覆盖全部可变 Skill 内容写入口，并区分真实 token、PAT、完整 PEM 私钥、实际 Bearer 值与普通认证说明/占位符。复盘创建还必须拒绝 bundled id 或名称冲突，不能用新建包绕过 bundled 只读边界。复盘历史和工具结果仍是不可信数据，用户文本不能把自己变成学习策略或授权。
+
+复盘还必须使用独立、不可被全局调大的 `16` 个模型 turn 硬上限；全局上限更小时取较小值。除此之外，每个 review durable job 只有持久共享的二十单位总变更预算：memory 单动作和 Skill create/patch 各计一单位，reconcile 按子动作计费，读操作不计费，重启或重试不重置。memory 在实际变更事务内原子扣减；Skill 因跨数据库/文件系统而在同一 lifecycle 门内先持久预扣，失败也可能耗费单位，以保证任何文件提交都不会逃逸计费。两种限制共同防止异常模型循环耗尽记忆或 Skill 配额。
+
 持久 session 中未带当前安全 envelope 的 web、browser、memory、knowledge、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
 
 ## 安全变更要求

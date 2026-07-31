@@ -16,7 +16,7 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 - `agent_schedules`、`agent_schedule_runs`；
 - `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
-数据库启用 WAL、外键和按线程连接。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
+数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；非空数据库必须同时精确匹配当前 marker 和声明结构；全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。任何其它 marker、未知业务表、额外列、缺失结构或退役表都必须在修改数据库前明确拒绝，当前版本不携带历史 baseline 升级入口。
 
@@ -63,7 +63,15 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 每条记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual` 或 `automatic`。所有权和是否允许自动写入从可信 Run context 派生；模型参数不能覆盖 owner 或把 unattended/channel/delegated Run 提升为可写。写入有配额、长度、注入扫描和去重约束，精确限制由代码契约和测试维护。
 
-交互式私人顶层 Run 在对话中发现稳定且跨会话有价值的信息时直接写入、替换或忘记正式记忆，不弹出审批。Agent 应优先更新同一事实而不是追加冲突副本；临时任务状态和过程信息留在 session 或工作区。计划任务、邮件唤醒、频道 Agent 和委派 Agent 只能召回，不得自动修改记忆。
+交互式私人顶层 Run 在对话中发现稳定且跨会话有价值的信息时直接写入、替换或忘记正式记忆，不弹出审批。Agent 应优先更新同一事实而不是追加冲突副本；临时任务状态和过程信息留在 session 或工作区。计划任务、邮件唤醒、频道 Agent 和委派 Agent 只能召回，不得自动修改记忆。普通自动写入也不是只凭 Runtime metadata 放行：Platform 必须持有该 scope 的 lifecycle start barrier，并在覆盖授权复验、记忆变更和返回快照的同一个 `BEGIN IMMEDIATE` 事务内确认 canonical private scope/current lifecycle、激活账号与私人权限、来源用户消息，以及 `agent_run_inputs.runtime_run_id` 所属父 `agent` durable job 仍为 running。撤权、reset、父任务终结和记忆写入据此线性化，不能在预检与落盘之间穿越。
+
+前台即时维护之外还有 Hermes 风格的回复后复盘。每个私人 Agent 的节奏状态保存在 SQLite `settings`，触发任务保存在 `durable_jobs`；成功私人回合每十次触发记忆审查，成功工具调用累计十次可提前触发流程审查。计数和任务都绑定当前 lifecycle，轮换后从零开始；同一来源消息只能产生一个复盘任务。复盘使用近期产品消息和有界工具活动作为不可信历史，只保存稳定事实、消除冲突或忘记已明确失效的事实，不保存凭据、一次性错误、短期任务状态和未经用户确认的推断。
+
+复盘对 Skill 采用 Hermes 的主动信号与分层策略：用户对风格、格式、流程或工具使用的纠正，非平凡的可复用技巧，以及本轮已使用 Skill 暴露的缺漏都应触发维护；优先精确 patch 已检查且允许自动维护的现有 agent-owned Skill，没有合适目标时才创建可覆盖一类任务的 umbrella Skill。不得把一次性任务叙述、已经恢复的瞬时故障、环境暂缺或“某工具永远不可用”固化为 Skill；没有真实持久信号时允许不写入。
+
+`memory.reconcile` 在一个 Platform 事务内执行至多二十个 `store`、`replace` 或 `forget` 动作，用于复盘时原子整理相关事实；不提供批量 `clear`。所有动作继续由 Platform 从可信 review job 派生 owner、scope、Run 和 source message，模型不能覆盖来源。复盘的 `search|read|list` 与写入使用同一完整主体契约；Python 必须持有 lifecycle start barrier，并在同一个 SQLite 事务快照中先重验当前 scope lifecycle、账号激活与权限、来源消息和 running job，再执行记忆查询，不能让 reset、撤权或 job 终止前已发出但延迟到达的查询越过授权边界。复盘写入还必须在覆盖复验、预算扣减、全部记忆变更和返回快照的同一个 `BEGIN IMMEDIATE` 事务内完成。撤权/reset 先提交时复盘读写失败关闭；复盘事务先线性化时完成该次快照或原子变更，后续撤权/reset 再生效。
+
+每个 `agent_learning_review` durable job 具有持久、跨重启和重试共享的二十单位变更预算；模型 turn 上限不能替代该预算。每个 memory `store|replace|forget` 消耗一单位，`reconcile` 按内部动作数逐项计费；每个 Skill `create|patch` 消耗一单位，读操作不计费。记忆预算与实际变更同事务扣减，变更失败整体回滚。Skill 横跨 SQLite 与文件系统，Platform 在持有同一 lifecycle barrier 时先用独立 `BEGIN IMMEDIATE` 事务持久预扣一单位，再重新复验授权并执行文件提交；因此失败的 Skill 写入也可能消耗预算，这是防止“文件已提交但预算回滚”的 fail-closed 语义。预算耗尽后 Gateway 拒绝后续变更，任务重领、进程重启或 Runtime 重试不得重置计数。
 
 ## 召回与搜索
 
@@ -77,7 +85,11 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 用户技能存放在 `agent-skills/<scope-hash>/`，scope key 不直接出现在路径中。每个包以 `SKILL.md` 为可移植主体，`.skill.json` 只保存平台生命周期状态；支持文件只能位于 `references`、`templates`、`scripts` 和 `assets`。
 
-仓库内 bundled skills 是全局只读层。用户用相同 id 或不区分大小写的名称创建技能时可遮蔽预置版本，升级不能覆盖用户文件。
+仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
+
+每个 scope 还保存 owner-only、原子写入的 `.skill-usage.json`。状态以不可变 skill id 为键，记录 `created_by=user|agent`、使用/patch 次数和时间、`active|stale|archived`、pin 与归档时间。既有技能缺少状态时必须安全解释为 `user + active`，自动流程不能因此取得维护权。普通界面或前台 Run 创建的 Skill 都是 user-owned；只有通过可信 `agent_learning_review` context 创建的 Skill 才标记为 agent-owned，模型参数不能声明来源。
+
+`skill.patch` 对 `SKILL.md` 或一个支持文件执行精确字符串替换，调用方声明期望替换次数；不使用模糊匹配。目标正文在 scope lock 内通过单文件原子替换提交，主指令完成后重新解析 frontmatter、检查配额并执行提示词注入扫描。patch 不改变 `created_by/state/pinned/enabled` 等授权字段；`.skill.json.updated_at` 与 usage 的 patch 时间/次数只是非授权 telemetry，存储异常后的尽力回滚失败可使其滞后，调用方收到失败时必须重新读取目标正文确认结果，不能盲目重放。所有可变 Skill 写入口（create、完整 update、精确 patch 和 support write）还必须拒绝高置信明文凭据，包括真实 token/PAT、完整 PEM 私钥和带实际值的 Bearer 凭据；普通认证说明、占位符和不含密钥正文的格式示例不得仅因出现相关术语而被拒绝。`skill.load` 记录实际使用；patch 记录维护活动。后台复盘的 `list/load/read` 必须持有 lifecycle/review 串行门，并在覆盖最终授权复验、Skill 文件读取和 read-ledger 登记的同一个 `BEGIN IMMEDIATE` 边界内完成；它们不扣变更预算，但旧 lifecycle、撤权账号或终态 job 不得读取当前 Skill。后台复盘只能创建 Skill，或在本次 Run 已 load/read 后 patch 未 pin、未归档且由后台复盘创建的 Skill；bundled、user-owned、pinned 和 archived Skill 永远不能被自动修改。后台复盘的 create 和 patch 都不能使用一个独立的“先检查”结果授权；Platform 必须先持有 lifecycle/review 串行门，在一个保持到文件提交结束的 `BEGIN IMMEDIATE` 事务内重验当前 scope、账号、权限、来源消息和 running job，再进入 Skill scope lock 完成包创建或精确 patch，使撤权、lifecycle 轮换或删除/重建都不能在验证与写入之间穿越。对自动 patch，该 scope lock 内还必须重新读取当前包和 usage 状态，验证 `created_by=agent + active + unpinned`并随即完成替换。自动 patch 还必须在提交前以当前不可变 package id 和重新解析后的 frontmatter name 复核 bundled 冲突；无论目标事后曾被用户改名，还是本次 patch 企图改名，都不得在免审批路径中遮蔽 bundled Skill。自动复盘不删除、禁用或物理移动 Skill，也不执行 Skill 中的 shell。长期清理只允许未来的确定性 curator 对 agent-owned 状态做可恢复的逻辑 stale/archive，不能自动永久删除。
 
 ## 备份与迁移
 

@@ -32,7 +32,7 @@
 │   │   ├── home/
 │   │   ├── env/
 │   │   └── logs/
-│   ├── agent-skills/<scope-hash>/
+│   ├── agent-skills/<scope-hash>/  # Skill 包及原子 .skill-usage.json
 │   ├── runtimes/
 │   │   ├── agent/{sessions,approvals,idempotency,logs}/
 │   │   ├── camofox/{profiles,cookies,traces,cache,logs}/
@@ -55,6 +55,8 @@
 `platform.db` 是账号、凭据、消息、记忆、知识、任务和设置的权威存储。SQLite 使用 WAL；迁移和备份必须在线 backup 或在停止 writer 后 checkpoint，不能单独复制主文件。
 
 附件、工作区和 Skill 的逻辑关系保持原设计。附件数据库路径为相对路径。Multipart 上传先增量写入 `upload-staging/` 下按请求隔离的 `0700` 目录和 `0600` 普通文件，提交后流式复制到 `attachments/`；staging 不是权威数据，不进入备份，并在请求成功、失败、取消或超时后删除。Platform 启动可以清理不属于活跃请求的遗留 staging 目录。工作区在数据库中保存相对标识，不保存宿主绝对路径；Platform 将其解析为宿主数据目录，Sandbox 内统一映射为 `/workspace`。管理器只把与当前私人或频道 scope 对应的附件子目录只读挂载到 `/workspace/.ubitech/attachments`。当前 scope 的可信系统提示可以同时说明 `/workspace` 和由 Manager 数据根派生的精确宿主映射，帮助 Agent 在获批宿主命令中理解同一文件；该绝对路径不得写入数据库、公共 API、普通 Runtime metadata 或日志。
+
+Skill 使用与来源状态位于每个 scope 根的 `.skill-usage.json`，与包一起进入平台快照。文件为部署用户 owner-only 普通文件，以临时文件、fsync、rename 和父目录 fsync 原子替换；不是目录、符号链接、硬链接或未知 schema 时失败关闭。缺少单个 skill id 的状态不补猜历史来源，而按 user-owned active 处理。
 
 恢复或复制必须保留可执行位并按各子树修复所有权，不能对整个数据根递归使用同一种 chmod/chown。根目录和 secret 为 owner-only；Manager 每次启动都验证并收紧 `manager/control`、`manager/secrets` 与 capability token 的 owner、类型和权限，拒绝符号链接。对外部服务专用 UID 的授权只应用到明确子目录。
 
