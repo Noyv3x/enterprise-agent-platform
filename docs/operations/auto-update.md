@@ -27,6 +27,8 @@ Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Com
 
 Manager 不为更新强行终止任务。任务自然结束后，排队更新自动继续。只有 Manager 本地进程登记为空闲后，它才请求 Platform 在对话锁内原子复核业务状态并建立 reservation。候选校验、下载和任务等待期间不持有固定容器切换锁；只要 `maintenance=false`，current generation 的能力后台仍可修复。Manager 取得 reservation 后才与能力收敛互斥并进入固定栈切换边界。
 
+自动学习复盘遵循同一静默边界，但排队与执行必须区分：尚未领取的复盘 durable job 可以跨 generation 保留，不单独阻塞更新；一旦 worker 领取复盘并登记为活动，它就和前台 Agent Run 一样阻塞 reservation，直到结果已持久结算或失败重排。reservation 建立后不得领取新复盘；进程关闭时仍在执行的复盘必须先取消 Runtime，再把同一 job 安全重排，不能丢弃计数、重置变更预算或把半完成结果当成成功。
+
 网络接收或只读外部探测不能无限占有 Platform 写准入。持续前进的附件上传没有普通墙钟总时限，但 multipart 只写非权威 staging；完整请求读完后才竞争短提交准入。若更新先取得 reservation，上传连接可以随旧 Platform 停止，staging 在请求清理或下次启动时删除，客户端明确重试。后台 IMAP 轮询同样在准入外读取；每个 checkpoint、消息/任务事务和错误状态落库前重新竞争短准入，更新已经预约时放弃本轮并由新 generation 从旧 checkpoint 重试。交互式邮件调用属于正在运行的 Agent Run，仍由任务本身自然阻塞更新；不能再用一个额外、不可收敛的网络 admission 重复阻塞。任何可能产生本地写入的网络结果都不得在 reservation 后补写。
 
 ## 原子准入与维护

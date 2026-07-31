@@ -12,6 +12,7 @@ from unittest import mock
 
 from enterprise_agent_platform.agent_runtime_client import AgentResult
 from enterprise_agent_platform.config import PlatformConfig
+from enterprise_agent_platform.learning import LEARNING_REVIEW_JOB_KIND
 from enterprise_agent_platform.manager_client import ManagerClientError
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
@@ -337,6 +338,54 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 self.assertTrue(service.release_auto_update_reservation("update-1"))
             finally:
                 agent.release.set()
+                service.close()
+
+    def test_queued_learning_review_crosses_update_but_claimed_review_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                _config(Path(td)),
+                agent_client=_BlockingAgent(),
+            )
+            review_id: int | None = None
+            try:
+                review, created = service.jobs.enqueue(
+                    kind=LEARNING_REVIEW_JOB_KIND,
+                    dedupe_key="update-quiescence-review",
+                    payload={},
+                    scope_type="private",
+                    scope_id="1",
+                    available_at=int(time.time()) + 3600,
+                )
+                self.assertTrue(created)
+                review_id = review.id
+
+                queued = service.try_reserve_auto_update("queued-review-update")
+                self.assertTrue(queued["reserved"])
+                self.assertTrue(
+                    service.release_auto_update_reservation(
+                        "queued-review-update"
+                    )
+                )
+
+                with service._conversation_lock:
+                    service._learning_active_jobs[review.id] = "review-run"
+                active = service.try_reserve_auto_update("active-review-update")
+                self.assertFalse(active["reserved"])
+                self.assertEqual(active["active_learning_reviews"], 1)
+
+                with service._conversation_lock:
+                    service._learning_active_jobs.pop(review.id, None)
+                idle = service.try_reserve_auto_update("settled-review-update")
+                self.assertTrue(idle["reserved"])
+                self.assertTrue(
+                    service.release_auto_update_reservation(
+                        "settled-review-update"
+                    )
+                )
+            finally:
+                if review_id is not None:
+                    with service._conversation_lock:
+                        service._learning_active_jobs.pop(review_id, None)
                 service.close()
 
     def test_finalize_reservation_defers_agent_and_background_workers(self):

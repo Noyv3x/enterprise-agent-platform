@@ -72,6 +72,20 @@ describe("chat translations", () => {
     expect(hasAgentProcessSteps(status)).toBe(false);
   });
 
+  it("keeps internal learning-review lifecycle events out of work records", () => {
+    const status: AgentStatus = {
+      state: "replying",
+      activity: [
+        { source: "platform", stage: "learning.review.queued" },
+        { source: "agent", stage: "learning.review.started", tool: "memory" },
+        { source: "agent", stage: "learning.review.completed", tool: "skill" },
+      ],
+    };
+
+    expect(agentProcessLines(status, english)).toEqual([]);
+    expect(hasAgentProcessSteps(status)).toBe(false);
+  });
+
   it("compacts generic tool noise and preserves distinct real tool calls", () => {
     const status: AgentStatus = {
       state: "replying",

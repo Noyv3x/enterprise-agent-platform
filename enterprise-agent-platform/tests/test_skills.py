@@ -479,6 +479,36 @@ class SkillStoreTests(unittest.TestCase):
             )
         self.assertEqual(archived.exception.code, "automatic_skill_patch_forbidden")
 
+    def test_automatic_patch_preserves_agent_provenance_and_counts_exact_change(self):
+        scope = "private:auto-patch-success"
+        skill = self.create_skill(
+            scope,
+            name="Review learned package",
+            instructions="Check the durable marker twice: alpha then alpha.",
+            created_by="agent",
+        )
+
+        patched = self.store.patch_automatic(
+            scope,
+            skill["id"],
+            "alpha",
+            "beta",
+            expected_replacements=2,
+        )
+
+        self.assertEqual(patched["id"], skill["id"])
+        loaded = self.store.load(scope, skill["id"])
+        self.assertEqual(
+            loaded["instructions"],
+            "Check the durable marker twice: beta then beta.",
+        )
+        usage = self.read_usage(scope)["skills"][skill["id"]]
+        self.assertEqual(usage["created_by"], "agent")
+        self.assertEqual(usage["state"], "active")
+        self.assertFalse(usage["pinned"])
+        self.assertEqual(usage["patch_count"], 1)
+        self.assertTrue(self.store.automatic_patch_allowed(scope, skill["id"]))
+
     def test_automatic_patch_rechecks_recreated_package_provenance(self):
         scope = "private:auto-patch-recreate"
         original = self.create_skill(
