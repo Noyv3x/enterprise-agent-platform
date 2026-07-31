@@ -166,9 +166,33 @@ jobs:
         run: npm test
 
       - name: Stress runtime inactivity lifecycle
+        shell: bash
         run: |
-          seq 1 12 | xargs -P 4 -n 1 sh -c \
-            'node --test --test-concurrency=4 --test-name-pattern="active foreground terminal work|uncooperative provider" dist/test/run-timeout.test.js >/dev/null'
+          work="$(mktemp -d)"
+          trap 'rm -rf -- "$work"' EXIT
+          export work
+          set +e
+          seq 1 12 | xargs -P 2 -I '{}' sh -c '
+            log="$work/run-{}.log"
+            node --test --test-concurrency=4 \
+              --test-name-pattern="active foreground terminal work|uncooperative provider" \
+              dist/test/run-timeout.test.js >"$log" 2>&1
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              rm -f -- "$log"
+            fi
+            exit "$status"
+          '
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            for log in "$work"/*.log; do
+              [[ -e "$log" ]] || continue
+              printf '%s\n' "--- failed stress worker: ${log##*/} ---" >&2
+              sed -n '1,240p' "$log" >&2
+            done
+            exit "$status"
+          fi
 
       - name: Build runtime
         run: npm run build
