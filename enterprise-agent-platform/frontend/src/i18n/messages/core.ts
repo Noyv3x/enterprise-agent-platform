@@ -1,11 +1,11 @@
 import { defineMessages } from "../types";
 
 export const coreMessages = defineMessages({
-  "app.title": { "zh-CN": "ubitech agent", en: "ubitech agent", "zh-TW": "ubitech agent" },
+  "app.title": { "zh-CN": "Agent Platform", en: "Agent Platform", "zh-TW": "Agent Platform" },
   "app.description": {
-    "zh-CN": "ubitech agent - 频道协作、私人 Agent、知识库与运行时管理。",
-    en: "ubitech agent - channels, private agents, knowledge, and runtime management.",
-    "zh-TW": "ubitech agent - 頻道協作、私人 Agent、知識庫與執行環境管理。",
+    "zh-CN": "{product} - 频道协作、私人 Agent、知识库与运行时管理。",
+    en: "{product} - channels, private agents, knowledge, and runtime management.",
+    "zh-TW": "{product} - 頻道協作、私人 Agent、知識庫與執行環境管理。",
   },
   "language.label": { "zh-CN": "语言", en: "Language", "zh-TW": "語言" },
   "common.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
@@ -30,9 +30,9 @@ export const coreMessages = defineMessages({
   "boot.connecting": { "zh-CN": "正在启动", en: "Starting", "zh-TW": "正在啟動" },
   "boot.failed": { "zh-CN": "暂时无法连接", en: "Unable to connect", "zh-TW": "暫時無法連線" },
   "boot.failedDetail": {
-    "zh-CN": "无法连接 ubitech agent 服务，请检查网络后重试。",
-    en: "Unable to connect to ubitech agent. Check your network and try again.",
-    "zh-TW": "無法連線至 ubitech agent，請檢查網路後重試。",
+    "zh-CN": "无法连接服务，请检查网络后重试。",
+    en: "Unable to connect to the service. Check your network and try again.",
+    "zh-TW": "無法連線至服務，請檢查網路後重試。",
   },
   "boot.restoringSession": {
     "zh-CN": "正在恢复安全会话…",
@@ -45,9 +45,9 @@ export const coreMessages = defineMessages({
     "zh-TW": "系統維護",
   },
   "maintenance.probingTitle": {
-    "zh-CN": "正在连接 ubitech agent",
-    en: "Connecting to ubitech agent",
-    "zh-TW": "正在連線至 ubitech agent",
+    "zh-CN": "正在连接服务",
+    en: "Connecting to the service",
+    "zh-TW": "正在連線至服務",
   },
   "maintenance.probingDetail": {
     "zh-CN": "正在确认服务状态，请稍候。",
@@ -55,9 +55,9 @@ export const coreMessages = defineMessages({
     "zh-TW": "正在確認服務狀態，請稍候。",
   },
   "maintenance.title": {
-    "zh-CN": "正在更新 ubitech agent",
-    en: "Updating ubitech agent",
-    "zh-TW": "正在更新 ubitech agent",
+    "zh-CN": "正在更新平台",
+    en: "Updating the platform",
+    "zh-TW": "正在更新平台",
   },
   "maintenance.detail": {
     "zh-CN": "服务暂时停止使用。更新和健康检查完成后，页面会自动恢复。",
@@ -75,9 +75,9 @@ export const coreMessages = defineMessages({
     "zh-TW": "更新未能安全完成",
   },
   "maintenance.failedDetail": {
-    "zh-CN": "ubitech agent 已暂停使用，正在等待管理员处理。",
-    en: "ubitech agent is unavailable while an administrator resolves the update.",
-    "zh-TW": "ubitech agent 已暫停使用，正在等待管理員處理。",
+    "zh-CN": "平台已暂停使用，正在等待管理员处理。",
+    en: "The platform is unavailable while an administrator resolves the update.",
+    "zh-TW": "平台已暫停使用，正在等待管理員處理。",
   },
   "maintenance.failedHint": {
     "zh-CN": "服务恢复后，此页面会自动重新加载。",

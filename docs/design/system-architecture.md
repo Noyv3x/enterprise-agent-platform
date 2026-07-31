@@ -1,6 +1,6 @@
 # 系统架构
 
-本文描述 ubitech agent 的组件边界和主要数据流。产品范围见[产品设计](product.md)，部署拓扑见[部署](../operations/deployment.md)，运行数据目录见[数据布局](../reference/data-layout.md)。
+本文描述系统的组件边界和主要数据流。产品范围见[产品设计](product.md)，部署拓扑见[部署](../operations/deployment.md)，运行数据目录见[数据布局](../reference/data-layout.md)。
 
 ## 总览
 
@@ -8,7 +8,7 @@
 Browser / Telegram
         │
         ▼
-Host ubitech-manager ───── maintenance / releases / host executor
+Host Manager ───────────── maintenance / releases / host executor
         │
         ▼
 Docker network
@@ -22,9 +22,17 @@ Docker network
 
 系统只包含一个公网 HTTP 入口。宿主机 user-systemd 管理器持有监听 socket，正常时代理当前 Platform generation，维护或 Platform 不可用时直接返回维护页。只有管理器访问 Docker socket；业务容器不挂载 Docker socket，也不直接管理其它容器。管理器还持有一个跨 generation 保留的受管 bridge 网络；固定 Compose 栈和动态 Sandbox 只作为 external network 使用者，固定栈 `down` 不删除网络或断开 Sandbox。
 
+## 品牌与技术身份
+
+部署后的产品名称、标识图和其它品牌字段是 Platform 所有的展示数据，只能影响浏览器界面、通知、面向用户的 Agent 自称及其它明确的展示投影。管理员品牌字段不得派生或改写 Manager 二进制与 unit 名、配置和数据根、Compose project、网络、容器与 ownership label、环境变量、secret mount、Cookie、内部 API 路径、数据库 marker、workspace/session identity、包名或 release asset；这些对象属于发布协议和持久身份，不属于品牌。
+
+当前白标发布只把 `ubitech-manager`、`ubitech-agent`、`UBITECH_*`、`ENTERPRISE_*`、`.ubitech*` 与 `enterprise_*` 等既有值作为桥接源身份继续读取，绝不把它们作为用户可见产品名称回退。其后先由一个普通 generation 把完整的源侧交接能力送达并稳定运行；再下一桥接发布把内部身份交接到固定的中性 `agent-platform` 命名空间，最终清理基线删除源名称、迁移器和兼容读取。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取品牌而依赖已停止的 Platform 数据库。
+
+目标身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。普通 generation 更新、管理员保存品牌或源码全局替换都不得直接承担这项迁移；唯一流程是[部署文档](../operations/deployment.md#技术命名空间交接)定义的两发布 Manager handoff。
+
 ## 管理平面
 
-`ubitech-manager` 是源码树之外的稳定控制平面，拥有：
+Manager 是源码树之外的稳定控制平面；当前桥接源命令为 `ubitech-manager`，交接后的唯一命令为 `agent-platform-manager`。它拥有：
 
 - 公网 Gateway、维护状态和 owner-only Unix 控制 socket；
 - 固定服务与按 Agent Sandbox 的创建、停止、对账和日志轮转；

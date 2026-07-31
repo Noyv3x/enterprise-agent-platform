@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://ubitech.invalid/schemas/release-manifest-v1.json",
-  "title": "ubitech agent release manifest",
+  "$id": "https://agent-platform.invalid/schemas/release-manifest-v1.json",
+  "title": "Agent Platform release manifest",
   "type": "object",
   "additionalProperties": false,
   "required": [

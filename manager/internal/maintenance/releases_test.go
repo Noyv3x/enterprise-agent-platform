@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/contract"
-	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 type recordingImagePruner struct {

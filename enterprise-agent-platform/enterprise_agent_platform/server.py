@@ -524,6 +524,43 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 self._json(self.server.service.auto_update_public_status())
                 return
+            if path == "/api/platform/branding":
+                if method != "GET":
+                    self._json({"error": "method not allowed"}, status=405)
+                    return
+                if parsed.query:
+                    raise ServiceError(400, "branding config does not accept query parameters")
+                self._serve_branding_snapshot(
+                    self.server.service.branding_public_config()
+                )
+                return
+            if path == "/api/platform/branding/logo":
+                if method != "GET":
+                    self._json({"error": "method not allowed"}, status=405)
+                    return
+                try:
+                    branding_logo_query = urllib.parse.parse_qsl(
+                        parsed.query,
+                        keep_blank_values=True,
+                        max_num_fields=2,
+                    )
+                except ValueError as exc:
+                    raise ServiceError(400, "invalid branding logo query") from exc
+                if (
+                    len(branding_logo_query) != 1
+                    or any(key != "v" for key, _value in branding_logo_query)
+                ):
+                    raise ServiceError(400, "invalid branding logo query")
+                try:
+                    expected_revision = int(branding_logo_query[0][1])
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "invalid branding logo revision") from exc
+                if expected_revision < 0:
+                    raise ServiceError(400, "invalid branding logo revision")
+                self._serve_branding_logo(
+                    self.server.service.branding_logo(expected_revision)
+                )
+                return
             if (
                 not path.startswith("/internal/manager/")
                 and self.server.service.platform_update_is_blocking()
@@ -1113,6 +1150,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/system/security/config" and method == "PUT":
             self._json(service.update_platform_security_config(actor, self._body_json()))
             return
+        if path == "/api/system/branding/config" and method == "GET":
+            self._json(service.branding_admin_config(actor))
+            return
+        if path == "/api/system/branding/config" and method == "PUT":
+            self._json(service.update_branding_config(actor, self._body_json()))
+            return
+        if path == "/api/system/branding/logo" and method == "PUT":
+            self._json(service.update_branding_logo(actor, self._body_json()))
+            return
+        if path == "/api/system/branding/logo" and method == "DELETE":
+            self._json(service.clear_branding_logo(actor, self._body_json()))
+            return
         if path == "/api/system/runtime" and method == "GET":
             self._json(service.runtime_status(actor))
             return
@@ -1414,6 +1463,71 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(image)
+        except (BrokenPipeError, ConnectionError):
+            return
+
+    def _serve_branding_snapshot(self, payload: dict[str, Any]) -> None:
+        revision = int(payload.get("revision") or 0)
+        etag = f'"branding-{revision}"'
+        headers = {
+            "Cache-Control": "public, no-cache, max-age=0",
+            "ETag": etag,
+            "Cross-Origin-Resource-Policy": "same-origin",
+        }
+        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Content-Length", "0")
+            self._send_security_headers()
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_branding_logo(self, logo: dict[str, Any]) -> None:
+        content = logo.get("content")
+        mime_type = logo.get("mime_type")
+        etag = str(logo.get("etag") or "")
+        if (
+            not isinstance(content, bytes)
+            or not content
+            or mime_type not in {"image/png", "image/webp"}
+            or not re.fullmatch(r'"[0-9a-f]{64}"', etag)
+        ):
+            raise ServiceError(500, "branding logo is invalid")
+        headers = {
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": etag,
+            "Content-Disposition": "inline",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        }
+        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Content-Length", "0")
+            self._send_security_headers()
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", str(mime_type))
+        self.send_header("Content-Length", str(len(content)))
+        self._send_security_headers()
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        try:
+            self.wfile.write(content)
         except (BrokenPipeError, ConnectionError):
             return
 
@@ -2069,7 +2183,8 @@ def run_server(
 ) -> None:
     server = make_server(config, listen_host=listen_host, listen_port=listen_port)
     host, port = server.server_address[:2]
-    print(f"ubitech agent running at http://{host}:{port}")
+    product_name = server.service.branding_public_config()["product_name"]
+    print(f"{product_name} running at http://{host}:{port}")
     bootstrap_password_path = server.service.config.data_dir / BOOTSTRAP_ADMIN_PASSWORD_FILE
     if bootstrap_password_path.exists():
         print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")

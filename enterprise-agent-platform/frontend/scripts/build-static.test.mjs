@@ -33,10 +33,10 @@ async function writeFixture(stage, { hashed = true } = {}) {
       join(stage, "index.html"),
       `<!doctype html><script src="/theme-init.js"></script><script type="module" src="/${app}"></script><link rel="stylesheet" href="/${styles}">`,
     ),
-    writeFile(join(stage, app), `console.log("/ubitech-logo.png")`),
+    writeFile(join(stage, app), `console.log("application-ready")`),
     writeFile(join(stage, styles), "body{color:black}"),
     writeFile(join(stage, "theme-init.js"), `localStorage.getItem("eap-theme")`),
-    writeFile(join(stage, "ubitech-logo.png"), Buffer.concat([pngSignature, Buffer.alloc(128)])),
+    writeFile(join(stage, "asset.png"), Buffer.concat([pngSignature, Buffer.alloc(128)])),
   ]);
 }
 
@@ -67,7 +67,7 @@ describe("static asset precompression", () => {
     const root = await temporaryRoot();
     const stage = join(root, "stage");
     await writeFixture(stage);
-    const source = "const payload = 'ubitech agent performance';\n".repeat(100);
+    const source = "const payload = 'agent platform performance';\n".repeat(100);
     await writeFile(join(stage, "app-AbCd1234.js"), source);
 
     expect(await precompressStaticAssets(stage)).toContain("app-AbCd1234.js");
@@ -85,7 +85,7 @@ describe("static asset precompression", () => {
     await writeFixture(stage);
 
     await precompressStaticAssets(stage);
-    expect((await readdir(stage)).some((name) => name.startsWith("ubitech-logo.png."))).toBe(false);
+    expect((await readdir(stage)).some((name) => name.startsWith("asset.png."))).toBe(false);
     expect((await readdir(stage)).some((name) => name === "theme-init.js.br")).toBe(false);
   });
 });
@@ -100,7 +100,7 @@ describe("atomic static publication", () => {
     await Promise.all([
       writeFile(join(live, "index.html"), "old index"),
       writeFile(join(live, "theme-init.js"), "old theme"),
-      writeFile(join(live, "ubitech-logo.png"), "old logo"),
+      writeFile(join(live, "legacy-brand-logo.png"), "old logo"),
       writeFile(join(live, "app-obsolete123.js"), "old bundle"),
     ]);
 
@@ -115,12 +115,12 @@ describe("atomic static publication", () => {
 
     expect(await readFile(join(live, "index.html"), "utf8")).toBe("old index");
     expect(await readFile(join(live, "theme-init.js"), "utf8")).toBe("old theme");
-    expect(await readFile(join(live, "ubitech-logo.png"), "utf8")).toBe("old logo");
+    expect(await readFile(join(live, "legacy-brand-logo.png"), "utf8")).toBe("old logo");
     expect((await readdir(live)).sort()).toEqual([
       "app-obsolete123.js",
       "index.html",
+      "legacy-brand-logo.png",
       "theme-init.js",
-      "ubitech-logo.png",
     ]);
   });
 
@@ -140,7 +140,7 @@ describe("atomic static publication", () => {
       {
         beforeCommit: async () => {
           dependenciesReady =
-            (await readFile(join(live, "app-AbCd1234.js"), "utf8")).includes("ubitech-logo") &&
+            (await readFile(join(live, "app-AbCd1234.js"), "utf8")).includes("application-ready") &&
             (await readFile(join(live, "styles-ZyXw9876.css"), "utf8")).includes("body");
         },
       },
@@ -181,10 +181,10 @@ describe("atomic static publication", () => {
     expect((await readdir(live)).sort()).toEqual([
       ".static-release.json",
       "app-AbCd1234.js",
+      "asset.png",
       "index.html",
       "styles-ZyXw9876.css",
       "theme-init.js",
-      "ubitech-logo.png",
     ]);
     expect(JSON.parse(await readFile(join(live, ".static-release.json"), "utf8"))).toEqual({
       version: 2,

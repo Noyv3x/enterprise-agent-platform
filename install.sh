@@ -14,7 +14,7 @@ assume_yes=0
 
 usage() {
   cat <<'EOF'
-Install ubitech agent from the current container release channel.
+Install the Agent Platform from the current container release channel.
 
 Usage: ./install.sh [options]
   --manifest-url URL          persistent release manifest URL
@@ -122,7 +122,7 @@ done
 
 for path in "$config_path" "$stable_manager" "$unit_path" "$socket_path"; do
   if [[ -e "$path" || -L "$path" || -S "$path" ]]; then
-    printf '%s\n' 'an ubitech agent installation already exists; use Manager update' >&2
+    printf '%s\n' 'an Agent Platform installation already exists; use Manager update' >&2
     exit 73
   fi
 done
@@ -173,7 +173,7 @@ if ((assume_yes == 0)); then
     printf '%s\n' 'interactive confirmation requires a controlling terminal; pass --yes for unattended installation' >&2
     exit 64
   fi
-  printf 'Install ubitech agent for user %s? [y/N] ' "${USER:-$(id -un)}" >/dev/tty
+  printf 'Install the Agent Platform for user %s? [y/N] ' "${USER:-$(id -un)}" >/dev/tty
   read -r answer </dev/tty
   [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]] || exit 0
 fi
@@ -280,7 +280,7 @@ stable_installed=1
 unit_incoming="$(mktemp "$unit_dir/.ubitech-agent-manager.service.XXXXXX")"
 cat > "$unit_incoming" <<EOF
 [Unit]
-Description=ubitech agent manager
+Description=Agent Platform Manager
 Documentation=https://github.com/${repository}
 After=docker.service
 
@@ -319,4 +319,4 @@ if command -v loginctl >/dev/null \
   printf 'Warning: user lingering is disabled; run `loginctl enable-linger %s`.\n' "${USER:-$(id -un)}" >&2
 fi
 
-printf 'ubitech agent installed. Run: %s status\n' "$stable_manager"
+printf 'Agent Platform installed. Run: %s status\n' "$stable_manager"

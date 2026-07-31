@@ -1,8 +1,8 @@
 {
-  "name": "@ubitech/camofox-runtime",
+  "name": "@agent-platform/camofox-runtime",
   "version": "0.1.0",
   "private": true,
-  "description": "Locked Camoufox browser runtime for ubitech agent",
+  "description": "Locked Camoufox browser runtime for Agent Platform",
   "engines": {
     "node": ">=22.19.0"
   },

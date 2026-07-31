@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 type stateStub struct{ value model.ManagerState }
@@ -40,6 +40,26 @@ func TestMaintenancePageContainsOnlyPublicState(t *testing.T) {
 	}
 	if strings.Contains(body, "secret/host") {
 		t.Fatal("private diagnostic leaked to public maintenance page")
+	}
+	if !strings.Contains(body, "Agent Platform") || strings.Contains(strings.ToLower(body), "ubitech") {
+		t.Fatalf("maintenance page is not neutral public copy: %s", body)
+	}
+}
+
+func TestUnavailableFallbackUsesNeutralPublicCopy(t *testing.T) {
+	t.Parallel()
+	handler, err := NewHandler(stateStub{model.NewState(time.Now())}, "http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusServiceUnavailable, body)
+	}
+	if !strings.Contains(body, "Agent Platform") || strings.Contains(strings.ToLower(body), "ubitech") {
+		t.Fatalf("fallback page is not neutral public copy: %s", body)
 	}
 }
 

@@ -39,6 +39,8 @@ export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): numbe
         : 0;
     case "updates":
       return state.autoUpdateConfig?.config?.enabled ? "enabled" : 0;
+    case "branding":
+      return 0;
     case "security":
       return securityWarnings;
     case "runtime":

@@ -267,12 +267,12 @@ function reportBlockedNetworkTarget(kind, decision) {
   // making it possible to distinguish a Playwright route denial from an
   // ordinary browser/network failure.
   process.stderr.write(
-    `[ubitech-camofox-network-guard] blocked ${kind} ${decision.hostname || "unknown"} (${decision.reason})\n`,
+    `[camofox-network-guard] blocked ${kind} ${decision.hostname || "unknown"} (${decision.reason})\n`,
   );
 }
 
 function reportProxyPolicy(policy) {
-  process.stderr.write(`[ubitech-camofox-network-policy] ${policy}\n`);
+  process.stderr.write(`[camofox-network-policy] ${policy}\n`);
 }
 
 function targetPort(target, fallback) {
@@ -356,7 +356,7 @@ function auditProxyFailure(kind, error) {
   const decision = error?.decision || { hostname: "unknown", reason: "proxy-failure" };
   if (error?.blocked) reportBlockedNetworkTarget(kind, decision);
   else process.stderr.write(
-    `[ubitech-camofox-network-guard] denied ${kind} ${decision.hostname || "unknown"} (${decision.reason || "resolution-or-connect-failed"})\n`,
+    `[camofox-network-guard] denied ${kind} ${decision.hostname || "unknown"} (${decision.reason || "resolution-or-connect-failed"})\n`,
   );
 }
 

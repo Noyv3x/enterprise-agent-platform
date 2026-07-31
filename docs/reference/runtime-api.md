@@ -46,7 +46,7 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
     "sandbox_id": "agent_opaque_id",
     "workspace_id": "user-42"
   },
-  "system_prompt": "You are ubitech agent.",
+  "system_prompt": "You are Agent.",
   "input": "处理这个任务",
   "model": {
     "provider": "openai-codex",

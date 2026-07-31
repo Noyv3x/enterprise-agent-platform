@@ -1,6 +1,6 @@
-# ubitech agent 文档
+# Agent Platform 文档
 
-本目录是 ubitech agent 当前设计的唯一真相源。代码、配置、测试和运维行为应实现这里描述的设计；发生冲突时，先修正文档中的目标设计，再同步代码。
+本目录是 Agent Platform 当前设计的唯一真相源。代码、配置、测试和运维行为应实现这里描述的设计；发生冲突时，先修正文档中的目标设计，再同步代码。此名称是未配置部署品牌时的中性文档称呼，不限制管理员部署后设置的公开品牌。
 
 ## 设计
 
@@ -35,3 +35,4 @@
 
 - [架构决策记录](decisions/README.md)
 - [文档作为设计真相源](decisions/0001-documentation-is-design-source.md)
+- [可配置品牌与中性运行身份](decisions/0004-configurable-branding-and-neutral-runtime-identity.md)

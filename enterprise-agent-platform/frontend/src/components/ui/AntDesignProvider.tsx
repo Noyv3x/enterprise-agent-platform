@@ -6,6 +6,7 @@ import { useMemo, type ReactNode } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useTheme } from "../../hooks/useTheme";
 import { useI18n, type Locale } from "../../i18n";
+import { useBranding } from "../../context/BrandingContext";
 
 const ANT_LOCALES = {
   "zh-CN": zhCN,
@@ -20,6 +21,7 @@ const ANT_LOCALES = {
 export function AntDesignProvider({ children }: { children: ReactNode }) {
   const { locale } = useI18n();
   const { theme } = useTheme();
+  const { branding } = useBranding();
   const coarsePointer = useMediaQuery("(pointer: coarse)");
   const themeConfig = useMemo(() => {
     const palette = theme === "dark"
@@ -48,8 +50,8 @@ export function AntDesignProvider({ children }: { children: ReactNode }) {
       cssVar: { prefix: "eap", key: "platform" },
       hashed: false,
       token: {
-        colorPrimary: "#526a9f",
-        colorInfo: "#526a9f",
+        colorPrimary: branding.primary_color,
+        colorInfo: branding.primary_color,
         ...palette,
         borderRadius: 10,
         borderRadiusLG: 12,
@@ -86,7 +88,7 @@ export function AntDesignProvider({ children }: { children: ReactNode }) {
         },
       },
     };
-  }, [theme]);
+  }, [branding.primary_color, theme]);
 
   return (
     <ConfigProvider

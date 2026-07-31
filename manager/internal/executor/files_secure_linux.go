@@ -17,8 +17,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ubitech/agent-platform/manager/internal/contract"
-	"github.com/ubitech/agent-platform/manager/internal/sandbox"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 // managedFilePath keeps the trusted mount/host root separate from the

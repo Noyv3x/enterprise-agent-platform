@@ -40,7 +40,7 @@ RUN python -m pip install . \
 FROM python:3.11-slim-bookworm AS platform
 ARG SOURCE_COMMIT=unknown
 ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="ubitech agent platform" \
+LABEL org.opencontainers.image.title="Agent Platform" \
       org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
       org.opencontainers.image.revision="$SOURCE_COMMIT" \
       org.opencontainers.image.version="$RELEASE_VERSION"

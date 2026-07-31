@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 type StateProvider interface{ State() model.ManagerState }
@@ -320,6 +320,6 @@ func Server(listener net.Listener, handler http.Handler) *http.Server {
 	return server
 }
 
-var maintenanceTemplate = template.Must(template.New("maintenance").Parse(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ubitech agent</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f6f7f9;color:#18202d;font:16px system-ui,sans-serif}.card{width:min(36rem,calc(100% - 2rem));box-sizing:border-box;background:white;border:1px solid #dde2ea;border-radius:18px;padding:2rem;box-shadow:0 18px 55px #1b2a4015}h1{font-size:1.35rem;margin:0 0 .75rem}.meta{color:#667085;font-size:.9rem;overflow-wrap:anywhere}</style></head><body><main class="card"><h1>ubitech agent 正在更新</h1><p>更新期间暂时无法使用，完成后此页面会自动恢复。</p><p class="meta">状态：{{.state}} · 阶段：{{.phase}}<br>操作编号：{{.operation_id}}</p></main></body></html>`))
+var maintenanceTemplate = template.Must(template.New("maintenance").Parse(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Platform</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f6f7f9;color:#18202d;font:16px system-ui,sans-serif}.card{width:min(36rem,calc(100% - 2rem));box-sizing:border-box;background:white;border:1px solid #dde2ea;border-radius:18px;padding:2rem;box-shadow:0 18px 55px #1b2a4015}h1{font-size:1.35rem;margin:0 0 .75rem}.meta{color:#667085;font-size:.9rem;overflow-wrap:anywhere}</style></head><body><main class="card"><h1>系统正在更新</h1><p>更新期间暂时无法使用，完成后此页面会自动恢复。</p><p class="meta">状态：{{.state}} · 阶段：{{.phase}}<br>操作编号：{{.operation_id}}</p></main></body></html>`))
 
-const fallbackPage = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ubitech agent</title></head><body><h1>ubitech agent 暂时不可用</h1><p>服务正在恢复，请稍后重试。</p></body></html>`
+const fallbackPage = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Platform</title></head><body><h1>服务暂时不可用</h1><p>服务正在恢复，请稍后重试。</p></body></html>`

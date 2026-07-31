@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/logstore"
-	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 func TestRecordCurrentRecoveryFailurePersistsBoundedDiagnosticOnly(t *testing.T) {

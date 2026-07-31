@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
-	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 type Entry struct {

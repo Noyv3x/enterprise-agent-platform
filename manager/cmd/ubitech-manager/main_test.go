@@ -17,17 +17,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/config"
-	"github.com/ubitech/agent-platform/manager/internal/contract"
-	"github.com/ubitech/agent-platform/manager/internal/control"
-	"github.com/ubitech/agent-platform/manager/internal/driver"
-	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/maintenance"
-	"github.com/ubitech/agent-platform/manager/internal/model"
-	"github.com/ubitech/agent-platform/manager/internal/release"
-	"github.com/ubitech/agent-platform/manager/internal/sandbox"
-	"github.com/ubitech/agent-platform/manager/internal/selfupdate"
-	"github.com/ubitech/agent-platform/manager/internal/snapshot"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/maintenance"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/selfupdate"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/snapshot"
 )
 
 type observedFixedStackLocker struct {

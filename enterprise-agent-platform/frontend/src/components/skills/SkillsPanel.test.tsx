@@ -213,7 +213,7 @@ describe("SkillsPanel", () => {
     const heading = await screen.findByRole("heading", { name: "View Skill" });
     expect(heading).toBeVisible();
     expect(heading).toHaveFocus();
-    expect(screen.getByText(/read-only Skill ships with ubitech agent/)).toBeVisible();
+    expect(screen.getByText(/read-only Skill ships with the platform/)).toBeVisible();
     expect(screen.getByText(/reads preset files on demand/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Name" })).toHaveAttribute("readonly");
@@ -237,7 +237,7 @@ describe("SkillsPanel", () => {
     expect(await screen.findByRole("heading", { name: "Edit Skill" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Save" })).toBeVisible();
     expect(screen.getByRole("textbox", { name: "Name" })).not.toHaveAttribute("readonly");
-    expect(screen.queryByText(/read-only Skill ships with ubitech agent/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/read-only Skill ships with the platform/)).not.toBeInTheDocument();
   });
 
   it("discards pending editable details when management permission is revoked", async () => {

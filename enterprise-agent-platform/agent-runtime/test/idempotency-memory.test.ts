@@ -207,7 +207,7 @@ function baseRequest(workspace: string): RunRequest {
     lifecycle_id: "life",
     session_id: "session",
     workspace,
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "What do I prefer?",
     model: { provider: "openai-codex", id: "gpt-5.5" },
   };

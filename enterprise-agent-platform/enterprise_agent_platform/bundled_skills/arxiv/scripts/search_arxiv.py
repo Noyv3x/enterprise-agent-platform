@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 
 
 API_URL = "https://export.arxiv.org/api/query"
-USER_AGENT = "ubitech-agent/1.0"
+USER_AGENT = "agent-platform/1.0"
 ATOM = {"a": "http://www.w3.org/2005/Atom"}
 OPEN_SEARCH = "http://a9.com/-/spec/opensearch/1.1/"
 

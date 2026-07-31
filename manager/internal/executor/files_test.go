@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ubitech/agent-platform/manager/internal/sandbox"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 func executeSandboxFile(t *testing.T, service *Service, action string, arguments any) (string, map[string]any, error) {

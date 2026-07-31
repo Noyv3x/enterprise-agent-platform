@@ -13,6 +13,10 @@ import type {
   AgentRuntimeConfigUpdateRequest,
   AutoUpdateConfigResponse,
   AutoUpdateConfigUpdateRequest,
+  BrandingConfigUpdateRequest,
+  BrandingLogoDeleteRequest,
+  BrandingLogoUpdateRequest,
+  BrandingSnapshot,
   ManagerOperationRequest,
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
@@ -117,6 +121,10 @@ export const endpoints = {
     "GET",
     () => "/api/platform/update-status",
   ),
+  platformBranding: ep<void, BrandingSnapshot>(
+    "GET",
+    () => "/api/platform/branding",
+  ),
 
   /* auth */
   authMe: ep<void, AuthMeResponse>("GET", () => "/api/auth/me"),
@@ -133,6 +141,24 @@ export const endpoints = {
   sessionBootstrap: ep<void, SessionBootstrapResponse>(
     "GET",
     () => "/api/session/bootstrap",
+  ),
+
+  /* deployment branding */
+  brandingConfig: ep<void, BrandingSnapshot>(
+    "GET",
+    () => "/api/system/branding/config",
+  ),
+  updateBrandingConfig: ep<BrandingConfigUpdateRequest, BrandingSnapshot>(
+    "PUT",
+    () => "/api/system/branding/config",
+  ),
+  updateBrandingLogo: ep<BrandingLogoUpdateRequest, BrandingSnapshot>(
+    "PUT",
+    () => "/api/system/branding/logo",
+  ),
+  deleteBrandingLogo: ep<BrandingLogoDeleteRequest, BrandingSnapshot>(
+    "DELETE",
+    () => "/api/system/branding/logo",
   ),
 
   /* channels */

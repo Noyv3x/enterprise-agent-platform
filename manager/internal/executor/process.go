@@ -19,10 +19,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
-	"github.com/ubitech/agent-platform/manager/internal/contract"
-	"github.com/ubitech/agent-platform/manager/internal/driver"
-	"github.com/ubitech/agent-platform/manager/internal/sandbox"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type ProcessManager struct {
@@ -94,7 +94,7 @@ func (b *boundedBuffer) String() string {
 	defer b.mu.Unlock()
 	result := b.value.String()
 	if b.truncated {
-		result += "\n[output truncated by ubitech-manager]\n"
+		result += "\n[output truncated by platform manager]\n"
 	}
 	return result
 }

@@ -1102,7 +1102,7 @@ class AgentRuntimeClient:
             raise AgentRuntimeConnectionError(f"Unable to reach Agent runtime: {exc}") from exc
 
     def _headers(self, *, accept: str, content_type: bool = False) -> dict[str, str]:
-        headers = {"Accept": accept, "User-Agent": "ubitech-agent-platform/agent-runtime-client"}
+        headers = {"Accept": accept, "User-Agent": "agent-platform/agent-runtime-client"}
         if content_type:
             headers["Content-Type"] = "application/json"
         if self.bearer_token:

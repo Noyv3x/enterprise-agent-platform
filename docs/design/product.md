@@ -1,10 +1,10 @@
 # 产品设计
 
-本文定义 ubitech agent 当前产品边界。系统结构见[系统架构](system-architecture.md)，Agent 行为见 [Agent Runtime](agent-runtime.md)，安全前提见[安全与信任边界](security-and-trust.md)。
+本文定义当前产品边界。系统结构见[系统架构](system-architecture.md)，Agent 行为见 [Agent Runtime](agent-runtime.md)，安全前提见[安全与信任边界](security-and-trust.md)。
 
 ## 产品目标
 
-ubitech agent 面向彼此可信的小规模成员，为每位用户提供私人 Agent，并在共享频道中提供频道 Agent。系统将对话、文件、工作环境、会话、记忆、技能和浏览器状态按主 Agent 分开，同时允许 Agent 为单次操作显式使用宿主机能力完成真实工作。
+平台面向彼此可信的小规模成员，为每位用户提供私人 Agent，并在共享频道中提供频道 Agent。系统将对话、文件、工作环境、会话、记忆、技能和浏览器状态按主 Agent 分开，同时允许 Agent 为单次操作显式使用宿主机能力完成真实工作。
 
 每个私人 Agent 和频道主 Agent都有独立持久工作目录与 Sandbox 容器，委派子 Agent共享父环境。Sandbox 用于环境隔离和减少误操作，不是恶意多租户安全边界；显式宿主执行可以获得部署用户及其免密 sudo 权限，接受这一信任风险是部署前提。
 
@@ -17,7 +17,13 @@ ubitech agent 面向彼此可信的小规模成员，为每位用户提供私人
 - 成员可参与频道并使用私人 Agent。
 - 只读用户只能读取被授权的频道和知识内容。
 
-账号还可以分别保存显示名称、职位、模型选择、思考深度、时区和启用状态。Agent 提示词必须携带当前说话人的可用上下文，但面向用户始终以“ubitech agent”自称，不暴露内部框架、Runtime 或模型供应商实现。
+账号还可以分别保存显示名称、职位、模型选择、思考深度、时区和启用状态。Agent 提示词必须携带当前说话人的可用上下文，并使用管理员配置的 Agent 展示名称，但不暴露内部框架、Runtime 或模型供应商实现。
+
+## 品牌配置
+
+产品不绑定固定展示品牌。新部署默认产品名为 `Agent Platform`、Agent 名为 `Agent`、使用组件库默认主色且不显示 Logo；管理员可在部署后的管理面板修改产品名、Agent 名、主色和单一 Logo。品牌值对全体用户生效，产品名用于浏览器界面，Agent 名用于 Agent 自称与回复通知；它们不是新的身份、权限或提示词指令来源。
+
+登录前页面可以读取同一份公开品牌投影。公开投影只包含当前名称、主色、Logo URL 和单调 revision，不包含其它 Platform 设置。Logo 由 Platform 保存并通过同源只读端点返回；不接受远程图片 URL。Manager 在 Platform 不可用时展示中性维护文案，不把动态品牌复制成第二份控制面配置。
 
 ## 对话模型
 

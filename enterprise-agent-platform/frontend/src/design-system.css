@@ -1,11 +1,11 @@
 /*
- * ubitech agent interface foundation.
+ * Agent platform interface foundation.
  * Loaded after product tokens so the shell and shared composition have one
  * compact, predictable visual contract while route CSS stays independently lazy.
  */
 
 :root {
-  --brand: light-dark(hsl(220 25% 48%), hsl(219 42% 70%));
+  --brand: var(--deployment-brand, #1677ff);
   --accent: light-dark(hsl(220 38% 40%), hsl(219 52% 74%));
   --accent-hover: light-dark(hsl(220 42% 34%), hsl(219 58% 80%));
   --accent-solid: light-dark(hsl(220 36% 43%), hsl(220 42% 64%));
@@ -133,6 +133,7 @@ h1, h2, h3 { font-family: var(--font-sans); letter-spacing: -0.015em; }
 .auth__card form { gap: var(--space-3); }
 .auth__card .brand { margin-bottom: var(--space-2); }
 .auth__card .brand__logo { display: block; height: 24px; }
+.auth__card .brand__name { display: block; font-size: 20px; }
 .auth__card .brand__eyebrow { font-size: 11px; letter-spacing: 0.12em; }
 .auth__locale {
   position: fixed;
@@ -146,7 +147,7 @@ h1, h2, h3 { font-family: var(--font-sans); letter-spacing: -0.015em; }
 /* Preserve the original split-screen sign-in treatment without leaking its
  * warm editorial tokens into the authenticated application shell. */
 .auth--login {
-  --brand: light-dark(hsl(220 22% 53%), hsl(222 30% 67%));
+  --brand: var(--deployment-brand, #1677ff);
   --accent: light-dark(hsl(222 24% 41%), hsl(223 40% 77%));
   --accent-hover: light-dark(hsl(223 27% 34%), hsl(223 48% 84%));
   --accent-solid: light-dark(hsl(222 23% 45%), hsl(222 27% 66%));
@@ -200,6 +201,7 @@ h1, h2, h3 { font-family: var(--font-sans); letter-spacing: -0.015em; }
 .auth--login .auth__card form { gap: 13px; }
 .auth--login .auth__card .brand { margin-bottom: 0; }
 .auth--login .auth__card .brand__logo { display: none; }
+.auth--login .auth__card .brand__name { display: none; }
 .auth--login .auth__card .brand__eyebrow { font-size: 11.5px; letter-spacing: 0.2em; }
 .auth--login .auth__locale {
   position: static;
@@ -394,6 +396,7 @@ h1, h2, h3 { font-family: var(--font-sans); letter-spacing: -0.015em; }
   .auth--login .auth__aside { display: none; }
   .auth--login .auth__main { grid-template-columns: minmax(0, 1fr); }
   .auth--login .auth__card .brand__logo { display: block; height: 24px; }
+  .auth--login .auth__card .brand__name { display: block; }
   .shell { grid-template-columns: minmax(0, 1fr); }
   .topbar {
     min-height: 60px;

@@ -26,6 +26,9 @@ const TokenUsageMonitoring = lazy(() => import("./tokens/TokenUsageMonitoring").
 const AutoUpdateConfig = lazy(() => import("./config/AutoUpdateConfig").then(
   (module) => ({ default: module.AutoUpdateConfig }),
 ));
+const BrandingSettings = lazy(() => import("./config/BrandingSettings").then(
+  (module) => ({ default: module.BrandingSettings }),
+));
 const CogneeInternalConfig = lazy(() => import("./config/CogneeInternalConfig").then(
   (module) => ({ default: module.CogneeInternalConfig }),
 ));
@@ -93,6 +96,9 @@ export function AdminPageContent({
       break;
     case "updates":
       content = <AutoUpdateConfig />;
+      break;
+    case "branding":
+      content = <BrandingSettings />;
       break;
     case "security":
       content = <SecuritySettings />;

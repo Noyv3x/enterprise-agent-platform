@@ -128,8 +128,6 @@ export function intlLocale(locale: Locale = activeLocale): string {
 
 interface LocaleDocument {
   documentElement: { lang: string };
-  title: string;
-  querySelector(selector: string): { setAttribute(name: string, value: string): void } | null;
 }
 
 export function applyDocumentLocale(
@@ -138,8 +136,6 @@ export function applyDocumentLocale(
 ): void {
   if (!target) return;
   target.documentElement.lang = locale;
-  target.title = translate(locale, "app.title");
-  target.querySelector('meta[name="description"]')?.setAttribute("content", translate(locale, "app.description"));
 }
 
 function persistLocale(locale: Locale): void {

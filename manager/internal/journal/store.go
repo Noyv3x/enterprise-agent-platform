@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
-	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 var ErrOperationInProgress = errors.New("another mutation operation is already active")

@@ -62,6 +62,7 @@ export const ADMIN_PAGES: AdminPage[] = [
   { id: "messages", label: "messages", icon: "message", description: "messages" },
   { id: "agent-runtime", label: "agent-runtime", icon: "bot", description: "agent-runtime" },
   { id: "telegram", label: "Telegram", icon: "message", description: "telegram" },
+  { id: "branding", label: "branding", icon: "settings", description: "branding" },
   { id: "updates", label: "updates", icon: "refresh", description: "updates" },
   { id: "security", label: "security", icon: "key", description: "security" },
   { id: "runtime", label: "runtime", icon: "server", description: "runtime" },

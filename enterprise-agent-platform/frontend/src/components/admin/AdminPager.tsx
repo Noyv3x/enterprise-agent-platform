@@ -18,7 +18,7 @@ export const ADMIN_PAGE_GROUPS: ReadonlyArray<{
 }> = [
   { id: "people", pages: ["accounts", "tokens", "messages"] },
   { id: "agents", pages: ["agent-runtime", "telegram"] },
-  { id: "system", pages: ["updates", "security", "runtime"] },
+  { id: "system", pages: ["branding", "updates", "security", "runtime"] },
   { id: "advanced", pages: ["cognee", "secrets"] },
 ];
 

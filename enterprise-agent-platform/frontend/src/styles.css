@@ -1,5 +1,5 @@
 /* =====================================================================
-   ubitech agent — product tokens and product-specific layout
+   Agent platform product tokens and product-specific layout
    Generic controls are owned by Ant Design; this sheet contains the app shell,
    chat composition, administration content and other product structures.
    ===================================================================== */
@@ -7,8 +7,8 @@
 :root {
   color-scheme: light dark;
 
-  /* ---- Brand: hazy slate-blue #7080A0 + light-blue support ---- */
-  --brand:         light-dark(hsl(220 22% 53%), hsl(222 30% 67%));
+  /* ---- Deployment-configurable brand + neutral support palette ---- */
+  --brand:         var(--deployment-brand, #1677ff);
   --accent:        light-dark(hsl(222 24% 41%), hsl(223 40% 77%));
   --accent-hover:  light-dark(hsl(223 27% 34%), hsl(223 48% 84%));
   --accent-solid:  light-dark(hsl(222 23% 45%), hsl(222 27% 66%));
@@ -253,7 +253,10 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
   pointer-events: none;
 }
 .auth__aside > * { position: relative; }
-.auth__logo { height: 44px; width: auto; filter: brightness(0) invert(1); opacity: 0.96; }
+.auth__logo { max-width: min(320px, 80%); color: white; opacity: 0.96; }
+.auth__logo .brand__logo { width: auto; max-width: 100%; height: 44px; object-fit: contain; }
+.auth__logo .brand__name { color: white; font-size: clamp(25px, 3vw, 38px); }
+.auth__logo .brand__eyebrow { color: hsl(42 30% 90% / 0.8); }
 
 .auth__main { display: grid; place-items: center; padding: 28px; background: var(--bg); }
 .auth__card {
@@ -266,6 +269,7 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
 .auth__card form { display: grid; gap: 13px; }
 /* ---- Aside already shows the logo on wide screens; avoid a duplicate in the card ---- */
 .auth__card .brand__logo { display: none; }
+.auth__card .brand__name { display: none; }
 .auth__card .brand__eyebrow { font-size: 11.5px; }
 .auth__locale { display: flex; justify-content: flex-end; margin-bottom: 4px; }
 .boot-status p { margin: 0; line-height: 1.55; }
@@ -418,7 +422,8 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
   padding: 16px 16px 14px;
 }
 .brand { display: grid; gap: 5px; justify-items: start; min-width: 0; }
-.brand__logo { height: 20px; width: auto; display: block; }
+.brand__logo { height: 20px; width: auto; max-width: 100%; object-fit: contain; display: block; }
+.brand__name { max-width: 100%; overflow: hidden; color: var(--ink); font-size: 16px; font-weight: 700; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
 .brand__eyebrow { font-size: 10px; letter-spacing: 0; text-transform: uppercase; color: var(--faint); }
 
 .sidebar__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 12px 12px; display: flex; flex-direction: column; gap: 18px; }

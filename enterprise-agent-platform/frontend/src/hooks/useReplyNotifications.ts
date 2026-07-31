@@ -10,6 +10,7 @@ import { registerSessionTeardown } from "../data/sessionActions";
 import { useI18n } from "../i18n";
 import { useStore, useStoreHandle } from "../store/useStore";
 import type { ChatMode } from "../types";
+import { useBranding } from "../context/BrandingContext";
 
 interface ReplyCompletionEvent {
   message_id?: unknown;
@@ -40,6 +41,7 @@ function parsePayload(event: MessageEvent<string>): ReplyCompletionEvent | null 
 export function useReplyNotifications(): void {
   const store = useStoreHandle();
   const { t } = useI18n();
+  const { branding } = useBranding();
   const userId = useStore((state) => state.user?.id);
   const [enabled, setEnabled] = useState(false);
 
@@ -102,9 +104,9 @@ export function useReplyNotifications(): void {
       watermark = messageId;
 
       if (Notification.permission !== "granted" || (!document.hidden && document.hasFocus())) return;
-      const notification = new Notification(t("notifications.reply.title"), {
+      const notification = new Notification(t("notifications.reply.title", { agent: branding.agent_name }), {
         body: t("notifications.reply.body"),
-        tag: `ubitech-agent-reply-${userId}-${mode}:${scopeId}-${messageId}`,
+        tag: `agent-platform-reply-${userId}-${mode}:${scopeId}-${messageId}`,
       });
       notification.onclick = () => {
         window.focus();
@@ -124,5 +126,5 @@ export function useReplyNotifications(): void {
       unregister();
       close();
     };
-  }, [enabled, store, t, userId]);
+  }, [branding.agent_name, enabled, store, t, userId]);
 }

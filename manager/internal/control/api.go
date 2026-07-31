@@ -13,14 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/config"
-	"github.com/ubitech/agent-platform/manager/internal/driver"
-	"github.com/ubitech/agent-platform/manager/internal/executor"
-	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/logstore"
-	"github.com/ubitech/agent-platform/manager/internal/model"
-	"github.com/ubitech/agent-platform/manager/internal/operation"
-	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/executor"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/operation"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 type API struct {

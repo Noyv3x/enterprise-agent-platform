@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/control"
-	"github.com/ubitech/agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 )
 
 func TestPendingCandidateControlHandlerOpensOnlyIdentityUntilPromotion(t *testing.T) {

@@ -1186,7 +1186,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$SOURCE_COMMIT" \
-              --title "ubitech agent ${SOURCE_COMMIT:0:12}" \
+              --title "Agent Platform ${SOURCE_COMMIT:0:12}" \
               --notes "Immutable Docker release for ${SOURCE_COMMIT}." \
               --draft
           fi

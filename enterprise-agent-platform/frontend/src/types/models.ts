@@ -625,6 +625,7 @@ export type AdminPageId =
   | "messages"
   | "telegram"
   | "updates"
+  | "branding"
   | "security"
   | "runtime"
   | "agent-runtime"

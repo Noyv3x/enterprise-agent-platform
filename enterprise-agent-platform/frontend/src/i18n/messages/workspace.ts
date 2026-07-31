@@ -117,9 +117,9 @@ export const workspaceMessages = defineMessages({
     "zh-TW": "瀏覽器已封鎖通知，請在瀏覽器網站設定中重新允許。",
   },
   "notifications.reply.title": {
-    "zh-CN": "ubitech agent 已回复",
-    en: "ubitech agent replied",
-    "zh-TW": "ubitech agent 已回覆",
+    "zh-CN": "{agent} 已回复",
+    en: "{agent} replied",
+    "zh-TW": "{agent} 已回覆",
   },
   "notifications.reply.body": {
     "zh-CN": "点击返回对话查看回复。",

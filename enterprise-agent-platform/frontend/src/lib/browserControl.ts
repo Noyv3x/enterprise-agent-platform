@@ -1,6 +1,6 @@
 import type { AgentPreviewScope } from "../types";
 
-export const BROWSER_CONTROL_RELINQUISH_EVENT = "ubitech:browser-control-relinquish";
+export const BROWSER_CONTROL_RELINQUISH_EVENT = "agent-platform:browser-control-relinquish";
 
 interface BrowserControlRelinquishDetail extends AgentPreviewScope {
   waitUntil: (operation: Promise<unknown>) => void;

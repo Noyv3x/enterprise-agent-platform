@@ -30,7 +30,7 @@ function BootScreen({
   return (
     <main className="auth auth--login">
       <aside className="auth__aside">
-        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
+        <Brand className="auth__logo" />
       </aside>
       <div className="auth__main">
         <section

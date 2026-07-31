@@ -5,6 +5,7 @@ import type { AdminPageId, AppState } from "../types";
 import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
 import {
   loadAutoUpdateConfig,
+  loadBrandingConfig,
   loadAgentRuntimeConfig,
   loadCogneeConfig,
   loadMessageAudit,
@@ -38,6 +39,8 @@ export function loadAdminPage(store: AppStore, pageId: AdminPageId): Promise<voi
       return loadTelegramConfig(store);
     case "updates":
       return loadAutoUpdateConfig(store);
+    case "branding":
+      return loadBrandingConfig(store);
     case "security":
       return Promise.all([loadSecurityConfig(store), loadAutoUpdateConfig(store)]).then(() => undefined);
     case "runtime":
@@ -77,6 +80,8 @@ export function hasAdminPageData(state: AppState, pageId: AdminPageId): boolean 
       return state.telegramConfig !== null;
     case "updates":
       return state.autoUpdateConfig !== null;
+    case "branding":
+      return state.brandingConfig !== null;
     case "security":
       return state.securityConfig !== null;
     case "runtime":

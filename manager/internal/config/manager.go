@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 )
 
 type Public struct {

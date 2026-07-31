@@ -1,4 +1,4 @@
-# ubitech agent runtime
+# Agent Runtime
 
 This directory contains the platform-owned Node.js Agent runtime. Its architecture, policy, configuration, and private protocol are defined only in the repository's canonical documentation layer:
 

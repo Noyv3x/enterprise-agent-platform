@@ -48,6 +48,10 @@
 
 `manager.toml` 位于 `~/.config/ubitech-agent/`，不属于数据根。`data_root` 是这个布局的唯一可配置根，Platform 权威数据目录始终是规范化后的 `$data_root/data`；schema migration、快照、Sandbox registry 和容器 bind mount 必须引用同一数据目录，不接受第二个 `data_dir`。
 
+上述 `ubitech-*`、`.ubitech*` 和 `enterprise_*` 名称只是当前白标发布读取的桥接源身份，不是可定制品牌或最终基线。品牌设置保存在 Platform 权威数据中，但不得改变数据根、数据库文件、Runtime 目录、workspace/session identity、附件挂载、Skill 状态、Manager journal 或备份路径；品牌修改也不搬移任何文件。备份与恢复必须按真实技术路径工作，不能把管理员显示名称拼入文件名或目录。
+
+紧随本发布的数据布局交接只能由[两发布 Manager handoff](../operations/deployment.md#技术命名空间交接)执行。目标宿主根固定为 `~/.local/share/agent-platform`，容器数据根固定为 `/var/lib/agent-platform`，内部工作目录固定为 `.agent-platform`；桥接必须在 writer 停止后从已验证源根和这些固定目标操作，以持久 journal、快照、原子 rename 或有校验的同文件系统 staging、文件与父目录 fsync完成每个阶段。禁止用符号链接、活跃数据库复制、双根写入或递归猜测来维持兼容。数据库 marker、Runtime session/idempotency、scope/workspace marker、内部附件/计划目录、Sandbox registry、Manager self-update path及其引用必须作为一个可回滚身份集合验收。第二发布确认目标基线后删除迁移器和源路径识别，不能把一次性兼容变成长期读取分支。
+
 所有产品持久状态使用宿主 bind mount。Docker 镜像、container writable layer、Engine metadata 和有界容器日志不属于备份数据。不得使用匿名 volume 保存产品权威状态。
 
 ## Platform 与文件数据

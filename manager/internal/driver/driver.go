@@ -21,11 +21,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/atomicfile"
-	"github.com/ubitech/agent-platform/manager/internal/contract"
-	"github.com/ubitech/agent-platform/manager/internal/journal"
-	"github.com/ubitech/agent-platform/manager/internal/release"
-	"github.com/ubitech/agent-platform/manager/internal/snapshot"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/snapshot"
 )
 
 type Result struct {
@@ -128,7 +128,7 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (b *limitedBuffer) String() string {
 	value := b.Buffer.String()
 	if b.truncated {
-		value += "\n[output truncated by ubitech-manager]\n"
+		value += "\n[output truncated by platform manager]\n"
 	}
 	return value
 }

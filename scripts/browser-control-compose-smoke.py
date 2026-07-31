@@ -18,7 +18,7 @@ from typing import Any
 
 
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
-CONTROL_TEXT = "UBITECH-HUMAN-CONTROL"
+CONTROL_TEXT = "AGENT-PLATFORM-HUMAN-CONTROL"
 
 
 class SmokeError(RuntimeError):

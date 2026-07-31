@@ -249,7 +249,7 @@ describe("MemoryPanel", () => {
     expect(mocks.exportAgentMemories).toHaveBeenCalledTimes(1);
     expect(mocks.downloadJson).toHaveBeenCalledWith(
       expect.objectContaining({ memories: [agentMemory, userMemory] }),
-      expect.stringMatching(/^ubitech-agent-memories-\d{4}-\d{2}-\d{2}\.json$/),
+      expect.stringMatching(/^agent-memories-\d{4}-\d{2}-\d{2}\.json$/),
     );
   });
 

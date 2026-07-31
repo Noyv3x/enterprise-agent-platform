@@ -30,11 +30,9 @@ export const RELEASE_MANIFEST = ".static-release.json";
 const FIXED_FILES = new Set([
   "index.html",
   "theme-init.js",
-  "ubitech-logo.png",
   RELEASE_MANIFEST,
 ]);
 const HASHED_ASSET_RE = /-[A-Za-z0-9_-]{8,}\.(?:js|css)$/;
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const COMPRESSIBLE_ASSET_RE = /\.(?:css|html|js|json|map|svg|txt|xml)$/i;
 const PRECOMPRESS_MIN_BYTES = 512;
 const brotliCompress = promisify(brotliCompressCallback);
@@ -106,10 +104,8 @@ export async function validateStagedBuild(stageDir) {
   await listFiles(stageDir);
   const indexPath = join(stageDir, "index.html");
   const themePath = join(stageDir, "theme-init.js");
-  const logoPath = join(stageDir, "ubitech-logo.png");
   await assertRegularNonempty(indexPath, "index.html");
   await assertRegularNonempty(themePath, "theme-init.js");
-  await assertRegularNonempty(logoPath, "ubitech-logo.png");
 
   const indexHtml = await readFile(indexPath, "utf8");
   if (!/<script\b[^>]*\bsrc=["']\/theme-init\.js["']/i.test(indexHtml)) {
@@ -128,15 +124,6 @@ export async function validateStagedBuild(stageDir) {
 
   const theme = await readFile(themePath, "utf8");
   if (!theme.includes("eap-theme")) throw new Error("theme-init.js failed its content check");
-  const logo = await readFile(logoPath);
-  if (logo.length < 100 || !logo.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
-    throw new Error("ubitech-logo.png failed its PNG signature/size check");
-  }
-  const entryCode = (await Promise.all(scripts.map((asset) => readFile(join(stageDir, asset), "utf8")))).join("\n");
-  if (!entryCode.includes("/ubitech-logo.png")) {
-    throw new Error("JavaScript entry does not reference /ubitech-logo.png");
-  }
-
   return { files: await listFiles(stageDir), scripts, styles };
 }
 
@@ -257,15 +244,6 @@ function runVite(stageDir) {
   });
 }
 
-async function copyLogoIntoStage(stageDir) {
-  const publicLogo = join(frontendDir, "public/ubitech-logo.png");
-  const source = (await exists(publicLogo)) ? publicLogo : join(liveStaticDir, "ubitech-logo.png");
-  if (!(await exists(source))) {
-    throw new Error("ubitech-logo.png is missing from both frontend/public and live static");
-  }
-  await copyFile(source, join(stageDir, "ubitech-logo.png"));
-}
-
 export async function precompressStaticAssets(stageDir) {
   const files = await listFiles(stageDir);
   const compressed = [];
@@ -309,7 +287,6 @@ async function main() {
     ]);
     if (stageDevice !== liveParentDevice) throw new Error("static staging must share the live filesystem");
     await runVite(stageDir);
-    await copyLogoIntoStage(stageDir);
     await validateStagedBuild(stageDir);
     await precompressStaticAssets(stageDir);
     // Re-read the staged tree after precompression. The release manifest is

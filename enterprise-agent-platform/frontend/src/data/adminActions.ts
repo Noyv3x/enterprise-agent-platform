@@ -11,6 +11,7 @@ import {
   loadAuditPrivateMessages,
   loadAgentRuntimeConfig,
   loadAutoUpdateConfig,
+  loadBrandingConfig,
   loadChannelMessages,
   loadChannels,
   loadCogneeConfig,
@@ -32,6 +33,10 @@ import { t } from "../i18n";
 import type {
   AdminPageId,
   AutoUpdateConfigUpdateRequest,
+  BrandingConfigUpdateRequest,
+  BrandingLogoDeleteRequest,
+  BrandingLogoUpdateRequest,
+  BrandingSnapshot,
   ManagerOperation,
   CreateUserRequest,
   DeleteBeforeRequest,
@@ -350,6 +355,76 @@ export async function saveAutoUpdateConfig(
   });
 }
 
+async function runBrandingMutation(
+  store: AppStore,
+  operationId: string,
+  request: () => Promise<BrandingSnapshot>,
+  onApplied: (snapshot: BrandingSnapshot) => void,
+): Promise<void> {
+  await runBusy(store, operationId, async () => {
+    try {
+      const result = await request();
+      store.dispatch({ type: "SET_BRANDING_CONFIG", payload: result });
+      onApplied(result);
+      toast(t("admin.toast.brandingSaved"), { type: "ok", title: t("admin.toast.complete") });
+    } catch (error) {
+      await loadBrandingConfig(store).then(() => {
+        const current = store.getState().brandingConfig;
+        if (current) onApplied(current);
+      }).catch(() => undefined);
+      throw error;
+    }
+  });
+}
+
+export function saveBrandingConfig(
+  store: AppStore,
+  body: BrandingConfigUpdateRequest,
+  onApplied: (snapshot: BrandingSnapshot) => void,
+): Promise<void> {
+  return runBrandingMutation(
+    store,
+    "admin:branding:save",
+    () => api<BrandingSnapshot>(endpoints.updateBrandingConfig.path(), {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+    onApplied,
+  );
+}
+
+export function saveBrandingLogo(
+  store: AppStore,
+  body: BrandingLogoUpdateRequest,
+  onApplied: (snapshot: BrandingSnapshot) => void,
+): Promise<void> {
+  return runBrandingMutation(
+    store,
+    "admin:branding:logo:save",
+    () => api<BrandingSnapshot>(endpoints.updateBrandingLogo.path(), {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+    onApplied,
+  );
+}
+
+export function deleteBrandingLogo(
+  store: AppStore,
+  body: BrandingLogoDeleteRequest,
+  onApplied: (snapshot: BrandingSnapshot) => void,
+): Promise<void> {
+  return runBrandingMutation(
+    store,
+    "admin:branding:logo:delete",
+    () => api<BrandingSnapshot>(endpoints.deleteBrandingLogo.path(), {
+      method: "DELETE",
+      body: JSON.stringify(body),
+    }),
+    onApplied,
+  );
+}
+
 /** Save the Manager-owned, hot-reloaded LAN listener configuration. */
 export async function saveLANAccessConfig(
   store: AppStore,
@@ -511,7 +586,7 @@ export function setOAuthCallbackUrl(store: AppStore, providerId: string, value: 
 export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   await runBusy(store, "admin:oauth:export", async () => {
     const payload = await api(endpoints.exportOAuthCredentials.path());
-    downloadJson(payload, `ubitech-agent-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
+    downloadJson(payload, `agent-oauth-credentials-${new Date().toISOString().slice(0, 10)}.json`);
     toast(t("admin.toast.oauthExported"), { type: "ok", title: t("admin.toast.complete") });
   });
 }

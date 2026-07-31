@@ -4,7 +4,7 @@
 
 ## 信任模型
 
-ubitech agent 面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个私人 Agent 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
+平台面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个私人 Agent 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
 
 默认工具在 Sandbox 执行并免人工审批，但仍受不可绕过的 hard-block。模型可以为单次 terminal、文件或进程调用显式选择宿主目标；任何 `target=host` 调用都必须由用户逐次批准，不能形成会话或永久授权。管理器随后才以部署用户执行；terminal 还允许使用该用户已有的免密 `sudo`。这等同把该次操作授予部署用户乃至 root 能力。部署方必须只给可信成员使用，并把部署用户、宿主文件和网络权限控制在可接受范围。
 
@@ -99,6 +99,14 @@ Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理�
 OAuth refresh token、邮箱应用密码、session secret、内部 token 和其它 secret 保存在 Platform SQLite 的专用凭据表或 `settings` 表，并只返回“已配置”状态；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。
 
 OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。
+
+## 品牌输入与公开读取
+
+品牌配置只允许管理员写入，并以单调 revision 防止并发管理请求覆盖较新的值。公开读取端点无需登录，但只能返回产品名、Agent 名、规范主色、同源 Logo URL 和 revision；不得借此暴露通用 `settings`、更新时间、管理员身份、文件路径或 secret。产品名和 Agent 名必须拒绝控制字符、Unicode 行/段分隔符并限制长度；进入 Agent 系统提示时作为闭合结构化数据而不是可执行指令。
+
+品牌 Logo 只接受经过服务端完整解码、声明 MIME 和尺寸复核的有界 PNG 或 WebP。完整 Pillow 解码只允许发生在管理员 `PUT` 的写入路径，并且必须在持久化之前完成；读取请求正文、打开解码器和解码完成后都必须复核 `256 KiB`、单边 `4096` 像素和总计 `16,777,216` 像素上限。容器头、尺寸字段或图片库的惰性 `open` 成功都不能替代写入时的完整像素解码。每个文件必须恰好包含一张可解码位图：拒绝 SVG、远程 URL、截断数据、header-only WebP、无 IDAT 的 PNG、动画/多帧、重复图像 bitstream、格式与声明不符、尾随数据、零尺寸和任一超限。
+
+匿名公开 Logo `GET` 只能读取已经验证并持久化的内容，不得再次打开图片解码器或调用像素 `load`。读取路径只执行严格 base64 解码、`1..256 KiB` 大小校验，以及正文大小和 SHA-256 与已规范化 metadata 的一致性校验；发现存储损坏返回服务端错误。响应使用 metadata 白名单 MIME、`nosniff`、ETag 和公开缓存语义。Logo 与配置 revision 在同一 SQLite 写事务内提交，读取到的公开快照不能把旧 Logo 内容与新 revision 混合。
 
 ## 不可信内容与提示词注入
 

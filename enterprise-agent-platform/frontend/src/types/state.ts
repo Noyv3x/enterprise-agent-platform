@@ -32,6 +32,7 @@ import type {
   TypingUser,
   User,
 } from "./models";
+import type { BrandingSnapshot } from "./api";
 
 export interface AppState {
   /* auth slice */
@@ -76,6 +77,7 @@ export interface AppState {
   agentRuntimeConfig: AgentRuntimeConfigState | null;
   telegramConfig: TelegramConfigState | null;
   autoUpdateConfig: AutoUpdateConfigState | null;
+  brandingConfig: BrandingSnapshot | null;
   cogneeConfig: CogneeConfigState | null;
   securityConfig: SecurityConfigState | null;
   oauthProviders: OAuthProvidersState | null;
@@ -168,6 +170,7 @@ export type AdminSliceState = Pick<
   | "agentRuntimeConfig"
   | "telegramConfig"
   | "autoUpdateConfig"
+  | "brandingConfig"
   | "cogneeConfig"
   | "securityConfig"
   | "oauthProviders"
@@ -389,6 +392,10 @@ interface SetAutoUpdateConfigAction {
   type: "SET_AUTO_UPDATE_CONFIG";
   payload: AutoUpdateConfigState | null;
 }
+interface SetBrandingConfigAction {
+  type: "SET_BRANDING_CONFIG";
+  payload: BrandingSnapshot | null;
+}
 interface SetCogneeConfigAction {
   type: "SET_COGNEE_CONFIG";
   payload: CogneeConfigState | null;
@@ -494,6 +501,7 @@ export type Action =
   | SetAgentRuntimeConfigAction
   | SetTelegramConfigAction
   | SetAutoUpdateConfigAction
+  | SetBrandingConfigAction
   | SetCogneeConfigAction
   | SetSecurityConfigAction
   | SetOAuthProvidersAction

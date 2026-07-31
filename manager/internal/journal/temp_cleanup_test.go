@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 func TestUnfinishedOperationsCleansCrashLeftAtomicResidue(t *testing.T) {

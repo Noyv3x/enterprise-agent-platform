@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 )
 
 type Config struct {

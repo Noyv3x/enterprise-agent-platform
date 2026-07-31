@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/ubitech/agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 )
 
 // HostPathAccess selects the hard-block policy applied at the Manager's

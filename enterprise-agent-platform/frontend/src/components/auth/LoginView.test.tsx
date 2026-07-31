@@ -40,7 +40,8 @@ describe("LoginView", () => {
 
     const aside = page?.querySelector(".auth__aside");
     expect(aside).toBeInTheDocument();
-    expect(within(aside as HTMLElement).getByRole("img", { name: "ubitech" })).toBeInTheDocument();
+    expect(within(aside as HTMLElement).getByText("Agent Platform")).toBeInTheDocument();
+    expect(within(aside as HTMLElement).getByText("Agent")).toBeInTheDocument();
 
     const card = page?.querySelector(".auth__card");
     expect(card).toContainElement(screen.getByRole("combobox", { name: "Language" }));

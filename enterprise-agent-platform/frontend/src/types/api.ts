@@ -36,6 +36,34 @@ import type {
   User,
 } from "./models";
 
+/* ------------------------------------------------------------- branding */
+
+export interface BrandingSnapshot {
+  schema_version: 1;
+  revision: number;
+  product_name: string;
+  agent_name: string;
+  primary_color: string;
+  logo_url: string | null;
+}
+
+export interface BrandingConfigUpdateRequest {
+  expected_revision: number;
+  product_name: string;
+  agent_name: string;
+  primary_color: string;
+}
+
+export interface BrandingLogoUpdateRequest {
+  expected_revision: number;
+  mime_type: "image/png" | "image/webp";
+  data_base64: string;
+}
+
+export interface BrandingLogoDeleteRequest {
+  expected_revision: number;
+}
+
 /* ------------------------------------------------------------------ auth */
 
 export interface AuthMeResponse {

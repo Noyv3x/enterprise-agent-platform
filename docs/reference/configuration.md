@@ -2,7 +2,7 @@
 
 本文说明 Docker 部署后的配置所有权、来源和生命周期。部署方式见[部署](../operations/deployment.md)，目录位置见[数据布局](data-layout.md)。Run 策略见 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器管理契约见 [`container-platform.json`](../contracts/container-platform.json)。
 
-Platform 只接受容器基线：`UBITECH_DEPLOYMENT_MODE` 必须显式为 `container`，Manager socket 与 token 文件必须是绝对路径。固定服务缺省地址使用 Compose DNS（`agent-runtime`、`camofox`、`searxng`、`firecrawl-api`）；产品代码不提供 development/source/宿主回环模式开关。
+Platform 只接受容器基线：`UBITECH_DEPLOYMENT_MODE` 必须显式为 `container`，Manager socket 与 token 文件必须是绝对路径。固定服务缺省地址使用 Compose DNS（`agent-runtime`、`camofox`、`searxng`、`firecrawl-api`）；产品代码不提供 development/source/宿主回环模式开关。本节出现的 `ubitech-*` 路径和 `UBITECH_*` 名称是前序白标发布仍需读取的桥接源身份；目标中性身份和交接边界以[部署文档](../operations/deployment.md#技术命名空间交接)为准。
 
 ## 配置所有权
 
@@ -29,7 +29,7 @@ lan_enabled = false
 lan_listen = "127.0.0.1:8081"
 direct_access_cidrs = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"]
 trusted_ingress_cidrs = ["127.0.0.0/8", "::1/128"]
-release_manifest_url = "https://example.invalid/ubitech-agent/main.json"
+release_manifest_url = "https://example.invalid/agent-platform/main.json"
 release_channel = "main"
 update_enabled = true
 update_interval = "5m"
@@ -82,6 +82,12 @@ Platform 命令行只有当前容器入口使用的 `serve --host --port --data`
 若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
 
 ## Platform 动态设置
+
+### 品牌
+
+Platform 是展示品牌的唯一所有者。`ui_branding_v1` 保存 schema version、单调 revision、产品名、Agent 名、主色和当前 Logo 元数据；`ui_branding_logo_v1` 保存有界的同源位图内容。两者都属于非 secret SQLite 设置，不接受环境变量、Manager TOML 或 release manifest 覆盖。新部署未配置时使用产品名 `Agent Platform`、Agent 名 `Agent`、主色 `#1677ff` 且无 Logo。
+
+公开读取接口为 `GET /api/platform/branding` 和它返回的同源 Logo URL。管理员通过 `GET/PUT /api/system/branding/config` 读取或更新名称与主色，通过 `PUT/DELETE /api/system/branding/logo` 替换或清除 Logo；每个写请求必须携带读取到的 `expected_revision`，过期 revision 返回冲突且不修改任何设置。配置接口不提供远程 Logo URL，也不把 Logo 正文塞入 session bootstrap 或普通 JSON 投影。管理员上传 Logo 时，Platform 使用明确声明的受限图片解码依赖，在持久化前完整解码并验证唯一单帧位图；容器构建必须从 `pyproject.toml` 安装同一依赖，不能只在开发机偶然可用。匿名 Logo 读取只验证已存正文的严格 base64、大小、SHA-256 与 metadata 一致性，不打开图片解码器或加载像素。
 
 ### 平台与认证
 

@@ -135,7 +135,7 @@ function request(model: ModelRequest): RunRequest {
     lifecycle_id: "life",
     session_id: "session",
     workspace: "/tmp/workspace",
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "hello",
     model,
   };

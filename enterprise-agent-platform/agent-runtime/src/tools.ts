@@ -1411,7 +1411,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
   const delegateTool: AgentTool<typeof delegateSchema, JsonValue> = {
     name: "delegate_task",
     label: "Delegate task",
-    description: "Delegate a bounded task to a child ubitech agent sharing the parent workspace but using an isolated session.",
+    description: "Delegate a bounded task to a child Agent sharing the parent workspace but using an isolated session.",
     parameters: delegateSchema,
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {

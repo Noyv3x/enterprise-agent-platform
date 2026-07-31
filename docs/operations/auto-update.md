@@ -12,6 +12,123 @@ Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Com
 
 当前通道发布出的 release manifest 镜像目录必须与当前契约定义的服务集合精确相等；缺少必需镜像或由发布器携带未知、退役服务键都在发布前失败。JSON Schema、发布组装和静态验收共用同一集合，不能通过额外字段保留第二套运行基线。Manager 解析器只为协议前向演进接受名称和 digest 格式安全的额外镜像项，并将其视为不可执行的 opaque metadata；只有当前契约显式命名的镜像能够被拉取、启动或展示。
 
+管理员品牌配置不是 release identity。产品显示名称、标识图或其它展示字段变化不创建 generation，不改变清单 URL、commit、镜像 digest、Manager 路径、Compose/Docker identity、环境变量或任何更新幂等键；更新期间也不能从品牌值推断这些字段。Platform 不可达时，Manager 使用中性维护文案，不把读取业务数据库作为控制面健康或回滚前提。
+
+### 技术命名空间迁移发布
+
+当前白标发布只清除产品展示绑定，不宣称具备命名空间迁移所有权。其后必须先发布一个普通、不会触发迁移的源侧交接能力 generation；该 generation 在全部现役实例上稳定并通过真实断电恢复矩阵后，下一 release 才执行[技术命名空间交接](deployment.md#技术命名空间交接)，并再由一个清理发布形成连续的两发布事务，不能伪装成普通镜像 generation 更新。桥接发布继续提供现役 Manager 能发现并校验的原技术资产，同时把签名目标固定为 `agent-platform-manager`、`agent-platform-manager.service`、`~/.config/agent-platform`、`~/.local/share/agent-platform`、`/var/lib/agent-platform`、`agent-platform`、`agent-platform_core`、`AGENT_PLATFORM_*`、`io.agent-platform.*`、`agent-platform-sandbox-*` 和 `.agent-platform`。在进入维护前它必须证明系统处于无 operation、无 activation/watchdog、无执行调用的稳定边界，并先持久化绑定源/目标全部身份的 handoff journal。其公开 operation 只有在目标 Manager 已接管、目标核心 generation 健康、自动更新轮询可达且源身份已安全退役后才能 finalize；仅复制数据、启动目标 unit 或返回健康页都不构成成功。
+
+桥接失败必须由同一 journal 回到唯一源 Manager 和原业务入口。目标状态不完整、两套 unit 同时可能启动、源/目标路径包含符号链接、Docker ownership 无法证明或任一持久摘要变化时保持维护并失败关闭。后续清理发布在确认 bridge terminal commit 后移除一次性识别与迁移实现；普通发布不得永久同时接受两套路径、unit、label、Cookie、API 或 release asset。CI 必须从上一公开基线真实执行桥接、在每个持久阶段注入终止并验证只存在一个更新所有者，再验证清理发布不能重新识别源命名空间。main 通道不得在全部现役实例尚未写入桥接 `target_ack` 且提交 `committed` 时把 latest 推进到只支持目标身份的清理发布；单实例部署也必须用该实例回执作为 promotion 门，不能依赖轮询恰好先看到中间 release。
+
+#### 第一发布的触发与所有权
+
+桥接能力必须先随当前白标基线之后的一个普通 source-identity generation 到达并完成 Manager 自更新；承载该能力的 release manifest 仍为普通清单，不能触发交接。只有其后的桥接清单携带严格版本化的 `namespace_handoff` 描述符时，已稳定运行的 Current Manager 才能自动建立交接事务。这样现役旧 Manager 不需要解析未知字段，桥接 Candidate 也不会在普通 activation/watchdog 尚未结算时搬移自己的状态根。描述符必须同时提供现役 Manager 可读取的源 Compose/Manager 工件和目标 Manager、目标 Compose 工件，所有 URL、摘要、源/目标 identity 和 bridge generation 都属于同一不可变清单；缺少任一目标工件时只能把该发布视为不可执行，不能退回普通 update。
+
+建立 journal 前必须同时满足：当前 Platform generation 与桥接清单声明的 predecessor 完全相等；Manager 自更新 `Current` 已稳定且 `Candidate`、`Activation`、普通或恢复 watchdog 均为空；Manager state 没有 active 或 finalize-pending operation，全部旧 operation 均为可验证终态；`maintenance=false`、公开状态为 `idle`；Platform reservation、Agent Run、durable job、Sandbox active call、Sandbox/host 后台进程和文件提交窗口均为空；源 unit、stable binary、配置、数据根、socket、Compose project、网络和 ownership label 与清单声明精确匹配；目标 unit、binary、配置、数据根、socket、Compose project、网络及 label 不存在；源和目标父目录是当前 UID 所有、不可被其它身份写入的真实目录，且数据 relocation 使用同一文件系统或经过完整 staging manifest 验证。等待任务只进入 `waiting_for_tasks`，不会提前创建目标对象；任一身份不确定都在零副作用边界失败。
+
+交接不是普通 `runUpdate` 的一个 phase。源 Manager 先持久化独立 handoff journal，再从已验证的不可变 Manager 工件安装并启动 owner-only、事务期间持久化的 user-systemd helper unit，并证明 helper 的 unit 文件、PID、可执行文件 SHA、参数、cgroup 和 journal 完全相符。该 unit 必须启用到事务 terminal，确保宿主重启后仍能按同一 journal 续作；写入 `committed` 或 `rolled_back` 并完成验收后才禁用和删除。普通 transient unit 不具备跨重启所有权，不能用于此事务。helper 是停止源 unit 后唯一有权写 handoff journal、切换数据根和启动目标 unit 的进程；源、目标 Manager 与 watchdog 均不得同时拥有该事务。公网 listener 还必须由 helper 以继承文件描述符或等价的单一 socket owner 继续提供维护页，直至目标 Manager 接管，不能在两个 Manager 间竞态重绑端口。
+
+#### Handoff journal schema
+
+journal 使用 schema 1、`0600` owner-only 普通文件和同目录 flock，事务目录本身为 `0700`、不位于会被直接 rename 的源或目标根内。每次变化都以临时文件、file fsync、rename 和 parent fsync 原子提交；`binding_sha256` 覆盖 `source`、`target`、`release` 与首次 `evidence` 的规范 JSON，后续重放不得改写这些字段。结构固定为：
+
+```json
+{
+  "schema_version": 1,
+  "transaction_id": "handoff_<32 hex>",
+  "status": "running|committed|rolled_back|failed",
+  "phase": "planned|helper_armed|admission_reserved|snapshot_ready|writers_stopped|source_fenced|target_staged|data_relocated|target_started|target_verified|source_retired|committed|rollback_planned|target_stopped|data_restored|source_started|rolled_back",
+  "binding_sha256": "<64 hex>",
+  "release": {
+    "predecessor_generation": "<40 hex>",
+    "bridge_generation": "<40 hex>",
+    "manifest_path": "<absolute path>",
+    "manifest_sha256": "<64 hex>",
+    "target_manager_sha256": "<64 hex>",
+    "target_compose_sha256": "<64 hex>"
+  },
+  "source": {
+    "namespace": "ubitech-agent-v1",
+    "unit": "ubitech-agent-manager.service",
+    "unit_enabled": true,
+    "unit_path": "<absolute path>",
+    "unit_sha256": "<64 hex>",
+    "stable_binary": "<absolute path>",
+    "stable_sha256": "<64 hex>",
+    "config_path": "<absolute path>",
+    "config_sha256": "<64 hex>",
+    "data_root": "<absolute path>",
+    "socket_path": "<absolute path>",
+    "compose_project": "ubitech-agent",
+    "core_network": "ubitech-agent_core",
+    "core_network_id": "<docker object id>",
+    "label_prefix": "org.ubitech.agent."
+  },
+  "target": {
+    "namespace": "agent-platform-v1",
+    "unit": "agent-platform-manager.service",
+    "unit_path": "<absolute path>",
+    "stable_binary": "<absolute path>",
+    "config_path": "<absolute path>",
+    "data_root": "<absolute path>",
+    "socket_path": "$XDG_RUNTIME_DIR/agent-platform-manager/manager.sock",
+    "compose_project": "agent-platform",
+    "core_network": "agent-platform_core",
+    "label_prefix": "io.agent-platform."
+  },
+  "evidence": {
+    "manager_state_sha256": "<64 hex>",
+    "self_update_state_sha256": "<64 hex>",
+    "sandbox_registry_sha256": "<64 hex>",
+    "docker_inventory_sha256": "<64 hex>",
+    "database_schema_version": 1,
+    "database_integrity": "ok",
+    "runtime_identity_sha256": "<64 hex>",
+    "workspace_identity_sha256": "<64 hex>",
+    "snapshot_path": "<absolute path>",
+    "snapshot_manifest_sha256": "<64 hex>",
+    "boot_id": "<uuid>"
+  },
+  "helper": {
+    "unit": "agent-platform-namespace-handoff-<12 hex>.service",
+    "executable": "<absolute immutable path>",
+    "sha256": "<64 hex>",
+    "pid": 1234,
+    "control_group": "<exact systemd cgroup>"
+  },
+  "target_ack": {
+    "manager_version": "<release version>",
+    "executable_sha256": "<64 hex>",
+    "source_commit": "<40 hex>",
+    "pid": 1234,
+    "socket_path": "$XDG_RUNTIME_DIR/agent-platform-manager/manager.sock",
+    "auto_update_check_at": "<RFC3339>"
+  },
+  "history": [{"phase": "planned", "at": "<RFC3339>", "note": ""}],
+  "error": "",
+  "created_at": "<RFC3339>",
+  "updated_at": "<RFC3339>",
+  "completed_at": null
+}
+```
+
+示例中的数据库 schema 数字只是类型占位，真实值必须等于桥接清单与数据库 marker。`target_ack` 只能由执行目标 stable inode 的目标 Manager 通过 owner-only handoff capability 写入；helper 只能验证，不能代签。secret 内容、token 和原始数据库内容不得进入 journal，只记录路径身份与摘要。每个 phase 只接受上一 phase 或该 phase 已完成事实的幂等重放；发现后继事实时只能按明确列出的半提交规则补 checkpoint，不能跳阶段。进入 `source_fenced` 后的任何不可恢复错误先写 `rollback_planned`；回滚按反向 phase 恢复数据位置、源 Docker ownership、源 unit enabled 状态、源 Manager inode及公网入口，全部探针通过后才写 `rolled_back`。若回滚证据不完整则保持 `failed + maintenance=true`，不得同时启动两套 unit。
+
+#### 实现切点与发布门
+
+桥接实现必须作为一个完整变更同时接通以下边界，不能只增加 CLI 或目录复制脚本：
+
+- `containers/release-manifest.schema.json`、`manager/internal/release/manifest.go` 与 release workflow：加入版本化 handoff 描述符、predecessor、目标 Manager 和目标 Compose 工件，并确保桥接前普通清单不触发；
+- `manager/internal/model`、`manager/internal/journal` 与 `manager/internal/operation`：公开等待/维护投影与 handoff transaction 互斥；独立 handoff journal 不能放进将被搬移的普通 operation 根，也不能走 `runUpdate` 的失败回滚；
+- 新的 `manager/internal/handoff` 与 Manager helper 子命令：实现 owner/type/no-symlink 校验、flock、phase 重放、systemd helper 身份证明、单 listener 交接、源/目标 unit fencing及反向恢复；完整实现以前不得注册该命令；
+- `manager/cmd/.../main.go` 与 `manager/internal/selfupdate`：普通 Candidate 必须先完成 watchdog commit，再允许 handoff；stable path、unit、socket、token 和 startup ownership 必须显式绑定 source/target profile，目标 Manager 只能用 `target_ack` 接管；
+- `manager/internal/config`、`manager/internal/driver`、`manager/internal/sandbox` 与 `manager/internal/snapshot`：生成固定目标配置，迁移数据根，重建 neutral Compose/network/label/container ownership，转换已停止的 Sandbox registry，并保留精确源快照；ownership 守卫必须认识“当前事务指定的一次转换”，不能永久接受双前缀；
+- Platform、Agent Runtime、Camoufox、Compose 与容器入口：桥接 generation 同时能在源环境启动、在目标环境完成一次迁移，显式转换数据库 marker、Runtime/session/idempotency、workspace marker、Cookie 和浏览器持久状态；清理 generation 随即删除源读取；
+- Gateway 与 control API：handoff 期间持续返回中性维护页，状态端点从源路径一次性交接到中性路径；目标自动更新至少成功执行一次带认证的 `check` 后才允许 commit；
+- CI：从上一真实公开 release 安装，不从当前源码夹具伪造源状态；对上述每个 phase 和 journal/状态双文件边界注入 kill/断电，证明自动继续或完整回滚、始终只有一个 Manager/Docker owner，并在清理 release 验证所有源常量与迁移入口已消失。
+
+在这些切点全部实现并通过端到端崩溃矩阵之前，任何 release 都只能作为源侧能力的前置基线，不能发布 `namespace_handoff` 描述符，也不能暴露一个表面成功的 handoff 命令。当前普通 operation journal、自更新 plan、配置默认值、Compose environment、Docker ownership 和 Sandbox registry 都绑定源身份；在该状态下直接启用交接会使恢复 watchdog 找不到原路径、目标 Manager 无法证明 Current、或两套控制面竞争同一端口和 Docker 对象。失败关闭比在唯一部署机上生成不可回滚的半迁移更安全。
+
 ## 检测与预拉取
 
 管理员可以启用 Manager 轮询、从管理界面提交检查，或使用宿主 CLI。其它进程不得实现第二套更新器。发现更新时，Manager 先校验 HTTPS、协议版本、宿主架构、数据库版本、磁盘空间、Manager 工件和全部镜像 digest，再在平台仍可使用时准备候选工件。切换前只强制预拉取 Platform 与 Agent Runtime 的精确 digest；本地已经存在的 digest 不访问 registry。每个缺失核心镜像的拉取同时受无输出空闲时限和较大的绝对上限约束，超时在进入维护前记录为可重试失败，继续保留 current generation。Camoufox、SearXNG、Firecrawl 与 Agent Sandbox 镜像由各自的后台收敛或首次使用独立拉取，不能因第三方 registry 缓慢阻塞核心更新。

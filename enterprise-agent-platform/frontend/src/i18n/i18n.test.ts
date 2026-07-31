@@ -63,17 +63,12 @@ describe("locale normalization", () => {
     expect(detectBrowserLocale(source)).toBe("en");
   });
 
-  it("updates document language and metadata", () => {
-    const attributes: Record<string, string> = {};
+  it("updates document language without taking ownership of deployment metadata", () => {
     const target = {
       documentElement: { lang: "zh-CN" },
-      title: "",
-      querySelector: () => ({ setAttribute: (name: string, value: string) => { attributes[name] = value; } }),
     };
     applyDocumentLocale("en", target);
     expect(target.documentElement.lang).toBe("en");
-    expect(target.title).toBe("ubitech agent");
-    expect(attributes.content).toContain("channels");
   });
 });
 

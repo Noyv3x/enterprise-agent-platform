@@ -1,9 +1,9 @@
 {
-  "name": "@ubitech/agent-runtime",
+  "name": "@agent-platform/agent-runtime",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Platform-owned ubitech agent runtime based on pi agent core",
+  "description": "Platform-owned Agent runtime based on pi agent core",
   "engines": {
     "node": ">=22.19.0"
   },

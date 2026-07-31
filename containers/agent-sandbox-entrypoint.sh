@@ -2,7 +2,7 @@
 set -eu
 
 fail() {
-  printf 'ubitech sandbox entrypoint: %s\n' "$*" >&2
+  printf 'Agent Sandbox entrypoint: %s\n' "$*" >&2
   exit 64
 }
 

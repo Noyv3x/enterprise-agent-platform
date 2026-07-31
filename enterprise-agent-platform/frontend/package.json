@@ -1,5 +1,5 @@
 {
-  "name": "enterprise-agent-platform-frontend",
+  "name": "agent-platform-frontend",
   "private": true,
   "version": "0.1.0",
   "type": "module",

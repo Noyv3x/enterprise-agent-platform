@@ -541,6 +541,47 @@
   }
 }
 
+.branding-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.branding-preview {
+  position: relative;
+  min-width: 0;
+  min-height: 150px;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 8px;
+  padding: 22px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  border-radius: 12px;
+}
+
+.branding-preview--light { color: #172033; background: #f7f8fb; }
+.branding-preview--dark { color: #eef1f7; background: #141821; }
+.branding-preview__label {
+  position: absolute;
+  inset-block-start: 10px;
+  inset-inline-end: 12px;
+  color: currentColor;
+  font-size: 11px;
+  opacity: 0.58;
+}
+.branding-preview img { width: auto; max-width: 100%; height: 32px; object-fit: contain; }
+.branding-preview strong { max-width: 100%; overflow: hidden; font-size: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.branding-preview > span:not(.branding-preview__label) { font-size: 12px; opacity: 0.68; }
+.branding-preview i { width: 52px; height: 4px; border-radius: 999px; background: var(--branding-preview-color); }
+
+.branding-color-field { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 8px; }
+.branding-color-field input[type="color"] { width: 48px; padding: 4px; cursor: pointer; }
+.branding-logo-field { display: grid; align-content: start; gap: 8px; }
+.branding-logo-field > strong { font-size: 13px; }
+.branding-actions { justify-content: space-between; }
+
 @container eap-admin-page (max-width: 839px) {
   .eap-admin-account-table {
     display: none;
@@ -590,6 +631,8 @@
   .eap-admin-page .secret-row form input {
     flex: 1 1 180px;
   }
+
+  .branding-preview-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 @container eap-admin-shell (max-width: 560px) {

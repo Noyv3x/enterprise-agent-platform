@@ -24,6 +24,8 @@ done
 
 bash -n install.sh
 for expected in \
+  'Install the Agent Platform from the current container release channel.' \
+  'Description=Agent Platform Manager' \
   'This installer supports fresh container installations only.' \
   'docker compose version' \
   'read -r answer </dev/tty' \
@@ -34,8 +36,21 @@ for expected in \
   '"$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"'; do
   grep -Fq "$expected" install.sh || fail "fresh container installer contract is missing: $expected"
 done
+for retired_copy in \
+  'Install ubitech agent' \
+  'Description=ubitech agent manager' \
+  'ubitech agent installed'; do
+  if grep -Fiq "$retired_copy" install.sh; then
+    fail "fresh container installer retains fixed product branding: $retired_copy"
+  fi
+done
 grep -Fq 'bash -s -- --yes' README.md \
   || fail "README fresh-install command does not pass explicit non-interactive consent"
+grep -Fq -- '--title "Agent Platform ${SOURCE_COMMIT:0:12}"' .github/workflows/container-release.yml \
+  || fail "container release title is not deployment-neutral"
+if grep -Fiq -- '--title "ubitech agent' .github/workflows/container-release.yml; then
+  fail "container release title retains fixed product branding"
+fi
 for excluded in \
   'enterprise-agent-platform/build/' \
   'enterprise-agent-platform/dist/' \

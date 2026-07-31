@@ -329,7 +329,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         started: list[str] = []
 
         result = self.client.generate(
-            system_prompt="You are ubitech agent.",
+            system_prompt="You are an Agent.",
             user_message="Hello",
             history=[{"role": "user", "content": "Earlier"}],
             session_id="session-1",

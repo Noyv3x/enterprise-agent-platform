@@ -25,6 +25,7 @@ export const adminInitial: AdminSliceState = {
   agentRuntimeConfig: null,
   telegramConfig: null,
   autoUpdateConfig: null,
+  brandingConfig: null,
   cogneeConfig: null,
   securityConfig: null,
   oauthProviders: null,
@@ -58,6 +59,8 @@ export function adminReducer(state: AppState, action: Action): AppState {
       return { ...state, telegramConfig: action.payload };
     case "SET_AUTO_UPDATE_CONFIG":
       return { ...state, autoUpdateConfig: action.payload };
+    case "SET_BRANDING_CONFIG":
+      return { ...state, brandingConfig: action.payload };
     case "SET_COGNEE_CONFIG":
       return { ...state, cogneeConfig: action.payload };
     case "SET_SECURITY_CONFIG":

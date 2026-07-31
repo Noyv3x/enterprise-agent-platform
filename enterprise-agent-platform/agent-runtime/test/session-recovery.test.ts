@@ -29,7 +29,7 @@ test("RunCoordinator repairs a durable assistant tool call with no result", asyn
     lifecycle_id: "life",
     session_id: "session",
     workspace,
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "continue",
     model: { provider: "openai-codex", id: "gpt-5.5" },
   };
@@ -70,7 +70,7 @@ test("compaction archives the exact durable entries when recovery removes an orp
     lifecycle_id: "life",
     session_id: "session",
     workspace,
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "continue after recovery",
     model: { provider: "openai-codex", id: "gpt-5.5" },
   };

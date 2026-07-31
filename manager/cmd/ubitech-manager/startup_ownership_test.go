@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ubitech/agent-platform/manager/internal/selfupdate"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/selfupdate"
 )
 
 func TestServeRejectsRecoveryOwnershipBeforeBuilderSideEffects(t *testing.T) {

@@ -33,9 +33,9 @@ export const skillMessages = defineMessages({
   "skills.viewTitle": { "zh-CN": "查看 Skill", en: "View Skill", "zh-TW": "檢視 Skill" },
   "skills.preset": { "zh-CN": "预置", en: "Preset", "zh-TW": "預置" },
   "skills.presetHint": {
-    "zh-CN": "这是随 ubitech agent 提供的只读 Skill，会随版本更新。你仍可新建自己的 Skill 来补充或替代它。",
-    en: "This read-only Skill ships with ubitech agent and may be updated with new releases. You can still create your own Skill to extend or replace it.",
-    "zh-TW": "這是隨 ubitech agent 提供的唯讀 Skill，會隨版本更新。你仍可新增自己的 Skill 來補充或取代它。",
+    "zh-CN": "这是随平台提供的只读 Skill，会随版本更新。你仍可新建自己的 Skill 来补充或替代它。",
+    en: "This read-only Skill ships with the platform and may be updated with new releases. You can still create your own Skill to extend or replace it.",
+    "zh-TW": "這是隨平台提供的唯讀 Skill，會隨版本更新。你仍可新增自己的 Skill 來補充或取代它。",
   },
   "skills.form.name": { "zh-CN": "名称", en: "Name", "zh-TW": "名稱" },
   "skills.form.namePlaceholder": { "zh-CN": "例如：review-code", en: "For example: review-code", "zh-TW": "例如：review-code" },

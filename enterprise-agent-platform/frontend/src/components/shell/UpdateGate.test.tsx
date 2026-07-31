@@ -54,7 +54,7 @@ describe("UpdateGate", () => {
     renderGate(vi.fn(async () => status("waiting_for_tasks")));
 
     expect(await screen.findByText("Application content")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Updating ubitech agent" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Updating the platform" })).not.toBeInTheDocument();
   });
 
   it("rechecks an idle platform within five seconds", async () => {
@@ -80,7 +80,7 @@ describe("UpdateGate", () => {
     renderGate(vi.fn(async () => status("updating")));
 
     expect(
-      await screen.findByRole("heading", { name: "Updating ubitech agent" }),
+      await screen.findByRole("heading", { name: "Updating the platform" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("Application content")).not.toBeInTheDocument();
 
@@ -97,12 +97,12 @@ describe("UpdateGate", () => {
       .mockRejectedValueOnce(new TypeError("offline"))
       .mockResolvedValue(status("updating"));
     renderGate(loadStatus);
-    expect(await screen.findByRole("heading", { name: "Updating ubitech agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Updating the platform" })).toBeInTheDocument();
 
     window.dispatchEvent(new Event("pageshow"));
     await waitFor(() => expect(loadStatus).toHaveBeenCalledTimes(2));
 
-    expect(screen.getByRole("heading", { name: "Updating ubitech agent" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Updating the platform" })).toBeInTheDocument();
     expect(screen.queryByText("Application content")).not.toBeInTheDocument();
   });
 
@@ -111,7 +111,7 @@ describe("UpdateGate", () => {
       .mockResolvedValueOnce(status("updating"))
       .mockResolvedValue(status("idle", "operation-b"));
     const { reload } = renderGate(loadStatus);
-    expect(await screen.findByRole("heading", { name: "Updating ubitech agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Updating the platform" })).toBeInTheDocument();
 
     window.dispatchEvent(new Event("pageshow"));
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
@@ -151,7 +151,7 @@ describe("UpdateGate", () => {
       });
     });
 
-    expect(screen.getByRole("heading", { name: "Updating ubitech agent" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Updating the platform" })).toBeInTheDocument();
     expect(screen.queryByText("Application content")).not.toBeInTheDocument();
   });
 });

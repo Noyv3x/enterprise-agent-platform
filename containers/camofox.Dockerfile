@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev \
 FROM node:24-bookworm-slim AS camofox
 ARG SOURCE_COMMIT=unknown
 ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="ubitech Camoufox browser" \
+LABEL org.opencontainers.image.title="Agent Platform Camoufox browser" \
       org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
       org.opencontainers.image.revision="$SOURCE_COMMIT" \
       org.opencontainers.image.version="$RELEASE_VERSION"

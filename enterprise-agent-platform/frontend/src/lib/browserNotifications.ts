@@ -1,5 +1,5 @@
-const STORAGE_PREFIX = "ubitech.reply-notifications:";
-const CHANGE_EVENT = "ubitech-reply-notifications-change";
+const STORAGE_PREFIX = "agent-platform.reply-notifications:";
+const CHANGE_EVENT = "agent-platform-reply-notifications-change";
 
 function storageKey(userId: string | number): string {
   return `${STORAGE_PREFIX}${String(userId)}`;

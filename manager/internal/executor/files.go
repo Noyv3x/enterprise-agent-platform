@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/sandbox"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type FileService struct {

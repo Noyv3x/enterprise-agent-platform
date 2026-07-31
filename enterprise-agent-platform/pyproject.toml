@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "enterprise-agent-platform"
 version = "0.1.0"
-description = "Web platform for shared and private ubitech agent instances with a platform-owned Agent runtime."
+description = "Web platform for shared and private configurable Agent instances with a platform-owned runtime."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "ubitech agent" }]
+authors = [{ name = "Agent Platform contributors" }]
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+  "Pillow>=10.4.0,<13",
+]
 
 [project.scripts]
 enterprise-agent-platform = "enterprise_agent_platform.__main__:main"

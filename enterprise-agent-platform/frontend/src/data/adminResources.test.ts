@@ -4,6 +4,7 @@ import type { AdminPageId } from "../types";
 const loads = vi.hoisted(() => ({
   updates: vi.fn(async () => undefined),
   agentRuntime: vi.fn(async () => undefined),
+  branding: vi.fn(async () => undefined),
   cognee: vi.fn(async () => undefined),
   messages: vi.fn(async () => undefined),
   oauth: vi.fn(async () => undefined),
@@ -19,6 +20,7 @@ const loads = vi.hoisted(() => ({
 vi.mock("./loaders", () => ({
   loadAutoUpdateConfig: loads.updates,
   loadAgentRuntimeConfig: loads.agentRuntime,
+  loadBrandingConfig: loads.branding,
   loadCogneeConfig: loads.cognee,
   loadMessageAudit: loads.messages,
   loadOAuthProviders: loads.oauth,
@@ -34,7 +36,7 @@ vi.mock("./loaders", () => ({
 import { loadAdminPage } from "./adminResources";
 
 const pages: AdminPageId[] = [
-  "accounts", "tokens", "messages", "agent-runtime", "telegram", "updates",
+  "accounts", "tokens", "messages", "agent-runtime", "telegram", "branding", "updates",
   "security", "runtime", "cognee", "secrets",
 ];
 
@@ -50,6 +52,7 @@ describe("administration page resources", () => {
       messages: ["messages"],
       "agent-runtime": ["agentRuntime", "oauth"],
       telegram: ["telegram"],
+      branding: ["branding"],
       updates: ["updates"],
       security: ["security", "updates"],
       runtime: ["runtime"],

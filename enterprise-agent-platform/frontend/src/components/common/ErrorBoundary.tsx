@@ -32,7 +32,7 @@ function ErrorFallback() {
   return (
     <main className="auth">
       <aside className="auth__aside">
-        <img className="auth__logo" src="/ubitech-logo.png" alt="ubitech" />
+        <Brand className="auth__logo" />
       </aside>
       <div className="auth__main">
         <section className="auth__card" role="alert" aria-labelledby="app-error-title">

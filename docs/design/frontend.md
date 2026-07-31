@@ -10,6 +10,22 @@
 
 前端数据类型以当前 API 实体名为唯一公开名称。不为已删除的规格名、旧组件名或旧响应形状保留未使用的 type alias；跨层名称改动与 API 类型在同一变更中完成。
 
+## 品牌与部署定制
+
+仓库发布中不绑定部署方品牌。未配置时，界面使用中性的 `Agent Platform` 产品名、`Agent` 助手名、纯文字标识、中性主题色和中性 favicon；Logo、浏览器标题、描述、通知标题与公开错误页不得退回到源码中的部署方名称或图片。管理员可在部署后热更新产品名、助手名、主色和一个通用 Logo，保存后无需重启即可作用于登录、启动恢复、前端更新提示、错误边界、应用侧栏、浏览器标题与描述和回复通知。Manager 在 Platform 离线时独立提供的灾备页只承诺中性基线，不依赖业务数据库中的动态品牌。favicon 本轮只使用仓库内置的中性图标，不把通用横向 Logo 误作方形图标，也不提供未进入服务端契约的独立图标上传。品牌名称是管理员提供的纯文本，不随界面语言翻译；围绕名称的说明和状态文案仍由三语 i18n 提供。
+
+公开 `GET /api/platform/branding` 返回 `{schema_version: 1, revision, product_name, agent_name, primary_color, logo_url}`；管理员 `GET /api/system/branding/config` 读取同一快照，`PUT /api/system/branding/config` 以 `{expected_revision, product_name, agent_name, primary_color}` 更新文本与颜色。名称在去除首尾空白并 NFC 规范化后必须为 1–64 个 Unicode 码点，拒绝 Unicode `C*` 类别及 `U+2028/U+2029` 行段分隔符；服务端校验为最终权威，前端使用同一规则即时提示。Logo 通过管理员 `PUT /api/system/branding/logo` 的 `{expected_revision, mime_type, data_base64}` 上传，通过同一路径的 `DELETE` 和 `{expected_revision}` 删除；每次成功写都返回新快照，revision 冲突返回 `409`。前端只接受服务端返回的同源、版本化 `/api/platform/branding/logo?v=<revision>`，上传只接受 PNG/WebP、不超过 256 KiB，不把资产写入或复制进静态发布目录。静态构建只携带中性入口；旧的固定 Logo 是受管陈旧资产，下一次原子发布必须清除。
+
+`BrandingProvider` 位于 i18n 内侧、主题、维护门、错误边界与 Store 外侧，使匿名登录、启动失败、更新维护、渲染错误和认证后界面共享同一品牌状态，且登出或 Store reset 不会清空品牌。Provider 首次渲染可从当前 origin 下的已验证公共缓存恢复 last-known 快照，同时并行使用 ETag 重验证；缓存缺失或损坏时使用中性默认值，网络请求失败时保留当前已验证快照（没有快照才保持中性默认），不能阻塞登录。管理员保存响应经过单调 revision 栅栏：只接受比当前 revision 更新的快照；同 revision 仅允许内容完全相同的幂等结果，旧 revision 或同 revision 异内容均不得覆盖 Context 或持久缓存。
+
+跨标签页 `storage` 事件只表示权威品牌可能变化，事件携带的 `newValue`（包括合法快照）永远不直接应用，也不得因旧值、同 revision 冲突、删除或损坏值而回写 localStorage。Provider 对同一品牌 key 的连续事件去抖后发起一次不带缓存 ETag 的公共 GET，并以请求发起时的 Context 作为基线；每个请求带递增序号，只有最新仍在途请求可提交结果。这样服务端 revision 从 8 回滚到 3、随后推进到 4，以及缓存删除或损坏时都由服务端权威状态收敛，不会出现两个标签页互相恢复旧缓存的 ping-pong。
+
+公共 GET 另需处理 Manager 回滚数据库后服务端 revision 合法降低的边界。请求发起时记录当前 revision 和完整内容；响应返回时若 Context 仍与该基线完全相同，则本次合法 `200` 作为当前服务端权威快照，可以接受较低 revision；若请求期间 Context 已被管理员保存或跨标签页同步推进，则该响应重新进入单调栅栏，旧 revision 不得覆盖较新的本地结果。这样既阻止“保存 revision 8 后旧请求 revision 7 回写”的竞态，也不会让浏览器永久卡在回滚前的高 revision。
+
+公共品牌 `200` 响应必须先完整验证结构、名称、颜色和同源版本化 Logo URL；非法 `200` 且 Context 仍等于请求基线时，代表当前权威响应不可安全使用，必须清除本地快照及 ETag 并立即降级为中性默认值。若请求期间 Context 已推进，迟到的非法响应不得清除或重写新状态。ETag 只有精确等于当前快照 revision 的 `"branding-<revision>"` 时才可持久化并在后续请求中作为 `If-None-Match` 发送；缺失或不匹配的 ETag 不影响使用合法快照，但不得缓存，下一次必须无条件重验证。`304` 只有在请求携带了与已验证缓存 revision 精确匹配的 ETag 时才可复用缓存，否则按请求失败处理。管理保存成功后立即将返回快照送入同一 revision 栅栏并写入无 ETag 缓存；保存失败（包括 `409`）必须重新读取管理员品牌快照，同时更新 Store 和 Branding Context，确保表单与全局界面回到服务端权威 revision。
+
+文档语言、标题与 description 由品牌和 locale 的统一 metadata 效果更新，中性 favicon 由静态入口声明；i18n 层只负责语言选择，不能再以固定产品名覆盖 metadata。Logo 保持原始比例并使用 `object-fit: contain`，不使用反色滤镜篡改上传图片；缺失或加载失败时显示可访问的品牌文字。内部 storage key、DOM 事件、通知 tag 和下载文件名使用稳定的中性命名空间，不能从可变品牌名派生，也不能保留部署方品牌作为技术标识。
+
 ## 组件与视觉系统
 
 Ant Design 是整个浏览器界面的组件和交互语义基础，负责按钮、菜单、表单控件、表格、标签、状态、提示、空态、加载态、弹窗、抽屉和响应式数据展示。全局 `ConfigProvider` 位于 i18n 与主题 Provider 内侧，统一品牌色、字号、圆角、密度、深浅主题和组件 Token。平台不得复制组件库内部 DOM，也不得以自研基础组件重新实现同类能力。现有业务 i18n 仍是产品文案的唯一来源；`zh-CN`、`en`、`zh-TW` 只映射到对应的 Ant Design 组件语言包。
@@ -29,9 +45,10 @@ Cognee 的 changed-only 动态配置收集器依赖真实原生字段及其 DOM 
 Provider 层次必须保持以下职责：
 
 1. i18n 和主题提供全局展示上下文。
-2. `UpdateGate` 在登录、Store、Toast 和应用错误边界之外处理强制维护。
-3. Error Boundary 隔离业务界面错误并提供安全重载。
-4. Store 只在正常产品生命周期中创建。
+2. Branding 在主题、维护门、错误边界和 Store 之外提供公共部署品牌并维护 document metadata。
+3. `UpdateGate` 在登录、Store、Toast 和应用错误边界之外处理强制维护。
+4. Error Boundary 隔离业务界面错误并提供安全重载。
+5. Store 只在正常产品生命周期中创建。
 
 未登录和启动恢复界面不得静态拉入聊天、浏览器预览与终端预览代码；认证后的 `AppShell` 在 bootstrap 确认存在用户后延迟加载，并在慢链路下载期间复用启动加载反馈。
 
@@ -127,4 +144,4 @@ Manager 状态不可达时不能伪造为 `idle`。管理页必须显示控制�
 
 ## 验证
 
-组件测试应使用与生产一致的 `eap` 组件前缀、主题和 i18n Provider，并使用真实 Store 和请求边界覆盖关键生命周期，特别是空数据 selector、迟到响应、移动宽度、维护切换、SSE 重连和首帧加载。历史回归必须在频道和私人对话分别加载多于一页、离开再返回，并证明 delta refresh 不裁掉已缓存前缀；通知回归必须从保留另一 scope 消息的真实 Store 点击通知，证明复用正式导航、目标加载和消息隔离。业务样式需要绑定组件库公开的 semantic `classNames/styles`，测试不得依赖默认 `ant` 前缀掩盖生产选择器错误。命令见[测试与验证](../development/testing.md)。
+组件测试应使用与生产一致的 `eap` 组件前缀、主题、品牌和 i18n Provider，并使用真实 Store 和请求边界覆盖关键生命周期，特别是空数据 selector、迟到响应、移动宽度、维护切换、SSE 重连和首帧加载。品牌回归必须覆盖中性默认、缓存恢复与重验证、非法响应降级、locale/品牌变更后的 metadata/favicon、匿名/维护/错误/Shell 的一致渲染、管理员 revision 冲突和保存后的跨标签页同步；静态构建测试必须证明固定品牌资产不再是发布前提且旧资产会被原子清理。历史回归必须在频道和私人对话分别加载多于一页、离开再返回，并证明 delta refresh 不裁掉已缓存前缀；通知回归必须从保留另一 scope 消息的真实 Store 点击通知，证明复用正式导航、目标加载和消息隔离。业务样式需要绑定组件库公开的 semantic `classNames/styles`，测试不得依赖默认 `ant` 前缀掩盖生产选择器错误。命令见[测试与验证](../development/testing.md)。

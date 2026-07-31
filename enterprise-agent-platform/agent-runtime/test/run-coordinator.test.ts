@@ -360,7 +360,7 @@ test("RunCoordinator places fixed untrusted guidance before direct user image bl
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: [
         { type: "text", text: "Review this screenshot." },
         { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
@@ -406,7 +406,7 @@ test("RunCoordinator accepts direct image blocks in active-run input without rea
       lifecycle_id: "life-inline",
       session_id: "session-inline",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "wait for the next message",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -545,7 +545,7 @@ test("RunCoordinator isolates learning review tools, approvals, prompt, and term
     lifecycle_id: "life",
     session_id: "learning-review-7",
     workspace,
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "Extract durable learning only.",
     model: { provider: "openai-codex", id: "gpt-5.5" },
     metadata: {
@@ -706,7 +706,7 @@ test("unattended scheduled skill mutations require existing persistent authoriza
       lifecycle_id: "life",
       session_id: "scheduled-skill",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "create the skill",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -749,7 +749,7 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run it",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -803,7 +803,7 @@ test("approval and tool events never journal raw terminal credentials", async ()
       lifecycle_id: "life",
       session_id: "approval-redaction",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run it",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -856,7 +856,7 @@ test("terminal execution keeps the canonical cwd that was approved across symlin
       lifecycle_id: "life",
       session_id: "approved-cwd",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run it",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -903,7 +903,7 @@ test("file execution keeps the canonical target that was approved across symlink
       lifecycle_id: "life",
       session_id: "approved-file",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "write it",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -951,7 +951,7 @@ test("process write cannot inject a hardline command into a background shell", a
       lifecycle_id: "life",
       session_id: "process-write-hardline",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "start a shell",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -999,7 +999,7 @@ test("RunCoordinator retries promise-only final responses at most twice", async 
       lifecycle_id: "life",
       session_id: "execution-review",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "修改项目并运行测试",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1057,7 +1057,7 @@ test("execution-review messages remain ephemeral across context compaction", asy
       lifecycle_id: "life",
       session_id: "execution-review-compaction",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "inspect the existing state",
       history: Array.from({ length: 8 }, (_, index) => ({
         role: "user" as const,
@@ -1120,7 +1120,7 @@ test("RunCoordinator requests one bounded verification after a file change", asy
       lifecycle_id: "life",
       session_id: "file-validation",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "update changed.txt",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1187,7 +1187,7 @@ test("an unrelated read does not satisfy focused file verification", async () =>
       lifecycle_id: "life",
       session_id: "focused-file-validation",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "update changed.txt",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1237,7 +1237,7 @@ test("a failed terminal check does not satisfy file verification", async () => {
       lifecycle_id: "life",
       session_id: "failed-file-validation",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "update changed.txt",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1283,7 +1283,7 @@ test("a failed mutating terminal command still requires file verification", asyn
       lifecycle_id: "life",
       session_id: "failed-mutating-terminal",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "update failed-change.txt and check it",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1329,7 +1329,7 @@ test("RunCoordinator overlaps pure parallel tool batches", async () => {
       lifecycle_id: "life",
       session_id: "parallel-tools",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "search two sources",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1369,7 +1369,7 @@ test("RunCoordinator serializes a batch containing any sequential tool", async (
       lifecycle_id: "life",
       session_id: "mixed-tools",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "search and inspect the browser",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1404,7 +1404,7 @@ test("parallel-mode approval preflight exposes only one pending approval card", 
       lifecycle_id: "life",
       session_id: "parallel-approvals",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "read both external files",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1471,7 +1471,7 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "start the task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: { idempotency_key: "steering-run" },
@@ -1609,7 +1609,7 @@ test("RunCoordinator rejects an unpreparable input without a false accepted even
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "start",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1675,7 +1675,7 @@ test("RunCoordinator accepts active-run input only for canonical private root sc
         lifecycle_id: `life-${index}`,
         session_id: `session-${index}`,
         workspace,
-        system_prompt: "You are ubitech agent.",
+        system_prompt: "You are an Agent.",
         input: "start",
         model: { provider: "openai-codex", id: "gpt-5.5" },
         ...(candidate.metadata ? { metadata: candidate.metadata } : {}),
@@ -1736,7 +1736,7 @@ test("RunCoordinator preserves endpoint order when an earlier attachment prepare
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "start",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1807,7 +1807,7 @@ test("RunCoordinator closes an accepted queued input as unconsumed", async () =>
       lifecycle_id: "blocker-life",
       session_id: "blocker-session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "block",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1819,7 +1819,7 @@ test("RunCoordinator closes an accepted queued input as unconsumed", async () =>
       lifecycle_id: "life",
       session_id: "session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "start",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -1866,7 +1866,7 @@ test("unattended scheduled runs reject sensitive tools immediately without reque
       lifecycle_id: "life",
       session_id: "scheduled-session",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run the scheduled task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -1911,7 +1911,7 @@ test("unattended scheduled runs accept only a persistent always authorization", 
       lifecycle_id: "life",
       session_id: "scheduled-always",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run the scheduled task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -1956,7 +1956,7 @@ test("unattended scheduled runs cannot reuse an always grant for process input",
       lifecycle_id: "life",
       session_id: "scheduled-process-write",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "send process input",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -2002,7 +2002,7 @@ test("persisted session approval does not authorize an unattended scheduled run"
     const run = coordinator.createRun({
       ...identity,
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run the scheduled task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -2049,7 +2049,7 @@ test("unattended scheduled runs cannot mutate schedules even with an always auth
       lifecycle_id: "life",
       session_id: "scheduled-mutation",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "pause the schedule",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -2102,7 +2102,7 @@ test("nested delegated unattended blocks reach the scheduled parent journal", as
       lifecycle_id: "life",
       session_id: "scheduled-delegate",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "run the scheduled delegated task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -2153,7 +2153,7 @@ test("interactive schedule mutations use the normal approval flow", async () => 
       lifecycle_id: "life",
       session_id: "interactive-schedule",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "delete the schedule",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -2198,7 +2198,7 @@ test("session tool searches the delegated Agent's own durable journal", async ()
     const first = coordinator.createRun({
       ...identity,
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "unique child note",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -2207,7 +2207,7 @@ test("session tool searches the delegated Agent's own durable journal", async ()
     const second = coordinator.createRun({
       ...identity,
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "search the current session",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -2268,7 +2268,7 @@ test("session read and search redact unmarked imported assistant credentials", a
       lifecycle_id: "life",
       session_id: "parent:child",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "inspect imported history",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
@@ -2473,7 +2473,7 @@ test("Spark receives browser vision text fallback while work records omit the li
       lifecycle_id: "life",
       session_id: "spark-browser",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "Inspect the page",
       model: { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
       metadata: { idempotency_key: "spark-vision-once" },
@@ -2558,7 +2558,7 @@ test("Spark browser vision timeout degrades to snapshot text without failing the
       lifecycle_id: "life",
       session_id: "spark-browser-timeout",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "Inspect the page",
       model: { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
     });

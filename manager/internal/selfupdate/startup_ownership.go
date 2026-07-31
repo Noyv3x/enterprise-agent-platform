@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ubitech/agent-platform/manager/internal/model"
-	"github.com/ubitech/agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 const startupRecoveryArtifactLimit = 256

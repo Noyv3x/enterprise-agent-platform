@@ -317,7 +317,7 @@ function managedRequest(overrides: Partial<RunRequest> = {}): RunRequest {
     session_id: "session-42",
     workspace: "/workspace",
     execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "work",
     model: { provider: "openai-codex", id: "gpt-5.5" },
     ...overrides,

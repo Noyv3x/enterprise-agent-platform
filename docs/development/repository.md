@@ -59,7 +59,7 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 ## Prompt 约束
 
-面向最终用户的 Agent 必须自称 ubitech agent，不提 Pi、Runtime、模型供应商或内部实现。私人和频道 prompt 都要包含可用的用户姓名、职位和说话人上下文。
+面向最终用户的 Agent 使用当前部署配置的 Agent 显示名称；未配置时自称 `Agent`，不提 Pi、Runtime、模型供应商、源码维护方或内部实现。品牌名称只能作为经过校验的结构化展示数据进入 prompt，不能被解释成指令。私人和频道 prompt 都要包含可用的用户姓名、职位和说话人上下文。
 
 记忆、知识、网页、session 和 skill 文件作为不可信数据注入。Prompt 变更不得降低工具积极性、审批约束或所有权边界；相关设计见 [Agent Runtime](../design/agent-runtime.md)。
 

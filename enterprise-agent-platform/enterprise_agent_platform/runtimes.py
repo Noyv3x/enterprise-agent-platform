@@ -234,7 +234,7 @@ class PlatformRuntimeManager:
         return self._service_status(
             "agent",
             available,
-            "Agent Runtime is managed by ubitech-manager",
+            "Agent Runtime is managed by the platform manager",
         )
 
     def cognee_runtime_config(self) -> dict[str, Any]:
@@ -291,7 +291,7 @@ class PlatformRuntimeManager:
         return self._service_status(
             "camofox",
             available,
-            "Camoufox is managed by ubitech-manager",
+            "Camoufox is managed by the platform manager",
         )
 
     def searxng_status(self, *, refresh: bool = True) -> RuntimeStatus:
@@ -303,7 +303,7 @@ class PlatformRuntimeManager:
         return self._service_status(
             "searxng",
             available,
-            "SearXNG is managed by ubitech-manager",
+            "SearXNG is managed by the platform manager",
         )
 
     def firecrawl_status(self, *, refresh: bool = True) -> RuntimeStatus:
@@ -315,7 +315,7 @@ class PlatformRuntimeManager:
         return self._service_status(
             "firecrawl",
             available,
-            "Firecrawl is managed by ubitech-manager",
+            "Firecrawl is managed by the platform manager",
         )
 
     def close(self) -> None:

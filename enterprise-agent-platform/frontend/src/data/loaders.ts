@@ -27,6 +27,7 @@ import type {
   AppState,
   AuditChannelMessagesResponse,
   AutoUpdateConfigResponse,
+  BrandingSnapshot,
   ChannelMessagesResponse,
   ChannelsResponse,
   ChatMode,
@@ -567,6 +568,13 @@ export async function loadAutoUpdateConfig(store: AppStore): Promise<void> {
   store.dispatch({
     type: "SET_AUTO_UPDATE_CONFIG",
     payload: await api<AutoUpdateConfigResponse>(endpoints.autoUpdateConfig.path()),
+  });
+}
+
+export async function loadBrandingConfig(store: AppStore): Promise<void> {
+  store.dispatch({
+    type: "SET_BRANDING_CONFIG",
+    payload: await api<BrandingSnapshot>(endpoints.brandingConfig.path()),
   });
 }
 

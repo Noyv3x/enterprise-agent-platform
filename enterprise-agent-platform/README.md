@@ -1,6 +1,6 @@
-# ubitech agent platform
+# Agent Platform
 
-这是 ubitech agent 的 Python Web 平台包入口。完整设计、配置和运维说明均以仓库顶层的 [canonical 文档层](../docs/README.md) 为准；本文件仅保留包入口和快速验证命令。
+这是 Agent Platform 的 Python Web 平台包入口。完整设计、配置和运维说明均以仓库顶层的 [canonical 文档层](../docs/README.md) 为准；本文件仅保留包入口和快速验证命令。
 
 ## 本地开发运行
 

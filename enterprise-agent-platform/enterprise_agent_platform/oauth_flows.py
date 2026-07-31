@@ -20,7 +20,7 @@ CODEX_DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/us
 CODEX_DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
-OAUTH_HTTP_USER_AGENT = "ubitech-agent/0.2"
+OAUTH_HTTP_USER_AGENT = "agent-platform/0.2"
 MAX_OAUTH_RESPONSE_BYTES = 2 * 1024 * 1024
 
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
@@ -344,7 +344,7 @@ class OAuthFlowManager:
                 "state": state,
                 "nonce": nonce,
                 "plan": "generic",
-                "referrer": "ubitech-agent",
+                "referrer": "agent-platform",
             }
         )
         flow_id = secrets.token_urlsafe(18)

@@ -10,23 +10,26 @@ import { ThemeProvider } from "./context/ThemeContext";
 import { ToastProvider } from "./context/ToastContext";
 import { StoreProvider } from "./store/StoreProvider";
 import { AntDesignProvider } from "./components/ui/AntDesignProvider";
+import { BrandingProvider } from "./context/BrandingContext";
 
 export default function App() {
   return (
     <I18nProvider>
-      <ThemeProvider>
-        <AntDesignProvider>
-          <UpdateGate>
-            <ErrorBoundary>
-              <ToastProvider>
-                <StoreProvider>
-                  <AppGate />
-                </StoreProvider>
-              </ToastProvider>
-            </ErrorBoundary>
-          </UpdateGate>
-        </AntDesignProvider>
-      </ThemeProvider>
+      <BrandingProvider>
+        <ThemeProvider>
+          <AntDesignProvider>
+            <UpdateGate>
+              <ErrorBoundary>
+                <ToastProvider>
+                  <StoreProvider>
+                    <AppGate />
+                  </StoreProvider>
+                </ToastProvider>
+              </ErrorBoundary>
+            </UpdateGate>
+          </AntDesignProvider>
+        </ThemeProvider>
+      </BrandingProvider>
     </I18nProvider>
   );
 }

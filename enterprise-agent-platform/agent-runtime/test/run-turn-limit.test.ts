@@ -153,7 +153,7 @@ test("learning reviews stop before their seventeenth model request", async () =>
       lifecycle_id: "life",
       session_id: "learning-review-7",
       workspace,
-      system_prompt: "You are ubitech agent.",
+      system_prompt: "You are an Agent.",
       input: "Review durable learning.",
       model: { provider: "openai-codex", id: "gpt-5.5" },
       metadata: {
@@ -201,7 +201,7 @@ function baseRequest(workspace: string): RunRequest {
     lifecycle_id: "life",
     session_id: "session",
     workspace,
-    system_prompt: "You are ubitech agent.",
+    system_prompt: "You are an Agent.",
     input: "Complete the task",
     model: { provider: "openai-codex", id: "gpt-5.5" },
   };

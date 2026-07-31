@@ -328,7 +328,7 @@ export function MemoryPanel() {
     try {
       const payload = await exportAgentMemories();
       const stamp = new Date().toISOString().slice(0, 10);
-      downloadJson(payload, `ubitech-agent-memories-${stamp}.json`);
+      downloadJson(payload, `agent-memories-${stamp}.json`);
       toast(t("memory.exportSuccess"), { type: "ok" });
     } catch (error) {
       setMutationError(errorText(error) || t("memory.exportFailed"));

@@ -11,7 +11,7 @@
 
 ## 决定
 
-`docs/` 成为 ubitech agent 的唯一设计真相源：
+`docs/` 成为 Agent Platform 的唯一设计真相源：
 
 1. `design/` 定义产品和架构不变量；
 2. `reference/` 定义当前配置、协议和数据布局；

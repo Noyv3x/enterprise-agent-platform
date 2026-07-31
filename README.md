@@ -1,6 +1,6 @@
-# ubitech agent
+# Agent Platform
 
-ubitech agent 的设计、架构、运维与开发规范统一收录在 [canonical 文档层](docs/README.md)。README 仅作为仓库入口；当 README、代码与 `docs/` 不一致时，以 `docs/` 为唯一设计真相源。
+Agent Platform 的设计、架构、运维与开发规范统一收录在 [canonical 文档层](docs/README.md)。README 仅作为仓库入口；当 README、代码与 `docs/` 不一致时，以 `docs/` 为唯一设计真相源。实际部署可由管理员设置独立的产品名称、Agent 名称、颜色和 Logo。
 
 ## 快速开始
 
