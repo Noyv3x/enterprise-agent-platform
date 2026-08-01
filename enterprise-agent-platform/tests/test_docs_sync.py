@@ -632,13 +632,13 @@ class DocsSyncTests(unittest.TestCase):
 
         self.run_command("check-change", "--base", base, "--head", head, expect=0)
 
-    def test_check_change_requires_implementation_for_documentation(self) -> None:
+    def test_check_change_allows_documentation_only_clarification(self) -> None:
         base = self.ready_repository()
         document = self.root / "docs/design/feature.md"
         document.write_text("# Feature\n\nA changed design.\n", encoding="utf-8")
         head = self.commit("docs only")
-        result = self.run_command("check-change", "--base", base, "--head", head, expect=1)
-        self.assertIn("canonical documentation changed in domain platform", result.stderr)
+        result = self.run_command("check-change", "--base", base, "--head", head, expect=0)
+        self.assertIn("documentation and code changes are synchronized", result.stdout)
 
     def test_check_change_accepts_paired_change(self) -> None:
         base = self.ready_repository()

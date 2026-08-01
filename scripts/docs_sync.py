@@ -4,8 +4,8 @@
 The checker deliberately uses only the Python standard library so it can run
 before project dependencies are installed.  ``sync`` writes deterministic
 generated contract modules; ``check`` validates the current tree; and
-``check-change`` additionally verifies bidirectional document/code co-changes
-between two Git revisions.
+``check-change`` additionally verifies that behavior-code changes carry their
+canonical documentation between two Git revisions.
 """
 
 from __future__ import annotations
@@ -2391,7 +2391,6 @@ def validate_change(root: Path, manifest: Manifest, base: str, head: str) -> tup
     }
     changed_documents: dict[str, set[str]] = {identifier: set() for identifier in domain_ids}
     changed_code: dict[str, set[str]] = {identifier: set() for identifier in domain_ids}
-    changed_implementation: dict[str, set[str]] = {identifier: set() for identifier in domain_ids}
 
     for path in paths:
         for candidate in classification_manifests:
@@ -2400,9 +2399,6 @@ def validate_change(root: Path, manifest: Manifest, base: str, head: str) -> tup
             if _is_covered_code(candidate, path):
                 for domain in domains_for_code(candidate, path):
                     changed_code[domain.identifier].add(path)
-                    changed_implementation[domain.identifier].add(path)
-            for domain in domains_for_test(candidate, path):
-                changed_implementation[domain.identifier].add(path)
 
     errors: list[str] = []
     for identifier in sorted(domain_ids):
@@ -2410,11 +2406,6 @@ def validate_change(root: Path, manifest: Manifest, base: str, head: str) -> tup
             errors.append(
                 f"code changed in domain {identifier} without its canonical documentation: "
                 f"{', '.join(sorted(changed_code[identifier]))}"
-            )
-        if changed_documents[identifier] and not changed_implementation[identifier]:
-            errors.append(
-                f"canonical documentation changed in domain {identifier} without code, generated contract, or tests: "
-                f"{', '.join(sorted(changed_documents[identifier]))}"
             )
     return errors, False
 
