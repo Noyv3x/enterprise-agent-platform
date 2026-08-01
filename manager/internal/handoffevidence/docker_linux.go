@@ -26,6 +26,7 @@ var (
 		"platform", "agent-runtime", "camofox", "searxng", "firecrawl-api",
 		"firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq",
 	}
+	catalogOnlyImages = []string{"agent-sandbox", "handoff-fs-helper"}
 )
 
 type DockerCLI struct {
@@ -93,7 +94,7 @@ func validateDockerRequest(request DockerRequest) error {
 		!filepath.IsAbs(request.PlatformDataRoot) || filepath.Clean(request.PlatformDataRoot) != request.PlatformDataRoot {
 		return errors.New("Docker evidence request has an invalid technical binding")
 	}
-	expected := append(append([]string(nil), fixedServices...), "agent-sandbox")
+	expected := append(append([]string(nil), fixedServices...), catalogOnlyImages...)
 	if len(request.Images) != len(expected) {
 		return errors.New("Docker evidence image set is not closed")
 	}
@@ -128,7 +129,7 @@ func reconcileDockerEvidence(request DockerRequest, containers []dockerContainer
 		}
 		if project == request.Source.ComposeProject {
 			service := container.Labels["com.docker.compose.service"]
-			if _, known := request.Images[service]; !known || service == "agent-sandbox" {
+			if _, known := request.Images[service]; !known || service == "agent-sandbox" || service == "handoff-fs-helper" {
 				return DockerEvidence{}, fmt.Errorf("source Compose contains unknown service %q", service)
 			}
 			if _, duplicate := sourceByService[service]; duplicate {

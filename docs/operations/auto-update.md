@@ -14,7 +14,7 @@ Bridge 尚未公开时，若已经公开的 source-owner 仍缺少使唯一 P1 �
 
 Manager 将 `releases/<source-commit>/` 视为不可变身份：manifest 与 Compose 先下载到同目录 staging，完整验证并同步后原子发布。相同 commit 的工件必须逐字节一致；缺件或内容漂移视为 immutable-ID collision，必须在拉取镜像和进入维护前失败。
 
-当前通道发布出的 release manifest 镜像目录必须与当前契约定义的十一服务集合精确相等；缺少必需镜像或携带任何未知、额外、退役服务键都失败。JSON Schema、发布组装、Manager 解析器和静态验收共用同一闭世集合，不接受、保留或投影 opaque 额外镜像项。这条规则同时适用于 A2 普通发布与后继 bridge/cleanup 发布。唯一的十镜像兼容面是 source-owner 从本地保留的 Current/Previous 路径读取、且 generation、manifest 摘要与镜像集都精确等于 canonical P1 登记值时的专用解码；它不适用于远程发布、Candidate 或任意其它历史清单。
+当前通道发布出的 schema-v1 release manifest 镜像目录必须精确包含十个运行镜像与一个 dormant `handoff-fs-helper`；缺少必需镜像或携带任何未知、额外、退役服务键都失败。JSON Schema、发布组装、Manager 解析器和静态验收共用同一闭世集合，不接受、保留或投影 opaque 额外镜像项。部署证据校验必须验证这十一项完整 catalog 的不可变 digest，但只能把九个固定 Compose 服务视为常驻容器；`agent-sandbox` 按登记表单独对账，`handoff-fs-helper` 不得被误当为常驻 Compose 服务，也不得从 catalog 闭集中过滤。这条规则同时适用于 A2 普通发布与后继 bridge/cleanup 发布。唯一的十镜像兼容面是 source-owner 从本地保留的 Current/Previous 路径读取、且 generation、manifest 摘要与镜像集都精确等于 canonical P1 登记值时的专用解码；它不适用于远程发布、Candidate 或任意其它历史清单。
 
 管理员品牌配置不是 release identity。产品显示名称、标识图或其它展示字段变化不创建 generation，不改变清单 URL、commit、镜像 digest、Manager 路径、Compose/Docker identity、环境变量或任何更新幂等键；更新期间也不能从品牌值推断这些字段。Platform 不可达时，Manager 使用中性维护文案，不把读取业务数据库作为控制面健康或回滚前提。
 
