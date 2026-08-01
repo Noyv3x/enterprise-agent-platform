@@ -192,7 +192,7 @@ func (m *Manager) RecoverCurrentWithAuthorityTransfer(
 	}
 	var healthyRecoveryEvidence *recoveryFinalizeEvidence
 	if oldCurrent.SHA256 != newSHA && recoveryManagerIdentityMatches(ctx, m.SocketPath, m.ControlTokenFile, oldCurrent.Version, oldCurrent.SHA256) {
-		evidence, evidenceErr := readRecoveryFinalizeEvidence(platformStatePath, platformCommit)
+		evidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformStatePath, platformCommit)
 		if evidenceErr != nil {
 			return errors.New("Current Manager control is healthy; use the normal update path instead of external recovery")
 		}
@@ -237,7 +237,7 @@ func (m *Manager) RecoverCurrentWithAuthorityTransfer(
 		return errors.Join(cause, m.restoreRecoveryCurrent(oldBinary, unit))
 	}
 	if healthyRecoveryEvidence != nil {
-		latestEvidence, evidenceErr := readRecoveryFinalizeEvidence(platformStatePath, platformCommit)
+		latestEvidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformStatePath, platformCommit)
 		if evidenceErr != nil || !sameRecoveryFinalize(*healthyRecoveryEvidence, latestEvidence) {
 			if evidenceErr == nil {
 				evidenceErr = errors.New("committed recovery finalize evidence changed before replacement")

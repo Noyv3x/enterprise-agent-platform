@@ -1747,7 +1747,7 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 		}
 		if plan.Status == recoverySupersededStatus {
 			platformPath := filepath.Join(filepath.Dir(m.StatePath), "state.json")
-			evidence, evidenceErr := readRecoveryFinalizeEvidence(platformPath, manifest.SourceCommit)
+			evidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformPath, manifest.SourceCommit)
 			if evidenceErr != nil {
 				return fmt.Errorf("read committed recovery activation evidence: %w", evidenceErr)
 			}

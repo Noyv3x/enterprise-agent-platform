@@ -2,7 +2,7 @@
   "schema_version": 1,
   "transition_id": "technical-namespace-v1",
   "stage": "bridge",
-  "predecessor_generation": "c09a4fe83b14ffa6a67beacf4bd27fade9ac9e94",
+  "predecessor_generation": "5f927197f17a05e906a0bf11cdb7b4e3c8944ed0",
   "source_profile_id": "ubitech-agent-v1",
   "target_profile_id": "agent-platform-v1",
   "manifest_protocol": {

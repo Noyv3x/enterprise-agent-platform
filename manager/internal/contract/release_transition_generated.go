@@ -3,7 +3,7 @@ package contract
 
 const (
 	ReleaseTransitionStage                 = "bridge"
-	ReleaseTransitionPredecessorGeneration = "c09a4fe83b14ffa6a67beacf4bd27fade9ac9e94"
+	ReleaseTransitionPredecessorGeneration = "5f927197f17a05e906a0bf11cdb7b4e3c8944ed0"
 	ReleaseTransitionSourceProfileID       = "ubitech-agent-v1"
 	ReleaseTransitionTargetProfileID       = "agent-platform-v1"
 )

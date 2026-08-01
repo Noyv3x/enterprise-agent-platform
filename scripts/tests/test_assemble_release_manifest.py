@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import assemble_release_manifest as assembler  # noqa: E402
 
 
-PREDECESSOR = "3fa84952c56a6daf2a9a18825778c54b2d150cf1"
+PREDECESSOR = "5f927197f17a05e906a0bf11cdb7b4e3c8944ed0"
 CANDIDATE = "b" * 40
 
 
