@@ -60,6 +60,7 @@ class _ManagerStub:
             "active_operation_id": "",
             "finalize_pending_operation_id": "",
             "operation_id": "",
+            "workspace_schema_commit": None,
             "gate_settlement": None,
             "current": {
                 "id": "release-current",
@@ -269,6 +270,7 @@ class ManagerUpdateControlTests(unittest.TestCase):
                     "active_operation_id": operation_id,
                     "finalize_pending_operation_id": "",
                     "operation_id": operation_id,
+                    "workspace_schema_commit": None,
                     "gate_settlement": None,
                 }
             ),
@@ -318,6 +320,7 @@ class ManagerUpdateControlTests(unittest.TestCase):
             "active_operation_id": operation_id,
             "finalize_pending_operation_id": "",
             "operation_id": operation_id,
+            "workspace_schema_commit": None,
             "gate_settlement": None,
         }
         with tempfile.TemporaryDirectory() as td:
@@ -446,6 +449,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             "active_operation_id": operation_id,
             "finalize_pending_operation_id": "",
             "operation_id": operation_id,
+            "workspace_schema_commit": None,
             "gate_settlement": None,
         }
 
@@ -453,6 +457,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
     def _p1_status(operation_id: str) -> dict[str, object]:
         status = ServiceUpdateReservationTests._handoff_status(operation_id)
         status.pop("gate_settlement")
+        status.pop("workspace_schema_commit")
         status["current"] = {
             "id": SOURCE_OWNER_COMPAT_GENERATION,
             "source_commit": SOURCE_OWNER_COMPAT_GENERATION,
@@ -1419,6 +1424,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     "active_operation_id": "",
                     "finalize_pending_operation_id": operation_id,
                     "operation_id": operation_id,
+                    "workspace_schema_commit": None,
                     "gate_settlement": None,
                 }
             )

@@ -713,6 +713,7 @@ jobs:
           trap cleanup EXIT
           mkdir -p \
             "$UBITECH_SECRETS_DIR" "$UBITECH_MANAGER_CONTROL_DIR" \
+            "$UBITECH_DATA_ROOT/data/workspaces" \
             "$UBITECH_DATA_ROOT/data/runtimes/agent" \
             "$UBITECH_DATA_ROOT/data/runtimes/camofox" \
             "$UBITECH_DATA_ROOT/data/runtimes/searxng/config" \
@@ -724,6 +725,7 @@ jobs:
           done
           cp containers/searxng/settings.yml "$UBITECH_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
           chmod 0700 \
+            "$UBITECH_DATA_ROOT/data/workspaces" \
             "$UBITECH_DATA_ROOT/data/runtimes/searxng/config" \
             "$UBITECH_DATA_ROOT/data/runtimes/searxng/cache"
           chmod 0600 "$UBITECH_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
@@ -782,6 +784,8 @@ jobs:
                       "active_operation_id": "",
                       "finalize_pending_operation_id": "",
                       "operation_id": "",
+                      "workspace_schema_commit": None,
+                      "gate_settlement": None,
                       "checked_at": checked_at,
                   })
 

@@ -713,6 +713,7 @@ class PlatformServiceTests(unittest.TestCase):
                     "active_operation_id": "",
                     "finalize_pending_operation_id": "",
                     "operation_id": "",
+                    "workspace_schema_commit": None,
                     "gate_settlement": None,
                 }
             )
