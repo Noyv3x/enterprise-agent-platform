@@ -42,7 +42,7 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_bridge_directly_follows_final_source_owner(self) -> None:
         self.assertEqual(
             self.base_contract["predecessor_generation"],
-            "5f927197f17a05e906a0bf11cdb7b4e3c8944ed0",
+            "73691cacbfd4dd1f64747724ec749d833587c731",
         )
 
     @staticmethod
