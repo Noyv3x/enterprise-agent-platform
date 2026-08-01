@@ -10,12 +10,15 @@
 - 容器模式下 Platform 只读取 Manager 注入的 Camoufox、SearXNG、Firecrawl 私有 service URL。SQLite 中任何 manage、URL、command 或 source repo 行都不参与解析，Platform API 也不提供安装或重启这些固定服务的入口；修复和重启通过 Manager operation 完成。
 - Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
-- 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生；其中仍属于命名空间交接源的路径、环境变量和进程身份按部署交接契约处理，不能在单个适配器中零散改名。
+- 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生。当前容器路径、环境变量、进程身份和 Camoufox sidecar 只使用 `agent-platform` / `AGENT_PLATFORM_*` / `.agent-platform-runtime.json` target 接口，单个适配器不得引入第二套技术身份。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
-- release manifest 的可选 `namespace_handoff` 只描述一次受签名技术命名空间交接，不是普通集成扩展。source-profile 基线严格解析其源/目标 Manager 与 Compose 工件、profile ID 和 generation 绑定，但在保存 generation 工件、下载工件、写入 Candidate 或进入维护之前拒绝执行；只有后续完整 source-owner 基线才可消费该字段。source-owner 的身份 Router 必须在普通 update ownership 之前分流它，且 target profile 只能由已验证的外置 handoff journal 注入，不能由描述符本身直接激活。字段名必须使用规范 ASCII 大小写，重复、大小写别名、未知字段和不完整 binding 全部失败关闭。
-- source-owner、bridge 与 cleanup 是供应链上的不同发布角色。bridge 和 cleanup 工件在满足各自部署前置条件以前保持 draft，不出现在 Manager 可发现通道；受保护 promotion workflow 分别验证 source-owner 已部署回执与 `target_ack + committed` 交接回执的签名、一次性挑战、精确 generation/profile/Manager 摘要和钉扎部署公钥，再执行单调 promotion。签名回执不能放宽镜像 digest、Manager/Compose checksum、Git ancestry、质量门或 release immutability。cleanup 使用 bridge 目标已实现的 target-only manifest/protocol schema barrier，使源侧解析器在任何下载或状态副作用前失败关闭；详细流程见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)。
+- 当前 release manifest 只接受 schema 2 target-only 十镜像闭集，不包含迁移 helper 或交接描述符；历史镜像、目录、环境变量或终态 journal 都不能使已退役集成重新进入运行边界。
+
+### Bridge→Cleanup 历史集成交接证据（非当前接口）
+
+受控 Bridge→Cleanup 发布曾使用 source profile、身份 Router、`namespace_handoff`、handoff journal、helper 与签名 promotion receipt 完成一次性技术命名空间交接。这些字段和角色只作为历史供应链证据保留，当前 Manager 与集成适配器不解析、执行或恢复它们；详细历史流程见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)。
 
 ## 模型 OAuth
 
