@@ -72,7 +72,7 @@ test("runtime bearer token accepts trimmed direct and file-backed values but rej
   }
 });
 
-test("runtime accepts only the target technical profile and rejects source-prefixed environment", () => {
+test("runtime requires the target technical profile", () => {
   assert.throws(
     () => loadConfig({
       AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
@@ -80,14 +80,7 @@ test("runtime accepts only the target technical profile and rejects source-prefi
     }),
     /AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1/,
   );
-  assert.throws(
-    () => loadConfig(runtimeEnv({ UBITECH_DATA_ROOT: "/tmp/source" })),
-    /Source-profile environment is not accepted/,
-  );
-  assert.throws(
-    () => loadConfig(runtimeEnv({ ENTERPRISE_PLATFORM_DATA: "/tmp/source" })),
-    /Source-profile environment is not accepted/,
-  );
+  assert.equal(loadConfig(runtimeEnv()).bearerToken, TEST_RUNTIME_TOKEN);
 });
 
 test("max concurrency defaults to eight and accepts the inclusive 1..64 range", () => {

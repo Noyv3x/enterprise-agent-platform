@@ -698,8 +698,6 @@ def load_manifest(root: Path) -> Manifest:
                 "python-container-platform",
                 "typescript-container-platform",
                 "go-container-platform",
-                "go-release-transition",
-                "python-release-transition",
                 "go-technical-profiles",
                 "python-technical-profiles",
                 "typescript-technical-profile",
@@ -1416,41 +1414,40 @@ export const TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE = {_typescript_string
 '''
 
 
+
 def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any]:
     contract = _expect_object(raw, label)
-    _reject_unknown_keys(
-        contract,
-        {
-            "schema_version",
-            "policy",
-            "release_channel",
-            "database_schema_version",
-            "container_paths",
-            "execution_targets",
-            "persistent_data_owners",
-            "agent_runtime_handoff",
-            "p1_source_handoff",
-            "sandbox_idle_seconds",
-            "migration_backup_retention_seconds",
-            "obsolete_artifact_retention_seconds",
-            "update_pre_download_min_free_bytes",
-            "update_pre_cutover_min_free_bytes",
-            "update_min_free_inodes",
-            "managed_image_capacity_estimates",
-            "public_update_states",
-            "operations",
-            "operation_phases",
-        },
-        label,
-    )
-    if contract.get("schema_version") != 1:
-        raise DocsSyncError(f"{label}.schema_version must be 1")
-    if contract.get("policy") != "container-platform":
+    expected_keys = {
+        "schema_version",
+        "policy",
+        "release_channel",
+        "database_schema_version",
+        "container_paths",
+        "execution_targets",
+        "persistent_data_owners",
+        "sandbox_idle_seconds",
+        "migration_backup_retention_seconds",
+        "obsolete_artifact_retention_seconds",
+        "update_pre_download_min_free_bytes",
+        "update_pre_cutover_min_free_bytes",
+        "update_min_free_inodes",
+        "managed_image_capacity_estimates",
+        "public_update_states",
+        "operations",
+        "operation_phases",
+    }
+    _reject_unknown_keys(contract, expected_keys, label)
+    if set(contract) != expected_keys:
+        missing = ", ".join(sorted(expected_keys - set(contract)))
+        raise DocsSyncError(f"{label} is missing required keys: {missing}")
+    if contract["schema_version"] != 2:
+        raise DocsSyncError(f"{label}.schema_version must be 2")
+    if contract["policy"] != "container-platform":
         raise DocsSyncError(f"{label}.policy must be 'container-platform'")
-    if contract.get("release_channel") != "main":
+    if contract["release_channel"] != "main":
         raise DocsSyncError(f"{label}.release_channel must be 'main'")
 
-    paths = _expect_object(contract.get("container_paths"), f"{label}.container_paths")
+    paths = _expect_object(contract["container_paths"], f"{label}.container_paths")
     expected_paths = {"data_root", "workspace", "agent_home", "agent_env"}
     if set(paths) != expected_paths:
         raise DocsSyncError(
@@ -1465,7 +1462,9 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
             or value.endswith("/")
             or any(part in {".", ".."} for part in PurePosixPath(value).parts)
         ):
-            raise DocsSyncError(f"{label}.container_paths.{name} must be a canonical absolute path")
+            raise DocsSyncError(
+                f"{label}.container_paths.{name} must be a canonical absolute path"
+            )
 
     list_fields = {
         "execution_targets": ("sandbox", "host"),
@@ -1485,14 +1484,14 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         ),
     }
     for field, expected in list_fields.items():
-        values = _expect_string_list(contract.get(field), f"{label}.{field}")
+        values = _expect_string_list(contract[field], f"{label}.{field}")
         if values != expected:
             raise DocsSyncError(
                 f"{label}.{field} must exactly match the documented ordered values"
             )
 
     persistent_owners = _expect_object(
-        contract.get("persistent_data_owners"),
+        contract["persistent_data_owners"],
         f"{label}.persistent_data_owners",
     )
     expected_owner_sets = {
@@ -1542,328 +1541,6 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
                 )
             seen_owners.add(identity)
 
-    runtime_handoff = _expect_object(
-        contract.get("agent_runtime_handoff"),
-        f"{label}.agent_runtime_handoff",
-    )
-    _reject_unknown_keys(
-        runtime_handoff,
-        {
-            "validation_limits",
-            "current_roots",
-            "ephemeral_roots",
-            "p1_retired_roots",
-        },
-        f"{label}.agent_runtime_handoff",
-    )
-    if set(runtime_handoff) != {
-        "validation_limits",
-        "current_roots",
-        "ephemeral_roots",
-        "p1_retired_roots",
-    }:
-        raise DocsSyncError(f"{label}.agent_runtime_handoff must be complete")
-    validation_limits = _expect_object(
-        runtime_handoff["validation_limits"],
-        f"{label}.agent_runtime_handoff.validation_limits",
-    )
-    expected_validation_limits = {
-        "maximum_identity_records",
-        "maximum_jsonl_bytes",
-        "maximum_jsonl_records",
-        "maximum_directory_entries",
-    }
-    _reject_unknown_keys(
-        validation_limits,
-        expected_validation_limits,
-        f"{label}.agent_runtime_handoff.validation_limits",
-    )
-    if set(validation_limits) != expected_validation_limits:
-        raise DocsSyncError(
-            f"{label}.agent_runtime_handoff.validation_limits must be complete"
-        )
-    for field in sorted(expected_validation_limits):
-        value = validation_limits[field]
-        if (
-            type(value) is not int
-            or value <= 0
-            or value > JAVASCRIPT_MAX_SAFE_INTEGER
-        ):
-            raise DocsSyncError(
-                f"{label}.agent_runtime_handoff.validation_limits.{field} "
-                "must be a positive JavaScript-safe integer"
-            )
-    if _expect_string_list(
-        runtime_handoff["current_roots"],
-        f"{label}.agent_runtime_handoff.current_roots",
-    ) != ("sessions", "approvals", "idempotency"):
-        raise DocsSyncError(
-            f"{label}.agent_runtime_handoff.current_roots must match the current Runtime schema"
-        )
-    if _expect_string_list(
-        runtime_handoff["ephemeral_roots"],
-        f"{label}.agent_runtime_handoff.ephemeral_roots",
-    ) != ("logs",):
-        raise DocsSyncError(
-            f"{label}.agent_runtime_handoff.ephemeral_roots must contain only logs"
-        )
-    retired = _expect_object(
-        runtime_handoff["p1_retired_roots"],
-        f"{label}.agent_runtime_handoff.p1_retired_roots",
-    )
-    if set(retired) != {"app", "home", "memory", "migration"}:
-        raise DocsSyncError(
-            f"{label}.agent_runtime_handoff.p1_retired_roots must contain exactly app, home, memory and migration"
-        )
-    app = _expect_object(retired["app"], f"{label}.agent_runtime_handoff.p1_retired_roots.app")
-    app_keys = {
-        "mode", "top_level_entries", "inventory_algorithm", "inventory_sha256",
-        "inventory_entries", "inventory_regular_bytes", "install_source_signature",
-        "package_name", "package_version", "allowed_symlinks",
-    }
-    _reject_unknown_keys(app, app_keys, f"{label}.agent_runtime_handoff.p1_retired_roots.app")
-    if set(app) != app_keys or app.get("mode") != 0o755:
-        raise DocsSyncError(f"{label}.agent_runtime_handoff.p1_retired_roots.app is incomplete")
-    expected_top = (
-        ".gitignore", "README.md", "dist", "install.json", "node_modules",
-        "package-lock.json", "package.json", "src", "test", "tsconfig.json",
-    )
-    if _expect_string_list(app["top_level_entries"], f"{label}.agent_runtime_handoff.p1_retired_roots.app.top_level_entries") != expected_top:
-        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app top-level inventory is invalid")
-    if app.get("inventory_algorithm") != "runtime-retired-tree-v1":
-        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app inventory algorithm is invalid")
-    for field in ("inventory_sha256", "install_source_signature"):
-        value = app.get(field)
-        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app {field} must be a SHA-256")
-    for field in ("inventory_entries", "inventory_regular_bytes"):
-        value = app.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > JAVASCRIPT_MAX_SAFE_INTEGER:
-            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app {field} must be positive")
-    if app.get("package_name") != "@ubitech/agent-runtime" or app.get("package_version") != "0.1.0":
-        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app package identity is invalid")
-    symlinks = _expect_object(app["allowed_symlinks"], f"{label}.agent_runtime_handoff.p1_retired_roots.app.allowed_symlinks")
-    expected_symlinks = {
-        "node_modules/.bin/anthropic-ai-sdk": "../@anthropic-ai/sdk/bin/cli",
-        "node_modules/.bin/openai": "../openai/bin/cli",
-        "node_modules/.bin/pi-ai": "../@earendil-works/pi-ai/dist/cli.js",
-        "node_modules/.bin/yaml": "../yaml/bin.mjs",
-    }
-    if symlinks != expected_symlinks:
-        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app symlink set is invalid")
-    for path_value, target_value in symlinks.items():
-        resolved = posixpath.normpath(
-            posixpath.join(posixpath.dirname(path_value), target_value)
-        )
-        if (
-            path_value.startswith("/")
-            or target_value.startswith("/")
-            or resolved in {"", ".", ".."}
-            or resolved.startswith("../")
-        ):
-            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 app symlink escapes its root")
-
-    for root_name, expected_mode in (("home", 0o755), ("memory", 0o700)):
-        empty_root = _expect_object(retired[root_name], f"{label}.agent_runtime_handoff.p1_retired_roots.{root_name}")
-        if empty_root != {"mode": expected_mode, "empty": True}:
-            raise DocsSyncError(f"{label}.agent_runtime_handoff P1 {root_name} must be an exact empty directory")
-    migration = _expect_object(retired["migration"], f"{label}.agent_runtime_handoff.p1_retired_roots.migration")
-    migration_keys = {"mode", "file_name", "file_mode", "schema_version", "phase", "fields"}
-    _reject_unknown_keys(migration, migration_keys, f"{label}.agent_runtime_handoff.p1_retired_roots.migration")
-    expected_migration_fields = (
-        "attachments_skipped", "attachments_verified", "imported", "memories_imported",
-        "memories_skipped", "oauth_cleared", "oauth_imported", "oauth_skipped",
-        "phase", "session_manifests", "session_messages", "skipped", "updated_at",
-        "version", "workspaces_skipped", "workspaces_verified",
-    )
-    if (
-        set(migration) != migration_keys
-        or migration.get("mode") != 0o700
-        or migration.get("file_name") != "hermes-cutover.json"
-        or migration.get("file_mode") != 0o600
-        or migration.get("schema_version") != 1
-        or migration.get("phase") != "finalized"
-        or _expect_string_list(migration.get("fields"), f"{label}.agent_runtime_handoff.p1_retired_roots.migration.fields") != expected_migration_fields
-    ):
-        raise DocsSyncError(f"{label}.agent_runtime_handoff P1 migration marker contract is invalid")
-
-    p1_source = _expect_object(
-        contract.get("p1_source_handoff"),
-        f"{label}.p1_source_handoff",
-    )
-    p1_keys = {
-        "layouts", "empty_files", "empty_directories", "fixed_sha256",
-        "secret_files", "secret_line_pattern", "manager_secret_names",
-        "workspace_namespace", "camofox_home", "manager_migration",
-        "firecrawl_environment",
-    }
-    _reject_unknown_keys(p1_source, p1_keys, f"{label}.p1_source_handoff")
-    if set(p1_source) != p1_keys:
-        raise DocsSyncError(f"{label}.p1_source_handoff must be complete")
-    layouts = _expect_object(p1_source["layouts"], f"{label}.p1_source_handoff.layouts")
-    expected_layout_roots = {
-        ".", "data", "data/runtimes", "data/runtimes/camofox",
-        "data/runtimes/cognee", "data/runtimes/firecrawl",
-        "data/runtimes/searxng", "manager",
-    }
-    if set(layouts) != expected_layout_roots:
-        raise DocsSyncError(f"{label}.p1_source_handoff.layouts has an invalid closed root set")
-    layout_entries: dict[str, dict[str, Any]] = {}
-    dispositions = {"retained", "copied", "generated", "retired", "ephemeral"}
-    for relative, raw_layout in layouts.items():
-        layout = _expect_object(raw_layout, f"{label}.p1_source_handoff.layouts.{relative}")
-        if set(layout) != {"mode", "entries"} or layout["mode"] != 0o700:
-            raise DocsSyncError(f"{label}.p1_source_handoff.layouts.{relative} must be an owner-only directory")
-        entries = _expect_object(layout["entries"], f"{label}.p1_source_handoff.layouts.{relative}.entries")
-        if not entries:
-            raise DocsSyncError(f"{label}.p1_source_handoff.layouts.{relative}.entries cannot be empty")
-        layout_entries[relative] = entries
-        for name, raw_entry in entries.items():
-            if (
-                not isinstance(name, str) or name in {"", ".", ".."}
-                or "/" in name or "\\" in name or "\x00" in name
-            ):
-                raise DocsSyncError(f"{label}.p1_source_handoff contains an unsafe entry name")
-            entry = _expect_object(raw_entry, f"{label}.p1_source_handoff.layouts.{relative}.entries.{name}")
-            if set(entry) != {"type", "disposition", "mode", "required"}:
-                raise DocsSyncError(f"{label}.p1_source_handoff entry must contain type, disposition, mode and required")
-            if entry["type"] not in {"directory", "file"} or entry["disposition"] not in dispositions:
-                raise DocsSyncError(f"{label}.p1_source_handoff entry has an invalid type or disposition")
-            if entry["mode"] not in {0o600, 0o644, 0o700, 0o755} or not isinstance(entry["required"], bool):
-                raise DocsSyncError(f"{label}.p1_source_handoff entry has an invalid mode or required flag")
-    for relative in expected_layout_roots - {"."}:
-        parent, name = posixpath.split(relative)
-        parent = parent or "."
-        parent_entry = layout_entries.get(parent, {}).get(name)
-        if not isinstance(parent_entry, dict) or parent_entry.get("type") != "directory" or not parent_entry.get("required"):
-            raise DocsSyncError(f"{label}.p1_source_handoff layout root {relative} is not required by its parent")
-
-    def p1_path_list(field: str, expected_disposition: str | None = None) -> tuple[str, ...]:
-        values = _expect_string_list(p1_source[field], f"{label}.p1_source_handoff.{field}")
-        if tuple(sorted(values)) != values or len(set(values)) != len(values):
-            raise DocsSyncError(f"{label}.p1_source_handoff.{field} must be sorted and unique")
-        for value in values:
-            parent, name = posixpath.split(value)
-            parent = parent or "."
-            entry = layout_entries.get(parent, {}).get(name)
-            if not isinstance(entry, dict) or not entry.get("required"):
-                raise DocsSyncError(f"{label}.p1_source_handoff.{field} references an unknown optional object")
-            if expected_disposition is not None and entry.get("disposition") != expected_disposition:
-                raise DocsSyncError(f"{label}.p1_source_handoff.{field} has the wrong disposition")
-        return values
-
-    empty_files = p1_path_list("empty_files", "ephemeral")
-    empty_directories = p1_path_list("empty_directories")
-    secret_files = p1_path_list("secret_files", "retired")
-    for value in empty_files + secret_files:
-        parent, name = posixpath.split(value)
-        if layout_entries[parent or "."][name]["type"] != "file":
-            raise DocsSyncError(f"{label}.p1_source_handoff expected a file at {value}")
-    for value in empty_directories:
-        parent, name = posixpath.split(value)
-        if layout_entries[parent or "."][name]["type"] != "directory":
-            raise DocsSyncError(f"{label}.p1_source_handoff expected a directory at {value}")
-    if p1_source["secret_line_pattern"] != r"^[A-Za-z0-9_-]{64}\n$":
-        raise DocsSyncError(f"{label}.p1_source_handoff.secret_line_pattern is invalid")
-    manager_secret_names = _expect_string_list(
-        p1_source["manager_secret_names"],
-        f"{label}.p1_source_handoff.manager_secret_names",
-    )
-    expected_manager_secret_names = (
-        "agent-runtime-token",
-        "agent-tool-token",
-        "camofox-access-key",
-        "firecrawl-bull-auth-key",
-        "firecrawl-postgres-password",
-        "manager-executor-token",
-        "manager-token",
-        "session-secret",
-    )
-    if manager_secret_names != expected_manager_secret_names:
-        raise DocsSyncError(
-            f"{label}.p1_source_handoff.manager_secret_names must match the audited P1 closed set"
-        )
-    workspace_namespace = _expect_object(
-        p1_source["workspace_namespace"],
-        f"{label}.p1_source_handoff.workspace_namespace",
-    )
-    workspace_namespace_keys = {
-        "source_directory", "target_directory", "required", "mode",
-        "root_owned_empty_mount",
-    }
-    if set(workspace_namespace) != workspace_namespace_keys:
-        raise DocsSyncError(
-            f"{label}.p1_source_handoff.workspace_namespace must be complete"
-        )
-    root_owned_mount = _expect_object(
-        workspace_namespace["root_owned_empty_mount"],
-        f"{label}.p1_source_handoff.workspace_namespace.root_owned_empty_mount",
-    )
-    if (
-        workspace_namespace["source_directory"] != ".ubitech"
-        or workspace_namespace["target_directory"] != ".agent-platform"
-        or workspace_namespace["required"] is not True
-        or workspace_namespace["mode"] != 0o755
-        or root_owned_mount != {
-            "relative_path": "attachments",
-            "mode": 0o755,
-            "uid": 0,
-            "gid": 0,
-        }
-    ):
-        raise DocsSyncError(
-            f"{label}.p1_source_handoff.workspace_namespace is not the audited P1 mapping"
-        )
-    fixed = _expect_object(p1_source["fixed_sha256"], f"{label}.p1_source_handoff.fixed_sha256")
-    expected_fixed = {
-        "data/runtimes/cognee/python-install.json",
-        "data/runtimes/firecrawl/docker-compose.enterprise.yaml",
-        "data/runtimes/firecrawl/docker-compose.ubitech.yaml",
-        "data/runtimes/searxng/docker-compose.ubitech.yaml",
-    }
-    if set(fixed) != expected_fixed or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in fixed.values()):
-        raise DocsSyncError(f"{label}.p1_source_handoff.fixed_sha256 is invalid")
-
-    camofox_home = _expect_object(p1_source["camofox_home"], f"{label}.p1_source_handoff.camofox_home")
-    if set(camofox_home) != {"path", "mode", "top_level_entries", "allowed_symlinks"} or camofox_home["path"] != "data/runtimes/camofox/home" or camofox_home["mode"] != 0o755:
-        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home identity is invalid")
-    if _expect_string_list(camofox_home["top_level_entries"], f"{label}.p1_source_handoff.camofox_home.top_level_entries") != (".cache", ".camoufox", "Downloads", "camoufox"):
-        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home top-level set is invalid")
-    expected_camofox_symlinks = {
-        ".cache/camoufox/camofox-bin": "/opt/camofox/browser/camoufox",
-        ".cache/camoufox/fontconfig": "/opt/camofox/browser/fontconfig",
-        ".cache/camoufox/properties.json": "/opt/camofox/browser/properties.json",
-    }
-    if _expect_object(camofox_home["allowed_symlinks"], f"{label}.p1_source_handoff.camofox_home.allowed_symlinks") != expected_camofox_symlinks:
-        raise DocsSyncError(f"{label}.p1_source_handoff.camofox_home symlink set is invalid")
-
-    manager_migration = _expect_object(p1_source["manager_migration"], f"{label}.p1_source_handoff.manager_migration")
-    migration_source_keys = {
-        "path", "mode", "schema_version", "status", "legacy_id_pattern",
-        "operation_id_pattern", "commit_pattern", "campaign_pattern",
-        "fields", "retirement_status", "retirement_fields",
-    }
-    if set(manager_migration) != migration_source_keys or manager_migration["path"] != "manager/migration.json" or manager_migration["mode"] != 0o600 or manager_migration["schema_version"] != 1 or manager_migration["status"] != "purged" or manager_migration["retirement_status"] != "completed":
-        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration identity is invalid")
-    expected_migration_patterns = {
-        "legacy_id_pattern": r"^legacy-[0-9a-f]{16}$",
-        "operation_id_pattern": r"^op_[0-9a-f]{32}$",
-        "commit_pattern": r"^[0-9a-f]{40}$",
-        "campaign_pattern": r"^source-v1-retirement-[0-9]{4}-[0-9]{2}$",
-    }
-    if any(manager_migration[name] != value for name, value in expected_migration_patterns.items()):
-        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration patterns are invalid")
-    expected_manager_fields = ("created_at", "expected_source_commit", "id", "operation_id", "retirement", "schema_version", "status", "updated_at")
-    expected_retirement_fields = ("campaign_id", "completed_at", "docker_removed", "generation_id", "recovery_removed", "source_state_removed", "started_at", "status", "systemd_removed")
-    if _expect_string_list(manager_migration["fields"], f"{label}.p1_source_handoff.manager_migration.fields") != expected_manager_fields or _expect_string_list(manager_migration["retirement_fields"], f"{label}.p1_source_handoff.manager_migration.retirement_fields") != expected_retirement_fields:
-        raise DocsSyncError(f"{label}.p1_source_handoff.manager_migration fields are invalid")
-
-    firecrawl_environment = _expect_object(p1_source["firecrawl_environment"], f"{label}.p1_source_handoff.firecrawl_environment")
-    if set(firecrawl_environment) != {"path", "mode", "keys", "bull_auth_pattern", "literal_values"} or firecrawl_environment["path"] != "data/runtimes/firecrawl/.env" or firecrawl_environment["mode"] != 0o600 or firecrawl_environment["bull_auth_pattern"] != r"^[A-Za-z0-9_-]{32}$":
-        raise DocsSyncError(f"{label}.p1_source_handoff.firecrawl_environment identity is invalid")
-    if _expect_string_list(firecrawl_environment["keys"], f"{label}.p1_source_handoff.firecrawl_environment.keys") != ("BULL_AUTH_KEY", "HOST", "PORT", "USE_DB_AUTHENTICATION") or _expect_object(firecrawl_environment["literal_values"], f"{label}.p1_source_handoff.firecrawl_environment.literal_values") != {"HOST": '"0.0.0.0"', "PORT": '"127.0.0.1:3002"', "USE_DB_AUTHENTICATION": '"false"'}:
-        raise DocsSyncError(f"{label}.p1_source_handoff.firecrawl_environment values are invalid")
-
     for field in (
         "database_schema_version",
         "sandbox_idle_seconds",
@@ -1873,14 +1550,19 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         "update_pre_cutover_min_free_bytes",
         "update_min_free_inodes",
     ):
-        value = contract.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise DocsSyncError(f"{label}.{field} must be a positive integer")
-        if value > JAVASCRIPT_MAX_SAFE_INTEGER:
-            raise DocsSyncError(f"{label}.{field} must be a JavaScript safe integer")
+        value = contract[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value > JAVASCRIPT_MAX_SAFE_INTEGER
+        ):
+            raise DocsSyncError(
+                f"{label}.{field} must be a positive JavaScript-safe integer"
+            )
 
     estimates = _expect_object(
-        contract.get("managed_image_capacity_estimates"),
+        contract["managed_image_capacity_estimates"],
         f"{label}.managed_image_capacity_estimates",
     )
     managed_images = {
@@ -1894,11 +1576,10 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         "firecrawl-postgres",
         "firecrawl-redis",
         "firecrawl-rabbitmq",
-        "handoff-fs-helper",
     }
     if set(estimates) != managed_images:
         raise DocsSyncError(
-            f"{label}.managed_image_capacity_estimates must contain exactly the current managed image set"
+            f"{label}.managed_image_capacity_estimates must contain exactly the current ten-image set"
         )
     for image_name, estimate_value in estimates.items():
         estimate = _expect_object(
@@ -1923,13 +1604,10 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
                 )
     return contract
 
-
 def _render_python_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
     estimates = contract["managed_image_capacity_estimates"]
     persistent_owners = contract["persistent_data_owners"]
-    runtime_handoff = contract["agent_runtime_handoff"]
-    p1_source_handoff = contract["p1_source_handoff"]
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -1939,8 +1617,6 @@ DATABASE_SCHEMA_VERSION = {contract["database_schema_version"]}
 CONTAINER_PATHS = {paths!r}
 EXECUTION_TARGETS = {tuple(contract["execution_targets"])!r}
 PERSISTENT_DATA_OWNERS = {persistent_owners!r}
-AGENT_RUNTIME_HANDOFF = {runtime_handoff!r}
-P1_SOURCE_HANDOFF = {p1_source_handoff!r}
 SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]}
 MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]}
 OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]}
@@ -1953,17 +1629,18 @@ MANAGER_OPERATIONS = {tuple(contract["operations"])!r}
 MANAGER_OPERATION_PHASES = {tuple(contract["operation_phases"])!r}
 '''
 
-
 def _render_typescript_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = json.dumps(contract["container_paths"], ensure_ascii=False, indent=2)
     targets = json.dumps(contract["execution_targets"], ensure_ascii=False)
     states = json.dumps(contract["public_update_states"], ensure_ascii=False)
     operations = json.dumps(contract["operations"], ensure_ascii=False)
     phases = json.dumps(contract["operation_phases"], ensure_ascii=False)
-    estimates = json.dumps(contract["managed_image_capacity_estimates"], ensure_ascii=False, indent=2)
-    persistent_owners = json.dumps(contract["persistent_data_owners"], ensure_ascii=False, indent=2)
-    runtime_handoff = json.dumps(contract["agent_runtime_handoff"], ensure_ascii=False, indent=2)
-    p1_source_handoff = json.dumps(contract["p1_source_handoff"], ensure_ascii=False, indent=2)
+    estimates = json.dumps(
+        contract["managed_image_capacity_estimates"], ensure_ascii=False, indent=2
+    )
+    persistent_owners = json.dumps(
+        contract["persistent_data_owners"], ensure_ascii=False, indent=2
+    )
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = {contract["schema_version"]} as const;
 export const RELEASE_CHANNEL = {_typescript_string(contract["release_channel"])} as const;
@@ -1972,8 +1649,6 @@ export const CONTAINER_PATHS = {paths} as const;
 export const EXECUTION_TARGETS = {targets} as const;
 export type ExecutionTarget = (typeof EXECUTION_TARGETS)[number];
 export const PERSISTENT_DATA_OWNERS = {persistent_owners} as const;
-export const AGENT_RUNTIME_HANDOFF = {runtime_handoff} as const;
-export const P1_SOURCE_HANDOFF = {p1_source_handoff} as const;
 export const SANDBOX_IDLE_SECONDS = {contract["sandbox_idle_seconds"]} as const;
 export const MIGRATION_BACKUP_RETENTION_SECONDS = {contract["migration_backup_retention_seconds"]} as const;
 export const OBSOLETE_ARTIFACT_RETENTION_SECONDS = {contract["obsolete_artifact_retention_seconds"]} as const;
@@ -1988,19 +1663,13 @@ export type ManagerOperation = (typeof MANAGER_OPERATIONS)[number];
 export const MANAGER_OPERATION_PHASES = {phases} as const;
 export type ManagerOperationPhase = (typeof MANAGER_OPERATION_PHASES)[number];
 '''
-
-
 def _go_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+
 def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
     paths = contract["container_paths"]
-    runtime_limits = contract["agent_runtime_handoff"]["validation_limits"]
-
-    def strings(values: Sequence[str]) -> str:
-        return ", ".join(_go_string(value) for value in values)
-
     constants = (
         ("SchemaVersion", str(contract["schema_version"])),
         ("ReleaseChannel", _go_string(contract["release_channel"])),
@@ -2027,22 +1696,6 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
             str(contract["update_pre_cutover_min_free_bytes"]),
         ),
         ("UpdateMinFreeInodes", str(contract["update_min_free_inodes"])),
-        (
-            "AgentRuntimeMaximumIdentityRecords",
-            str(runtime_limits["maximum_identity_records"]),
-        ),
-        (
-            "AgentRuntimeMaximumJSONLBytes",
-            str(runtime_limits["maximum_jsonl_bytes"]),
-        ),
-        (
-            "AgentRuntimeMaximumJSONLRecords",
-            str(runtime_limits["maximum_jsonl_records"]),
-        ),
-        (
-            "AgentRuntimeMaximumDirectoryEntries",
-            str(runtime_limits["maximum_directory_entries"]),
-        ),
     )
     name_width = max(len(name) for name, _ in constants)
     constant_lines = "\n".join(
@@ -2073,72 +1726,6 @@ def _render_go_container_platform(contract: dict[str, Any], source: str) -> str:
         + "},"
         for name, owners in sorted(contract["persistent_data_owners"].items())
     )
-    runtime_handoff = contract["agent_runtime_handoff"]
-    retired = runtime_handoff["p1_retired_roots"]
-    app = retired["app"]
-    migration = retired["migration"]
-    symlink_items = [
-        (_go_string(path), _go_string(target))
-        for path, target in sorted(app["allowed_symlinks"].items())
-    ]
-    symlink_key_width = max(len(path) for path, _ in symlink_items)
-    symlink_lines = "\n".join(
-        f"\t{path}:{' ' * (symlink_key_width - len(path) + 1)}{target},"
-        for path, target in symlink_items
-    )
-    p1_source = contract["p1_source_handoff"]
-    p1_layout_lines: list[str] = []
-    for relative, layout in sorted(p1_source["layouts"].items()):
-        rendered_names = [_go_string(name) for name in layout["entries"]]
-        rendered_name_width = max(len(name) for name in rendered_names)
-        entry_lines = "\n".join(
-            "\t\t"
-            + _go_string(name)
-            + ":"
-            + " " * (rendered_name_width - len(_go_string(name)) + 1)
-            + "{Type: "
-            + _go_string(value["type"])
-            + ", Disposition: "
-            + _go_string(value["disposition"])
-            + ", Mode: "
-            + str(value["mode"])
-            + ", Required: "
-            + str(value["required"]).lower()
-            + "},"
-            for name, value in sorted(layout["entries"].items())
-        )
-        p1_layout_lines.append(
-            "\t"
-            + _go_string(relative)
-            + ": {Mode: "
-            + str(layout["mode"])
-            + ", Entries: map[string]P1SourceObject{\n"
-            + entry_lines
-            + "\n\t}},"
-        )
-    p1_fixed_names = [_go_string(path) for path in p1_source["fixed_sha256"]]
-    p1_fixed_width = max(len(name) for name in p1_fixed_names)
-    p1_fixed_lines = "\n".join(
-        f"\t{_go_string(path)}:{' ' * (p1_fixed_width - len(_go_string(path)) + 1)}{_go_string(value)},"
-        for path, value in sorted(p1_source["fixed_sha256"].items())
-    )
-    p1_camofox = p1_source["camofox_home"]
-    p1_camofox_symlink_names = [_go_string(path) for path in p1_camofox["allowed_symlinks"]]
-    p1_camofox_symlink_width = max(len(name) for name in p1_camofox_symlink_names)
-    p1_camofox_symlink_lines = "\n".join(
-        f"\t{_go_string(path)}:{' ' * (p1_camofox_symlink_width - len(_go_string(path)) + 1)}{_go_string(value)},"
-        for path, value in sorted(p1_camofox["allowed_symlinks"].items())
-    )
-    p1_migration = p1_source["manager_migration"]
-    p1_firecrawl = p1_source["firecrawl_environment"]
-    p1_workspace = p1_source["workspace_namespace"]
-    p1_workspace_mount = p1_workspace["root_owned_empty_mount"]
-    p1_firecrawl_literal_names = [_go_string(name) for name in p1_firecrawl["literal_values"]]
-    p1_firecrawl_literal_width = max(len(name) for name in p1_firecrawl_literal_names)
-    p1_firecrawl_literal_lines = "\n".join(
-        f"\t{_go_string(name)}:{' ' * (p1_firecrawl_literal_width - len(_go_string(name)) + 1)}{_go_string(value)},"
-        for name, value in sorted(p1_firecrawl["literal_values"].items())
-    )
 
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
 package contract
@@ -2164,125 +1751,7 @@ type PersistentDataOwner struct {{
 var PersistentDataOwners = map[string][]PersistentDataOwner{{
 {owner_lines}
 }}
-
-const (
-\tAgentRuntimeP1AppMode             = {app["mode"]}
-\tAgentRuntimeP1AppInventorySHA256  = {_go_string(app["inventory_sha256"])}
-\tAgentRuntimeP1AppInventoryEntries = {app["inventory_entries"]}
-\tAgentRuntimeP1AppRegularBytes     = {app["inventory_regular_bytes"]}
-\tAgentRuntimeP1InstallSignature    = {_go_string(app["install_source_signature"])}
-\tAgentRuntimeP1PackageName         = {_go_string(app["package_name"])}
-\tAgentRuntimeP1PackageVersion      = {_go_string(app["package_version"])}
-\tAgentRuntimeP1HomeMode            = {retired["home"]["mode"]}
-\tAgentRuntimeP1MemoryMode          = {retired["memory"]["mode"]}
-\tAgentRuntimeP1MigrationMode       = {migration["mode"]}
-\tAgentRuntimeP1MigrationFile       = {_go_string(migration["file_name"])}
-\tAgentRuntimeP1MigrationFileMode   = {migration["file_mode"]}
-\tAgentRuntimeP1MigrationSchema     = {migration["schema_version"]}
-\tAgentRuntimeP1MigrationPhase      = {_go_string(migration["phase"])}
-)
-
-var AgentRuntimeCurrentRoots = []string{{{strings(runtime_handoff["current_roots"])}}}
-var AgentRuntimeEphemeralRoots = []string{{{strings(runtime_handoff["ephemeral_roots"])}}}
-var AgentRuntimeP1RetiredRoots = []string{{{strings(retired.keys())}}}
-var AgentRuntimeP1AppTopLevelEntries = []string{{{strings(app["top_level_entries"])}}}
-var AgentRuntimeP1AppAllowedSymlinks = map[string]string{{
-{symlink_lines}
-}}
-var AgentRuntimeP1MigrationFields = []string{{{strings(migration["fields"])}}}
-
-type P1SourceObject struct {{
-	Type        string
-	Disposition string
-	Mode        uint32
-	Required    bool
-}}
-
-type P1SourceDirectory struct {{
-	Mode    uint32
-	Entries map[string]P1SourceObject
-}}
-
-var P1SourceLayouts = map[string]P1SourceDirectory{{
-{chr(10).join(p1_layout_lines)}
-}}
-
-var P1SourceEmptyFiles = []string{{{strings(p1_source["empty_files"])}}}
-var P1SourceEmptyDirectories = []string{{{strings(p1_source["empty_directories"])}}}
-var P1SourceSecretFiles = []string{{{strings(p1_source["secret_files"])}}}
-var P1ManagerSecretNames = []string{{{strings(p1_source["manager_secret_names"])}}}
-var P1SourceFixedSHA256 = map[string]string{{
-{p1_fixed_lines}
-}}
-
-const P1SourceSecretLinePattern = {_go_string(p1_source["secret_line_pattern"])}
-const P1WorkspaceSourceDirectory = {_go_string(p1_workspace["source_directory"])}
-const P1WorkspaceTargetDirectory = {_go_string(p1_workspace["target_directory"])}
-const P1WorkspaceNamespaceRequired = {str(p1_workspace["required"]).lower()}
-const P1WorkspaceNamespaceMode = {p1_workspace["mode"]}
-const P1WorkspaceRootOwnedMountPath = {_go_string(p1_workspace_mount["relative_path"])}
-const P1WorkspaceRootOwnedMountMode = {p1_workspace_mount["mode"]}
-const P1WorkspaceRootOwnedUID = {p1_workspace_mount["uid"]}
-const P1WorkspaceRootOwnedGID = {p1_workspace_mount["gid"]}
-const P1CamofoxHomePath = {_go_string(p1_camofox["path"])}
-const P1CamofoxHomeMode = {p1_camofox["mode"]}
-const P1ManagerMigrationPath = {_go_string(p1_migration["path"])}
-const P1ManagerMigrationMode = {p1_migration["mode"]}
-const P1ManagerMigrationSchema = {p1_migration["schema_version"]}
-const P1ManagerMigrationStatus = {_go_string(p1_migration["status"])}
-const P1ManagerRetirementStatus = {_go_string(p1_migration["retirement_status"])}
-const P1ManagerLegacyIDPattern = {_go_string(p1_migration["legacy_id_pattern"])}
-const P1ManagerOperationIDPattern = {_go_string(p1_migration["operation_id_pattern"])}
-const P1ManagerCommitPattern = {_go_string(p1_migration["commit_pattern"])}
-const P1ManagerCampaignPattern = {_go_string(p1_migration["campaign_pattern"])}
-const P1FirecrawlEnvironmentPath = {_go_string(p1_firecrawl["path"])}
-const P1FirecrawlEnvironmentMode = {p1_firecrawl["mode"]}
-const P1FirecrawlBullAuthPattern = {_go_string(p1_firecrawl["bull_auth_pattern"])}
-
-var P1CamofoxHomeTopLevelEntries = []string{{{strings(p1_camofox["top_level_entries"])}}}
-var P1CamofoxHomeAllowedSymlinks = map[string]string{{
-{p1_camofox_symlink_lines}
-}}
-var P1ManagerMigrationFields = []string{{{strings(p1_migration["fields"])}}}
-var P1ManagerRetirementFields = []string{{{strings(p1_migration["retirement_fields"])}}}
-var P1FirecrawlEnvironmentKeys = []string{{{strings(p1_firecrawl["keys"])}}}
-var P1FirecrawlEnvironmentLiteralValues = map[string]string{{
-{p1_firecrawl_literal_lines}
-}}
-
-var ExecutionTargets = []string{{{strings(contract["execution_targets"])}}}
-var PublicUpdateStates = []string{{{strings(contract["public_update_states"])}}}
-var Operations = []string{{{strings(contract["operations"])}}}
-var OperationPhases = []string{{{strings(contract["operation_phases"])}}}
 '''
-
-
-def _render_go_release_transition(contract: dict[str, Any], source: str) -> str:
-    return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
-package contract
-
-const (
-\tReleaseTransitionStage                 = {_go_string(contract["stage"])}
-\tReleaseTransitionPredecessorGeneration = {_go_string(contract["predecessor_generation"])}
-\tReleaseTransitionSourceProfileID       = {_go_string(contract["source_profile_id"])}
-\tReleaseTransitionTargetProfileID       = {_go_string(contract["target_profile_id"])}
-)
-'''
-
-
-def _render_python_release_transition(
-    contract: dict[str, Any], source: str
-) -> str:
-    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
-from __future__ import annotations
-
-RELEASE_TRANSITION_STAGE = {contract["stage"]!r}
-PREDECESSOR_GENERATION = {contract["predecessor_generation"]!r}
-SOURCE_PROFILE_ID = {contract["source_profile_id"]!r}
-TARGET_PROFILE_ID = {contract["target_profile_id"]!r}
-'''
-
-
 def _validate_technical_profiles_contract(
     raw: Any,
     label: str,
@@ -2291,14 +1760,12 @@ def _validate_technical_profiles_contract(
     _reject_unknown_keys(contract, {"schema_version", "profiles"}, label)
     if set(contract) != {"schema_version", "profiles"}:
         raise DocsSyncError(f"{label} must contain schema_version and profiles")
-    if contract["schema_version"] != 1:
-        raise DocsSyncError(f"{label}.schema_version must be 1")
+    if contract["schema_version"] != 2:
+        raise DocsSyncError(f"{label}.schema_version must be 2")
 
     profiles = _expect_object(contract["profiles"], f"{label}.profiles")
-    if set(profiles) != {"source", "target"}:
-        raise DocsSyncError(
-            f"{label}.profiles must contain exactly source and target"
-        )
+    if set(profiles) != {"target"}:
+        raise DocsSyncError(f"{label}.profiles must contain exactly target")
 
     profile_keys = {
         "profile_id",
@@ -2319,7 +1786,6 @@ def _validate_technical_profiles_contract(
             "config_file",
             "data_directory",
             "state_directory",
-            "data_root_socket_path",
             "runtime_socket_path",
             "default_socket_path",
             "default_token_file",
@@ -2356,7 +1822,9 @@ def _validate_technical_profiles_contract(
         "host_data_root",
     }
 
-    def complete_object(value: Any, expected: set[str], value_label: str) -> dict[str, Any]:
+    def complete_object(
+        value: Any, expected: set[str], value_label: str
+    ) -> dict[str, Any]:
         item = _expect_object(value, value_label)
         _reject_unknown_keys(item, expected, value_label)
         missing = sorted(expected - set(item))
@@ -2401,180 +1869,157 @@ def _validate_technical_profiles_contract(
             raise DocsSyncError(f"{value_label} must be a canonical relative path")
         return path
 
-    for role in ("source", "target"):
-        profile_label = f"{label}.profiles.{role}"
-        profile = complete_object(profiles[role], profile_keys, profile_label)
-        profile_id = nonempty_string(profile["profile_id"], f"{profile_label}.profile_id")
-        if re.fullmatch(r"[a-z][a-z0-9-]*-v[1-9][0-9]*", profile_id) is None:
-            raise DocsSyncError(
-                f"{profile_label}.profile_id must be a versioned lowercase identifier"
-            )
-
-        groups = {
-            name: complete_object(
-                profile[name], keys, f"{profile_label}.{name}"
-            )
-            for name, keys in group_keys.items()
-        }
-        manager = groups["manager"]
-        container = groups["container"]
-        gateway = groups["gateway"]
-        compose = groups["compose"]
-        environment = groups["environment"]
-        labels = groups["labels"]
-        workspace = groups["workspace"]
-        platform = groups["platform"]
-
-        for name in (
-            "binary",
-            "unit",
-            "config_directory",
-            "config_file",
-            "data_directory",
-            "state_directory",
-        ):
-            relative_path(manager[name], f"{profile_label}.manager.{name}")
-        if "/" in manager["binary"] or "/" in manager["unit"]:
-            raise DocsSyncError(
-                f"{profile_label}.manager binary and unit must be base names"
-            )
-        if not manager["unit"].endswith(".service"):
-            raise DocsSyncError(f"{profile_label}.manager.unit must be a service unit")
-
-        socket_bindings: list[str | None] = []
-        for name in ("data_root_socket_path", "runtime_socket_path"):
-            binding = manager[name]
-            if binding is not None:
-                binding = relative_path(binding, f"{profile_label}.manager.{name}")
-            socket_bindings.append(binding)
-        if sum(binding is not None for binding in socket_bindings) != 1:
-            raise DocsSyncError(
-                f"{profile_label}.manager must define exactly one relative socket binding"
-            )
-        if role == "source" and manager["data_root_socket_path"] is None:
-            raise DocsSyncError(
-                f"{profile_label}.manager must bind its socket under the data root"
-            )
-        if role == "target" and manager["runtime_socket_path"] is None:
-            raise DocsSyncError(
-                f"{profile_label}.manager must bind its socket under the runtime root"
-            )
-
-        for name in ("default_socket_path", "default_token_file"):
-            absolute_path(manager[name], f"{profile_label}.manager.{name}")
-        for name, value in container.items():
-            absolute_path(value, f"{profile_label}.container.{name}")
-        for name, value in gateway.items():
-            absolute_path(value, f"{profile_label}.gateway.{name}")
-        if manager["default_socket_path"] != container["control_socket_path"]:
-            raise DocsSyncError(
-                f"{profile_label} default and container control sockets must match"
-            )
-
-        for name, value in compose.items():
-            identifier = nonempty_string(value, f"{profile_label}.compose.{name}")
-            if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", identifier) is None:
-                raise DocsSyncError(
-                    f"{profile_label}.compose.{name} must be a lowercase Compose identifier"
-                )
-
-        environment_keys = complete_object(
-            environment["keys"],
-            environment_key_names,
-            f"{profile_label}.environment.keys",
+    profile_label = f"{label}.profiles.target"
+    profile = complete_object(profiles["target"], profile_keys, profile_label)
+    profile_id = nonempty_string(profile["profile_id"], f"{profile_label}.profile_id")
+    if re.fullmatch(r"[a-z][a-z0-9-]*-v[1-9][0-9]*", profile_id) is None:
+        raise DocsSyncError(
+            f"{profile_label}.profile_id must be a versioned lowercase identifier"
         )
-        for prefix_name in ("manager_prefix", "platform_prefix"):
-            prefix = nonempty_string(
-                environment[prefix_name],
-                f"{profile_label}.environment.{prefix_name}",
-            )
-            if re.fullmatch(r"[A-Z][A-Z0-9_]*", prefix) is None:
-                raise DocsSyncError(
-                    f"{profile_label}.environment.{prefix_name} must be an uppercase prefix"
-                )
-        for name, value in environment_keys.items():
-            variable = nonempty_string(
-                value, f"{profile_label}.environment.keys.{name}"
-            )
-            if re.fullmatch(r"[A-Z][A-Z0-9_]*", variable) is None:
-                raise DocsSyncError(
-                    f"{profile_label}.environment.keys.{name} must be an environment variable"
-                )
-            if not variable.startswith(environment["manager_prefix"] + "_"):
-                raise DocsSyncError(
-                    f"{profile_label}.environment.keys.{name} must use manager_prefix"
-                )
-        if len(set(environment_keys.values())) != len(environment_keys):
-            raise DocsSyncError(f"{profile_label}.environment.keys must be unique")
 
-        label_prefix = nonempty_string(
-            labels["prefix"], f"{profile_label}.labels.prefix"
+    groups = {
+        name: complete_object(profile[name], keys, f"{profile_label}.{name}")
+        for name, keys in group_keys.items()
+    }
+    manager = groups["manager"]
+    container = groups["container"]
+    gateway = groups["gateway"]
+    compose = groups["compose"]
+    environment = groups["environment"]
+    labels = groups["labels"]
+    workspace = groups["workspace"]
+    platform = groups["platform"]
+
+    for name in (
+        "binary",
+        "unit",
+        "config_directory",
+        "config_file",
+        "data_directory",
+        "state_directory",
+    ):
+        relative_path(manager[name], f"{profile_label}.manager.{name}")
+    if "/" in manager["binary"] or "/" in manager["unit"]:
+        raise DocsSyncError(
+            f"{profile_label}.manager binary and unit must be base names"
         )
-        if re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)+", label_prefix) is None:
-            raise DocsSyncError(
-                f"{profile_label}.labels.prefix must be a lowercase label namespace"
-            )
-        for name in (
-            "sandbox_container_prefix",
-            "migration_container_prefix",
-            "watchdog_unit_prefix",
-            "recovery_watchdog_unit_prefix",
-        ):
-            value = nonempty_string(labels[name], f"{profile_label}.labels.{name}")
-            if re.fullmatch(r"[a-z0-9][a-z0-9-]*-", value) is None:
-                raise DocsSyncError(
-                    f"{profile_label}.labels.{name} must be a lowercase name prefix"
-                )
+    if not manager["unit"].endswith(".service"):
+        raise DocsSyncError(f"{profile_label}.manager.unit must be a service unit")
+    relative_path(
+        manager["runtime_socket_path"],
+        f"{profile_label}.manager.runtime_socket_path",
+    )
 
-        internal_directory = relative_path(
-            workspace["internal_directory"],
-            f"{profile_label}.workspace.internal_directory",
+    for name in ("default_socket_path", "default_token_file"):
+        absolute_path(manager[name], f"{profile_label}.manager.{name}")
+    for name, value in container.items():
+        absolute_path(value, f"{profile_label}.container.{name}")
+    for name, value in gateway.items():
+        absolute_path(value, f"{profile_label}.gateway.{name}")
+    if manager["default_socket_path"] != container["control_socket_path"]:
+        raise DocsSyncError(
+            f"{profile_label} default and container control sockets must match"
         )
-        if len(PurePosixPath(internal_directory).parts) != 1 or not internal_directory.startswith("."):
+
+    for name, value in compose.items():
+        identifier = nonempty_string(value, f"{profile_label}.compose.{name}")
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", identifier) is None:
             raise DocsSyncError(
-                f"{profile_label}.workspace.internal_directory must be one hidden directory"
+                f"{profile_label}.compose.{name} must be a lowercase Compose identifier"
             )
-        scope_marker = relative_path(
-            workspace["scope_marker"], f"{profile_label}.workspace.scope_marker"
+
+    environment_keys = complete_object(
+        environment["keys"],
+        environment_key_names,
+        f"{profile_label}.environment.keys",
+    )
+    for prefix_name in ("manager_prefix", "platform_prefix"):
+        prefix = nonempty_string(
+            environment[prefix_name],
+            f"{profile_label}.environment.{prefix_name}",
         )
-        if len(PurePosixPath(scope_marker).parts) != 1 or not scope_marker.startswith("."):
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", prefix) is None:
             raise DocsSyncError(
-                f"{profile_label}.workspace.scope_marker must be one hidden file"
+                f"{profile_label}.environment.{prefix_name} must be an uppercase prefix"
+            )
+    for name, value in environment_keys.items():
+        variable = nonempty_string(
+            value, f"{profile_label}.environment.keys.{name}"
+        )
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", variable) is None:
+            raise DocsSyncError(
+                f"{profile_label}.environment.keys.{name} must be an environment variable"
+            )
+        if not variable.startswith(environment["manager_prefix"] + "_"):
+            raise DocsSyncError(
+                f"{profile_label}.environment.keys.{name} must use manager_prefix"
+            )
+    if len(set(environment_keys.values())) != len(environment_keys):
+        raise DocsSyncError(f"{profile_label}.environment.keys must be unique")
+
+    label_prefix = nonempty_string(labels["prefix"], f"{profile_label}.labels.prefix")
+    if re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)+", label_prefix) is None:
+        raise DocsSyncError(
+            f"{profile_label}.labels.prefix must be a lowercase label namespace"
+        )
+    for name in (
+        "sandbox_container_prefix",
+        "migration_container_prefix",
+        "watchdog_unit_prefix",
+        "recovery_watchdog_unit_prefix",
+    ):
+        value = nonempty_string(labels[name], f"{profile_label}.labels.{name}")
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]*-", value) is None:
+            raise DocsSyncError(
+                f"{profile_label}.labels.{name} must be a lowercase name prefix"
             )
 
-        default_data_root = platform["default_data_root"]
-        if default_data_root is not None:
-            absolute_path(
-                default_data_root, f"{profile_label}.platform.default_data_root"
-            )
-        if role == "source" and default_data_root is not None:
-            raise DocsSyncError(
-                f"{profile_label}.platform.default_data_root must remain null"
-            )
-        if role == "target" and default_data_root != container["data_root"]:
-            raise DocsSyncError(
-                f"{profile_label}.platform.default_data_root must match container.data_root"
-            )
-        for name in (
-            "database_baseline",
-            "instance_lock",
-            "camofox_sidecar",
-            "session_namespace",
-            "session_cookie",
-            "health_service",
-            "search_health_service",
-            "agent_runtime_health_service",
-        ):
-            relative_path(platform[name], f"{profile_label}.platform.{name}")
-            if "/" in platform[name]:
-                raise DocsSyncError(
-                    f"{profile_label}.platform.{name} must be a base name"
-                )
+    internal_directory = relative_path(
+        workspace["internal_directory"],
+        f"{profile_label}.workspace.internal_directory",
+    )
+    if (
+        len(PurePosixPath(internal_directory).parts) != 1
+        or not internal_directory.startswith(".")
+    ):
+        raise DocsSyncError(
+            f"{profile_label}.workspace.internal_directory must be one hidden directory"
+        )
+    scope_marker = relative_path(
+        workspace["scope_marker"], f"{profile_label}.workspace.scope_marker"
+    )
+    if (
+        len(PurePosixPath(scope_marker).parts) != 1
+        or not scope_marker.startswith(".")
+    ):
+        raise DocsSyncError(
+            f"{profile_label}.workspace.scope_marker must be one hidden file"
+        )
 
-    if profiles["source"]["profile_id"] == profiles["target"]["profile_id"]:
-        raise DocsSyncError(f"{label} source and target profile IDs must differ")
+    if platform["default_data_root"] != container["data_root"]:
+        raise DocsSyncError(
+            f"{profile_label}.platform.default_data_root must match container.data_root"
+        )
+    absolute_path(
+        platform["default_data_root"],
+        f"{profile_label}.platform.default_data_root",
+    )
+    for name in (
+        "database_baseline",
+        "instance_lock",
+        "camofox_sidecar",
+        "session_namespace",
+        "session_cookie",
+        "health_service",
+        "search_health_service",
+        "agent_runtime_health_service",
+    ):
+        relative_path(platform[name], f"{profile_label}.platform.{name}")
+        if "/" in platform[name]:
+            raise DocsSyncError(
+                f"{profile_label}.platform.{name} must be a base name"
+            )
     return contract
-
 
 def _render_go_technical_profiles(contract: dict[str, Any], source: str) -> str:
     field_paths = (
@@ -2585,7 +2030,6 @@ def _render_go_technical_profiles(contract: dict[str, Any], source: str) -> str:
         ("ConfigFile", ("manager", "config_file")),
         ("DataDirectory", ("manager", "data_directory")),
         ("ManagerStateDirectory", ("manager", "state_directory")),
-        ("DataRootSocketPath", ("manager", "data_root_socket_path")),
         ("RuntimeSocketPath", ("manager", "runtime_socket_path")),
         ("ContainerDataRoot", ("container", "data_root")),
         ("ContainerSecretRoot", ("container", "secret_root")),
@@ -2606,30 +2050,25 @@ def _render_go_technical_profiles(contract: dict[str, Any], source: str) -> str:
         ("InternalWorkspaceDirectory", ("workspace", "internal_directory")),
     )
     field_width = max(len(name) for name, _ in field_paths)
+    profile = contract["profiles"]["target"]
 
-    def lookup(profile: dict[str, Any], path: tuple[str, ...]) -> str:
+    def lookup(path: tuple[str, ...]) -> str:
         value: Any = profile
         for component in path:
             value = value[component]
         return "" if value is None else value
 
-    def render_profile(role: str) -> str:
-        profile = contract["profiles"][role]
-        lines = "\n".join(
-            f"\t{name + ':':<{field_width + 1}} {_go_string(lookup(profile, path))},"
-            for name, path in field_paths
-        )
-        return f"var generated{role.title()}Profile = Profile{{\n{lines}\n}}"
-
+    lines = "\n".join(
+        f"\t{name + ':':<{field_width + 1}} {_go_string(lookup(path))},"
+        for name, path in field_paths
+    )
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
 package identity
 
-{render_profile("source")}
-
-{render_profile("target")}
+var generatedTargetProfile = Profile{{
+{lines}
+}}
 '''
-
-
 def _python_technical_profile_projection(profile: dict[str, Any]) -> dict[str, Any]:
     environment = profile["environment"]
     keys = environment["keys"]
@@ -2660,19 +2099,15 @@ def _python_technical_profile_projection(profile: dict[str, Any]) -> dict[str, A
     }
 
 
+
 def _render_python_technical_profiles(contract: dict[str, Any], source: str) -> str:
-    projection = {
-        role: _python_technical_profile_projection(contract["profiles"][role])
-        for role in ("source", "target")
-    }
-    lines: list[str] = []
-    for role in ("source", "target"):
-        lines.append(f"    {role!r}: {{")
-        lines.extend(
-            f"        {name!r}: {value!r},"
-            for name, value in projection[role].items()
-        )
-        lines.append("    },")
+    projection = _python_technical_profile_projection(contract["profiles"]["target"])
+    lines = ["    'target': {"]
+    lines.extend(
+        f"        {name!r}: {value!r},"
+        for name, value in projection.items()
+    )
+    lines.append("    },")
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -2681,28 +2116,15 @@ TECHNICAL_PROFILES: dict[str, dict[str, object]] = {{
 }}
 '''
 
-
 def _render_typescript_technical_profile(
     contract: dict[str, Any], source: str
 ) -> str:
-    source_profile = contract["profiles"]["source"]
     target_profile = contract["profiles"]["target"]
-    source_prefixes = tuple(
-        dict.fromkeys(
-            (
-                source_profile["environment"]["manager_prefix"] + "_",
-                source_profile["environment"]["platform_prefix"] + "_",
-            )
-        )
-    )
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const TARGET_TECHNICAL_PROFILE_ID = {_typescript_string(target_profile["profile_id"])} as const;
 export const TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE = {_typescript_string(target_profile["environment"]["keys"]["technical_profile"])} as const;
 export const TARGET_MANAGER_EXECUTOR_SOCKET_PATH = {_typescript_string(target_profile["manager"]["default_socket_path"])} as const;
-export const SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES = {json.dumps(source_prefixes, ensure_ascii=False)} as const;
 '''
-
-
 def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     contract = _expect_object(raw, label)
     _reject_unknown_keys(contract, {"schema_version", "sources"}, label)
@@ -2802,13 +2224,11 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             "release-transition contract",
         )
         if (
-            parsed["profiles"]["source"]["profile_id"]
-            != transition["source_profile_id"]
-            or parsed["profiles"]["target"]["profile_id"]
+            parsed["profiles"]["target"]["profile_id"]
             != transition["target_profile_id"]
         ):
             raise DocsSyncError(
-                "technical-profiles IDs must match the release-transition contract"
+                "technical-profiles target ID must match the release-transition contract"
             )
     elif contract.identifier == "release-transition":
         parsed = validate_release_transition_contract(raw, f"contract {contract.identifier}")
@@ -2826,10 +2246,6 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_typescript_container_platform(parsed, contract.source)
         elif target.format == "go-container-platform":
             content = _render_go_container_platform(parsed, contract.source)
-        elif target.format == "go-release-transition":
-            content = _render_go_release_transition(parsed, contract.source)
-        elif target.format == "python-release-transition":
-            content = _render_python_release_transition(parsed, contract.source)
         elif target.format == "go-technical-profiles":
             content = _render_go_technical_profiles(parsed, contract.source)
         elif target.format == "python-technical-profiles":

@@ -72,7 +72,6 @@ from .internal_config import (
     read_cognee_internal_config,
     update_env_file,
 )
-from .handoff_evidence import collect_platform_handoff_evidence
 from .jobs import DurableJob, DurableJobStore
 from .learning import (
     LEARNING_REVIEW_JOB_KIND,
@@ -104,7 +103,6 @@ from .memory_security import (
     normalize_memory_tags,
     validate_memory_content,
 )
-from .technical_profile import select_technical_profile
 from .manager_client import ManagerClient, ManagerClientError
 from .model_catalog import MODEL_CATALOG_CACHE_SETTING, ModelCatalogManager
 from .oauth_flows import (
@@ -229,29 +227,15 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-_IMPORT_TECHNICAL_PROFILE = select_technical_profile()
-
-
-def _profile_env(source_name: str) -> str:
-    return _IMPORT_TECHNICAL_PROFILE.environment_variable(source_name)
-
-
 def _ensure_profile_camofox_runtime_sidecar(
     config: PlatformConfig,
     *,
     commit_schema_upgrade: bool,
 ) -> Path:
-    """Keep the established source-profile helper call shape stable."""
-
-    if config.technical_profile.is_target:
-        return ensure_camofox_runtime_sidecar(
-            config.data_dir,
-            commit_schema_upgrade=commit_schema_upgrade,
-            technical_profile_value=config.technical_profile,
-        )
     return ensure_camofox_runtime_sidecar(
         config.data_dir,
         commit_schema_upgrade=commit_schema_upgrade,
+        technical_profile_value=config.technical_profile,
     )
 
 
@@ -261,7 +245,7 @@ MAX_ATTACHMENTS_TOTAL_BYTES = max(
     MAX_ATTACHMENT_BYTES,
     int(
         os.getenv(
-            _profile_env("ENTERPRISE_MAX_ATTACHMENTS_TOTAL_BYTES"),
+            "AGENT_PLATFORM_MAX_ATTACHMENTS_TOTAL_BYTES",
             str(100 * 1024 * 1024),
         )
         or "0"
@@ -274,7 +258,7 @@ ATTACHMENT_QUOTA_BYTES = max(
     0,
     int(
         os.getenv(
-            _profile_env("ENTERPRISE_ATTACHMENT_QUOTA_BYTES"),
+            "AGENT_PLATFORM_ATTACHMENT_QUOTA_BYTES",
             str(2 * 1024 * 1024 * 1024),
         )
         or "0"
@@ -284,7 +268,7 @@ GLOBAL_ATTACHMENT_QUOTA_BYTES = max(
     0,
     int(
         os.getenv(
-            _profile_env("ENTERPRISE_GLOBAL_ATTACHMENT_QUOTA_BYTES"),
+            "AGENT_PLATFORM_GLOBAL_ATTACHMENT_QUOTA_BYTES",
             str(10 * 1024 * 1024 * 1024),
         )
         or "0"
@@ -297,13 +281,13 @@ GLOBAL_ATTACHMENT_QUOTA_BYTES = max(
 UPLOAD_RATE_LIMIT_WINDOW_SECONDS = max(
     1,
     int(
-        os.getenv(_profile_env("ENTERPRISE_UPLOAD_RATE_WINDOW_SECONDS"), "60")
+        os.getenv("AGENT_PLATFORM_UPLOAD_RATE_WINDOW_SECONDS", "60")
         or "60"
     ),
 )
 MAX_UPLOADS_PER_WINDOW = max(
     0,
-    int(os.getenv(_profile_env("ENTERPRISE_MAX_UPLOADS_PER_WINDOW"), "30") or "0"),
+    int(os.getenv("AGENT_PLATFORM_MAX_UPLOADS_PER_WINDOW", "30") or "0"),
 )
 MIN_PASSWORD_LENGTH = 8
 BOOTSTRAP_ADMIN_PASSWORD_FILE = "bootstrap-admin-password.txt"
@@ -360,7 +344,7 @@ MAX_CONCURRENT_AGENT_RUNS = max(
     min(
         64,
         int(
-            os.getenv(_profile_env("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS"), "8")
+            os.getenv("AGENT_PLATFORM_MAX_CONCURRENT_AGENT_RUNS", "8")
             or "8"
         ),
     ),
@@ -374,21 +358,21 @@ MAX_TRACKED_INGEST_RESULTS = 1000
 # counted as a permanent failure (surfaced in knowledge_status).
 MAX_INGEST_ATTEMPTS = max(
     1,
-    int(os.getenv(_profile_env("ENTERPRISE_INGEST_MAX_ATTEMPTS"), "3") or "3"),
+    int(os.getenv("AGENT_PLATFORM_INGEST_MAX_ATTEMPTS", "3") or "3"),
 )
 INGEST_RETRY_BACKOFF_CAP_SECONDS = 30
 AGENT_JOB_LEASE_SECONDS = max(
     60,
-    int(os.getenv(_profile_env("ENTERPRISE_AGENT_JOB_LEASE_SECONDS"), "3600") or "3600"),
+    int(os.getenv("AGENT_PLATFORM_AGENT_JOB_LEASE_SECONDS", "3600") or "3600"),
 )
 COGNEE_JOB_LEASE_SECONDS = max(
     60,
-    int(os.getenv(_profile_env("ENTERPRISE_COGNEE_JOB_LEASE_SECONDS"), "3600") or "3600"),
+    int(os.getenv("AGENT_PLATFORM_COGNEE_JOB_LEASE_SECONDS", "3600") or "3600"),
 )
 TELEGRAM_LINK_TTL_SECONDS = max(
     60,
     min(
-        int(os.getenv(_profile_env("ENTERPRISE_TELEGRAM_LINK_TTL_SECONDS"), "600") or "600"),
+        int(os.getenv("AGENT_PLATFORM_TELEGRAM_LINK_TTL_SECONDS", "600") or "600"),
         3600,
     ),
 )
@@ -397,7 +381,7 @@ TELEGRAM_DELIVERY_LEASE_SECONDS = max(
     60,
     int(
         os.getenv(
-            _profile_env("ENTERPRISE_TELEGRAM_DELIVERY_LEASE_SECONDS"), "600"
+            "AGENT_PLATFORM_TELEGRAM_DELIVERY_LEASE_SECONDS", "600"
         )
         or "600"
     ),
@@ -406,7 +390,7 @@ TELEGRAM_DELIVERY_POLL_SECONDS = max(
     0.05,
     min(
         _float_env(
-            _profile_env("ENTERPRISE_TELEGRAM_DELIVERY_POLL_SECONDS"), 0.2
+            "AGENT_PLATFORM_TELEGRAM_DELIVERY_POLL_SECONDS", 0.2
         ),
         2.0,
     ),
@@ -415,18 +399,18 @@ MAIL_DELIVERY_JOB_KIND = "mail_delivery"
 MAIL_DELIVERY_LEASE_SECONDS = max(
     60,
     int(
-        os.getenv(_profile_env("ENTERPRISE_MAIL_DELIVERY_LEASE_SECONDS"), "300")
+        os.getenv("AGENT_PLATFORM_MAIL_DELIVERY_LEASE_SECONDS", "300")
         or "300"
     ),
 )
 MAIL_POLL_MAX_SECONDS = max(
     1.0,
-    min(_float_env(_profile_env("ENTERPRISE_MAIL_POLL_MAX_SECONDS"), 15.0), 60.0),
+    min(_float_env("AGENT_PLATFORM_MAIL_POLL_MAX_SECONDS", 15.0), 60.0),
 )
 SCHEDULE_POLL_MAX_SECONDS = max(
     0.2,
     min(
-        _float_env(_profile_env("ENTERPRISE_SCHEDULE_POLL_MAX_SECONDS"), 30.0),
+        _float_env("AGENT_PLATFORM_SCHEDULE_POLL_MAX_SECONDS", 30.0),
         60.0,
     ),
 )
@@ -488,149 +472,24 @@ MAX_BRAND_LOGO_BYTES = 256 * 1024
 MAX_BRAND_LOGO_DIMENSION = 4096
 MAX_BRAND_LOGO_PIXELS = 16 * 1024 * 1024
 BRAND_LOGO_MIME_TYPES = frozenset({"image/png", "image/webp"})
-MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING = (
-    "manager_namespace_handoff_commit_receipt_v1"
-)
-MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION = 1
-MANAGER_HANDOFF_OPERATION_RE = re.compile(r"^handoff_[0-9a-f]{32}$")
-MANAGER_HANDOFF_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
 MANAGER_GATE_SETTLEMENT_FIELDS = {
     "schema_version",
     "operation_id",
     "action",
 }
 MANAGER_OPERATION_RE = re.compile(r"^op_[0-9a-f]{32}$")
-MANAGER_HANDOFF_BINDING_RE = re.compile(r"^[0-9a-f]{64}$")
-MANAGER_HANDOFF_RECEIPT_RE = re.compile(r"^[0-9a-f]{64}$")
-MANAGER_HANDOFF_RECEIPT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "operation_id",
-        "target_generation",
-        "binding_sha256",
-        "database_schema_version",
-        "committed_at",
-        "receipt_sha256",
-    }
-)
+MANAGER_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
 TELEGRAM_SETTING_ENABLED = "telegram_enabled"
 TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
 TELEGRAM_SETTING_POLLING = "telegram_polling"
-SESSION_SECRET_SETTING_SOURCE = "ENTERPRISE_SESSION_SECRET"
-TELEGRAM_SECRET_BOT_TOKEN_SOURCE = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
-TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
+SESSION_SECRET_SETTING = "AGENT_PLATFORM_SESSION_SECRET"
+TELEGRAM_SECRET_BOT_TOKEN = "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN"
+TELEGRAM_SECRET_WEBHOOK_SECRET = "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
 }
 
-
-def _machine_setting_key(config: PlatformConfig, source_key: str) -> str:
-    """Return the single SQLite key owned by the active technical profile."""
-
-    return config.technical_profile.environment_variable(source_key)
-
-
-def _manager_handoff_object_pairs(
-    pairs: list[tuple[str, Any]],
-) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate handoff receipt field {key!r}")
-        result[key] = value
-    return result
-
-
-def _manager_handoff_receipt_material(receipt: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "binding_sha256": receipt["binding_sha256"],
-        "committed_at": receipt["committed_at"],
-        "database_schema_version": receipt["database_schema_version"],
-        "operation_id": receipt["operation_id"],
-        "schema_version": receipt["schema_version"],
-        "target_generation": receipt["target_generation"],
-    }
-
-
-def _manager_handoff_receipt_digest(receipt: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        _manager_handoff_receipt_material(receipt),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _validate_manager_handoff_receipt(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != MANAGER_HANDOFF_RECEIPT_FIELDS:
-        raise ValueError("handoff commit receipt fields do not match schema 1")
-    if (
-        type(value.get("schema_version")) is not int
-        or value["schema_version"] != MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION
-    ):
-        raise ValueError("handoff commit receipt schema is unsupported")
-    operation_id = value.get("operation_id")
-    target_generation = value.get("target_generation")
-    binding_sha256 = value.get("binding_sha256")
-    database_schema_version = value.get("database_schema_version")
-    committed_at = value.get("committed_at")
-    receipt_sha256 = value.get("receipt_sha256")
-    if not isinstance(operation_id, str) or not MANAGER_HANDOFF_OPERATION_RE.fullmatch(
-        operation_id
-    ):
-        raise ValueError("handoff commit receipt operation id is invalid")
-    if not isinstance(
-        target_generation, str
-    ) or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation):
-        raise ValueError("handoff commit receipt target generation is invalid")
-    if not isinstance(binding_sha256, str) or not MANAGER_HANDOFF_BINDING_RE.fullmatch(
-        binding_sha256
-    ):
-        raise ValueError("handoff commit receipt binding is invalid")
-    if type(database_schema_version) is not int or database_schema_version <= 0:
-        raise ValueError("handoff commit receipt database schema is invalid")
-    if not isinstance(committed_at, str) or not committed_at.endswith("Z"):
-        raise ValueError("handoff commit receipt timestamp is invalid")
-    try:
-        parsed_at = datetime.fromisoformat(committed_at[:-1] + "+00:00")
-    except ValueError as exc:
-        raise ValueError("handoff commit receipt timestamp is invalid") from exc
-    if parsed_at.tzinfo is None or parsed_at.utcoffset() != timezone.utc.utcoffset(parsed_at):
-        raise ValueError("handoff commit receipt timestamp is not UTC")
-    if not isinstance(receipt_sha256, str) or not MANAGER_HANDOFF_RECEIPT_RE.fullmatch(
-        receipt_sha256
-    ):
-        raise ValueError("handoff commit receipt digest is invalid")
-    normalized = dict(value)
-    if not secrets.compare_digest(
-        receipt_sha256, _manager_handoff_receipt_digest(normalized)
-    ):
-        raise ValueError("handoff commit receipt digest does not match its fields")
-    return normalized
-
-
-def _validate_manager_handoff_commit_identity(
-    operation_id: str,
-    target_generation: str,
-    binding_sha256: str,
-) -> tuple[str, str, str]:
-    if not all(
-        isinstance(value, str)
-        for value in (operation_id, target_generation, binding_sha256)
-    ):
-        raise ServiceError(400, "handoff commit identity fields must be strings")
-    clean_operation_id = operation_id.strip()
-    clean_target_generation = target_generation.strip()
-    clean_binding_sha256 = binding_sha256.strip()
-    if not MANAGER_HANDOFF_OPERATION_RE.fullmatch(clean_operation_id):
-        raise ServiceError(400, "handoff operation_id is invalid")
-    if not MANAGER_HANDOFF_GENERATION_RE.fullmatch(clean_target_generation):
-        raise ServiceError(400, "handoff target_generation is invalid")
-    if not MANAGER_HANDOFF_BINDING_RE.fullmatch(clean_binding_sha256):
-        raise ServiceError(400, "handoff binding_sha256 is invalid")
-    return clean_operation_id, clean_target_generation, clean_binding_sha256
 
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     "admin": {
@@ -721,11 +580,10 @@ class EnterpriseService:
             self.config.technical_profile,
         )
         assert_existing_workspace_profile(self.config)
-        if self.config.technical_profile.is_target:
-            _ensure_profile_camofox_runtime_sidecar(
-                self.config,
-                commit_schema_upgrade=False,
-            )
+        _ensure_profile_camofox_runtime_sidecar(
+            self.config,
+            commit_schema_upgrade=False,
+        )
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
         self._instance_lock_directory_fd: int | None = None
@@ -967,7 +825,7 @@ class EnterpriseService:
             or public_id != operation_id
             or status.get("target") is not None
             or not isinstance(current_id, str)
-            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(current_id)
+            or not MANAGER_GENERATION_RE.fullmatch(current_id)
             or current_source != current_id
         ):
             raise ManagerClientError("manager Gate settlement state is inconsistent")
@@ -2209,9 +2067,7 @@ class EnterpriseService:
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
         configured = os.getenv(
-            self.config.technical_profile.environment_variable(
-                "ENTERPRISE_ADMIN_PASSWORD"
-            )
+            "AGENT_PLATFORM_ADMIN_PASSWORD"
         )
         if configured:
             return configured, False
@@ -2241,20 +2097,14 @@ class EnterpriseService:
         generated secret so it stays stable across restarts. Source and target
         keys are never read as fallbacks for one another.
         """
-        setting_key = _machine_setting_key(
-            self.config, SESSION_SECRET_SETTING_SOURCE
-        )
+        setting_key = SESSION_SECRET_SETTING
         row = self.db.query_one(
             "SELECT value FROM settings WHERE key = ? AND secret = 1",
             (setting_key,),
         )
         if row and row["value"]:
             return str(row["value"])
-        env_secret = os.getenv(
-            self.config.technical_profile.environment_variable(
-                SESSION_SECRET_SETTING_SOURCE
-            )
-        )
+        env_secret = os.getenv(SESSION_SECRET_SETTING)
         if env_secret:
             self.set_setting(setting_key, env_secret, secret=True)
             return env_secret
@@ -2577,17 +2427,11 @@ class EnterpriseService:
         session_secret_row = self.db.query_one(
             "SELECT updated_at FROM settings WHERE key = ? AND secret = 1",
             (
-                _machine_setting_key(
-                    self.config, SESSION_SECRET_SETTING_SOURCE
-                ),
+                SESSION_SECRET_SETTING,
             ),
         )
         env_session_secret = bool(
-            os.getenv(
-                self.config.technical_profile.environment_variable(
-                    SESSION_SECRET_SETTING_SOURCE
-                )
-            )
+            os.getenv(SESSION_SECRET_SETTING)
         )
         return {
             "config": {
@@ -2636,9 +2480,7 @@ class EnterpriseService:
             if len(session_secret) < 32:
                 raise ServiceError(400, "session secret must be at least 32 characters")
             self.set_setting(
-                _machine_setting_key(
-                    self.config, SESSION_SECRET_SETTING_SOURCE
-                ),
+                SESSION_SECRET_SETTING,
                 session_secret,
                 secret=True,
             )
@@ -3640,9 +3482,7 @@ class EnterpriseService:
 
     def telegram_bot_token(self) -> str:
         return self.get_secret(
-            _machine_setting_key(
-                self.config, TELEGRAM_SECRET_BOT_TOKEN_SOURCE
-            )
+            TELEGRAM_SECRET_BOT_TOKEN
         ) or self.config.telegram_bot_token
 
     def telegram_bot_username(self) -> str:
@@ -3650,9 +3490,7 @@ class EnterpriseService:
 
     def telegram_webhook_secret(self) -> str:
         return self.get_secret(
-            _machine_setting_key(
-                self.config, TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE
-            )
+            TELEGRAM_SECRET_WEBHOOK_SECRET
         ) or self.config.telegram_webhook_secret
 
     def telegram_gateway_update(self, update: dict[str, Any]) -> dict[str, Any]:
@@ -4417,18 +4255,14 @@ class EnterpriseService:
         if token is not None:
             if token:
                 self.set_setting(
-                    _machine_setting_key(
-                        self.config, TELEGRAM_SECRET_BOT_TOKEN_SOURCE
-                    ),
+                    TELEGRAM_SECRET_BOT_TOKEN,
                     token,
                     secret=True,
                 )
         if webhook_secret is not None:
             if webhook_secret:
                 self.set_setting(
-                    _machine_setting_key(
-                        self.config, TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE
-                    ),
+                    TELEGRAM_SECRET_WEBHOOK_SECRET,
                     webhook_secret,
                     secret=True,
                 )
@@ -4526,166 +4360,6 @@ class EnterpriseService:
                 )
         return {"released": True}
 
-    def _load_manager_handoff_commit_receipt(self) -> dict[str, Any] | None:
-        raw = self.get_setting(MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING)
-        if raw is None:
-            return None
-        if len(raw.encode("utf-8")) > 16 * 1024:
-            raise ServiceError(500, "persisted handoff commit receipt is invalid")
-        try:
-            value = json.loads(raw, object_pairs_hook=_manager_handoff_object_pairs)
-            return _validate_manager_handoff_receipt(value)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ServiceError(
-                500, "persisted handoff commit receipt is invalid"
-            ) from exc
-
-    def _persist_manager_handoff_commit_receipt(
-        self,
-        operation_id: str,
-        target_generation: str,
-        binding_sha256: str,
-    ) -> dict[str, Any]:
-        database_schema_version = int(
-            self.db.scalar(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-            )
-            or 0
-        )
-        if database_schema_version != DATABASE_SCHEMA_VERSION:
-            raise ServiceError(
-                409, "Platform database schema is not at the target generation"
-            )
-        receipt: dict[str, Any] = {
-            "schema_version": MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION,
-            "operation_id": operation_id,
-            "target_generation": target_generation,
-            "binding_sha256": binding_sha256,
-            "database_schema_version": database_schema_version,
-            "committed_at": datetime.now(timezone.utc)
-            .isoformat(timespec="microseconds")
-            .replace("+00:00", "Z"),
-        }
-        receipt["receipt_sha256"] = _manager_handoff_receipt_digest(receipt)
-        receipt = _validate_manager_handoff_receipt(receipt)
-        self.set_setting(
-            MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING,
-            json.dumps(
-                receipt,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-        observed = self._load_manager_handoff_commit_receipt()
-        if observed != receipt:
-            raise ServiceError(500, "handoff commit receipt was not durable")
-        return receipt
-
-    @staticmethod
-    def _handoff_receipt_matches(
-        receipt: dict[str, Any],
-        operation_id: str,
-        target_generation: str,
-        binding_sha256: str,
-    ) -> bool:
-        return bool(
-            receipt.get("operation_id") == operation_id
-            and receipt.get("target_generation") == target_generation
-            and receipt.get("binding_sha256") == binding_sha256
-        )
-
-    def manager_handoff_commit_release(
-        self,
-        operation_id: str,
-        target_generation: str,
-        binding_sha256: str,
-    ) -> dict[str, Any]:
-        """Commit one journal-bound target handoff and release its reservation."""
-
-        if self.manager_client is None:
-            raise ServiceError(404, "manager integration is not active")
-        (
-            clean_operation_id,
-            clean_target_generation,
-            clean_binding_sha256,
-        ) = _validate_manager_handoff_commit_identity(
-            operation_id, target_generation, binding_sha256
-        )
-        with self._conversation_lock:
-            receipt = self._load_manager_handoff_commit_receipt()
-            if receipt is not None and not self._handoff_receipt_matches(
-                receipt,
-                clean_operation_id,
-                clean_target_generation,
-                clean_binding_sha256,
-            ):
-                raise ServiceError(
-                    409, "persisted handoff commit receipt has another identity"
-                )
-
-            if self._auto_update_reserved and (
-                self._auto_update_reservation_owner != "manager"
-                or self._auto_update_reservation_id != clean_operation_id
-            ):
-                raise ServiceError(
-                    409, "maintenance reservation does not match the handoff operation"
-                )
-            if receipt is None:
-                if not self._auto_update_reserved:
-                    raise ServiceError(
-                        409,
-                        "maintenance reservation does not match the handoff operation",
-                    )
-                # Both schema transitions are idempotent. A crash between either
-                # effect and the durable receipt re-enters here under the same
-                # frozen reservation and converges the missing effect.
-                self.agent_scopes.commit_schema_upgrade()
-                self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
-                    self.config,
-                    commit_schema_upgrade=True,
-                )
-                receipt = self._persist_manager_handoff_commit_receipt(
-                    clean_operation_id,
-                    clean_target_generation,
-                    clean_binding_sha256,
-                )
-
-            # The receipt is already durable before admission is reopened. If
-            # the process or response fails here, target startup restores the
-            # same reservation and a retry releases it without repeating schema
-            # effects.
-            if self._auto_update_reserved:
-                released = self.release_auto_update_reservation(
-                    clean_operation_id,
-                    expected_owner="manager",
-                )
-                if not released:
-                    raise ServiceError(
-                        409,
-                        "maintenance reservation does not match the handoff operation",
-                    )
-            self._auto_update_last_committed_id = clean_operation_id
-            return {"released": True, "receipt": dict(receipt)}
-
-    def manager_handoff_reservation(self) -> dict[str, Any]:
-        """Return the exact read-only handoff reservation reconciliation view."""
-
-        if self.manager_client is None:
-            raise ServiceError(404, "manager integration is not active")
-        with self._conversation_lock:
-            return {
-                "schema_version": 1,
-                "reserved": bool(self._auto_update_reserved),
-                "reservation_id": self._auto_update_reservation_id
-                if self._auto_update_reserved
-                else "",
-                "reservation_owner": self._auto_update_reservation_owner
-                if self._auto_update_reserved
-                else "",
-                "receipt": self._load_manager_handoff_commit_receipt(),
-            }
-
     def manager_internal_health(self) -> dict[str, Any]:
         with self._conversation_lock:
             blockers = self._auto_update_agent_blockers_locked()
@@ -4697,23 +4371,6 @@ class EnterpriseService:
             "update_reserved": self._auto_update_reserved,
             **blockers,
         }
-
-    def manager_handoff_evidence(self) -> dict[str, Any]:
-        """Observe the source Platform boundary without reserving or repairing it."""
-
-        with self._conversation_lock:
-            if self._closed:
-                raise ServiceError(409, "Platform is shutting down")
-            blockers = self._auto_update_agent_blockers_locked()
-            blockers["reserved"] = bool(self._auto_update_reserved)
-            workspace_identity = self.agent_scopes.handoff_workspace_identity()
-            return collect_platform_handoff_evidence(
-                self.db,
-                self.config.data_dir,
-                workspace_identity,
-                blockers,
-                self.config.technical_profile,
-            )
 
     def auto_update_public_status(self) -> dict[str, Any]:
         if self.manager_client is None:
@@ -16485,7 +16142,7 @@ class EnterpriseService:
         The Agent Runtime writes generated documents/images/audio under
         its cache and the dedicated
         media scratch dir, so those subtrees are allowed, plus any
-        operator-configured ``ENTERPRISE_MEDIA_ROOTS``. The broad system temp dir
+        operator-configured ``AGENT_PLATFORM_MEDIA_ROOTS``. The broad system temp dir
         is intentionally NOT allowed: it is shared with other processes/users on
         the host, so allowing it would let a prompt-injected agent exfiltrate
         arbitrary readable temp files via ``MEDIA:`` tags. Platform secrets
@@ -16494,11 +16151,7 @@ class EnterpriseService:
         ``_resolve_media_path``.
         """
         candidates = list(self._media_safe_data_subtrees(owner_id, workspace_path))
-        media_roots_environment_variable = (
-            self.config.technical_profile.environment_variable(
-                "ENTERPRISE_MEDIA_ROOTS"
-            )
-        )
+        media_roots_environment_variable = "AGENT_PLATFORM_MEDIA_ROOTS"
         for raw in os.getenv(media_roots_environment_variable, "").split(os.pathsep):
             raw = raw.strip()
             if raw:

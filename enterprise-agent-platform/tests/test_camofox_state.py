@@ -8,7 +8,6 @@ from pathlib import Path
 
 from enterprise_agent_platform.camofox_state import (
     CAMOFOX_SIDECAR_NAME,
-    CAMOFOX_TARGET_SIDECAR_NAME,
     ensure_camofox_runtime_sidecar,
     expected_camofox_sidecar,
 )
@@ -16,37 +15,18 @@ from enterprise_agent_platform.technical_profile import TARGET_TECHNICAL_PROFILE
 
 
 class CamofoxPlatformSidecarTests(unittest.TestCase):
-    def test_target_profile_creates_only_target_sidecar(self):
+    def test_target_profile_creates_current_sidecar(self):
         with tempfile.TemporaryDirectory() as td:
             data = Path(td) / "data"
             sidecar = ensure_camofox_runtime_sidecar(
                 data,
                 technical_profile_value=TARGET_TECHNICAL_PROFILE,
             )
-            self.assertEqual(sidecar.name, CAMOFOX_TARGET_SIDECAR_NAME)
-            self.assertFalse(
-                (sidecar.parent / CAMOFOX_SIDECAR_NAME).exists()
-            )
+            self.assertEqual(sidecar.name, CAMOFOX_SIDECAR_NAME)
             self.assertEqual(
                 json.loads(sidecar.read_text(encoding="utf-8")),
                 expected_camofox_sidecar(TARGET_TECHNICAL_PROFILE),
             )
-
-    def test_target_profile_rejects_source_sidecar_without_rewriting_it(self):
-        with tempfile.TemporaryDirectory() as td:
-            data = Path(td) / "data"
-            source = ensure_camofox_runtime_sidecar(data)
-            original = source.read_bytes()
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "another technical profile",
-            ):
-                ensure_camofox_runtime_sidecar(
-                    data,
-                    technical_profile_value=TARGET_TECHNICAL_PROFILE,
-                )
-            self.assertEqual(source.read_bytes(), original)
-            self.assertFalse((source.parent / CAMOFOX_TARGET_SIDECAR_NAME).exists())
 
     def test_candidate_validation_does_not_create_sidecar_before_commit(self):
         with tempfile.TemporaryDirectory() as td:

@@ -273,12 +273,12 @@ class DocsSyncTests(unittest.TestCase):
             ).read_text(encoding="utf-8"),
             "docs/contracts/container-platform.json": json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "policy": "container-platform",
                     "release_channel": "main",
                     "database_schema_version": 2026072401,
                     "container_paths": {
-                        "data_root": "/var/lib/ubitech-agent",
+                        "data_root": "/var/lib/agent-platform",
                         "workspace": "/workspace",
                         "agent_home": "/home/agent",
                         "agent_env": "/opt/agent-env",
@@ -300,18 +300,6 @@ class DocsSyncTests(unittest.TestCase):
                             {"uid": 999, "gid": 999},
                         ],
                     },
-                    "agent_runtime_handoff": json.loads(
-                        (
-                            REPOSITORY_ROOT
-                            / "docs/contracts/container-platform.json"
-                        ).read_text(encoding="utf-8")
-                    )["agent_runtime_handoff"],
-                    "p1_source_handoff": json.loads(
-                        (
-                            REPOSITORY_ROOT
-                            / "docs/contracts/container-platform.json"
-                        ).read_text(encoding="utf-8")
-                    )["p1_source_handoff"],
                     "sandbox_idle_seconds": 1800,
                     "migration_backup_retention_seconds": 604800,
                     "obsolete_artifact_retention_seconds": 3600,
@@ -358,10 +346,6 @@ class DocsSyncTests(unittest.TestCase):
                         "firecrawl-rabbitmq": {
                             "compressed_bytes": 1073741824,
                             "unpacked_bytes": 2147483648,
-                        },
-                        "handoff-fs-helper": {
-                            "compressed_bytes": 536870912,
-                            "unpacked_bytes": 1073741824,
                         },
                     },
                     "public_update_states": [
@@ -618,11 +602,11 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("sync", expect=1)
 
         self.assertIn(
-            "technical-profiles IDs must match the release-transition contract",
+            "technical-profiles target ID must match the release-transition contract",
             result.stderr,
         )
 
-    def test_release_transition_generates_bridge_identity_without_retired_compatibility(self) -> None:
+    def test_release_transition_has_no_generated_runtime_projection(self) -> None:
         self.initialize_git()
         manifest = self.manifest()
         manifest["contracts"].append(  # type: ignore[index,union-attr]
@@ -635,40 +619,12 @@ class DocsSyncTests(unittest.TestCase):
                         "path": "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py",
                         "format": "python-release-transition",
                     },
-                    {
-                        "path": "manager/internal/contract/release_transition_generated.go",
-                        "format": "go-release-transition",
-                    },
                 ],
             }
         )
         self.write_fixture(manifest)
-
-        self.run_command("sync", expect=0)
-        generated = (
-            self.root
-            / "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("RELEASE_TRANSITION_STAGE = 'bridge'", generated)
-        self.assertIn(
-            "PREDECESSOR_GENERATION = "
-            "'5f927197f17a05e906a0bf11cdb7b4e3c8944ed0'",
-            generated,
-        )
-        self.assertNotIn("SOURCE_OWNER_COMPAT", generated)
-        go_generated = (
-            self.root
-            / "manager/internal/contract/release_transition_generated.go"
-        ).read_text(encoding="utf-8")
-        self.assertRegex(go_generated, r'ReleaseTransitionStage\s+= "bridge"')
-        self.assertRegex(
-            go_generated,
-            r'ReleaseTransitionSourceProfileID\s+= "ubitech-agent-v1"',
-        )
-        self.assertRegex(
-            go_generated,
-            r'ReleaseTransitionTargetProfileID\s+= "agent-platform-v1"',
-        )
+        result = self.run_command("sync", expect=1)
+        self.assertIn("format is unsupported", result.stderr)
 
     def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:
         self.initialize_git()
@@ -685,44 +641,33 @@ class DocsSyncTests(unittest.TestCase):
             result.stderr,
         )
 
-    def test_container_contract_rejects_runtime_retired_root_drift(self) -> None:
+    def test_container_contract_rejects_retired_runtime_handoff(self) -> None:
         self.initialize_git()
         self.write_fixture()
         path = self.root / "docs/contracts/container-platform.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["agent_runtime_handoff"]["p1_retired_roots"]["app"][  # type: ignore[index]
-            "allowed_symlinks"
-        ]["node_modules/.bin/extra"] = "../extra/bin.js"
+        contract["agent_runtime_handoff"] = {}
         path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
         result = self.run_command("sync", expect=1)
-        self.assertIn("P1 app symlink set is invalid", result.stderr)
+        self.assertIn("contains unknown keys: agent_runtime_handoff", result.stderr)
 
-    def test_container_contract_rejects_invalid_runtime_validation_limits(self) -> None:
-        self.initialize_git()
-        path = self.root / "docs/contracts/container-platform.json"
-        for invalid in (True, 0):
-            with self.subTest(invalid=invalid):
-                self.write_fixture()
-                contract = json.loads(path.read_text(encoding="utf-8"))
-                contract["agent_runtime_handoff"]["validation_limits"][  # type: ignore[index]
-                    "maximum_jsonl_records"
-                ] = invalid
-                path.write_text(
-                    json.dumps(contract, indent=2) + "\n", encoding="utf-8"
-                )
-                result = self.run_command("sync", expect=1)
-                self.assertIn(
-                    "validation_limits.maximum_jsonl_records must be a positive JavaScript-safe integer",
-                    result.stderr,
-                )
-
-    def test_container_contract_runtime_limit_change_drives_all_generated_targets(self) -> None:
+    def test_container_contract_rejects_retired_source_handoff(self) -> None:
         self.initialize_git()
         self.write_fixture()
         path = self.root / "docs/contracts/container-platform.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["agent_runtime_handoff"]["validation_limits"][  # type: ignore[index]
-            "maximum_jsonl_records"
+        contract["p1_source_handoff"] = {}
+        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        result = self.run_command("sync", expect=1)
+        self.assertIn("contains unknown keys: p1_source_handoff", result.stderr)
+
+    def test_container_contract_capacity_change_drives_all_generated_targets(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/container-platform.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["managed_image_capacity_estimates"]["agent-runtime"][  # type: ignore[index]
+            "compressed_bytes"
         ] = 123_457
         path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
 
@@ -738,41 +683,33 @@ class DocsSyncTests(unittest.TestCase):
             "go": self.root / "manager/internal/contract/generated.go",
         }
         self.assertIn(
-            "'maximum_jsonl_records': 123457",
+            "'compressed_bytes': 123457",
             generated["python"].read_text(encoding="utf-8"),
         )
         for name in ("runtime", "frontend"):
             self.assertIn(
-                '"maximum_jsonl_records": 123457',
+                '"compressed_bytes": 123457',
                 generated[name].read_text(encoding="utf-8"),
             )
         self.assertTrue(
             any(
-                line.split() == ["AgentRuntimeMaximumJSONLRecords", "=", "123457"]
+                "CompressedBytes: 123457" in line
                 for line in generated["go"].read_text(encoding="utf-8").splitlines()
             )
         )
 
-    def test_container_contract_rejects_p1_source_layout_and_digest_drift(self) -> None:
+    def test_container_contract_requires_exact_ten_image_set(self) -> None:
         self.initialize_git()
         self.write_fixture()
         path = self.root / "docs/contracts/container-platform.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["p1_source_handoff"]["layouts"]["manager"]["entries"][  # type: ignore[index]
-            "migration.json"
-        ]["disposition"] = "ignored"
+        contract["managed_image_capacity_estimates"]["extra-image"] = {
+            "compressed_bytes": 1,
+            "unpacked_bytes": 1,
+        }
         path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
-        layout = self.run_command("sync", expect=1)
-        self.assertIn("invalid type or disposition", layout.stderr)
-
-        self.write_fixture()
-        contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["p1_source_handoff"]["fixed_sha256"][  # type: ignore[index]
-            "data/runtimes/cognee/python-install.json"
-        ] = "not-a-digest"
-        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
-        digest = self.run_command("sync", expect=1)
-        self.assertIn("fixed_sha256 is invalid", digest.stderr)
+        result = self.run_command("sync", expect=1)
+        self.assertIn("exactly the current ten-image set", result.stderr)
 
     def test_check_change_requires_documentation_for_code(self) -> None:
         base = self.ready_repository()

@@ -36,7 +36,6 @@ from .service import (
     UploadedFile,
     is_safe_inline_attachment_mime,
 )
-from .technical_profile import select_technical_profile
 from .secure_fs import ensure_private_directory
 
 
@@ -79,31 +78,24 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
-_IMPORT_TECHNICAL_PROFILE = select_technical_profile()
-
-
-def _profile_env(source_name: str) -> str:
-    return _IMPORT_TECHNICAL_PROFILE.environment_variable(source_name)
-
-
 # Admission control: cap concurrent worker threads (and therefore the per-thread
 # SQLite connections / file descriptors they hold) and cap concurrent long-lived
 # SSE streams both globally and per user, so a scripted client cannot exhaust
 # server resources. Tunable via environment with safe defaults.
 MAX_CONCURRENT_REQUESTS = _env_int(
-    _profile_env("ENTERPRISE_MAX_CONCURRENT_REQUESTS"), 64
+    "AGENT_PLATFORM_MAX_CONCURRENT_REQUESTS", 64
 )
 MAX_CONCURRENT_SSE_STREAMS = _env_int(
-    _profile_env("ENTERPRISE_MAX_SSE_STREAMS"), 256
+    "AGENT_PLATFORM_MAX_SSE_STREAMS", 256
 )
 MAX_SSE_STREAMS_PER_USER = _env_int(
-    _profile_env("ENTERPRISE_MAX_SSE_STREAMS_PER_USER"), 4
+    "AGENT_PLATFORM_MAX_SSE_STREAMS_PER_USER", 4
 )
 MAX_CONCURRENT_UPLOADS = _env_int(
-    _profile_env("ENTERPRISE_MAX_CONCURRENT_UPLOADS"), 4
+    "AGENT_PLATFORM_MAX_CONCURRENT_UPLOADS", 4
 )
 UPLOAD_IDLE_TIMEOUT_SECONDS = _env_int(
-    _profile_env("ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS"), 120
+    "AGENT_PLATFORM_UPLOAD_IDLE_TIMEOUT_SECONDS", 120
 )
 UPLOAD_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_MULTIPART_HEADER_BYTES = 64 * 1024
@@ -651,26 +643,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid manager token")
         if path == "/internal/manager/health" and method == "GET":
             self._json(service.manager_internal_health())
-            return
-        if path == "/internal/manager/handoff/evidence" and method == "GET":
-            self._json(service.manager_handoff_evidence())
-            return
-        if path == "/internal/manager/handoff/reservation" and method == "GET":
-            self._json(service.manager_handoff_reservation())
-            return
-        if path == "/internal/manager/handoff/commit-release" and method == "POST":
-            body = self._body_json_closed_world(
-                frozenset(
-                    {"operation_id", "target_generation", "binding_sha256"}
-                )
-            )
-            self._json(
-                service.manager_handoff_commit_release(
-                    body["operation_id"],
-                    body["target_generation"],
-                    body["binding_sha256"],
-                )
-            )
             return
         if path == "/internal/manager/update/readiness" and method == "POST":
             body = self._body_json()
@@ -2274,11 +2246,7 @@ def run_server(
     if bootstrap_password_path.exists():
         print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")
     else:
-        admin_password_name = (
-            server.service.config.technical_profile.environment_variable(
-                "ENTERPRISE_ADMIN_PASSWORD"
-            )
-        )
+        admin_password_name = "AGENT_PLATFORM_ADMIN_PASSWORD"
         print(
             "Bootstrap admin account is admin; password came from "
             f"{admin_password_name} or existing database state."

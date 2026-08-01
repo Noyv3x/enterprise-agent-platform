@@ -56,14 +56,13 @@ type Manager struct {
 	// ReclaimCapacity performs one controlled maintenance pass before a missing
 	// Sandbox image is retried. It is invoked before MaintenanceMu is acquired so
 	// cleanup cannot invert admission locks.
-	ReclaimCapacity        func(context.Context) error
-	mu                     sync.Mutex
-	registry               registry
-	ensureMu               sync.Mutex
-	ensureByID             map[string]*sync.Mutex
-	profile                identity.Profile
-	protected              []identity.Profile
-	registryUpgradePending bool
+	ReclaimCapacity func(context.Context) error
+	mu              sync.Mutex
+	registry        registry
+	ensureMu        sync.Mutex
+	ensureByID      map[string]*sync.Mutex
+	profile         identity.Profile
+	protected       []identity.Profile
 }
 
 func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
@@ -76,37 +75,13 @@ func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePat
 		return nil, fmt.Errorf("Sandbox protected technical profiles: %w", err)
 	}
 	manager := &Manager{Engine: engine, DataDir: filepath.Clean(dataDir), StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: sandboxRegistrySchemaVersion, TechnicalProfile: profile.ProfileID, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}, profile: profile, protected: protected}
-	upgraded, err := manager.loadRegistry()
-	if err != nil {
+	if err := manager.loadRegistry(); err != nil {
 		return nil, err
 	}
 	if err := manager.validateRegistry(); err != nil {
 		return nil, err
 	}
-	if upgraded {
-		manager.registryUpgradePending = true
-	}
 	return manager, nil
-}
-
-// CommitRegistryUpgrade publishes a fully proven v1 -> v2 conversion. The
-// caller must invoke it only after a candidate Manager has been committed by
-// its watchdog (or when the running binary was already Current), so the prior
-// binary never has to read a schema it does not understand during rollback.
-func (m *Manager) CommitRegistryUpgrade() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.registryUpgradePending {
-		return nil
-	}
-	if err := m.validateRegistry(); err != nil {
-		return err
-	}
-	if err := atomicfile.WriteJSON(m.StatePath, m.registry, 0o600); err != nil {
-		return fmt.Errorf("persist upgraded sandbox registry: %w", err)
-	}
-	m.registryUpgradePending = false
-	return nil
 }
 
 func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now time.Time) (driver.SandboxSpec, error) {
@@ -672,9 +647,6 @@ func safeSegment(value string) bool {
 	return value != ""
 }
 func (m *Manager) persistLocked() error {
-	if m.registryUpgradePending {
-		return errors.New("sandbox registry v2 cannot be persisted before Manager activation commits")
-	}
 	return atomicfile.WriteJSON(m.StatePath, m.registry, 0o600)
 }
 func stableHash(value string) string {

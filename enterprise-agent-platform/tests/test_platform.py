@@ -644,7 +644,7 @@ class PlatformServiceTests(unittest.TestCase):
                     for row in service.db.query(
                         "SELECT key, value, secret FROM settings "
                         "WHERE key LIKE 'AGENT_PLATFORM_%' "
-                        "OR key LIKE 'ENTERPRISE_%'"
+                        "OR key LIKE 'AGENT_PLATFORM_%'"
                     )
                 }
                 self.assertEqual(
@@ -1516,7 +1516,9 @@ class PlatformServiceTests(unittest.TestCase):
             agent_message = messages[-1]
 
             self.assertEqual(agent_message["username"], "Main Agent")
-            self.assertEqual(agent.calls[-1]["session_id"], "ubitech-channel-1-main-agent")
+            self.assertEqual(
+                agent.calls[-1]["session_id"], "agent-platform-channel-1-main-agent"
+            )
             self.assertEqual(agent.calls[-1]["session_key"], "channel:1:main-agent")
             self.assertEqual(agent.calls[-1]["user_message"], "Administrator: What is the VPN access policy?")
             self.assertEqual(
@@ -1575,7 +1577,9 @@ class PlatformServiceTests(unittest.TestCase):
                 service.send_channel_message(user, 1, "@agent second")
                 service.wait_for_agent_idle("channel", "1")
 
-                self.assertEqual(agent.calls[0]["session_id"], "ubitech-channel-1-main-agent")
+                self.assertEqual(
+                    agent.calls[0]["session_id"], "agent-platform-channel-1-main-agent"
+                )
                 self.assertEqual(agent.calls[1]["session_id"], "compacted-channel-session")
                 self.assertEqual(agent.calls[0]["history"], [])
                 self.assertEqual(
@@ -2302,8 +2306,8 @@ class PlatformServiceTests(unittest.TestCase):
             media_path = Path(media_td) / "result.csv"
             media_path.write_text("a,b\n1,2\n", encoding="utf-8")
             agent = MediaReturningAgent(media_path)
-            previous_roots = os.environ.get("ENTERPRISE_MEDIA_ROOTS")
-            os.environ["ENTERPRISE_MEDIA_ROOTS"] = media_td
+            previous_roots = os.environ.get("AGENT_PLATFORM_MEDIA_ROOTS")
+            os.environ["AGENT_PLATFORM_MEDIA_ROOTS"] = media_td
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             bot = FakeTelegramBot()
             gateway = TelegramGateway(service, bot=bot, autostart=False)
@@ -2331,9 +2335,9 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
                 if previous_roots is None:
-                    os.environ.pop("ENTERPRISE_MEDIA_ROOTS", None)
+                    os.environ.pop("AGENT_PLATFORM_MEDIA_ROOTS", None)
                 else:
-                    os.environ["ENTERPRISE_MEDIA_ROOTS"] = previous_roots
+                    os.environ["AGENT_PLATFORM_MEDIA_ROOTS"] = previous_roots
 
     def test_telegram_unlinked_private_message_replies_with_binding_hint(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2594,12 +2598,12 @@ class PlatformServiceTests(unittest.TestCase):
             )
             self.assertIn("清理自己产生的临时文件和中间产物", prompt)
             self.assertIn("不要为了整理而删除用户上传", prompt)
-            self.assertIn("/workspace/.ubitech/attachments", prompt)
+            self.assertIn("/workspace/.agent-platform/attachments", prompt)
             self.assertTrue(
                 Path(service.agent_scopes.get_scope("private:1").workspace_path).is_dir()
             )
             self.assertNotIn("container", status)
-            self.assertEqual(agent.calls[-1]["session_id"], "ubitech-private-u1")
+            self.assertEqual(agent.calls[-1]["session_id"], "agent-platform-private-u1")
             self.assertEqual(agent.calls[-1]["session_key"], "private:1")
             self.assertNotIn("container", agent.calls[-1]["metadata"])
             service.close()
@@ -2988,7 +2992,9 @@ class PlatformServiceTests(unittest.TestCase):
                 service.send_private_message(user, "second")
                 service.wait_for_agent_idle("private", str(user["id"]))
 
-                self.assertEqual(agent.calls[0]["session_id"], "ubitech-private-u1")
+                self.assertEqual(
+                    agent.calls[0]["session_id"], "agent-platform-private-u1"
+                )
                 self.assertEqual(agent.calls[1]["session_id"], "compacted-private-session")
                 self.assertEqual(agent.calls[0]["history"], [])
                 self.assertEqual(
@@ -3552,13 +3558,13 @@ class PlatformServiceTests(unittest.TestCase):
             # shared host state, so trusting it would let a prompt-injected agent
             # exfiltrate arbitrary readable temp files via MEDIA: tags). An
             # operator allow-lists this generated-media directory explicitly via
-            # ENTERPRISE_MEDIA_ROOTS, the documented escape hatch alongside the
+            # AGENT_PLATFORM_MEDIA_ROOTS, the documented escape hatch alongside the
             # managed Agent runtime directories that are trusted by default.
             media_path = Path(media_td) / "result.csv"
             media_path.write_text("a,b\n1,2\n", encoding="utf-8")
             agent = MediaReturningAgent(media_path)
-            previous_roots = os.environ.get("ENTERPRISE_MEDIA_ROOTS")
-            os.environ["ENTERPRISE_MEDIA_ROOTS"] = media_td
+            previous_roots = os.environ.get("AGENT_PLATFORM_MEDIA_ROOTS")
+            os.environ["AGENT_PLATFORM_MEDIA_ROOTS"] = media_td
             service = EnterpriseService(make_config(tmp), agent_client=agent)
             try:
                 _, user = service.authenticate("admin", "admin")
@@ -3580,9 +3586,9 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
                 if previous_roots is None:
-                    os.environ.pop("ENTERPRISE_MEDIA_ROOTS", None)
+                    os.environ.pop("AGENT_PLATFORM_MEDIA_ROOTS", None)
                 else:
-                    os.environ["ENTERPRISE_MEDIA_ROOTS"] = previous_roots
+                    os.environ["AGENT_PLATFORM_MEDIA_ROOTS"] = previous_roots
 
     def test_agent_media_tags_outside_allowed_roots_are_refused(self):
         # A path that exists but lives outside the temp dir and the workspace
@@ -3682,11 +3688,20 @@ class PlatformServiceTests(unittest.TestCase):
             service.send_channel_message(member, 1, "@agent member asks")
             service.wait_for_agent_idle("channel", "1")
             channel_sessions = [call["session_id"] for call in agent.calls[-2:]]
-            self.assertEqual(channel_sessions, ["ubitech-channel-1-main-agent", "ubitech-channel-1-main-agent"])
+            self.assertEqual(
+                channel_sessions,
+                [
+                    "agent-platform-channel-1-main-agent",
+                    "agent-platform-channel-1-main-agent",
+                ],
+            )
 
             service.send_private_message(member, "private task")
             service.wait_for_agent_idle("private", str(member["id"]))
-            self.assertEqual(service.private_status(member)["execution"]["session_id"], "ubitech-private-u2")
+            self.assertEqual(
+                service.private_status(member)["execution"]["session_id"],
+                "agent-platform-private-u2",
+            )
             self.assertEqual(service.model_secret_env(), {})
             service.close()
 
@@ -5102,7 +5117,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIsNone(service.user_from_token(token + "tamper"))
                 self.assertIsNone(service.user_from_token("not.a.valid.token"))
                 self.assertIsNone(service.user_from_token(""))
-                secret = service.get_secret("ENTERPRISE_SESSION_SECRET")
+                secret = service.get_secret("AGENT_PLATFORM_SESSION_SECRET")
                 self.assertTrue(secret)
                 expired = TokenSigner(secret, ttl_seconds=-10).issue(1, 1)
                 self.assertIsNone(service.user_from_token(expired))

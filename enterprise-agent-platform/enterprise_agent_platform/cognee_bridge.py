@@ -28,7 +28,7 @@ class CogneeBridge:
 
     The platform always keeps a local SQLite index so the web UI and agent
     tools remain available without heavy LLM/database setup. When
-    ENTERPRISE_KB_BACKEND is `hybrid` or `cognee`, this bridge also attempts
+    AGENT_PLATFORM_KB_BACKEND is `hybrid` or `cognee`, this bridge also attempts
     Cognee ingestion/search using the locked image distribution.
     """
 

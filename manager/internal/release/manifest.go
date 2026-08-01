@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
@@ -32,10 +31,9 @@ var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var canonicalManifestJSONKeys = func() map[string]string {
 	keys := []string{
-		"url", "sha256", "version", "artifacts", "profile_id", "manager", "compose",
-		"schema_version", "predecessor_generation", "bridge_generation", "source", "target",
+		"url", "sha256", "version", "artifacts", "manager", "compose", "schema_version",
 		"channel", "source_commit", "generated_at", "protocol_version", "database_schema_version",
-		"images", "namespace_handoff",
+		"images",
 	}
 	result := make(map[string]string, len(keys))
 	for _, key := range keys {
@@ -44,42 +42,24 @@ var canonicalManifestJSONKeys = func() map[string]string {
 	return result
 }()
 
-const (
-	// ManifestSchemaVersionV1 is the source-owner and one-time Bridge catalog
-	// shape. It retains the handoff helper image and may carry the signed
-	// namespace_handoff descriptor.
-	ManifestSchemaVersionV1 = 1
-	// ManifestSchemaVersionV2 is the target-only cleanup/baseline catalog shape.
-	// It cannot carry the one-time handoff descriptor or helper image.
-	ManifestSchemaVersionV2       = 2
-	namespaceHandoffSchemaVersion = 1
-)
+const ManifestSchemaVersion = 2
 
-var managedImageNamesV1 = []string{
-	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-	"firecrawl-redis", "firecrawl-rabbitmq",
-	"handoff-fs-helper",
-}
-
-var managedImageNamesV2 = []string{
+var managedImageNames = []string{
 	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
 	"firecrawl-redis", "firecrawl-rabbitmq",
 }
 
 var managedImageNameSet = func() map[string]struct{} {
-	result := make(map[string]struct{}, len(managedImageNamesV1))
-	for _, name := range managedImageNamesV1 {
+	result := make(map[string]struct{}, len(managedImageNames))
+	for _, name := range managedImageNames {
 		result[name] = struct{}{}
 	}
 	return result
 }()
 
-// IsManagedImageName identifies every logical image name recognized by one of
-// the supported release schemas. Manifest validation applies the narrower
-// schema-specific closed set; this union remains useful for exact cleanup of a
-// retained schema-v1 handoff helper after the target switches to schema v2.
+// IsManagedImageName identifies every logical image in the current release
+// schema. Cleanup uses the same closed set as manifest validation.
 func IsManagedImageName(name string) bool {
 	_, ok := managedImageNameSet[name]
 	return ok
@@ -103,24 +83,6 @@ type ManagerRelease struct {
 	Artifacts map[string]Artifact `json:"artifacts"`
 }
 
-// NamespaceBinding binds one fixed technical identity to the immutable
-// Manager and Compose artifacts needed on that side of a handoff.
-type NamespaceBinding struct {
-	ProfileID string         `json:"profile_id"`
-	Manager   ManagerRelease `json:"manager"`
-	Compose   Artifact       `json:"compose"`
-}
-
-// NamespaceHandoff is the inert, signed manifest capability for a future
-// namespace handoff. Parsing it does not start or schedule a handoff.
-type NamespaceHandoff struct {
-	SchemaVersion         int              `json:"schema_version"`
-	PredecessorGeneration string           `json:"predecessor_generation"`
-	BridgeGeneration      string           `json:"bridge_generation"`
-	Source                NamespaceBinding `json:"source"`
-	Target                NamespaceBinding `json:"target"`
-}
-
 type Manifest struct {
 	SchemaVersion         int               `json:"schema_version"`
 	Channel               string            `json:"channel"`
@@ -131,49 +93,28 @@ type Manifest struct {
 	Manager               ManagerRelease    `json:"manager"`
 	Compose               Artifact          `json:"compose"`
 	Images                map[string]string `json:"images"`
-	NamespaceHandoff      *NamespaceHandoff `json:"namespace_handoff,omitempty"`
 }
 
 func (m Manifest) ID() string { return m.SourceCommit }
 func (m Manifest) Validate(channel, goos, goarch string) error {
-	active, err := identity.CompileTimeActiveProfile()
-	if err != nil {
-		return err
-	}
-	return m.ValidateForProfile(channel, goos, goarch, active)
+	return m.ValidateForProfile(channel, goos, goarch, identity.CompileTimeActiveProfile())
 }
 
-// ValidateForProfile applies the manifest/protocol barrier using the active
-// technical identity selected by the startup Router. Schema v2 is deliberately
-// unavailable to source Managers, even when every other field is well formed.
+// ValidateForProfile applies the target-only manifest/protocol barrier using
+// the compile-time technical identity supplied by the caller.
 func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identity.ActiveProfile) error {
 	profile, err := active.Profile()
 	if err != nil {
 		return fmt.Errorf("validate release technical profile: %w", err)
 	}
-	if contract.ReleaseTransitionStage != "bridge" && m.SchemaVersion != ManifestSchemaVersionV2 {
-		return fmt.Errorf("release stage %q accepts only target manifest schema 2", contract.ReleaseTransitionStage)
+	if profile.ProfileID != identity.TargetProfileID() {
+		return errors.New("release manifest requires the target technical profile")
 	}
-	var managedImages []string
-	switch m.SchemaVersion {
-	case ManifestSchemaVersionV1:
-		managedImages = managedImageNamesV1
-		if m.ProtocolVersion != ManifestSchemaVersionV1 {
-			return fmt.Errorf("unsupported manager protocol %d for manifest schema %d", m.ProtocolVersion, m.SchemaVersion)
-		}
-	case ManifestSchemaVersionV2:
-		if profile.ProfileID != identity.TargetProfileID() {
-			return errors.New("manifest schema 2 requires the verified target technical profile")
-		}
-		managedImages = managedImageNamesV2
-		if m.ProtocolVersion != ManifestSchemaVersionV2 {
-			return fmt.Errorf("unsupported manager protocol %d for manifest schema %d", m.ProtocolVersion, m.SchemaVersion)
-		}
-		if m.NamespaceHandoff != nil {
-			return errors.New("manifest schema 2 must not contain namespace_handoff")
-		}
-	default:
+	if m.SchemaVersion != ManifestSchemaVersion {
 		return fmt.Errorf("unsupported manifest schema %d", m.SchemaVersion)
+	}
+	if m.ProtocolVersion != ManifestSchemaVersion {
+		return fmt.Errorf("unsupported manager protocol %d for manifest schema %d", m.ProtocolVersion, m.SchemaVersion)
 	}
 	if m.Channel != channel {
 		return fmt.Errorf("manifest channel %q does not match %q", m.Channel, channel)
@@ -190,20 +131,18 @@ func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identi
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	if len(m.Images) != len(managedImages) {
-		return fmt.Errorf("manifest schema %d images must contain exactly %d managed entries", m.SchemaVersion, len(managedImages))
+	if len(m.Images) != len(managedImageNames) {
+		return fmt.Errorf("manifest schema %d images must contain exactly %d managed entries", m.SchemaVersion, len(managedImageNames))
 	}
-	managedImageSet := make(map[string]struct{}, len(managedImages))
-	for _, name := range managedImages {
-		managedImageSet[name] = struct{}{}
+	for _, name := range managedImageNames {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q must use a complete registry sha256 digest", name)
 		}
 	}
 	for name, digest := range m.Images {
-		if _, ok := managedImageSet[name]; !ok {
-			return fmt.Errorf("image %q is outside manifest schema %d managed release set", name, m.SchemaVersion)
+		if _, ok := managedImageNameSet[name]; !ok {
+			return fmt.Errorf("image %q is outside the managed release set", name)
 		}
 		if !imageNamePattern.MatchString(name) {
 			return fmt.Errorf("image name %q must use lowercase kebab-case", name)
@@ -215,10 +154,8 @@ func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identi
 	if m.Manager.Version == "" {
 		return errors.New("manager version is required")
 	}
-	if m.SchemaVersion == ManifestSchemaVersionV2 {
-		if err := m.validateTargetArtifactCatalog(); err != nil {
-			return err
-		}
+	if err := m.validateTargetArtifactCatalog(); err != nil {
+		return err
 	}
 	artifact, ok := m.Manager.Artifacts[goarch]
 	if !ok {
@@ -229,11 +166,6 @@ func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identi
 	}
 	if err := m.Compose.Validate(); err != nil {
 		return fmt.Errorf("compose artifact: %w", err)
-	}
-	if m.NamespaceHandoff != nil {
-		if err := m.NamespaceHandoff.Validate(m); err != nil {
-			return fmt.Errorf("namespace_handoff: %w", err)
-		}
 	}
 	return nil
 }
@@ -275,98 +207,6 @@ func validateTargetArtifact(artifact Artifact, expectedBase string) error {
 		return fmt.Errorf("URL basename must be %q", expectedBase)
 	}
 	return nil
-}
-
-func (h NamespaceHandoff) Validate(manifest Manifest) error {
-	if h.SchemaVersion != namespaceHandoffSchemaVersion {
-		return fmt.Errorf("unsupported schema %d", h.SchemaVersion)
-	}
-	if !commitPattern.MatchString(h.PredecessorGeneration) {
-		return errors.New("predecessor_generation must be a full 40-character commit")
-	}
-	if !commitPattern.MatchString(h.BridgeGeneration) {
-		return errors.New("bridge_generation must be a full 40-character commit")
-	}
-	if h.BridgeGeneration != manifest.SourceCommit {
-		return errors.New("bridge_generation must match manifest source_commit")
-	}
-	if h.PredecessorGeneration == h.BridgeGeneration {
-		return errors.New("predecessor_generation and bridge_generation must differ")
-	}
-	if h.Source.ProfileID == h.Target.ProfileID {
-		return errors.New("source and target profile_id must differ")
-	}
-	sourceProfileID := identity.SourceProfile().ProfileID
-	targetProfileID := identity.TargetProfileID()
-	if h.Source.ProfileID != sourceProfileID {
-		return fmt.Errorf("source profile_id must be %q", sourceProfileID)
-	}
-	if h.Target.ProfileID != targetProfileID {
-		return fmt.Errorf("target profile_id must be %q", targetProfileID)
-	}
-	if h.Source.Manager.Version != h.PredecessorGeneration {
-		return errors.New("source manager version must match predecessor_generation")
-	}
-	if h.Target.Manager.Version != h.BridgeGeneration {
-		return errors.New("target manager version must match bridge_generation")
-	}
-	if err := h.Source.validate("source"); err != nil {
-		return err
-	}
-	if err := h.Target.validate("target"); err != nil {
-		return err
-	}
-	if !managerReleasesEqual(h.Target.Manager, manifest.Manager) {
-		return errors.New("target manager must exactly match the top-level manager")
-	}
-	if h.Target.Compose != manifest.Compose {
-		return errors.New("target compose must exactly match the top-level compose")
-	}
-	return nil
-}
-
-func (b NamespaceBinding) validate(name string) error {
-	if strings.TrimSpace(b.Manager.Version) == "" {
-		return fmt.Errorf("%s manager version is required", name)
-	}
-	if len(b.Manager.Artifacts) != 2 {
-		return fmt.Errorf("%s manager artifacts must contain exactly amd64 and arm64", name)
-	}
-	for _, arch := range []string{"amd64", "arm64"} {
-		artifact, ok := b.Manager.Artifacts[arch]
-		if !ok {
-			return fmt.Errorf("%s manager artifact for %s is missing", name, arch)
-		}
-		if err := validateBoundArtifact(artifact); err != nil {
-			return fmt.Errorf("%s manager artifact for %s: %w", name, arch, err)
-		}
-	}
-	if err := validateBoundArtifact(b.Compose); err != nil {
-		return fmt.Errorf("%s compose artifact: %w", name, err)
-	}
-	return nil
-}
-
-func validateBoundArtifact(artifact Artifact) error {
-	if err := artifact.Validate(); err != nil {
-		return err
-	}
-	if !sha256Pattern.MatchString(artifact.SHA256) {
-		return errors.New("sha256 must use 64 lowercase hexadecimal characters")
-	}
-	return nil
-}
-
-func managerReleasesEqual(left, right ManagerRelease) bool {
-	if left.Version != right.Version || len(left.Artifacts) != len(right.Artifacts) {
-		return false
-	}
-	for arch, artifact := range left.Artifacts {
-		if candidate, ok := right.Artifacts[arch]; !ok || candidate != artifact {
-			return false
-		}
-	}
-	return true
 }
 
 func (a Artifact) Validate() error {
@@ -419,11 +259,7 @@ func IsTemporarilyUnavailable(err error) bool {
 }
 
 func (c Client) Fetch(ctx context.Context, url, channel string) (Manifest, []byte, error) {
-	active, err := identity.CompileTimeActiveProfile()
-	if err != nil {
-		return Manifest{}, nil, err
-	}
-	return c.FetchForProfile(ctx, url, channel, active)
+	return c.FetchForProfile(ctx, url, channel, identity.CompileTimeActiveProfile())
 }
 
 // FetchForProfile downloads and validates a catalog for the already-routed
@@ -441,15 +277,9 @@ func (c Client) FetchForProfile(ctx context.Context, url, channel string, active
 }
 
 // DecodeManifest applies the same closed-world parser and cross-field
-// validation as Client.Fetch to already retained immutable bytes. The handoff
-// helper uses it after the source Manager has stopped; it must never reinterpret
-// a journal-bound manifest through a weaker decoder.
+// validation as Client.Fetch to retained immutable bytes.
 func DecodeManifest(data []byte, channel, goos, goarch string) (Manifest, error) {
-	active, err := identity.CompileTimeActiveProfile()
-	if err != nil {
-		return Manifest{}, err
-	}
-	return DecodeManifestForProfile(data, channel, goos, goarch, active)
+	return DecodeManifestForProfile(data, channel, goos, goarch, identity.CompileTimeActiveProfile())
 }
 
 // DecodeManifestForProfile applies the same target-only schema barrier to
@@ -484,14 +314,6 @@ func decodeManifestDocument(data []byte) (Manifest, error) {
 			return Manifest{}, errors.New("decode release manifest: trailing JSON value")
 		}
 		return Manifest{}, fmt.Errorf("decode release manifest: %w", err)
-	}
-	var envelope struct {
-		NamespaceHandoff json.RawMessage `json:"namespace_handoff"`
-	}
-	if err := json.Unmarshal(data, &envelope); err == nil {
-		if envelope.NamespaceHandoff != nil && strings.TrimSpace(string(envelope.NamespaceHandoff)) == "null" {
-			return Manifest{}, errors.New("decode release manifest: namespace_handoff must not be null")
-		}
 	}
 	return manifest, nil
 }
