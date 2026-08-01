@@ -111,14 +111,6 @@ func (a *API) identity(response http.ResponseWriter) {
 }
 
 func (a *API) status(response http.ResponseWriter, requestContext context.Context) {
-	state := a.Store.State()
-	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
-	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
-	operationID := activeOperationID
-	if operationID == "" {
-		operationID = finalizeOperationID
-	}
-	publicState := safePublicState(state.PublicState)
 	services := map[string]any{"manager": map[string]any{"status": "healthy"}}
 	for _, name := range []string{
 		"platform",
@@ -142,7 +134,96 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		}
 		cancel()
 	}
-	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt})
+	state, referencedOperation, snapshotErr := a.Store.StateWithReferencedOperation()
+	var gateSettlement *gateSettlementStatus
+	if snapshotErr == nil && referencedOperation != nil {
+		gateSettlement = projectGateSettlement(state, *referencedOperation)
+	}
+	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
+	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
+	operationID := activeOperationID
+	if operationID == "" {
+		operationID = finalizeOperationID
+	}
+	publicState := safePublicState(state.PublicState)
+	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "gate_settlement": gateSettlement, "checked_at": state.HeartbeatAt})
+}
+
+type gateSettlementStatus struct {
+	SchemaVersion int    `json:"schema_version"`
+	OperationID   string `json:"operation_id"`
+	Action        string `json:"action"`
+}
+
+func projectGateSettlement(state model.ManagerState, operation model.Operation) *gateSettlementStatus {
+	if state.SchemaVersion != 1 || !state.Maintenance ||
+		state.PublicState != model.StateUpdating || state.Phase != "" ||
+		state.ActiveOperationID != "" ||
+		state.FinalizePendingOperationID != operation.ID || state.Candidate != nil ||
+		operation.SchemaVersion != 1 || !validStatusOperationID(operation.ID) ||
+		operation.Status != model.OperationSucceeded || !operation.Finalized ||
+		operation.Phase != model.PhaseCommitting || operation.CompletedAt == nil ||
+		operation.ReservationReleased || operation.SnapshotRestored ||
+		operation.PreparedCleanupPending || operation.ManagerActivationRollback ||
+		operation.ManagerRollbackGeneration != "" ||
+		!validGateSettlementReservation(state, operation) ||
+		!validGateSettlementAction(operation) ||
+		safeCommit(operation.TargetGeneration) != operation.TargetGeneration ||
+		!generationMatchesTarget(state.Current, operation.TargetGeneration) {
+		return nil
+	}
+
+	return &gateSettlementStatus{
+		SchemaVersion: 1,
+		OperationID:   operation.ID,
+		Action:        string(operation.GateSettlementAction),
+	}
+}
+
+func validGateSettlementAction(operation model.Operation) bool {
+	switch operation.GateSettlementAction {
+	case model.GateSettlementCommit:
+		return operation.Kind == model.OperationInstall || operation.Kind == model.OperationUpdate
+	case model.GateSettlementAbort:
+		switch operation.Kind {
+		case model.OperationInstall, model.OperationUpdate, model.OperationRestart, model.OperationRollback, model.OperationRepair:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func validGateSettlementReservation(state model.ManagerState, operation model.Operation) bool {
+	switch operation.Kind {
+	case model.OperationInstall:
+		return operation.ReservationStatus == "" && state.Previous == nil ||
+			operation.ReservationStatus == model.ReservationMutationStarted && state.Previous != nil
+	case model.OperationRepair:
+		return operation.ReservationStatus == ""
+	case model.OperationUpdate, model.OperationRestart, model.OperationRollback:
+		return operation.ReservationStatus == model.ReservationMutationStarted
+	default:
+		return false
+	}
+}
+
+func generationMatchesTarget(generation *model.Generation, target string) bool {
+	return generation != nil && generation.ID == target && generation.SourceCommit == target
+}
+
+func validStatusOperationID(value string) bool {
+	if len(value) != len("op_")+32 || !strings.HasPrefix(value, "op_") {
+		return false
+	}
+	for _, character := range value[len("op_"):] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func safeServiceStatus(value string) string {

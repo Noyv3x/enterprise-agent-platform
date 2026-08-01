@@ -170,6 +170,198 @@ func TestStatusExposesDurableMaintenanceReservation(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesNullGateSettlementForActiveFreshInstall(t *testing.T) {
+	t.Parallel()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &API{Store: store, ControlToken: "control-token-0123456789abcdef"}
+	status, _ := requestManagerStatus(t, api)
+	if value, exists := status["gate_settlement"]; !exists || value != nil {
+		t.Fatalf("idle gate_settlement = %#v, want explicit null", value)
+	}
+	operation, _, err := store.Begin(model.OperationRequest{
+		Kind:               model.OperationInstall,
+		IdempotencyKey:     "active-fresh-install",
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := strings.Repeat("a", 40)
+	if _, err = store.UpdateOperation(operation.ID, func(value *model.Operation) error {
+		value.TargetGeneration = target
+		value.Status = model.OperationRunning
+		value.Phase = model.PhaseStarting
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.PublicState = model.StateUpdating
+		state.Maintenance = true
+		state.Phase = model.PhaseStarting
+		state.Candidate = targetGeneration(target)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, _ = requestManagerStatus(t, api)
+	if value, exists := status["gate_settlement"]; !exists || value != nil {
+		t.Fatalf("active fresh install gate_settlement = %#v, want explicit null", value)
+	}
+}
+
+func TestStatusProjectsExactFinalizedGateSettlement(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		kind   model.OperationKind
+		action model.GateSettlementAction
+	}{
+		{name: "install commit", kind: model.OperationInstall, action: model.GateSettlementCommit},
+		{name: "update commit", kind: model.OperationUpdate, action: model.GateSettlementCommit},
+		{name: "update abort", kind: model.OperationUpdate, action: model.GateSettlementAbort},
+		{name: "restart abort", kind: model.OperationRestart, action: model.GateSettlementAbort},
+		{name: "rollback abort", kind: model.OperationRollback, action: model.GateSettlementAbort},
+		{name: "repair abort", kind: model.OperationRepair, action: model.GateSettlementAbort},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, operationID := finalizedGateSettlementStore(t, test.kind, test.action)
+			status, _ := requestManagerStatus(t, &API{Store: store, ControlToken: "control-token-0123456789abcdef"})
+			settlement, ok := status["gate_settlement"].(map[string]any)
+			if !ok || len(settlement) != 3 || settlement["schema_version"] != float64(1) ||
+				settlement["operation_id"] != operationID || settlement["action"] != string(test.action) {
+				t.Fatalf("gate_settlement = %#v, want exact %q settlement", status["gate_settlement"], test.action)
+			}
+		})
+	}
+}
+
+func TestGateSettlementProjectionFailsClosedOnJournalOrStateDrift(t *testing.T) {
+	t.Parallel()
+	mutations := []struct {
+		name   string
+		mutate func(*model.ManagerState, *model.Operation)
+	}{
+		{name: "maintenance ended", mutate: func(state *model.ManagerState, _ *model.Operation) { state.Maintenance = false }},
+		{name: "public state changed", mutate: func(state *model.ManagerState, _ *model.Operation) { state.PublicState = model.StateIdle }},
+		{name: "state phase appeared", mutate: func(state *model.ManagerState, _ *model.Operation) { state.Phase = model.PhaseCommitting }},
+		{name: "active slot appeared", mutate: func(state *model.ManagerState, operation *model.Operation) { state.ActiveOperationID = operation.ID }},
+		{name: "finalize slot drifted", mutate: func(state *model.ManagerState, _ *model.Operation) {
+			state.FinalizePendingOperationID = "op_ffffffffffffffffffffffffffffffff"
+		}},
+		{name: "candidate appeared", mutate: func(state *model.ManagerState, operation *model.Operation) {
+			state.Candidate = targetGeneration(operation.TargetGeneration)
+		}},
+		{name: "current drifted", mutate: func(state *model.ManagerState, _ *model.Operation) {
+			state.Current.SourceCommit = strings.Repeat("b", 40)
+		}},
+		{name: "operation not finalized", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.Finalized = false }},
+		{name: "operation failed", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.Status = model.OperationFailed }},
+		{name: "operation phase drifted", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.Phase = model.PhaseProbing }},
+		{name: "settlement action missing", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.GateSettlementAction = "" }},
+		{name: "settlement action conflicts with kind", mutate: func(_ *model.ManagerState, operation *model.Operation) {
+			operation.Kind = model.OperationRollback
+		}},
+		{name: "reservation checkpoint drifted", mutate: func(_ *model.ManagerState, operation *model.Operation) {
+			operation.ReservationStatus = model.ReservationConfirmed
+		}},
+		{name: "completion missing", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.CompletedAt = nil }},
+		{name: "reservation already released", mutate: func(_ *model.ManagerState, operation *model.Operation) { operation.ReservationReleased = true }},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			state, operation := validGateSettlement()
+			test.mutate(&state, &operation)
+			if projected := projectGateSettlement(state, operation); projected != nil {
+				t.Fatalf("gate settlement survived drift: %#v", projected)
+			}
+		})
+	}
+}
+
+func finalizedGateSettlementStore(t *testing.T, kind model.OperationKind, action model.GateSettlementAction) (*journal.Store, string) {
+	t.Helper()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, _, err := store.Begin(model.OperationRequest{
+		Kind:               kind,
+		IdempotencyKey:     "finalized-gate-settlement-" + string(kind) + "-" + string(action),
+		ExpectedGeneration: store.State().Generation,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := strings.Repeat("a", 40)
+	completedAt := time.Now().UTC()
+	reservation := model.ReservationMutationStarted
+	if kind == model.OperationInstall || kind == model.OperationRepair {
+		reservation = ""
+	}
+	if _, err = store.UpdateOperation(operation.ID, func(value *model.Operation) error {
+		value.TargetGeneration = target
+		value.Status = model.OperationSucceeded
+		value.Finalized = true
+		value.Phase = model.PhaseCommitting
+		value.ReservationStatus = reservation
+		value.GateSettlementAction = action
+		value.CompletedAt = &completedAt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.PublicState = model.StateUpdating
+		state.Maintenance = true
+		state.ActiveOperationID = ""
+		state.FinalizePendingOperationID = operation.ID
+		state.Phase = ""
+		state.Current = targetGeneration(target)
+		state.Candidate = nil
+		if kind != model.OperationInstall {
+			state.Previous = targetGeneration(strings.Repeat("b", 40))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return store, operation.ID
+}
+
+func validGateSettlement() (model.ManagerState, model.Operation) {
+	target := strings.Repeat("a", 40)
+	completedAt := time.Now().UTC()
+	operation := model.Operation{
+		SchemaVersion:        1,
+		ID:                   "op_0123456789abcdef0123456789abcdef",
+		Kind:                 model.OperationUpdate,
+		TargetGeneration:     target,
+		Status:               model.OperationSucceeded,
+		Finalized:            true,
+		Phase:                model.PhaseCommitting,
+		ReservationStatus:    model.ReservationMutationStarted,
+		GateSettlementAction: model.GateSettlementCommit,
+		CompletedAt:          &completedAt,
+	}
+	return model.ManagerState{
+		SchemaVersion:              1,
+		PublicState:                model.StateUpdating,
+		Maintenance:                true,
+		Current:                    targetGeneration(target),
+		Previous:                   targetGeneration(strings.Repeat("b", 40)),
+		FinalizePendingOperationID: operation.ID,
+	}, operation
+}
+
+func targetGeneration(generation string) *model.Generation {
+	return &model.Generation{ID: generation, SourceCommit: generation}
+}
+
 func TestStatusReportsEveryCoreServiceWithoutAssumingUnknownIsHealthy(t *testing.T) {
 	store, err := journal.Open(t.TempDir(), time.Now())
 	if err != nil {
