@@ -17,7 +17,7 @@
 
 温热工作区的目标是 `affected` 在 3 分钟内给出反馈、`full` 在 10 分钟内完成；Quality CI 继续以独立 job 全量并行。顶层脚本必须输出选中组件和每组耗时；普通变更连续超出目标时，先定位回归或拆分过宽测试域，不把增大全局超时当作默认解法。
 
-每个可发布提交的 Manager 全量测试只在对应的成功 Quality run 中以 `go test -count=1 ./...` 真实执行一次。Container release 必须绑定该精确提交的成功 Quality 证据；其两个 Manager 工件 job 只分别交叉编译 `linux/amd64` 与 `linux/arm64`、生成校验和并上传，不得再次运行全量测试。进入 `target_baseline` 后，发布工作流必须在任何镜像构建前证明 canonical Cleanup 已进入当前公开 release 的祖先链，并证明当前公开 generation 是候选提交的祖先；Cleanup 阶段的同一静态门禁只验证这条未来路径存在，不把尚未完成的阶段误当作当前契约。Go 模块与构建缓存以 `manager/go.sum` 为精确依赖入口，仅用于加速且不替代测试、编译或工件校验。真实 user-systemd 集成测试仍是独立发布门禁，必须使用 `-count=1` 执行，不能由全量单元测试或缓存命中代替。
+每个可发布提交的 Manager 全量测试只在对应的成功 Quality run 中以 `go test -count=1 ./...` 真实执行一次。Container release 必须绑定该精确提交的成功 Quality 证据；其两个 Manager 工件 job 只分别交叉编译 `linux/amd64` 与 `linux/arm64`、生成校验和并上传，不得再次运行全量测试。发布工作流在镜像构建前证明当前公开 generation 是候选提交的 Git 祖先，防止分叉或降级通道。Go 模块与构建缓存以 `manager/go.sum` 为精确依赖入口，仅用于加速且不替代测试、编译或工件校验。真实 user-systemd 集成测试仍是独立发布门禁，必须使用 `-count=1` 执行，不能由全量单元测试或缓存命中代替。
 
 ## Manager 与容器
 
@@ -25,10 +25,12 @@
 cd manager
 go test ./...
 go vet ./...
-go build ./cmd/agent-platform-manager
+go build -buildvcs=false ./cmd/agent-platform-manager
 cd ..
 ./scripts/container-smoke.sh
 ```
+
+本地 Manager 编译关闭 Go 的 VCS stamping；发布身份由已验证的 release manifest 与镜像 label 固定，不依赖开发工作树元数据。这也保证普通工作树和 Git worktree 使用同一构建入口。
 
 顶层测试脚本执行 Compose 静态校验时必须自行注入不可变的占位镜像引用和临时挂载路径，并忽略开发机的 `.env`；校验不能依赖生产部署变量，也不能连接或修改正在运行的容器。发布 Compose 冒烟中的 Manager contract stub 必须返回当前 `/v1/status` 的完整能力键集合；空能力使用显式 JSON `null`，不得用字段缺失意外模拟只为精确历史边界保留的旧协议。该 stub 取代真实 Manager 执行 fresh-install 前置阶段时，还必须显式创建 owner-only `data/workspaces/`，不能依赖候选 Platform 越权补建受管根。
 
@@ -36,15 +38,7 @@ Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 diges
 
 跨 Manager 包复用的正向 release fixture 必须由 `manager/internal/releasetest` 从当前 canonical contract 生成并在返回前按对应技术身份严格验证；测试只能覆盖本用例关心的 generation、时间或真实 artifact 字节等语义。未知/重复字段、缺字段、错误 checksum、错误 basename 与其它 decoder 负例必须继续使用原始 JSON 或显式 struct，不能交给共享 builder 自动补全或修正。
 
-### Bridge 历史阶段专用测试证据（非当前 Cleanup 门禁）
-
-Bridge 阶段的 handoff 特权树测试使用真实不同 UID/GID 且部署用户不可读的 `0700` PostgreSQL/RabbitMQ 风格目录，证明 native 路径失败、只有 `container_owned_tree + byte_exact_tree` 进入注入的 `PrivilegedTreeFS`，且内容、owner/group、mode、mtime、size 和完整 inventory 在复制前后不变。负例覆盖结构化/secret/单文件滥用、未知 access class、mutable 或错误镜像引用、额外挂载/网络/拉取/能力、symlink、hardlink、FIFO/device/socket、跨 mount、路径逃逸、request/receipt/label/image 摘要篡改、取消和崩溃残留；删除测试同时证明缺少 writer lease、target fence 或 publication proof 时零删除，身份完整时只删除声明目标。
-
-Bridge 阶段的 Manager 启动/CLI 竞态测试确定性交错 handoff、watchdog、`recover-current` 和本地 `preflight`，并验证 terminal observation、Router、helper participant、一次性能力和目标配置摘要的历史交接边界。release-transition attestation 测试另证明当时的长期 control API 没有私钥或签名路由，宿主 CLI 才能使用部署证明密钥；状态根、challenge、输出与路径竞态均按历史契约失败关闭。
-
-上述用例只属于 Bridge 发布的隔离 orchestration/审计证据。Cleanup 与 target-baseline 的当前 Manager 源码和 `go test ./...` 不编译、不链接或运行已删除的 handoff privileged-tree、startup、Router、helper、observation lease 或 attestation 包/API；当前 source-tree gate 必须阻止这些生产路径或符号重新出现。
-
-### 当前 Manager 与容器测试
+### Manager 与容器测试
 
 Manager 自更新还必须在真实的 user-systemd manager 中验证，而不能只依赖 fake runner：发布门禁应实际启动独立 watchdog、由 watchdog 提交主 unit 的 `restart --no-block`、确认主进程切换到候选 inode、候选完成 acknowledgement/commit，并证明 watchdog 不随主 unit 停止、同一重启只提交一次且测试创建的瞬态 unit 被精确清理。受控恢复的主 unit/watchdog 隔离也必须使用同一真实 systemd 门禁验证；显式启用门禁后，缺少 systemd 前提或发现已有产品 watchdog 必须失败关闭，不能以跳过测试形成绿色结果。持久 unit 的回归还必须区分 systemd 命令行与普通属性语法：`ExecStart` 对 argv 逐项引用，`WorkingDirectory` 使用属性值的路径转义，不能复用会把双引号当成路径字符的命令行引用器。该门禁失败时不得发布或提升 latest channel。
 
@@ -144,23 +138,15 @@ npm run build
 
 原子 release 组装只能下载经过匿名拉取、双架构容量和本地镜像身份验证后生成的单一 `verified-managed-images` 目录，以及独立的 `manager-*` 二进制 family；不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Compose 冒烟和最终 manifest 必须消费同一份已验证目录，不能各自维护镜像默认值。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
 
-镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖其同名中间 artifact。真正组装 GitHub Release 的 `publish` job 必须按 `prepare` 已解析的完整 source commit 跨 run 串行，不能使用可能指向同一提交的原始分支/ref 文本作为锁键；它只能生成并封印 draft，已公开 release 仍逐文件比较并拒绝漂移。封印测试必须覆盖除 `promotion.json` 外的精确资产名称/SHA-256/size，并对任一内容、大小、未知或重名资产漂移失败关闭；GitHub API 身份在上传后、promotion 紧邻前和切换后必须一致。每个成功 publish attempt 还要上传闭世 Actions 出处证明；测试覆盖 run id/attempt、workflow path/event/repository、Container execution head、built source commit、Quality run/attempt/workflow/head、dispatch ref/source 规则及 release/asset API identity 的任一错配，明确覆盖 default branch 已前进但合法旧 candidate、无关 run 唤醒、proof source 与上游 Quality head 不符，以及封印后、证明前中断的新 attempt 只能复验后补上自己的证明。promotion 门还要用无凭据 registry 请求覆盖候选 schema 的精确受管镜像闭集（schema 1 为十一项，schema 2 为十项）、摘要不符、私有/缺失和超时，并对 visibility 前后两次复验的缺失任一失败。同名 tag 测试覆盖不存在时 create-only 建立、精确 commit 复用、错误 commit、annotated tag 与竞争，并保证任一错配都发生在 visibility 修改前。main channel 的唯一 promotion evaluator 使用独立全局锁，测试必须证明它只选择唯一直接后继、不能跳过或重排已封印 source-owner→bridge→cleanup→target-baseline→target-baseline；发布图不再接受 source-owner 同阶段后继，也不再具有 P1 特殊目录或 `source_owner_compat` 输入。target-baseline 属于普通自动 promotion，只有 bridge 与 cleanup 必须经过签名部署回执门。回执测试还须覆盖闭世界 schema、Ed25519 公钥类型、Manager 摘要、过期时间及永久 challenge 防重放 ref。GitHub API 分页结果必须先聚合各页再做闭世界计数，不得把串联的多个 JSON 页误当单页。
+镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖同名中间 artifact。最终 `publish` job 必须使用完整 source commit 作为跨 run 全局锁，并在同一发布步骤中直接复验成功 Quality run、构建 source、workflow run/attempt、release ID、tag commit 和精确资产名称/SHA-256/size；不再生成第二套 promotion 或 provenance 文件。相同 generation 的重放只接受逐字节一致资产；错误 tag、未知/重名资产、无关 Quality run、镜像不可匿名拉取或 digest 漂移都必须在推进 latest 前失败。
 
-Bridge B 的同一原子候选必须同时切换 canonical transition stage、组装器和 target 工件；不能先推一个仍标为 source-owner 的“发布器准备”提交。测试必须从直接前任公开 release API/资产取 source Manager、Compose 与 manifest，把它们逐字段绑定到 `namespace_handoff.source`，并证明 target binding 与 B 顶层 Manager/Compose 完全相等。真实 target Compose 仅在 `AGENT_PLATFORM_*` 环境下执行 `config` 与核心 `up`，静态及运行时都拒绝 `UBITECH_*`、source data/secret/control 根、source project/network/label 和错误 UID/GID 前缀。Platform 必须分别用 source 与 target baseline/Workspace/Camoufox marker 启动，并对混合身份失败；Runtime、Camofox 与 Sandbox 也覆盖 target health、路径、token 与 ownership。
+main 通道测试必须覆盖至少三个线性后代：较旧 workflow 后完成不能降级 latest，连续 push 最终自动推进到最新通过 Quality 的 main head，分叉 candidate 在构建前或发布前拒绝。发布链没有阶段选择器、固定迁移前任、部署 challenge 或人工 promotion 分支。
 
-Bridge 发布证据由仓库内可重复执行的四层门禁共同组成，不再依赖仓库外维护的十六重启 harness、资格 JSON 或独立 qualification artifact：确定性的 phase/recovery 测试覆盖每个 durable phase、journal/state 边界、listener 转交、forward-only checkpoint 与完整 rollback；真实 user-systemd 集成测试对持久 helper 和 Manager 执行 `SIGKILL`，证明进程由正确 unit/cgroup 重启且同时只有一个所有者；Compose 发布冒烟使用同一份已验证镜像目录启动 target 实栈并验证身份、持久数据与能力；唯一部署机的短生命周期宿主 CLI 最后以 deployment-level Ed25519 密钥签署 challenge-bound `source_owner_ready` 或 `target_handoff_committed` 回执，证明实际 source-owner 空闲或目标交接已提交。任一层都不能单独代替其它层，签名回执、Bridge/Cleanup 直接后继顺序、不可逆提交边界与原子回滚门保持不变。Cleanup C 的 draft 还须在 B 公开前已通过 target schema-v2 parser、target-only Compose/镜像闭集与 source 常量/命令扫描；B 未提交时它保持不可选。
-
-source-tree gate 测试必须直接构造最小仓库树，证明 Bridge 无条件跳过，而 Cleanup/target-baseline 对每个精确生产/构建根生效，并分别拒绝 source profile 常量、旧环境变量/路径/资产名、`ENTERPRISE_`、`SOURCE_TECHNICAL_PROFILE`、`enterprise_session`、`.enterprise-platform.lock`、`release-transition`/namespace handoff 命令与 parser、helper/coordinator/transformer 路径以及生成 P1 inventory。测试还要证明只有 `_test`、`tests`、`testdata` 和 `scripts/tests/fixtures` 中的历史用户数据夹具可保留这些字面值；生产迁移文件不能获得整文件豁免，扫描根缺失、符号链接、未知文件类型和非 UTF-8 内容均失败关闭。进入产品树但没有标准文本扩展名的文件只能按精确 basename 登记为文本输入并接受同一标量扫描，不能把整个未知后缀加入宽泛 allowlist。Quality 和 Container release 必须都调用同一脚本，不能各自复制 grep 清单。
-
-普通 target-baseline 快速 push 回归必须覆盖至少三个线性后代：release workflow 全局串行，第二个候选在前一个密封 draft 尚未公开时不得生成同前任 draft；前一个公开后必须重新读取 latest 并继续封印，promotion evaluator 最终推进到最新已通过 Quality 的 main head。多候选唯一性检查仍失败关闭，不能靠选择任意一个或人工删除 draft 解锁；Bridge/Cleanup 的 B/C 双 draft 测试保持原语义。
+source-tree gate 对每个生产与构建根生效，拒绝非当前技术 profile、路径、环境变量、一次性部署转换和签名回执实现。测试和 fixture 可以保存必要的数据演进样本，但不能形成可执行兼容入口。Quality 和 Container release 必须调用同一 gate。
 
 release 时间测试必须把 `git show --format=%cI` 形式的带偏移时间交给真实 assembler，再把其 schema-2 输出交给 fresh installer 的 manifest 解析路径，证明资产中的 `generated_at` 已规范化为 UTC `Z` 并可安装。另需覆盖正负偏移的等价 UTC 转换，以及无时区、无效日期/偏移和非 RFC 3339 输入拒绝；不得把 installer 改为接受非 canonical 输出。
 
-发布测试必须分别覆盖三个 stage 路由：Bridge 组装 schema 1/十一镜像/helper 并从 public final source-owner 取直接前任，封印 source 可发现的 `ubitech-compose.yaml` 与 `ubitech-manager-linux-*`；Cleanup 在 B 仍为 sealed draft 时从认证的分页 release 列表按精确 `container-<B>` tag 唯一解析前任，不能使用对 draft 返回 404 的 tag-name REST endpoint；随后复验前任、组装 schema 2/十镜像且不构建 helper，只封印 `agent-platform-compose.yaml` 与 `agent-platform-manager-linux-*`，并证明此时绝不公开；target-baseline 从 public target-only latest 走普通单调 promotion并保持同一中性资产集合。Bridge 历史 manifest 只由 release orchestration 的隔离验证器消费；进入 Cleanup 产品容器的 `release-manifest.schema.json` 必须收缩为 schema/protocol 2 与精确十镜像，不能保留 schema 1、helper 或 handoff 分支。Cleanup/target-baseline 的 fresh install、普通 startup、Candidate watchdog 与 finalize recovery 都必须在没有 handoff journal 时选择编译期 target profile，且 source 配置、路径、资产 basename、环境或可执行文件名不能重新选择身份。
-
-确定性 Bridge phase/recovery 测试必须显式枚举 canonical durable phase，并分别覆盖崩溃前后 journal/state 写入顺序、幂等重放、forward commit 与 source rollback；测试中的 fake host 只用于精确交错和失败注入，不得伪造真实 systemd 或 Compose 结论。真实 user-systemd 门必须验证 helper `SIGKILL` 后取得不同 PID、仍处于同一宿主 boot epoch、由原持久 unit 恢复且旧 writer 不再存活；真实 Compose 门负责容器、网络、挂载、数据库、Runtime、Workspace、Camoufox 与 Sandbox 的发布身份。部署回执只证明部署机在 challenge 时刻的权威状态，不能由 CI 自签，也不能被测试自报布尔值替代。
-
-普通更新测试必须证明未物化 workspace、缺 marker/alias、旧 marker 和未知 residue 全部在副作用前失败关闭，且不存在按历史 generation、摘要或路径启用的修复能力。Bridge 数据变换测试则只消费 canonical source inventory，并逐项证明 source workspace 已符合 current marker/alias 规则后才允许 staging。
+发布测试只覆盖当前 manifest schema、十个受管镜像和中性 Compose/Manager 资产。fresh install、普通 startup、Candidate watchdog 与 finalize recovery 始终使用编译期唯一 profile；配置、路径、环境或可执行文件名不能选择另一身份。普通更新还要证明未物化 workspace、缺 marker/alias、未知 residue 都在副作用前失败，且不存在按历史 generation、摘要或路径启用的修复能力。
 
 fresh installer 隔离测试必须用可控账户查询 stub 返回当前 UID/GID 的权威 home，同时把 `HOME`、`XDG_BIN_HOME`、`XDG_CONFIG_HOME` 与 `XDG_DATA_HOME` 指向不同的恶意临时目录；stable Manager、配置、user unit 和数据根只能出现在账户 home 派生路径，四个 ambient 根必须保持未创建。`XDG_RUNTIME_DIR` 另行指向 owner-only 临时目录并验证 socket 写入该目录，并至少以非私有 runtime 根证明安装副作用前失败；实现还必须拒绝非绝对、符号链接或错误 owner 的 runtime 根。
 

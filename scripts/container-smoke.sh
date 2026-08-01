@@ -56,31 +56,10 @@ for ambient_install_root in HOME XDG_BIN_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
     fail "fresh installer derives a persistent path from ambient $ambient_install_root"
   fi
 done
-for retired_installer_identity in \
-  'ubitech-manager-linux-' \
-  '/ubitech-manager' \
-  'ubitech-agent-manager.service' \
-  '/ubitech-agent/manager.toml' \
-  '/ubitech-agent/manager/control'; do
-  if grep -Fq "$retired_installer_identity" install.sh; then
-    fail "target-only fresh installer retains source identity: $retired_installer_identity"
-  fi
-done
-for retired_copy in \
-  'Install ubitech agent' \
-  'Description=ubitech agent manager' \
-  'ubitech agent installed'; do
-  if grep -Fiq "$retired_copy" install.sh; then
-    fail "fresh container installer retains fixed product branding: $retired_copy"
-  fi
-done
 grep -Fq 'bash -s -- --yes' README.md \
   || fail "README fresh-install command does not pass explicit non-interactive consent"
 grep -Fq -- '--title "Agent Platform ${SOURCE_COMMIT:0:12}"' .github/workflows/container-release.yml \
   || fail "container release title is not deployment-neutral"
-if grep -Fiq -- '--title "ubitech agent' .github/workflows/container-release.yml; then
-  fail "container release title retains fixed product branding"
-fi
 for excluded in \
   'enterprise-agent-platform/build/' \
   'enterprise-agent-platform/dist/' \
@@ -198,7 +177,6 @@ chmod 0755 "$installer_test/fake-manager"
 python3 - "$installer_test/fake-manager" "$installer_test/release.json" <<'PY'
 import argparse
 import hashlib
-import copy
 import json
 import pathlib
 import sys
@@ -212,22 +190,19 @@ sha = hashlib.sha256(manager.read_bytes()).hexdigest()
 commit = "a" * 40
 image_sha = "b" * 64
 manifest_path = pathlib.Path(sys.argv[2])
-contract = json.loads(
-    (repository / "docs/contracts/release-transition.json").read_text(encoding="utf-8")
-)
-contract["stage"] = "target_baseline"
-contract_path = manifest_path.parent / "target-contract.json"
-contract_path.write_text(json.dumps(contract), encoding="utf-8")
+managed_images = {
+    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+    "firecrawl-redis", "firecrawl-rabbitmq",
+}
 images = {
     name: f"registry.example/{name}@sha256:{image_sha}"
-    for name in assembler.MANAGED_V2
+    for name in managed_images
 }
-images_path = manifest_path.parent / "target-images.json"
+images_path = manifest_path.parent / "images.json"
 images_path.write_text(json.dumps(images), encoding="utf-8")
 manifest = assembler.assemble(
     argparse.Namespace(
-        contract=contract_path,
-        predecessor_manifest=None,
         images=images_path,
         generation=commit,
         # Match the real `git show --format=%cI` producer instead of hand-writing Z.
@@ -246,42 +221,34 @@ if manifest["generated_at"] != "2026-08-01T00:00:00Z":
     raise SystemExit("real assembler did not normalize generated_at to UTC Z")
 manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 
-bridge = copy.deepcopy(manifest)
-bridge["schema_version"] = 1
-bridge["protocol_version"] = 1
-bridge["namespace_handoff"] = {}
-(manifest_path.parent / "bridge-release.json").write_text(
-    json.dumps(bridge) + "\n", encoding="utf-8"
-)
-
-schema1 = copy.deepcopy(manifest)
+schema1 = json.loads(json.dumps(manifest))
 schema1["schema_version"] = 1
 schema1["protocol_version"] = 1
 (manifest_path.parent / "schema1-release.json").write_text(
     json.dumps(schema1) + "\n", encoding="utf-8"
 )
 
-extra = copy.deepcopy(manifest)
+extra = json.loads(json.dumps(manifest))
 extra["unexpected"] = True
 (manifest_path.parent / "extra-release.json").write_text(
     json.dumps(extra) + "\n", encoding="utf-8"
 )
 
-eleven = copy.deepcopy(manifest)
-eleven["images"]["handoff-fs-helper"] = (
-    f"registry.example/handoff-fs-helper@sha256:{image_sha}"
+extra_image = json.loads(json.dumps(manifest))
+extra_image["images"]["unexpected-component"] = (
+    f"registry.example/unexpected-component@sha256:{image_sha}"
 )
-(manifest_path.parent / "eleven-release.json").write_text(
-    json.dumps(eleven) + "\n", encoding="utf-8"
+(manifest_path.parent / "extra-image-release.json").write_text(
+    json.dumps(extra_image) + "\n", encoding="utf-8"
 )
 
-source_basename = copy.deepcopy(manifest)
+wrong_basename = json.loads(json.dumps(manifest))
 for arch in ("amd64", "arm64"):
-    source_basename["manager"]["artifacts"][arch]["url"] = (
-        f"https://example.invalid/ubitech-manager-linux-{arch}"
+    wrong_basename["manager"]["artifacts"][arch]["url"] = (
+        f"https://example.invalid/wrong-manager-linux-{arch}"
     )
-(manifest_path.parent / "source-basename-release.json").write_text(
-    json.dumps(source_basename) + "\n", encoding="utf-8"
+(manifest_path.parent / "wrong-basename-release.json").write_text(
+    json.dumps(wrong_basename) + "\n", encoding="utf-8"
 )
 PY
 cat > "$installer_stubs/curl" <<'EOF'
@@ -364,14 +331,11 @@ assert_manifest_rejected_before_paths() {
 }
 
 assert_manifest_rejected_before_paths \
-  bridge "$installer_test/bridge-release.json" \
-  'fresh install requires the closed target-only release manifest'
-assert_manifest_rejected_before_paths \
   schema1 "$installer_test/schema1-release.json" \
   'fresh installation requires manifest schema/protocol 2'
 assert_manifest_rejected_before_paths extra "$installer_test/extra-release.json"
-assert_manifest_rejected_before_paths eleven "$installer_test/eleven-release.json"
-assert_manifest_rejected_before_paths source-basename "$installer_test/source-basename-release.json"
+assert_manifest_rejected_before_paths extra-image "$installer_test/extra-image-release.json"
+assert_manifest_rejected_before_paths wrong-basename "$installer_test/wrong-basename-release.json"
 
 unsafe_runtime="$installer_test/unsafe-runtime"
 unsafe_runtime_home="$installer_test/unsafe-runtime-account-home"
@@ -432,8 +396,6 @@ cat install.sh | env \
 grep -Fq "$installer_test/happy-runtime/agent-platform-manager/manager.sock" \
   "$happy_home/.config/agent-platform/manager.toml" \
   || fail "schema-2 fresh install did not bind the target runtime socket"
-[[ ! -e "$happy_home/.local/bin/ubitech-manager" ]] \
-  || fail "schema-2 fresh install created a source Manager path"
 for ignored_root in \
   "$installer_test/happy-ambient-home" \
   "$installer_test/happy-data" \
@@ -604,458 +566,175 @@ for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do
   grep -Fq "$secret" containers/compose.yaml \
     || fail "Compose is missing Firecrawl secret $secret"
 done
-grep -Fq 'python3 scripts/browser-control-compose-smoke.py' .github/workflows/container-release.yml \
-  || fail "release smoke test does not exercise browser control through Platform"
-grep -Fq 'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' .github/workflows/container-release.yml \
-  || fail "release smoke test does not verify the durable core network"
-grep -Fq 'cp install.sh "$stage/install.sh"' .github/workflows/container-release.yml \
-  || fail "release assembly does not include install.sh"
-grep -Fq 'sha256sum install.sh > install.sh.sha256' .github/workflows/container-release.yml \
-  || fail "release assembly does not checksum install.sh"
-grep -Eq '^[[:space:]]+install\.sh$' .github/workflows/container-release.yml \
-  || fail "release publication does not include install.sh"
-grep -Eq '^[[:space:]]+install\.sh\.sha256$' .github/workflows/container-release.yml \
-  || fail "release publication does not include the install.sh checksum"
-grep -Fq 'gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/$asset"' .github/workflows/container-release.yml \
-  || fail "release publication does not upload each immutable asset"
-grep -Fq 'scripts/release_promotion.py create-promotion' .github/workflows/container-release.yml \
-  || fail "container release does not create the immutable promotion contract"
-grep -Fq 'scripts/release_promotion.py create-publisher-provenance' .github/workflows/container-release.yml \
-  || fail "container release does not publish an exact Actions provenance record"
-grep -Fq 'Upload immutable release provenance' .github/workflows/container-release.yml \
-  || fail "container release does not retain its publisher provenance as an Actions artifact"
-grep -Fq 'Verify real Manager restart and watchdog cgroups' .github/workflows/container-release.yml \
-  || fail "release publication does not run the real user-systemd Manager gate"
-grep -Fq 'Verify Bridge persistent helper cgroup' .github/workflows/container-release.yml \
-  || fail "Bridge publication does not run the persistent helper user-systemd gate"
-grep -Fq 'AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"' .github/workflows/container-release.yml \
-  || fail "release publication does not explicitly enable real user-systemd integration"
-grep -Fq 'scripts/release_promotion.py verify-receipt' .github/workflows/channel-promotion.yml \
-  || fail "transition promotion does not verify the deployment-signed receipt"
-grep -Fq 'RELEASE_TRANSITION_ED25519_PUBLIC_KEY_PEM' .github/workflows/channel-promotion.yml \
-  || fail "transition promotion does not bind the deployment Ed25519 public key"
-grep -Fq 'elif [[ "$TRANSITION_STAGE" == cleanup ]]; then' .github/workflows/container-release.yml \
-  || fail "Cleanup publication has no explicit predecessor branch"
-grep -Fq '.draft == true and .prerelease == false' .github/workflows/container-release.yml \
-  || fail "Cleanup publication does not require the exact sealed Bridge draft"
-grep -Fq -- '--candidate-stage "$CANDIDATE_STAGE"' .github/workflows/container-release.yml \
-  || fail "publisher provenance does not bind the transition stage"
-for target_asset in \
-  agent-platform-manager-linux-amd64 \
-  agent-platform-manager-linux-arm64 \
-  agent-platform-compose.yaml; do
-  grep -Fq "$target_asset" .github/workflows/container-release.yml \
-    || fail "target-only release asset is absent: $target_asset"
-done
-grep -Fq '"$STAGE/promotion.json"' .github/workflows/container-release.yml \
-  || fail "container release does not upload promotion.json last"
-if grep -Eq -- '--draft=false|--latest|--clobber' .github/workflows/container-release.yml; then
-  fail "container build workflow can mutate visibility or replace immutable assets"
-fi
-grep -Fq "group: container-release-\${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}" .github/workflows/container-release.yml \
-  || fail "container releases are not isolated per source commit"
-grep -Fq 'group: container-publish-main' .github/workflows/container-release.yml \
-  || fail "release sealing is not serialized across target generations"
-grep -Fq 'scripts/release_promotion.py ensure-publication-slot' .github/workflows/container-release.yml \
-  || fail "release sealing does not reject a second same-stage direct-successor draft"
-grep -Fq 'promotion_args+=(--predecessor-generation "$predecessor")' .github/workflows/container-release.yml \
-  || fail "ordinary target promotion does not bind the live public predecessor"
-grep -Fq 'Queue the canonical missing Cleanup release' .github/workflows/channel-promotion.yml \
-  || fail "Bridge evaluation cannot recover an earlier Cleanup publication race"
-grep -Fq 'Queue the latest qualified target-only main generation' .github/workflows/channel-promotion.yml \
-  || fail "ordinary promotion cannot catch the release channel up to main"
-grep -Fq 'scripts/verify_target_baseline_source.py' .github/workflows/quality.yml \
-  || fail "Quality does not enforce the target-only production source boundary"
-grep -Fq 'scripts/verify_target_baseline_source.py' .github/workflows/container-release.yml \
-  || fail "Container release does not recheck the target-only production source boundary"
-grep -Fq 'group: container-channel-main' .github/workflows/channel-promotion.yml \
-  || fail "main-channel release promotion is not serialized"
-grep -Fq 'scripts/release_promotion.py select-candidate' .github/workflows/channel-promotion.yml \
-  || fail "main-channel release promotion does not enforce a direct predecessor"
-grep -Fq 'scripts/release_promotion.py validate-publisher-provenance' .github/workflows/channel-promotion.yml \
-  || fail "main-channel release promotion does not verify exact publisher provenance"
-grep -Fq 'Current release is not a complete sealed generation' .github/workflows/channel-promotion.yml \
-  || fail "channel promotion does not require a sealed current release"
-if grep -Eq 'current-compat-root|source_owner_compat|canonical P1' .github/workflows/channel-promotion.yml; then
-  fail "channel promotion still contains the retired pre-seal compatibility path"
-fi
-[[ "$(grep -Fc 'scripts/verify-release-images-anonymous.sh' .github/workflows/channel-promotion.yml)" -eq 4 ]] \
-  || fail "main-channel promotion must verify all public image digests before and after both visibility paths"
-[[ "$(grep -Fc 'CRITICAL post-visibility registry failure' .github/workflows/channel-promotion.yml)" -eq 2 ]] \
-  || fail "post-visibility registry failures are not classified as release incidents"
-[[ "$(grep -Fc 'scripts/ensure-release-candidate-tag.sh' .github/workflows/channel-promotion.yml)" -eq 2 ]] \
-  || fail "both visibility paths do not establish the exact candidate tag first"
+release_workflow=.github/workflows/container-release.yml
 [[ -x scripts/verify-release-images-anonymous.sh ]] \
   || fail "anonymous release-image verifier is missing or not executable"
 [[ -x scripts/ensure-release-candidate-tag.sh ]] \
-  || fail "create-only release candidate tag verifier is missing or not executable"
-grep -Fq 'release-transition-consumed-${challenge_id}' .github/workflows/channel-promotion.yml \
-  || fail "main-channel release promotion has no durable replay ledger"
-grep -Fq 'public-images:' .github/workflows/container-release.yml \
-  || fail "container release has no public-image publication gate"
-grep -Fq 'GitHub exposes no supported package-visibility mutation API' .github/workflows/container-release.yml \
-  || fail "private GHCR packages do not produce an actionable fail-closed error"
-grep -Fq 'unset DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE' .github/workflows/container-release.yml \
-  || fail "anonymous image verification can inherit registry credentials"
-grep -Fq 'export DOCKER_CONFIG="$anonymous_config"' .github/workflows/container-release.yml \
-  || fail "anonymous image verification does not use an isolated Docker config"
-grep -Fq 'env -u GH_TOKEN -u GITHUB_TOKEN curl -q' .github/workflows/container-release.yml \
-  || fail "public package metadata verification can inherit GitHub credentials"
-grep -Fq 'https://ghcr.io/v2/${owner}/${package}/manifests/${digest}' .github/workflows/container-release.yml \
-  || fail "release does not verify final digest metadata through the anonymous GHCR registry contract"
-grep -Fq '.managed_image_capacity_estimates[$component].compressed_bytes' .github/workflows/container-release.yml \
-  || fail "release does not enforce the canonical compressed managed-image capacity limit"
-grep -Fq '.managed_image_capacity_estimates[$component].unpacked_bytes' .github/workflows/container-release.yml \
-  || fail "release does not enforce the canonical unpacked managed-image capacity limit"
-grep -Fq 'docker pull --platform "linux/${architecture}" "$image"' .github/workflows/container-release.yml \
-  || fail "release does not verify every supported managed-image architecture"
-grep -Fq 'image_repository="${image%@*}"' .github/workflows/container-release.yml \
-  || fail "release managed-image verification does not isolate its repository variable"
-if grep -Eq '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
-  fail "release managed-image verification overwrites the package repository variable"
+  || fail "release candidate tag verifier is missing or not executable"
+[[ ! -e .github/workflows/channel-promotion.yml ]] \
+  || fail "a second release-promotion workflow remains"
+[[ ! -e scripts/release_promotion.py ]] \
+  || fail "a second release-promotion implementation remains"
+
+for expected in \
+  'python3 scripts/verify_current_source.py --root .' \
+  'python3 scripts/browser-control-compose-smoke.py' \
+  'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
+  'group: container-channel-main' \
+  'scripts/assemble_release_manifest.py' \
+  'scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"' \
+  'gh release upload "$release_tag" --repo "$GITHUB_REPOSITORY" "$stage/$asset"' \
+  'gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest' \
+  'gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$root"' \
+  'scripts/verify-release-images-anonymous.sh "$stage/release.json"'; do
+  grep -Fq "$expected" "$release_workflow" \
+    || fail "current release workflow is missing: $expected"
+done
+for asset in \
+  agent-platform-manager-linux-amd64 \
+  agent-platform-manager-linux-arm64 \
+  agent-platform-compose.yaml \
+  install.sh \
+  release.json; do
+  grep -Fq "$asset" "$release_workflow" \
+    || fail "release asset is absent: $asset"
+done
+[[ "$(grep -Fc 'scripts/verify-release-images-anonymous.sh "$stage/release.json"' "$release_workflow")" -eq 2 ]] \
+  || fail "release images must be anonymously verified before and after publication"
+if grep -Eq -- '--clobber' "$release_workflow"; then
+  fail "immutable release assets can be overwritten"
 fi
-grep -Fq 'mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE"' .github/workflows/container-release.yml \
-  || fail "release image verification is not driven by the stage-filtered canonical managed-image directory"
-[[ "$(grep -Fc 'expected_count=10' .github/workflows/container-release.yml)" -ge 2 ]] \
-  || fail "release does not bind the target-only managed-image count"
-[[ "$(grep -Fc '[[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11' .github/workflows/container-release.yml)" -ge 2 ]] \
-  || fail "release does not bind the Bridge managed-image count"
-if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then
-  fail "container release still publishes a retired FoundationDB image key"
-fi
-if grep -Fq 'foundationdb/foundationdb@sha256:' .github/workflows/container-release.yml; then
-  fail "container release still publishes or validates a FoundationDB image"
-fi
-if grep -En 'gh api[^\n]*(--method|-X)[[:space:]]+PATCH|gh api[[:space:]]+--method[[:space:]]+PATCH' .github/workflows/container-release.yml; then
-  fail "release relies on an unsupported GitHub package visibility mutation"
-fi
+
 python3 - <<'PY'
 import re
 from pathlib import Path
 
 workflow = Path(".github/workflows/container-release.yml").read_text(encoding="utf-8")
-quality_workflow = Path(".github/workflows/quality.yml").read_text(encoding="utf-8")
+quality = Path(".github/workflows/quality.yml").read_text(encoding="utf-8")
 
-def workflow_job(source: str, name: str, label: str) -> str:
+def job(source: str, name: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
         source,
     )
     if match is None:
-        raise SystemExit(f"{label} job is missing: {name}")
+        raise SystemExit(f"workflow job is missing: {name}")
     return match.group(0)
 
-def job(name: str) -> str:
-    return workflow_job(workflow, name, "container release")
+required_jobs = {
+    "prepare", "upstream-contracts", "images", "public-images",
+    "manager-binaries", "manager-systemd-integration", "compose-smoke", "publish",
+}
+jobs_source = workflow.split("\njobs:\n", 1)[1]
+actual_jobs = set(re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):\n", jobs_source))
+if actual_jobs != required_jobs:
+    raise SystemExit(f"unexpected release jobs: {sorted(actual_jobs ^ required_jobs)}")
 
-quality_manager = workflow_job(quality_workflow, "manager", "Quality")
-manager_binaries = job("manager-binaries")
-manager_systemd = job("manager-systemd-integration")
-publish_job = job("publish")
+for path, source in (
+    (".github/workflows/quality.yml", quality),
+    (".github/workflows/container-release.yml", workflow),
+):
+    for action in re.findall(r"(?m)^\s+uses:\s+([^#\s]+)", source):
+        if action.startswith("./"):
+            continue
+        if re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action) is None:
+            raise SystemExit(f"{path} action is not pinned by commit: {action}")
 
-if (
-    quality_manager.count("run: go test -count=1 ./...") != 1
-    or quality_workflow.count("go test -count=1 ./...") != 1
+prepare = job(workflow, "prepare")
+for fragment in (
+    'git merge-base --is-ancestor "$source_commit" origin/main',
+    'git merge-base --is-ancestor "$current_generation" "$source_commit"',
+    '.path == ".github/workflows/quality.yml"',
+    '.conclusion == "success"',
+    '.head_sha == $source',
+    '.head_repository.full_name == $repo',
+    "python3 scripts/verify_current_source.py --root .",
 ):
-    raise SystemExit("Quality must execute the Manager full suite exactly once without result reuse")
-if (
-    "go test" in manager_binaries
-    or "go test ./..." in workflow
-    or "go test -count=1 ./..." in workflow
-):
-    raise SystemExit("Manager architecture builders must not repeat the full test suite")
-for label, block in (
-    ("Quality Manager", quality_manager),
-    ("Manager architecture builders", manager_binaries),
-    ("Manager user-systemd gate", manager_systemd),
-):
-    for fragment in ("cache: true", "cache-dependency-path: manager/go.sum"):
-        if fragment not in block:
-            raise SystemExit(f"{label} does not use the exact Manager Go cache: {fragment}")
-arch_block = re.search(r"(?ms)^        arch:\n((?:          - [^\n]+\n)+)", manager_binaries)
-architectures = [] if arch_block is None else re.findall(
-    r"(?m)^          - ([^\n]+)$", arch_block.group(1)
-)
-if architectures != ["amd64", "arm64"]:
-    raise SystemExit("Manager artifact matrix must contain exactly amd64 and arm64")
+    if fragment not in prepare:
+        raise SystemExit(f"release preparation gate is missing: {fragment}")
+
+quality_manager = job(quality, "manager")
+manager_binaries = job(workflow, "manager-binaries")
+manager_systemd = job(workflow, "manager-systemd-integration")
+if quality.count("go test -count=1 ./...") != 1:
+    raise SystemExit("Quality must run the Manager full suite exactly once")
+if "go test" in manager_binaries:
+    raise SystemExit("Manager artifact builders repeat the full test suite")
 for fragment in (
     "GOARCH: ${{ matrix.arch }}",
     "CGO_ENABLED=0 GOOS=linux go -C manager build",
-    'output="dist/agent-platform-manager-linux-${GOARCH}"',
-    'sha256sum "$(basename "$output")"',
+    "agent-platform-manager-linux-${GOARCH}",
     "name: manager-${{ matrix.arch }}",
-    "            dist/agent-platform-manager-linux-${{ matrix.arch }}\n",
-    "dist/agent-platform-manager-linux-${{ matrix.arch }}.sha256",
-    "if-no-files-found: error",
+    "cache-dependency-path: manager/go.sum",
 ):
     if fragment not in manager_binaries:
-        raise SystemExit(f"Manager architecture artifact validation is missing: {fragment}")
+        raise SystemExit(f"Manager artifact build is incomplete: {fragment}")
 for fragment in (
     'AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"',
     "go test -count=1 -v",
     "RecoverySystemdQuiescenceIntegration",
     "OrdinarySystemdActivationRestartIntegration",
-    "PersistentHelperUserSystemdIntegration",
 ):
     if fragment not in manager_systemd:
-        raise SystemExit(f"real user-systemd Manager gate is missing: {fragment}")
-for dependency in ("manager-binaries", "manager-systemd-integration"):
-    if f"      - {dependency}\n" not in publish_job:
-        raise SystemExit(f"release publication no longer requires {dependency}")
+        raise SystemExit(f"real Manager systemd gate is incomplete: {fragment}")
 
-prepare = job("prepare")
-target_gate_start = prepare.index('if [[ "$transition_stage" == target_baseline ]]; then')
-target_gate_end = prepare.index("          manager_command=./cmd/agent-platform-manager")
-target_gate = prepare[target_gate_start:target_gate_end]
-if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in prepare:
-    raise SystemExit("pre-image target-baseline predecessor lookup is unauthenticated")
-for fragment in (
-    ".predecessor_generation",
-    'current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"',
-    '^container-([0-9a-f]{40})$',
-    'current_generation="${BASH_REMATCH[1]}"',
-    'git merge-base --is-ancestor "$transition_predecessor" "$current_generation"',
-    'git merge-base --is-ancestor "$current_generation" "$source_commit"',
-):
-    if fragment not in target_gate:
-        raise SystemExit(f"pre-image target-baseline predecessor gate is missing: {fragment}")
-if target_gate_start >= prepare.index("          image_matrix="):
-    raise SystemExit("target-baseline predecessor gate runs after image-matrix publication")
-if "      - prepare\n" not in job("images"):
-    raise SystemExit("container images can build before release-predecessor validation")
-if '[[ "$current_tag" == "container-${transition_predecessor}" ]]' in target_gate:
-    raise SystemExit("target-baseline pre-image gate permanently pins Cleanup as latest")
-
-public_images = job("public-images")
-for fragment in (
-    'if [[ "$transition_stage" == bridge ]]; then',
-    'component:"handoff-fs-helper",dockerfile:"containers/handoff-fs-helper.Dockerfile",image:"platform",tag_suffix:"-handoff-fs-helper"',
-    'if [[ "$TRANSITION_STAGE" == bridge ]]; then',
-):
-    if fragment not in workflow:
-        raise SystemExit(f"stage-aware handoff helper publication is missing: {fragment}")
-if workflow.count("package_component=platform") != 2:
-    raise SystemExit("handoff helper package mapping is not enforced in both public-image gates")
-if "${{ needs.prepare.outputs.source_commit }}${{ matrix.tag_suffix }}" not in workflow:
-    raise SystemExit("container image publication does not preserve the helper's distinct tag")
-if "packages: read" not in public_images:
-    raise SystemExit("public-image gate lacks package metadata read permission")
-if "    timeout-minutes: 120\n" not in public_images:
-    raise SystemExit("public-image gate lacks the all-image multi-architecture validation budget")
-if "docker/login-action" in public_images:
-    raise SystemExit("public-image gate must never establish a registry login")
-for dependent in ("compose-smoke", "publish"):
-    if "      - public-images\n" not in job(dependent):
-        raise SystemExit(f"{dependent} can run before the public-image gate")
-managed_components = (
+public_images = job(workflow, "public-images")
+if "packages: read" not in public_images or "docker/login-action" in public_images:
+    raise SystemExit("public-image verification is not anonymous")
+managed = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
-)
-for component in managed_components:
-    if component not in public_images:
-        raise SystemExit(f"public-image gate omits {component}")
-    if f"[{component}]=" not in public_images:
-        raise SystemExit(f"public-image capacity catalog omits {component}")
+    "firecrawl-redis", "firecrawl-rabbitmq",
+}
+for component in managed:
+    if component not in public_images or f"[{component}]=" not in public_images:
+        raise SystemExit(f"public-image capacity gate omits {component}")
 for fragment in (
-    'mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE"',
-    'select($stage == "bridge" or . != "handoff-fs-helper")',
-    'expected_count=10',
-    '[[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11',
-    '[[ "${#components[@]}" -eq "$expected_count" && "${#images[@]}" -eq "${#components[@]}" ]]',
-    'for component in "${components[@]}"; do',
-    'for architecture in amd64 arm64; do',
-    'docker buildx imagetools inspect "$image" --raw',
-    'docker buildx imagetools inspect "${image_repository}@${platform_digest}" --raw',
+    "for architecture in amd64 arm64; do",
     'docker pull --platform "linux/${architecture}" "$image"',
-    "[.config.size, (.layers[]?.size)] | add",
-    'remove_exact_local_image() {',
-    'docker image rm --force "$local_id"',
-    "docker info --format '{{.ServerVersion}}'",
-    '.[0].Os == "linux"',
-    '.[0].Architecture == $architecture',
-    'remove_exact_local_image "$image" "$pulled_id"',
-    'verified_images="$GITHUB_WORKSPACE/verified-managed-images.json"',
-    '([.managed_image_capacity_estimates | keys[] |',
-    'select($stage == "bridge" or . != "handoff-fs-helper")]) ==',
-    '($verified[0] | keys)',
+    ".managed_image_capacity_estimates[$component].compressed_bytes",
+    ".managed_image_capacity_estimates[$component].unpacked_bytes",
     "name: verified-managed-images",
 ):
     if fragment not in public_images:
-        raise SystemExit(f"public-image capacity gate lacks required coverage: {fragment}")
-if 'if [[ "$component" == platform || "$component" == agent-runtime ]]' in public_images:
-    raise SystemExit("managed-image capacity verification is still limited to core images")
-if public_images.count('for architecture in amd64 arm64; do') != 1:
-    raise SystemExit("managed-image capacity gate must have one shared architecture loop")
-if public_images.count(".managed_image_capacity_estimates[$component].compressed_bytes") != 1 or public_images.count(
-    ".managed_image_capacity_estimates[$component].unpacked_bytes"
-) != 1:
-    raise SystemExit("managed-image capacity limits must be read once in the shared all-image loop")
-if 'docker image rm --force "$image" >/dev/null 2>&1 || true' in public_images:
-    raise SystemExit("managed-image cleanup still masks exact-reference removal failures")
-if "set -x" in public_images or 'echo "$anonymous_token"' in public_images:
-    raise SystemExit("public-image gate can expose anonymous registry credentials")
+        raise SystemExit(f"public-image gate is incomplete: {fragment}")
 
-upstream_contracts = job("upstream-contracts")
-if 'grep -Fxq "$service" "$root/actual-services"' not in upstream_contracts:
-    raise SystemExit("upstream contract does not verify every managed Firecrawl service")
-if 'diff -u "$root/expected-services" "$root/actual-services"' in upstream_contracts:
-    raise SystemExit("upstream contract still requires unrelated upstream Compose services")
+compose = job(workflow, "compose-smoke")
+for fragment in (
+    "timeout-minutes: 45",
+    "--wait --wait-timeout 600 firecrawl-api",
+    "firecrawl_scrape cold",
+    "firecrawl_scrape warm",
+    "agent_platform_ci_persistence",
+    "python3 scripts/browser-control-compose-smoke.py",
+    'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"',
+):
+    if fragment not in compose:
+        raise SystemExit(f"Compose acceptance gate is incomplete: {fragment}")
 
-compose_smoke = job("compose-smoke")
-if "    timeout-minutes: 45\n" not in compose_smoke:
-    raise SystemExit("compose-smoke must reserve the 45-minute cold/warm Firecrawl budget")
+publish = job(workflow, "publish")
+for dependency in required_jobs - {"publish"}:
+    if f"      - {dependency}\n" not in publish:
+        raise SystemExit(f"publish does not require {dependency}")
 for fragment in (
-    'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/agent-platform-compose-smoke.XXXXXX")"',
-    '"$RUNNER_TEMP"/agent-platform-compose-smoke.*) ;;',
-    'sudo -n rm -rf --one-file-system -- "$root"',
-    'http://127.0.0.1:3002/v0/health/liveness',
-    "url: 'https://example.com/'",
-    "fetch('http://127.0.0.1:3002/v1/scrape'",
-    'signal: AbortSignal.timeout(120000)',
-    'firecrawl_scrape() {',
-    'for attempt in 1 2 3; do',
-    'Firecrawl ${phase} scrape failed after 3 attempts',
-    'firecrawl_scrape cold',
-    'firecrawl_scrape warm',
-    'sentinel_key=agent_platform_ci_persistence',
-    'CREATE TABLE IF NOT EXISTS agent_platform_release_smoke',
-    'INSERT INTO agent_platform_release_smoke',
-    'SELECT value FROM agent_platform_release_smoke',
-    'first_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
-    'second_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
-    'test "$second_postgres" != "$first_postgres"',
-    'test "$read_output" = "$sentinel_value"',
-    'rm --stop --force',
-    '--wait --wait-timeout 600 firecrawl-api',
-    'name: verified-managed-images',
-    'verified_images=artifacts/verified-managed-images.json',
-    'AGENT_PLATFORM_PLATFORM_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_AGENT_RUNTIME_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_CAMOFOX_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_AGENT_SANDBOX_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_SEARXNG_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_FIRECRAWL_API_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_FIRECRAWL_PLAYWRIGHT_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE="$(jq -er',
-    'AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er',
-    'sandbox_image="$AGENT_PLATFORM_AGENT_SANDBOX_IMAGE"',
-    'docker compose -f containers/compose.yaml config --format json',
-    '} == ($expected[0] | del(."agent-sandbox", ."handoff-fs-helper"))',
-    'handoff_helper_image="$(jq -er',
-    'docker pull "$handoff_helper_image"',
-    '"$handoff_helper_image" --request /control/request.json --receipt /control/receipt.json',
-    'sudo -n chown -R 42424:42424 "$handoff_helper_root/source/data"',
-    '--env "HANDOFF_FS_IMAGE_DIGEST=$handoff_helper_image"',
-    'src=$handoff_helper_root/source/data,dst=/source,readonly',
-    'target/copied/payload.txt',
-    '"$AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE" -c',
-    '"$AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE" -c',
-    '"$AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE" -c',
-    'browser_fixture_container="${AGENT_PLATFORM_COMPOSE_PROJECT}-browser-fixture"',
-    'scripts/fixtures/browser-control.html',
-    '--entrypoint python',
-    'python3 scripts/browser-control-compose-smoke.py',
-    '--bootstrap-password-file "$AGENT_PLATFORM_DATA_ROOT/data/bootstrap-admin-password.txt"',
-    '--agent-tool-token-file "$AGENT_PLATFORM_SECRETS_DIR/agent-tool-token"',
-    '--fixture-url "http://${browser_fixture_container}:18081/"',
-):
-    if fragment not in compose_smoke:
-        raise SystemExit(f"compose-smoke lacks PostgreSQL Firecrawl acceptance coverage: {fragment}")
-for variable in (
-    "AGENT_PLATFORM_PLATFORM_IMAGE", "AGENT_PLATFORM_AGENT_RUNTIME_IMAGE", "AGENT_PLATFORM_CAMOFOX_IMAGE",
-    "AGENT_PLATFORM_AGENT_SANDBOX_IMAGE", "AGENT_PLATFORM_SEARXNG_IMAGE", "AGENT_PLATFORM_FIRECRAWL_API_IMAGE",
-    "AGENT_PLATFORM_FIRECRAWL_PLAYWRIGHT_IMAGE", "AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE",
-    "AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE", "AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE",
-):
-    if compose_smoke.count(variable) < 2:
-        raise SystemExit(f"compose-smoke does not export verified image identity: {variable}")
-if compose_smoke.count('--wait --wait-timeout 600 firecrawl-api') < 2:
-    raise SystemExit("compose-smoke must use the production Firecrawl wait budget for cold and warm starts")
-if compose_smoke.count("fetch('http://127.0.0.1:3002/v1/scrape'") != 1 or compose_smoke.count(
-    'signal: AbortSignal.timeout(120000)'
-) != 1:
-    raise SystemExit("compose-smoke must centralize the bounded real scrape in its retry helper")
-if "foundationdb/foundationdb@sha256:" in compose_smoke:
-    raise SystemExit("compose-smoke still pulls or runs the retired FoundationDB image")
-
-browser_smoke = Path("scripts/browser-control-compose-smoke.py").read_text(encoding="utf-8")
-for fragment in (
-    '"/api/auth/login"',
-    '"/api/private-agent/status"',
-    '"/internal/agent/tools/browser"',
-    '"/api/agent-previews/browser/control"',
-    'send(1, "click", x=96, y=64)',
-    'send(2, "text", text=CONTROL_TEXT)',
-    'send(3, "key", key="Enter")',
-    'send(4, "wheel", delta_x=0, delta_y=900)',
-    'client.frame(actor_id, tab_id)',
-    'exc.status == 409',
-    '"command": "release"',
-    'client.gateway("refresh", {"tab_id": tab_id})',
-):
-    if fragment not in browser_smoke:
-        raise SystemExit(f"browser control compose smoke lacks required coverage: {fragment}")
-
-publish = job("publish")
-if "pattern: '*'" in publish or 'pattern: "*"' in publish:
-    raise SystemExit("publish must not download every workflow artifact")
-if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in publish:
-    raise SystemExit("Cleanup predecessor pagination is unauthenticated")
-target_publish_start = publish.index('if [[ "$TRANSITION_STAGE" == target_baseline ]]; then')
-target_publish_end = publish.index('          predecessor_root="$RUNNER_TEMP/predecessor-release"')
-target_publish = publish[target_publish_start:target_publish_end]
-for fragment in ('^container-([0-9a-f]{40})$', 'predecessor="${BASH_REMATCH[1]}"'):
-    if fragment not in target_publish:
-        raise SystemExit(f"target-baseline does not bind the current public predecessor: {fragment}")
-if '[[ "$current_tag" == "container-${predecessor}" ]]' in target_publish:
-    raise SystemExit("target-baseline publish permanently pins Cleanup as predecessor")
-lookup_start = publish.index('          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"')
-lookup_end = publish.index("          assembler_args=(")
-predecessor_lookup = publish[lookup_start:lookup_end]
-cleanup_branch = 'if [[ "$TRANSITION_STAGE" == cleanup ]]; then'
-paginated_releases = '"/repos/${GITHUB_REPOSITORY}/releases?per_page=100"'
-tagged_release = '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
-for fragment in (
-    cleanup_branch,
-    "gh api --paginate -H 'Accept: application/vnd.github+json'",
-    paginated_releases,
-    'jq -se --arg tag "container-${predecessor}"',
-    "if length == 1 then .[0]",
-    "Cleanup predecessor draft release identity is not unique",
-):
-    if fragment not in predecessor_lookup:
-        raise SystemExit(f"Cleanup predecessor pagination gate is missing: {fragment}")
-if predecessor_lookup.count(tagged_release) != 1:
-    raise SystemExit("Cleanup predecessor tag endpoint is not confined to one fallback branch")
-cleanup_else = predecessor_lookup.index("          else\n")
-if not (
-    predecessor_lookup.index(cleanup_branch)
-    < predecessor_lookup.index(paginated_releases)
-    < cleanup_else
-    < predecessor_lookup.index(tagged_release)
-):
-    raise SystemExit("Cleanup predecessor is not uniquely resolved before the tag-endpoint fallback")
-for fragment in ("name: verified-managed-images", "pattern: manager-*"):
-    if fragment not in publish:
-        raise SystemExit(f"publish omits scoped release artifact family: {fragment}")
-for fragment in (
-    "group: container-publish-main",
+    "group: container-channel-main",
     "cancel-in-progress: false",
-    'gh release download "container-${predecessor}"',
-    'for asset in release.json ubitech-compose.yaml ubitech-manager-linux-amd64',
-    'assembler_args=(',
-    'scripts/assemble_release_manifest.py',
-    'python3 "${assembler_args[@]}"',
-    '--contract docs/contracts/release-transition.json',
-    '--predecessor-manifest "$predecessor_root/release.json"',
-    '--images "$stage/verified-managed-images.json"',
+    "pattern: manager-*",
+    "name: verified-managed-images",
+    'git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main',
+    'git merge-base --is-ancestor "$current" "$SOURCE_COMMIT"',
+    "verify_tag",
+    'verify_asset_set "$release_api" 1',
+    'cmp "$RUNNER_TEMP/release-identity-before.json" "$RUNNER_TEMP/release-identity-after.json"',
 ):
     if fragment not in publish:
-        raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")
+        raise SystemExit(f"atomic publication gate is incomplete: {fragment}")
+if "pattern: '*'" in publish or 'pattern: "*"' in publish:
+    raise SystemExit("publish downloads an unscoped artifact family")
+if "--contract" in publish or "--predecessor-manifest" in publish:
+    raise SystemExit("current manifest assembly accepts unrelated inputs")
 for producer in ("images", "manager-binaries"):
-    if "overwrite: true" not in job(producer):
+    if "overwrite: true" not in job(workflow, producer):
         raise SystemExit(f"{producer} artifacts cannot be replaced by a full-run retry")
 PY
 for entrypoint in containers/*-entrypoint.sh; do
@@ -1113,10 +792,10 @@ if (
 image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
 if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
     raise SystemExit("target image names are not lowercase kebab-case")
-if schema.get("allOf") is not None or "namespace_handoff" in properties:
-    raise SystemExit("target release schema retains a transition branch")
-if "handoff-fs-helper" in expected_images or "firecrawl-foundationdb" in expected_images:
-    raise SystemExit("the current release schema still requires a retired image")
+if schema.get("allOf") is not None:
+    raise SystemExit("current release schema must have one closed shape")
+if "firecrawl-foundationdb" in expected_images:
+    raise SystemExit("the current release schema still requires FoundationDB")
 managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
 expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
 if managed_firecrawl_services != expected_firecrawl_services:
@@ -1128,13 +807,6 @@ for dockerfile in containers/*.Dockerfile; do
   if [[ "$dockerfile" == containers/agent-sandbox.Dockerfile ]]; then
     grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-sandbox-entrypoint"]' "$dockerfile" \
       || fail "Agent Sandbox does not use the UID/GID mapping entrypoint"
-  elif [[ "$dockerfile" == containers/handoff-fs-helper.Dockerfile ]]; then
-    grep -Fq 'FROM scratch' "$dockerfile" \
-      || fail "handoff filesystem helper must use a shell-free scratch image"
-    grep -Fq 'USER 0:0' "$dockerfile" \
-      || fail "handoff filesystem helper must declare its narrow privileged identity"
-    grep -Fq 'ENTRYPOINT ["/handoff-fs-helper"]' "$dockerfile" \
-      || fail "handoff filesystem helper has an unexpected entrypoint"
   else
     grep -q '^USER ' "$dockerfile" || fail "$dockerfile has no explicit USER"
     grep -q '^HEALTHCHECK ' "$dockerfile" || fail "$dockerfile has no image healthcheck"
@@ -1151,9 +823,6 @@ grep -Fq 'AGENT_PLATFORM_AGENT_UID' containers/agent-sandbox-entrypoint.sh \
   || fail "Agent Sandbox does not consume the target UID prefix"
 grep -Fq 'io.agent-platform.role="sandbox"' containers/agent-sandbox.Dockerfile \
   || fail "Agent Sandbox image does not carry the target ownership label"
-if rg -n 'UBITECH_AGENT_(UID|GID)|io\.ubitech\.agent' containers/agent-sandbox-entrypoint.sh containers/agent-sandbox.Dockerfile; then
-  fail "Agent Sandbox still accepts source UID/GID or ownership labels"
-fi
 if rg -n 'chown[^\n]*(--recursive|-R)' containers/agent-sandbox-entrypoint.sh; then
   fail "Agent Sandbox entrypoint recursively changes persistent ownership"
 fi
@@ -1164,9 +833,6 @@ grep -Fq '"release": "beta.25"' containers/camofox.Dockerfile \
 grep -Fq 'XDG_CACHE_HOME=/var/lib/agent-platform/camofox/home/.cache' containers/camofox.Dockerfile \
   || fail "Camoufox and camoufox-js cache locations are inconsistent"
 
-if rg -n 'UBITECH_|ENTERPRISE_|/var/lib/ubitech-agent|/run/secrets/ubitech|/run/ubitech-manager|/run/ubitech-agent|org\.ubitech\.agent|ubitech-agent' containers/compose.yaml; then
-  fail "target Compose contains source-profile technical identity"
-fi
 python3 - <<'PY'
 import re
 from pathlib import Path
@@ -1190,28 +856,6 @@ docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 zero_digest="sha256:$(printf '0%.0s' {1..64})"
-cat > "$temporary/source-compose.env" <<EOF
-UBITECH_DATA_ROOT=$temporary/source-data-root
-UBITECH_SECRETS_DIR=$temporary/source-data-root/manager/secrets
-UBITECH_MANAGER_CONTROL_DIR=$temporary/source-data-root/manager/control
-UBITECH_PLATFORM_IMAGE=registry.invalid/source/platform@$zero_digest
-UBITECH_AGENT_RUNTIME_IMAGE=registry.invalid/source/agent-runtime@$zero_digest
-UBITECH_CAMOFOX_IMAGE=registry.invalid/source/camofox@$zero_digest
-EOF
-if env \
-  -u AGENT_PLATFORM_DATA_ROOT \
-  -u AGENT_PLATFORM_SECRETS_DIR \
-  -u AGENT_PLATFORM_MANAGER_CONTROL_DIR \
-  -u AGENT_PLATFORM_PLATFORM_IMAGE \
-  -u AGENT_PLATFORM_AGENT_RUNTIME_IMAGE \
-  -u AGENT_PLATFORM_CAMOFOX_IMAGE \
-  docker compose \
-  --env-file "$temporary/source-compose.env" \
-  -f containers/compose.yaml \
-  config --quiet >/dev/null 2>&1; then
-  fail "target Compose accepted a source-only environment"
-fi
-
 cat > "$temporary/compose.env" <<EOF
 AGENT_PLATFORM_COMPOSE_PROJECT=agent-platform
 AGENT_PLATFORM_DATA_ROOT=$temporary/data-root
@@ -1223,8 +867,6 @@ AGENT_PLATFORM_GID=23457
 AGENT_PLATFORM_PLATFORM_IMAGE=registry.invalid/agent-platform/platform@$zero_digest
 AGENT_PLATFORM_AGENT_RUNTIME_IMAGE=registry.invalid/agent-platform/agent-runtime@$zero_digest
 AGENT_PLATFORM_CAMOFOX_IMAGE=registry.invalid/agent-platform/camofox@$zero_digest
-UBITECH_UID=999
-UBITECH_GID=999
 EOF
 
 docker compose \
@@ -1350,14 +992,6 @@ if "/run/secrets/agent-platform/manager-executor-token" not in runtime_secret_ta
 platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == "/var/lib/agent-platform"]
 if len(platform_data) != 1 or not str(platform_data[0].get("source") or "").endswith("/data"):
     raise SystemExit("Platform data must map <manager data root>/data to /var/lib/agent-platform")
-
-serialized = json.dumps(document, sort_keys=True)
-for source_token in (
-    "UBITECH_", "ENTERPRISE_", "/var/lib/ubitech-agent", "/run/secrets/ubitech",
-    "/run/ubitech-manager", "/run/ubitech-agent", "org.ubitech.agent", "ubitech-agent",
-):
-    if source_token in serialized:
-        raise SystemExit(f"resolved target Compose leaked source token: {source_token}")
 
 firecrawl = services["firecrawl-api"]
 firecrawl_environment = firecrawl.get("environment") or {}

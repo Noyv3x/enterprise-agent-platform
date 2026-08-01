@@ -18,9 +18,8 @@ permissions:
   contents: read
 
 concurrency:
-  # A deployment may have pulled any qualified main commit, so a newer workflow
-  # must not evict its pending exact release. Channel monotonicity is enforced
-  # separately when the immutable release is made public.
+  # Build each qualified commit once; the final publish job separately
+  # serializes the mutable main-channel pointer.
   group: container-release-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
   cancel-in-progress: false
 
@@ -37,8 +36,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       source_commit: ${{ steps.release.outputs.source_commit }}
-      transition_stage: ${{ steps.release.outputs.transition_stage }}
-      manager_command: ${{ steps.release.outputs.manager_command }}
       image_matrix: ${{ steps.release.outputs.image_matrix }}
       image_namespace: ${{ steps.release.outputs.image_namespace }}
       cognee_revision: ${{ steps.release.outputs.cognee_revision }}
@@ -50,6 +47,9 @@ jobs:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify current production source boundary
+        run: python3 scripts/verify_current_source.py --root .
 
       - name: Resolve immutable release inputs
         id: release
@@ -64,66 +64,61 @@ jobs:
           image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           cognee_revision="$(jq -er '.sources.cognee.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
-          transition_stage="$(jq -er '.stage | select(. == "bridge" or . == "cleanup" or . == "target_baseline")' docs/contracts/release-transition.json)"
-          if [[ "$transition_stage" == target_baseline ]]; then
-            transition_predecessor="$(jq -er '.predecessor_generation | select(test("^[0-9a-f]{40}$"))' docs/contracts/release-transition.json)"
-            current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
-            if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
-              echo "Target baseline latest is not an immutable generation: ${current_tag}" >&2
-              exit 1
-            fi
-            current_generation="${BASH_REMATCH[1]}"
-            git merge-base --is-ancestor "$transition_predecessor" "$current_generation" || {
-              echo "Target baseline is waiting for its canonical Cleanup ancestry: ${current_tag}" >&2
-              exit 1
-            }
-            git merge-base --is-ancestor "$current_generation" "$source_commit" || {
-              echo "Target baseline latest is not an ancestor of this candidate: ${current_tag}" >&2
-              exit 1
-            }
-            echo "Target baseline lineage verified: ${current_generation} -> ${source_commit}"
+          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
+            echo "Current latest is not an immutable generation: ${current_tag}" >&2
+            exit 1
           fi
-          manager_command=./cmd/agent-platform-manager
+          current_generation="${BASH_REMATCH[1]}"
+          git merge-base --is-ancestor "$current_generation" "$source_commit" || {
+            echo "Current latest is not an ancestor of this candidate: ${current_tag}" >&2
+            exit 1
+          }
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
-          if [[ "$transition_stage" == bridge ]]; then
-            manager_command=./cmd/ubitech-manager
-            image_matrix="$(jq -c '.include += [{component:"handoff-fs-helper",dockerfile:"containers/handoff-fs-helper.Dockerfile",image:"platform",tag_suffix:"-handoff-fs-helper"}]' <<<"$image_matrix")"
-          fi
           {
             echo "source_commit=$source_commit"
-            echo "transition_stage=$transition_stage"
-            echo "manager_command=$manager_command"
             echo "image_matrix=$image_matrix"
             echo "image_namespace=$image_namespace"
             echo "cognee_revision=$cognee_revision"
             echo "firecrawl_revision=$firecrawl_revision"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Require a successful quality run for manual releases
-        if: github.event_name == 'workflow_dispatch'
+      - name: Revalidate the exact successful Quality run
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          UPSTREAM_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          UPSTREAM_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
         run: |
           set -euo pipefail
-          successful="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" \
-            --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
-          if [[ "$successful" -lt 1 ]]; then
-            echo "No successful pushed Quality gates run exists for $SOURCE_COMMIT" >&2
-            exit 1
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$UPSTREAM_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            run_json="$RUNNER_TEMP/quality-run.json"
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}" > "$run_json"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
+              --argjson run "$UPSTREAM_RUN_ID" --argjson attempt "$UPSTREAM_RUN_ATTEMPT" '
+              .id == $run and .run_attempt == $attempt and
+              .path == ".github/workflows/quality.yml" and
+              .event == "push" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $source and
+              .head_repository.full_name == $repo
+            ' "$run_json" >/dev/null
+          else
+            gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
+              jq -se --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
+                [.[].workflow_runs[] | select(
+                  .path == ".github/workflows/quality.yml" and
+                  .event == "push" and .conclusion == "success" and
+                  .head_branch == "main" and .head_sha == $source and
+                  .head_repository.full_name == $repo and
+                  (.id | type == "number" and . > 0) and
+                  (.run_attempt | type == "number" and . > 0)
+                )] | length >= 1
+              ' >/dev/null
           fi
-
-      - name: Recheck container definitions
-        run: scripts/container-smoke.sh
-
-      - name: Recheck target-only production source boundary
-        run: >-
-          python3 scripts/verify_target_baseline_source.py
-          --root .
-          --contract docs/contracts/release-transition.json
 
   upstream-contracts:
     name: Validate managed upstream sources
@@ -295,7 +290,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TRANSITION_STAGE: ${{ needs.prepare.outputs.transition_stage }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
@@ -313,15 +307,9 @@ jobs:
           esac
 
           package_components=(platform agent-runtime camofox agent-sandbox)
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-            package_components+=(handoff-fs-helper)
-          fi
           for component in "${package_components[@]}"; do
             metadata="image-metadata/${component}.json"
             package_component="$component"
-            if [[ "$component" == handoff-fs-helper ]]; then
-              package_component=platform
-            fi
             package="${repository}/${package_component}"
             reference="$(jq -er '.reference' "$metadata")"
             expected_reference="ghcr.io/${owner}/${package}"
@@ -352,8 +340,6 @@ jobs:
 
       - name: Pull every final digest without registry credentials
         shell: bash
-        env:
-          TRANSITION_STAGE: ${{ needs.prepare.outputs.transition_stage }}
         run: |
           set -euo pipefail
           anonymous_config="$(mktemp -d "${RUNNER_TEMP}/anonymous-docker.XXXXXX")"
@@ -430,19 +416,10 @@ jobs:
             [firecrawl-redis]='redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
             [firecrawl-rabbitmq]='rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
           )
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-            images[handoff-fs-helper]="$(jq -er '
-              select(.reference | test("^ghcr\\.io/[a-z0-9._/-]+$")) |
-              select(.digest | test("^sha256:[0-9a-f]{64}$")) |
-              .reference + "@" + .digest
-            ' image-metadata/handoff-fs-helper.json)"
-          fi
-          mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE" '
-            .managed_image_capacity_estimates | keys[] |
-            select($stage == "bridge" or . != "handoff-fs-helper")
+          mapfile -t components < <(jq -er '
+            .managed_image_capacity_estimates | keys[]
           ' docs/contracts/container-platform.json)
           expected_count=10
-          [[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11
           [[ "${#components[@]}" -eq "$expected_count" && "${#images[@]}" -eq "${#components[@]}" ]]
 
           for component in "${components[@]}"; do
@@ -452,11 +429,8 @@ jobs:
               exit 1
             }
             case "$component" in
-              platform|agent-runtime|camofox|agent-sandbox|handoff-fs-helper)
+              platform|agent-runtime|camofox|agent-sandbox)
                 package_component="$component"
-                if [[ "$component" == handoff-fs-helper ]]; then
-                  package_component=platform
-                fi
                 package="${repository}/${package_component}"
                 digest="${image##*@}"
                 anonymous_token="$(env -u GH_TOKEN -u GITHUB_TOKEN curl -q \
@@ -529,9 +503,8 @@ jobs:
             map({(.key): .value}) | add |
             select(length == $expected and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
           ' > "$verified_images"
-          jq -e --arg stage "$TRANSITION_STAGE" --slurpfile verified "$verified_images" '
-            ([.managed_image_capacity_estimates | keys[] |
-              select($stage == "bridge" or . != "handoff-fs-helper")]) ==
+          jq -e --slurpfile verified "$verified_images" '
+            ([.managed_image_capacity_estimates | keys[]]) ==
             ($verified[0] | keys)
           ' docs/contracts/container-platform.json >/dev/null
 
@@ -588,7 +561,7 @@ jobs:
             -trimpath \
             -ldflags "-s -w -buildid= -X main.version=${SOURCE_COMMIT}" \
             -o "../$output" \
-            '${{ needs.prepare.outputs.manager_command }}'
+            ./cmd/agent-platform-manager
           test -s "$output"
           (cd dist && sha256sum "$(basename "$output")" > "$(basename "$output").sha256")
 
@@ -657,16 +630,6 @@ jobs:
             -run '^Test(RecoverySystemdQuiescenceIntegration|OrdinarySystemdActivationRestartIntegration)$' \
             ./internal/selfupdate
 
-      - name: Verify Bridge persistent helper cgroup
-        if: needs.prepare.outputs.transition_stage == 'bridge'
-        working-directory: manager
-        env:
-          AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"
-        run: >-
-          go test -count=1 -v
-          -run '^TestPersistentHelperUserSystemdIntegration$'
-          ./internal/handoffhost
-
   compose-smoke:
     name: Core Compose smoke test
     needs:
@@ -700,8 +663,6 @@ jobs:
 
       - name: Start and probe the core stack
         shell: bash
-        env:
-          TRANSITION_STAGE: ${{ needs.prepare.outputs.transition_stage }}
         run: |
           set -euo pipefail
           root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/agent-platform-compose-smoke.XXXXXX")"
@@ -716,10 +677,8 @@ jobs:
           export AGENT_PLATFORM_PLATFORM_BIND=127.0.0.1:18080
           export AGENT_PLATFORM_PUBLIC_BASE_URL=http://127.0.0.1:18080
           verified_images=artifacts/verified-managed-images.json
-          expected_count=10
-          [[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11
-          jq -e --argjson expected "$expected_count" '
-            length == $expected and
+          jq -e '
+            length == 10 and
             all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$"))
           ' "$verified_images" >/dev/null
           AGENT_PLATFORM_PLATFORM_IMAGE="$(jq -er '.platform' "$verified_images")"
@@ -732,12 +691,6 @@ jobs:
           AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE="$(jq -er '."firecrawl-postgres"' "$verified_images")"
           AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE="$(jq -er '."firecrawl-redis"' "$verified_images")"
           AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er '."firecrawl-rabbitmq"' "$verified_images")"
-          handoff_helper_image=""
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-            handoff_helper_image="$(jq -er '."handoff-fs-helper"' "$verified_images")"
-          else
-            jq -e 'has("handoff-fs-helper") | not' "$verified_images" >/dev/null
-          fi
           export \
             AGENT_PLATFORM_PLATFORM_IMAGE AGENT_PLATFORM_AGENT_RUNTIME_IMAGE AGENT_PLATFORM_CAMOFOX_IMAGE \
             AGENT_PLATFORM_AGENT_SANDBOX_IMAGE AGENT_PLATFORM_SEARXNG_IMAGE \
@@ -890,7 +843,7 @@ jobs:
               "firecrawl-postgres": .services["firecrawl-postgres"].image,
               "firecrawl-redis": .services["firecrawl-redis"].image,
               "firecrawl-rabbitmq": .services["firecrawl-rabbitmq"].image
-            } == ($expected[0] | del(."agent-sandbox", ."handoff-fs-helper"))
+            } == ($expected[0] | del(."agent-sandbox"))
           ' <<<"$resolved_compose" >/dev/null
           test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
             "$AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE" -c 'printf "%s:%s" "$(id -u redis)" "$(id -g redis)"')" = "999:1000"
@@ -898,92 +851,6 @@ jobs:
             "$AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE" -c 'printf "%s:%s" "$(id -u rabbitmq)" "$(id -g rabbitmq)"')" = "999:999"
           test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
             "$AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE" -c 'printf "%s:%s" "$(id -u postgres)" "$(id -g postgres)"')" = "999:999"
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-          docker pull "$handoff_helper_image"
-          handoff_helper_root="$root/handoff-helper"
-          mkdir -p "$handoff_helper_root/source/data" "$handoff_helper_root/target" "$handoff_helper_root/control"
-          chmod 0700 "$handoff_helper_root" "$handoff_helper_root/source" "$handoff_helper_root/target" "$handoff_helper_root/control"
-          printf 'different uid payload\n' > "$handoff_helper_root/source/data/payload.txt"
-          chmod 0700 "$handoff_helper_root/source/data"
-          chmod 0600 "$handoff_helper_root/source/data/payload.txt"
-          sudo -n chown -R 42424:42424 "$handoff_helper_root/source/data"
-          sudo -n python3 - \
-            "$handoff_helper_root/source/data" "$handoff_helper_root/control/request.json" \
-            "$handoff_helper_image" "$AGENT_PLATFORM_UID" "$AGENT_PLATFORM_GID" <<'PY'
-          import hashlib
-          import json
-          import os
-          import stat
-          import sys
-
-          source, output, image, manager_uid, manager_gid = sys.argv[1:]
-
-          def entry(path, relative):
-              observed = os.lstat(path)
-              result = {
-                  "resource": "different_uid_data",
-                  "path": relative,
-                  "type": "directory" if stat.S_ISDIR(observed.st_mode) else "file",
-                  "mode": stat.S_IMODE(observed.st_mode),
-                  "uid": observed.st_uid,
-                  "gid": observed.st_gid,
-                  "link_count": observed.st_nlink,
-                  "size": observed.st_size,
-                  "allocated_size": observed.st_blocks * 512,
-                  "modified_nanos": observed.st_mtime_ns,
-              }
-              if stat.S_ISREG(observed.st_mode):
-                  result["sha256"] = hashlib.sha256(open(path, "rb").read()).hexdigest()
-              return result
-
-          request = {
-              "schema_version": 1,
-              "operation": "copy",
-              "transaction_id": "handoff_11111111111111111111111111111111",
-              "data_request_sha256": "a" * 64,
-              "resource_name": "different_uid_data",
-              "access": "container_owned_tree",
-              "image_digest": image,
-              "manager_uid": int(manager_uid),
-              "manager_gid": int(manager_gid),
-              "target_relative": "copied",
-              "source_owners": [{"uid": 42424, "gid": 42424}],
-              "target_owners": [{"uid": 42424, "gid": 42424}],
-              "expected_source": [
-                  entry(source, "."),
-                  entry(os.path.join(source, "payload.txt"), "payload.txt"),
-              ],
-              "request_sha256": "",
-          }
-          canonical = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
-          request["request_sha256"] = hashlib.sha256(canonical).hexdigest()
-          with open(output, "x", encoding="utf-8") as target:
-              json.dump(request, target, ensure_ascii=False, separators=(",", ":"))
-              target.write("\n")
-              target.flush()
-              os.fsync(target.fileno())
-          os.chmod(output, 0o600)
-          os.chown(output, int(manager_uid), int(manager_gid))
-          PY
-          docker run --rm --pull=never --network=none --read-only --user=0:0 \
-            --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER \
-            --security-opt=no-new-privileges:true --pids-limit=64 \
-            --env "HANDOFF_FS_IMAGE_DIGEST=$handoff_helper_image" \
-            --mount "type=bind,src=$handoff_helper_root/control,dst=/control" \
-            --mount "type=bind,src=$handoff_helper_root/source/data,dst=/source,readonly" \
-            --mount "type=bind,src=$handoff_helper_root/target,dst=/target" \
-            "$handoff_helper_image" --request /control/request.json --receipt /control/receipt.json
-          jq -e --arg image "$handoff_helper_image" '
-            .schema_version == 1 and .operation == "copy" and .image_digest == $image and
-            .transaction_id == "handoff_11111111111111111111111111111111" and
-            (.source_entries | length) == 2 and (.target_entries | length) == 2 and
-            (.receipt_sha256 | test("^[0-9a-f]{64}$"))
-          ' "$handoff_helper_root/control/receipt.json" >/dev/null
-          test "$(sudo -n stat -c '%u:%g:%a' "$handoff_helper_root/target/copied")" = "42424:42424:700"
-          test "$(sudo -n stat -c '%u:%g:%a' "$handoff_helper_root/target/copied/payload.txt")" = "42424:42424:600"
-          test "$(sudo -n sha256sum "$handoff_helper_root/source/data/payload.txt" | awk '{print $1}')" = \
-            "$(sudo -n sha256sum "$handoff_helper_root/target/copied/payload.txt" | awk '{print $1}')"
-          fi
           docker compose -f containers/compose.yaml up --detach agent-runtime camofox searxng platform
           for service in agent-runtime camofox searxng platform; do
             container="$(docker compose -f containers/compose.yaml ps -q "$service")"
@@ -1223,16 +1090,13 @@ jobs:
       needs.compose-smoke.result == 'success' &&
       needs.public-images.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: write
       packages: read
     concurrency:
-      # The seal/upload critical section is repository-wide.  In particular,
-      # two ordinary target generations must never reserve the same public
-      # predecessor while promotion is catching up.
-      group: container-publish-main
+      group: container-channel-main
       cancel-in-progress: false
     steps:
       - name: Check out release source
@@ -1240,13 +1104,6 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check out publisher policy from the workflow execution head
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.sha }}
-          path: .publisher-policy
           persist-credentials: false
 
       - name: Download verified managed-image directory
@@ -1262,605 +1119,303 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Assemble and validate release manifest
-        id: manifest
+      - name: Assemble release directory
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
-          TRANSITION_STAGE: ${{ needs.prepare.outputs.transition_stage }}
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/release"
           mkdir -p "$stage"
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-            manager_prefix=ubitech-manager-linux
-            compose_asset=ubitech-compose.yaml
-          else
-            manager_prefix=agent-platform-manager-linux
-            compose_asset=agent-platform-compose.yaml
-          fi
           for architecture in amd64 arm64; do
-            cp "artifacts/agent-platform-manager-linux-${architecture}" \
-              "$stage/${manager_prefix}-${architecture}"
-            cp "artifacts/agent-platform-manager-linux-${architecture}.sha256" \
-              "$stage/${manager_prefix}-${architecture}.sha256"
-            sed -i "s/agent-platform-manager-linux-${architecture}/${manager_prefix}-${architecture}/" \
-              "$stage/${manager_prefix}-${architecture}.sha256"
+            binary="agent-platform-manager-linux-${architecture}"
+            cp "artifacts/${binary}" "$stage/${binary}"
+            cp "artifacts/${binary}.sha256" "$stage/${binary}.sha256"
+            chmod 0755 "$stage/${binary}"
           done
-          cp containers/compose.yaml "$stage/$compose_asset"
+          cp containers/compose.yaml "$stage/agent-platform-compose.yaml"
           cp install.sh "$stage/install.sh"
-          chmod 0755 "$stage"/${manager_prefix}-amd64 "$stage"/${manager_prefix}-arm64 "$stage/install.sh"
+          chmod 0755 "$stage/install.sh"
           bash -n "$stage/install.sh"
           (cd "$stage" && sha256sum install.sh > install.sh.sha256)
+
+          jq -ecS '
+            select(length == 10) |
+            select(
+              keys == [
+                "agent-runtime", "agent-sandbox", "camofox", "firecrawl-api",
+                "firecrawl-playwright", "firecrawl-postgres",
+                "firecrawl-rabbitmq", "firecrawl-redis", "platform", "searxng"
+              ]
+            ) |
+            select(all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
+          ' artifacts/verified-managed-images.json > "$stage/verified-managed-images.json"
+
           release_tag="container-${SOURCE_COMMIT}"
           release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}"
-          compose_sha="$(sha256sum "$stage/$compose_asset" | awk '{print $1}')"
-          amd64_sha="$(awk 'NR==1 {print $1}' "$stage/${manager_prefix}-amd64.sha256")"
-          arm64_sha="$(awk 'NR==1 {print $1}' "$stage/${manager_prefix}-arm64.sha256")"
           generated_at="$(git show -s --format=%cI "$SOURCE_COMMIT")"
-          database_schema_version="$(jq -er '.database_schema_version' docs/contracts/container-platform.json)"
-          expected_images=10
-          [[ "$TRANSITION_STAGE" == bridge ]] && expected_images=11
-          jq -ecS --argjson expected "$expected_images" '
-            select(length == $expected) |
-            with_entries(select(.key | test("^[a-z0-9]+(-[a-z0-9]+)*$"))) |
-            select(length == $expected and all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))
-          ' artifacts/verified-managed-images.json > "$stage/verified-managed-images.json"
-          transition_predecessor="$(jq -er '.predecessor_generation | select(test("^[0-9a-f]{40}$"))' docs/contracts/release-transition.json)"
-          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
-          predecessor="$transition_predecessor"
-          if [[ "$TRANSITION_STAGE" == target_baseline ]]; then
-            if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
-              echo "Target baseline latest is not an immutable generation: ${current_tag}" >&2
-              exit 1
-            fi
-            predecessor="${BASH_REMATCH[1]}"
-          fi
-          predecessor_root="$RUNNER_TEMP/predecessor-release"
-          mkdir -p "$predecessor_root"
-          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"
-          if [[ "$TRANSITION_STAGE" == cleanup ]]; then
-            gh api --paginate -H 'Accept: application/vnd.github+json' \
-              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
-              jq -se --arg tag "container-${predecessor}" '
-                if all(.[]; type == "array") then [.[] | .[] | select(.tag_name == $tag)]
-                else error("invalid paginated releases response") end |
-                if length == 1 then .[0]
-                else error("Cleanup predecessor draft release identity is not unique") end
-              ' > "$predecessor_api"
-          else
-            gh api -H 'Accept: application/vnd.github+json' \
-              "/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}" \
-              > "$predecessor_api"
-          fi
-          assembler_args=(
-            scripts/assemble_release_manifest.py
-            --contract docs/contracts/release-transition.json
-            --images "$stage/verified-managed-images.json"
-            --generation "$SOURCE_COMMIT"
-            --generated-at "$generated_at"
-            --database-schema-version "$database_schema_version"
-            --manager-amd64-url "$release_base/${manager_prefix}-amd64"
-            --manager-amd64-sha256 "$amd64_sha"
-            --manager-arm64-url "$release_base/${manager_prefix}-arm64"
-            --manager-arm64-sha256 "$arm64_sha"
-            --compose-url "$release_base/${compose_asset}"
-            --compose-sha256 "$compose_sha"
+          database_schema_version="$(jq -er '.database_schema_version | select(type == "number" and . >= 1)' docs/contracts/container-platform.json)"
+          amd64_sha="$(sha256sum "$stage/agent-platform-manager-linux-amd64" | awk '{print $1}')"
+          arm64_sha="$(sha256sum "$stage/agent-platform-manager-linux-arm64" | awk '{print $1}')"
+          compose_sha="$(sha256sum "$stage/agent-platform-compose.yaml" | awk '{print $1}')"
+          grep -Fx "${amd64_sha}  agent-platform-manager-linux-amd64" \
+            "$stage/agent-platform-manager-linux-amd64.sha256"
+          grep -Fx "${arm64_sha}  agent-platform-manager-linux-arm64" \
+            "$stage/agent-platform-manager-linux-arm64.sha256"
+          scripts/assemble_release_manifest.py \
+            --images "$stage/verified-managed-images.json" \
+            --generation "$SOURCE_COMMIT" \
+            --generated-at "$generated_at" \
+            --database-schema-version "$database_schema_version" \
+            --manager-amd64-url "$release_base/agent-platform-manager-linux-amd64" \
+            --manager-amd64-sha256 "$amd64_sha" \
+            --manager-arm64-url "$release_base/agent-platform-manager-linux-arm64" \
+            --manager-arm64-sha256 "$arm64_sha" \
+            --compose-url "$release_base/agent-platform-compose.yaml" \
+            --compose-sha256 "$compose_sha" \
             --output "$stage/release.json"
-          )
-          if [[ "$TRANSITION_STAGE" == bridge ]]; then
-            [[ "$current_tag" == "container-${predecessor}" ]] || {
-              echo "Bridge predecessor is no longer the public latest: ${current_tag}" >&2
-              exit 1
-            }
-            jq -e --arg tag "container-${predecessor}" --arg predecessor "$predecessor" '
-              .tag_name == $tag and .target_commitish == $predecessor and
-              .draft == false and .prerelease == false
-            ' "$predecessor_api" >/dev/null
-            for asset in release.json ubitech-compose.yaml ubitech-manager-linux-amd64; do
-              gh release download "container-${predecessor}" --repo "$GITHUB_REPOSITORY" \
-                --dir "$predecessor_root" --pattern "$asset"
-            done
-            assembler_args+=(--predecessor-manifest "$predecessor_root/release.json")
-          elif [[ "$TRANSITION_STAGE" == cleanup ]]; then
-            [[ "$current_tag" != "container-${predecessor}" ]] || {
-              echo "Cleanup must be prebuilt while its Bridge predecessor remains draft" >&2
-              exit 1
-            }
-            bridge_assets=(
-              install.sh install.sh.sha256 promotion.json release.json
-              ubitech-compose.yaml ubitech-manager-linux-amd64
-              ubitech-manager-linux-amd64.sha256 ubitech-manager-linux-arm64
-              ubitech-manager-linux-arm64.sha256
-            )
-            expected_bridge_assets="$(printf '%s\n' "${bridge_assets[@]}" | jq -R . | jq -sc 'sort')"
-            jq -e --arg tag "container-${predecessor}" --arg predecessor "$predecessor" \
-              --argjson names "$expected_bridge_assets" '
-              .tag_name == $tag and .target_commitish == $predecessor and
-              .draft == true and .prerelease == false and
-              ([.assets[].name] | sort) == $names and
-              ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
-              all(.assets[]; (.id | type == "number" and . > 0) and
-                .state == "uploaded" and (.size | type == "number" and . > 0) and
-                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))
-            ' "$predecessor_api" >/dev/null
-            for asset in "${bridge_assets[@]}"; do
-              asset_id="$(jq -er --arg name "$asset" \
-                '.assets[] | select(.name == $name) | .id | select(type == "number" and . > 0)' \
-                "$predecessor_api")"
-              gh api -H 'Accept: application/octet-stream' \
-                "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-                > "$predecessor_root/$asset"
-            done
-            for contract_asset in release-transition.json release-transition-challenge.schema.json release-transition-receipt.schema.json; do
-              git show "$predecessor:docs/contracts/$contract_asset" > "$predecessor_root/$contract_asset"
-            done
-            bridge_public_predecessor="$(jq -er '
-              select(.stage == "bridge") |
-              .predecessor_generation | select(test("^[0-9a-f]{40}$"))
-            ' "$predecessor_root/release-transition.json")"
-            [[ "$current_tag" == "container-${bridge_public_predecessor}" ]] || {
-              echo "Cleanup prebuild requires the Bridge source-owner to remain public latest" >&2
-              exit 1
-            }
-            python3 scripts/release_promotion.py validate-promotion \
-              --contract "$predecessor_root/release-transition.json" \
-              --manifest "$predecessor_root/release.json" \
-              --challenge-schema "$predecessor_root/release-transition-challenge.schema.json" \
-              --receipt-schema "$predecessor_root/release-transition-receipt.schema.json" \
-              --generation "$predecessor" \
-              --assets-root "$predecessor_root" \
-              --promotion "$predecessor_root/promotion.json"
-            python3 - "$predecessor_root" "$predecessor_api" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import sys
+          rm "$stage/verified-managed-images.json"
 
-          root = pathlib.Path(sys.argv[1])
-          api = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-          expected = {item["name"]: item for item in api["assets"]}
-          actual = sorted(path.name for path in root.iterdir() if not path.name.startswith("release-transition"))
-          if actual != sorted(expected):
-              raise SystemExit(f"Cleanup predecessor release directory mismatch: {actual}")
-          for name, item in expected.items():
-              path = root / name
-              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-              if digest != item["digest"] or path.stat().st_size != item["size"]:
-                  raise SystemExit(f"Cleanup predecessor asset identity drift: {name}")
-          PY
-            predecessor_proof_root="$RUNNER_TEMP/cleanup-predecessor-provenance"
-            mkdir -p "$predecessor_proof_root"
-            gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" |
-              jq -s --arg predecessor "$predecessor" '
-                [.[].artifacts[] | select(
-                  .expired == false and
-                  (.name | test("^release-promotion-provenance-" + $predecessor + "-attempt-[1-9][0-9]*$")) and
-                  (.id | type == "number" and . > 0) and
-                  (.size_in_bytes | type == "number" and . > 0 and . <= 8388608) and
-                  (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-                  (.workflow_run.id | type == "number" and . > 0) and
-                  (.workflow_run.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
-                )] | sort_by(.created_at) | reverse
-              ' > "$predecessor_proof_root/artifacts.json"
-            proof_count=0
-            while IFS=$'\t' read -r artifact_id artifact_name artifact_digest artifact_run artifact_head; do
-              attempt_root="$predecessor_proof_root/$artifact_id"
-              mkdir -p "$attempt_root"
-              archive="$attempt_root/provenance.zip"
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$archive"
-              [[ "sha256:$(sha256sum "$archive" | awk '{print $1}')" == "$artifact_digest" ]]
-              python3 - "$archive" "$attempt_root/provenance.json" <<'PY'
+          python3 - "$stage" <<'PY'
+          import os
           import pathlib
           import stat
           import sys
-          import zipfile
 
-          archive = pathlib.Path(sys.argv[1])
-          output = pathlib.Path(sys.argv[2])
-          with zipfile.ZipFile(archive) as value:
-              infos = value.infolist()
-              if len(infos) != 1 or infos[0].filename != "publisher-provenance.json":
-                  raise SystemExit("Cleanup predecessor provenance artifact is not closed")
-              mode = infos[0].external_attr >> 16
-              if stat.S_ISLNK(mode) or infos[0].file_size <= 0 or infos[0].file_size > 1024 * 1024:
-                  raise SystemExit("Cleanup predecessor provenance member is unsafe")
-              output.write_bytes(value.read(infos[0]))
+          root = pathlib.Path(sys.argv[1])
+          expected = {
+              "agent-platform-compose.yaml",
+              "agent-platform-manager-linux-amd64",
+              "agent-platform-manager-linux-amd64.sha256",
+              "agent-platform-manager-linux-arm64",
+              "agent-platform-manager-linux-arm64.sha256",
+              "install.sh",
+              "install.sh.sha256",
+              "release.json",
+          }
+          actual = {entry.name for entry in os.scandir(root)}
+          if actual != expected:
+              raise SystemExit(f"release directory is not closed: {sorted(actual ^ expected)}")
+          for name in expected:
+              path = root / name
+              mode = path.lstat().st_mode
+              if not stat.S_ISREG(mode) or path.is_symlink() or path.stat().st_size <= 0:
+                  raise SystemExit(f"invalid release asset: {name}")
           PY
-              proof="$attempt_root/provenance.json"
-              if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg predecessor "$predecessor" \
-                --arg artifact "$artifact_name" '
-                .repository == $repo and .workflow_path == ".github/workflows/container-release.yml" and
-                (.workflow_event == "workflow_run" or .workflow_event == "workflow_dispatch") and
-                .source_commit == $predecessor and .candidate_stage == "bridge" and
-                (.workflow_run_id | type == "number" and . > 0) and
-                (.run_attempt | type == "number" and . > 0) and
-                $artifact == ("release-promotion-provenance-" + $predecessor + "-attempt-" + (.run_attempt | tostring))
-              ' "$proof" >/dev/null; then
-                continue
-              fi
-              run_id="$(jq -er .workflow_run_id "$proof")"
-              run_attempt="$(jq -er .run_attempt "$proof")"
-              [[ "$artifact_run" == "$run_id" ]]
-              [[ "$artifact_head" == "$(jq -er .execution_head_sha "$proof")" ]]
-              run_api="$attempt_root/run.json"
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" > "$run_api"
-              jq -e --arg repo "$GITHUB_REPOSITORY" --argjson run "$run_id" \
-                --argjson attempt "$run_attempt" --arg execution "$(jq -er .execution_head_sha "$proof")" '
-                .id == $run and .run_attempt == $attempt and
-                .path == ".github/workflows/container-release.yml" and .conclusion == "success" and
-                (.event == "workflow_run" or .event == "workflow_dispatch") and
-                .head_branch == "main" and .head_sha == $execution and
-                .head_repository.full_name == $repo
-              ' "$run_api" >/dev/null
-              gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}/jobs?per_page=100" |
-                jq -se --arg execution "$(jq -er .execution_head_sha "$proof")" '
-                  [.[].jobs[] | select(.name == "Publish atomic main release" and
-                    .status == "completed" and .conclusion == "success" and .head_sha == $execution)] |
-                  length == 1
-                ' >/dev/null
-              jq -cS '{
-                release_id: .id, tag_name, target_commitish, draft, prerelease,
-                assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
-              }' "$predecessor_api" > "$attempt_root/release-identity.json"
-              jq -cS .release "$proof" > "$attempt_root/proof-release-identity.json"
-              cmp "$attempt_root/release-identity.json" "$attempt_root/proof-release-identity.json"
-              jq -cS .source_selection "$proof" > "$attempt_root/source-selection.json"
-              quality_run_id="$(jq -er '.source_selection.qualification_run_id | select(type == "number" and . > 0)' "$proof")"
-              quality_attempt="$(jq -er '.source_selection.qualification_run_attempt | select(type == "number" and . > 0)' "$proof")"
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${quality_run_id}" > "$attempt_root/quality-run.json"
-              jq -e --arg repo "$GITHUB_REPOSITORY" --arg predecessor "$predecessor" \
-                --argjson run "$quality_run_id" --argjson attempt "$quality_attempt" '
-                .id == $run and .run_attempt == $attempt and
-                .path == ".github/workflows/quality.yml" and .event == "push" and
-                .conclusion == "success" and .head_branch == "main" and
-                .head_sha == $predecessor and .head_repository.full_name == $repo
-              ' "$attempt_root/quality-run.json" >/dev/null
-              python3 scripts/release_promotion.py validate-publisher-provenance \
-                --repository "$GITHUB_REPOSITORY" \
-                --workflow-event "$(jq -er .workflow_event "$proof")" \
-                --workflow-run-id "$run_id" \
-                --run-attempt "$run_attempt" \
-                --execution-head-sha "$(jq -er .execution_head_sha "$proof")" \
-                --source-commit "$predecessor" \
-                --source-selection "$attempt_root/source-selection.json" \
-                --release-identity "$attempt_root/release-identity.json" \
-                --candidate-stage bridge \
-                --provenance "$proof"
-              proof_count=$((proof_count + 1))
-              break
-            done < <(jq -r '.[] | [.id, .name, .digest, .workflow_run.id, .workflow_run.head_sha] | @tsv' "$predecessor_proof_root/artifacts.json")
-            [[ "$proof_count" -eq 1 ]] || {
-              echo "Cleanup predecessor has no exact successful sealed publisher provenance" >&2
-              exit 1
-            }
-          elif [[ "$TRANSITION_STAGE" == target_baseline ]]; then
-            [[ "$current_tag" == "container-${predecessor}" ]] || {
-              echo "Target baseline predecessor is no longer the public latest: ${current_tag}" >&2
-              exit 1
-            }
-            jq -e --arg tag "container-${predecessor}" --arg predecessor "$predecessor" '
-              .tag_name == $tag and .target_commitish == $predecessor and
-              .draft == false and .prerelease == false
-            ' "$predecessor_api" >/dev/null
-            for asset in promotion.json release.json; do
-              gh release download "container-${predecessor}" --repo "$GITHUB_REPOSITORY" \
-                --dir "$predecessor_root" --pattern "$asset"
-            done
-            for contract_asset in release-transition.json release-transition-challenge.schema.json release-transition-receipt.schema.json; do
-              git show "$predecessor:docs/contracts/$contract_asset" > "$predecessor_root/$contract_asset"
-            done
-            predecessor_stage="$(jq -er '.stage | select(. == "cleanup" or . == "target_baseline")' \
-              "$predecessor_root/promotion.json")"
-            python3 scripts/release_promotion.py validate-promotion \
-              --contract "$predecessor_root/release-transition.json" \
-              --manifest "$predecessor_root/release.json" \
-              --challenge-schema "$predecessor_root/release-transition-challenge.schema.json" \
-              --receipt-schema "$predecessor_root/release-transition-receipt.schema.json" \
-              --generation "$predecessor" \
-              --promotion "$predecessor_root/promotion.json"
-            [[ "$predecessor_stage" == cleanup || "$predecessor_stage" == target_baseline ]]
-          else
-            echo "Unsupported transition stage: $TRANSITION_STAGE" >&2
-            exit 1
-          fi
-          slot_root="$RUNNER_TEMP/publication-slot"
-          mkdir -p "$slot_root"
-          gh api --paginate -H 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
-            jq -s '
-              if all(.[]; type == "array") then add
-              else error("invalid paginated releases response") end
-            ' > "$RUNNER_TEMP/publication-slot-releases.json"
-          jq -c '.[] | select(
-              .draft == true and
-              (.tag_name | test("^container-[0-9a-f]{40}$")) and
-              ([.assets[].name] | index("promotion.json") != null)
-            ) | {tag_name, target_commitish, draft}' \
-            "$RUNNER_TEMP/publication-slot-releases.json" |
-          while IFS= read -r metadata; do
-            tag="$(jq -er .tag_name <<<"$metadata")"
-            generation="${tag#container-}"
-            root="$slot_root/$generation"
-            mkdir -p "$root"
-            jq -cS . <<<"$metadata" > "$root/metadata.json"
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-              --dir "$root" --pattern promotion.json
-          done
-          python3 scripts/release_promotion.py ensure-publication-slot \
-            --current-generation "$predecessor" \
-            --candidate-generation "$SOURCE_COMMIT" \
-            --candidate-stage "$TRANSITION_STAGE" \
-            --candidates-root "$slot_root"
-          python3 "${assembler_args[@]}"
-          rm "$stage/verified-managed-images.json"
-          promotion_args=(
-            scripts/release_promotion.py create-promotion
-            --contract docs/contracts/release-transition.json
-            --manifest "$stage/release.json"
-            --challenge-schema docs/contracts/release-transition-challenge.schema.json
-            --receipt-schema docs/contracts/release-transition-receipt.schema.json
-            --generation "$SOURCE_COMMIT"
-            --assets-root "$stage"
-            --output "$stage/promotion.json"
-          )
-          if [[ "$TRANSITION_STAGE" == target_baseline ]]; then
-            promotion_args+=(--predecessor-generation "$predecessor")
-          fi
-          python3 "${promotion_args[@]}"
-          echo "stage=$stage" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Publish complete release as one visible generation
-        id: publish
+      - name: Publish immutable release and advance main
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
-          STAGE: ${{ steps.manifest.outputs.stage }}
-          RELEASE_TAG: ${{ steps.manifest.outputs.release_tag }}
-          EXECUTION_HEAD_SHA: ${{ github.sha }}
-          UPSTREAM_QUALITY_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
-          UPSTREAM_QUALITY_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
-          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
-          CANDIDATE_STAGE: ${{ needs.prepare.outputs.transition_stage }}
+          UPSTREAM_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          UPSTREAM_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
         run: |
           set -euo pipefail
-          sealed_assets=(
+          stage="$RUNNER_TEMP/release"
+          release_tag="container-${SOURCE_COMMIT}"
+          release_api="$RUNNER_TEMP/release-api.json"
+          expected_assets=(
+            agent-platform-compose.yaml
+            agent-platform-manager-linux-amd64
+            agent-platform-manager-linux-amd64.sha256
+            agent-platform-manager-linux-arm64
+            agent-platform-manager-linux-arm64.sha256
             install.sh
             install.sh.sha256
             release.json
           )
-          if [[ "$CANDIDATE_STAGE" == bridge ]]; then
-            sealed_assets+=(
-              ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256
-              ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256
-              ubitech-compose.yaml
-            )
-          else
-            sealed_assets+=(
-              agent-platform-manager-linux-amd64 agent-platform-manager-linux-amd64.sha256
-              agent-platform-manager-linux-arm64 agent-platform-manager-linux-arm64.sha256
-              agent-platform-compose.yaml
-            )
-          fi
-          assets=("${sealed_assets[@]}" promotion.json)
-          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc 'sort')"
-          local_identity="$RUNNER_TEMP/local-release-assets.json"
-          python3 - "$STAGE" "$local_identity" "${assets[@]}" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import stat
-          import sys
 
-          root = pathlib.Path(sys.argv[1])
-          output = pathlib.Path(sys.argv[2])
-          expected = sorted(sys.argv[3:])
-          actual = sorted(path.name for path in root.iterdir())
-          if actual != expected:
-              raise SystemExit(f"local release directory mismatch: {actual}")
-          assets = []
-          for name in expected:
-              path = root / name
-              info = path.lstat()
-              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size <= 0:
-                  raise SystemExit(f"local release asset is not a non-empty regular file: {name}")
-              assets.append({
-                  "name": name,
-                  "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
-                  "size": info.st_size,
-              })
-          output.write_text(
-              json.dumps(assets, sort_keys=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
-          PY
-          python3 scripts/release_promotion.py validate-promotion \
-            --contract docs/contracts/release-transition.json \
-            --manifest "$STAGE/release.json" \
-            --challenge-schema docs/contracts/release-transition-challenge.schema.json \
-            --receipt-schema docs/contracts/release-transition-receipt.schema.json \
-            --generation "$SOURCE_COMMIT" \
-            --assets-root "$STAGE" \
-            --promotion "$STAGE/promotion.json"
-
-          fetch_release() {
-            local output="$1"
-            local api_url
-            api_url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
-            [[ "$api_url" == "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"* ]]
-            gh api -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' "$api_url" > "${output}.tmp"
-            mv "${output}.tmp" "$output"
-          }
-
-          validate_asset_metadata() {
-            local document="$1"
-            local require_complete="$2"
-            jq -e --arg tag "$RELEASE_TAG" --arg target "$SOURCE_COMMIT" \
-              --argjson names "$expected_names" --argjson complete "$require_complete" '
-              .tag_name == $tag and
-              .target_commitish == $target and
-              .prerelease == false and
-              (.draft | type == "boolean") and
-              (.id | type == "number") and
-              (.assets | type == "array") and
-              ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
-              ([.assets[].name] - $names | length) == 0 and
-              (if $complete then ([.assets[].name] | sort) == $names else true end) and
-              all(.assets[];
-                (.id | type == "number") and .state == "uploaded" and
-                (.name | type == "string") and
-                (.size | type == "number" and . > 0) and
-                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
-              )
-            ' "$document" >/dev/null
-          }
-
-          verify_complete_release() {
-            local document="$1"
-            local api_identity="$2"
-            validate_asset_metadata "$document" true
-            jq -cS '[.assets[] | {name, digest, size}] | sort_by(.name)' \
-              "$document" > "$RUNNER_TEMP/api-release-assets.json"
-            cmp "$local_identity" "$RUNNER_TEMP/api-release-assets.json"
-            jq -cS '{
-              release_id: .id,
-              tag_name,
-              target_commitish,
-              draft,
-              prerelease,
-              assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
-            }' "$document" > "$api_identity"
-          }
-
-          release_json="$RUNNER_TEMP/release-api.json"
-          release_complete=false
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            fetch_release "$release_json"
-            validate_asset_metadata "$release_json" false
-            is_draft="$(jq -r 'if (.draft | type) == "boolean" then .draft else error("invalid draft state") end' "$release_json")"
-            mkdir -p "$RUNNER_TEMP/existing"
-            mapfile -t existing_assets < <(jq -er '.assets[].name' "$release_json")
-            declare -A existing=()
-            for asset in "${existing_assets[@]}"; do
-              existing["$asset"]=1
-              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-                --dir "$RUNNER_TEMP/existing" --pattern "$asset"
-              cmp "$STAGE/$asset" "$RUNNER_TEMP/existing/$asset"
-            done
-            if [[ -n "${existing[promotion.json]:-}" ]]; then
-              verify_complete_release "$release_json" "$RUNNER_TEMP/published-release-identity.json"
-              (cd "$RUNNER_TEMP/existing" && bash -n install.sh)
-              release_complete=true
-            fi
-            if [[ "$release_complete" != true && "$is_draft" != true ]]; then
-              echo "Incomplete immutable release is already public" >&2
-              exit 1
-            fi
-          else
-            gh release create "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$SOURCE_COMMIT" \
-              --title "Agent Platform ${SOURCE_COMMIT:0:12}" \
-              --notes "Immutable Docker release for ${SOURCE_COMMIT}." \
-              --draft
-            declare -A existing=()
-          fi
-          if [[ "$release_complete" != true ]]; then
-            # Fill an interrupted draft without replacing any existing byte.
-            # promotion.json is uploaded last and seals the immutable directory.
-            for asset in "${sealed_assets[@]}"; do
-              if [[ -z "${existing[$asset]:-}" ]]; then
-                gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/$asset"
-              fi
-            done
-            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$STAGE/promotion.json"
-          fi
-          fetch_release "$release_json"
-          verify_complete_release "$release_json" "$RUNNER_TEMP/published-release-identity.json"
-          source_selection="$RUNNER_TEMP/publisher-source-selection.json"
-          quality_run="$RUNNER_TEMP/publisher-quality-run.json"
-          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            [[ "$UPSTREAM_QUALITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
-            [[ "$UPSTREAM_QUALITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_QUALITY_RUN_ID}" > "$quality_run"
-            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
-              --argjson run "$UPSTREAM_QUALITY_RUN_ID" --argjson attempt "$UPSTREAM_QUALITY_RUN_ATTEMPT" '
-              .id == $run and .run_attempt == $attempt and
-              .path == ".github/workflows/quality.yml" and
-              .event == "push" and .conclusion == "success" and
-              .head_branch == "main" and .head_sha == $source and
-              .head_repository.full_name == $repo
-            ' "$quality_run" >/dev/null
-            selection_kind=workflow_run
-            selection_resolution=qualified_workflow_run.head_sha
-          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            [[ -n "$REQUESTED_REF" ]]
-            quality_runs="$RUNNER_TEMP/publisher-quality-runs.json"
-            gh api --paginate \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
-              jq -s '
-                if all(.[]; type == "object" and (.workflow_runs | type == "array"))
-                then {workflow_runs: [.[].workflow_runs[]]}
-                else error("invalid paginated quality workflow runs response")
-                end
-              ' > "$quality_runs"
-            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
-              [.workflow_runs[] | select(
+          revalidate_quality() {
+            local result="$RUNNER_TEMP/quality-run.json"
+            if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+              [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+              [[ "$UPSTREAM_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}" > "$result"
+              jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
+                --argjson run "$UPSTREAM_RUN_ID" --argjson attempt "$UPSTREAM_RUN_ATTEMPT" '
+                .id == $run and .run_attempt == $attempt and
                 .path == ".github/workflows/quality.yml" and
                 .event == "push" and .conclusion == "success" and
                 .head_branch == "main" and .head_sha == $source and
-                .head_repository.full_name == $repo and
-                (.id | type == "number" and . > 0) and
-                (.run_attempt | type == "number" and . > 0)
-              )] | sort_by(.id) | last // error("no exact successful Quality run")
-            ' "$quality_runs" > "$quality_run"
-            selection_kind=workflow_dispatch
-            selection_resolution='checkout(inputs.ref).git_rev_parse_head'
-          else
-            echo "Unsupported publisher event: $GITHUB_EVENT_NAME" >&2
-            exit 1
-          fi
-          jq -cS --arg kind "$selection_kind" --arg resolution "$selection_resolution" \
-            --arg requested_ref "$REQUESTED_REF" '
-            {
-              kind: $kind,
-              resolution: $resolution,
-              requested_ref: (if $kind == "workflow_run" then null else $requested_ref end),
-              qualification_run_id: .id,
-              qualification_run_attempt: .run_attempt,
-              qualification_workflow_path: .path,
-              qualification_event: .event,
-              qualification_conclusion: .conclusion,
-              qualification_head_branch: .head_branch,
-              qualification_head_sha: .head_sha,
-              qualification_head_repository: .head_repository.full_name
-            }
-          ' "$quality_run" > "$source_selection"
-          proof="$RUNNER_TEMP/publisher-provenance.json"
-          provenance_args=(
-            .publisher-policy/scripts/release_promotion.py create-publisher-provenance
-            --repository "$GITHUB_REPOSITORY"
-            --workflow-event "$GITHUB_EVENT_NAME"
-            --workflow-run-id "$GITHUB_RUN_ID"
-            --run-attempt "$GITHUB_RUN_ATTEMPT"
-            --execution-head-sha "$EXECUTION_HEAD_SHA"
-            --source-commit "$SOURCE_COMMIT"
-            --source-selection "$source_selection"
-            --release-identity "$RUNNER_TEMP/published-release-identity.json"
-            --candidate-stage "$CANDIDATE_STAGE"
-            --output "$proof"
-          )
-          python3 "${provenance_args[@]}"
-          echo "publisher_provenance=$proof" >> "$GITHUB_OUTPUT"
+                .head_repository.full_name == $repo
+              ' "$result" >/dev/null
+            else
+              gh api --paginate \
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
+                jq -se --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
+                  [.[].workflow_runs[] | select(
+                    .path == ".github/workflows/quality.yml" and
+                    .event == "push" and .conclusion == "success" and
+                    .head_branch == "main" and .head_sha == $source and
+                    .head_repository.full_name == $repo and
+                    (.id | type == "number" and . > 0) and
+                    (.run_attempt | type == "number" and . > 0)
+                  )] | length >= 1
+                ' >/dev/null
+            fi
+          }
 
-      - name: Upload immutable release provenance
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-promotion-provenance-${{ needs.prepare.outputs.source_commit }}-attempt-${{ github.run_attempt }}
-          path: ${{ steps.publish.outputs.publisher_provenance }}
-          if-no-files-found: error
-          retention-days: 90
+          current_latest() {
+            gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" |
+              jq -er '.tag_name | select(test("^container-[0-9a-f]{40}$")) | sub("^container-"; "")'
+          }
+
+          verify_tag() {
+            gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/container-${SOURCE_COMMIT}" |
+              jq -e --arg source "$SOURCE_COMMIT" \
+                '.object.type == "commit" and .object.sha == $source' >/dev/null
+          }
+
+          verify_forward() {
+            local current="$1"
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+            git merge-base --is-ancestor "$current" "$SOURCE_COMMIT" || {
+              echo "Refusing to move main from a non-ancestor generation: ${current}" >&2
+              exit 1
+            }
+          }
+
+          inspect_release() {
+            gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" > "$release_api"
+            jq -e --arg tag "$release_tag" --arg source "$SOURCE_COMMIT" '
+              (.id | type == "number" and . > 0) and
+              .tag_name == $tag and .target_commitish == $source and
+              .prerelease == false and
+              (.draft | type == "boolean") and
+              ([.assets[].name] | length == (unique | length)) and
+              all(.assets[];
+                (.id | type == "number" and . > 0) and
+                .state == "uploaded" and
+                (.size | type == "number" and . > 0) and
+                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+              )
+            ' "$release_api" >/dev/null
+          }
+
+          verify_asset_set() {
+            local api="$1" require_complete="$2"
+            EXPECTED_ASSETS="$(printf '%s\n' "${expected_assets[@]}" | jq -R . | jq -sc .)" \
+              REQUIRE_COMPLETE="$require_complete" python3 - "$api" "$stage" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          api = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          root = pathlib.Path(sys.argv[2])
+          expected = set(json.loads(os.environ["EXPECTED_ASSETS"]))
+          assets = api.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("release assets are not an array")
+          names = [asset.get("name") for asset in assets]
+          if len(names) != len(set(names)) or not set(names) <= expected:
+              raise SystemExit("release contains duplicate or foreign assets")
+          if os.environ["REQUIRE_COMPLETE"] == "1" and set(names) != expected:
+              raise SystemExit("release asset set is incomplete")
+          for asset in assets:
+              name = asset["name"]
+              path = root / name
+              if not path.is_file() or path.is_symlink() or asset.get("size") != path.stat().st_size:
+                  raise SystemExit(f"release asset metadata differs: {name}")
+              expected_digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              if asset.get("digest") != expected_digest:
+                  raise SystemExit(f"release asset digest differs: {name}")
+          PY
+          }
+
+          compare_downloaded_assets() {
+            local root
+            root="$(mktemp -d "$RUNNER_TEMP/release-download.XXXXXX")"
+            trap 'rm -rf "$root"' RETURN
+            gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$root"
+            python3 - "$stage" "$root" <<'PY'
+          import filecmp
+          import os
+          import pathlib
+          import sys
+
+          expected = {entry.name for entry in os.scandir(sys.argv[1])}
+          actual = {entry.name for entry in os.scandir(sys.argv[2])}
+          if actual != expected:
+              raise SystemExit("downloaded release asset set differs")
+          for name in expected:
+              if not filecmp.cmp(
+                  pathlib.Path(sys.argv[1], name),
+                  pathlib.Path(sys.argv[2], name),
+                  shallow=False,
+              ):
+                  raise SystemExit(f"downloaded release asset differs: {name}")
+          PY
+            rm -rf "$root"
+            trap - RETURN
+          }
+
+          revalidate_quality
+          current="$(current_latest)"
+          verify_forward "$current"
+          scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"
+          verify_tag
+
+          if inspect_release 2>/dev/null; then
+            verify_asset_set "$release_api" 0
+            if jq -e '.draft == false' "$release_api" >/dev/null; then
+              verify_asset_set "$release_api" 1
+              compare_downloaded_assets
+            fi
+          else
+            gh release create "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_COMMIT" \
+              --verify-tag \
+              --draft \
+              --title "Agent Platform ${SOURCE_COMMIT:0:12}"
+            inspect_release
+          fi
+
+          declare -A existing=()
+          while IFS= read -r name; do existing["$name"]=1; done < <(jq -r '.assets[].name' "$release_api")
+          if jq -e '.draft == false' "$release_api" >/dev/null; then
+            [[ "${#existing[@]}" -eq "${#expected_assets[@]}" ]]
+          else
+            for asset in "${expected_assets[@]}"; do
+              [[ -n "${existing[$asset]:-}" ]] && continue
+              gh release upload "$release_tag" --repo "$GITHUB_REPOSITORY" "$stage/$asset"
+            done
+          fi
+
+          inspect_release
+          verify_asset_set "$release_api" 1
+          compare_downloaded_assets
+          jq -cS '{
+            id, tag_name, target_commitish, prerelease,
+            assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+          }' "$release_api" > "$RUNNER_TEMP/release-identity-before.json"
+          scripts/verify-release-images-anonymous.sh "$stage/release.json"
+
+          current="$(current_latest)"
+          verify_forward "$current"
+          verify_tag
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+          inspect_release
+          jq -e '.draft == false' "$release_api" >/dev/null
+          verify_asset_set "$release_api" 1
+          compare_downloaded_assets
+          jq -cS '{
+            id, tag_name, target_commitish, prerelease,
+            assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+          }' "$release_api" > "$RUNNER_TEMP/release-identity-after.json"
+          cmp "$RUNNER_TEMP/release-identity-before.json" "$RUNNER_TEMP/release-identity-after.json"
+          published="$(current_latest)"
+          [[ "$published" == "$SOURCE_COMMIT" ]] || {
+            echo "Main release did not advance to the candidate generation" >&2
+            exit 1
+          }
+          verify_tag
+          scripts/verify-release-images-anonymous.sh "$stage/release.json" || {
+            echo "CRITICAL: published release image verification failed" >&2
+            exit 1
+          }

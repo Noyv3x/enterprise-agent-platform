@@ -19,7 +19,6 @@ COMPONENTS = (
     "firecrawl-postgres",
     "firecrawl-rabbitmq",
     "firecrawl-redis",
-    "handoff-fs-helper",
     "platform",
     "searxng",
 )
@@ -80,8 +79,8 @@ fi
         self,
         images: dict[str, str],
         *,
-        schema_version: int = 1,
-        include_handoff: bool | None = None,
+        schema_version: int = 2,
+        include_unknown: bool = False,
         **environment: str,
     ) -> subprocess.CompletedProcess[str]:
         manifest = self.root / "release.json"
@@ -90,10 +89,8 @@ fi
             "protocol_version": schema_version,
             "images": images,
         }
-        if include_handoff is None:
-            include_handoff = schema_version == 1
-        if include_handoff:
-            value["namespace_handoff"] = {}
+        if include_unknown:
+            value["unexpected"] = {}
         manifest.write_text(json.dumps(value), encoding="utf-8")
         env = os.environ.copy()
         env.update(environment)
@@ -109,23 +106,17 @@ fi
             env=env,
         )
 
-    def test_exact_eleven_public_digests_are_verified_without_credentials(self) -> None:
+    def test_exact_ten_public_digests_are_verified_without_credentials(self) -> None:
         result = self.run_verifier(self.images())
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_schema_v2_verifies_exact_ten_and_rejects_helper_or_handoff(self) -> None:
-        images = self.images()
-        images.pop("handoff-fs-helper")
-        result = self.run_verifier(images, schema_version=2)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-        with_helper = self.images()
+    def test_rejects_wrong_schema_or_unknown_top_level_field(self) -> None:
         self.assertNotEqual(
-            self.run_verifier(with_helper, schema_version=2).returncode, 0
+            self.run_verifier(self.images(), schema_version=1).returncode, 0
         )
         self.assertNotEqual(
             self.run_verifier(
-                images, schema_version=2, include_handoff=True
+                self.images(), include_unknown=True
             ).returncode,
             0,
         )

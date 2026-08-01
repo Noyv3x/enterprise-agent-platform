@@ -36,11 +36,8 @@ jobs:
       - name: Validate canonical documentation
         run: python scripts/docs_sync.py check
 
-      - name: Enforce target-only production source boundary
-        run: >-
-          python scripts/verify_target_baseline_source.py
-          --root .
-          --contract docs/contracts/release-transition.json
+      - name: Enforce current production source boundary
+        run: python scripts/verify_current_source.py --root .
 
       - name: Validate pull request synchronization
         if: github.event_name == 'pull_request'
@@ -233,14 +230,7 @@ jobs:
         run: go vet ./...
 
       - name: Build manager
-        shell: bash
-        working-directory: .
-        run: |
-          set -euo pipefail
-          stage="$(jq -er '.stage | select(. == "bridge" or . == "cleanup" or . == "target_baseline")' docs/contracts/release-transition.json)"
-          command=./cmd/agent-platform-manager
-          [[ "$stage" == bridge ]] && command=./cmd/ubitech-manager
-          go -C manager build "$command"
+        run: go build ./cmd/agent-platform-manager
 
   container-definitions:
     name: Container definitions

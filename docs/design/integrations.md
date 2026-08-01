@@ -14,11 +14,7 @@
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
-- 当前 release manifest 只接受 schema 2 target-only 十镜像闭集，不包含迁移 helper 或交接描述符；历史镜像、目录、环境变量或终态 journal 都不能使已退役集成重新进入运行边界。
-
-### Bridge→Cleanup 历史集成交接证据（非当前接口）
-
-受控 Bridge→Cleanup 发布曾使用 source profile、身份 Router、`namespace_handoff`、handoff journal、helper 与签名 promotion receipt 完成一次性技术命名空间交接。这些字段和角色只作为历史供应链证据保留，当前 Manager 与集成适配器不解析、执行或恢复它们；详细历史流程见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)。
+- 当前 release manifest 只接受当前 schema 的十镜像闭集，不包含迁移 helper 或第二套技术身份；历史镜像、目录或环境变量不能使已退役集成重新进入运行边界。
 
 ## 模型 OAuth
 

@@ -58,7 +58,7 @@ select_path() {
     enterprise-agent-platform/frontend/*|enterprise-agent-platform/enterprise_agent_platform/static/*)
       selected[frontend]=1
       ;;
-    enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py|enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py)
+    enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py)
       select_full
       ;;
     enterprise-agent-platform/enterprise_agent_platform/server.py|enterprise-agent-platform/enterprise_agent_platform/service.py|enterprise-agent-platform/enterprise_agent_platform/runtimes.py|enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py)
@@ -127,11 +127,7 @@ run_manager() {
   cd "$ROOT/manager"
   go test ./...
   go vet ./...
-  local transition_stage manager_command
-  transition_stage="$($PYTHON_BIN -c 'import json; print(json.load(open("../docs/contracts/release-transition.json", encoding="utf-8"))["stage"])')"
-  manager_command=./cmd/agent-platform-manager
-  [[ "$transition_stage" == bridge ]] && manager_command=./cmd/ubitech-manager
-  go build "$manager_command"
+  go build -buildvcs=false ./cmd/agent-platform-manager
 }
 
 run_python() {

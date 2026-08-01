@@ -26,11 +26,9 @@ Docker network
 
 部署后的产品名称、标识图和其它品牌字段是 Platform 所有的展示数据，只能影响浏览器界面、通知、面向用户的 Agent 自称及其它明确的展示投影。管理员品牌字段不得派生或改写 Manager 二进制与 unit 名、配置和数据根、Compose project、网络、容器与 ownership label、环境变量、secret mount、Cookie、内部 API 路径、数据库 marker、workspace/session identity、包名或 release asset；这些对象属于发布协议和持久身份，不属于品牌。
 
-当前系统是单一 target-only 基线。运行时持久部署与内部协议身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根及其 `.agent-platform.lock` 单实例锁、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。Manager 和业务容器只接受编译期 target profile；当前启动、更新与恢复没有第二套 profile 选择或迁移执行分支。
+系统只有一个运行时与内部协议身份：`agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部目录。启动、安装、更新和恢复没有第二套 profile、旧路径发现或迁移执行分支。Manager 在 Platform 不可达或维护期间使用中性公共文案，不能为了读取展示品牌而依赖已停止的业务数据库。
 
-本次身份迁移只覆盖运行时持久部署对象和机器协议标识。源码仓库名、Python distribution/module 坐标（包括 `enterprise-agent-platform` 与 `enterprise_agent_platform`）以及 Go module/import 坐标不参与有状态迁移，也不是管理员品牌设置的投影；是否在未来重命名这些开发坐标属于独立、无状态的源码变更，不能与部署数据迁移混为一谈。
-
-已完成的 Bridge→Cleanup 两发布流程及其 source 名称、Router、coordinator、helper、journal、`target_ack` 和 `namespace_handoff` 只作为受控发布与审计证据保留在[部署文档](../operations/deployment.md#技术命名空间交接)和[自动更新文档](../operations/auto-update.md#技术命名空间迁移发布)中。它们不是当前 Manager、Platform 或 Runtime 的运行职责，也不能由普通启动或普通更新重新激活。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取展示品牌而依赖已停止的 Platform 数据库。
+源码仓库名、Python distribution/module 坐标和 Go module/import 坐标是开发坐标，不是管理员品牌设置的投影；其无状态重命名必须与持久部署协议分开评估。
 
 ## 管理平面
 
@@ -103,8 +101,6 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 
 管理器先验证 release manifest 并预拉取镜像，再等待 Platform 的全局自然空闲点。原子预约成功后入口切换为维护，旧 Platform 停止，数据库快照与迁移完成后启动新 generation；只有所有核心 readiness 通过才恢复业务。完整协议见[自动更新](../operations/auto-update.md)。
 
-Cleanup 之前的 Bridge→Cleanup 交接使用过独立于普通 generation operation 的 Router、coordinator、持久 helper、参与者、journal 和发布回执。该流程已经终结，相关状态机只保留为受控发布证据；当前二进制不包含其执行入口，后台循环也不取得 handoff lease 或扫描 source journal。历史状态机、恢复与 listener 证明见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)和[部署](../operations/deployment.md#技术命名空间交接)，不得从这些历史说明推导出当前运行能力。
-
 ## 故障边界
 
 - 两个可写 Platform generation 不能同时打开同一 SQLite。
@@ -112,8 +108,7 @@ Cleanup 之前的 Bridge→Cleanup 交接使用过独立于普通 generation ope
 - Platform 重启不应重复执行已经开始副作用的 job。
 - Runtime 重启通过幂等记录和会话日志区分可重放结果与 `needs_review`。
 - 管理器重启从 operation journal 和容器 label 对账，不从容器名称猜测状态。
-- target-only 启动只能使用编译期 target profile 和当前配置根；历史发布证据、旧目录、进程名或普通 operation 都不能改变技术身份。
-- 命名空间转换只改写机器拥有的路径引用、marker、协议键与 ownership metadata；用户消息、记忆、Skill、session 正文、附件内容和其它用户文本不做品牌或命名空间字符串替换。
+- 启动只能使用当前技术 profile 和配置根；旧目录、进程名或普通 operation 都不能改变技术身份。
 - 搜索、抓取、浏览器和 Cognee 失败只影响对应工具，不能破坏本地消息和知识数据。
 - 邮件轮询和回复通知失败只降级对应集成，不阻断对话；更新维护期间不启动新的邮件副作用或唤醒。
 - Run 空闲、模型轮次和 terminal 默认超时只在 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义；容器与更新状态只在 [`container-platform.json`](../contracts/container-platform.json) 定义。

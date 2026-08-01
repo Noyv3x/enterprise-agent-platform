@@ -350,7 +350,8 @@ func TestStartupOwnershipCommittedCandidateUsesFinalizeEvidenceNotMutableMetadat
 func TestStartupOwnershipRealPrepareMarkRestartUsesImmutableMetadataFields(t *testing.T) {
 	fixture := newStartupOwnershipFixture(t)
 	commit := strings.Repeat("6", 40)
-	manifest, server := startupOwnershipManifest(t, fixture.running, commit)
+	candidateBinary := append(append([]byte(nil), fixture.running...), []byte("\nAGENT-PLATFORM-STARTUP-PREPARE-"+commit+"\n")...)
+	manifest, server := startupOwnershipManifest(t, candidateBinary, commit)
 	defer server.Close()
 	fixture.manager.Client = release.Client{HTTP: server.Client()}
 	fixture.manager.Now = func() time.Time { return manifest.GeneratedAt }
@@ -434,7 +435,8 @@ func TestStartupOwnershipRecoveredCurrentCanRestartAndOwnNextRealPrepare(t *test
 	}
 
 	nextCommit := strings.Repeat("7", 40)
-	manifest, server := startupOwnershipManifest(t, running, nextCommit)
+	candidateBinary := append(append([]byte(nil), running...), []byte("\nAGENT-PLATFORM-RECOVERED-PREPARE-"+nextCommit+"\n")...)
+	manifest, server := startupOwnershipManifest(t, candidateBinary, nextCommit)
 	defer server.Close()
 	fixture.manager.Client = release.Client{HTTP: server.Client()}
 	t.Setenv(startupPrepareProbeEnvironment, "1")

@@ -18,9 +18,6 @@
 - [Runtime API](reference/runtime-api.md)
 - [数据目录](reference/data-layout.md)
 - [Runtime 精确策略契约](contracts/runtime-policy.json)
-- [技术命名空间发布转换契约](contracts/release-transition.json)
-- [发布转换部署 challenge 契约](contracts/release-transition-challenge.schema.json)
-- [发布转换部署回执契约](contracts/release-transition-receipt.schema.json)
 
 ## 运维
 

@@ -434,25 +434,6 @@ class ConfigFromEnvTests(unittest.TestCase):
                 self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
                 self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
 
-    def test_cleanup_transition_is_not_projected_into_platform_runtime(self):
-        repository_root = Path(__file__).resolve().parents[2]
-        contract = json.loads(
-            (repository_root / "docs/contracts/release-transition.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(contract["stage"], "cleanup")
-        self.assertEqual(
-            contract["predecessor_generation"],
-            "104e6c8c74c4027852c0efb1292ac11de687fcb1",
-        )
-        self.assertFalse(
-            (
-                repository_root
-                / "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py"
-            ).exists()
-        )
-
     def test_unknown_technical_profile_is_rejected(self):
         environments = (
             {
@@ -469,11 +450,11 @@ class ConfigFromEnvTests(unittest.TestCase):
                     ):
                         PlatformConfig.from_env(Path("/tmp"))
 
-    def test_target_profile_rejects_source_or_unbound_target_paths(self):
+    def test_target_profile_rejects_unbound_paths(self):
         for key, value in (
-            ("AGENT_PLATFORM_DATA", "/var/lib/ubitech-agent"),
-            ("AGENT_PLATFORM_MANAGER_SOCKET", "/run/ubitech-manager/manager.sock"),
-            ("AGENT_PLATFORM_MANAGER_TOKEN_FILE", "/run/secrets/manager-token"),
+            ("AGENT_PLATFORM_DATA", "/tmp/unmanaged-data"),
+            ("AGENT_PLATFORM_MANAGER_SOCKET", "/tmp/unmanaged-manager.sock"),
+            ("AGENT_PLATFORM_MANAGER_TOKEN_FILE", "/tmp/unmanaged-token"),
         ):
             with self.subTest(key=key):
                 environment = {

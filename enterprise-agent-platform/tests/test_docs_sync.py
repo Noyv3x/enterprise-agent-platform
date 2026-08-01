@@ -96,12 +96,7 @@ class DocsSyncTests(unittest.TestCase):
                 },
                 {
                     "id": "deployment",
-                    "documents": [
-                        "docs/design/deployment.md",
-                        "docs/contracts/release-transition.json",
-                        "docs/contracts/release-transition-challenge.schema.json",
-                        "docs/contracts/release-transition-receipt.schema.json",
-                    ],
+                    "documents": ["docs/design/deployment.md"],
                     "code": ["manager/**"],
                     "tests": [],
                 },
@@ -259,17 +254,6 @@ class DocsSyncTests(unittest.TestCase):
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
             "docs/contracts/technical-profiles.json": (
                 REPOSITORY_ROOT / "docs/contracts/technical-profiles.json"
-            ).read_text(encoding="utf-8"),
-            "docs/contracts/release-transition.json": (
-                REPOSITORY_ROOT / "docs/contracts/release-transition.json"
-            ).read_text(encoding="utf-8"),
-            "docs/contracts/release-transition-challenge.schema.json": (
-                REPOSITORY_ROOT
-                / "docs/contracts/release-transition-challenge.schema.json"
-            ).read_text(encoding="utf-8"),
-            "docs/contracts/release-transition-receipt.schema.json": (
-                REPOSITORY_ROOT
-                / "docs/contracts/release-transition-receipt.schema.json"
             ).read_text(encoding="utf-8"),
             "docs/contracts/container-platform.json": json.dumps(
                 {
@@ -510,41 +494,6 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("sync", expect=1)
         self.assertIn("0 <= minimum <= default <= maximum", result.stderr)
 
-    def test_release_transition_contract_and_receipt_schemas_fail_closed(self) -> None:
-        self.initialize_git()
-        self.write_fixture()
-        transition_path = self.root / "docs/contracts/release-transition.json"
-        transition = json.loads(transition_path.read_text(encoding="utf-8"))
-        transition["promotion"]["require_direct_predecessor"] = False
-        transition_path.write_text(json.dumps(transition), encoding="utf-8")
-        policy = self.run_command("sync", expect=1)
-        self.assertIn("direct-predecessor draft gates", policy.stderr)
-
-        self.write_fixture()
-        schema_path = (
-            self.root
-            / "docs/contracts/release-transition-receipt.schema.json"
-        )
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        schema["additionalProperties"] = True
-        schema_path.write_text(json.dumps(schema), encoding="utf-8")
-        schema_result = self.run_command("sync", expect=1)
-        self.assertIn("schema must describe a closed object", schema_result.stderr)
-
-    def test_release_transition_accepts_target_baseline_without_draft_gate(self) -> None:
-        self.initialize_git()
-        self.write_fixture()
-        transition_path = self.root / "docs/contracts/release-transition.json"
-        transition = json.loads(transition_path.read_text(encoding="utf-8"))
-        transition["stage"] = "target_baseline"
-        transition_path.write_text(json.dumps(transition), encoding="utf-8")
-        self.run_command("sync", expect=0)
-
-        transition["promotion"]["draft_stages"].append("target_baseline")
-        transition_path.write_text(json.dumps(transition), encoding="utf-8")
-        policy = self.run_command("sync", expect=1)
-        self.assertIn("direct-predecessor draft gates", policy.stderr)
-
     def test_technical_profiles_are_closed_and_generate_minimal_consumers(self) -> None:
         self.initialize_git()
         self.write_fixture()
@@ -591,41 +540,6 @@ class DocsSyncTests(unittest.TestCase):
         closed = self.run_command("sync", expect=1)
         self.assertIn("contains unknown keys: unknown", closed.stderr)
 
-    def test_technical_profile_ids_must_match_release_transition(self) -> None:
-        self.initialize_git()
-        self.write_fixture()
-        path = self.root / "docs/contracts/technical-profiles.json"
-        contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["profiles"]["target"]["profile_id"] = "different-platform-v1"
-        path.write_text(json.dumps(contract), encoding="utf-8")
-
-        result = self.run_command("sync", expect=1)
-
-        self.assertIn(
-            "technical-profiles target ID must match the release-transition contract",
-            result.stderr,
-        )
-
-    def test_release_transition_has_no_generated_runtime_projection(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        manifest["contracts"].append(  # type: ignore[index,union-attr]
-            {
-                "id": "release-transition",
-                "source": "docs/contracts/release-transition.json",
-                "domains": ["deployment", "platform"],
-                "targets": [
-                    {
-                        "path": "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py",
-                        "format": "python-release-transition",
-                    },
-                ],
-            }
-        )
-        self.write_fixture(manifest)
-        result = self.run_command("sync", expect=1)
-        self.assertIn("format is unsupported", result.stderr)
-
     def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:
         self.initialize_git()
         self.write_fixture()
@@ -641,25 +555,15 @@ class DocsSyncTests(unittest.TestCase):
             result.stderr,
         )
 
-    def test_container_contract_rejects_retired_runtime_handoff(self) -> None:
+    def test_container_contract_rejects_unknown_top_level_field(self) -> None:
         self.initialize_git()
         self.write_fixture()
         path = self.root / "docs/contracts/container-platform.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["agent_runtime_handoff"] = {}
+        contract["unexpected"] = {}
         path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
         result = self.run_command("sync", expect=1)
-        self.assertIn("contains unknown keys: agent_runtime_handoff", result.stderr)
-
-    def test_container_contract_rejects_retired_source_handoff(self) -> None:
-        self.initialize_git()
-        self.write_fixture()
-        path = self.root / "docs/contracts/container-platform.json"
-        contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["p1_source_handoff"] = {}
-        path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
-        result = self.run_command("sync", expect=1)
-        self.assertIn("contains unknown keys: p1_source_handoff", result.stderr)
+        self.assertIn("contains unknown keys: unexpected", result.stderr)
 
     def test_container_contract_capacity_change_drives_all_generated_targets(self) -> None:
         self.initialize_git()
@@ -1213,7 +1117,7 @@ class DocsSyncTests(unittest.TestCase):
             (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
         )
         governance = self.manifest_domain(manifest, "documentation-governance")
-        self.assertIn("scripts/**", governance["code"])
+        self.assertEqual(governance["code"], ["scripts/docs_sync.py"])
         self.assertIn(
             "enterprise-agent-platform/tests/test_docs_sync.py",
             governance["tests"],
@@ -1227,7 +1131,8 @@ class DocsSyncTests(unittest.TestCase):
         data = self.manifest_domain(manifest, "data-memory-sessions")
 
         self.assertIn("scripts/tests/**", manifest["coverage"]["code_exclude"])
-        self.assertIn("scripts/release_promotion.py", deployment["code"])
+        self.assertIn("scripts/assemble_release_manifest.py", deployment["code"])
+        self.assertIn("scripts/container-smoke.sh", deployment["code"])
         self.assertIn("scripts/tests/**", deployment["tests"])
         self.assertIn(
             "enterprise-agent-platform/tests/test_agent_scopes.py",

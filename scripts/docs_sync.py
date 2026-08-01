@@ -75,25 +75,10 @@ REQUIRED_CONTAINER_PLATFORM_TARGETS = {
     "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts": "typescript-container-platform",
     "enterprise-agent-platform/frontend/src/container-contract.generated.ts": "typescript-container-platform",
 }
-REQUIRED_RELEASE_TRANSITION_SOURCE = "docs/contracts/release-transition.json"
-REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA = (
-    "docs/contracts/release-transition-challenge.schema.json"
-)
-REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA = (
-    "docs/contracts/release-transition-receipt.schema.json"
-)
-REQUIRED_RELEASE_TRANSITION_DOCUMENTS = frozenset(
-    {
-        REQUIRED_RELEASE_TRANSITION_SOURCE,
-        REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA,
-        REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA,
-    }
-)
 REQUIRED_OWNED_CODE_PROBES = {
     ".gitignore": frozenset({"repository-development"}),
     ".github/workflows/quality.yml": frozenset({"repository-development"}),
     "scripts/docs_sync.py": frozenset({"documentation-governance"}),
-    "scripts/release.sh": frozenset({"documentation-governance"}),
     "enterprise-agent-platform/pyproject.toml": frozenset({"platform"}),
     "enterprise-agent-platform/enterprise_agent_platform/service.py": frozenset({"platform"}),
     "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": frozenset({"integrations"}),
@@ -239,8 +224,8 @@ def _read_json(path: Path, label: str) -> Any:
 def read_strict_json(path: Path, label: str) -> Any:
     """Read JSON while rejecting duplicate object members.
 
-    Release-transition inputs are signed or drive release visibility, so the
-    ordinary last-member-wins behavior of ``json.loads`` is not acceptable.
+    Signed and release-critical inputs cannot use the ordinary
+    last-member-wins behavior of ``json.loads``.
     """
 
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -282,7 +267,7 @@ def validate_closed_json_schema_instance(
     schema: Any,
     label: str,
 ) -> dict[str, Any]:
-    """Validate the closed Draft-2020-12 subset used by receipt contracts.
+    """Validate the closed Draft-2020-12 subset used by repository contracts.
 
     The field list and constraints remain in the canonical schema documents;
     this interpreter intentionally supports only their fail-closed subset.
@@ -337,87 +322,6 @@ def validate_closed_json_schema_instance(
                 raise DocsSyncError(f"{label} schema property {name} uses an unsupported format")
             _parse_rfc3339(item, f"{label}.{name}")
     return instance
-
-
-def validate_release_transition_contract(value: Any, label: str) -> dict[str, Any]:
-    contract = _expect_object(value, label)
-    _reject_unknown_keys(
-        contract,
-        {
-            "schema_version",
-            "transition_id",
-            "stage",
-            "predecessor_generation",
-            "source_profile_id",
-            "target_profile_id",
-            "manifest_protocol",
-            "promotion",
-            "deployment_receipt",
-        },
-        label,
-    )
-    required_keys = {
-        "schema_version", "transition_id", "stage", "predecessor_generation",
-        "source_profile_id", "target_profile_id", "manifest_protocol",
-        "promotion", "deployment_receipt",
-    }
-    if set(contract) != required_keys:
-        raise DocsSyncError(f"{label} must contain the complete closed transition contract")
-    if (
-        type(contract["schema_version"]) is not int
-        or contract["schema_version"] != 1
-        or contract["transition_id"] != "technical-namespace-v1"
-    ):
-        raise DocsSyncError(f"{label} has an unsupported schema or transition id")
-    if contract["stage"] not in {"bridge", "cleanup", "target_baseline"}:
-        raise DocsSyncError(
-            f"{label}.stage must be bridge, cleanup, or target_baseline"
-        )
-    if not isinstance(contract["predecessor_generation"], str) or re.fullmatch(r"[0-9a-f]{40}", contract["predecessor_generation"]) is None:
-        raise DocsSyncError(f"{label}.predecessor_generation must be a lowercase 40-character commit")
-    if contract["source_profile_id"] != "ubitech-agent-v1" or contract["target_profile_id"] != "agent-platform-v1":
-        raise DocsSyncError(f"{label} must bind the canonical source and target profiles")
-    protocol = _expect_object(contract["manifest_protocol"], f"{label}.manifest_protocol")
-    _reject_unknown_keys(protocol, {"ordinary_schema_version", "bridge_schema_version", "cleanup_schema_version"}, f"{label}.manifest_protocol")
-    expected_protocol = {
-        "ordinary_schema_version": 1,
-        "bridge_schema_version": 1,
-        "cleanup_schema_version": 2,
-    }
-    if json.dumps(protocol, sort_keys=True) != json.dumps(expected_protocol, sort_keys=True):
-        raise DocsSyncError(f"{label}.manifest_protocol must preserve the v1 ordinary/bridge and v2 cleanup barrier")
-    promotion = _expect_object(contract["promotion"], f"{label}.promotion")
-    _reject_unknown_keys(promotion, {"draft_stages", "require_direct_predecessor", "concurrency_group"}, f"{label}.promotion")
-    expected_promotion = {
-        "draft_stages": ["bridge", "cleanup"],
-        "require_direct_predecessor": True,
-        "concurrency_group": "container-channel-main",
-    }
-    if json.dumps(promotion, sort_keys=True) != json.dumps(expected_promotion, sort_keys=True):
-        raise DocsSyncError(f"{label}.promotion must preserve serialized direct-predecessor draft gates")
-    receipt = _expect_object(contract["deployment_receipt"], f"{label}.deployment_receipt")
-    _reject_unknown_keys(
-        receipt,
-        {
-            "schema_version", "algorithm", "canonicalization", "state_root",
-            "challenge_ttl_seconds", "receipt_ttl_seconds",
-            "source_owner_receipt_type", "target_commit_receipt_type",
-        },
-        f"{label}.deployment_receipt",
-    )
-    expected_receipt = {
-        "schema_version": 1,
-        "algorithm": "Ed25519",
-        "canonicalization": "RFC8785",
-        "state_root": "$XDG_STATE_HOME/agent-platform/release-transition",
-        "challenge_ttl_seconds": 300,
-        "receipt_ttl_seconds": 300,
-        "source_owner_receipt_type": "source_owner_ready",
-        "target_commit_receipt_type": "target_handoff_committed",
-    }
-    if json.dumps(receipt, sort_keys=True) != json.dumps(expected_receipt, sort_keys=True):
-        raise DocsSyncError(f"{label}.deployment_receipt does not match the one-time Ed25519 receipt policy")
-    return contract
 
 
 def _expect_object(value: Any, label: str) -> dict[str, Any]:
@@ -566,94 +470,6 @@ def load_manifest(root: Path) -> Manifest:
                 tests=tests,
             )
         )
-
-    deployment_domains = [domain for domain in domains if domain.identifier == "deployment"]
-    if len(deployment_domains) != 1:
-        raise DocsSyncError("manifest must define exactly one deployment domain")
-    missing_transition_documents = sorted(
-        REQUIRED_RELEASE_TRANSITION_DOCUMENTS
-        - set(deployment_domains[0].documents)
-    )
-    if missing_transition_documents:
-        raise DocsSyncError(
-            "deployment domain must own all release-transition contracts: "
-            + ", ".join(missing_transition_documents)
-        )
-    transition_path = _reject_symlink_chain(
-        root,
-        REQUIRED_RELEASE_TRANSITION_SOURCE,
-        "release-transition contract",
-    )
-    challenge_schema_path = _reject_symlink_chain(
-        root,
-        REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA,
-        "release-transition challenge schema",
-    )
-    receipt_schema_path = _reject_symlink_chain(
-        root,
-        REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA,
-        "release-transition receipt schema",
-    )
-    for path, label, relative in (
-        (transition_path, "release-transition contract", REQUIRED_RELEASE_TRANSITION_SOURCE),
-        (challenge_schema_path, "release-transition challenge schema", REQUIRED_RELEASE_TRANSITION_CHALLENGE_SCHEMA),
-        (receipt_schema_path, "release-transition receipt schema", REQUIRED_RELEASE_TRANSITION_RECEIPT_SCHEMA),
-    ):
-        _require_regular_file(path, label, relative)
-    transition_contract = validate_release_transition_contract(
-        read_strict_json(transition_path, "release-transition contract"),
-        "release-transition contract",
-    )
-    challenge_schema = read_strict_json(
-        challenge_schema_path,
-        "release-transition challenge schema",
-    )
-    receipt_schema = read_strict_json(
-        receipt_schema_path,
-        "release-transition receipt schema",
-    )
-    # Validate the schemas themselves through representative values derived
-    # from the transition contract. Runtime/CI consumers read these same files.
-    source_receipt_type = transition_contract["deployment_receipt"]["source_owner_receipt_type"]
-    sample_challenge = {
-        "schema_version": 1,
-        "transition_id": transition_contract["transition_id"],
-        "challenge_id": "challenge_" + "0" * 32,
-        "nonce": "A" * 43,
-        "receipt_type": source_receipt_type,
-        "deployment_id": "deployment",
-        "key_id": "primary",
-        "predecessor_generation": "0" * 40,
-        "candidate_generation": "1" * 40,
-        "expected_observed_generation": "0" * 40,
-        "expected_profile_id": transition_contract["source_profile_id"],
-        "expected_capability": "source_owner",
-        "expected_status": "idle",
-        "issued_at": "2026-01-01T00:00:00Z",
-        "expires_at": "2026-01-01T00:05:00Z",
-    }
-    validate_closed_json_schema_instance(sample_challenge, challenge_schema, "release-transition challenge")
-    sample_receipt = {
-        "schema_version": 1,
-        "transition_id": transition_contract["transition_id"],
-        "challenge_id": sample_challenge["challenge_id"],
-        "nonce": sample_challenge["nonce"],
-        "receipt_type": source_receipt_type,
-        "deployment_id": sample_challenge["deployment_id"],
-        "key_id": sample_challenge["key_id"],
-        "predecessor_generation": sample_challenge["predecessor_generation"],
-        "candidate_generation": sample_challenge["candidate_generation"],
-        "observed_generation": sample_challenge["expected_observed_generation"],
-        "profile_id": sample_challenge["expected_profile_id"],
-        "capability": sample_challenge["expected_capability"],
-        "status": sample_challenge["expected_status"],
-        "architecture": "amd64",
-        "manager_sha256": "2" * 64,
-        "evidence_sha256": "3" * 64,
-        "issued_at": sample_challenge["issued_at"],
-        "expires_at": sample_challenge["expires_at"],
-    }
-    validate_closed_json_schema_instance(sample_receipt, receipt_schema, "release-transition receipt")
 
     contracts_raw = raw.get("contracts")
     if not isinstance(contracts_raw, list) or not contracts_raw:
@@ -2216,22 +2032,6 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
         parsed = _validate_technical_profiles_contract(
             raw, f"contract {contract.identifier}"
         )
-        transition = validate_release_transition_contract(
-            _read_json(
-                _safe_path(root, REQUIRED_RELEASE_TRANSITION_SOURCE),
-                "release-transition contract",
-            ),
-            "release-transition contract",
-        )
-        if (
-            parsed["profiles"]["target"]["profile_id"]
-            != transition["target_profile_id"]
-        ):
-            raise DocsSyncError(
-                "technical-profiles target ID must match the release-transition contract"
-            )
-    elif contract.identifier == "release-transition":
-        parsed = validate_release_transition_contract(raw, f"contract {contract.identifier}")
     else:
         raise DocsSyncError(f"unsupported contract id: {contract.identifier}")
     rendered: dict[str, str] = {}

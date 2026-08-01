@@ -104,7 +104,7 @@ func TestDecodeManifestRejectsUnknownDuplicateAndRetiredFields(t *testing.T) {
 		payload string
 	}{
 		{name: "unknown", payload: strings.Replace(doc, "{", `{"unknown":true,`, 1)},
-		{name: "retired descriptor", payload: strings.Replace(doc, "{", `{"namespace_handoff":{},`, 1)},
+		{name: "unknown top-level field", payload: strings.Replace(doc, "{", `{"unexpected":{},`, 1)},
 		{name: "case variant", payload: strings.Replace(doc, `"schema_version"`, `"Schema_Version"`, 1)},
 		{name: "duplicate", payload: strings.Replace(doc, "{", `{"schema_version":2,`, 1)},
 		{name: "trailing", payload: doc + `{}`},

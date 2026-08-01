@@ -80,17 +80,13 @@ Platform 容器只接受 Manager 生成的 target-only 最小环境：
 - 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制；
 - `AGENT_PLATFORM_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`AGENT_PLATFORM_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
-这些字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。Cleanup 后 Platform 不读取旧环境前缀，也不提供双读或自动转换。
+这些字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。Platform 不读取其它环境前缀，也不提供双读或自动转换。
 
 Platform 命令行只有当前容器入口使用的 `serve --host --port --data`、无业务 writer 的 `migrate --data`，以及明确的管理子命令。子命令必须显式提供；监听地址不提供隐藏别名；未知参数必须由参数解析器直接拒绝，不能静默映射到另一套启动接口。
 
 若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
 
 Platform 的 SQLite 机器自有 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。其它前缀、旧键或混合键直接拒绝；Platform 不提供双读回退，也不会在启动或管理员更新时补写旧键。
-
-### Bridge→Cleanup 历史环境转换（非当前接口）
-
-受控 Bridge 发布曾把 `UBITECH_*`、`ENTERPRISE_*`、旧容器根和旧 SQLite 机器键一次性转换为上述 target 身份；Cleanup 已删除这些读取与转换分支。它们只作为[部署文档](../operations/deployment.md#技术命名空间交接)中的历史发布证据存在，不能由普通启动、更新、恢复、管理员配置或 release manifest 重新启用。
 
 ## Platform 动态设置
 

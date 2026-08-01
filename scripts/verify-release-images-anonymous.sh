@@ -12,7 +12,14 @@ if [[ ! -f "$manifest" || -L "$manifest" ]]; then
   exit 1
 fi
 
-schema_version="$(jq -er '.schema_version | select(. == 1 or . == 2)' "$manifest")"
+jq -e '
+  .schema_version == 2 and
+  .protocol_version == 2 and
+  ((keys - [
+    "schema_version", "channel", "source_commit", "generated_at",
+    "protocol_version", "database_schema_version", "manager", "compose", "images"
+  ]) | length == 0)
+' "$manifest" >/dev/null
 expected_components=(
   agent-runtime
   agent-sandbox
@@ -25,18 +32,6 @@ expected_components=(
   platform
   searxng
 )
-if [[ "$schema_version" == 1 ]]; then
-  expected_components+=(handoff-fs-helper)
-  jq -e '
-    .protocol_version == 1 and
-    (.namespace_handoff | type == "object")
-  ' "$manifest" >/dev/null
-else
-  jq -e '
-    .protocol_version == 2 and
-    (has("namespace_handoff") | not)
-  ' "$manifest" >/dev/null
-fi
 expected_json="$(printf '%s\n' "${expected_components[@]}" | jq -R . | jq -sc 'sort')"
 jq -e --argjson expected "$expected_json" '
   .images | type == "object" and

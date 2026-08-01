@@ -191,6 +191,33 @@ func newPreparedManager(t *testing.T) (*Manager, release.Manifest, []byte, *fake
 	return manager, manifest, oldBinary, runner
 }
 
+func newFreshInstalledManager(t *testing.T) (*Manager, release.Manifest, []byte, *fakeRunner) {
+	t.Helper()
+	commit := strings.Repeat("a", 40)
+	binary := []byte("#!/bin/sh\necho " + commit + "\n")
+	manifest, server := candidateManifest(t, binary)
+	t.Cleanup(server.Close)
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	install := filepath.Join(root, "bin", "agent-platform-manager")
+	if err := atomicfile.WriteFile(install, binary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{activeUnits: map[string]bool{}}
+	manager := &Manager{
+		Profile: testActiveProfile, Root: filepath.Join(root, "state", "binaries"),
+		StatePath: filepath.Join(root, "state", "manager-binaries.json"), InstallPath: install,
+		RunningVersion: commit, Client: release.Client{HTTP: server.Client()}, Runner: runner,
+		Now: func() time.Time { return time.Unix(10, 0) },
+	}
+	return manager, manifest, binary, runner
+}
+
 func ordinaryTestPlan(manager *Manager, manifest release.Manifest, state State, createdAt time.Time) Plan {
 	return Plan{
 		SchemaVersion: 1, PlanPath: filepath.Join(manager.Root, "activations", safeID(manifest.SourceCommit)+".json"),
@@ -243,6 +270,92 @@ func TestPrepareVerifiesButDoesNotActivateCandidate(t *testing.T) {
 		if metadata != *version {
 			t.Fatalf("Manager version metadata = %#v, want %#v", metadata, *version)
 		}
+	}
+}
+
+func TestPrepareRegistersMatchingFreshInstallAsInitialCurrent(t *testing.T) {
+	manager, manifest, binary, runner := newFreshInstalledManager(t)
+	if err := manager.Prepare(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedPath := filepath.Join(
+		manager.Root,
+		"versions",
+		safeID(manifest.Manager.Version+"-"+manifest.SourceCommit[:12]),
+		"agent-platform-manager",
+	)
+	if state.Current == nil || state.Current.Version != manifest.Manager.Version ||
+		state.Current.SourceCommit != manifest.SourceCommit || state.Current.Path != expectedPath ||
+		state.Current.SHA256 != sha256Hex(binary) || !state.Current.PlatformCommitted ||
+		state.Previous != nil || state.Candidate != nil || state.Activation != nil {
+		t.Fatalf("fresh install did not register one exact initial Current: %#v", state)
+	}
+	var metadata Version
+	if err := atomicfile.ReadJSON(filepath.Join(filepath.Dir(expectedPath), "metadata.json"), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata != *state.Current {
+		t.Fatalf("initial Current metadata = %#v, want %#v", metadata, *state.Current)
+	}
+	activationRoot := filepath.Join(manager.Root, "activations")
+	if _, err := os.Lstat(activationRoot); !os.IsNotExist(err) {
+		t.Fatalf("fresh install created an activation directory: %v", err)
+	}
+
+	before := state
+	if err := manager.MarkPlatformCommitted(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Activate(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := manager.ActivationCommitted(manifest); err != nil || !committed {
+		t.Fatalf("initial Current did not satisfy the no-activation commit barrier: committed=%v err=%v", committed, err)
+	}
+	if rolledBack, err := manager.ActivationRolledBack(manifest); err != nil || rolledBack {
+		t.Fatalf("initial Current was classified as rolled back: rolledBack=%v err=%v", rolledBack, err)
+	}
+	if err := manager.Prepare(context.Background(), manifest); err != nil {
+		t.Fatalf("idempotent initial Current prepare failed: %v", err)
+	}
+	after, err := manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("idempotent initial Current prepare changed state: before=%#v after=%#v", before, after)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("fresh install used a watchdog or service action: %#v", runner.calls)
+	}
+}
+
+func TestPrepareRejectsSameChecksumWithConflictingIdentity(t *testing.T) {
+	manager, manifest, _, _ := newFreshInstalledManager(t)
+	if err := manager.Prepare(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	before, err := manager.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicting := manifest
+	conflicting.SourceCommit = strings.Repeat("b", 40)
+	conflicting.Manager.Version = conflicting.SourceCommit
+	err = manager.Prepare(context.Background(), conflicting)
+	if err == nil || !strings.Contains(err.Error(), "registered Manager Current conflicts with the release artifact identity") {
+		t.Fatalf("same-checksum conflicting release identity was accepted: %v", err)
+	}
+	after, readErr := manager.State()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected same-checksum identity changed state: before=%#v after=%#v", before, after)
 	}
 }
 

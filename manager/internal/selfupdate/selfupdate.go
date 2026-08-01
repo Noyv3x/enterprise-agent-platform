@@ -196,6 +196,29 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if !ok {
 		return errors.New("manager artifact is missing")
 	}
+	state, err := m.load()
+	if err != nil {
+		return err
+	}
+	if state.Current != nil && (state.Current.SourceCommit == manifest.SourceCommit || strings.EqualFold(state.Current.SHA256, artifact.SHA256)) {
+		current := *state.Current
+		if state.Candidate != nil || state.Activation != nil || current.SourceCommit != manifest.SourceCommit ||
+			current.Version != manifest.Manager.Version || !strings.EqualFold(current.SHA256, artifact.SHA256) ||
+			!current.PlatformCommitted || current.VerifiedAt.IsZero() {
+			return errors.New("registered Manager Current conflicts with the release artifact identity")
+		}
+		if err := m.validateStartupVersionArtifact(current, "Current"); err != nil {
+			return fmt.Errorf("validate existing Manager Current: %w", err)
+		}
+		installPath, pathErr := m.installPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		if !binaryMatches(installPath, current.SHA256) || m.RunningVersion != current.Version {
+			return errors.New("running Manager does not match the registered release Current")
+		}
+		return nil
+	}
 	data, err := m.Client.FetchArtifact(ctx, artifact, 128<<20)
 	if err != nil {
 		return err
@@ -226,11 +249,30 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if reportedVersion != manifest.Manager.Version {
 		return fmt.Errorf("staged manager version %q does not match release version %q", reportedVersion, manifest.Manager.Version)
 	}
-	state, err := m.load()
-	if err != nil {
-		return err
-	}
 	if state.Current == nil {
+		if state.Previous != nil || state.Candidate != nil || state.Activation != nil {
+			return errors.New("initial Manager Current state contains conflicting activation references")
+		}
+		installPath, pathErr := m.installPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		stableSHA, hashErr := fileSHA256(installPath)
+		if hashErr != nil {
+			return fmt.Errorf("inspect stable Manager before initial registration: %w", hashErr)
+		}
+		if strings.EqualFold(stableSHA, candidate.SHA256) {
+			if m.RunningVersion != candidate.Version {
+				return errors.New("stable Manager matches the release checksum but its running version differs")
+			}
+			candidate.PlatformCommitted = true
+			if err := m.ensureVersionMetadata(candidate); err != nil {
+				return fmt.Errorf("record initial Manager Current metadata: %w", err)
+			}
+			state.Current = &candidate
+			state.UpdatedAt = m.now()
+			return atomicfile.WriteJSON(m.StatePath, state, 0o600)
+		}
 		current, backupErr := m.backupRunningVersion()
 		if backupErr != nil {
 			return backupErr

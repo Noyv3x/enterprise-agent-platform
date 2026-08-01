@@ -61,7 +61,7 @@
         "docs/domains.json"
       ],
       "code": [
-        "scripts/**"
+        "scripts/docs_sync.py"
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_docs_sync.py"
@@ -76,6 +76,7 @@
       "code": [
         ".gitignore",
         ".github/**",
+        "scripts/python_test_shard.py",
         "scripts/test.sh"
       ],
       "tests": []
@@ -84,15 +85,18 @@
       "id": "deployment",
       "documents": [
         "docs/operations/deployment.md",
-        "docs/operations/auto-update.md",
-        "docs/contracts/release-transition.json",
-        "docs/contracts/release-transition-challenge.schema.json",
-        "docs/contracts/release-transition-receipt.schema.json"
+        "docs/operations/auto-update.md"
       ],
       "code": [
         "manager/**",
         "containers/**",
-        "scripts/release_promotion.py",
+        "scripts/assemble_release_manifest.py",
+        "scripts/browser-control-compose-smoke.py",
+        "scripts/container-smoke.sh",
+        "scripts/ensure-release-candidate-tag.sh",
+        "scripts/fixtures/**",
+        "scripts/verify-release-images-anonymous.sh",
+        "scripts/verify_current_source.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py"
@@ -252,15 +256,6 @@
     }
   ],
   "contracts": [
-    {
-      "id": "release-transition",
-      "source": "docs/contracts/release-transition.json",
-      "domains": [
-        "deployment",
-        "platform"
-      ],
-      "targets": []
-    },
     {
       "id": "container-platform",
       "source": "docs/contracts/container-platform.json",
