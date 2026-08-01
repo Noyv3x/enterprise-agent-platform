@@ -9,10 +9,7 @@ import (
 )
 
 func TestManagerUsesVerifiedTargetTechnicalProfile(t *testing.T) {
-	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
-	if err != nil {
-		t.Fatal(err)
-	}
+	active := identity.CompileTimeActiveProfile()
 	manager := &Manager{Profile: active}
 	if err := manager.ValidateTechnicalProfile(); err != nil {
 		t.Fatal(err)
@@ -40,16 +37,13 @@ func TestManagerRejectsMissingTechnicalProfile(t *testing.T) {
 }
 
 func TestSelfUpdateManifestValidationUsesTheRoutedProfile(t *testing.T) {
-	target, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
-	if err != nil {
-		t.Fatal(err)
-	}
+	target := identity.CompileTimeActiveProfile()
 	manifest := releasetest.NewTarget(strings.Repeat("a", 40)).Manifest
 	if err := validateSelfUpdateManifest(target, manifest); err != nil {
 		t.Fatalf("routed target rejected schema 2 Candidate: %v", err)
 	}
-	if err := validateSelfUpdateManifest(identity.SourceActiveProfile(), manifest); err == nil ||
-		!strings.Contains(err.Error(), "verified target technical profile") {
-		t.Fatalf("routed source accepted schema 2 Candidate: %v", err)
+	if err := validateSelfUpdateManifest(identity.ActiveProfile{}, manifest); err == nil ||
+		!strings.Contains(err.Error(), "technical profile") {
+		t.Fatalf("missing technical identity accepted target Candidate: %v", err)
 	}
 }

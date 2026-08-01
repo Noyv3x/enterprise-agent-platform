@@ -29,22 +29,10 @@ const (
 	recoveryIdentityChecks = 7
 )
 
-// RecoverCurrentWithAuthorityTransfer acquires recovery.lock while the caller
-// still owns its retained handoff observation. transfer must re-read and close
-// that same observation; only after it succeeds may recovery proceed while
-// holding recovery.lock alone. This is the deliberately external escape hatch
-// for a Current Manager which cannot stay alive long enough to self-update;
-// normal updates use Prepare/Activate and the independent watchdog. The
-// mandatory callback makes the global handoff -> recovery lock order part of
-// the production API rather than a caller convention.
-func (m *Manager) RecoverCurrentWithAuthorityTransfer(
-	ctx context.Context,
-	executablePath, platformStatePath, expectedSHA256 string,
-	transfer func() error,
-) error {
-	if transfer == nil {
-		return errors.New("external recovery requires a retained handoff authority transfer")
-	}
+// RecoverCurrent is the deliberately external escape hatch for a Current
+// Manager which cannot stay alive long enough to self-update. Normal updates
+// use Prepare/Activate and the independent watchdog.
+func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformStatePath, expectedSHA256 string) error {
 	if !validSHA256(expectedSHA256) {
 		return errors.New("expected Manager SHA-256 must be 64 lowercase hexadecimal characters")
 	}
@@ -110,12 +98,6 @@ func (m *Manager) RecoverCurrentWithAuthorityTransfer(
 	}
 	if !pathWithin(filepath.Join(m.Root, "versions"), oldCurrent.Path) {
 		return errors.New("registered Current Manager path is outside the Manager versions directory")
-	}
-	if transfer != nil {
-		if err := transfer(); err != nil {
-			return fmt.Errorf("transfer handoff authority to external recovery ownership: %w", err)
-		}
-		transfer = nil
 	}
 	activationRequest := recoveryActivationRequest{
 		executablePath:    executablePath,

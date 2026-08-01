@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,34 +15,6 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
-func TestBackgroundProcessCompletionFailsClosedBeforeObservableMutation(t *testing.T) {
-	admissionCalls := 0
-	manager := &ProcessManager{BackgroundAdmission: func(context.Context) (func(), error) {
-		admissionCalls++
-		return nil, errors.New("namespace handoff is active")
-	}}
-	ctx, cancel := context.WithCancel(context.Background())
-	command := exec.CommandContext(ctx, "/bin/true")
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	process := &managedProcess{
-		snapshot: ProcessSnapshot{ID: "proc_background", Status: "running", Background: true, StartedAt: time.Now().UTC()},
-		command:  command, cancel: cancel, context: ctx,
-		stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
-	}
-	manager.wait(process)
-	process.mu.Lock()
-	status, finished := process.snapshot.Status, process.snapshot.FinishedAt
-	process.mu.Unlock()
-	if admissionCalls != 1 {
-		t.Fatalf("background completion admission calls = %d, want 1", admissionCalls)
-	}
-	if status != "running" || finished != nil {
-		t.Fatalf("background completion crossed denied handoff admission: status=%q finished=%v", status, finished)
-	}
-}
-
 func TestPreviewRevisionIsOpaqueAndChangesAcrossManagerRestart(t *testing.T) {
 	root := t.TempDir()
 	engine := localSandboxEngine{}
@@ -52,7 +23,7 @@ func TestPreviewRevisionIsOpaqueAndChangesAcrossManagerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10, openBackgroundMutationAdmission)
+	first, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +39,7 @@ func TestPreviewRevisionIsOpaqueAndChangesAcrossManagerRestart(t *testing.T) {
 	if otherScope["unchanged"] == true || otherScope["revision"] == firstRevision {
 		t.Fatalf("preview cursor was reusable across scopes: %#v", otherScope)
 	}
-	second, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10, openBackgroundMutationAdmission)
+	second, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +252,7 @@ func TestHostWorkingDirectoryFDStaysPinnedAfterPathReplacement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "marker.txt"), []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command("/bin/sh", "-c", hostProcessWrapper, "ubitech-manager", "cat marker.txt")
+	command := exec.Command("/bin/sh", "-c", hostProcessWrapper, "agent-platform-manager", "cat marker.txt")
 	command.Dir = string(filepath.Separator)
 	command.ExtraFiles = []*os.File{directory}
 	output, err := command.CombinedOutput()
@@ -378,7 +349,7 @@ func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10, openBackgroundMutationAdmission)
+	first, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +374,7 @@ func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
 	// Constructing a second manager simulates service restart: it has no docker
 	// attach handle or in-memory command, only the durable process record/PID and
 	// output files.
-	second, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10, openBackgroundMutationAdmission)
+	second, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
 	if err != nil {
 		t.Fatal(err)
 	}

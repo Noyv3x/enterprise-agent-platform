@@ -7,10 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db import Database, now_ts
-from .technical_profile import select_technical_profile
-
-
-_IMPORT_TECHNICAL_PROFILE = select_technical_profile()
 
 
 def _resolve_max_content_chars() -> int:
@@ -21,10 +17,7 @@ def _resolve_max_content_chars() -> int:
     pathologically large docs cannot bloat the FTS index or Cognee ingestion.
     A value <= 0 disables the limit.
     """
-    environment_variable = _IMPORT_TECHNICAL_PROFILE.environment_variable(
-        "ENTERPRISE_KB_MAX_CONTENT_CHARS"
-    )
-    raw = os.getenv(environment_variable, "").strip()
+    raw = os.getenv("AGENT_PLATFORM_KB_MAX_CONTENT_CHARS", "").strip()
     if not raw:
         return 2_000_000
     try:

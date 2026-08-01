@@ -24,6 +24,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 type activationTakeoverRunner struct {
@@ -167,10 +168,10 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 			t.Fatal(err)
 		}
 	}
-	currentPath := filepath.Join(currentDir, "ubitech-manager")
-	candidatePath := filepath.Join(candidateDir, "ubitech-manager")
-	fixture.stablePath = filepath.Join(binDir, "ubitech-manager")
-	fixture.executablePath = filepath.Join(downloadDir, "ubitech-manager")
+	currentPath := filepath.Join(currentDir, "agent-platform-manager")
+	candidatePath := filepath.Join(candidateDir, "agent-platform-manager")
+	fixture.stablePath = filepath.Join(binDir, "agent-platform-manager")
+	fixture.executablePath = filepath.Join(downloadDir, "agent-platform-manager")
 	for path, data := range map[string][]byte{
 		currentPath:            fixture.currentBinary,
 		candidatePath:          fixture.candidateBinary,
@@ -204,7 +205,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		InstallPath:      fixture.stablePath,
 		SocketPath:       "",
 		ControlTokenFile: fixture.tokenPath,
-		UnitName:         "ubitech-agent-manager.service",
+		UnitName:         "agent-platform-manager.service",
 		CandidateVersion: fixture.candidateCommit,
 		CandidateSHA:     fixture.candidateSHA,
 		CandidatePath:    candidatePath,
@@ -234,23 +235,13 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		UpdatedAt: completedAt,
 	}
 
-	images := activationTakeoverImages()
-	fixture.originalManifest = release.Manifest{
-		SchemaVersion:         contract.SchemaVersion,
-		Channel:               contract.ReleaseChannel,
-		SourceCommit:          fixture.candidateCommit,
-		GeneratedAt:           createdAt,
-		ProtocolVersion:       contract.SchemaVersion,
-		DatabaseSchemaVersion: contract.DatabaseSchemaVersion,
-		Manager: release.ManagerRelease{
-			Version: fixture.candidateCommit,
-			Artifacts: map[string]release.Artifact{
-				runtime.GOARCH: {URL: "http://127.0.0.1/manager", SHA256: fixture.candidateSHA},
-			},
-		},
-		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("a", 64)},
-		Images:  images,
-	}
+	fixture.originalManifest = releasetest.NewTarget(
+		fixture.candidateCommit,
+		releasetest.WithGeneratedAt(createdAt),
+		releasetest.WithManagerBinary("amd64", fixture.candidateBinary),
+		releasetest.WithManagerBinary("arm64", fixture.candidateBinary),
+	).Manifest
+	images := fixture.originalManifest.Images
 	rollbackSnapshot := filepath.Join(stateDir, "backups", "before-X")
 	fixture.originalPlatform = model.NewState(createdAt)
 	fixture.originalPlatform.Generation = 43898
@@ -343,7 +334,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		InstallPath:              fixture.stablePath,
 		SocketPath:               socketPath,
 		ControlTokenFile:         fixture.tokenPath,
-		UnitName:                 "ubitech-agent-manager.service",
+		UnitName:                 "agent-platform-manager.service",
 		RunningVersion:           fixture.recoveryCommit,
 		Runner:                   fixture.runner,
 		Now:                      func() time.Time { return completedAt.Add(time.Second) },
@@ -381,7 +372,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		defer fixture.mu.Unlock()
 		fixture.watchdogChecks++
 		if unit != testTechnicalProfile.RecoveryWatchdogUnitPrefix+fixture.recoverySHA[:12] ||
-			immutablePath != filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.recoverySHA[:12], "ubitech-manager") ||
+			immutablePath != filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.recoverySHA[:12], "agent-platform-manager") ||
 			expectedSHA != fixture.recoverySHA || planPath != fixture.manager.currentRecoveryPlanPath(fixture.candidateCommit, fixture.recoverySHA) {
 			return errors.New("unexpected recovery watchdog process identity")
 		}
@@ -2261,17 +2252,7 @@ func activationTakeoverSHA(data []byte) string {
 }
 
 func activationTakeoverImages() map[string]string {
-	names := []string{
-		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis",
-		"firecrawl-rabbitmq", "handoff-fs-helper",
-	}
-	images := make(map[string]string, len(names))
-	for index, name := range names {
-		digit := "abcdef0123456789"[index%16]
-		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(string(digit), 64)
-	}
-	return images
+	return releasetest.NewTarget(strings.Repeat("a", 40)).Manifest.Images
 }
 
 func activationTakeoverArtifacts(source map[string]release.Artifact) map[string]release.Artifact {
