@@ -40,12 +40,22 @@ from PIL import Image, UnidentifiedImageError
 
 from .auth import TokenSigner, hash_password, verify_password
 from .agent_inputs import AgentRunInput, AgentRunInputStore
-from .agent_scopes import AgentExecutionScope, AgentScopeManager
+from .agent_scopes import (
+    AgentExecutionScope,
+    AgentScopeManager,
+    assert_existing_workspace_profile,
+)
 from .camofox_state import ensure_camofox_runtime_sidecar
 from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .container_contract_generated import CONTAINER_PATHS, DATABASE_SCHEMA_VERSION
-from .db import Database, decode_json, encode_json, now_ts
+from .db import (
+    Database,
+    assert_existing_database_profile,
+    decode_json,
+    encode_json,
+    now_ts,
+)
 from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
     RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
@@ -94,6 +104,7 @@ from .memory_security import (
     normalize_memory_tags,
     validate_memory_content,
 )
+from .technical_profile import select_technical_profile
 from .manager_client import ManagerClient, ManagerClientError
 from .model_catalog import MODEL_CATALOG_CACHE_SETTING, ModelCatalogManager
 from .oauth_flows import (
@@ -108,7 +119,6 @@ from .oauth_flows import (
     oauth_provider_info,
 )
 from .prompt_security import format_untrusted_context_data
-from .release_transition_contract_generated import SOURCE_OWNER_COMPAT_GENERATION
 from .runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
     AGENT_SETTING_MAX_CONCURRENCY,
@@ -130,6 +140,10 @@ from .secure_fs import (
     UnsafePrivatePathError,
     copy_private_file_exclusive,
     ensure_private_directory,
+    open_private_directory_fd,
+    open_private_file_fd_at,
+    verify_private_directory_path_fd,
+    verify_private_file_fd_at,
     write_private_file_below_exclusive,
     write_private_file_exclusive,
 )
@@ -141,6 +155,14 @@ class ServiceError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def _close_instance_lock_descriptors(lock_fd: int, directory_fd: int) -> None:
+    for fd in (lock_fd, directory_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 class _AgentTaskCancelled(Exception):
@@ -207,26 +229,82 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+_IMPORT_TECHNICAL_PROFILE = select_technical_profile()
+
+
+def _profile_env(source_name: str) -> str:
+    return _IMPORT_TECHNICAL_PROFILE.environment_variable(source_name)
+
+
+def _ensure_profile_camofox_runtime_sidecar(
+    config: PlatformConfig,
+    *,
+    commit_schema_upgrade: bool,
+) -> Path:
+    """Keep the established source-profile helper call shape stable."""
+
+    if config.technical_profile.is_target:
+        return ensure_camofox_runtime_sidecar(
+            config.data_dir,
+            commit_schema_upgrade=commit_schema_upgrade,
+            technical_profile_value=config.technical_profile,
+        )
+    return ensure_camofox_runtime_sidecar(
+        config.data_dir,
+        commit_schema_upgrade=commit_schema_upgrade,
+    )
+
+
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 MAX_ATTACHMENTS_TOTAL_BYTES = max(
     MAX_ATTACHMENT_BYTES,
-    int(os.getenv("ENTERPRISE_MAX_ATTACHMENTS_TOTAL_BYTES", str(100 * 1024 * 1024)) or "0"),
+    int(
+        os.getenv(
+            _profile_env("ENTERPRISE_MAX_ATTACHMENTS_TOTAL_BYTES"),
+            str(100 * 1024 * 1024),
+        )
+        or "0"
+    ),
 )
 # Cumulative per-uploader storage budget for attachment blobs. Bounds deliberate
 # or accidental disk exhaustion by any authenticated chat/private-agent user.
 # 0 disables the quota.
-ATTACHMENT_QUOTA_BYTES = max(0, int(os.getenv("ENTERPRISE_ATTACHMENT_QUOTA_BYTES", str(2 * 1024 * 1024 * 1024)) or "0"))
+ATTACHMENT_QUOTA_BYTES = max(
+    0,
+    int(
+        os.getenv(
+            _profile_env("ENTERPRISE_ATTACHMENT_QUOTA_BYTES"),
+            str(2 * 1024 * 1024 * 1024),
+        )
+        or "0"
+    ),
+)
 GLOBAL_ATTACHMENT_QUOTA_BYTES = max(
     0,
-    int(os.getenv("ENTERPRISE_GLOBAL_ATTACHMENT_QUOTA_BYTES", str(10 * 1024 * 1024 * 1024)) or "0"),
+    int(
+        os.getenv(
+            _profile_env("ENTERPRISE_GLOBAL_ATTACHMENT_QUOTA_BYTES"),
+            str(10 * 1024 * 1024 * 1024),
+        )
+        or "0"
+    ),
 )
 # Sliding-window per-user upload rate limit. Caps how many attachment-bearing
 # messages a single user can send within the window, providing lightweight
 # backpressure against storage floods. Only messages that carry attachments are
 # counted, so ordinary chat is unaffected. 0 disables the limiter.
-UPLOAD_RATE_LIMIT_WINDOW_SECONDS = max(1, int(os.getenv("ENTERPRISE_UPLOAD_RATE_WINDOW_SECONDS", "60") or "60"))
-MAX_UPLOADS_PER_WINDOW = max(0, int(os.getenv("ENTERPRISE_MAX_UPLOADS_PER_WINDOW", "30") or "0"))
+UPLOAD_RATE_LIMIT_WINDOW_SECONDS = max(
+    1,
+    int(
+        os.getenv(_profile_env("ENTERPRISE_UPLOAD_RATE_WINDOW_SECONDS"), "60")
+        or "60"
+    ),
+)
+MAX_UPLOADS_PER_WINDOW = max(
+    0,
+    int(os.getenv(_profile_env("ENTERPRISE_MAX_UPLOADS_PER_WINDOW"), "30") or "0"),
+)
 MIN_PASSWORD_LENGTH = 8
 BOOTSTRAP_ADMIN_PASSWORD_FILE = "bootstrap-admin-password.txt"
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
@@ -279,7 +357,13 @@ EMPTY_TERMINAL_PREVIEW_REVISION = "preview_none:0"
 # distinct conversations from exhausting host threads and sockets.
 MAX_CONCURRENT_AGENT_RUNS = max(
     1,
-    min(64, int(os.getenv("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS", "8") or "8")),
+    min(
+        64,
+        int(
+            os.getenv(_profile_env("ENTERPRISE_MAX_CONCURRENT_AGENT_RUNS"), "8")
+            or "8"
+        ),
+    ),
 )
 # Cognee ingestion is heavy; it runs on a background worker so document creation
 # never blocks the request thread (and, via the DB, every other request).
@@ -288,27 +372,63 @@ MAX_TRACKED_INGEST_RESULTS = 1000
 # Bounded retry for transient Cognee ingest failures. A failed job is re-queued
 # with a short capped backoff up to this many attempts before it is dropped and
 # counted as a permanent failure (surfaced in knowledge_status).
-MAX_INGEST_ATTEMPTS = max(1, int(os.getenv("ENTERPRISE_INGEST_MAX_ATTEMPTS", "3") or "3"))
+MAX_INGEST_ATTEMPTS = max(
+    1,
+    int(os.getenv(_profile_env("ENTERPRISE_INGEST_MAX_ATTEMPTS"), "3") or "3"),
+)
 INGEST_RETRY_BACKOFF_CAP_SECONDS = 30
-AGENT_JOB_LEASE_SECONDS = max(60, int(os.getenv("ENTERPRISE_AGENT_JOB_LEASE_SECONDS", "3600") or "3600"))
-COGNEE_JOB_LEASE_SECONDS = max(60, int(os.getenv("ENTERPRISE_COGNEE_JOB_LEASE_SECONDS", "3600") or "3600"))
-TELEGRAM_LINK_TTL_SECONDS = max(60, min(int(os.getenv("ENTERPRISE_TELEGRAM_LINK_TTL_SECONDS", "600") or "600"), 3600))
+AGENT_JOB_LEASE_SECONDS = max(
+    60,
+    int(os.getenv(_profile_env("ENTERPRISE_AGENT_JOB_LEASE_SECONDS"), "3600") or "3600"),
+)
+COGNEE_JOB_LEASE_SECONDS = max(
+    60,
+    int(os.getenv(_profile_env("ENTERPRISE_COGNEE_JOB_LEASE_SECONDS"), "3600") or "3600"),
+)
+TELEGRAM_LINK_TTL_SECONDS = max(
+    60,
+    min(
+        int(os.getenv(_profile_env("ENTERPRISE_TELEGRAM_LINK_TTL_SECONDS"), "600") or "600"),
+        3600,
+    ),
+)
 TELEGRAM_DELIVERY_JOB_KIND = "telegram_delivery"
 TELEGRAM_DELIVERY_LEASE_SECONDS = max(
-    60, int(os.getenv("ENTERPRISE_TELEGRAM_DELIVERY_LEASE_SECONDS", "600") or "600")
+    60,
+    int(
+        os.getenv(
+            _profile_env("ENTERPRISE_TELEGRAM_DELIVERY_LEASE_SECONDS"), "600"
+        )
+        or "600"
+    ),
 )
 TELEGRAM_DELIVERY_POLL_SECONDS = max(
-    0.05, min(_float_env("ENTERPRISE_TELEGRAM_DELIVERY_POLL_SECONDS", 0.2), 2.0)
+    0.05,
+    min(
+        _float_env(
+            _profile_env("ENTERPRISE_TELEGRAM_DELIVERY_POLL_SECONDS"), 0.2
+        ),
+        2.0,
+    ),
 )
 MAIL_DELIVERY_JOB_KIND = "mail_delivery"
 MAIL_DELIVERY_LEASE_SECONDS = max(
-    60, int(os.getenv("ENTERPRISE_MAIL_DELIVERY_LEASE_SECONDS", "300") or "300")
+    60,
+    int(
+        os.getenv(_profile_env("ENTERPRISE_MAIL_DELIVERY_LEASE_SECONDS"), "300")
+        or "300"
+    ),
 )
 MAIL_POLL_MAX_SECONDS = max(
-    1.0, min(_float_env("ENTERPRISE_MAIL_POLL_MAX_SECONDS", 15.0), 60.0)
+    1.0,
+    min(_float_env(_profile_env("ENTERPRISE_MAIL_POLL_MAX_SECONDS"), 15.0), 60.0),
 )
 SCHEDULE_POLL_MAX_SECONDS = max(
-    0.2, min(_float_env("ENTERPRISE_SCHEDULE_POLL_MAX_SECONDS", 30.0), 60.0)
+    0.2,
+    min(
+        _float_env(_profile_env("ENTERPRISE_SCHEDULE_POLL_MAX_SECONDS"), 30.0),
+        60.0,
+    ),
 )
 SCHEDULE_DISPATCH_RETRY_SECONDS = 60
 SCHEDULE_PROMPT_SAFETY_ERROR = "stored scheduled prompt failed safety validation"
@@ -374,12 +494,6 @@ MANAGER_HANDOFF_COMMIT_RECEIPT_SETTING = (
 MANAGER_HANDOFF_COMMIT_RECEIPT_SCHEMA_VERSION = 1
 MANAGER_HANDOFF_OPERATION_RE = re.compile(r"^handoff_[0-9a-f]{32}$")
 MANAGER_HANDOFF_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
-MANAGER_WORKSPACE_SCHEMA_COMMIT_FIELDS = {
-    "schema_version",
-    "operation_id",
-    "predecessor_generation",
-    "target_generation",
-}
 MANAGER_GATE_SETTLEMENT_FIELDS = {
     "schema_version",
     "operation_id",
@@ -402,12 +516,19 @@ MANAGER_HANDOFF_RECEIPT_FIELDS = frozenset(
 TELEGRAM_SETTING_ENABLED = "telegram_enabled"
 TELEGRAM_SETTING_BOT_USERNAME = "telegram_bot_username"
 TELEGRAM_SETTING_POLLING = "telegram_polling"
-TELEGRAM_SECRET_BOT_TOKEN = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
-TELEGRAM_SECRET_WEBHOOK_SECRET = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
+SESSION_SECRET_SETTING_SOURCE = "ENTERPRISE_SESSION_SECRET"
+TELEGRAM_SECRET_BOT_TOKEN_SOURCE = "ENTERPRISE_TELEGRAM_BOT_TOKEN"
+TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE = "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
     "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
 }
+
+
+def _machine_setting_key(config: PlatformConfig, source_key: str) -> str:
+    """Return the single SQLite key owned by the active technical profile."""
+
+    return config.technical_profile.environment_variable(source_key)
 
 
 def _manager_handoff_object_pairs(
@@ -595,15 +716,26 @@ class EnterpriseService:
         startup_schema_writes_committed = bool(
             not startup_reservation_id and startup_settlement_action != "abort"
         )
+        assert_existing_database_profile(
+            self.config.db_path,
+            self.config.technical_profile,
+        )
+        assert_existing_workspace_profile(self.config)
+        if self.config.technical_profile.is_target:
+            _ensure_profile_camofox_runtime_sidecar(
+                self.config,
+                commit_schema_upgrade=False,
+            )
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
+        self._instance_lock_directory_fd: int | None = None
         self._instance_lock_finalizer: weakref.finalize | None = None
         self._acquire_instance_lock()
-        self._camofox_sidecar = ensure_camofox_runtime_sidecar(
-            self.config.data_dir,
+        self.db = Database(config.db_path, config.technical_profile)
+        self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
+            self.config,
             commit_schema_upgrade=startup_schema_writes_committed,
         )
-        self.db = Database(config.db_path)
         self.jobs = DurableJobStore(self.db)
         self.learning_reviews = LearningReviewStore(self.db)
         self.agent_inputs = AgentRunInputStore(self.db)
@@ -641,13 +773,6 @@ class EnterpriseService:
             config,
             self.db,
             commit_schema_upgrade=startup_schema_writes_committed,
-            allow_unmaterialized_p1_workspaces=(
-                bool(startup_reservation_id)
-                and self._manager_allows_source_owner_workspace_commit(
-                    startup_manager_status,
-                    startup_reservation_id,
-                )
-            ),
         )
         if startup_settlement_action == "abort":
             # The first abort Gate already proved that no schema transition is
@@ -727,7 +852,6 @@ class EnterpriseService:
         self._auto_update_last_committed_id = (
             startup_settlement_id if startup_settlement_action == "commit" else ""
         )
-        self._auto_update_quiesced_abort_id = ""
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
@@ -804,34 +928,9 @@ class EnterpriseService:
         if not isinstance(status, dict):
             raise ManagerClientError("manager status must be a JSON object")
         if "gate_settlement" not in status:
-            active_id = status.get("active_operation_id")
-            finalize_id = status.get("finalize_pending_operation_id")
-            public_id = status.get("operation_id")
-            current = status.get("current")
-            target = status.get("target")
-            target_id = target.get("id") if isinstance(target, dict) else None
-            if not (
-                status.get("maintenance") is True
-                and status.get("public_state") == "updating"
-                and isinstance(active_id, str)
-                and MANAGER_OPERATION_RE.fullmatch(active_id)
-                and finalize_id == ""
-                and public_id == active_id
-                and isinstance(current, dict)
-                and current.get("id") == SOURCE_OWNER_COMPAT_GENERATION
-                and current.get("source_commit") == SOURCE_OWNER_COMPAT_GENERATION
-                and isinstance(target_id, str)
-                and target_id != SOURCE_OWNER_COMPAT_GENERATION
-                and MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_id)
-                and target.get("source_commit") == target_id
-            ):
-                raise ManagerClientError(
-                    "manager status is missing the Gate settlement capability"
-                )
-            # The sole deployed P1 Manager predates this field. Its exact active
-            # source-owner update boundary retains the old reservation path;
-            # no other generation may treat an absent field as explicit null.
-            return None
+            raise ManagerClientError(
+                "manager status is missing the Gate settlement capability"
+            )
         if status.get("gate_settlement") is None:
             return None
         settlement = status.get("gate_settlement")
@@ -930,95 +1029,6 @@ class EnterpriseService:
                 "manager maintenance operation identity is inconsistent"
             )
         return reservation_id
-
-    @staticmethod
-    def _manager_allows_source_owner_workspace_commit(
-        status: dict[str, Any],
-        reservation_id: str,
-    ) -> bool:
-        """Validate the one-generation P1 workspace-normalization capability.
-
-        The historical P1 Manager cannot project the durable capability added
-        by A2, so candidate startup accepts its exact active Current/Target
-        boundary.  Once A2 has become Current, only A2's operation-journal-
-        derived capability can preserve the permission across a Platform crash.
-        """
-
-        if (
-            not isinstance(SOURCE_OWNER_COMPAT_GENERATION, str)
-            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(
-                SOURCE_OWNER_COMPAT_GENERATION
-            )
-            or not isinstance(status, dict)
-            or not isinstance(reservation_id, str)
-            or not reservation_id
-        ):
-            return False
-
-        def operation_id(field: str) -> str:
-            value = status.get(field, "")
-            return value if isinstance(value, str) else ""
-
-        def exact_generation(value: Any, generation: str) -> bool:
-            return bool(
-                isinstance(value, dict)
-                and value.get("id") == generation
-                and value.get("source_commit") == generation
-            )
-
-        active_id = operation_id("active_operation_id")
-        finalize_id = operation_id("finalize_pending_operation_id")
-        current = status.get("current")
-        previous = status.get("previous")
-        target = status.get("target")
-        capability_present = "workspace_schema_commit" in status
-        capability = status.get("workspace_schema_commit")
-
-        # The one deployed P1 predates workspace_schema_commit. Bind its narrow
-        # fallback to the exact update Candidate as well as the reservation so
-        # a generic maintenance operation cannot gain schema-write authority.
-        if not capability_present:
-            target_generation = target.get("id") if isinstance(target, dict) else None
-            return bool(
-                active_id == reservation_id
-                and not finalize_id
-                and exact_generation(current, SOURCE_OWNER_COMPAT_GENERATION)
-                and isinstance(target_generation, str)
-                and target_generation != SOURCE_OWNER_COMPAT_GENERATION
-                and MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation)
-                and exact_generation(target, target_generation)
-            )
-
-        if (
-            not isinstance(capability, dict)
-            or set(capability) != MANAGER_WORKSPACE_SCHEMA_COMMIT_FIELDS
-            or type(capability.get("schema_version")) is not int
-            or capability["schema_version"] != 1
-            or capability.get("operation_id") != reservation_id
-            or capability.get("predecessor_generation")
-            != SOURCE_OWNER_COMPAT_GENERATION
-        ):
-            return False
-        target_generation = capability.get("target_generation")
-        if (
-            not isinstance(target_generation, str)
-            or target_generation == SOURCE_OWNER_COMPAT_GENERATION
-            or not MANAGER_HANDOFF_GENERATION_RE.fullmatch(target_generation)
-        ):
-            return False
-
-        if active_id == reservation_id and not finalize_id:
-            return bool(
-                exact_generation(current, SOURCE_OWNER_COMPAT_GENERATION)
-                and exact_generation(target, target_generation)
-            )
-        if finalize_id == reservation_id and not active_id:
-            return bool(
-                exact_generation(previous, SOURCE_OWNER_COMPAT_GENERATION)
-                and exact_generation(current, target_generation)
-                and target is None
-            )
-        return False
 
     def _new_agent_runtime_client(self) -> AgentRuntimeClient:
         runtime = self.runtimes.agent_runtime_config()
@@ -1150,29 +1160,63 @@ class EnterpriseService:
         owner is still processing Telegram updates or Agent jobs.
         """
 
-        lock_path = self.config.data_dir / ".enterprise-platform.lock"
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        lock_name = self.config.technical_profile.instance_lock_name
+        directory_fd = open_private_directory_fd(self.config.data_dir)
+        fd = -1
         try:
-            os.chmod(lock_path, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(fd)
-            raise RuntimeError(
-                f"another platform instance is already using {self.config.data_dir}"
-            ) from exc
-        except Exception:
-            os.close(fd)
+            verify_private_directory_path_fd(self.config.data_dir, directory_fd)
+            fd = open_private_file_fd_at(
+                directory_fd,
+                lock_name,
+                writable=True,
+                create=True,
+                mode=0o600,
+                tighten_mode=True,
+            )
+            verify_private_file_fd_at(directory_fd, lock_name, fd, mode=0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    f"another platform instance is already using {self.config.data_dir}"
+                ) from exc
+
+            # The lock and its parent path are re-proven after flock so a leaf
+            # or data-root replacement cannot split two service processes onto
+            # different lock inodes between open and ownership acquisition.
+            verify_private_directory_path_fd(self.config.data_dir, directory_fd)
+            verify_private_file_fd_at(directory_fd, lock_name, fd, mode=0o600)
+            os.ftruncate(fd, 0)
+            payload = memoryview(f"{os.getpid()}\n".encode("ascii"))
+            while payload:
+                written = os.write(fd, payload)
+                if written <= 0:
+                    raise OSError("platform instance lock write made no progress")
+                payload = payload[written:]
+            os.fsync(fd)
+            verify_private_file_fd_at(directory_fd, lock_name, fd, mode=0o600)
+            verify_private_directory_path_fd(self.config.data_dir, directory_fd)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            os.close(directory_fd)
             raise
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
         self._instance_lock_fd = fd
-        self._instance_lock_finalizer = weakref.finalize(self, os.close, fd)
+        self._instance_lock_directory_fd = directory_fd
+        self._instance_lock_finalizer = weakref.finalize(
+            self,
+            _close_instance_lock_descriptors,
+            fd,
+            directory_fd,
+        )
 
     def _release_instance_lock(self) -> None:
         fd = self._instance_lock_fd
         if fd is None:
             return
         self._instance_lock_fd = None
+        directory_fd = self._instance_lock_directory_fd
+        self._instance_lock_directory_fd = None
         finalizer = self._instance_lock_finalizer
         self._instance_lock_finalizer = None
         if finalizer is not None and finalizer.alive:
@@ -1181,6 +1225,8 @@ class EnterpriseService:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _agent_run_start_lock(self, scope_key: str) -> threading.Lock:
         digest = hashlib.sha256(str(scope_key).encode("utf-8")).digest()
@@ -2162,7 +2208,11 @@ class EnterpriseService:
             self.set_setting(key, default)
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
-        configured = os.getenv("ENTERPRISE_ADMIN_PASSWORD")
+        configured = os.getenv(
+            self.config.technical_profile.environment_variable(
+                "ENTERPRISE_ADMIN_PASSWORD"
+            )
+        )
         if configured:
             return configured, False
         if self.config.allow_insecure_bootstrap_password:
@@ -2186,28 +2236,30 @@ class EnterpriseService:
     def _resolve_session_secret(self) -> str:
         """Resolve a stable HMAC signing secret for session tokens.
 
-        Precedence: an explicit ``ENTERPRISE_SESSION_SECRET`` env var wins so
-        operators can rotate it; otherwise reuse a value previously persisted in
-        the settings table; otherwise persist this process's secret so it stays
-        stable across restarts. Without persistence, ``config.token_secret``
-        falls back to a fresh random value on every boot, which would silently
-        invalidate every outstanding session/token each time the service
-        restarts (including systemd auto-restarts).
+        Reuse the one profile-owned settings row; when it is absent, persist
+        the active profile's explicit environment value or this process's
+        generated secret so it stays stable across restarts. Source and target
+        keys are never read as fallbacks for one another.
         """
+        setting_key = _machine_setting_key(
+            self.config, SESSION_SECRET_SETTING_SOURCE
+        )
         row = self.db.query_one(
             "SELECT value FROM settings WHERE key = ? AND secret = 1",
-            ("ENTERPRISE_SESSION_SECRET",),
+            (setting_key,),
         )
         if row and row["value"]:
             return str(row["value"])
-        env_secret = os.getenv("ENTERPRISE_SESSION_SECRET")
+        env_secret = os.getenv(
+            self.config.technical_profile.environment_variable(
+                SESSION_SECRET_SETTING_SOURCE
+            )
+        )
         if env_secret:
-            self.set_setting("ENTERPRISE_SESSION_SECRET", env_secret, secret=True)
+            self.set_setting(setting_key, env_secret, secret=True)
             return env_secret
-        if row and row["value"]:
-            return str(row["value"])
         secret = self.config.token_secret or secrets.token_urlsafe(32)
-        self.set_setting("ENTERPRISE_SESSION_SECRET", secret, secret=True)
+        self.set_setting(setting_key, secret, secret=True)
         return secret
 
     def _synchronize_container_internal_tokens(self) -> None:
@@ -2524,9 +2576,19 @@ class EnterpriseService:
         admin_default_password_active = bool(admin_row and verify_password("admin", str(admin_row["password_hash"])))
         session_secret_row = self.db.query_one(
             "SELECT updated_at FROM settings WHERE key = ? AND secret = 1",
-            ("ENTERPRISE_SESSION_SECRET",),
+            (
+                _machine_setting_key(
+                    self.config, SESSION_SECRET_SETTING_SOURCE
+                ),
+            ),
         )
-        env_session_secret = bool(os.getenv("ENTERPRISE_SESSION_SECRET"))
+        env_session_secret = bool(
+            os.getenv(
+                self.config.technical_profile.environment_variable(
+                    SESSION_SECRET_SETTING_SOURCE
+                )
+            )
+        )
         return {
             "config": {
                 "public_base_url": public_base_url,
@@ -2573,7 +2635,13 @@ class EnterpriseService:
         if session_secret:
             if len(session_secret) < 32:
                 raise ServiceError(400, "session secret must be at least 32 characters")
-            self.set_setting("ENTERPRISE_SESSION_SECRET", session_secret, secret=True)
+            self.set_setting(
+                _machine_setting_key(
+                    self.config, SESSION_SECRET_SETTING_SOURCE
+                ),
+                session_secret,
+                secret=True,
+            )
             session_secret_restart_required = True
             restart_required = True
         result = self.platform_security_config(actor)
@@ -3571,13 +3639,21 @@ class EnterpriseService:
         return parse_bool(raw)
 
     def telegram_bot_token(self) -> str:
-        return self.get_secret(TELEGRAM_SECRET_BOT_TOKEN) or self.config.telegram_bot_token
+        return self.get_secret(
+            _machine_setting_key(
+                self.config, TELEGRAM_SECRET_BOT_TOKEN_SOURCE
+            )
+        ) or self.config.telegram_bot_token
 
     def telegram_bot_username(self) -> str:
         return (self.get_setting(TELEGRAM_SETTING_BOT_USERNAME) or self.config.telegram_bot_username or "").strip().lstrip("@")
 
     def telegram_webhook_secret(self) -> str:
-        return self.get_secret(TELEGRAM_SECRET_WEBHOOK_SECRET) or self.config.telegram_webhook_secret
+        return self.get_secret(
+            _machine_setting_key(
+                self.config, TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE
+            )
+        ) or self.config.telegram_webhook_secret
 
     def telegram_gateway_update(self, update: dict[str, Any]) -> dict[str, Any]:
         from .telegram_gateway import TelegramGateway
@@ -4340,10 +4416,22 @@ class EnterpriseService:
             self.set_setting(TELEGRAM_SETTING_BOT_USERNAME, username or "")
         if token is not None:
             if token:
-                self.set_setting(TELEGRAM_SECRET_BOT_TOKEN, token, secret=True)
+                self.set_setting(
+                    _machine_setting_key(
+                        self.config, TELEGRAM_SECRET_BOT_TOKEN_SOURCE
+                    ),
+                    token,
+                    secret=True,
+                )
         if webhook_secret is not None:
             if webhook_secret:
-                self.set_setting(TELEGRAM_SECRET_WEBHOOK_SECRET, webhook_secret, secret=True)
+                self.set_setting(
+                    _machine_setting_key(
+                        self.config, TELEGRAM_SECRET_WEBHOOK_SECRET_SOURCE
+                    ),
+                    webhook_secret,
+                    secret=True,
+                )
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
 
@@ -4377,26 +4465,12 @@ class EnterpriseService:
         clean_operation_id = str(operation_id or "").strip()
         with self._conversation_lock:
             if (
-                clean_operation_id
-                and self._auto_update_quiesced_abort_id == clean_operation_id
-            ):
-                return {"released": True}
-            if (
                 self._auto_update_reserved
                 and self._auto_update_reservation_owner == "manager"
                 and self._auto_update_reservation_id == clean_operation_id
             ):
-                if self.agent_scopes.abort_requires_process_quiescence():
-                    # The canonical P1 candidate may have observed missing or
-                    # legacy machine state. A successful abort only settles the
-                    # Manager Gate; this process must remain a frozen 503
-                    # participant until Manager stops the container.
-                    self._auto_update_quiesced_abort_id = clean_operation_id
-                    self._auto_update_last_released_id = clean_operation_id
-                    return {"released": True}
                 # This performs pure-read validation plus an in-memory gate
-                # transition. Exact P1 compatibility remains write-disabled;
-                # abort never publishes a marker, directory or alias.
+                # transition; abort never publishes a marker, directory or alias.
                 self.agent_scopes.release_schema_write_gate_after_abort()
             released = self.release_auto_update_reservation(
                 clean_operation_id,
@@ -4415,8 +4489,6 @@ class EnterpriseService:
             raise ServiceError(404, "manager integration is not active")
         clean_operation_id = str(operation_id or "").strip()
         with self._conversation_lock:
-            if self._auto_update_quiesced_abort_id == clean_operation_id:
-                raise ServiceError(409, "maintenance reservation was already aborted")
             if (
                 not self._auto_update_reserved
                 and clean_operation_id
@@ -4438,8 +4510,8 @@ class EnterpriseService:
             # and while admission remains frozen. A failure deliberately leaves
             # the reservation held for an idempotent retry or controlled repair.
             self.agent_scopes.commit_schema_upgrade()
-            self._camofox_sidecar = ensure_camofox_runtime_sidecar(
-                self.config.data_dir,
+            self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
+                self.config,
                 commit_schema_upgrade=True,
             )
             self._auto_update_last_committed_id = clean_operation_id
@@ -4569,8 +4641,8 @@ class EnterpriseService:
                 # effect and the durable receipt re-enters here under the same
                 # frozen reservation and converges the missing effect.
                 self.agent_scopes.commit_schema_upgrade()
-                self._camofox_sidecar = ensure_camofox_runtime_sidecar(
-                    self.config.data_dir,
+                self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
+                    self.config,
                     commit_schema_upgrade=True,
                 )
                 receipt = self._persist_manager_handoff_commit_receipt(
@@ -4640,6 +4712,7 @@ class EnterpriseService:
                 self.config.data_dir,
                 workspace_identity,
                 blockers,
+                self.config.technical_profile,
             )
 
     def auto_update_public_status(self) -> dict[str, Any]:
@@ -9846,8 +9919,8 @@ class EnterpriseService:
             "error": str(job.last_error or "") if job.status in {"failed", "needs_review"} else "",
         }
 
-    @staticmethod
     def _save_mail_attachment(
+        self,
         workspace: Path,
         data: bytes,
         *,
@@ -9860,7 +9933,10 @@ class EnterpriseService:
         if not raw_path or "\\" in raw_path or any(character in raw_path for character in "\r\n\x00"):
             raise ServiceError(400, "attachment path is invalid")
         relative = Path(raw_path)
-        if relative.is_absolute() or any(part in {"", ".", "..", ".ubitech"} for part in relative.parts):
+        if relative.is_absolute() or any(
+            part in {"", ".", "..", self.config.workspace_internal_directory}
+            for part in relative.parts
+        ):
             raise ServiceError(400, "attachment path must remain in the Agent workspace")
         if len(relative.parts) > 16 or len(relative.as_posix()) > 512:
             raise ServiceError(400, "attachment path is too long")
@@ -16312,7 +16388,7 @@ class EnterpriseService:
                 raise RuntimeError("attachment storage path does not match its scope")
             item["path"] = str(
                 Path(CONTAINER_PATHS["workspace"])
-                / ".ubitech"
+                / self.config.workspace_internal_directory
                 / "attachments"
                 / Path(*parts[2:])
             )
@@ -16418,7 +16494,12 @@ class EnterpriseService:
         ``_resolve_media_path``.
         """
         candidates = list(self._media_safe_data_subtrees(owner_id, workspace_path))
-        for raw in os.getenv("ENTERPRISE_MEDIA_ROOTS", "").split(os.pathsep):
+        media_roots_environment_variable = (
+            self.config.technical_profile.environment_variable(
+                "ENTERPRISE_MEDIA_ROOTS"
+            )
+        )
+        for raw in os.getenv(media_roots_environment_variable, "").split(os.pathsep):
             raw = raw.strip()
             if raw:
                 candidates.append(Path(raw).expanduser())
@@ -16811,7 +16892,8 @@ class EnterpriseService:
             f"持久工作区是 {logical}{mapping}。默认在 {logical} 中工作并把交付文件保留在这里；"
             "保持目录有序，确认不再需要后清理自己产生的临时文件和中间产物。"
             "不要为了整理而删除用户上传、用户已有或用途不明的文件，也不要修改平台管理的 "
-            f"{logical}/.ubitech/attachments。宿主调用获批后，{logical} 会自动映射到同一工作区，"
+            f"{logical}/{self.config.workspace_internal_directory}/attachments。"
+            f"宿主调用获批后，{logical} 会自动映射到同一工作区，"
             "除非确实需要，不要改用宿主绝对路径。"
         )
 

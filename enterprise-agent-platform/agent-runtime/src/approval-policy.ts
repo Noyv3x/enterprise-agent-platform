@@ -1401,12 +1401,13 @@ function isDockerSocketTarget(value: string): boolean {
 
 function isManagerControlTarget(value: string): boolean {
   const normalized = value.replaceAll("\\", "/");
-  return /^(?:\/var\/run|\/run)\/ubitech-agent(?:\/|$)/i.test(normalized)
-    || /^\/var\/lib\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
-    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
-    || /^\/(?:root|home\/[^/]+)\/\.config\/ubitech-agent(?:\/|$)/i.test(normalized)
-    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/i.test(normalized)
-    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.config\/ubitech-agent(?:\/|$)/i.test(normalized);
+  return /^(?:\/var\/run|\/run)(?:\/user\/\d+)?\/agent-platform-manager(?:\/|$)/i.test(normalized)
+    || /^(?:\$XDG_RUNTIME_DIR|\$\{XDG_RUNTIME_DIR(?::[-=?+][^}]*)?\})\/agent-platform-manager(?:\/|$)/i.test(normalized)
+    || /^\/var\/lib\/agent-platform\/manager(?:\/|$)/i.test(normalized)
+    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/agent-platform\/manager(?:\/|$)/i.test(normalized)
+    || /^\/(?:root|home\/[^/]+)\/\.config\/agent-platform(?:\/|$)/i.test(normalized)
+    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.local\/share\/agent-platform\/manager(?:\/|$)/i.test(normalized)
+    || /^(?:~|\$HOME|\$\{HOME(?::[-=?+][^}]*)?\})\/\.config\/agent-platform(?:\/|$)/i.test(normalized);
 }
 
 function isProtectedProcessTarget(value: string): boolean {

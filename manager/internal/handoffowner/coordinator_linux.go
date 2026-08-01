@@ -77,7 +77,7 @@ func New(options Options) (*Coordinator, error) {
 	}
 	return &Coordinator{
 		store: options.Store, host: options.Host, listeners: options.Listeners,
-		source: source, target: options.TargetProfile, channel: options.Channel,
+		active: options.SourceProfile, source: source, target: options.TargetProfile, channel: options.Channel,
 		goos: goos, goarch: goarch, clock: clock,
 	}, nil
 }
@@ -651,7 +651,7 @@ func (c *Coordinator) validateBridgeRequest(request BridgeRequest) (handoff.Rele
 	if request.Manifest.NamespaceHandoff == nil {
 		return handoff.ReleaseBinding{}, release.NamespaceHandoff{}, ErrOrdinaryManifest
 	}
-	if err := request.Manifest.Validate(c.channel, c.goos, c.goarch); err != nil {
+	if err := request.Manifest.ValidateForProfile(c.channel, c.goos, c.goarch, c.active); err != nil {
 		return handoff.ReleaseBinding{}, release.NamespaceHandoff{}, fmt.Errorf("validate bridge release: %w", err)
 	}
 	if !canonicalAbsolutePath(request.ManifestPath) || !sha256Pattern.MatchString(request.ManifestSHA256) {

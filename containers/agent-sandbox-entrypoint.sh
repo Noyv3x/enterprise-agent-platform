@@ -18,10 +18,16 @@ validate_id() {
 
 [ "$(id -u)" -eq 0 ] || fail "startup identity must be root"
 
-agent_uid="${UBITECH_AGENT_UID:-}"
-agent_gid="${UBITECH_AGENT_GID:-}"
-validate_id UBITECH_AGENT_UID "$agent_uid"
-validate_id UBITECH_AGENT_GID "$agent_gid"
+if env | grep -Eq '^(UBITECH_|ENTERPRISE_)'; then
+  fail "source-profile environment is not accepted by the target Sandbox image"
+fi
+[ "${AGENT_PLATFORM_TECHNICAL_PROFILE:-}" = "agent-platform-v1" ] \
+  || fail "AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1"
+
+agent_uid="${AGENT_PLATFORM_AGENT_UID:-}"
+agent_gid="${AGENT_PLATFORM_AGENT_GID:-}"
+validate_id AGENT_PLATFORM_AGENT_UID "$agent_uid"
+validate_id AGENT_PLATFORM_AGENT_GID "$agent_gid"
 
 agent_entry="$(getent passwd agent || true)"
 [ -n "$agent_entry" ] || fail "image account agent is missing"
@@ -31,7 +37,7 @@ uid_owner="$(awk -F: -v uid="$agent_uid" '$3 == uid && $1 != "agent" { print $1;
 
 target_group="$(awk -F: -v gid="$agent_gid" '$3 == gid { print $1; exit }' /etc/group)"
 if [ -z "$target_group" ]; then
-  group_tmp="$(mktemp /etc/group.ubitech.XXXXXX)"
+  group_tmp="$(mktemp /etc/group.agent-platform.XXXXXX)"
   if ! awk -F: -v OFS=: -v gid="$agent_gid" '
       $1 == "agent" { $3 = gid; found += 1 }
       { print }
@@ -45,7 +51,7 @@ if [ -z "$target_group" ]; then
   mv -f -- "$group_tmp" /etc/group
 fi
 
-passwd_tmp="$(mktemp /etc/passwd.ubitech.XXXXXX)"
+passwd_tmp="$(mktemp /etc/passwd.agent-platform.XXXXXX)"
 if ! awk -F: -v OFS=: -v uid="$agent_uid" -v gid="$agent_gid" '
     $1 == "agent" { $3 = uid; $4 = gid; found += 1 }
     { print }

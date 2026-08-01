@@ -3,8 +3,6 @@ package operation
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +23,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 type fakeEngine struct {
@@ -602,23 +600,95 @@ func (s *recordingSelfUpdate) ActivationRolledBack(release.Manifest) (bool, erro
 func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	compose := []byte("services: {}\n")
-	composeSum := sha256.Sum256(compose)
-	managerSum := sha256.Sum256([]byte("manager"))
-	generatedAt := time.Now()
+	var fixture releasetest.Fixture
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/compose" {
-			_, _ = w.Write(compose)
+		if r.URL.Path == "/ubitech-compose.yaml" {
+			_, _ = w.Write(fixture.Compose)
 			return
 		}
-		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
-			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
-		}
-		manifest := release.Manifest{SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("b", 40), GeneratedAt: generatedAt, ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2, Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}}, Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images}
-		_ = json.NewEncoder(w).Encode(manifest)
+		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
+	fixture = releasetest.NewSource(
+		strings.Repeat("b", 40),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+		releasetest.WithCompose(compose),
+	)
 	return server, server.URL + "/manifest"
+}
+
+func testSchemaV2ReleaseServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	compose := []byte("services: {}\n")
+	manager := []byte("target-manager")
+	var fixture releasetest.Fixture
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/agent-platform-compose.yaml" {
+			_, _ = w.Write(fixture.Compose)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fixture.Manifest)
+	}))
+	fixture = releasetest.NewTarget(
+		strings.Repeat("c", 40),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+		releasetest.WithCompose(compose),
+		releasetest.WithManagerBinary("amd64", manager),
+		releasetest.WithManagerBinary("arm64", manager),
+	)
+	return server, server.URL + "/manifest"
+}
+
+func TestCheckConsumesSchemaV2OnlyOnTargetProfile(t *testing.T) {
+	server, url := testSchemaV2ReleaseServer(t)
+	defer server.Close()
+	sourceRoot := t.TempDir()
+	sourceStore, err := journal.Open(filepath.Join(sourceRoot, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceReleases := filepath.Join(sourceRoot, "releases")
+	if err := os.MkdirAll(sourceReleases, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := &Orchestrator{
+		Store: sourceStore, TechnicalProfile: identity.SourceActiveProfile(), ReleasesDir: sourceReleases,
+		ManifestURL: url, Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	if _, err := source.Check(context.Background(), url); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source operation accepted schema v2: %v", err)
+	}
+	entries, err := os.ReadDir(sourceReleases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 || sourceStore.State().Candidate != nil {
+		t.Fatalf("source rejection produced release side effects: entries=%v state=%#v", entries, sourceStore.State())
+	}
+	targetProfile, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot := t.TempDir()
+	targetStore, err := journal.Open(filepath.Join(targetRoot, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &Orchestrator{
+		Store: targetStore, TechnicalProfile: targetProfile, ReleasesDir: filepath.Join(targetRoot, "releases"),
+		ManifestURL: url, Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	manifest, err := target.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := targetStore.State()
+	if manifest.SchemaVersion != release.ManifestSchemaVersionV2 || state.Candidate == nil || state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 10 {
+		t.Fatalf("target operation did not retain schema v2: manifest=%#v state=%#v", manifest, state)
+	}
 }
 
 func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) {
@@ -626,43 +696,22 @@ func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) 
 	predecessor := strings.Repeat("a", 40)
 	bridge := strings.Repeat("b", 40)
 	composeBytes := []byte("services: {}\n")
-	composeSum := sha256.Sum256(composeBytes)
-	compose := release.Artifact{URL: "https://example.invalid/target-compose", SHA256: hex.EncodeToString(composeSum[:])}
-	targetManager := release.ManagerRelease{Version: bridge, Artifacts: map[string]release.Artifact{
-		"amd64": {URL: "https://example.invalid/target-manager-amd64", SHA256: strings.Repeat("2", 64)},
-		"arm64": {URL: "https://example.invalid/target-manager-arm64", SHA256: strings.Repeat("3", 64)},
-	}}
-	sourceManager := release.ManagerRelease{Version: predecessor, Artifacts: map[string]release.Artifact{
-		"amd64": {URL: "https://example.invalid/source-manager-amd64", SHA256: strings.Repeat("4", 64)},
-		"arm64": {URL: "https://example.invalid/source-manager-arm64", SHA256: strings.Repeat("5", 64)},
-	}}
-	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
-		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("a", 64)
-	}
-	manifest := release.Manifest{
-		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: bridge,
-		GeneratedAt: time.Now().UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
-		Manager: targetManager, Compose: compose, Images: images,
-		NamespaceHandoff: &release.NamespaceHandoff{
-			SchemaVersion: 1, PredecessorGeneration: predecessor, BridgeGeneration: bridge,
-			Source: release.NamespaceBinding{
-				ProfileID: identity.SourceProfile().ProfileID, Manager: sourceManager,
-				Compose: release.Artifact{URL: "https://example.invalid/source-compose", SHA256: strings.Repeat("6", 64)},
-			},
-			Target: release.NamespaceBinding{ProfileID: identity.TargetProfileID(), Manager: targetManager, Compose: compose},
-		},
-	}
+	var fixture releasetest.Fixture
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/target-compose" {
-			_, _ = w.Write(composeBytes)
+		if request.URL.Path == "/ubitech-compose.yaml" {
+			_, _ = w.Write(fixture.Compose)
 			return
 		}
-		manifest.Compose.URL = server.URL + "/target-compose"
-		manifest.NamespaceHandoff.Target.Compose = manifest.Compose
-		_ = json.NewEncoder(w).Encode(manifest)
+		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
+	fixture = releasetest.NewBridge(
+		bridge,
+		releasetest.WithPredecessorGeneration(predecessor),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+		releasetest.WithCompose(composeBytes),
+	)
 	return server, server.URL
 }
 
@@ -1043,26 +1092,22 @@ func TestSourceOwnerCheckRetainsNamespaceHandoffWithoutOrdinaryCandidate(t *test
 
 func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 	compose := []byte("services: {}\n")
-	composeSum := sha256.Sum256(compose)
-	managerSum := sha256.Sum256([]byte("manager"))
+	var fixture releasetest.Fixture
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/compose" {
+		if r.URL.Path == "/ubitech-compose.yaml" {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
 		}
-		images := map[string]string{}
-		for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
-			images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
-		}
-		manifest := release.Manifest{
-			SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: strings.Repeat("c", 40), GeneratedAt: time.Now(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
-			Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL + "/manager", SHA256: hex.EncodeToString(managerSum[:])}}},
-			Compose: release.Artifact{URL: server.URL + "/compose", SHA256: hex.EncodeToString(composeSum[:])}, Images: images,
-		}
-		_ = json.NewEncoder(w).Encode(manifest)
+		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
 	defer server.Close()
+	fixture = releasetest.NewSource(
+		strings.Repeat("c", 40),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+		releasetest.WithCompose(compose),
+	)
 	store, err := journal.Open(t.TempDir(), time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -2493,62 +2538,6 @@ func TestRecoverFinalizesCrashBetweenOperationAndStateCommit(t *testing.T) {
 	}
 }
 
-func TestP1NormalizationWithoutManagerCommitFailsBeforeFirstGate(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	_, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{
-			ID:           contract.SourceOwnerCompatGeneration,
-			SourceCommit: contract.SourceOwnerCompatGeneration,
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gate := &recordingGate{}
-	orchestrator := &Orchestrator{
-		Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{},
-		ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main",
-		ReleaseClient: release.Client{HTTP: server.Client()},
-	}
-	manifest, err := orchestrator.Check(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{
-		Kind: model.OperationUpdate, IdempotencyKey: "p1-without-manager-commit",
-		ExpectedGeneration: store.State().Generation,
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationSucceeded
-		value.TargetGeneration = manifest.ID()
-		value.SnapshotPath = "/backup/p1-before-a2"
-		value.ReservationStatus = model.ReservationMutationStarted
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = orchestrator.Recover(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "P1 workspace normalization") {
-		t.Fatalf("P1 update without watchdog proof did not fail closed: %v", err)
-	}
-	state := store.State()
-	durable, readErr := store.Operation(op.ID)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if gate.releases != 0 || state.FinalizePendingOperationID != op.ID || !state.Maintenance ||
-		durable.Finalized || durable.GateSettlementAction != "" {
-		t.Fatalf("P1 update crossed the Gate without watchdog proof: state=%#v operation=%#v gate=%#v", state, durable, gate)
-	}
-}
-
 func TestRecoverFailedTerminalOperationClearsHalfCommittedActiveState(t *testing.T) {
 	store, err := journal.Open(t.TempDir(), time.Now())
 	if err != nil {
@@ -2894,15 +2883,11 @@ func TestRecoverReplaysNonGenerationReleaseBeforeClearingFinalizedPendingState(t
 
 func writeRollbackManifest(t *testing.T, dir, commit string) string {
 	t.Helper()
-	images := map[string]string{}
-	for _, name := range []string{"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng", "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper"} {
-		images[name] = "registry/" + name + "@sha256:" + strings.Repeat("a", 64)
-	}
-	manifest := release.Manifest{
-		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: commit, GeneratedAt: time.Now(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 2,
-		Manager: release.ManagerRelease{Version: "v1", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: "http://127.0.0.1/manager", SHA256: strings.Repeat("b", 64)}}},
-		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("c", 64)}, Images: images,
-	}
+	manifest := releasetest.NewSource(
+		commit,
+		releasetest.WithArtifactBaseURL("http://127.0.0.1"),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+	).Manifest
 	path := filepath.Join(dir, commit+".json")
 	data, err := json.Marshal(manifest)
 	if err != nil {

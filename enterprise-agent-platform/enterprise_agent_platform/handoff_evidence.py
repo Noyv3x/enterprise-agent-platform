@@ -20,10 +20,14 @@ from .secure_fs import (
     open_private_directory_fd,
     read_private_file_at,
 )
+from .technical_profile import (
+    SOURCE_TECHNICAL_PROFILE,
+    TechnicalProfile,
+    technical_profile,
+)
 
 
 HANDOFF_EVIDENCE_SCHEMA_VERSION = 1
-SOURCE_TECHNICAL_PROFILE = "ubitech-agent-v1"
 _MAX_IDENTITY_JSON_BYTES = 8 * 1024 * 1024
 _RUNTIME_VALIDATION_LIMITS = AGENT_RUNTIME_HANDOFF["validation_limits"]
 
@@ -49,6 +53,7 @@ def collect_platform_handoff_evidence(
     data_dir: Path,
     workspace_identity_sha256: str,
     blockers: dict[str, Any],
+    technical_profile_value: TechnicalProfile | str = SOURCE_TECHNICAL_PROFILE,
 ) -> dict[str, Any]:
     """Return the bounded, secret-free Platform side of handoff evidence.
 
@@ -57,6 +62,7 @@ def collect_platform_handoff_evidence(
     schema upgrade, or persistence.
     """
 
+    profile = technical_profile(technical_profile_value)
     integrity_row = db.query_one("PRAGMA integrity_check(1)")
     if integrity_row is None or list(integrity_row.values()) != ["ok"]:
         raise sqlite3.IntegrityError("database integrity_check did not return ok")
@@ -69,8 +75,13 @@ def collect_platform_handoff_evidence(
         raise sqlite3.DatabaseError("database schema version is unavailable")
 
     runtime_identity_sha256 = _runtime_identity(db, Path(data_dir) / "runtimes" / "agent")
-    camofox_sidecar = Path(data_dir) / "runtimes" / "camofox" / ".ubitech-agent-runtime.json"
-    if not is_expected_camofox_sidecar(_read_sidecar(camofox_sidecar)):
+    camofox_sidecar = (
+        Path(data_dir)
+        / "runtimes"
+        / "camofox"
+        / profile.camofox_sidecar_name
+    )
+    if not is_expected_camofox_sidecar(_read_sidecar(camofox_sidecar), profile):
         raise sqlite3.DatabaseError("Platform Camoufox sidecar is outside the current schema")
 
     count_fields = (
@@ -94,7 +105,7 @@ def collect_platform_handoff_evidence(
 
     return {
         "schema_version": HANDOFF_EVIDENCE_SCHEMA_VERSION,
-        "technical_profile": SOURCE_TECHNICAL_PROFILE,
+        "technical_profile": profile.profile_id,
         "database_schema_version": database_schema_version,
         "database_integrity": "ok",
         "database_foreign_keys": "ok",

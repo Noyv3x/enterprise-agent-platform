@@ -428,7 +428,7 @@ func TestReconcileMaintenanceJointlyReclaimsSnapshotsReleasesImagesAndManagerVer
 		config: cfg, state: store, docker: docker, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots,
 		maintenanceMu: &maintenance.Admission{}, handoffAdmission: openHandoffMutationAdmission{},
 	}
-	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, operations: store, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, profile: identity.SourceActiveProfile(), operations: store, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
 
 	if err := app.reconcileMaintenance(context.Background()); err != nil {
 		t.Fatal(err)

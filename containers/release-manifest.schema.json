@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-platform.invalid/schemas/release-manifest-v1.json",
+  "$id": "https://agent-platform.invalid/schemas/release-manifest.json",
   "title": "Agent Platform release manifest",
   "type": "object",
   "additionalProperties": false,
@@ -16,20 +16,64 @@
     "images"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "enum": [1, 2] },
     "channel": { "const": "main" },
     "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "generated_at": { "type": "string", "format": "date-time" },
-    "protocol_version": { "const": 1 },
+    "protocol_version": { "enum": [1, 2] },
     "database_schema_version": { "type": "integer", "minimum": 1 },
     "manager": { "$ref": "#/$defs/manager_release" },
     "compose": { "$ref": "#/$defs/artifact" },
-    "images": {
+    "images": { "type": "object" },
+    "namespace_handoff": { "$ref": "#/$defs/namespace_handoff" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "schema_version": { "const": 1 } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "protocol_version": { "const": 1 },
+          "images": { "$ref": "#/$defs/images_v1" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema_version": { "const": 2 } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "protocol_version": { "const": 2 },
+          "images": { "$ref": "#/$defs/images_v2" }
+        },
+        "not": { "required": ["namespace_handoff"] }
+      }
+    }
+  ],
+  "$defs": {
+    "images_v1": {
       "type": "object",
+      "additionalProperties": false,
       "minProperties": 11,
       "maxProperties": 11,
       "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
-      "additionalProperties": { "$ref": "#/$defs/image" },
+      "properties": {
+        "platform": { "$ref": "#/$defs/image" },
+        "agent-runtime": { "$ref": "#/$defs/image" },
+        "camofox": { "$ref": "#/$defs/image" },
+        "agent-sandbox": { "$ref": "#/$defs/image" },
+        "searxng": { "$ref": "#/$defs/image" },
+        "firecrawl-api": { "$ref": "#/$defs/image" },
+        "firecrawl-playwright": { "$ref": "#/$defs/image" },
+        "firecrawl-postgres": { "$ref": "#/$defs/image" },
+        "firecrawl-redis": { "$ref": "#/$defs/image" },
+        "firecrawl-rabbitmq": { "$ref": "#/$defs/image" },
+        "handoff-fs-helper": { "$ref": "#/$defs/image" }
+      },
       "required": [
         "platform",
         "agent-runtime",
@@ -44,9 +88,37 @@
         "handoff-fs-helper"
       ]
     },
-    "namespace_handoff": { "$ref": "#/$defs/namespace_handoff" }
-  },
-  "$defs": {
+    "images_v2": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 10,
+      "maxProperties": 10,
+      "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+      "properties": {
+        "platform": { "$ref": "#/$defs/image" },
+        "agent-runtime": { "$ref": "#/$defs/image" },
+        "camofox": { "$ref": "#/$defs/image" },
+        "agent-sandbox": { "$ref": "#/$defs/image" },
+        "searxng": { "$ref": "#/$defs/image" },
+        "firecrawl-api": { "$ref": "#/$defs/image" },
+        "firecrawl-playwright": { "$ref": "#/$defs/image" },
+        "firecrawl-postgres": { "$ref": "#/$defs/image" },
+        "firecrawl-redis": { "$ref": "#/$defs/image" },
+        "firecrawl-rabbitmq": { "$ref": "#/$defs/image" }
+      },
+      "required": [
+        "platform",
+        "agent-runtime",
+        "camofox",
+        "agent-sandbox",
+        "searxng",
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-postgres",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq"
+      ]
+    },
     "artifact": {
       "type": "object",
       "additionalProperties": false,

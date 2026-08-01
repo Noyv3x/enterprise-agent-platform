@@ -2,20 +2,18 @@ package maintenance
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 type recordingImagePruner struct {
@@ -23,11 +21,6 @@ type recordingImagePruner struct {
 	protected   map[string]struct{}
 	disposition map[string]bool
 }
-
-const (
-	retainedHandoffPredecessorID     = "983f79b4900502f35fac6de8154eb344fc9f143b"
-	retainedHandoffPredecessorSHA256 = "8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1"
-)
 
 func (p *recordingImagePruner) PruneManagedImages(_ context.Context, candidates []string, protected map[string]struct{}, _ RemovalGuard) (map[string]bool, error) {
 	p.candidates = append([]string(nil), candidates...)
@@ -80,46 +73,42 @@ func TestPruneReleasesRemovesOnlyExpiredVerifiedUnprotectedGeneration(t *testing
 	}
 }
 
-func TestPruneReleasesDoesNotParseStateProtectedRetainedHandoffPredecessor(t *testing.T) {
+func TestPruneReleasesConsumesSchemaV2OnlyWithTargetProfile(t *testing.T) {
 	root := t.TempDir()
-	path := writeRetainedHandoffPredecessor(t, root)
-	pruner := &recordingImagePruner{}
-	now := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
-
+	now := time.Unix(20_000, 0).UTC()
+	id := strings.Repeat("d", 40)
+	path := writeReleaseWithSchema(t, root, id, now.Add(-2*time.Hour), "d", release.ManifestSchemaVersionV2)
+	sourcePruner := &recordingImagePruner{}
 	removed, err := PruneReleases(context.Background(), now, ReleasePolicy{
-		Root: root, Channel: "main", Retention: time.Hour,
-		ProtectedIDs: map[string]struct{}{retainedHandoffPredecessorID: {}},
-		Images:       pruner, RemovalGuard: acceptingRemovalGuard(),
+		Root: root, Channel: "main", Retention: time.Hour, Images: sourcePruner,
+		RemovalGuard: acceptingRemovalGuard(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 0 || len(pruner.candidates) != 0 {
-		t.Fatalf("state-protected P1 crossed ordinary maintenance: removed=%d images=%#v", removed, pruner.candidates)
+	if removed != 0 || len(sourcePruner.candidates) != 0 {
+		t.Fatalf("source maintenance consumed schema v2: removed=%d images=%#v", removed, sourcePruner.candidates)
 	}
 	if _, err := os.Lstat(path); err != nil {
-		t.Fatalf("state-protected P1 release was changed: %v", err)
+		t.Fatalf("source maintenance changed target-only release: %v", err)
 	}
-}
-
-func TestPruneReleasesDoesNotUseLegacyDecoderForUnboundRetainedHandoffPredecessor(t *testing.T) {
-	root := t.TempDir()
-	path := writeRetainedHandoffPredecessor(t, root)
-	pruner := &recordingImagePruner{}
-	now := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
-
-	removed, err := PruneReleases(context.Background(), now, ReleasePolicy{
-		Root: root, Channel: "main", Retention: time.Hour,
-		Images: pruner, RemovalGuard: acceptingRemovalGuard(),
+	target, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPruner := &recordingImagePruner{}
+	removed, err = PruneReleases(context.Background(), now, ReleasePolicy{
+		Root: root, Channel: "main", Profile: target, Retention: time.Hour, Images: targetPruner,
+		RemovalGuard: acceptingRemovalGuard(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 0 || len(pruner.candidates) != 0 {
-		t.Fatalf("unbound P1 entered ordinary maintenance through a legacy decoder: removed=%d images=%#v", removed, pruner.candidates)
+	if removed != 1 || len(targetPruner.candidates) != 10 {
+		t.Fatalf("target maintenance did not consume exact schema-v2 set: removed=%d images=%#v", removed, targetPruner.candidates)
 	}
-	if _, err := os.Lstat(path); err != nil {
-		t.Fatalf("unbound P1 evidence was not retained fail-closed: %v", err)
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("target schema-v2 release remains: %v", err)
 	}
 }
 
@@ -463,7 +452,7 @@ func TestPruneReleasesRetainsGenerationWhenAnyImageCannotBeRemoved(t *testing.T)
 	root := t.TempDir()
 	now := time.Unix(20_000, 0).UTC()
 	path := writeRelease(t, root, strings.Repeat("e", 40), now.Add(-2*time.Hour), "e")
-	verified, err := verifyRelease(path, strings.Repeat("e", 40), "main")
+	verified, err := verifyRelease(path, strings.Repeat("e", 40), "main", identity.SourceActiveProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,29 +538,25 @@ func TestPruneReleasesRemovesOnlyRecognizedExpiredStaging(t *testing.T) {
 }
 
 func writeRelease(t *testing.T, root, id string, generatedAt time.Time, digestDigit string) string {
+	return writeReleaseWithSchema(t, root, id, generatedAt, digestDigit, release.ManifestSchemaVersionV1)
+}
+
+func writeReleaseWithSchema(t *testing.T, root, id string, generatedAt time.Time, digestDigit string, schemaVersion int) string {
 	t.Helper()
 	compose := []byte("services: {}\n")
-	composeDigest := sha256.Sum256(compose)
-	images := map[string]string{}
-	for _, name := range []string{
-		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
-	} {
-		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(digestDigit, 64)
+	options := []releasetest.Option{
+		releasetest.WithGeneratedAt(generatedAt),
+		releasetest.WithCompose(compose),
+		releasetest.WithImageDigest(strings.Repeat(digestDigit, 64)),
 	}
-	manifest := release.Manifest{
-		SchemaVersion:         contract.SchemaVersion,
-		Channel:               "main",
-		SourceCommit:          id,
-		GeneratedAt:           generatedAt,
-		ProtocolVersion:       contract.SchemaVersion,
-		DatabaseSchemaVersion: 1,
-		Manager: release.ManagerRelease{Version: id, Artifacts: map[string]release.Artifact{
-			runtime.GOARCH: {URL: "https://example.invalid/manager", SHA256: strings.Repeat("f", 64)},
-		}},
-		Compose: release.Artifact{URL: "https://example.invalid/compose", SHA256: hex.EncodeToString(composeDigest[:])},
-		Images:  images,
+	var manifest release.Manifest
+	switch schemaVersion {
+	case release.ManifestSchemaVersionV1:
+		manifest = releasetest.NewSource(id, options...).Manifest
+	case release.ManifestSchemaVersionV2:
+		manifest = releasetest.NewTarget(id, options...).Manifest
+	default:
+		t.Fatalf("unsupported positive release fixture schema %d", schemaVersion)
 	}
 	data, err := json.Marshal(manifest)
 	if err != nil {
@@ -585,36 +570,6 @@ func writeRelease(t *testing.T, root, id string, generatedAt time.Time, digestDi
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), compose, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func writeRetainedHandoffPredecessor(t *testing.T, root string) string {
-	t.Helper()
-	fixture := filepath.Join("..", "release", "testdata", retainedHandoffPredecessorID+"-release.json")
-	raw, err := os.ReadFile(fixture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(raw)
-	if got := hex.EncodeToString(digest[:]); got != retainedHandoffPredecessorSHA256 {
-		t.Fatalf("retained handoff predecessor fixture SHA-256 = %s", got)
-	}
-	path := filepath.Join(root, retainedHandoffPredecessorID)
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(path, "manifest.json"), raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Ordinary maintenance must reject the legacy exact-10 image shape before
-	// reading Compose. The real Compose remains a release asset used only by the
-	// narrowly bound handoff predecessor decoder/participant path.
-	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {

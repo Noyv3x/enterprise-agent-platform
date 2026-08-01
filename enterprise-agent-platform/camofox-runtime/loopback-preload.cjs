@@ -9,7 +9,17 @@ const net = require("node:net");
 const http = require("node:http");
 const dns = require("node:dns").promises;
 
-const serviceBindHost = process.env.UBITECH_CAMOFOX_BIND_HOST || "127.0.0.1";
+const sourceEnvironment = Object.keys(process.env)
+  .filter((name) => name.startsWith("UBITECH_") || name.startsWith("ENTERPRISE_"))
+  .sort();
+if (sourceEnvironment.length > 0) {
+  throw new Error(`Source-profile environment is not accepted by the target Camoufox runtime: ${sourceEnvironment.join(", ")}`);
+}
+if (process.env.AGENT_PLATFORM_TECHNICAL_PROFILE !== "agent-platform-v1") {
+  throw new Error("AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1");
+}
+
+const serviceBindHost = process.env.AGENT_PLATFORM_CAMOFOX_BIND_HOST || "127.0.0.1";
 const pinningProxyHost = "127.0.0.1";
 const originalListen = net.Server.prototype.listen;
 
@@ -27,10 +37,10 @@ net.Server.prototype.listen = function managedLoopbackListen(...args) {
   return originalListen.apply(this, args);
 };
 
-const contextGuardInstalled = Symbol.for("ubitech.camofox.context-network-guard");
-const browserGuardInstalled = Symbol.for("ubitech.camofox.browser-network-guard");
-const browserTypeGuardInstalled = Symbol.for("ubitech.camofox.browser-type-network-guard");
-const browserProxyPolicy = Symbol.for("ubitech.camofox.browser-proxy-policy");
+const contextGuardInstalled = Symbol.for("agent-platform.camofox.context-network-guard");
+const browserGuardInstalled = Symbol.for("agent-platform.camofox.browser-network-guard");
+const browserTypeGuardInstalled = Symbol.for("agent-platform.camofox.browser-type-network-guard");
+const browserProxyPolicy = Symbol.for("agent-platform.camofox.browser-proxy-policy");
 
 const blockedMetadataHosts = new Set([
   "instance-data.ec2.internal",
@@ -175,7 +185,7 @@ class PinningProxyError extends Error {
 }
 
 function configuredPinningLookup() {
-  const servers = String(process.env.UBITECH_CAMOFOX_PINNING_DNS_SERVERS || "")
+  const servers = String(process.env.AGENT_PLATFORM_CAMOFOX_PINNING_DNS_SERVERS || "")
     .split(/[\s,]+/)
     .map((value) => value.trim())
     .filter(Boolean);

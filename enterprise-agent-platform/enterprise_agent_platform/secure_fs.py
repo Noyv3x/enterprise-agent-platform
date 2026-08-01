@@ -114,6 +114,33 @@ def open_private_directory_fd(path: Path, *, mode: int | None = 0o700) -> int:
         raise
 
 
+def verify_private_directory_path_fd(
+    path: Path,
+    directory_fd: int,
+    *,
+    mode: int | None = 0o700,
+) -> os.stat_result:
+    """Reprove that an absolute no-follow path still names a pinned directory."""
+
+    opened = os.fstat(directory_fd)
+    _require_private_identity(
+        opened,
+        kind="directory",
+        mode=mode,
+        display=str(path),
+    )
+    current_fd = open_private_directory_fd(path, mode=mode)
+    try:
+        current = os.fstat(current_fd)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise UnsafePrivatePathError(
+                f"private directory path changed identity: {path}"
+            )
+    finally:
+        os.close(current_fd)
+    return opened
+
+
 def open_private_child_directory_fd(
     parent_fd: int,
     name: str,
@@ -442,6 +469,138 @@ def stat_private_entry_at(parent_fd: int, name: str) -> os.stat_result:
 
     _require_leaf_name(name)
     return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+
+
+def _require_private_regular_file_identity(
+    info: os.stat_result,
+    *,
+    display: str,
+    mode: int | None,
+) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise UnsafePrivatePathError(
+            f"private file has an unsafe type: {display}"
+        )
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise UnsafePrivatePathError(
+            f"private file has an unsafe owner: {display}"
+        )
+    if info.st_nlink != 1:
+        raise UnsafePrivatePathError(
+            f"private file has an unsafe link count: {display}"
+        )
+    if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+        raise UnsafePrivatePathError(
+            f"private file has an unsafe mode: {display}"
+        )
+
+
+def verify_private_file_fd_at(
+    parent_fd: int,
+    name: str,
+    file_fd: int,
+    *,
+    mode: int | None = _PRIVATE_FILE_MODE,
+) -> os.stat_result:
+    """Reprove that a safe private leaf still names one pinned file inode."""
+
+    _require_leaf_name(name)
+    opened = os.fstat(file_fd)
+    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_private_regular_file_identity(opened, display=name, mode=mode)
+    _require_private_regular_file_identity(entry, display=name, mode=mode)
+    if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
+        raise UnsafePrivatePathError(
+            f"private file entry changed identity: {name}"
+        )
+    return opened
+
+
+def open_private_file_fd_at(
+    parent_fd: int,
+    name: str,
+    *,
+    writable: bool,
+    create: bool = False,
+    mode: int | None = _PRIVATE_FILE_MODE,
+    tighten_mode: bool = False,
+) -> int:
+    """Open or create one private regular file below a pinned directory.
+
+    Existing leaves are observed before and after ``openat`` so a replacement
+    cannot silently become the authorized inode.  Type, owner and single-link
+    checks always precede an fd-only permission repair.
+    """
+
+    _require_leaf_name(name)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("secure file opening is unsupported on this platform")
+    if create and mode is None:
+        raise ValueError("created private files require an explicit mode")
+
+    access_flags = os.O_RDWR if writable else os.O_RDONLY
+    flags = access_flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    before: os.stat_result | None = None
+    created = False
+    fd = -1
+    try:
+        if create:
+            try:
+                fd = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    int(mode),
+                    dir_fd=parent_fd,
+                )
+                created = True
+            except FileExistsError:
+                before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                _require_private_regular_file_identity(
+                    before,
+                    display=name,
+                    mode=None if tighten_mode else mode,
+                )
+                fd = os.open(name, flags, dir_fd=parent_fd)
+        else:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _require_private_regular_file_identity(
+                before,
+                display=name,
+                mode=None if tighten_mode else mode,
+            )
+            fd = os.open(name, flags, dir_fd=parent_fd)
+
+        opened = os.fstat(fd)
+        _require_private_regular_file_identity(
+            opened,
+            display=name,
+            mode=None if (created or tighten_mode) else mode,
+        )
+        if before is not None and (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise UnsafePrivatePathError(
+                f"private file changed while opening: {name}"
+            )
+        if created or tighten_mode:
+            os.fchmod(fd, int(mode))
+        verify_private_file_fd_at(parent_fd, name, fd, mode=mode)
+        if created:
+            os.fsync(parent_fd)
+        return fd
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
+            raise UnsafePrivatePathError(
+                f"private file path is unsafe: {name}"
+            ) from exc
+        raise
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
 
 
 def read_private_file_at(
@@ -1077,17 +1236,23 @@ def ensure_private_directory(path: Path) -> Path:
 
 
 def ensure_private_file(path: Path) -> None:
-    """Validate an existing owner file and tighten it to mode 0600."""
+    """Validate one existing single-link owner file and tighten it by fd."""
 
+    parent_fd = open_private_directory_fd(path.parent)
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise RuntimeError(f"private runtime file must be a regular non-symlink file: {path}")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
-        raise RuntimeError(f"private runtime file is not owned by the service user: {path}")
-    path.chmod(0o600)
+        try:
+            file_fd = open_private_file_fd_at(
+                parent_fd,
+                path.name,
+                writable=False,
+                mode=_PRIVATE_FILE_MODE,
+                tighten_mode=True,
+            )
+        except FileNotFoundError:
+            return
+        os.close(file_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def write_private_file_exclusive(path: Path, data: bytes) -> None:
@@ -1175,3 +1340,37 @@ def tighten_sqlite_files(path: Path) -> None:
 
     for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
         ensure_private_file(candidate)
+
+
+def tighten_sqlite_files_at(
+    parent_fd: int,
+    database_name: str,
+    *,
+    database_fd: int | None = None,
+) -> None:
+    """Validate/tighten a SQLite file set relative to one pinned directory."""
+
+    _require_leaf_name(database_name)
+    names = (database_name, f"{database_name}-wal", f"{database_name}-shm")
+    for index, name in enumerate(names):
+        if index == 0 and database_fd is not None:
+            verify_private_file_fd_at(parent_fd, name, database_fd, mode=None)
+            os.fchmod(database_fd, _PRIVATE_FILE_MODE)
+            verify_private_file_fd_at(
+                parent_fd,
+                name,
+                database_fd,
+                mode=_PRIVATE_FILE_MODE,
+            )
+            continue
+        try:
+            file_fd = open_private_file_fd_at(
+                parent_fd,
+                name,
+                writable=False,
+                mode=_PRIVATE_FILE_MODE,
+                tighten_mode=True,
+            )
+        except FileNotFoundError:
+            continue
+        os.close(file_fd)

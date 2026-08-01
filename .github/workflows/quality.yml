@@ -36,6 +36,12 @@ jobs:
       - name: Validate canonical documentation
         run: python scripts/docs_sync.py check
 
+      - name: Enforce target-only production source boundary
+        run: >-
+          python scripts/verify_target_baseline_source.py
+          --root .
+          --contract docs/contracts/release-transition.json
+
       - name: Validate pull request synchronization
         if: github.event_name == 'pull_request'
         run: >-
@@ -60,10 +66,14 @@ jobs:
           fi
           python scripts/docs_sync.py check-change --base "$base" --head HEAD
 
-  backend:
-    name: Python 3.11
+  backend-shard:
+    name: Python shard ${{ matrix.shard }} of 0-3
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     defaults:
       run:
         working-directory: enterprise-agent-platform
@@ -84,10 +94,31 @@ jobs:
         run: python -m pip install --no-input --editable .
 
       - name: Compile Python sources
+        if: matrix.shard == 0
         run: python -m compileall -q enterprise_agent_platform tests
 
       - name: Run Python tests
-        run: python -m unittest discover -s tests -v
+        run: >-
+          python ../scripts/python_test_shard.py
+          --shard-index "${{ matrix.shard }}"
+          --shard-count 4
+
+  backend:
+    name: Python 3.11
+    if: ${{ always() }}
+    needs: backend-shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Python shard
+        env:
+          SHARD_RESULT: ${{ needs['backend-shard'].result }}
+        shell: bash
+        run: |
+          if [[ "$SHARD_RESULT" != "success" ]]; then
+            printf 'Python shards did not all succeed: %s\n' "$SHARD_RESULT" >&2
+            exit 1
+          fi
 
   frontend:
     name: Node 24
@@ -159,11 +190,11 @@ jobs:
       - name: Install runtime dependencies
         run: npm ci
 
-      - name: Type-check runtime
-        run: npm run check
+      - name: Build runtime once
+        run: npm run build
 
       - name: Run runtime tests
-        run: npm test
+        run: npm run test:compiled
 
       - name: Stress runtime inactivity lifecycle
         shell: bash
@@ -194,8 +225,12 @@ jobs:
             exit "$status"
           fi
 
-      - name: Build runtime
-        run: npm run build
+      - name: Test Camoufox runtime patch
+        working-directory: enterprise-agent-platform/camofox-runtime
+        shell: bash
+        run: |
+          npm ci
+          npm test
 
       - name: Audit runtime dependencies
         run: npm audit --audit-level=high
@@ -217,7 +252,7 @@ jobs:
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
         with:
           go-version-file: manager/go.mod
-          cache: false
+          cache: true
 
       - name: Test manager
         run: go test ./...
@@ -226,7 +261,14 @@ jobs:
         run: go vet ./...
 
       - name: Build manager
-        run: go build ./cmd/ubitech-manager
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          stage="$(jq -er '.stage | select(. == "bridge" or . == "cleanup" or . == "target_baseline")' docs/contracts/release-transition.json)"
+          command=./cmd/agent-platform-manager
+          [[ "$stage" == bridge ]] && command=./cmd/ubitech-manager
+          go -C manager build "$command"
 
   container-definitions:
     name: Container definitions

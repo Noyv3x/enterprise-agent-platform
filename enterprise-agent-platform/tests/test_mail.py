@@ -180,6 +180,7 @@ class MailTransportCheckpointTests(unittest.TestCase):
 class MailServiceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         start_worker = mock.patch.object(
             EnterpriseService, "_start_mail_worker", return_value=None
         )
@@ -189,7 +190,6 @@ class MailServiceTests(unittest.TestCase):
             make_config(Path(self.temporary.name)), agent_client=RecordingAgent()
         )
         self.addCleanup(self.service.close)
-        self.addCleanup(self.temporary.cleanup)
         self.actor = self.service.get_user(1)
         assert self.actor is not None
         self.transport = FakeMailTransport()

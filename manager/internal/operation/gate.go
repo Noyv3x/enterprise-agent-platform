@@ -12,8 +12,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 )
 
 const (
@@ -92,10 +90,6 @@ type targetHandoffCommitResponse struct {
 	Receipt  TargetHandoffCommitReceipt `json:"receipt"`
 }
 
-type retainedPredecessorReleaseResponse struct {
-	Released bool `json:"released"`
-}
-
 // TargetHandoffReservationObservation is a read-only reconciliation view. A
 // receipt can coexist with a reservation only in the crash window after the
 // durable receipt and before admission release.
@@ -125,59 +119,11 @@ func (g HTTPGate) Release(ctx context.Context, id string) error {
 	return g.call(ctx, http.MethodPost, "/internal/manager/update/abort-release", map[string]string{"operation_id": id}, nil)
 }
 
-// releaseRetainedSourcePredecessor is the sole HTTP compatibility branch for
-// the fixed source-owner predecessor. It always tries the current abort API
-// first and reaches the old release endpoint only when the authenticated old
-// Platform proves that the new endpoint is absent with its exact 404 body.
-func (g HTTPGate) releaseRetainedSourcePredecessor(ctx context.Context, id, generation string) error {
-	if generation != contract.SourceOwnerCompatGeneration {
-		return errors.New("retained source predecessor generation is not canonical")
-	}
-	if strings.TrimSpace(g.Token) == "" {
-		return errors.New("retained source predecessor release requires a Manager token")
-	}
-	err := g.Release(ctx, id)
-	if err == nil {
-		return nil
-	}
-	if !isRetainedPredecessorEndpointMissing(err) {
-		return err
-	}
-	var response retainedPredecessorReleaseResponse
-	if fallbackErr := g.callStrict(ctx, http.MethodPost, "/internal/manager/update/release", map[string]string{"operation_id": id}, &response); fallbackErr != nil {
-		return fmt.Errorf("release retained source predecessor through its legacy endpoint: %w", fallbackErr)
-	}
-	if !response.Released {
-		return errors.New("retained source predecessor legacy endpoint did not release admission")
-	}
-	return nil
-}
 func (g HTTPGate) Commit(ctx context.Context, id string) error {
 	return g.call(ctx, http.MethodPost, "/internal/manager/update/commit-release", map[string]string{"operation_id": id}, nil)
 }
 func (g HTTPGate) Health(ctx context.Context) error {
 	return g.call(ctx, http.MethodGet, "/internal/manager/health", nil, nil)
-}
-
-func isRetainedPredecessorEndpointMissing(err error) bool {
-	var statusErr *HTTPStatusError
-	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
-		return false
-	}
-	data := []byte(statusErr.Body)
-	if len(data) == 0 || len(data) > 4096 || rejectDuplicateGateJSONFields(data) != nil {
-		return false
-	}
-	var response struct {
-		Error string `json:"error"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if decodeErr := decoder.Decode(&response); decodeErr != nil || response.Error != "manager endpoint not found" {
-		return false
-	}
-	var trailing any
-	return errors.Is(decoder.Decode(&trailing), io.EOF)
 }
 
 // CommitTargetHandoff retries safely after an ambiguous HTTP response because

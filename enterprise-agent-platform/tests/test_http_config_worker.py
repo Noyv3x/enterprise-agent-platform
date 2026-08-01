@@ -27,6 +27,10 @@ from enterprise_agent_platform.internal_config import (
 )
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService
+from enterprise_agent_platform.technical_profile import (
+    SOURCE_TECHNICAL_PROFILE,
+    TARGET_TECHNICAL_PROFILE,
+)
 
 from test_platform import RecordingAgent, make_config
 
@@ -53,6 +57,57 @@ class FailingThenRecoveringAgent(RecordingAgent):
 
 
 class HTTPServerBehaviorTests(unittest.TestCase):
+    def test_target_profile_uses_target_health_cookie_and_workspace_namespace(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            config = replace(
+                make_config(Path(td)),
+                technical_profile=TARGET_TECHNICAL_PROFILE,
+            )
+            service = EnterpriseService(config, agent_client=agent)
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/healthz")
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    json.loads(response.read().decode("utf-8")),
+                    {"status": "ok", "service": "agent-platform"},
+                )
+
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                response = conn.getresponse()
+                response.read()
+                cookie = response.getheader("Set-Cookie") or ""
+                self.assertEqual(response.status, 200)
+                self.assertTrue(cookie.startswith("agent_platform_session="))
+                self.assertNotIn("enterprise_session", cookie)
+
+                _, admin = service.authenticate("admin", "admin")
+                service.send_private_message(admin, "target workspace")
+                service.wait_for_agent_idle("private", str(admin["id"]))
+                self.assertIn(
+                    "/workspace/.agent-platform/attachments",
+                    agent.calls[-1]["system_prompt"],
+                )
+                self.assertNotIn(
+                    "/workspace/.ubitech/attachments",
+                    agent.calls[-1]["system_prompt"],
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_health_endpoint_is_exact_public_readiness_contract(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
@@ -336,6 +391,89 @@ class ConfigFromEnvTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "must be absolute"):
                     PlatformConfig.from_env(root)
+
+    def test_target_profile_uses_only_target_configuration_namespace(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_PLATFORM_TECHNICAL_PROFILE": "agent-platform-v1",
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "AGENT_PLATFORM_HOST": "0.0.0.0",
+                "AGENT_PLATFORM_PORT": "9876",
+                "AGENT_PLATFORM_SESSION_SECRET": "target-secret",
+            },
+            clear=True,
+        ):
+            config = PlatformConfig.from_env(Path("/ignored/source/root"))
+
+        self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
+        self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
+        self.assertEqual(
+            config.manager_socket,
+            Path("/run/agent-platform-manager/manager.sock"),
+        )
+        self.assertEqual(
+            config.manager_token_file,
+            Path("/run/secrets/agent-platform/manager-token"),
+        )
+        self.assertEqual(config.host, "0.0.0.0")
+        self.assertEqual(config.port, 9876)
+        self.assertEqual(config.token_secret, "target-secret")
+        self.assertEqual(config.session_cookie_name, "agent_platform_session")
+
+    def test_source_profile_remains_the_default_and_accepts_exact_selector(self):
+        for environment in (
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
+            {
+                "UBITECH_TECHNICAL_PROFILE": "ubitech-agent-v1",
+                "UBITECH_DEPLOYMENT_MODE": "container",
+            },
+        ):
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    config = PlatformConfig.from_env(Path("/source"))
+                self.assertEqual(config.technical_profile, SOURCE_TECHNICAL_PROFILE)
+                self.assertEqual(config.data_dir, Path("/source/data"))
+
+    def test_unknown_or_mixed_technical_profile_environment_is_rejected(self):
+        environments = (
+            {
+                "AGENT_PLATFORM_TECHNICAL_PROFILE": "unknown-profile",
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+            },
+            {
+                "AGENT_PLATFORM_TECHNICAL_PROFILE": "agent-platform-v1",
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "ENTERPRISE_PLATFORM_PORT": "8765",
+            },
+            {
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+            },
+        )
+        for environment in environments:
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "technical profile|cannot be mixed|required",
+                    ):
+                        PlatformConfig.from_env(Path("/tmp"))
+
+    def test_target_profile_rejects_source_or_unbound_target_paths(self):
+        for key, value in (
+            ("AGENT_PLATFORM_DATA", "/var/lib/ubitech-agent"),
+            ("AGENT_PLATFORM_MANAGER_SOCKET", "/run/ubitech-manager/manager.sock"),
+            ("AGENT_PLATFORM_MANAGER_TOKEN_FILE", "/run/secrets/manager-token"),
+        ):
+            with self.subTest(key=key):
+                environment = {
+                    "AGENT_PLATFORM_TECHNICAL_PROFILE": "agent-platform-v1",
+                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                    key: value,
+                }
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(ValueError, "target profile"):
+                        PlatformConfig.from_env(Path("/tmp"))
 
     def test_container_mode_exposes_only_an_absolute_trusted_host_data_root(self):
         with tempfile.TemporaryDirectory() as td:

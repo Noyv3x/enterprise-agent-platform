@@ -1,7 +1,32 @@
 #!/bin/sh
 set -eu
 
-mkdir -p "${HOME:-/var/lib/ubitech-agent/.home}"
+if env | grep -Eq '^(UBITECH_|ENTERPRISE_)'; then
+  echo "source-profile environment is not accepted by the target Platform image" >&2
+  exit 64
+fi
+
+require_exact() {
+  variable="$1"
+  expected="$2"
+  eval "actual=\${$variable:-}"
+  if [ "$actual" != "$expected" ]; then
+    echo "$variable must be $expected for the target technical profile" >&2
+    exit 64
+  fi
+}
+
+require_exact AGENT_PLATFORM_TECHNICAL_PROFILE agent-platform-v1
+require_exact AGENT_PLATFORM_DATA /var/lib/agent-platform
+require_exact AGENT_PLATFORM_DEPLOYMENT_MODE container
+require_exact AGENT_PLATFORM_SESSION_SECRET_FILE /run/secrets/agent-platform/session-secret
+require_exact AGENT_PLATFORM_AGENT_TOOL_TOKEN_FILE /run/secrets/agent-platform/agent-tool-token
+require_exact AGENT_PLATFORM_AGENT_RUNTIME_TOKEN_FILE /run/secrets/agent-platform/agent-runtime-token
+require_exact AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE /run/secrets/agent-platform/camofox-access-key
+require_exact AGENT_PLATFORM_MANAGER_SOCKET /run/agent-platform-manager/manager.sock
+require_exact AGENT_PLATFORM_MANAGER_TOKEN_FILE /run/secrets/agent-platform/manager-token
+
+mkdir -p "${HOME:-/var/lib/agent-platform/.home}"
 
 load_secret() {
   variable="$1"
@@ -27,11 +52,10 @@ load_secret() {
   fi
 }
 
-load_secret ENTERPRISE_SESSION_SECRET
-load_secret ENTERPRISE_AGENT_TOOL_TOKEN
-load_secret ENTERPRISE_AGENT_RUNTIME_TOKEN
-load_secret CAMOFOX_ACCESS_KEY
-load_secret FIRECRAWL_API_KEY
+load_secret AGENT_PLATFORM_SESSION_SECRET
+load_secret AGENT_PLATFORM_AGENT_TOOL_TOKEN
+load_secret AGENT_PLATFORM_AGENT_RUNTIME_TOKEN
+load_secret AGENT_PLATFORM_CAMOFOX_ACCESS_KEY
 
 case "${1:-}" in
   migrate|serve|init-admin|print-agent-token)

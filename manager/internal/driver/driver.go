@@ -972,7 +972,7 @@ func (d DockerCLI) verifyBoundManifest(manifest release.Manifest) error {
 	if hex.EncodeToString(digest[:]) != d.ManifestSHA256 {
 		return errors.New("bound manifest SHA-256 differs from the handoff journal")
 	}
-	decoded, err := release.DecodeManifest(raw, d.ManifestChannel, runtime.GOOS, runtime.GOARCH)
+	decoded, err := release.DecodeManifestForProfile(raw, d.ManifestChannel, runtime.GOOS, runtime.GOARCH, d.Profile)
 	if err != nil {
 		return fmt.Errorf("decode bound manifest: %w", err)
 	}

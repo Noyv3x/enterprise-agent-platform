@@ -892,7 +892,7 @@ func (m *Manager) validateStartupPreparedCandidatePlatform(candidate Version) (r
 	}
 
 	if candidate.PlatformCommitted {
-		evidence, err := readRecoveryFinalizeEvidence(platformPath, candidate.SourceCommit)
+		evidence, err := readRecoveryFinalizeEvidence(m.Profile, platformPath, candidate.SourceCommit)
 		if err != nil {
 			return release.Manifest{}, fmt.Errorf("validate committed prepared Manager Candidate: %w", err)
 		}
@@ -925,7 +925,7 @@ func (m *Manager) validateStartupPreparedCandidatePlatform(candidate Version) (r
 	if err := decodeRecoveryJSON(manifestData, &manifest); err != nil {
 		return release.Manifest{}, fmt.Errorf("decode prepared Manager Candidate manifest: %w", err)
 	}
-	if err := manifest.Validate(manifest.Channel, "linux", runtime.GOARCH); err != nil {
+	if err := validateSelfUpdateManifest(m.Profile, manifest); err != nil {
 		return release.Manifest{}, fmt.Errorf("validate prepared Manager Candidate manifest: %w", err)
 	}
 	if manifest.SourceCommit != candidate.SourceCommit || platform.Candidate.DatabaseVersion != manifest.DatabaseSchemaVersion ||

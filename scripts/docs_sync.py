@@ -56,6 +56,15 @@ REQUIRED_RUNTIME_POLICY_TARGETS = {
 REQUIRED_UPSTREAM_SOURCES_SOURCE = "docs/contracts/upstream-sources.json"
 REQUIRED_UPSTREAM_SOURCES_DOMAINS = frozenset({"integrations", "platform"})
 REQUIRED_UPSTREAM_SOURCES_TARGETS: dict[str, str] = {}
+REQUIRED_TECHNICAL_PROFILES_SOURCE = "docs/contracts/technical-profiles.json"
+REQUIRED_TECHNICAL_PROFILES_DOMAINS = frozenset(
+    {"deployment", "platform", "agent-runtime"}
+)
+REQUIRED_TECHNICAL_PROFILES_TARGETS = {
+    "manager/internal/identity/technical_profiles_generated.go": "go-technical-profiles",
+    "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py": "python-technical-profiles",
+    "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts": "typescript-technical-profile",
+}
 REQUIRED_CONTAINER_PLATFORM_SOURCE = "docs/contracts/container-platform.json"
 REQUIRED_CONTAINER_PLATFORM_DOMAINS = frozenset(
     {"deployment", "platform", "agent-runtime", "frontend"}
@@ -339,7 +348,6 @@ def validate_release_transition_contract(value: Any, label: str) -> dict[str, An
             "transition_id",
             "stage",
             "predecessor_generation",
-            "source_owner_compat",
             "source_profile_id",
             "target_profile_id",
             "manifest_protocol",
@@ -353,7 +361,7 @@ def validate_release_transition_contract(value: Any, label: str) -> dict[str, An
         "source_profile_id", "target_profile_id", "manifest_protocol",
         "promotion", "deployment_receipt",
     }
-    if set(contract) not in {frozenset(required_keys), frozenset(required_keys | {"source_owner_compat"})}:
+    if set(contract) != required_keys:
         raise DocsSyncError(f"{label} must contain the complete closed transition contract")
     if (
         type(contract["schema_version"]) is not int
@@ -361,43 +369,12 @@ def validate_release_transition_contract(value: Any, label: str) -> dict[str, An
         or contract["transition_id"] != "technical-namespace-v1"
     ):
         raise DocsSyncError(f"{label} has an unsupported schema or transition id")
-    if contract["stage"] not in {"source_owner", "bridge", "cleanup", "target_baseline"}:
+    if contract["stage"] not in {"bridge", "cleanup", "target_baseline"}:
         raise DocsSyncError(
-            f"{label}.stage must be source_owner, bridge, cleanup, or target_baseline"
+            f"{label}.stage must be bridge, cleanup, or target_baseline"
         )
     if not isinstance(contract["predecessor_generation"], str) or re.fullmatch(r"[0-9a-f]{40}", contract["predecessor_generation"]) is None:
         raise DocsSyncError(f"{label}.predecessor_generation must be a lowercase 40-character commit")
-    compat = contract.get("source_owner_compat")
-    if contract["stage"] == "source_owner":
-        compat = _expect_object(compat, f"{label}.source_owner_compat")
-        _reject_unknown_keys(
-            compat,
-            {"generation", "manifest_sha256", "compose_sha256", "managed_images"},
-            f"{label}.source_owner_compat",
-        )
-        if set(compat) != {"generation", "manifest_sha256", "compose_sha256", "managed_images"}:
-            raise DocsSyncError(f"{label}.source_owner_compat must be complete")
-        canonical_p1 = {
-            "generation": "983f79b4900502f35fac6de8154eb344fc9f143b",
-            "manifest_sha256": "8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1",
-            "compose_sha256": "ebe1ce922cd33c9acb816bf9af175fc7e3838835cb413ab3ee91b91808698954",
-        }
-        if any(compat.get(name) != value for name, value in canonical_p1.items()):
-            raise DocsSyncError(
-                f"{label}.source_owner_compat is limited to the canonical P1 generation and bytes"
-            )
-        for name in ("manifest_sha256", "compose_sha256"):
-            if not isinstance(compat[name], str) or re.fullmatch(r"[0-9a-f]{64}", compat[name]) is None:
-                raise DocsSyncError(f"{label}.source_owner_compat.{name} must be a lowercase SHA-256")
-        expected_compat_images = [
-            "agent-runtime", "agent-sandbox", "camofox", "firecrawl-api",
-            "firecrawl-playwright", "firecrawl-postgres", "firecrawl-rabbitmq",
-            "firecrawl-redis", "platform", "searxng",
-        ]
-        if compat["managed_images"] != expected_compat_images:
-            raise DocsSyncError(f"{label}.source_owner_compat.managed_images must preserve the exact P1 closed set")
-    elif compat is not None:
-        raise DocsSyncError(f"{label}.source_owner_compat is permitted only for source_owner")
     if contract["source_profile_id"] != "ubitech-agent-v1" or contract["target_profile_id"] != "agent-platform-v1":
         raise DocsSyncError(f"{label} must bind the canonical source and target profiles")
     protocol = _expect_object(contract["manifest_protocol"], f"{label}.manifest_protocol")
@@ -723,6 +700,9 @@ def load_manifest(root: Path) -> Manifest:
                 "go-container-platform",
                 "go-release-transition",
                 "python-release-transition",
+                "go-technical-profiles",
+                "python-technical-profiles",
+                "typescript-technical-profile",
             }:
                 raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
             _reject_symlink_chain(root, target_path, f"{target_label}.path")
@@ -819,6 +799,34 @@ def load_manifest(root: Path) -> Manifest:
     ):
         raise DocsSyncError(
             "upstream-sources must not define generated targets; direct consumers read its validated JSON"
+        )
+
+    technical_contracts = [
+        contract
+        for contract in manifest.contracts
+        if contract.identifier == "technical-profiles"
+    ]
+    if len(technical_contracts) != 1:
+        raise DocsSyncError("manifest must define exactly one technical-profiles contract")
+    technical_contract = technical_contracts[0]
+    if technical_contract.source != REQUIRED_TECHNICAL_PROFILES_SOURCE:
+        raise DocsSyncError(
+            f"technical-profiles source must be {REQUIRED_TECHNICAL_PROFILES_SOURCE}"
+        )
+    if set(technical_contract.domains) != REQUIRED_TECHNICAL_PROFILES_DOMAINS:
+        raise DocsSyncError(
+            "technical-profiles domains must be exactly: "
+            + ", ".join(sorted(REQUIRED_TECHNICAL_PROFILES_DOMAINS))
+        )
+    technical_targets = {
+        target.path: target.format for target in technical_contract.targets
+    }
+    if (
+        len(technical_targets) != len(technical_contract.targets)
+        or technical_targets != REQUIRED_TECHNICAL_PROFILES_TARGETS
+    ):
+        raise DocsSyncError(
+            "technical-profiles targets and formats must match the required Go, Python, and Agent Runtime projections"
         )
 
     container_contracts = [
@@ -2233,30 +2241,21 @@ var OperationPhases = []string{{{strings(contract["operation_phases"])}}}
 
 
 def _render_go_release_transition(contract: dict[str, Any], source: str) -> str:
-    compat = contract.get("source_owner_compat")
-    if compat is None:
-        return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
-package contract
-'''
-    images = ", ".join(_go_string(value) for value in compat["managed_images"])
     return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
 package contract
 
 const (
-\tSourceOwnerCompatGeneration     = {_go_string(compat["generation"])}
-\tSourceOwnerCompatManifestSHA256 = {_go_string(compat["manifest_sha256"])}
-\tSourceOwnerCompatComposeSHA256  = {_go_string(compat["compose_sha256"])}
+\tReleaseTransitionStage                 = {_go_string(contract["stage"])}
+\tReleaseTransitionPredecessorGeneration = {_go_string(contract["predecessor_generation"])}
+\tReleaseTransitionSourceProfileID       = {_go_string(contract["source_profile_id"])}
+\tReleaseTransitionTargetProfileID       = {_go_string(contract["target_profile_id"])}
 )
-
-var SourceOwnerCompatManagedImages = []string{{{images}}}
 '''
 
 
 def _render_python_release_transition(
     contract: dict[str, Any], source: str
 ) -> str:
-    compat = contract.get("source_owner_compat")
-    compat_generation = compat["generation"] if compat is not None else None
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -2264,7 +2263,426 @@ RELEASE_TRANSITION_STAGE = {contract["stage"]!r}
 PREDECESSOR_GENERATION = {contract["predecessor_generation"]!r}
 SOURCE_PROFILE_ID = {contract["source_profile_id"]!r}
 TARGET_PROFILE_ID = {contract["target_profile_id"]!r}
-SOURCE_OWNER_COMPAT_GENERATION = {compat_generation!r}
+'''
+
+
+def _validate_technical_profiles_contract(
+    raw: Any,
+    label: str,
+) -> dict[str, Any]:
+    contract = _expect_object(raw, label)
+    _reject_unknown_keys(contract, {"schema_version", "profiles"}, label)
+    if set(contract) != {"schema_version", "profiles"}:
+        raise DocsSyncError(f"{label} must contain schema_version and profiles")
+    if contract["schema_version"] != 1:
+        raise DocsSyncError(f"{label}.schema_version must be 1")
+
+    profiles = _expect_object(contract["profiles"], f"{label}.profiles")
+    if set(profiles) != {"source", "target"}:
+        raise DocsSyncError(
+            f"{label}.profiles must contain exactly source and target"
+        )
+
+    profile_keys = {
+        "profile_id",
+        "manager",
+        "container",
+        "gateway",
+        "compose",
+        "environment",
+        "labels",
+        "workspace",
+        "platform",
+    }
+    group_keys = {
+        "manager": {
+            "binary",
+            "unit",
+            "config_directory",
+            "config_file",
+            "data_directory",
+            "state_directory",
+            "data_root_socket_path",
+            "runtime_socket_path",
+            "default_socket_path",
+            "default_token_file",
+        },
+        "container": {"data_root", "secret_root", "control_socket_path"},
+        "gateway": {"status_path", "health_path"},
+        "compose": {"project", "core_network"},
+        "environment": {"manager_prefix", "platform_prefix", "keys"},
+        "labels": {
+            "prefix",
+            "sandbox_container_prefix",
+            "migration_container_prefix",
+            "watchdog_unit_prefix",
+            "recovery_watchdog_unit_prefix",
+        },
+        "workspace": {"internal_directory", "scope_marker"},
+        "platform": {
+            "default_data_root",
+            "database_baseline",
+            "instance_lock",
+            "camofox_sidecar",
+            "session_namespace",
+            "session_cookie",
+            "health_service",
+            "search_health_service",
+            "agent_runtime_health_service",
+        },
+    }
+    environment_key_names = {
+        "technical_profile",
+        "deployment_mode",
+        "manager_socket",
+        "manager_token_file",
+        "host_data_root",
+    }
+
+    def complete_object(value: Any, expected: set[str], value_label: str) -> dict[str, Any]:
+        item = _expect_object(value, value_label)
+        _reject_unknown_keys(item, expected, value_label)
+        missing = sorted(expected - set(item))
+        if missing:
+            raise DocsSyncError(
+                f"{value_label} is missing required keys: {', '.join(missing)}"
+            )
+        return item
+
+    def nonempty_string(value: Any, value_label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or any(character in value for character in ("\x00", "\r", "\n"))
+        ):
+            raise DocsSyncError(f"{value_label} must be a non-empty canonical string")
+        return value
+
+    def absolute_path(value: Any, value_label: str) -> str:
+        path = nonempty_string(value, value_label)
+        parsed = PurePosixPath(path)
+        if (
+            not parsed.is_absolute()
+            or path.startswith("//")
+            or path.endswith("/")
+            or parsed.as_posix() != path
+            or any(part in {".", ".."} for part in parsed.parts)
+        ):
+            raise DocsSyncError(f"{value_label} must be a canonical absolute path")
+        return path
+
+    def relative_path(value: Any, value_label: str) -> str:
+        path = nonempty_string(value, value_label)
+        parsed = PurePosixPath(path)
+        if (
+            parsed.is_absolute()
+            or path.endswith("/")
+            or parsed.as_posix() != path
+            or any(part in {"", ".", ".."} for part in parsed.parts)
+        ):
+            raise DocsSyncError(f"{value_label} must be a canonical relative path")
+        return path
+
+    for role in ("source", "target"):
+        profile_label = f"{label}.profiles.{role}"
+        profile = complete_object(profiles[role], profile_keys, profile_label)
+        profile_id = nonempty_string(profile["profile_id"], f"{profile_label}.profile_id")
+        if re.fullmatch(r"[a-z][a-z0-9-]*-v[1-9][0-9]*", profile_id) is None:
+            raise DocsSyncError(
+                f"{profile_label}.profile_id must be a versioned lowercase identifier"
+            )
+
+        groups = {
+            name: complete_object(
+                profile[name], keys, f"{profile_label}.{name}"
+            )
+            for name, keys in group_keys.items()
+        }
+        manager = groups["manager"]
+        container = groups["container"]
+        gateway = groups["gateway"]
+        compose = groups["compose"]
+        environment = groups["environment"]
+        labels = groups["labels"]
+        workspace = groups["workspace"]
+        platform = groups["platform"]
+
+        for name in (
+            "binary",
+            "unit",
+            "config_directory",
+            "config_file",
+            "data_directory",
+            "state_directory",
+        ):
+            relative_path(manager[name], f"{profile_label}.manager.{name}")
+        if "/" in manager["binary"] or "/" in manager["unit"]:
+            raise DocsSyncError(
+                f"{profile_label}.manager binary and unit must be base names"
+            )
+        if not manager["unit"].endswith(".service"):
+            raise DocsSyncError(f"{profile_label}.manager.unit must be a service unit")
+
+        socket_bindings: list[str | None] = []
+        for name in ("data_root_socket_path", "runtime_socket_path"):
+            binding = manager[name]
+            if binding is not None:
+                binding = relative_path(binding, f"{profile_label}.manager.{name}")
+            socket_bindings.append(binding)
+        if sum(binding is not None for binding in socket_bindings) != 1:
+            raise DocsSyncError(
+                f"{profile_label}.manager must define exactly one relative socket binding"
+            )
+        if role == "source" and manager["data_root_socket_path"] is None:
+            raise DocsSyncError(
+                f"{profile_label}.manager must bind its socket under the data root"
+            )
+        if role == "target" and manager["runtime_socket_path"] is None:
+            raise DocsSyncError(
+                f"{profile_label}.manager must bind its socket under the runtime root"
+            )
+
+        for name in ("default_socket_path", "default_token_file"):
+            absolute_path(manager[name], f"{profile_label}.manager.{name}")
+        for name, value in container.items():
+            absolute_path(value, f"{profile_label}.container.{name}")
+        for name, value in gateway.items():
+            absolute_path(value, f"{profile_label}.gateway.{name}")
+        if manager["default_socket_path"] != container["control_socket_path"]:
+            raise DocsSyncError(
+                f"{profile_label} default and container control sockets must match"
+            )
+
+        for name, value in compose.items():
+            identifier = nonempty_string(value, f"{profile_label}.compose.{name}")
+            if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", identifier) is None:
+                raise DocsSyncError(
+                    f"{profile_label}.compose.{name} must be a lowercase Compose identifier"
+                )
+
+        environment_keys = complete_object(
+            environment["keys"],
+            environment_key_names,
+            f"{profile_label}.environment.keys",
+        )
+        for prefix_name in ("manager_prefix", "platform_prefix"):
+            prefix = nonempty_string(
+                environment[prefix_name],
+                f"{profile_label}.environment.{prefix_name}",
+            )
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", prefix) is None:
+                raise DocsSyncError(
+                    f"{profile_label}.environment.{prefix_name} must be an uppercase prefix"
+                )
+        for name, value in environment_keys.items():
+            variable = nonempty_string(
+                value, f"{profile_label}.environment.keys.{name}"
+            )
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", variable) is None:
+                raise DocsSyncError(
+                    f"{profile_label}.environment.keys.{name} must be an environment variable"
+                )
+            if not variable.startswith(environment["manager_prefix"] + "_"):
+                raise DocsSyncError(
+                    f"{profile_label}.environment.keys.{name} must use manager_prefix"
+                )
+        if len(set(environment_keys.values())) != len(environment_keys):
+            raise DocsSyncError(f"{profile_label}.environment.keys must be unique")
+
+        label_prefix = nonempty_string(
+            labels["prefix"], f"{profile_label}.labels.prefix"
+        )
+        if re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)+", label_prefix) is None:
+            raise DocsSyncError(
+                f"{profile_label}.labels.prefix must be a lowercase label namespace"
+            )
+        for name in (
+            "sandbox_container_prefix",
+            "migration_container_prefix",
+            "watchdog_unit_prefix",
+            "recovery_watchdog_unit_prefix",
+        ):
+            value = nonempty_string(labels[name], f"{profile_label}.labels.{name}")
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]*-", value) is None:
+                raise DocsSyncError(
+                    f"{profile_label}.labels.{name} must be a lowercase name prefix"
+                )
+
+        internal_directory = relative_path(
+            workspace["internal_directory"],
+            f"{profile_label}.workspace.internal_directory",
+        )
+        if len(PurePosixPath(internal_directory).parts) != 1 or not internal_directory.startswith("."):
+            raise DocsSyncError(
+                f"{profile_label}.workspace.internal_directory must be one hidden directory"
+            )
+        scope_marker = relative_path(
+            workspace["scope_marker"], f"{profile_label}.workspace.scope_marker"
+        )
+        if len(PurePosixPath(scope_marker).parts) != 1 or not scope_marker.startswith("."):
+            raise DocsSyncError(
+                f"{profile_label}.workspace.scope_marker must be one hidden file"
+            )
+
+        default_data_root = platform["default_data_root"]
+        if default_data_root is not None:
+            absolute_path(
+                default_data_root, f"{profile_label}.platform.default_data_root"
+            )
+        if role == "source" and default_data_root is not None:
+            raise DocsSyncError(
+                f"{profile_label}.platform.default_data_root must remain null"
+            )
+        if role == "target" and default_data_root != container["data_root"]:
+            raise DocsSyncError(
+                f"{profile_label}.platform.default_data_root must match container.data_root"
+            )
+        for name in (
+            "database_baseline",
+            "instance_lock",
+            "camofox_sidecar",
+            "session_namespace",
+            "session_cookie",
+            "health_service",
+            "search_health_service",
+            "agent_runtime_health_service",
+        ):
+            relative_path(platform[name], f"{profile_label}.platform.{name}")
+            if "/" in platform[name]:
+                raise DocsSyncError(
+                    f"{profile_label}.platform.{name} must be a base name"
+                )
+
+    if profiles["source"]["profile_id"] == profiles["target"]["profile_id"]:
+        raise DocsSyncError(f"{label} source and target profile IDs must differ")
+    return contract
+
+
+def _render_go_technical_profiles(contract: dict[str, Any], source: str) -> str:
+    field_paths = (
+        ("ProfileID", ("profile_id",)),
+        ("ManagerBinary", ("manager", "binary")),
+        ("ManagerUnit", ("manager", "unit")),
+        ("ConfigDirectory", ("manager", "config_directory")),
+        ("ConfigFile", ("manager", "config_file")),
+        ("DataDirectory", ("manager", "data_directory")),
+        ("ManagerStateDirectory", ("manager", "state_directory")),
+        ("DataRootSocketPath", ("manager", "data_root_socket_path")),
+        ("RuntimeSocketPath", ("manager", "runtime_socket_path")),
+        ("ContainerDataRoot", ("container", "data_root")),
+        ("ContainerSecretRoot", ("container", "secret_root")),
+        ("ContainerControlSocketPath", ("container", "control_socket_path")),
+        ("GatewayStatusPath", ("gateway", "status_path")),
+        ("GatewayHealthPath", ("gateway", "health_path")),
+        ("ComposeProject", ("compose", "project")),
+        ("CoreNetwork", ("compose", "core_network")),
+        ("EnvironmentPrefix", ("environment", "manager_prefix")),
+        ("LabelPrefix", ("labels", "prefix")),
+        ("SandboxContainerPrefix", ("labels", "sandbox_container_prefix")),
+        ("MigrationContainerPrefix", ("labels", "migration_container_prefix")),
+        ("WatchdogUnitPrefix", ("labels", "watchdog_unit_prefix")),
+        (
+            "RecoveryWatchdogUnitPrefix",
+            ("labels", "recovery_watchdog_unit_prefix"),
+        ),
+        ("InternalWorkspaceDirectory", ("workspace", "internal_directory")),
+    )
+    field_width = max(len(name) for name, _ in field_paths)
+
+    def lookup(profile: dict[str, Any], path: tuple[str, ...]) -> str:
+        value: Any = profile
+        for component in path:
+            value = value[component]
+        return "" if value is None else value
+
+    def render_profile(role: str) -> str:
+        profile = contract["profiles"][role]
+        lines = "\n".join(
+            f"\t{name + ':':<{field_width + 1}} {_go_string(lookup(profile, path))},"
+            for name, path in field_paths
+        )
+        return f"var generated{role.title()}Profile = Profile{{\n{lines}\n}}"
+
+    return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
+package identity
+
+{render_profile("source")}
+
+{render_profile("target")}
+'''
+
+
+def _python_technical_profile_projection(profile: dict[str, Any]) -> dict[str, Any]:
+    environment = profile["environment"]
+    keys = environment["keys"]
+    manager = profile["manager"]
+    platform = profile["platform"]
+    return {
+        "profile_id": profile["profile_id"],
+        "selector_environment_variable": keys["technical_profile"],
+        "deployment_mode_environment_variable": keys["deployment_mode"],
+        "manager_socket_environment_variable": keys["manager_socket"],
+        "manager_token_file_environment_variable": keys["manager_token_file"],
+        "host_data_root_environment_variable": keys["host_data_root"],
+        "manager_environment_prefix": environment["manager_prefix"],
+        "platform_environment_prefix": environment["platform_prefix"],
+        "default_data_root": platform["default_data_root"],
+        "default_manager_socket": manager["default_socket_path"],
+        "default_manager_token_file": manager["default_token_file"],
+        "database_baseline_name": platform["database_baseline"],
+        "instance_lock_name": platform["instance_lock"],
+        "scope_marker_name": profile["workspace"]["scope_marker"],
+        "camofox_sidecar_name": platform["camofox_sidecar"],
+        "workspace_internal_directory": profile["workspace"]["internal_directory"],
+        "session_namespace": platform["session_namespace"],
+        "session_cookie_name": platform["session_cookie"],
+        "health_service": platform["health_service"],
+        "search_health_service": platform["search_health_service"],
+        "agent_runtime_health_service": platform["agent_runtime_health_service"],
+    }
+
+
+def _render_python_technical_profiles(contract: dict[str, Any], source: str) -> str:
+    projection = {
+        role: _python_technical_profile_projection(contract["profiles"][role])
+        for role in ("source", "target")
+    }
+    lines: list[str] = []
+    for role in ("source", "target"):
+        lines.append(f"    {role!r}: {{")
+        lines.extend(
+            f"        {name!r}: {value!r},"
+            for name, value in projection[role].items()
+        )
+        lines.append("    },")
+    return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
+from __future__ import annotations
+
+TECHNICAL_PROFILES: dict[str, dict[str, object]] = {{
+{chr(10).join(lines)}
+}}
+'''
+
+
+def _render_typescript_technical_profile(
+    contract: dict[str, Any], source: str
+) -> str:
+    source_profile = contract["profiles"]["source"]
+    target_profile = contract["profiles"]["target"]
+    source_prefixes = tuple(
+        dict.fromkeys(
+            (
+                source_profile["environment"]["manager_prefix"] + "_",
+                source_profile["environment"]["platform_prefix"] + "_",
+            )
+        )
+    )
+    return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
+export const TARGET_TECHNICAL_PROFILE_ID = {_typescript_string(target_profile["profile_id"])} as const;
+export const TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE = {_typescript_string(target_profile["environment"]["keys"]["technical_profile"])} as const;
+export const TARGET_MANAGER_EXECUTOR_SOCKET_PATH = {_typescript_string(target_profile["manager"]["default_socket_path"])} as const;
+export const SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES = {json.dumps(source_prefixes, ensure_ascii=False)} as const;
 '''
 
 
@@ -2355,6 +2773,26 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
         parsed = _validate_upstream_sources_contract(
             raw, f"contract {contract.identifier}"
         )
+    elif contract.identifier == "technical-profiles":
+        parsed = _validate_technical_profiles_contract(
+            raw, f"contract {contract.identifier}"
+        )
+        transition = validate_release_transition_contract(
+            _read_json(
+                _safe_path(root, REQUIRED_RELEASE_TRANSITION_SOURCE),
+                "release-transition contract",
+            ),
+            "release-transition contract",
+        )
+        if (
+            parsed["profiles"]["source"]["profile_id"]
+            != transition["source_profile_id"]
+            or parsed["profiles"]["target"]["profile_id"]
+            != transition["target_profile_id"]
+        ):
+            raise DocsSyncError(
+                "technical-profiles IDs must match the release-transition contract"
+            )
     elif contract.identifier == "release-transition":
         parsed = validate_release_transition_contract(raw, f"contract {contract.identifier}")
     else:
@@ -2375,6 +2813,12 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_go_release_transition(parsed, contract.source)
         elif target.format == "python-release-transition":
             content = _render_python_release_transition(parsed, contract.source)
+        elif target.format == "go-technical-profiles":
+            content = _render_go_technical_profiles(parsed, contract.source)
+        elif target.format == "python-technical-profiles":
+            content = _render_python_technical_profiles(parsed, contract.source)
+        elif target.format == "typescript-technical-profile":
+            content = _render_typescript_technical_profile(parsed, contract.source)
         else:  # Protected by manifest validation; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content

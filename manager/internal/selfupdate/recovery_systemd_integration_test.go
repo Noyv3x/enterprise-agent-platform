@@ -20,11 +20,11 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 )
 
-const recoverySystemdIntegrationEnvironment = "UBITECH_SYSTEMD_INTEGRATION"
-const recoverySystemdIntegrationHelperEnvironment = "UBITECH_SYSTEMD_INTEGRATION_HELPER"
-const ordinarySystemdIntegrationMainEnvironment = "UBITECH_SYSTEMD_ACTIVATION_MAIN_HELPER"
-const ordinarySystemdIntegrationWatchdogEnvironment = "UBITECH_SYSTEMD_ACTIVATION_WATCHDOG_HELPER"
-const ordinarySystemdIntegrationConfigEnvironment = "UBITECH_SYSTEMD_ACTIVATION_CONFIG"
+const recoverySystemdIntegrationEnvironment = "AGENT_PLATFORM_SYSTEMD_INTEGRATION"
+const recoverySystemdIntegrationHelperEnvironment = "AGENT_PLATFORM_SYSTEMD_INTEGRATION_HELPER"
+const ordinarySystemdIntegrationMainEnvironment = "AGENT_PLATFORM_SYSTEMD_ACTIVATION_MAIN_HELPER"
+const ordinarySystemdIntegrationWatchdogEnvironment = "AGENT_PLATFORM_SYSTEMD_ACTIVATION_WATCHDOG_HELPER"
+const ordinarySystemdIntegrationConfigEnvironment = "AGENT_PLATFORM_SYSTEMD_ACTIVATION_CONFIG"
 
 func init() {
 	if os.Getenv(ordinarySystemdIntegrationWatchdogEnvironment) == "1" {
@@ -78,8 +78,8 @@ func init() {
 }
 
 func runOrdinarySystemdIntegrationMain() error {
-	planPath := os.Getenv("UBITECH_SYSTEMD_ACTIVATION_PLAN")
-	markerPath := os.Getenv("UBITECH_SYSTEMD_ACTIVATION_MARKER")
+	planPath := os.Getenv("AGENT_PLATFORM_SYSTEMD_ACTIVATION_PLAN")
+	markerPath := os.Getenv("AGENT_PLATFORM_SYSTEMD_ACTIVATION_MARKER")
 	configPath := os.Getenv(ordinarySystemdIntegrationConfigEnvironment)
 	if !filepath.IsAbs(planPath) || !filepath.IsAbs(markerPath) || !filepath.IsAbs(configPath) {
 		return fmt.Errorf("ordinary integration paths must be absolute: plan=%q marker=%q config=%q", planPath, markerPath, configPath)
@@ -173,7 +173,7 @@ func runOrdinarySystemdIntegrationMain() error {
 
 func TestRecoverySystemdQuiescenceIntegration(t *testing.T) {
 	if os.Getenv(recoverySystemdIntegrationEnvironment) != "1" {
-		t.Skip("set UBITECH_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
+		t.Skip("set AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		t.Fatalf("systemctl is unavailable while the systemd integration gate is required: %v", err)
@@ -305,7 +305,7 @@ func TestRecoverySystemdQuiescenceIntegration(t *testing.T) {
 
 func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 	if os.Getenv(recoverySystemdIntegrationEnvironment) != "1" {
-		t.Skip("set UBITECH_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
+		t.Skip("set AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		t.Fatalf("systemctl is unavailable while the systemd integration gate is required: %v", err)
@@ -447,8 +447,8 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 		"systemd-run", "--user", "--quiet", "--collect", "--unit", mainBase,
 		"--property=Type=exec", "--property=TimeoutStopSec=5s",
 		"--setenv="+ordinarySystemdIntegrationMainEnvironment+"=1",
-		"--setenv=UBITECH_SYSTEMD_ACTIVATION_PLAN="+planPath,
-		"--setenv=UBITECH_SYSTEMD_ACTIVATION_MARKER="+markerPath,
+		"--setenv=AGENT_PLATFORM_SYSTEMD_ACTIVATION_PLAN="+planPath,
+		"--setenv=AGENT_PLATFORM_SYSTEMD_ACTIVATION_MARKER="+markerPath,
 		"--setenv="+ordinarySystemdIntegrationConfigEnvironment+"="+configPath,
 		installPath,
 	)
@@ -492,7 +492,7 @@ func TestOrdinarySystemdActivationRestartIntegration(t *testing.T) {
 		if err != nil || active != "active" {
 			return false, err
 		}
-		if err := manager.verifyOrdinaryWatchdogProcess(ctx, watchdogBase, currentPath, currentSHA, planPath, false); err != nil {
+		if err := manager.verifyOrdinaryWatchdogProcess(ctx, watchdogBase, currentPath, currentSHA, planPath); err != nil {
 			return false, nil
 		}
 		return true, nil

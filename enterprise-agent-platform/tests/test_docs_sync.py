@@ -168,6 +168,25 @@ class DocsSyncTests(unittest.TestCase):
                     "targets": [],
                 },
                 {
+                    "id": "technical-profiles",
+                    "source": "docs/contracts/technical-profiles.json",
+                    "domains": ["deployment", "platform", "agent-runtime"],
+                    "targets": [
+                        {
+                            "path": "manager/internal/identity/technical_profiles_generated.go",
+                            "format": "go-technical-profiles",
+                        },
+                        {
+                            "path": "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py",
+                            "format": "python-technical-profiles",
+                        },
+                        {
+                            "path": "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts",
+                            "format": "typescript-technical-profile",
+                        },
+                    ],
+                },
+                {
                     "id": "runtime-policy",
                     "source": "docs/contracts/runtime-policy.json",
                     "domains": ["platform", "agent-runtime", "frontend"],
@@ -238,6 +257,9 @@ class DocsSyncTests(unittest.TestCase):
         files: dict[str, str] = {
             "docs/domains.json": json.dumps(manifest or self.manifest(), indent=2) + "\n",
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
+            "docs/contracts/technical-profiles.json": (
+                REPOSITORY_ROOT / "docs/contracts/technical-profiles.json"
+            ).read_text(encoding="utf-8"),
             "docs/contracts/release-transition.json": (
                 REPOSITORY_ROOT / "docs/contracts/release-transition.json"
             ).read_text(encoding="utf-8"),
@@ -531,7 +553,6 @@ class DocsSyncTests(unittest.TestCase):
         transition_path = self.root / "docs/contracts/release-transition.json"
         transition = json.loads(transition_path.read_text(encoding="utf-8"))
         transition["stage"] = "target_baseline"
-        transition.pop("source_owner_compat")
         transition_path.write_text(json.dumps(transition), encoding="utf-8")
         self.run_command("sync", expect=0)
 
@@ -540,7 +561,68 @@ class DocsSyncTests(unittest.TestCase):
         policy = self.run_command("sync", expect=1)
         self.assertIn("direct-predecessor draft gates", policy.stderr)
 
-    def test_release_transition_generates_python_p1_compatibility_identity(self) -> None:
+    def test_technical_profiles_are_closed_and_generate_minimal_consumers(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        self.run_command("sync", expect=0)
+
+        go_projection = (
+            self.root
+            / "manager/internal/identity/technical_profiles_generated.go"
+        ).read_text(encoding="utf-8")
+        python_projection = (
+            self.root
+            / "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py"
+        ).read_text(encoding="utf-8")
+        runtime_projection = (
+            self.root
+            / "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts"
+        ).read_text(encoding="utf-8")
+        self.assertIn('ManagerBinary:              "agent-platform-manager"', go_projection)
+        self.assertIn("'database_baseline_name': 'agent-platform-container-baseline-v1'", python_projection)
+        self.assertIn(
+            'TARGET_MANAGER_EXECUTOR_SOCKET_PATH = "/run/agent-platform-manager/manager.sock"',
+            runtime_projection,
+        )
+        self.assertNotIn("repository", runtime_projection)
+        self.assertNotIn("module", runtime_projection)
+
+        runtime_path = (
+            self.root
+            / "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts"
+        )
+        runtime_path.write_text(runtime_projection + "// stale\n", encoding="utf-8")
+        stale = self.run_command("check", expect=1)
+        self.assertIn(
+            "generated contract target is stale: "
+            "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts",
+            stale.stderr,
+        )
+        self.run_command("sync", expect=0)
+
+        path = self.root / "docs/contracts/technical-profiles.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["profiles"]["target"]["unknown"] = True
+        path.write_text(json.dumps(contract), encoding="utf-8")
+        closed = self.run_command("sync", expect=1)
+        self.assertIn("contains unknown keys: unknown", closed.stderr)
+
+    def test_technical_profile_ids_must_match_release_transition(self) -> None:
+        self.initialize_git()
+        self.write_fixture()
+        path = self.root / "docs/contracts/technical-profiles.json"
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        contract["profiles"]["target"]["profile_id"] = "different-platform-v1"
+        path.write_text(json.dumps(contract), encoding="utf-8")
+
+        result = self.run_command("sync", expect=1)
+
+        self.assertIn(
+            "technical-profiles IDs must match the release-transition contract",
+            result.stderr,
+        )
+
+    def test_release_transition_generates_bridge_identity_without_retired_compatibility(self) -> None:
         self.initialize_git()
         manifest = self.manifest()
         manifest["contracts"].append(  # type: ignore[index,union-attr]
@@ -567,16 +649,25 @@ class DocsSyncTests(unittest.TestCase):
             self.root
             / "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("RELEASE_TRANSITION_STAGE = 'source_owner'", generated)
+        self.assertIn("RELEASE_TRANSITION_STAGE = 'bridge'", generated)
         self.assertIn(
             "PREDECESSOR_GENERATION = "
-            "'72b2fe687b5ff3e602e29da076398db375c101c4'",
+            "'3fa84952c56a6daf2a9a18825778c54b2d150cf1'",
             generated,
         )
-        self.assertIn(
-            "SOURCE_OWNER_COMPAT_GENERATION = "
-            "'983f79b4900502f35fac6de8154eb344fc9f143b'",
-            generated,
+        self.assertNotIn("SOURCE_OWNER_COMPAT", generated)
+        go_generated = (
+            self.root
+            / "manager/internal/contract/release_transition_generated.go"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(go_generated, r'ReleaseTransitionStage\s+= "bridge"')
+        self.assertRegex(
+            go_generated,
+            r'ReleaseTransitionSourceProfileID\s+= "ubitech-agent-v1"',
+        )
+        self.assertRegex(
+            go_generated,
+            r'ReleaseTransitionTargetProfileID\s+= "agent-platform-v1"',
         )
 
     def test_container_contract_rejects_incomplete_image_capacity_estimates(self) -> None:

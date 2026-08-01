@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -69,6 +70,77 @@ func TestStageByteExactTreeAndSecret(t *testing.T) {
 	}
 	if _, err := os.Lstat(result.StagingRoot); !os.IsNotExist(err) {
 		t.Fatalf("staging still exists after cleanup: %v", err)
+	}
+}
+
+func TestRenameNoReplacePreservesExistingTarget(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	target := filepath.Join(root, "target")
+	mustMkdirAll(t, staging, 0o700)
+	mustMkdirAll(t, target, 0o700)
+	mustWrite(t, filepath.Join(staging, "evidence"), []byte("staged"), 0o600)
+
+	err := renameNoReplace(staging, target)
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("no-replace rename did not reject an existing target: %v", err)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(staging, "evidence")); readErr != nil || string(got) != "staged" {
+		t.Fatalf("staging evidence changed after rejected publication: %q, %v", got, readErr)
+	}
+	if entries, readErr := os.ReadDir(target); readErr != nil || len(entries) != 0 {
+		t.Fatalf("existing target changed after rejected publication: entries=%v err=%v", entries, readErr)
+	}
+}
+
+func TestVerifyStagedRejectsDuplicateManifestResource(t *testing.T) {
+	fixture := newFixture(t)
+	request := fixture.request([]Resource{
+		{Name: "one", Kind: Generated, Target: "data/one", Type: RegularFile, Required: true, SchemaIdentifier: "test", SchemaVersion: 1, TransformationSHA256: semanticDigest("one"), Transformer: writeGenerated("one"), Validator: noMutationValidator()},
+		{Name: "two", Kind: Generated, Target: "data/two", Type: RegularFile, Required: true, SchemaIdentifier: "test", SchemaVersion: 1, TransformationSHA256: semanticDigest("two"), Transformer: writeGenerated("two"), Validator: noMutationValidator()},
+	})
+	engine := Engine{}
+	result, err := engine.Stage(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := result.Manifest
+	manifest.Resources[1] = manifest.Resources[0]
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, result.ManifestPath, append(raw, '\n'), 0o600)
+
+	if _, err := engine.VerifyStaged(context.Background(), request); err == nil || !strings.Contains(err.Error(), "duplicate resource") {
+		t.Fatalf("duplicate manifest resource replaced an omitted resource: %v", err)
+	}
+}
+
+func TestVerifyStagedRejectsDuplicateManifestJSONKey(t *testing.T) {
+	fixture := newFixture(t)
+	request := fixture.request([]Resource{{
+		Name: "one", Kind: Generated, Target: "data/one", Type: RegularFile, Required: true,
+		SchemaIdentifier: "test", SchemaVersion: 1, TransformationSHA256: semanticDigest("one"),
+		Transformer: writeGenerated("one"), Validator: noMutationValidator(),
+	}})
+	engine := Engine{}
+	result, err := engine.Stage(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(result.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(raw), `"schema_version":1,`, `"schema_version":1,"schema_version":1,`, 1)
+	if tampered == string(raw) {
+		t.Fatal("manifest fixture did not contain the expected schema_version field")
+	}
+	mustWrite(t, result.ManifestPath, []byte(tampered), 0o600)
+
+	if _, err := engine.VerifyStaged(context.Background(), request); err == nil || !strings.Contains(err.Error(), "duplicate JSON object key") {
+		t.Fatalf("duplicate manifest JSON key was accepted: %v", err)
 	}
 }
 

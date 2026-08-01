@@ -64,7 +64,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   if (request.method === "GET" && url.pathname === "/health") {
     json(response, 200, {
       status: "ok",
-      service: "ubitech-agent-runtime",
+      service: "agent-platform-runtime",
       version: VERSION,
       pid: process.pid,
       uptime_seconds: Math.floor(process.uptime()),

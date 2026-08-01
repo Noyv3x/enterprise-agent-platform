@@ -1067,17 +1067,25 @@ test("tool policy blocks writes to protected host paths", async () => {
   assert.match((await classifyToolCall("terminal", { command: "echo unsafe > /boot/marker" })).hardBlock || "", /protected/);
   assert.match((await classifyToolCall("terminal", { command: "curl --unix-socket /var/run/docker.sock http://localhost" })).hardBlock || "", /Docker/);
   assert.match(
-    (await classifyToolCall("terminal", { command: "cat /run/ubitech-agent/manager.sock" })).hardBlock || "",
+    (await classifyToolCall("terminal", { command: "cat /run/agent-platform-manager/manager.sock" })).hardBlock || "",
     /Manager control/,
   );
   assert.match(
-    (await classifyToolCall("terminal", { command: "cat ~/.config/ubitech-agent/manager.toml" })).hardBlock || "",
+    (await classifyToolCall("terminal", { command: "cat /run/user/1001/agent-platform-manager/manager.sock" })).hardBlock || "",
+    /Manager control/,
+  );
+  assert.match(
+    (await classifyToolCall("terminal", { command: "cat $XDG_RUNTIME_DIR/agent-platform-manager/manager.sock" })).hardBlock || "",
+    /Manager control/,
+  );
+  assert.match(
+    (await classifyToolCall("terminal", { command: "cat ~/.config/agent-platform/manager.toml" })).hardBlock || "",
     /Manager control/,
   );
   assert.match(
     (await classifyToolCall(
       "read_file",
-      { target: "host", path: "/home/deploy/.local/share/ubitech-agent/manager/state.json" },
+      { target: "host", path: "/home/deploy/.local/share/agent-platform/manager/state.json" },
       "/workspace",
       undefined,
       true,

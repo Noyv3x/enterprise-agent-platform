@@ -18,6 +18,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 func TestBoundComposeIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
@@ -135,6 +136,38 @@ func TestBoundManifestIsReverifiedBeforeAnyFixedStackMutation(t *testing.T) {
 	}
 }
 
+func TestBoundSchemaV2ManifestRequiresTargetDriverProfile(t *testing.T) {
+	manifest := releasetest.NewTarget(
+		strings.Repeat("a", 40),
+		releasetest.WithGeneratedAt(time.Unix(100, 0).UTC()),
+		releasetest.WithDatabaseSchemaVersion(7),
+	).Manifest
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	bound := DockerCLI{
+		Profile: testActiveProfile, ManifestFile: path,
+		ManifestSHA256: hex.EncodeToString(digest[:]), ManifestChannel: contract.ReleaseChannel,
+	}
+	if err := bound.verifyBoundManifest(manifest); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source Driver accepted schema-v2 manifest: %v", err)
+	}
+	target, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound.Profile = target
+	if err := bound.verifyBoundManifest(manifest); err != nil {
+		t.Fatalf("target Driver rejected schema-v2 manifest: %v", err)
+	}
+}
+
 var testActiveProfile = identity.SourceActiveProfile()
 
 type recordedCall struct {
@@ -210,26 +243,11 @@ func pullTestManifest() release.Manifest {
 }
 
 func strictDriverManifest(generation string) release.Manifest {
-	artifact := func(name string) release.Artifact {
-		return release.Artifact{URL: "https://example.invalid/" + name, SHA256: strings.Repeat("a", 64)}
-	}
-	managedNames := []string{
-		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
-	}
-	images := make(map[string]string, len(managedNames))
-	for _, name := range managedNames {
-		images[name] = "example.invalid/" + name + "@sha256:" + strings.Repeat("b", 64)
-	}
-	return release.Manifest{
-		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: generation,
-		GeneratedAt: time.Unix(100, 0).UTC(), ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: 7,
-		Manager: release.ManagerRelease{Version: generation, Artifacts: map[string]release.Artifact{
-			"amd64": artifact("manager-amd64"), "arm64": artifact("manager-arm64"),
-		}},
-		Compose: artifact("compose.yaml"), Images: images,
-	}
+	return releasetest.NewSource(
+		generation,
+		releasetest.WithGeneratedAt(time.Unix(100, 0).UTC()),
+		releasetest.WithDatabaseSchemaVersion(7),
+	).Manifest
 }
 
 func TestGenerationEnvironmentExcludesOpaqueExtraImages(t *testing.T) {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -74,6 +73,27 @@ func validNamespaceHandoffManifest(base string) Manifest {
 	return manifest
 }
 
+func validTargetManifestV2(t *testing.T, base string) (Manifest, identity.ActiveProfile) {
+	t.Helper()
+	manifest := validManifest(base, []byte("target baseline compose"))
+	manifest.SchemaVersion = ManifestSchemaVersionV2
+	manifest.ProtocolVersion = ManifestSchemaVersionV2
+	manifest.Manager = ManagerRelease{
+		Version: manifest.SourceCommit,
+		Artifacts: map[string]Artifact{
+			"amd64": testArtifact(base, "agent-platform-manager-linux-amd64"),
+			"arm64": testArtifact(base, "agent-platform-manager-linux-arm64"),
+		},
+	}
+	manifest.Compose = testArtifact(base, "agent-platform-compose.yaml")
+	delete(manifest.Images, "handoff-fs-helper")
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest, active
+}
+
 func fetchManifestDocument(t *testing.T, document any) (Manifest, error) {
 	t.Helper()
 	payload, err := json.Marshal(document)
@@ -85,6 +105,20 @@ func fetchManifestDocument(t *testing.T, document any) (Manifest, error) {
 	}))
 	defer server.Close()
 	manifest, _, err := (Client{HTTP: server.Client()}).Fetch(context.Background(), server.URL, contract.ReleaseChannel)
+	return manifest, err
+}
+
+func fetchManifestDocumentForProfile(t *testing.T, document any, active identity.ActiveProfile) (Manifest, error) {
+	t.Helper()
+	payload, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	manifest, _, err := (Client{HTTP: server.Client()}).FetchForProfile(context.Background(), server.URL, contract.ReleaseChannel, active)
 	return manifest, err
 }
 
@@ -118,6 +152,102 @@ func TestManifestRejectsUnsafeExtraImageNames(t *testing.T) {
 				t.Fatalf("unsafe extra image name %q was accepted", name)
 			}
 		})
+	}
+}
+
+func TestTargetProfileAcceptsSchemaV2ExactTenImageBaseline(t *testing.T) {
+	manifest, active := validTargetManifestV2(t, "http://127.0.0.1")
+	got, err := fetchManifestDocumentForProfile(t, manifest, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SchemaVersion != ManifestSchemaVersionV2 || got.ProtocolVersion != ManifestSchemaVersionV2 || len(got.Images) != 10 {
+		t.Fatalf("unexpected target schema-v2 manifest: %#v", got)
+	}
+	if _, exists := got.Images["handoff-fs-helper"]; exists || got.NamespaceHandoff != nil {
+		t.Fatalf("target baseline retained one-time handoff content: %#v", got)
+	}
+}
+
+func TestSourceProfileRejectsSchemaV2BeforeConsumption(t *testing.T) {
+	manifest, _ := validTargetManifestV2(t, "http://127.0.0.1")
+	if err := manifest.Validate(contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source validation accepted schema v2: %v", err)
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeManifest(payload, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source decoder accepted schema v2: %v", err)
+	}
+	if _, err := fetchManifestDocument(t, manifest); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source client accepted schema v2: %v", err)
+	}
+}
+
+func TestSchemaV2RejectsBridgeAndNonExactImageSets(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{name: "old protocol", mutate: func(manifest *Manifest) { manifest.ProtocolVersion = ManifestSchemaVersionV1 }},
+		{name: "missing image", mutate: func(manifest *Manifest) { delete(manifest.Images, "searxng") }},
+		{name: "one-time helper", mutate: func(manifest *Manifest) {
+			manifest.Images["handoff-fs-helper"] = "registry.example/handoff-fs-helper@sha256:" + strings.Repeat("a", 64)
+		}},
+		{name: "unknown replacement", mutate: func(manifest *Manifest) {
+			delete(manifest.Images, "searxng")
+			manifest.Images["future-service"] = "registry.example/future-service@sha256:" + strings.Repeat("a", 64)
+		}},
+		{name: "namespace descriptor", mutate: func(manifest *Manifest) {
+			bridge := validNamespaceHandoffManifest("http://127.0.0.1")
+			manifest.NamespaceHandoff = bridge.NamespaceHandoff
+		}},
+		{name: "manager version differs from source", mutate: func(manifest *Manifest) { manifest.Manager.Version = "other" }},
+		{name: "missing architecture", mutate: func(manifest *Manifest) { delete(manifest.Manager.Artifacts, "arm64") }},
+		{name: "extra architecture", mutate: func(manifest *Manifest) {
+			manifest.Manager.Artifacts["riscv64"] = testArtifact("http://127.0.0.1", "agent-platform-manager-linux-riscv64")
+		}},
+		{name: "source manager basename", mutate: func(manifest *Manifest) {
+			artifact := manifest.Manager.Artifacts["amd64"]
+			artifact.URL = "http://127.0.0.1/ubitech-manager-linux-amd64"
+			manifest.Manager.Artifacts["amd64"] = artifact
+		}},
+		{name: "swapped architecture basename", mutate: func(manifest *Manifest) {
+			artifact := manifest.Manager.Artifacts["amd64"]
+			artifact.URL = "http://127.0.0.1/agent-platform-manager-linux-arm64"
+			manifest.Manager.Artifacts["amd64"] = artifact
+		}},
+		{name: "manager query", mutate: func(manifest *Manifest) {
+			artifact := manifest.Manager.Artifacts["amd64"]
+			artifact.URL += "?token=secret"
+			manifest.Manager.Artifacts["amd64"] = artifact
+		}},
+		{name: "compose basename", mutate: func(manifest *Manifest) {
+			manifest.Compose.URL = "http://127.0.0.1/compose.yaml"
+		}},
+		{name: "compose fragment", mutate: func(manifest *Manifest) { manifest.Compose.URL += "#release" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest, active := validTargetManifestV2(t, "http://127.0.0.1")
+			test.mutate(&manifest)
+			if err := manifest.ValidateForProfile(contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH, active); err == nil {
+				t.Fatal("invalid target schema-v2 manifest was accepted")
+			}
+		})
+	}
+}
+
+func TestTargetProfileRetainsSchemaV1BridgeConsumption(t *testing.T) {
+	manifest := validNamespaceHandoffManifest("http://127.0.0.1")
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.ValidateForProfile(contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH, active); err != nil {
+		t.Fatalf("target rejected its retained schema-v1 Bridge generation: %v", err)
 	}
 }
 
@@ -165,29 +295,6 @@ func TestDecodeManifestUsesFetchValidationForRetainedBytes(t *testing.T) {
 	tampered := append([]byte(`{"schema_version":1,"schema_version":1,`), data[1:]...)
 	if _, err := DecodeManifest(tampered, manifest.Channel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate retained manifest error = %v", err)
-	}
-}
-
-func TestDecodeRetainedHandoffPredecessorManifestAcceptsOnlyCanonicalP1Bytes(t *testing.T) {
-	path := "testdata/" + contract.SourceOwnerCompatGeneration + "-release.json"
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := DecodeRetainedHandoffPredecessorManifest(data, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if manifest.ID() != contract.SourceOwnerCompatGeneration || len(manifest.Images) != len(contract.SourceOwnerCompatManagedImages) || manifest.NamespaceHandoff != nil {
-		t.Fatalf("unexpected canonical predecessor: %#v", manifest)
-	}
-	if _, err := DecodeManifest(data, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil {
-		t.Fatal("ordinary decoder accepted the old ten-image predecessor")
-	}
-	tampered := append([]byte(nil), data...)
-	tampered[len(tampered)-2] ^= 1
-	if _, err := DecodeRetainedHandoffPredecessorManifest(tampered, contract.ReleaseChannel, runtime.GOOS, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), "checksum") {
-		t.Fatalf("tampered predecessor error = %v", err)
 	}
 }
 

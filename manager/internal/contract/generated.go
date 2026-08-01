@@ -5,7 +5,7 @@ const (
 	SchemaVersion                       = 1
 	ReleaseChannel                      = "main"
 	DatabaseSchemaVersion               = 2026072901
-	ContainerDataRoot                   = "/var/lib/ubitech-agent"
+	ContainerDataRoot                   = "/var/lib/agent-platform"
 	ContainerWorkspace                  = "/workspace"
 	ContainerAgentHome                  = "/home/agent"
 	ContainerAgentEnv                   = "/opt/agent-env"

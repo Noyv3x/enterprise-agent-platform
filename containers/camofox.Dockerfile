@@ -46,15 +46,16 @@ LABEL org.opencontainers.image.title="Agent Platform Camoufox browser" \
       org.opencontainers.image.revision="$SOURCE_COMMIT" \
       org.opencontainers.image.version="$RELEASE_VERSION"
 ENV NODE_ENV=production \
-    HOME=/var/lib/ubitech-agent/camofox/home \
+    AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1 \
+    HOME=/var/lib/agent-platform/camofox/home \
     CAMOFOX_PORT=9377 \
     HOST=0.0.0.0 \
     CAMOFOX_HOST=0.0.0.0 \
-    UBITECH_CAMOFOX_BIND_HOST=0.0.0.0 \
-    CAMOFOX_PROFILE_DIR=/var/lib/ubitech-agent/camofox/profiles \
-    CAMOFOX_COOKIES_DIR=/var/lib/ubitech-agent/camofox/cookies \
-    CAMOFOX_TRACES_DIR=/var/lib/ubitech-agent/camofox/traces \
-    XDG_CACHE_HOME=/var/lib/ubitech-agent/camofox/home/.cache \
+    AGENT_PLATFORM_CAMOFOX_BIND_HOST=0.0.0.0 \
+    CAMOFOX_PROFILE_DIR=/var/lib/agent-platform/camofox/profiles \
+    CAMOFOX_COOKIES_DIR=/var/lib/agent-platform/camofox/cookies \
+    CAMOFOX_TRACES_DIR=/var/lib/agent-platform/camofox/traces \
+    XDG_CACHE_HOME=/var/lib/agent-platform/camofox/home/.cache \
     CAMOFOX_CRASH_REPORT_ENABLED=false \
     CAMOUFOX_EXECUTABLE_PATH=/opt/camofox/browser/camoufox \
     CAMOFOX_EXECUTABLE_PATH=/opt/camofox/browser/camoufox \
@@ -66,14 +67,14 @@ RUN apt-get update \
       libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 \
       libxrandr2 libxrender1 libxss1 libxt6 libxtst6 xvfb \
     && rm -rf /var/lib/apt/lists/* \
-    && install -d -o node -g node -m 0700 /var/lib/ubitech-agent/camofox
+    && install -d -o node -g node -m 0700 /var/lib/agent-platform/camofox
 WORKDIR /opt/camofox
 COPY --from=camofox-build --chown=1000:1000 /opt/camofox /opt/camofox
-COPY containers/camofox-entrypoint.sh /usr/local/bin/ubitech-camofox-entrypoint
-RUN chmod 0755 /usr/local/bin/ubitech-camofox-entrypoint
+COPY containers/camofox-entrypoint.sh /usr/local/bin/camofox-entrypoint
+RUN chmod 0755 /usr/local/bin/camofox-entrypoint
 USER node
 EXPOSE 9377
 HEALTHCHECK --interval=10s --timeout=3s --start-period=45s --retries=18 \
   CMD node -e 'fetch("http://127.0.0.1:9377/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
-ENTRYPOINT ["/usr/local/bin/ubitech-camofox-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/camofox-entrypoint"]
 CMD ["node", "--require", "/opt/camofox/loopback-preload.cjs", "/opt/camofox/node_modules/@askjo/camofox-browser/server.js"]
