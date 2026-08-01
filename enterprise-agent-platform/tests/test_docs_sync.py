@@ -570,7 +570,7 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("RELEASE_TRANSITION_STAGE = 'source_owner'", generated)
         self.assertIn(
             "PREDECESSOR_GENERATION = "
-            "'72b2fe687b5ff3e602e29da076398db375c101c4'",
+            "'3fa84952c56a6daf2a9a18825778c54b2d150cf1'",
             generated,
         )
         self.assertIn(
