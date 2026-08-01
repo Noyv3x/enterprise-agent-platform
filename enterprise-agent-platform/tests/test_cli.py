@@ -17,7 +17,7 @@ class PlatformCLITests(unittest.TestCase):
     def setUp(self):
         self._container_env = mock.patch.dict(
             os.environ,
-            {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
         )
         self._container_env.start()
 

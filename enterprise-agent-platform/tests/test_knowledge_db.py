@@ -169,21 +169,21 @@ class KnowledgeContentCapTests(unittest.TestCase):
                 db.close()
 
     def test_cap_resolver_reads_env_and_defaults(self):
-        previous = os.environ.get("AGENT_PLATFORM_KB_MAX_CONTENT_CHARS")
+        previous = os.environ.get("ENTERPRISE_KB_MAX_CONTENT_CHARS")
         try:
-            os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "42"
+            os.environ["ENTERPRISE_KB_MAX_CONTENT_CHARS"] = "42"
             self.assertEqual(knowledge_module._resolve_max_content_chars(), 42)
             # 0 disables the limit.
-            os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "0"
+            os.environ["ENTERPRISE_KB_MAX_CONTENT_CHARS"] = "0"
             self.assertEqual(knowledge_module._resolve_max_content_chars(), 0)
             # Garbage falls back to the generous default rather than crashing.
-            os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "not-an-int"
+            os.environ["ENTERPRISE_KB_MAX_CONTENT_CHARS"] = "not-an-int"
             self.assertEqual(knowledge_module._resolve_max_content_chars(), 2_000_000)
         finally:
             if previous is None:
-                os.environ.pop("AGENT_PLATFORM_KB_MAX_CONTENT_CHARS", None)
+                os.environ.pop("ENTERPRISE_KB_MAX_CONTENT_CHARS", None)
             else:
-                os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = previous
+                os.environ["ENTERPRISE_KB_MAX_CONTENT_CHARS"] = previous
 
 
 class DatabaseFtsRebuildTests(unittest.TestCase):

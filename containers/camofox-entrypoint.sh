@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if env | grep -Eq '^(UBITECH_|ENTERPRISE_)'; then
+  echo "source-profile environment is not accepted by the target Camoufox image" >&2
+  exit 64
+fi
+
 require_exact() {
   variable="$1"
   expected="$2"

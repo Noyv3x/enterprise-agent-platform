@@ -16,18 +16,79 @@
     "images"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "enum": [1, 2] },
     "channel": { "const": "main" },
     "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "generated_at": { "type": "string", "format": "date-time" },
-    "protocol_version": { "const": 2 },
+    "protocol_version": { "enum": [1, 2] },
     "database_schema_version": { "type": "integer", "minimum": 1 },
     "manager": { "$ref": "#/$defs/manager_release" },
     "compose": { "$ref": "#/$defs/artifact" },
-    "images": { "$ref": "#/$defs/images" }
+    "images": { "type": "object" },
+    "namespace_handoff": { "$ref": "#/$defs/namespace_handoff" }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "schema_version": { "const": 1 } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "protocol_version": { "const": 1 },
+          "images": { "$ref": "#/$defs/images_v1" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema_version": { "const": 2 } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "protocol_version": { "const": 2 },
+          "images": { "$ref": "#/$defs/images_v2" }
+        },
+        "not": { "required": ["namespace_handoff"] }
+      }
+    }
+  ],
   "$defs": {
-    "images": {
+    "images_v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 11,
+      "maxProperties": 11,
+      "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+      "properties": {
+        "platform": { "$ref": "#/$defs/image" },
+        "agent-runtime": { "$ref": "#/$defs/image" },
+        "camofox": { "$ref": "#/$defs/image" },
+        "agent-sandbox": { "$ref": "#/$defs/image" },
+        "searxng": { "$ref": "#/$defs/image" },
+        "firecrawl-api": { "$ref": "#/$defs/image" },
+        "firecrawl-playwright": { "$ref": "#/$defs/image" },
+        "firecrawl-postgres": { "$ref": "#/$defs/image" },
+        "firecrawl-redis": { "$ref": "#/$defs/image" },
+        "firecrawl-rabbitmq": { "$ref": "#/$defs/image" },
+        "handoff-fs-helper": { "$ref": "#/$defs/image" }
+      },
+      "required": [
+        "platform",
+        "agent-runtime",
+        "camofox",
+        "agent-sandbox",
+        "searxng",
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-postgres",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+        "handoff-fs-helper"
+      ]
+    },
+    "images_v2": {
       "type": "object",
       "additionalProperties": false,
       "minProperties": 10,
@@ -82,6 +143,64 @@
             "arm64": { "$ref": "#/$defs/artifact" }
           }
         }
+      }
+    },
+    "handoff_manager_release": {
+      "allOf": [
+        { "$ref": "#/$defs/manager_release" },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        }
+      ]
+    },
+    "source_namespace_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "manager", "compose"],
+      "properties": {
+        "profile_id": { "const": "ubitech-agent-v1" },
+        "manager": { "$ref": "#/$defs/handoff_manager_release" },
+        "compose": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "target_namespace_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "manager", "compose"],
+      "properties": {
+        "profile_id": { "const": "agent-platform-v1" },
+        "manager": { "$ref": "#/$defs/handoff_manager_release" },
+        "compose": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "namespace_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "predecessor_generation",
+        "bridge_generation",
+        "source",
+        "target"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "predecessor_generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "bridge_generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "source": { "$ref": "#/$defs/source_namespace_binding" },
+        "target": { "$ref": "#/$defs/target_namespace_binding" }
       }
     },
     "image": {

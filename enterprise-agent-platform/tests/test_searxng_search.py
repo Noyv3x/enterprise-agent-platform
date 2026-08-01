@@ -62,7 +62,7 @@ class SearXNGConfigTests(unittest.TestCase):
     def test_from_env_has_private_search_defaults_and_explicit_overrides(self):
         with mock.patch.dict(
             os.environ,
-            {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
             clear=True,
         ):
             default = PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
@@ -72,9 +72,9 @@ class SearXNGConfigTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                "AGENT_PLATFORM_SEARXNG_API_URL": "http://127.0.0.1:14567/",
-                "AGENT_PLATFORM_SEARXNG_TIMEOUT_SECONDS": "7.5",
+                "UBITECH_DEPLOYMENT_MODE": "container",
+                "ENTERPRISE_SEARXNG_API_URL": "http://127.0.0.1:14567/",
+                "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": "7.5",
             },
             clear=True,
         ):
@@ -87,8 +87,8 @@ class SearXNGConfigTests(unittest.TestCase):
             with self.subTest(value=value), mock.patch.dict(
                 os.environ,
                 {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_SEARXNG_TIMEOUT_SECONDS": value,
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "ENTERPRISE_SEARXNG_TIMEOUT_SECONDS": value,
                 },
                 clear=True,
             ):

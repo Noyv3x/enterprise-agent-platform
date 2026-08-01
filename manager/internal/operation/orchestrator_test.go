@@ -61,25 +61,39 @@ type sequenceLocker struct {
 func (locker sequenceLocker) Lock()   { *locker.sequence = append(*locker.sequence, "runtime_lock") }
 func (locker sequenceLocker) Unlock() { *locker.sequence = append(*locker.sequence, "runtime_unlock") }
 
-func TestMaintenanceAdmissionUsesRuntimeLock(t *testing.T) {
+func TestOrdinaryAdmissionUsesHandoffThenRuntimeLockOrder(t *testing.T) {
 	sequence := []string{}
-	orchestrator := &Orchestrator{MaintenanceMu: sequenceLocker{sequence: &sequence}}
+	orchestrator := &Orchestrator{
+		MaintenanceMu: sequenceLocker{sequence: &sequence},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			sequence = append(sequence, "handoff_lock")
+			return func() { sequence = append(sequence, "handoff_unlock") }, nil
+		},
+	}
 	releaseAdmission, err := orchestrator.lockMaintenanceAdmission(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	releaseAdmission()
-	want := []string{"runtime_lock", "runtime_unlock"}
+	want := []string{"handoff_lock", "runtime_lock", "runtime_unlock", "handoff_unlock"}
 	if !reflect.DeepEqual(sequence, want) {
 		t.Fatalf("admission lock sequence = %v, want %v", sequence, want)
 	}
 }
 
-func TestMaintenanceAdmissionRejectsCancelledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if releaseAdmission, err := (&Orchestrator{}).lockMaintenanceAdmission(ctx); err == nil || releaseAdmission != nil {
-		t.Fatalf("cancelled admission returned_release=%t err=%v", releaseAdmission != nil, err)
+func TestOrdinaryAdmissionFailsBeforeRuntimeLockWhenHandoffRejects(t *testing.T) {
+	sequence := []string{}
+	orchestrator := &Orchestrator{
+		MaintenanceMu: sequenceLocker{sequence: &sequence},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			return nil, errors.New("handoff active")
+		},
+	}
+	if releaseAdmission, err := orchestrator.lockMaintenanceAdmission(context.Background()); err == nil || releaseAdmission != nil {
+		t.Fatalf("rejected handoff admission returned_release=%t err=%v", releaseAdmission != nil, err)
+	}
+	if len(sequence) != 0 {
+		t.Fatalf("runtime admission was touched after handoff rejection: %v", sequence)
 	}
 }
 
@@ -589,13 +603,13 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 	var fixture releasetest.Fixture
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/agent-platform-compose.yaml" {
+		if r.URL.Path == "/ubitech-compose.yaml" {
 			_, _ = w.Write(fixture.Compose)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
-	fixture = releasetest.NewTarget(
+	fixture = releasetest.NewSource(
 		strings.Repeat("b", 40),
 		releasetest.WithArtifactBaseURL(server.URL),
 		releasetest.WithGeneratedAt(time.Now().UTC()),
@@ -628,28 +642,77 @@ func testSchemaV2ReleaseServer(t *testing.T) (*httptest.Server, string) {
 	return server, server.URL + "/manifest"
 }
 
-func TestCheckConsumesCurrentSchemaOnTargetProfile(t *testing.T) {
+func TestCheckConsumesSchemaV2OnlyOnTargetProfile(t *testing.T) {
 	server, url := testSchemaV2ReleaseServer(t)
 	defer server.Close()
-	root := t.TempDir()
-	store, err := journal.Open(filepath.Join(root, "state"), time.Now())
+	sourceRoot := t.TempDir()
+	sourceStore, err := journal.Open(filepath.Join(sourceRoot, "state"), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator := &Orchestrator{
-		Store: store, TechnicalProfile: identity.CompileTimeActiveProfile(),
-		ReleasesDir: filepath.Join(root, "releases"), ManifestURL: url,
-		Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	sourceReleases := filepath.Join(sourceRoot, "releases")
+	if err := os.MkdirAll(sourceReleases, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	manifest, err := orchestrator.Check(context.Background(), url)
+	source := &Orchestrator{
+		Store: sourceStore, TechnicalProfile: identity.SourceActiveProfile(), ReleasesDir: sourceReleases,
+		ManifestURL: url, Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	if _, err := source.Check(context.Background(), url); err == nil || !strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("source operation accepted schema v2: %v", err)
+	}
+	entries, err := os.ReadDir(sourceReleases)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := store.State()
-	if manifest.SchemaVersion != release.ManifestSchemaVersion || state.Candidate == nil ||
-		state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 10 {
-		t.Fatalf("operation did not retain current schema: manifest=%#v state=%#v", manifest, state)
+	if len(entries) != 0 || sourceStore.State().Candidate != nil {
+		t.Fatalf("source rejection produced release side effects: entries=%v state=%#v", entries, sourceStore.State())
 	}
+	targetProfile, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot := t.TempDir()
+	targetStore, err := journal.Open(filepath.Join(targetRoot, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &Orchestrator{
+		Store: targetStore, TechnicalProfile: targetProfile, ReleasesDir: filepath.Join(targetRoot, "releases"),
+		ManifestURL: url, Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	manifest, err := target.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := targetStore.State()
+	if manifest.SchemaVersion != release.ManifestSchemaVersionV2 || state.Candidate == nil || state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 10 {
+		t.Fatalf("target operation did not retain schema v2: manifest=%#v state=%#v", manifest, state)
+	}
+}
+
+func testNamespaceHandoffReleaseServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	predecessor := strings.Repeat("a", 40)
+	bridge := strings.Repeat("b", 40)
+	composeBytes := []byte("services: {}\n")
+	var fixture releasetest.Fixture
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/ubitech-compose.yaml" {
+			_, _ = w.Write(fixture.Compose)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fixture.Manifest)
+	}))
+	fixture = releasetest.NewBridge(
+		bridge,
+		releasetest.WithPredecessorGeneration(predecessor),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithGeneratedAt(time.Now().UTC()),
+		releasetest.WithCompose(composeBytes),
+	)
+	return server, server.URL
 }
 
 func TestInstallWaitsWhenManagerExistsBeforeManifestPublication(t *testing.T) {
@@ -910,19 +973,136 @@ func TestCheckPublishesReleaseArtifactsImmutably(t *testing.T) {
 	}
 }
 
+func TestInertCapabilityRejectsNamespaceHandoffBeforeOrdinaryUpdateSideEffects(t *testing.T) {
+	server, url := testNamespaceHandoffReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40), SourceCommit: strings.Repeat("a", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releases := t.TempDir()
+	engine := &fakeEngine{}
+	orchestrator := &Orchestrator{
+		Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: releases, ManifestURL: url, Channel: contract.ReleaseChannel,
+		ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	if _, err := orchestrator.Check(context.Background(), url); err == nil || !strings.Contains(err.Error(), "complete handoff owner") {
+		t.Fatalf("Check accepted an unowned namespace handoff: %v", err)
+	}
+	if entries, err := os.ReadDir(releases); err != nil || len(entries) != 0 {
+		t.Fatalf("rejected Check published release artifacts: entries=%v err=%v", entries, err)
+	}
+	if state := store.State(); state.Candidate != nil {
+		t.Fatalf("rejected Check wrote a Candidate: %#v", state.Candidate)
+	}
+
+	op, _, err := orchestrator.Start(model.OperationRequest{
+		Kind: model.OperationUpdate, IdempotencyKey: "reject-unowned-handoff",
+		ExpectedGeneration: store.State().Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.OperationFailed || !completed.Finalized || !strings.Contains(completed.Error, "complete handoff owner") {
+		t.Fatalf("unowned handoff did not fail before maintenance: %#v", completed)
+	}
+	if len(engine.calls) != 0 {
+		t.Fatalf("ordinary update engine observed rejected handoff: %#v", engine.calls)
+	}
+	state := store.State()
+	if state.Candidate != nil || state.Maintenance || state.ActiveOperationID != "" || state.PublicState != model.StateIdle {
+		t.Fatalf("rejected handoff changed ordinary update state: %#v", state)
+	}
+}
+
+func TestSourceOwnerCheckRetainsNamespaceHandoffWithoutOrdinaryCandidate(t *testing.T) {
+	server, url := testNamespaceHandoffReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40), SourceCommit: strings.Repeat("a", 40)}
+		state.Candidate = &model.Generation{ID: strings.Repeat("c", 40), SourceCommit: strings.Repeat("c", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releases := t.TempDir()
+	var retainedPath, retainedDigest string
+	var admissionMu sync.Mutex
+	admissionHeld := false
+	orchestrator := &Orchestrator{
+		Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Snapshots: fakeSnapshot{},
+		ReleasesDir: releases, ManifestURL: url, Channel: contract.ReleaseChannel,
+		ReleaseClient: release.Client{HTTP: server.Client()},
+		HandoffAdmission: func(context.Context) (func(), error) {
+			admissionMu.Lock()
+			defer admissionMu.Unlock()
+			if admissionHeld {
+				t.Fatal("ordinary handoff admission was entered twice")
+			}
+			admissionHeld = true
+			return func() {
+				admissionMu.Lock()
+				admissionHeld = false
+				admissionMu.Unlock()
+			}, nil
+		},
+		NamespaceHandoffCheck: func(_ context.Context, manifest release.Manifest, path, digest string) error {
+			admissionMu.Lock()
+			held := admissionHeld
+			admissionMu.Unlock()
+			if held {
+				t.Fatal("handoff coordinator callback re-entered while ordinary global admission was held")
+			}
+			if manifest.NamespaceHandoff == nil {
+				t.Fatal("source owner callback received an ordinary manifest")
+			}
+			retainedPath, retainedDigest = path, digest
+			return nil
+		},
+	}
+	manifest, err := orchestrator.Check(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.NamespaceHandoff == nil || retainedPath != filepath.Join(releases, manifest.ID(), "manifest.json") || len(retainedDigest) != 64 {
+		t.Fatalf("bridge was not retained with its exact identity: path=%q digest=%q", retainedPath, retainedDigest)
+	}
+	if state := store.State(); state.Candidate != nil || state.ActiveOperationID != "" || state.Maintenance {
+		t.Fatalf("bridge Check published ordinary operation state: %#v", state)
+	}
+	if _, err := os.Stat(retainedPath); err != nil {
+		t.Fatalf("retained bridge manifest is unavailable: %v", err)
+	}
+}
+
 func TestCheckDoesNotPublishAPartialReleaseWhenComposeFetchFails(t *testing.T) {
 	compose := []byte("services: {}\n")
 	var fixture releasetest.Fixture
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/agent-platform-compose.yaml" {
+		if r.URL.Path == "/ubitech-compose.yaml" {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
 	defer server.Close()
-	fixture = releasetest.NewTarget(
+	fixture = releasetest.NewSource(
 		strings.Repeat("c", 40),
 		releasetest.WithArtifactBaseURL(server.URL),
 		releasetest.WithGeneratedAt(time.Now().UTC()),
@@ -2703,7 +2883,7 @@ func TestRecoverReplaysNonGenerationReleaseBeforeClearingFinalizedPendingState(t
 
 func writeRollbackManifest(t *testing.T, dir, commit string) string {
 	t.Helper()
-	manifest := releasetest.NewTarget(
+	manifest := releasetest.NewSource(
 		commit,
 		releasetest.WithArtifactBaseURL("http://127.0.0.1"),
 		releasetest.WithGeneratedAt(time.Now().UTC()),

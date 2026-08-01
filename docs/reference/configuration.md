@@ -2,13 +2,13 @@
 
 本文说明 Docker 部署后的配置所有权、来源和生命周期。部署方式见[部署](../operations/deployment.md)，目录位置见[数据布局](data-layout.md)。Run 策略见 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器管理契约见 [`container-platform.json`](../contracts/container-platform.json)。
 
-Platform 只接受 target-only 容器基线：`AGENT_PLATFORM_DEPLOYMENT_MODE` 必须显式为 `container`，`AGENT_PLATFORM_TECHNICAL_PROFILE` 必须为 `agent-platform-v1`，Manager socket 与 token 文件必须是绝对路径。固定服务缺省地址使用 Compose DNS（`agent-runtime`、`camofox`、`searxng`、`firecrawl-api`）；产品代码不提供 development、其它 technical profile 或宿主回环运行模式开关。
+Platform 只接受容器基线：`UBITECH_DEPLOYMENT_MODE` 必须显式为 `container`，Manager socket 与 token 文件必须是绝对路径。固定服务缺省地址使用 Compose DNS（`agent-runtime`、`camofox`、`searxng`、`firecrawl-api`）；产品代码不提供 development/source/宿主回环模式开关。本节出现的 `ubitech-*` 路径和 `UBITECH_*` 名称是前序白标发布仍需读取的桥接源身份；目标中性身份和交接边界以[部署文档](../operations/deployment.md#技术命名空间交接)为准。
 
 ## 配置所有权
 
 | 来源 | 所有者 | 用途 |
 |---|---|---|
-| `~/.config/agent-platform/manager.toml` | Manager | 公网监听、release channel、registry、数据根、更新轮询和 Docker 参数 |
+| `~/.config/ubitech-agent/manager.toml` | Manager | 公网监听、release channel、registry、数据根、更新轮询和 Docker 参数 |
 | Manager secret 文件 | Manager | control/executor token 与 registry 凭据 |
 | SQLite `settings` | Platform | 产品设置、OAuth、Telegram、模型、知识和可在管理界面更新的 secret |
 | release manifest | CI / Manager | 源 commit、协议/数据库版本、Manager 校验和和镜像 digest |
@@ -23,7 +23,7 @@ Platform 只接受 target-only 容器基线：`AGENT_PLATFORM_DEPLOYMENT_MODE` �
 标准 TOML 字段：
 
 ```toml
-data_root = "~/.local/share/agent-platform"
+data_root = "~/.local/share/ubitech-agent"
 listen = "127.0.0.1:8080"
 lan_enabled = false
 lan_listen = "127.0.0.1:8081"
@@ -51,12 +51,12 @@ Manager 配置修改通过临时文件、fsync 和原子替换保存。`lan_enab
 
 Manager 为固定服务生成私有网络和下列路径：
 
-- Platform 数据：容器 `/var/lib/agent-platform`，宿主 `$DATA_ROOT/data`；
-- Runtime 状态：容器 `/var/lib/agent-platform/runtime`；
+- Platform 数据：容器 `/var/lib/ubitech-agent`，宿主 `$DATA_ROOT/data`；
+- Runtime 状态：容器 `/var/lib/ubitech-agent/runtime`；
 - Camoufox/SearXNG/Firecrawl：各自明确的 `$DATA_ROOT/data/runtimes/*` 子目录；
 - Sandbox：`/workspace`、`/home/agent`、`/opt/agent-env`，分别映射主 Agent 的 workspace、home 和 env。
 
-当前唯一基线使用 `/var/lib/agent-platform`、`/run/secrets/agent-platform`、`/run/agent-platform-manager` 和 `AGENT_PLATFORM_*` Compose 环境。technical profile 是编译期固定的 `agent-platform-v1`；未知 profile、旧前缀、旧数据库 baseline/marker 或混合技术身份都必须在启动 writer 前拒绝，不能按历史目录或环境变量推断兼容模式。
+以上 `/var/lib/ubitech-agent` 只描述技术命名空间交接前的 source profile。Bridge target 与后续唯一基线使用 `/var/lib/agent-platform`、`/run/secrets/agent-platform`、`/run/agent-platform-manager` 和 `AGENT_PLATFORM_*` Compose 环境。Bridge 镜像允许的 source/target technical profile 是编译期闭集，具体 profile 由已验证 Manager/Compose 绑定注入；未知 profile、两套前缀同时出现、target profile 搭配 source 数据库 baseline/marker（或反向搭配）都必须在启动 writer 前拒绝。清理发布删除 source 分支后，本节只保留 target 接口。
 
 Platform 额外接收只读的宿主数据根字符串，用于在当前 scope 的可信系统提示中计算工作区映射；它不能用该值访问宿主文件，不能写入数据库或公共状态，也不能接受模型覆盖。
 
@@ -68,29 +68,22 @@ Manager 配置只记录 control token file 路径，不接受 TOML 中的 `inter
 
 ## Platform 启动配置
 
-Platform 容器只接受 Manager 生成的 target-only 最小环境：
+Platform 容器接受 Manager 生成的最小环境。交接前 source Compose 使用下列现存接口；Bridge target 和清理后基线使用语义一一对应的 `AGENT_PLATFORM_*` 名称及 target 容器路径：
 
-- `AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1`；
-- `AGENT_PLATFORM_DEPLOYMENT_MODE=container`；
-- `AGENT_PLATFORM_DATA=/var/lib/agent-platform`；
-- `AGENT_PLATFORM_MANAGER_SOCKET=/run/agent-platform-manager/manager.sock` 与 `AGENT_PLATFORM_MANAGER_TOKEN_FILE=/run/secrets/agent-platform/manager-token`；
+- `ENTERPRISE_PLATFORM_DATA=/var/lib/ubitech-agent`；
 - 内部监听 host/port、public base URL 和 trusted proxy；
 - Agent Runtime、Camoufox、SearXNG 与 Firecrawl 的私有 service URL；
 - 对应内部 token file；
 - 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制；
-- `AGENT_PLATFORM_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`AGENT_PLATFORM_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
+- `ENTERPRISE_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
-这些字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。Cleanup 后 Platform 不读取旧环境前缀，也不提供双读或自动转换。
+`ENTERPRISE_` 是 source profile 的现存内部环境前缀，不代表产品名称。Bridge 只为 source 回滚保留其读取，target Compose 不得继续发出；Cleanup 删除该读取。两侧字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
 
 Platform 命令行只有当前容器入口使用的 `serve --host --port --data`、无业务 writer 的 `migrate --data`，以及明确的管理子命令。子命令必须显式提供；监听地址不提供隐藏别名；未知参数必须由参数解析器直接拒绝，不能静默映射到另一套启动接口。
 
 若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
 
-Platform 的 SQLite 机器自有 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。其它前缀、旧键或混合键直接拒绝；Platform 不提供双读回退，也不会在启动或管理员更新时补写旧键。
-
-### Bridge→Cleanup 历史环境转换（非当前接口）
-
-受控 Bridge 发布曾把 `UBITECH_*`、`ENTERPRISE_*`、旧容器根和旧 SQLite 机器键一次性转换为上述 target 身份；Cleanup 已删除这些读取与转换分支。它们只作为[部署文档](../operations/deployment.md#技术命名空间交接)中的历史发布证据存在，不能由普通启动、更新、恢复、管理员配置或 release manifest 重新启用。
+target Platform 的 SQLite 机器自有 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。Bridge 从 source 数据库一次性结构化映射对应 `ENTERPRISE_*` 键；target Platform 不提供双读回退，不会在启动或管理员更新时重新写入 source 键。映射只改 `settings.key`，不改值、secret 标志、更新时间、用户配置键或任何自由文本。
 
 ## Platform 动态设置
 

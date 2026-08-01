@@ -12,12 +12,33 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 const (
 	sandboxRegistrySchemaVersion = 2
 	maxSandboxRegistryBytes      = 8 << 20
 )
+
+// registryV1 is the complete legacy shape. Keeping a separate type prevents a
+// missing v2 field from being confused with its zero value during the one-time
+// source-owner upgrade.
+type registryV1 struct {
+	SchemaVersion int                 `json:"schema_version"`
+	Records       map[string]recordV1 `json:"records"`
+}
+
+type recordV1 struct {
+	SandboxID           string     `json:"sandbox_id"`
+	SandboxHash         string     `json:"sandbox_hash"`
+	WorkspaceID         string     `json:"workspace_id"`
+	ContainerName       string     `json:"container_name"`
+	Image               string     `json:"image"`
+	LastActivityAt      time.Time  `json:"last_activity_at"`
+	ActiveCalls         int        `json:"active_calls"`
+	BackgroundProcesses int        `json:"background_processes"`
+	StoppedAt           *time.Time `json:"stopped_at,omitempty"`
+}
 
 type persistentBinding struct {
 	UID             int
@@ -43,38 +64,111 @@ func bindingFromRecord(record Record) persistentBinding {
 	}
 }
 
-func (m *Manager) loadRegistry() error {
+func (m *Manager) loadRegistry() (bool, error) {
 	data, err := readSandboxRegistry(m.StatePath, m.UID, m.GID)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
-		return fmt.Errorf("decode sandbox registry: %w", err)
+		return false, fmt.Errorf("decode sandbox registry: %w", err)
 	}
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return fmt.Errorf("decode sandbox registry: %w", err)
+		return false, fmt.Errorf("decode sandbox registry: %w", err)
 	}
 	versionJSON, ok := envelope["schema_version"]
 	if !ok {
-		return errors.New("decode sandbox registry: schema_version is required")
+		return false, errors.New("decode sandbox registry: schema_version is required")
 	}
 	var version int
 	if err := json.Unmarshal(versionJSON, &version); err != nil {
-		return fmt.Errorf("decode sandbox registry schema_version: %w", err)
+		return false, fmt.Errorf("decode sandbox registry schema_version: %w", err)
 	}
-	if version != sandboxRegistrySchemaVersion {
-		return fmt.Errorf("unsupported sandbox registry schema %d", version)
+	switch version {
+	case 1:
+		var legacy registryV1
+		if err := decodeSandboxRegistryStrict(data, &legacy); err != nil {
+			return false, err
+		}
+		if legacy.Records == nil {
+			return false, errors.New("sandbox registry v1 records must be an object")
+		}
+		upgraded := registry{
+			SchemaVersion:    sandboxRegistrySchemaVersion,
+			TechnicalProfile: m.profile.ProfileID,
+			Records:          make(map[string]Record, len(legacy.Records)),
+		}
+		for key, old := range legacy.Records {
+			record, err := m.upgradeV1Record(key, old)
+			if err != nil {
+				return false, err
+			}
+			upgraded.Records[key] = record
+		}
+		m.registry = upgraded
+		return true, nil
+	case sandboxRegistrySchemaVersion:
+		var current registry
+		if err := decodeSandboxRegistryStrict(data, &current); err != nil {
+			return false, err
+		}
+		m.registry = current
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported sandbox registry schema %d", version)
 	}
-	var current registry
-	if err := decodeSandboxRegistryStrict(data, &current); err != nil {
-		return err
+}
+
+func (m *Manager) upgradeV1Record(key string, old recordV1) (Record, error) {
+	if key == "" || old.SandboxID != key {
+		return Record{}, fmt.Errorf("sandbox registry v1 key %q does not match record identity %q", key, old.SandboxID)
 	}
-	m.registry = current
-	return nil
+	hash := stableHash(key)
+	if old.SandboxHash != hash {
+		return Record{}, fmt.Errorf("sandbox registry v1 %q has an invalid identity hash", key)
+	}
+	if old.ContainerName != m.profile.SandboxContainerPrefix+hash[:16] {
+		return Record{}, fmt.Errorf("sandbox registry v1 %q has an invalid container name", key)
+	}
+	if old.Image == "" {
+		return Record{}, fmt.Errorf("sandbox registry v1 %q has no image identity", key)
+	}
+	if old.ActiveCalls < 0 || old.BackgroundProcesses < 0 {
+		return Record{}, fmt.Errorf("sandbox registry v1 %q has invalid activity counters", key)
+	}
+	binding, err := m.expectedBinding(old.WorkspaceID, hash)
+	if err != nil {
+		return Record{}, fmt.Errorf("sandbox registry v1 %q has an invalid persistent binding: %w", key, err)
+	}
+	for _, relative := range binding.relativePaths() {
+		path, err := m.dataPath(relative)
+		if err != nil {
+			return Record{}, fmt.Errorf("sandbox registry v1 %q has an invalid path: %w", key, err)
+		}
+		if err := validateOwnedDirectoryBelow(m.DataDir, path, binding.UID, binding.GID); err != nil {
+			return Record{}, fmt.Errorf("sandbox registry v1 %q cannot prove directory %q: %w", key, relative, err)
+		}
+	}
+	return Record{
+		SandboxID:           old.SandboxID,
+		SandboxHash:         old.SandboxHash,
+		WorkspaceID:         old.WorkspaceID,
+		UID:                 binding.UID,
+		GID:                 binding.GID,
+		WorkspacePath:       binding.WorkspacePath,
+		HomePath:            binding.HomePath,
+		EnvironmentPath:     binding.EnvironmentPath,
+		AttachmentsPath:     binding.AttachmentsPath,
+		ContainerName:       old.ContainerName,
+		Image:               old.Image,
+		LastActivityAt:      old.LastActivityAt,
+		ActiveCalls:         old.ActiveCalls,
+		BackgroundProcesses: old.BackgroundProcesses,
+		StoppedAt:           old.StoppedAt,
+	}, nil
 }
 
 func (m *Manager) expectedBinding(workspaceID, sandboxHash string) (persistentBinding, error) {

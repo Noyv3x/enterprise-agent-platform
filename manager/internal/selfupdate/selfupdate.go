@@ -848,9 +848,13 @@ func RunWatchdog(
 	binding WatchdogBinding,
 	planPath string,
 	runner Runner,
+	transferStartupAuthority func() error,
 ) error {
 	if err := binding.validate(); err != nil {
 		return err
+	}
+	if transferStartupAuthority == nil {
+		return errors.New("watchdog requires a retained handoff authority transfer")
 	}
 	active := binding.active
 	if runner == nil {
@@ -878,6 +882,12 @@ func RunWatchdog(
 				if err := binding.verifyCurrentProcess(ctx, plan, committed.Previous.Path, committed.Previous.SHA256); err != nil {
 					return fmt.Errorf("verify committed ordinary watchdog executable: %w", err)
 				}
+				if transferStartupAuthority != nil {
+					if err := transferStartupAuthority(); err != nil {
+						return err
+					}
+					transferStartupAuthority = nil
+				}
 				return commitActivation(active, planPath, plan)
 			}
 			return fmt.Errorf("validate ordinary Manager activation watchdog ownership: %w", validationErr)
@@ -898,6 +908,12 @@ func RunWatchdog(
 		}
 		lastRecoveryOwnership = &ownership
 	} else {
+		if transferStartupAuthority != nil {
+			if err := transferStartupAuthority(); err != nil {
+				return err
+			}
+			transferStartupAuthority = nil
+		}
 		switch plan.Status {
 		case "committed":
 			return nil
@@ -909,6 +925,12 @@ func RunWatchdog(
 		default:
 			return fmt.Errorf("unsupported Manager activation watchdog status %q", plan.Status)
 		}
+	}
+	if transferStartupAuthority != nil {
+		if err := transferStartupAuthority(); err != nil {
+			return fmt.Errorf("release retained handoff authority after watchdog ownership proof: %w", err)
+		}
+		transferStartupAuthority = nil
 	}
 	timeout := time.Duration(plan.HealthTimeoutMS) * time.Millisecond
 	if timeout < time.Second {

@@ -13,7 +13,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
-var testActiveProfile = identity.CompileTimeActiveProfile()
+var testActiveProfile = identity.SourceActiveProfile()
 
 type stateStub struct{ value model.ManagerState }
 
@@ -49,8 +49,11 @@ func TestMaintenancePageContainsOnlyPublicState(t *testing.T) {
 	}
 }
 
-func TestTargetProfileOwnsOnlyCurrentGatewayPaths(t *testing.T) {
-	active := identity.CompileTimeActiveProfile()
+func TestVerifiedTargetProfileOwnsOnlyNeutralGatewayPaths(t *testing.T) {
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
 	state := model.NewState(time.Now())
 	handler, err := NewHandler(active, stateStub{state}, "http://127.0.0.1:1")
 	if err != nil {
@@ -64,9 +67,9 @@ func TestTargetProfileOwnsOnlyCurrentGatewayPaths(t *testing.T) {
 		}
 	}
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/__retired/status", nil))
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/__ubitech/status", nil))
 	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("retired path remained active under target profile: %d", response.Code)
+		t.Fatalf("source path remained active under target profile: %d", response.Code)
 	}
 }
 
@@ -97,7 +100,7 @@ func TestLANAccessUsesPeerAddressAndRejectsDisallowedSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request := httptest.NewRequest(http.MethodGet, "/__agent_platform/health", nil)
+	request := httptest.NewRequest(http.MethodGet, "/__ubitech/health", nil)
 	request.RemoteAddr = "203.0.113.9:43000"
 	request.Header.Set("X-Forwarded-For", "192.168.1.10")
 	response := httptest.NewRecorder()
@@ -106,7 +109,7 @@ func TestLANAccessUsesPeerAddressAndRejectsDisallowedSources(t *testing.T) {
 		t.Fatalf("spoofed LAN request status = %d, want 403", response.Code)
 	}
 
-	request = httptest.NewRequest(http.MethodGet, "/__agent_platform/health", nil)
+	request = httptest.NewRequest(http.MethodGet, "/__ubitech/health", nil)
 	request.RemoteAddr = "192.168.1.10:43000"
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -191,7 +194,7 @@ func TestMaintenanceStatusUsesFinalizePendingOperation(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/__agent_platform/status", nil))
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/__ubitech/status", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
 	}

@@ -24,6 +24,7 @@ type Config struct {
 	DataHome            string
 	DataRoot            string
 	StateDir            string
+	StateHome           string
 	SocketPath          string
 	GatewayAddress      string
 	LANEnabled          bool
@@ -64,15 +65,24 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve home directory: %w", err)
 	}
-	// Target-only startup derives durable technical paths from the operating-
-	// system account. Ambient XDG overrides are deliberately not authorities:
-	// shells, service managers, and recovery helpers may provide different
-	// values for the same deployment account.
-	configHome := filepath.Join(home, ".config")
-	dataHome := filepath.Join(home, ".local", "share")
+	configHome := os.Getenv("XDG_CONFIG_HOME")
+	if configHome == "" {
+		configHome = filepath.Join(home, ".config")
+	}
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	if !filepath.IsAbs(stateHome) || filepath.Clean(stateHome) != stateHome {
+		return Config{}, errors.New("XDG_STATE_HOME must resolve to an absolute canonical path")
+	}
 	dataRoot := profile.DefaultDataRoot(dataHome)
 	stateDir := profile.ManagerStateRoot(dataRoot)
-	socketPath, err := profile.ControlSocketPath(os.Getenv("XDG_RUNTIME_DIR"))
+	socketPath, err := profile.ControlSocketPath(dataRoot, os.Getenv("XDG_RUNTIME_DIR"))
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve Manager control socket: %w", err)
 	}
@@ -81,6 +91,7 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		DataHome:            dataHome,
 		DataRoot:            dataRoot,
 		StateDir:            stateDir,
+		StateHome:           stateHome,
 		SocketPath:          socketPath,
 		GatewayAddress:      "127.0.0.1:8080",
 		LANEnabled:          false,
@@ -121,18 +132,42 @@ func accountHome() (string, error) {
 	return home, nil
 }
 
-// LoadSnapshot parses configuration bytes that were opened and authenticated
-// by the target startup router. It never reopens path, so startup ownership,
-// application construction, and command execution all use one observation.
-func LoadSnapshot(active identity.ActiveProfile, path string, raw []byte, exists bool) (Config, error) {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return Config{}, errors.New("config snapshot path must be canonical and absolute")
-	}
+func Load(active identity.ActiveProfile, path string) (Config, error) {
 	cfg, err := Defaults(active)
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.ConfigPath = path
+	if path != "" {
+		cfg.ConfigPath = path
+	}
+	f, err := os.Open(cfg.ConfigPath)
+	if os.IsNotExist(err) {
+		return cfg, cfg.Validate()
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("open config: %w", err)
+	}
+	defer f.Close()
+	return loadReader(cfg, f)
+}
+
+// LoadStartupSnapshot parses an already authenticated configuration snapshot.
+// stateHome is the profile-neutral locator result and deliberately replaces
+// any ambient XDG_STATE_HOME default before the full profile parse.  A missing
+// snapshot has the same defaults-only semantics as Load observing
+// os.ErrNotExist, except that its startup state-home remains authoritative.
+func LoadStartupSnapshot(active identity.ActiveProfile, path string, raw []byte, exists bool, stateHome string) (Config, error) {
+	cfg, err := Defaults(active)
+	if err != nil {
+		return Config{}, err
+	}
+	if stateHome == "" || !filepath.IsAbs(stateHome) || filepath.Clean(stateHome) != stateHome {
+		return Config{}, errors.New("startup state_home must be canonical and absolute")
+	}
+	cfg.StateHome = stateHome
+	if path != "" {
+		cfg.ConfigPath = path
+	}
 	if !exists {
 		if len(raw) != 0 {
 			return Config{}, errors.New("missing config snapshot carries bytes")
@@ -140,6 +175,20 @@ func LoadSnapshot(active identity.ActiveProfile, path string, raw []byte, exists
 		return cfg, cfg.Validate()
 	}
 	return loadReader(cfg, bytes.NewReader(raw))
+}
+
+// ValidateFor proves that an already parsed configuration belongs to the
+// technical profile selected by the authenticated startup router.  Routed
+// serve paths keep Config in memory rather than reopening its pathname after
+// acquiring startup ownership.
+func (c Config) ValidateFor(active identity.ActiveProfile) error {
+	if err := active.Validate(); err != nil {
+		return fmt.Errorf("validate requested technical profile: %w", err)
+	}
+	if c.activeProfile != active {
+		return errors.New("configuration belongs to a different technical profile")
+	}
+	return c.Validate()
 }
 
 func loadReader(cfg Config, reader io.Reader) (Config, error) {
@@ -175,7 +224,7 @@ func set(c *Config, key, value string) error {
 		if err != nil {
 			return fmt.Errorf("active technical profile: %w", err)
 		}
-		socketPath, err := profile.ControlSocketPath(os.Getenv("XDG_RUNTIME_DIR"))
+		socketPath, err := profile.ControlSocketPath(root, os.Getenv("XDG_RUNTIME_DIR"))
 		if err != nil {
 			return err
 		}
@@ -184,6 +233,8 @@ func set(c *Config, key, value string) error {
 		c.SocketPath = socketPath
 	case "state_dir":
 		c.StateDir = expandHome(value)
+	case "state_home":
+		c.StateHome = expandHome(value)
 	case "socket_path":
 		c.SocketPath = expandHome(value)
 	case "listen":
@@ -288,7 +339,7 @@ func (c Config) Validate() error {
 	if err := c.activeProfile.Validate(); err != nil {
 		return fmt.Errorf("active technical profile: %w", err)
 	}
-	for name, path := range map[string]string{"config_path": c.ConfigPath, "data_home": c.DataHome, "data_root": c.DataRoot, "state_dir": c.StateDir, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
+	for name, path := range map[string]string{"data_home": c.DataHome, "data_root": c.DataRoot, "state_dir": c.StateDir, "state_home": c.StateHome, "socket_path": c.SocketPath, "internal_token_file": c.ControlTokenFile()} {
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("%s must be absolute", name)
 		}
@@ -444,6 +495,27 @@ func parseStringArray(value string) ([]string, error) {
 // Platform container.
 func (c Config) PlatformDataDir() string {
 	return filepath.Join(filepath.Clean(c.DataRoot), "data")
+}
+
+// TransitionStateRoot is the neutral owner-only root for deployment
+// attestation material. It is deliberately outside either technical
+// profile's mutable data root.
+func (c Config) TransitionStateRoot() string {
+	return filepath.Join(c.StateHome, "agent-platform", "release-transition")
+}
+
+// HandoffRoot is the neutral owner-only root for the one-time technical
+// namespace handoff journal.
+func (c Config) HandoffRoot() string {
+	return filepath.Join(c.StateHome, "agent-platform", "handoff")
+}
+
+// TargetDataRoot derives the immutable target namespace beside the live data
+// root. This preserves an administrator's explicit filesystem placement and
+// the handoff same-filesystem invariant without accepting an arbitrary target
+// path from a release or request.
+func (c Config) TargetDataRoot() string {
+	return filepath.Join(filepath.Dir(c.DataRoot), identity.TargetProfile().DataDirectory)
 }
 
 // ControlTokenFile returns the effective Manager control capability path. An

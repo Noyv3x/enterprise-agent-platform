@@ -26,20 +26,20 @@ Docker network
 
 部署后的产品名称、标识图和其它品牌字段是 Platform 所有的展示数据，只能影响浏览器界面、通知、面向用户的 Agent 自称及其它明确的展示投影。管理员品牌字段不得派生或改写 Manager 二进制与 unit 名、配置和数据根、Compose project、网络、容器与 ownership label、环境变量、secret mount、Cookie、内部 API 路径、数据库 marker、workspace/session identity、包名或 release asset；这些对象属于发布协议和持久身份，不属于品牌。
 
-当前系统是单一 target-only 基线。运行时持久部署与内部协议身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根及其 `.agent-platform.lock` 单实例锁、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。Manager 和业务容器只接受编译期 target profile；当前启动、更新与恢复没有第二套 profile 选择或迁移执行分支。
+当前 Bridge 只把 `ubitech-manager`、`ubitech-agent`、`UBITECH_*`、`ENTERPRISE_*`、`.ubitech*` 与 `enterprise_*` 等既有值作为已完成 source-profile/source-owner 发布留下的精确交接源身份继续读取，绝不把它们作为用户可见产品名称回退。Bridge 把内部身份交接到固定的中性 `agent-platform` 命名空间，紧随其后的 Cleanup 基线删除源名称、迁移器和兼容读取。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取品牌而依赖已停止的 Platform 数据库。
 
-本次身份迁移只覆盖运行时持久部署对象和机器协议标识。源码仓库名、Python distribution/module 坐标（包括 `enterprise-agent-platform` 与 `enterprise_agent_platform`）以及 Go module/import 坐标不参与有状态迁移，也不是管理员品牌设置的投影；是否在未来重命名这些开发坐标属于独立、无状态的源码变更，不能与部署数据迁移混为一谈。
+目标身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根及其 `.agent-platform.lock` 单实例锁、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。普通 generation 更新、管理员保存品牌或源码全局替换都不得直接承担这项迁移；唯一流程是[部署文档](../operations/deployment.md#技术命名空间交接)定义的两发布 Manager handoff。
 
-已完成的 Bridge→Cleanup 两发布流程及其 source 名称、Router、coordinator、helper、journal、`target_ack` 和 `namespace_handoff` 只作为受控发布与审计证据保留在[部署文档](../operations/deployment.md#技术命名空间交接)和[自动更新文档](../operations/auto-update.md#技术命名空间迁移发布)中。它们不是当前 Manager、Platform 或 Runtime 的运行职责，也不能由普通启动或普通更新重新激活。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取展示品牌而依赖已停止的 Platform 数据库。
+Manager 在解析默认配置路径、打开状态根、恢复普通 operation 或取得 control/Gateway 所有权之前先构造身份 Router。无交接事务时 Router 只能注入编译期 source profile；target profile 只能由位于源/目标数据根之外、经过完整身份与阶段校验的 handoff journal 选择。命令行、环境变量、管理员品牌、release manifest 本身或目标目录恰好存在都不能选择 target。Router 还在普通 update/self-update owner 之前识别 `namespace_handoff`：描述符存在时只能交给独立 handoff coordinator，普通 operation 不得先创建 Candidate、Activation、维护状态或其它所有权事实。
 
 ## 管理平面
 
-Manager 是源码树之外的稳定控制平面；唯一命令为 `agent-platform-manager`。它拥有：
+Manager 是源码树之外的稳定控制平面；当前桥接源命令为 `ubitech-manager`，交接后的唯一命令为 `agent-platform-manager`。它拥有：
 
 - 公网 Gateway、维护状态和 owner-only Unix 控制 socket；
 - 固定服务与按 Agent Sandbox 的创建、停止、对账和日志轮转；
 - release manifest 校验、镜像预拉取、更新、快照、回滚和自恢复；
-- target-only 配置、单实例启动、控制 socket 与 Gateway 所有权；
+- 技术身份 Router、独立 handoff coordinator 与跨重启 helper 所有权；
 - sandbox/host 执行路由，以及宿主执行审计；
 - 容器 generation、operation journal 和健康状态。
 
@@ -103,7 +103,13 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 
 管理器先验证 release manifest 并预拉取镜像，再等待 Platform 的全局自然空闲点。原子预约成功后入口切换为维护，旧 Platform 停止，数据库快照与迁移完成后启动新 generation；只有所有核心 readiness 通过才恢复业务。完整协议见[自动更新](../operations/auto-update.md)。
 
-Cleanup 之前的 Bridge→Cleanup 交接使用过独立于普通 generation operation 的 Router、coordinator、持久 helper、参与者、journal 和发布回执。该流程已经终结，相关状态机只保留为受控发布证据；当前二进制不包含其执行入口，后台循环也不取得 handoff lease 或扫描 source journal。历史状态机、恢复与 listener 证明见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)和[部署](../operations/deployment.md#技术命名空间交接)，不得从这些历史说明推导出当前运行能力。
+技术命名空间交接不复用上述普通 generation operation。source-owner 只负责建立事务并把所有权耐久移交给源码树和两套数据根之外的持久 helper；从移交完成到 terminal phase，helper 是 journal、数据位置、unit 和 listener 切换的唯一 writer。源 Manager 失去写权；目标 Manager 只对执行中的目标 stable inode、目标 profile 和当前事务产出权威 `target_ack` 证明，不能推进其它交接阶段。helper 验证并持久化该证明，但不能自行生成或替目标签署。目标 Manager 使用全新的 Manager state、自更新和普通 operation 根，不能复制或改写源 Candidate、Activation、watchdog、recovery 或历史 operation 来伪造连续所有权。完整状态机、恢复与 listener 规则见[自动更新](../operations/auto-update.md#技术命名空间迁移发布)和[部署](../operations/deployment.md#技术命名空间交接)。
+
+helper 启动的 source/target 参与者在事务 terminal 前只运行 owner-only 受限控制面和等待接管的 Gateway，不启动普通恢复、自动更新、Sandbox 或后台维护。为让已绑定 Manager socket 的 Platform 在维护预约下启动，受限控制面只合成 transaction-bound、`maintenance=true` 的只读状态；其它普通 API 全部关闭。参与者先在线并通过 helper challenge，helper 才启动相应固定容器栈。目标 listener 接管后，helper 先耐久写入 forward-only 的 `target_commit_planned`，再让目标 Platform 提交 machine schema、持久化 transaction/generation/binding 绑定的 receipt 并释放预约；receipt 与 terminal `committed` 同步后，同一目标进程才取得普通启动所有权并原子提升 handler。terminal 因而已经包含目标准入结算证明，不存在“先报告 committed、重启后再猜测是否释放”的窗口。
+
+持久 helper 还是唯一的目标宿主安装 owner：目标数据发布后，它从 journal 与已验证目标 artifact 确定性生成并原子安装目标 stable binary、配置和 user unit，之后目标 participant 才可启动。普通 source/target Manager、自更新和环境 locator 均不能安装或选择这些对象；崩溃只重放完全相同安装，回滚在 writer fence 后精确删除，提交保留。source preflight 必须把目标 runtime socket 解析成唯一规范绝对路径并写入 journal；participant 证明、目标配置、PID/token 连接、listener challenge 与 Compose control mount 都使用该同一个字符串，不允许逻辑/实际双重身份。`target_commit_planned` 重启时 target participant 仍可消费这一严格绑定的 startup capability，helper 先恢复/证明 participant，再继续 forward-only commit。
+
+完整 Manager 的所有后台可变循环都通过同一 routed handoff admission，而不只是 operation 和 executor HTTP 路由。每次 Capability/Firecrawl 对账、Sandbox lifecycle/镜像刷新、维护清理、自动更新发布与异步进程终态落盘先持有 handoff global observation，再进入 runtime、maintenance 或 fixed-stack 子边界。一旦有非终态 journal，这些循环与其 audit 保持零写入；journal terminal 后不需人工重启，下一轮重新取得观测即恢复。
 
 ## 故障边界
 
@@ -112,7 +118,7 @@ Cleanup 之前的 Bridge→Cleanup 交接使用过独立于普通 generation ope
 - Platform 重启不应重复执行已经开始副作用的 job。
 - Runtime 重启通过幂等记录和会话日志区分可重放结果与 `needs_review`。
 - 管理器重启从 operation journal 和容器 label 对账，不从容器名称猜测状态。
-- target-only 启动只能使用编译期 target profile 和当前配置根；历史发布证据、旧目录、进程名或普通 operation 都不能改变技术身份。
+- handoff 任一阶段只能有一个 journal writer；target profile 选择和 `target_ack` 必须分别来自已验证 journal 与目标 Manager，不从目录、进程名或普通 operation 推断。
 - 命名空间转换只改写机器拥有的路径引用、marker、协议键与 ownership metadata；用户消息、记忆、Skill、session 正文、附件内容和其它用户文本不做品牌或命名空间字符串替换。
 - 搜索、抓取、浏览器和 Cognee 失败只影响对应工具，不能破坏本地消息和知识数据。
 - 邮件轮询和回复通知失败只降级对应集成，不阻断对话；更新维护期间不启动新的邮件副作用或唤醒。

@@ -24,6 +24,7 @@ from .secure_fs import (
     publish_private_file_at,
     read_private_file_at,
 )
+from .technical_profile import other_technical_profile
 
 
 _MAX_SESSION_ID_LENGTH = 512
@@ -60,7 +61,12 @@ def _scope_marker_payload_for_profile(
 
 
 def assert_existing_workspace_profile(config: PlatformConfig) -> None:
-    """Pure-read validation of current workspace markers."""
+    """Pure-read rejection of cross-profile workspace markers.
+
+    Target data has already passed the handoff transformer, so every recorded
+    workspace must carry its target marker before the Platform may start any
+    writer. Source inventory must likewise remain entirely source-profile.
+    """
 
     try:
         database_info = os.lstat(config.db_path)
@@ -93,13 +99,19 @@ def assert_existing_workspace_profile(config: PlatformConfig) -> None:
         )
 
     selected = config.technical_profile
+    other_marker_name = other_technical_profile(selected).scope_marker_name
     try:
         root_fd = open_private_directory_fd(config.workspace_dir)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
-        raise sqlite3.DatabaseError(
-            "Agent workspace root is missing or unsafe"
-        ) from exc
+        if selected.is_target:
+            raise sqlite3.DatabaseError(
+                "target Agent workspace root is missing or unsafe"
+            ) from exc
+        return
     try:
+        other_internal_directory = other_technical_profile(
+            selected
+        ).workspace_internal_directory
         for row in rows:
             scope_key = str(row["scope_key"])
             scope_type = str(row["scope_type"])
@@ -125,7 +137,7 @@ def assert_existing_workspace_profile(config: PlatformConfig) -> None:
                 raise sqlite3.DatabaseError(
                     "Agent workspace inventory does not match its scope identity"
                 )
-            relative = Path(workspace_path)
+            relative = Path(str(workspace_path))
             if relative.is_absolute() or any(
                 part in {"", ".", ".."} for part in relative.parts
             ):
@@ -140,49 +152,83 @@ def assert_existing_workspace_profile(config: PlatformConfig) -> None:
                         os.close(current_fd)
                         current_fd = next_fd
                 except (FileNotFoundError, UnsafePrivatePathError) as exc:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace is missing or unsafe: " + scope_key
-                    ) from exc
+                    if selected.is_target:
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace is missing or unsafe: "
+                            + str(scope_key)
+                        ) from exc
+                    continue
                 try:
-                    raw, _ = read_private_file_at(
-                        current_fd,
-                        selected.scope_marker_name,
-                        maximum_bytes=_MAX_SCOPE_MARKER_BYTES,
+                    os.stat(
+                        other_marker_name,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
                     )
-                    payload = AgentScopeManager._decode_scope_marker(
-                        raw,
-                        config.workspace_dir / relative / selected.scope_marker_name,
-                    )
-                except (FileNotFoundError, UnsafePrivatePathError) as exc:
+                except FileNotFoundError:
+                    pass
+                else:
                     raise sqlite3.DatabaseError(
-                        "Agent workspace marker is missing or unsafe: " + scope_key
-                    ) from exc
-                scope = AgentExecutionScope(
-                    scope_key=scope_key,
-                    scope_type=scope_type,
-                    scope_id=scope_id,
-                    session_id=str(row["runtime_session_id"]),
-                    lifecycle_id=str(row["runtime_lifecycle_id"]),
-                    workspace_path=str(config.workspace_dir / relative),
-                    workspace_id=workspace_id,
-                    sandbox_id=str(row["sandbox_id"]),
-                )
-                expected = _scope_marker_payload_for_profile(
-                    scope,
-                    selected.profile_id,
-                )
-                if not AgentScopeManager._scope_marker_payload_matches(
-                    payload,
-                    expected,
-                ):
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace marker does not match its database identity: "
-                        + scope_key
+                        "Agent workspace contains another technical profile marker: "
+                        + str(scope_key)
                     )
+                try:
+                    os.stat(
+                        other_internal_directory,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise sqlite3.DatabaseError(
+                        "Agent workspace contains another technical profile directory: "
+                        + str(scope_key)
+                    )
+                if selected.is_target:
+                    try:
+                        raw, _ = read_private_file_at(
+                            current_fd,
+                            selected.scope_marker_name,
+                            maximum_bytes=_MAX_SCOPE_MARKER_BYTES,
+                        )
+                        payload = AgentScopeManager._decode_scope_marker(
+                            raw,
+                            config.workspace_dir
+                            / relative
+                            / selected.scope_marker_name,
+                        )
+                    except (FileNotFoundError, UnsafePrivatePathError) as exc:
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace marker is missing or unsafe: "
+                            + str(scope_key)
+                        ) from exc
+                    scope = AgentExecutionScope(
+                        scope_key=scope_key,
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                        session_id=str(row["runtime_session_id"]),
+                        lifecycle_id=str(row["runtime_lifecycle_id"]),
+                        workspace_path=str(config.workspace_dir / relative),
+                        workspace_id=workspace_id,
+                        sandbox_id=str(row["sandbox_id"]),
+                    )
+                    expected = _scope_marker_payload_for_profile(
+                        scope,
+                        selected.profile_id,
+                    )
+                    if not AgentScopeManager._scope_marker_payload_matches(
+                        payload,
+                        expected,
+                    ):
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace marker does not match its database identity: "
+                            + str(scope_key)
+                        )
             finally:
                 os.close(current_fd)
     finally:
         os.close(root_fd)
+
 
 @dataclass(frozen=True)
 class AgentExecutionScope:
@@ -230,6 +276,12 @@ class AgentScopeManager:
         self.db = db
         self._technical_profile = self.config.technical_profile
         self._scope_marker_name = self._technical_profile.scope_marker_name
+        self._other_scope_marker_name = other_technical_profile(
+            self._technical_profile
+        ).scope_marker_name
+        self._other_workspace_internal_directory = other_technical_profile(
+            self._technical_profile
+        ).workspace_internal_directory
         self._schema_writes_enabled = bool(commit_schema_upgrade)
         self._workspace_root = Path(
             os.path.abspath(os.fspath(self.config.workspace_dir.expanduser()))
@@ -394,6 +446,46 @@ class AgentScopeManager:
             )
         self._assert_scope_markers()
         self._schema_writes_enabled = True
+
+    def handoff_workspace_identity(self) -> str:
+        """Pure-read, closed-world workspace identity for Manager handoff.
+
+        Unlike the startup compatibility path, this method never accepts or
+        upgrades a legacy marker.  It reopens every marker and hashes only the
+        canonical relative identity, never a host absolute workspace path.
+        """
+
+        rows = self.db.query(_SCOPE_SELECT + " ORDER BY scopes.scope_key")
+        expected_count = int(self.db.scalar("SELECT COUNT(*) FROM agent_scopes") or 0)
+        if len(rows) != expected_count:
+            raise sqlite3.DatabaseError(
+                "Agent scope runtime identity is incomplete in the current baseline"
+            )
+        identities: list[dict[str, Any]] = []
+        for row in rows:
+            self._validate_existing_workspace(
+                str(row["scope_type"]),
+                str(row["scope_id"]),
+            )
+            scope = self._from_row(row)
+            expected = self._scope_marker_payload(scope)
+            self._reject_other_profile_marker(None, scope)
+            marker = Path(scope.workspace_path) / self._scope_marker_name
+            if not self._scope_marker_payload_matches(
+                self._read_scope_marker(marker), expected
+            ):
+                raise sqlite3.DatabaseError(
+                    "Agent workspace scope marker is not the committed current schema: "
+                    + scope.scope_key
+                )
+            identities.append(expected)
+        encoded = json.dumps(
+            identities,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _validate_existing_workspace(
         self,
@@ -673,6 +765,7 @@ class AgentScopeManager:
         previous: AgentExecutionScope,
         planned: AgentExecutionScope,
     ) -> None:
+        self._reject_other_profile_marker(None, previous)
         marker = Path(previous.workspace_path) / self._scope_marker_name
         marker_fd = open_private_directory_fd(marker.parent)
         staging_fd: int | None = None
@@ -786,6 +879,7 @@ class AgentScopeManager:
         expected_previous: dict[str, Any] | None = None,
         directory_fd: int | None = None,
     ) -> None:
+        self._reject_other_profile_marker(directory_fd, scope)
         marker = Path(scope.workspace_path) / self._scope_marker_name
         encoded = self._encoded_scope_marker(scope)
         owns_directory_fd = directory_fd is None
@@ -850,6 +944,53 @@ class AgentScopeManager:
             if owns_directory_fd:
                 os.close(directory_fd)
 
+    def _reject_other_profile_marker(
+        self,
+        directory_fd: int | None,
+        scope: AgentExecutionScope,
+    ) -> None:
+        owns_directory_fd = directory_fd is None
+        if directory_fd is None:
+            directory_fd = open_private_directory_fd(Path(scope.workspace_path))
+        try:
+            try:
+                os.stat(
+                    self._other_scope_marker_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace profile marker could not be inspected: "
+                    + scope.scope_key
+                ) from exc
+            else:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace contains another technical profile marker: "
+                    + scope.scope_key
+                )
+            try:
+                os.stat(
+                    self._other_workspace_internal_directory,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace profile directory could not be inspected: "
+                    + scope.scope_key
+                ) from exc
+            raise sqlite3.DatabaseError(
+                "Agent workspace contains another technical profile directory: "
+                + scope.scope_key
+            )
+        finally:
+            if owns_directory_fd:
+                os.close(directory_fd)
 
     def _encoded_scope_marker(self, scope: AgentExecutionScope) -> bytes:
         return (
@@ -1138,6 +1279,7 @@ class AgentScopeManager:
         *,
         directory_fd: int | None = None,
     ) -> None:
+        self._reject_other_profile_marker(directory_fd, scope)
         marker = Path(scope.workspace_path) / self._scope_marker_name
         payload = self._read_scope_marker(
             marker,

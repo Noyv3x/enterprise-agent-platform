@@ -61,11 +61,7 @@ class TargetBaselineSourceTreeGateTests(unittest.TestCase):
     def test_each_source_capability_category_is_rejected(self) -> None:
         examples = (
             "UBITECH_MANAGER_SOCKET",
-            "ENTERPRISE_PLATFORM_DATA",
-            "SOURCE_TECHNICAL_PROFILE",
             "ubitech-manager-linux-amd64",
-            ".enterprise-platform.lock",
-            "enterprise_session",
             "namespace_handoff",
             "release-transition",
             "P1_SOURCE_HANDOFF",
@@ -137,22 +133,6 @@ class TargetBaselineSourceTreeGateTests(unittest.TestCase):
         with temporary:
             (root / "manager/internal/invalid.go").write_bytes(b"\xff")
             with self.assertRaisesRegex(gate.SourceTreeGateError, "not UTF-8"):
-                gate.verify_source_tree(root, "cleanup")
-
-    def test_exact_nonstandard_text_input_is_scanned_without_suffix_allowlist(self) -> None:
-        temporary, root = self.make_tree()
-        with temporary:
-            example = root / "containers/dev.env.example"
-            example.write_text("AGENT_PLATFORM_DATA_ROOT=/tmp/data\n", encoding="utf-8")
-            gate.verify_source_tree(root, "cleanup")
-            example.write_text("ENTERPRISE_PLATFORM_DATA=/tmp/source\n", encoding="utf-8")
-            with self.assertRaisesRegex(gate.SourceTreeGateError, "ENTERPRISE_"):
-                gate.verify_source_tree(root, "cleanup")
-
-            example.write_text("AGENT_PLATFORM_DATA_ROOT=/tmp/data\n", encoding="utf-8")
-            unrelated = root / "containers/other.env.example"
-            unrelated.write_text("AGENT_PLATFORM_DATA_ROOT=/tmp/data\n", encoding="utf-8")
-            with self.assertRaisesRegex(gate.SourceTreeGateError, "unknown file type"):
                 gate.verify_source_tree(root, "cleanup")
 
     def test_quality_and_release_workflows_call_the_same_gate(self) -> None:

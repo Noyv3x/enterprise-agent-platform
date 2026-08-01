@@ -80,7 +80,7 @@ func TestCleanupStartupAtomicResiduesCleansReferencedVersionDirectory(t *testing
 	state := State{
 		SchemaVersion: 1,
 		Current: &Version{
-			Version: "current", Path: filepath.Join(versionDirectory, "agent-platform-manager"), SHA256: digest,
+			Version: "current", Path: filepath.Join(versionDirectory, "ubitech-manager"), SHA256: digest,
 		},
 		UpdatedAt: now,
 	}
@@ -186,7 +186,7 @@ func TestAcquireStartupOwnershipNeverUsesDurableVersionPathAsCleanupAuthority(t 
 			residue := filepath.Join(outsideDirectory, ".tmp-1212")
 			writeStartupTempResidue(t, residue)
 			outsideVersion := fixture.current
-			outsideVersion.Path = filepath.Join(outsideDirectory, "agent-platform-manager")
+			outsideVersion.Path = filepath.Join(outsideDirectory, "ubitech-manager")
 			state := State{SchemaVersion: 1, Current: &fixture.current, UpdatedAt: fixture.current.VerifiedAt}
 			switch field {
 			case "current":
@@ -295,7 +295,7 @@ func newStartupTempCleanupManager(t *testing.T) (*Manager, string, time.Time) {
 	manager := &Manager{Profile: testActiveProfile,
 		Root:             root,
 		StatePath:        filepath.Join(stateDirectory, "manager-binaries.json"),
-		InstallPath:      filepath.Join(stateDirectory, "bin", "agent-platform-manager"),
+		InstallPath:      filepath.Join(stateDirectory, "bin", "ubitech-manager"),
 		SocketPath:       filepath.Join(stateDirectory, "control", "manager.sock"),
 		ControlTokenFile: filepath.Join(stateDirectory, "secrets", "manager-token"),
 		Now:              func() time.Time { return now },

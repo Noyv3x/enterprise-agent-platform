@@ -16,7 +16,11 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
-var testActiveProfile = technicalidentity.CompileTimeActiveProfile()
+var testActiveProfile = technicalidentity.SourceActiveProfile()
+
+func openBackgroundMutationAdmission(context.Context) (func(), error) {
+	return func() {}, nil
+}
 
 type engineStub struct{}
 
@@ -45,7 +49,7 @@ func newTestService(t *testing.T) (*Service, string) {
 		t.Fatal(err)
 	}
 	auditLog := logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)
-	processes, err := NewProcessManager(testActiveProfile, engine, sandboxes, 1<<20)
+	processes, err := NewProcessManager(testActiveProfile, engine, sandboxes, 1<<20, openBackgroundMutationAdmission)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,9 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/attestation"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/executor"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/handoffhelper"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/handofflisteners"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
@@ -24,19 +27,63 @@ import (
 )
 
 type API struct {
-	Store          *journal.Store
-	Operations     *operation.Orchestrator
-	Engine         driver.Engine
-	Executor       *executor.Service
-	Config         *config.Manager
-	AuditLog       *logstore.Store
-	ControlToken   string
-	ExecutorToken  string
-	ManagerVersion string
-	ManagerSHA256  string
-	IdentityOnly   bool
-	mu             sync.Mutex
-	checks         map[string]release.Manifest
+	Store               *journal.Store
+	Operations          *operation.Orchestrator
+	Engine              driver.Engine
+	Executor            *executor.Service
+	Config              *config.Manager
+	AuditLog            *logstore.Store
+	ControlToken        string
+	ExecutorToken       string
+	ManagerVersion      string
+	ManagerSHA256       string
+	TransitionObserver  attestation.Observer
+	OwnershipProof      OwnershipProofProvider
+	ParticipantObserver ParticipantObservationProvider
+	// ExecutorAdmission accounts for one complete authenticated executor HTTP
+	// call. The source-owner handoff freezes this gate before observing runtime
+	// state, which closes file/audit/process commit windows as well as terminal
+	// creation. Read-only executor calls share the same short boundary so a
+	// future route cannot become mutating without being accounted for.
+	ExecutorAdmission interface {
+		Enter(context.Context) (release func(), err error)
+	}
+	IdentityOnly           bool
+	HandoffParticipantOnly bool
+	// HandoffTransactionID is the only Manager-state fact projected by a
+	// restricted participant. Platform startup uses it to restore the
+	// helper-owned maintenance reservation without opening the ordinary Store.
+	HandoffTransactionID string
+	mu                   sync.Mutex
+	checks               map[string]release.Manifest
+}
+
+// OwnershipProofProvider is implemented by the active participant gateway.
+// It must build the proof while holding the same lock that protects listener
+// adoption and teardown, so the returned FD set is one atomic observation.
+type OwnershipProofProvider interface {
+	ProveListenerOwnership(context.Context, handofflisteners.OwnershipChallenge) (handofflisteners.OwnershipProof, error)
+}
+
+type OwnershipProofProviderFunc func(context.Context, handofflisteners.OwnershipChallenge) (handofflisteners.OwnershipProof, error)
+
+func (function OwnershipProofProviderFunc) ProveListenerOwnership(ctx context.Context, challenge handofflisteners.OwnershipChallenge) (handofflisteners.OwnershipProof, error) {
+	return function(ctx, challenge)
+}
+
+// ParticipantObservationProvider is the challenge-bound, read-only surface
+// exposed by a helper-started source or target Manager. Implementations must
+// derive every fact from the consumed startup capability and live process;
+// the control handler independently validates the returned closed-world
+// observation before it crosses the owner-only socket.
+type ParticipantObservationProvider interface {
+	ObserveParticipant(context.Context, handoffhelper.ParticipantChallenge) (handoffhelper.ParticipantObservation, error)
+}
+
+type ParticipantObservationProviderFunc func(context.Context, handoffhelper.ParticipantChallenge) (handoffhelper.ParticipantObservation, error)
+
+func (function ParticipantObservationProviderFunc) ObserveParticipant(ctx context.Context, challenge handoffhelper.ParticipantChallenge) (handoffhelper.ParticipantObservation, error) {
+	return function(ctx, challenge)
 }
 
 func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -52,6 +99,25 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 			return
 		}
 		writeError(response, http.StatusNotFound, "not found")
+		return
+	}
+	if a.HandoffParticipantOnly {
+		if !authorized(request, a.ControlToken) {
+			writeError(response, http.StatusUnauthorized, "control authentication failed")
+			return
+		}
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/identity":
+			a.identity(response)
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
+			a.handoffParticipantStatus(response)
+		case request.Method == http.MethodPost && request.URL.Path == handofflisteners.OwnershipControlPath:
+			a.listenerOwnership(response, request)
+		case request.Method == http.MethodPost && request.URL.Path == handoffhelper.ParticipantObservePath:
+			a.participantObservation(response, request)
+		default:
+			writeError(response, http.StatusNotFound, "not found")
+		}
 		return
 	}
 	if strings.HasPrefix(request.URL.Path, "/v1/executor/") {
@@ -73,6 +139,12 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	switch {
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/status":
 		a.status(response, request.Context())
+	case request.Method == http.MethodPost && request.URL.Path == "/v1/release-transition/observation":
+		a.transitionObservation(response, request)
+	case request.Method == http.MethodPost && request.URL.Path == handofflisteners.OwnershipControlPath:
+		a.listenerOwnership(response, request)
+	case request.Method == http.MethodPost && request.URL.Path == handoffhelper.ParticipantObservePath:
+		a.participantObservation(response, request)
 	case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
 		writeJSON(response, http.StatusOK, a.Config.Public())
 	case request.Method == http.MethodPatch && request.URL.Path == "/v1/config":
@@ -90,6 +162,125 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}
+}
+
+func (a *API) handoffParticipantStatus(response http.ResponseWriter) {
+	transactionID := safeStatusToken(a.HandoffTransactionID, 160)
+	if len(transactionID) != len("handoff_")+32 || !strings.HasPrefix(transactionID, "handoff_") {
+		writeError(response, http.StatusServiceUnavailable, "handoff participant transaction identity is unavailable")
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{
+		"generation":                    0,
+		"current":                       nil,
+		"previous":                      nil,
+		"target":                        nil,
+		"public_state":                  model.StateUpdating,
+		"phase":                         "namespace_handoff",
+		"services":                      map[string]any{"manager": map[string]any{"status": "healthy"}},
+		"error":                         "",
+		"maintenance":                   true,
+		"active_operation_id":           transactionID,
+		"finalize_pending_operation_id": "",
+		"operation_id":                  transactionID,
+		"gate_settlement":               nil,
+		"checked_at":                    time.Now().UTC(),
+	})
+}
+
+func (a *API) participantObservation(response http.ResponseWriter, request *http.Request) {
+	if a.ParticipantObserver == nil {
+		writeError(response, http.StatusServiceUnavailable, "handoff participant observation is unavailable")
+		return
+	}
+	defer request.Body.Close()
+	challenge, err := handoffhelper.DecodeParticipantChallenge(request.Body)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	observation, err := a.ParticipantObserver.ObserveParticipant(request.Context(), challenge)
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	if err := handoffhelper.ValidateParticipantObservation(challenge, observation); err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	encoded, err := handoffhelper.EncodeParticipantObservation(observation)
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	response.WriteHeader(http.StatusOK)
+	_, _ = response.Write(append(encoded, '\n'))
+}
+
+func (a *API) listenerOwnership(response http.ResponseWriter, request *http.Request) {
+	if a.OwnershipProof == nil {
+		writeError(response, http.StatusServiceUnavailable, "listener ownership proof is unavailable")
+		return
+	}
+	defer request.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(request.Body, handofflisteners.MaximumOwnershipPayloadBytes+1))
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "read listener ownership challenge")
+		return
+	}
+	challenge, err := handofflisteners.DecodeOwnershipChallenge(data)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	proof, err := a.OwnershipProof.ProveListenerOwnership(request.Context(), challenge)
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	encoded, err := handofflisteners.EncodeOwnershipProof(challenge, proof)
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	response.WriteHeader(http.StatusOK)
+	_, _ = response.Write(append(encoded, '\n'))
+}
+
+func (a *API) transitionObservation(response http.ResponseWriter, request *http.Request) {
+	if a.TransitionObserver == nil {
+		writeError(response, http.StatusServiceUnavailable, "release transition observation is unavailable")
+		return
+	}
+	const maxChallengeBody = 32 << 10
+	data, err := io.ReadAll(io.LimitReader(request.Body, maxChallengeBody+1))
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "read release transition challenge")
+		return
+	}
+	if len(data) == 0 || len(data) > maxChallengeBody {
+		writeError(response, http.StatusBadRequest, "release transition challenge has an invalid size")
+		return
+	}
+	challenge, err := attestation.DecodeChallenge(data)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := attestation.ValidateChallengeAt(challenge, time.Now()); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	observation, err := a.TransitionObserver.ObserveTransition(request.Context(), challenge)
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	if err := attestation.ValidateObservation(challenge, observation); err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(response, http.StatusOK, observation)
 }
 
 // identity is the constant-time, owner-authenticated process probe used by the
@@ -111,14 +302,6 @@ func (a *API) identity(response http.ResponseWriter) {
 }
 
 func (a *API) status(response http.ResponseWriter, requestContext context.Context) {
-	state := a.Store.State()
-	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
-	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
-	operationID := activeOperationID
-	if operationID == "" {
-		operationID = finalizeOperationID
-	}
-	publicState := safePublicState(state.PublicState)
 	services := map[string]any{"manager": map[string]any{"status": "healthy"}}
 	for _, name := range []string{
 		"platform",
@@ -142,7 +325,99 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		}
 		cancel()
 	}
-	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "checked_at": state.HeartbeatAt})
+	state, referencedOperation, snapshotErr := a.Store.StateWithReferencedOperation()
+	var gateSettlement *gateSettlementStatus
+	if snapshotErr == nil && referencedOperation != nil {
+		gateSettlement = projectGateSettlement(state, *referencedOperation)
+	}
+	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
+	finalizeOperationID := safeStatusToken(state.FinalizePendingOperationID, 160)
+	operationID := activeOperationID
+	if operationID == "" {
+		operationID = finalizeOperationID
+	}
+	publicState := safePublicState(state.PublicState)
+	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "gate_settlement": gateSettlement, "checked_at": state.HeartbeatAt})
+}
+
+type gateSettlementStatus struct {
+	SchemaVersion int    `json:"schema_version"`
+	OperationID   string `json:"operation_id"`
+	Action        string `json:"action"`
+}
+
+func projectGateSettlement(
+	state model.ManagerState,
+	operation model.Operation,
+) *gateSettlementStatus {
+	if state.SchemaVersion != 1 || !state.Maintenance ||
+		state.PublicState != model.StateUpdating || state.Phase != "" ||
+		state.ActiveOperationID != "" ||
+		state.FinalizePendingOperationID != operation.ID || state.Candidate != nil ||
+		operation.SchemaVersion != 1 || !validStatusOperationID(operation.ID) ||
+		operation.Status != model.OperationSucceeded || !operation.Finalized ||
+		operation.Phase != model.PhaseCommitting || operation.CompletedAt == nil ||
+		operation.ReservationReleased || operation.SnapshotRestored ||
+		operation.PreparedCleanupPending || operation.ManagerActivationRollback ||
+		operation.ManagerRollbackGeneration != "" ||
+		!validGateSettlementReservation(state, operation) ||
+		!validGateSettlementAction(operation) ||
+		safeCommit(operation.TargetGeneration) != operation.TargetGeneration ||
+		!generationMatchesTarget(state.Current, operation.TargetGeneration) {
+		return nil
+	}
+
+	return &gateSettlementStatus{
+		SchemaVersion: 1,
+		OperationID:   operation.ID,
+		Action:        string(operation.GateSettlementAction),
+	}
+}
+
+func validGateSettlementAction(operation model.Operation) bool {
+	switch operation.GateSettlementAction {
+	case model.GateSettlementCommit:
+		return operation.Kind == model.OperationInstall || operation.Kind == model.OperationUpdate
+	case model.GateSettlementAbort:
+		switch operation.Kind {
+		case model.OperationInstall, model.OperationUpdate, model.OperationRestart, model.OperationRollback, model.OperationRepair:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func validGateSettlementReservation(state model.ManagerState, operation model.Operation) bool {
+	switch operation.Kind {
+	case model.OperationInstall:
+		return operation.ReservationStatus == "" && state.Previous == nil ||
+			operation.ReservationStatus == model.ReservationMutationStarted && state.Previous != nil
+	case model.OperationRepair:
+		return operation.ReservationStatus == ""
+	case model.OperationUpdate, model.OperationRestart, model.OperationRollback:
+		return operation.ReservationStatus == model.ReservationMutationStarted
+	default:
+		return false
+	}
+}
+
+func generationMatchesTarget(generation *model.Generation, target string) bool {
+	return generation != nil && generation.ID == target && generation.SourceCommit == target
+}
+
+func validStatusOperationID(value string) bool {
+	if len(value) != len("op_")+32 || !strings.HasPrefix(value, "op_") {
+		return false
+	}
+	for _, character := range value[len("op_"):] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func safeServiceStatus(value string) string {
@@ -289,6 +564,14 @@ func safeStatusToken(value string, limit int) string {
 	return value
 }
 func (a *API) patchConfig(response http.ResponseWriter, request *http.Request) {
+	if a.Operations != nil && a.Operations.HandoffAdmission != nil {
+		release, err := a.Operations.HandoffAdmission(request.Context())
+		if err != nil {
+			writeError(response, http.StatusConflict, err.Error())
+			return
+		}
+		defer release()
+	}
 	var patch config.Patch
 	if err := decode(request, &patch); err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
@@ -303,6 +586,20 @@ func (a *API) patchConfig(response http.ResponseWriter, request *http.Request) {
 	writeJSON(response, http.StatusOK, value)
 }
 func (a *API) preflight(response http.ResponseWriter, request *http.Request) {
+	if a.Operations == nil || a.Operations.HandoffAdmission == nil {
+		writeError(response, http.StatusServiceUnavailable, "preflight handoff admission is unavailable")
+		return
+	}
+	releaseAdmission, err := a.Operations.HandoffAdmission(request.Context())
+	if err != nil {
+		writeError(response, http.StatusConflict, err.Error())
+		return
+	}
+	if releaseAdmission == nil {
+		writeError(response, http.StatusServiceUnavailable, "preflight handoff admission returned no release boundary")
+		return
+	}
+	defer releaseAdmission()
 	ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
 	defer cancel()
 	if err := a.Operations.Preflight(ctx); err != nil {
@@ -409,6 +706,18 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 	if request.Method != http.MethodPost {
 		writeError(response, http.StatusMethodNotAllowed, "method not allowed")
 		return
+	}
+	if a.ExecutorAdmission != nil {
+		release, err := a.ExecutorAdmission.Enter(request.Context())
+		if err != nil {
+			writeError(response, http.StatusConflict, err.Error())
+			return
+		}
+		if release == nil {
+			writeError(response, http.StatusServiceUnavailable, "executor admission returned no release boundary")
+			return
+		}
+		defer release()
 	}
 	switch request.URL.Path {
 	case "/v1/executor/audit":
